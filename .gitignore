@@ -1,0 +1,15 @@
+/.cache
+/.clangd
+
+/.cursor
+/.idea
+/.vscode
+
+/build
+/xbuild
+/cmake-build-*
+/compile_commands.json
+
+*.pem
+
+__pycache__

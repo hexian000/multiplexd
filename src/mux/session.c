@@ -1,0 +1,2044 @@
+/* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
+ * This code is licensed under MIT license (see LICENSE for details) */
+
+/**
+ * @file session.c
+ * @brief Internal mux session state machine implementation.
+ */
+
+#include "mux/session.h"
+
+#include "mux/dispatch.h"
+#include "mux/estimator.h"
+#include "mux/frame.h"
+#include "mux/handshake.h"
+#include "mux/sched.h"
+#include "mux/stream.h"
+#include "mux/wire.h"
+#include "util.h"
+
+#include "algo/hashtable.h"
+
+#include "os/clock.h"
+#include "os/socket.h"
+#include "utils/arraysize.h"
+#include "utils/debug.h"
+#include "utils/formats.h"
+#include "utils/minmax.h"
+#include "utils/serialize.h"
+#include "utils/slog.h"
+
+#include <ev.h>
+#include <sys/socket.h>
+
+#include <assert.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static const char *session_state_str[] = {
+	[SESSION_INIT] = "INIT",
+	[SESSION_CONNECT] = "CONNECT",
+	[SESSION_HANDSHAKE] = "HANDSHAKE",
+	[SESSION_ESTABLISHED] = "ESTABLISHED",
+	[SESSION_SUSPENDED] = "SUSPENDED",
+	[SESSION_CLOSING] = "CLOSING",
+	[SESSION_CLOSE_WAIT] = "CLOSE_WAIT",
+	[SESSION_CLOSED] = "CLOSED",
+};
+
+/* -------------------------------------------------------------------------
+ * Infrastructure & Lifecycle
+ * Session state, lifecycle management, stream table, raw socket I/O.
+ * ---------------------------------------------------------------------- */
+
+static void
+session_set_state(struct mux_session *ss, enum session_state newstate)
+{
+	if (ss->state == newstate) {
+		return;
+	}
+	MUX_LOG_F(
+		DEBUG, ss, "state: %s -> %s", session_state_str[ss->state],
+		session_state_str[newstate]);
+	const enum session_state oldstate = ss->state;
+
+	if (oldstate == SESSION_ESTABLISHED) {
+		ev_timer_stop(ss->loop, &ss->w_keepalive);
+		ev_timer_stop(ss->loop, &ss->w_send_timeout);
+		estimator_stop(ss);
+		COUNTER_ADD(ss->cnt.num_session_disconnected, 1);
+		COUNTER_SUB(ss->cnt.num_sessions, 1);
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_LOST,
+				(union mux_event_data){ 0 });
+		}
+	} else if (
+		(oldstate == SESSION_CONNECT ||
+		 oldstate == SESSION_HANDSHAKE) &&
+		newstate != SESSION_CONNECT && newstate != SESSION_HANDSHAKE &&
+		newstate != SESSION_ESTABLISHED) {
+		COUNTER_SUB(ss->cnt.num_session_halfopen, 1);
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CONNECT_FAILED,
+				(union mux_event_data){ 0 });
+		}
+	}
+
+	ss->state = newstate;
+	if (newstate == SESSION_CONNECT) {
+		ss->connect_started = clock_monotonic_ns();
+	} else if (newstate == SESSION_HANDSHAKE && ss->accepted) {
+		ss->connect_started = clock_monotonic_ns();
+	}
+
+	if ((newstate == SESSION_CONNECT || newstate == SESSION_HANDSHAKE) &&
+	    oldstate != SESSION_CONNECT && oldstate != SESSION_HANDSHAKE) {
+		COUNTER_ADD(ss->cnt.num_session_connect, 1);
+		COUNTER_ADD(ss->cnt.num_session_halfopen, 1);
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CONNECT,
+				(union mux_event_data){ 0 });
+		}
+	} else if (newstate == SESSION_ESTABLISHED) {
+		if (ss->connect_started > 0) {
+			const intmax_t lat =
+				clock_monotonic_ns() - ss->connect_started;
+			ss->last_connect_latency_ns = lat;
+			ss->connect_started = 0;
+		}
+		/* peer_addr is cleared by session_cleanup after each reconnect.
+		 * It remains set across suspend, distinguishing first
+		 * establishment (CONNECT) from transport resumption (RESUMED). */
+		const bool first_establish =
+			(ss->peer_addr.sa.sa_family == AF_UNSPEC);
+		(void)socket_get_peer(ss->w_socket.fd, &ss->peer_addr);
+		ev_timer_again(ss->loop, &ss->w_keepalive);
+		COUNTER_ADD(ss->cnt.num_session_connected, 1);
+		COUNTER_SUB(ss->cnt.num_session_halfopen, 1);
+		COUNTER_ADD(ss->cnt.num_sessions, 1);
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss,
+				first_establish ? MUX_EVENT_ESTABLISHED :
+						  MUX_EVENT_RESUMED,
+				(union mux_event_data){
+					.connected.ns =
+						ss->last_connect_latency_ns,
+					.connected.peer_id =
+						ss->handshake.peer_id,
+					.connected.peer_identity =
+						ss->handshake.peer_identity,
+				});
+		}
+	}
+}
+
+static void session_stop(struct mux_session *ss)
+{
+	struct ev_loop *loop = ss->loop;
+	ev_io_stop(loop, &ss->w_socket);
+	ev_idle_stop(loop, &ss->sched.w_sched);
+	ev_timer_stop(loop, &ss->w_timeout);
+	ev_timer_stop(loop, &ss->w_keepalive);
+	ev_timer_stop(loop, &ss->w_send_timeout);
+	ev_timer_stop(loop, &ss->w_connect_timeout);
+	ev_timer_stop(loop, &ss->sched.w_coalesce);
+	ev_timer_stop(loop, &ss->w_idle_timeout);
+	estimator_stop(ss);
+}
+
+static void session_cleanup(struct mux_session *restrict ss)
+{
+	sched_free_streams(ss);
+	wire_conn_free(ss);
+	if (ss->w_socket.fd != -1) {
+		CLOSE_FD(ss->w_socket.fd);
+		ss->w_socket.fd = -1;
+	}
+
+	wire_discard_buffers(ss);
+	mux_frame_list_clear(&ss->unacked, &ss->pool);
+	COUNTER_SUB(ss->cnt.unacked_frames, ss->unacked_frames);
+	ss->unacked_frames = 0;
+	ss->retransmit_cursor = NULL;
+	ss->retransmit_copy = NULL;
+}
+
+void session_reset(struct mux_session *ss)
+{
+	if (ss->state == SESSION_CLOSED) {
+		return;
+	}
+	MUX_LOG(VERBOSE, ss, "closing");
+	session_set_state(ss, SESSION_CLOSED);
+	session_stop(ss);
+	session_cleanup(ss);
+
+	if (ss->accepted) {
+		return;
+	}
+	/* Reset peer_addr so the next establishment is recognised as first. */
+	memset(&ss->peer_addr, 0, sizeof(ss->peer_addr));
+	ss->num_halfopen = 0;
+}
+
+void session_update_watcher(struct mux_session *restrict ss)
+{
+	int events = 0;
+#if WITH_TLS
+	if (ss->wire.tls_want != 0) {
+		modify_io_events(ss->loop, &ss->w_socket, ss->wire.tls_want);
+		return;
+	}
+#endif
+	switch (ss->state) {
+	case SESSION_CONNECT:
+		events = EV_WRITE;
+		break;
+	case SESSION_HANDSHAKE:
+	case SESSION_ESTABLISHED:
+	case SESSION_CLOSING:
+		if (ss->wire.rx_open) {
+			events = EV_READ;
+		}
+		if (ss->wire.tx_pending || !ss->wire.rx_open) {
+			events |= EV_WRITE;
+		}
+		break;
+	case SESSION_CLOSE_WAIT:
+		/* Wait for peer to close; if receive is closed, drive teardown via write. */
+		events = ss->wire.rx_open ? EV_READ : EV_WRITE;
+		break;
+	case SESSION_SUSPENDED:
+		/* No transport I/O while waiting for reconnect. */
+		return;
+	default:
+		return;
+	}
+	modify_io_events(ss->loop, &ss->w_socket, events);
+}
+
+/* -------------------------------------------------------------------------
+ * Connection & Frame Processing
+ * Connection establishment, frame buffer management, frame parsing and
+ * dispatch, send/recv flush, scheduler and control packet path.
+ * ---------------------------------------------------------------------- */
+
+static void format_frame_flags(
+	char *restrict buf, const size_t buflen, const uint_fast8_t flags)
+{
+	static const struct {
+		uint_least8_t flag;
+		const char *name;
+	} names[] = {
+		{ MUX_FLAG_SYN, "SYN" },   { MUX_FLAG_ACK, "ACK" },
+		{ MUX_FLAG_FIN, "FIN" },   { MUX_FLAG_RST, "RST" },
+		{ MUX_FLAG_PUSH, "PUSH" },
+	};
+
+	char *p = buf;
+	const char *const end = buf + buflen;
+	bool wrote = false;
+	for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+		if ((flags & names[i].flag) == 0) {
+			continue;
+		}
+		if (wrote && p + 1 < end) {
+			*p++ = '|';
+		}
+		for (const char *s = names[i].name; *s != '\0' && p + 1 < end;
+		     s++) {
+			*p++ = *s;
+		}
+		wrote = true;
+	}
+	const uint_fast8_t unknown = flags & (uint_fast8_t)(~MUX_FLAG_MASK);
+	if (unknown != 0) {
+		if (snprintf(
+			    p, (size_t)(end - p), "%sUNKNOWN(0x%02x)",
+			    wrote ? "|" : "", unknown) < 0 &&
+		    buflen > 0) {
+			buf[0] = '\0';
+		}
+		return;
+	}
+	if (!wrote) {
+		if (snprintf(buf, buflen, "NONE") < 0 && buflen > 0) {
+			buf[0] = '\0';
+		}
+	} else if (p < end) {
+		*p = '\0';
+	}
+}
+
+void session_log_frame_header(
+	struct mux_session *restrict ss, const char *restrict what,
+	const unsigned char *restrict raw,
+	const struct mux_header *restrict hdr)
+{
+	if (!LOGLEVEL(VERYVERBOSE)) {
+		return;
+	}
+	char flags_str[64];
+	format_frame_flags(flags_str, sizeof(flags_str), hdr->flags);
+
+	LOG_BIN_F(
+		VERYVERBOSE, raw, MUX_FRAME_HEADER_SIZE, 0,
+		"[fd:%d] %s: stream_id=%" PRIuLEAST16 " length=%" PRIuLEAST16
+		" flags=0x%02" PRIxLEAST8 "(%s)"
+		" extra=%" PRIuLEAST16,
+		ss->w_socket.fd, what, hdr->stream_id, hdr->length, hdr->flags,
+		flags_str, hdr->extra);
+}
+
+static void mux_notify_write(struct mux_session *ss)
+{
+	if (ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
+	if (!ss->wire.tx_pending) {
+		MUX_LOG_F(
+			DEBUG, ss,
+			"wake write path: sendbuf=%d oobbuf=%d"
+			" ready=%d stalled=%d",
+			ss->wire.sendbuf.head != NULL,
+			ss->wire.oobbuf.head != NULL,
+			ss->sched.sched_head != NULL, ss->send_stalled);
+	}
+	ss->wire.tx_pending = true;
+	session_update_watcher(ss);
+}
+
+/* Emit a session-level ACK for all unacknowledged non-stream-0 frames.
+ * Caller must ensure recv_seq != ack_seq. */
+void session_emit_ack(struct mux_session *restrict ss)
+{
+	const uint_fast32_t delta = ss->recv_seq - ss->ack_seq;
+	const uint_fast32_t emit = (delta > (uint_fast32_t)UINT16_MAX) ?
+					   (uint_fast32_t)UINT16_MAX :
+					   delta;
+	if (session_send_ctrl(ss, STREAMID_CTRL, MUX_FLAG_ACK, emit)) {
+		ss->ack_seq += emit;
+		ss->session_ack_ticks = 0;
+		ss->ack_pending = false;
+	}
+}
+
+/* Update w_send_timeout after a send attempt:
+ * - stop if nothing is pending (sendbuf, oobbuf, ready queue all empty)
+ * - again if pending data exists and (progress was made OR timer is not running) */
+static void
+update_send_timeout(struct mux_session *restrict ss, const bool progress)
+{
+	if (!(ss->w_send_timeout.repeat > 0.0) ||
+	    ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
+	if (ss->wire.sendbuf.head == NULL && ss->wire.oobbuf.head == NULL &&
+	    ss->sched.sched_head == NULL) {
+		ev_timer_stop(ss->loop, &ss->w_send_timeout);
+		return;
+	}
+	if (!ev_is_active(&ss->w_send_timeout) || progress) {
+		ev_timer_again(ss->loop, &ss->w_send_timeout);
+	}
+}
+
+static bool oobbuf_has_pong(const struct mux_session *ss)
+{
+	for (const struct mux_frame *frame = ss->wire.oobbuf.head;
+	     frame != NULL; frame = frame->next) {
+		struct mux_header hdr;
+		mux_read_header(frame->data, &hdr);
+		if (hdr.stream_id == STREAMID_CTRL &&
+		    hdr.extra == MUX_CTRL_PONG) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Add one unacked-list entry worth @p count logical seqnums.  Hitting the
+ * session cap only stalls new data dequeues; ACK/oob paths still run until
+ * session_ack_trim drops the list below session_window. */
+static bool push_unacked(
+	struct mux_session *restrict ss, struct mux_frame *restrict frame,
+	const size_t count)
+{
+	frame->unacked_count = count;
+	mux_frame_list_push(&ss->unacked, frame);
+	ss->unacked_frames += count;
+	COUNTER_ADD(ss->cnt.unacked_frames, count);
+	ss->send_seq += count;
+	if (!ss->send_stalled &&
+	    ss->unacked_frames >= (size_t)ss->session_window) {
+		MUX_LOG_F(
+			DEBUG, ss,
+			"send stalled: unacked=%zu limit=%" PRIuLEAST32
+			" ready=%d sendbuf=%d oobbuf=%d"
+			"; stalling data sends until peer acknowledges",
+			ss->unacked_frames, ss->session_window,
+			ss->sched.sched_head != NULL,
+			ss->wire.sendbuf.head != NULL,
+			ss->wire.oobbuf.head != NULL);
+		ss->send_stalled = true;
+	}
+	return true;
+}
+
+/* Keep flushed frames only when resume replay may need them.  Hello frames
+ * and stream-0 controls are one-shot, retransmit copies only advance the
+ * cursor, and bundled control frames are compacted before tracking. */
+static void session_track_sent(
+	struct mux_session *restrict ss, struct mux_frame *restrict frame)
+{
+	ASSERT(frame->len >= MUX_FRAME_HEADER_SIZE);
+	struct mux_header hdr;
+	mux_read_header(frame->data, &hdr);
+
+	/* Hello frames are handshake-only and never enter the resume log. */
+	if (hdr.version == 0) {
+		mux_frame_put(&ss->pool, frame);
+		return;
+	}
+
+	/* Each retransmit copy corresponds to one original unacked entry. */
+	if (ss->retransmit_copy == frame) {
+		ss->retransmit_copy = NULL;
+		ASSERT(ss->retransmit_cursor != NULL);
+		ss->retransmit_cursor = ss->retransmit_cursor->next;
+		mux_frame_put(&ss->pool, frame);
+		return;
+	}
+
+	if (hdr.flags & MUX_FLAG_PUSH) {
+		/* One PUSH frame advances one logical session sequence number. */
+		push_unacked(ss, frame, 1);
+		return;
+	}
+
+	/* Strip stream-0 controls and compact the remaining headers in-place. */
+	unsigned char *dst = frame->data;
+	const unsigned char *src = frame->data;
+	const unsigned char *const end = frame->data + frame->len;
+	size_t n = 0;
+	while (src < end) {
+		if ((size_t)(end - src) < MUX_FRAME_HEADER_SIZE) {
+			MUX_LOG(ERROR, ss, "invalid internal frame layout");
+			mux_frame_put(&ss->pool, frame);
+			return;
+		}
+		mux_read_header(src, &hdr);
+		const size_t entry_len = MUX_FRAME_HEADER_SIZE + hdr.length;
+		if ((size_t)(end - src) < entry_len) {
+			MUX_LOG(ERROR, ss, "invalid internal frame layout");
+			mux_frame_put(&ss->pool, frame);
+			return;
+		}
+		if (hdr.stream_id != STREAMID_CTRL) {
+			if (dst != src) {
+				memmove(dst, src, entry_len);
+			}
+			dst += entry_len;
+			n++;
+		}
+		src += entry_len;
+	}
+	if (n == 0) {
+		mux_frame_put(&ss->pool, frame);
+		return;
+	}
+	frame->len = (size_t)(dst - frame->data);
+	push_unacked(ss, frame, n);
+}
+
+/* Flush one write attempt for the current sendbuf head frame.
+ * Returns true when the transport is still blocked on the current head.
+ * On error, session_reset or session_suspend has already been called. */
+static bool
+flush_sendbuf(struct mux_session *restrict ss, bool *restrict made_progress)
+{
+	struct mux_frame *frame = ss->wire.sendbuf.head;
+	if (frame == NULL) {
+		return false;
+	}
+	const size_t remaining = frame->len - frame->pos;
+	ASSERT(remaining > 0);
+
+	size_t nsend = remaining;
+	if (!wire_send(ss, frame->data + frame->pos, &nsend)) {
+		if (ss->handshake.has_session_id &&
+		    (ss->state == SESSION_ESTABLISHED ||
+		     (ss->state == SESSION_HANDSHAKE && !ss->accepted))) {
+			session_suspend(ss);
+		} else {
+			session_reset(ss);
+		}
+		return true;
+	}
+	if (nsend == 0) {
+		return true; /* EAGAIN — transport buffer full */
+	}
+	*made_progress = true;
+
+	/* Only reset the keepalive deadline while the timer is active (i.e.
+	 * state == SESSION_ESTABLISHED).  In other states—HANDSHAKE, CONNECT,
+	 * SUSPENDED—the timer is stopped and must not be restarted here. */
+	if (ev_is_active(&ss->w_keepalive)) {
+		ev_timer_again(ss->loop, &ss->w_keepalive);
+	}
+	COUNTER_ADD(ss->cnt.traffic.byt_mux_sent, (uintmax_t)nsend);
+	frame->pos += nsend;
+	MUX_LOG_F(
+		VERBOSE, ss, "mux sent %zu bytes (buf: %zu/%zu)", nsend,
+		frame->pos, frame->len);
+
+	if (frame->pos >= frame->len) {
+		struct mux_frame *const popped =
+			mux_frame_list_pop(&ss->wire.sendbuf);
+		ASSERT(popped == frame);
+		(void)popped;
+		session_track_sent(ss, frame);
+		return false;
+	}
+	return true;
+}
+
+bool session_send_push(
+	struct mux_session *ss, struct stream *s, struct mux_frame *frame)
+{
+	ASSERT(frame->len > MUX_FRAME_HEADER_SIZE);
+	ASSERT(ss->wire.sendbuf.head == NULL);
+	const size_t payload_len = frame->len - MUX_FRAME_HEADER_SIZE;
+	const bool send_syn = s->state == STREAM_INIT;
+
+	/* Calculate window increment first so it can be carried in Extra.
+	 * Piggyback ACK only when we can grant credits; extra=0 is useless. */
+	const uint_fast32_t raw_inc = stream_grant_inc(s);
+	uint_fast8_t flags = MUX_FLAG_PUSH;
+	if (send_syn) {
+		flags |= MUX_FLAG_SYN;
+	} else if (
+		(s->state == STREAM_ESTABLISHED ||
+		 s->state == STREAM_CLOSE_WAIT) &&
+		raw_inc > 0) {
+		flags |= MUX_FLAG_ACK;
+	}
+
+	/* Piggyback FIN on last data frame.  Extra always carries the credit
+	 * grant (raw_inc); ACK|FIN is a valid combination per spec §2.4.1. */
+	const bool want_fin =
+		!send_syn && s->rx_eof &&
+		!(s->state == STREAM_FIN_WAIT || s->state == STREAM_CLOSING) &&
+		s->send_queue.head == NULL;
+	if (want_fin) {
+		flags |= MUX_FLAG_FIN;
+		stream_mark_fin_sent(s);
+	}
+
+	const uint_fast32_t extra = raw_inc;
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = flags,
+		.length = (uint_least16_t)payload_len,
+		.stream_id = s->id,
+		.extra = extra,
+	};
+
+	/* Fill header at the beginning of frame buffer */
+	unsigned char *p = frame->data;
+	mux_write_header(p, &hdr);
+
+	frame->pos = 0;
+	frame->len = MUX_FRAME_HEADER_SIZE + payload_len;
+
+	mux_frame_list_push(&ss->wire.sendbuf, frame);
+
+	if (payload_len > 0) {
+		s->bytes_sent += payload_len;
+		/* Track for Nagle algorithm: unacked data sent */
+		s->unacked_bytes += (uint_least32_t)payload_len;
+	}
+
+	s->grant_sent += raw_inc * MUX_WINDOW_UNIT;
+	if (flags & MUX_FLAG_ACK) {
+		s->ack_pending = false;
+		ss->ack_pending = true;
+	}
+	/* ACK piggybacked on PUSH: cancel any pending delay. */
+	if (s->delay_pending) {
+		sched_delay_remove(ss, s);
+	}
+
+	session_log_frame_header(ss, "frame out", p, &hdr);
+	return true;
+}
+
+static unsigned char *sendbuf_reserve_ctrl(struct mux_session *restrict ss)
+{
+	struct mux_frame *frame = mux_frame_get(&ss->pool);
+	if (frame == NULL) {
+		return NULL;
+	}
+	frame->pos = 0;
+	frame->len = MUX_FRAME_HEADER_SIZE;
+	mux_frame_list_push(&ss->wire.sendbuf, frame);
+	return frame->data;
+}
+
+/* EV_WRITE interleaves transport flushes with the next highest-priority work:
+ * retransmit copy, oob control, queued frame, then freshly scheduled data. */
+static void send_cb(struct mux_session *restrict ss)
+{
+	ss->wire.tx_pending = false;
+
+	/* TLS close_notify is terminal; a plain TCP FIN may still be resumable.
+	 * Outbound TLS closes also discard the cached peer session_id so the next
+	 * reconnect starts fresh instead of attempting an invalid resume. */
+	if (!ss->wire.rx_open && ss->state == SESSION_ESTABLISHED) {
+		if (ss->handshake.has_session_id
+#if WITH_TLS
+		    && (ss->wire.tlsconn == NULL)
+#endif
+		) {
+			/* Plain TCP FIN keeps resume state intact. */
+			session_suspend(ss);
+			return;
+		}
+		wire_discard_buffers(ss);
+		if (!ss->accepted) {
+			ss->handshake.has_session_id = false;
+		}
+		session_set_state(ss, SESSION_CLOSING);
+		ss->wire.tx_pending = true;
+		update_send_timeout(ss, false);
+		return;
+	}
+
+	bool made_progress = false;
+	bool retransmitting = false;
+
+	for (;;) {
+		/* 1. Flush the current sendbuf head frame. */
+		if (ss->wire.sendbuf.head != NULL) {
+			const bool blocked = flush_sendbuf(ss, &made_progress);
+			if (blocked) {
+				/* Transport blocked (EAGAIN or TLS cross-direction
+				 * WANT_READ/WANT_WRITE).  Set tx_pending so the
+				 * watcher is re-armed once the unblocking event
+				 * fires, regardless of the current session state.
+				 * Without this, a TLS WANT_READ during HANDSHAKE
+				 * would leave tls_want=EV_READ but tx_pending=false,
+				 * so after the next EV_READ the watcher would never
+				 * request EV_WRITE again and the sendbuf would stall
+				 * until connect_timeout fires. */
+				const struct mux_frame *const frame =
+					ss->wire.sendbuf.head;
+				if (frame == NULL) {
+					return;
+				}
+				MUX_LOG_F(
+					DEBUG, ss,
+					"send loop blocked on transport: frame=%zu/%zu"
+					" oobbuf=%d ready=%d",
+					frame->pos, frame->len,
+					ss->wire.oobbuf.head != NULL,
+					ss->sched.sched_head != NULL);
+				ss->wire.tx_pending = true;
+				break;
+			}
+			if (ss->state != SESSION_ESTABLISHED) {
+				return;
+			}
+		}
+
+		if (ss->state != SESSION_ESTABLISHED) {
+			break;
+		}
+
+		/* 2a. Resume replay takes precedence over new traffic. */
+		if (ss->retransmit_cursor != NULL) {
+			if (!retransmitting) {
+				MUX_LOG_F(
+					DEBUG, ss,
+					"retransmitting %zu unacked frames",
+					ss->unacked_frames);
+				retransmitting = true;
+			}
+			struct mux_frame *orig = ss->retransmit_cursor;
+			/* The cursor advances only after the replay copy is fully flushed. */
+			struct mux_frame *copy = mux_frame_get(&ss->pool);
+			if (copy == NULL) {
+				LOGOOM();
+				break;
+			}
+			memcpy(copy->data, orig->data, orig->len);
+			copy->pos = 0;
+			copy->len = orig->len;
+			ss->retransmit_copy = copy;
+			mux_frame_list_push_front(&ss->wire.sendbuf, copy);
+			continue; /* write the retransmit copy */
+		}
+
+		/* 2b. OOB controls bypass send_stalled so keepalives and PONGs still flow. */
+		if (ss->wire.oobbuf.head != NULL) {
+			struct mux_frame *oob =
+				mux_frame_list_pop(&ss->wire.oobbuf);
+			mux_frame_list_push_front(&ss->wire.sendbuf, oob);
+			continue;
+		}
+
+		/* 2c. Drain any frame already queued ahead of the scheduler. */
+		if (ss->wire.sendbuf.head != NULL) {
+			continue;
+		}
+
+		/* 3. send_stalled blocks new payload only; per-stream ACK/FIN must still
+		 * flow so the peer can drain its window and return session ACKs. */
+		if (ss->send_stalled) {
+			MUX_LOG_F(
+				DEBUG, ss,
+				"send loop paused by session window: unacked=%zu"
+				" limit=%" PRIuLEAST32 " ready=%d",
+				ss->unacked_frames, ss->session_window,
+				ss->sched.sched_head != NULL);
+			sched_flush_ctrl(ss);
+			/* sched_flush_ctrl may have queued control frames for the next flush. */
+			if (ss->wire.sendbuf.head != NULL) {
+				continue;
+			}
+			break;
+		}
+		if (!sched_next_data(ss)) {
+			if (ss->sched.sched_head != NULL) {
+				MUX_LOG_F(
+					DEBUG, ss,
+					"send loop found no sendable data: ready=%d"
+					" unacked=%zu",
+					ss->sched.sched_head != NULL,
+					ss->unacked_frames);
+			}
+			break; /* nothing to send */
+		}
+		/* sendbuf now holds the data frame; loop to write it. */
+	}
+
+	update_send_timeout(ss, made_progress);
+}
+
+static void recv_cb(struct mux_session *ss)
+{
+	if (!ringbuf_reserve(&ss->wire.recvbuf, 1, false)) {
+		MUX_LOG(WARNING, ss, "receive buffer full");
+		session_reset(ss);
+		return;
+	}
+
+	const size_t cap = ringbuf_write_space(ss->wire.recvbuf);
+	if (cap == 0) {
+		MUX_LOG(WARNING, ss, "receive buffer full");
+		session_reset(ss);
+		return;
+	}
+
+	size_t nread = cap;
+	unsigned char *const buf = ringbuf_write_ptr(ss->wire.recvbuf);
+
+	if (!wire_recv(ss, buf, &nread)) {
+		if (ss->handshake.has_session_id &&
+		    (ss->state == SESSION_ESTABLISHED ||
+		     (ss->state == SESSION_HANDSHAKE && !ss->accepted))) {
+			session_suspend(ss);
+		} else {
+			session_reset(ss);
+		}
+		return;
+	}
+	if (nread == 0) {
+		/* TLS close_notify: wire_recv clears rx_open but returns true.
+		 * During handshake there is no send-side handler to detect this;
+		 * drive teardown immediately to avoid an EV_WRITE busy-wait loop.
+		 * On a client resume attempt, suspend rather than reset so the
+		 * unacked list and streams are preserved. */
+		if (!ss->wire.rx_open && ss->state == SESSION_HANDSHAKE) {
+			if (ss->handshake.has_session_id && !ss->accepted) {
+				MUX_LOG(DEBUG, ss,
+					"connection closed during resume handshake;"
+					" re-suspending");
+				session_suspend(ss);
+			} else {
+				MUX_LOG(DEBUG, ss,
+					"connection closed during protocol handshake");
+				session_reset(ss);
+			}
+		}
+		return;
+	}
+
+	ringbuf_produce(ss->wire.recvbuf, nread);
+	ss->bytes_recv += (uintmax_t)nread;
+	COUNTER_ADD(ss->cnt.traffic.byt_mux_recv, (uintmax_t)nread);
+	if (ss->state == SESSION_ESTABLISHED) {
+		ev_timer_again(ss->loop, &ss->w_timeout);
+	}
+
+	dispatch_frame(ss);
+}
+
+void session_eager_flush(
+	struct mux_session *restrict ss, struct stream *restrict s)
+{
+	const bool was_pending = ss->wire.tx_pending;
+	sched_wake(ss, s);
+	if (was_pending || ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
+	send_cb(ss);
+	session_update_watcher(ss);
+}
+
+void session_flush(struct mux_session *restrict ss)
+{
+	if (ss->state != SESSION_ESTABLISHED) {
+		session_update_watcher(ss);
+		return;
+	}
+
+	const bool want_write =
+		(ss->wire.sendbuf.head != NULL || ss->wire.oobbuf.head != NULL);
+	if (want_write) {
+		if (!ss->wire.tx_pending) {
+			MUX_LOG_F(
+				DEBUG, ss,
+				"flush requests write: sendbuf=%d"
+				" oobbuf=%d ready=%d",
+				ss->wire.sendbuf.head != NULL,
+				ss->wire.oobbuf.head != NULL,
+				ss->sched.sched_head != NULL);
+		}
+		ss->wire.tx_pending = true;
+	}
+	/* Re-arm EV_IDLE if the lp queue has work and sendbuf is now clear.
+	 * This handles the case where sched_cb paused because sendbuf was
+	 * occupied; once it drains, lifecycle events can proceed. */
+	if (ss->sched.lp_head != NULL && ss->wire.sendbuf.head == NULL) {
+		ev_idle_start(ss->loop, &ss->sched.w_sched);
+	}
+	session_update_watcher(ss);
+}
+
+/* -------------------------------------------------------------------------
+ * Event Callbacks & Public API
+ * libev I/O, timer and idle callbacks; session creation, configuration,
+ * and control packet public interface.
+ * ---------------------------------------------------------------------- */
+
+static void closing_cb(struct mux_session *ss)
+{
+	switch (wire_shutdown(ss)) {
+	case WIRE_SHUTDOWN_PENDING:
+		return;
+	case WIRE_SHUTDOWN_DONE:
+		session_set_state(ss, SESSION_CLOSE_WAIT);
+		return;
+	case WIRE_SHUTDOWN_ERROR:
+		session_reset(ss);
+		return;
+	}
+}
+
+static void close_wait_cb(struct mux_session *ss)
+{
+	if (!wire_wait_eof(ss)) {
+		MUX_LOG(DEBUG, ss, "unexpected state after shutdown");
+	} else {
+		MUX_LOG(VERBOSE, ss, "shutdown completed");
+	}
+	session_reset(ss);
+}
+
+static void handshake_start(struct mux_session *ss)
+{
+	session_set_state(ss, SESSION_HANDSHAKE);
+	if (!ss->accepted) {
+		/* Client: build and send ClientHello. */
+		handshake_enqueue_hello(
+			ss, PROTO_MSG_CLIENT_HELLO,
+			ss->handshake.has_session_id /* resume request */);
+	}
+}
+
+static void connect_cb(struct mux_session *ss)
+{
+	const int err = socket_get_error(ss->w_socket.fd);
+	if (err != 0) {
+		MUX_LOG_F(WARNING, ss, "connect: (%d) %s", err, strerror(err));
+		session_reset(ss);
+		return;
+	}
+
+	MUX_LOG(INFO, ss, "TCP connected");
+
+#if WITH_TLS
+	if (!wire_tls_start(ss)) {
+		MUX_LOG(ERROR, ss, "TLS connect failed");
+		session_reset(ss);
+		return;
+	}
+	if (ss->wire.tlsconn != NULL) {
+		handshake_start(ss);
+		return;
+	}
+#endif
+
+	handshake_start(ss);
+}
+
+static void socket_cb(struct ev_loop *loop, ev_io *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_READ | EV_WRITE);
+	struct mux_session *restrict ss = w->data;
+	ASSERT(loop == ss->loop);
+	UNUSED(loop);
+	MUX_LOG_F(
+		VERBOSE, ss, "mux socket: state=%s revents=%d",
+		session_state_str[ss->state], revents);
+
+#if WITH_TLS
+	/* Consume the pending TLS I/O request.  Retry via session_on_recv,
+	 * which drives TLS handshake progress regardless of direction. */
+	const bool tls_poll = (ss->wire.tls_want != 0);
+	ss->wire.tls_want = 0;
+#endif
+
+	switch (ss->state) {
+	case SESSION_CONNECT:
+		connect_cb(ss);
+		break;
+	case SESSION_HANDSHAKE:
+	case SESSION_ESTABLISHED:
+		if ((revents & EV_READ) != 0
+#if WITH_TLS
+		    || tls_poll
+#endif
+		) {
+			const bool was_handshake =
+				(ss->state == SESSION_HANDSHAKE);
+			recv_cb(ss);
+			if (ss->state != SESSION_ESTABLISHED &&
+			    ss->state != SESSION_HANDSHAKE) {
+				break;
+			}
+			if (was_handshake && ss->state == SESSION_ESTABLISHED &&
+			    ss->wire.tx_pending) {
+				send_cb(ss);
+				break;
+			}
+		}
+		if ((revents & EV_WRITE) != 0) {
+			send_cb(ss);
+		}
+		break;
+	case SESSION_CLOSING:
+		closing_cb(ss);
+		break;
+	case SESSION_CLOSE_WAIT:
+		close_wait_cb(ss);
+		break;
+	default:
+		FAILMSGF("unexpected session state %d", ss->state);
+	}
+
+	/* post-dispatch */
+	if (ss->state == SESSION_CLOSED) {
+		ss->last_modified = clock_monotonic_ns();
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CLOSED,
+				(union mux_event_data){
+					.closed.clean = ss->wire.rx_eof,
+				});
+		}
+		return;
+	}
+	session_flush(ss);
+}
+
+static void
+connect_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct mux_session *restrict ss = w->data;
+	ASSERT(loop == ss->loop);
+	UNUSED(loop);
+	switch (ss->state) {
+	case SESSION_CONNECT:
+	case SESSION_HANDSHAKE:
+		break;
+	default:
+		FAILMSGF("unexpected session state %d", ss->state);
+	}
+	MUX_LOG(WARNING, ss, "connect timeout");
+	session_reset(ss);
+	if (ss->state == SESSION_CLOSED) {
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CLOSED,
+				(union mux_event_data){
+					.closed.clean = ss->wire.rx_eof });
+		}
+	}
+}
+
+static void
+send_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct mux_session *restrict ss = w->data;
+	ASSERT(loop == ss->loop);
+	UNUSED(loop);
+	switch (ss->state) {
+	case SESSION_ESTABLISHED:
+		break;
+	default:
+		FAILMSGF("unexpected session state %d", ss->state);
+	}
+	MUX_LOG(WARNING, ss, "send timeout");
+	if (ss->handshake.has_session_id) {
+		session_suspend(ss);
+		return;
+	}
+	session_reset(ss);
+	if (ss->state == SESSION_CLOSED) {
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CLOSED,
+				(union mux_event_data){
+					.closed.clean = ss->wire.rx_eof,
+				});
+		}
+	}
+}
+
+static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct mux_session *restrict ss = w->data;
+	ASSERT(loop == ss->loop);
+	UNUSED(loop);
+	switch (ss->state) {
+	case SESSION_ESTABLISHED:
+	case SESSION_CLOSING:
+	case SESSION_CLOSE_WAIT:
+	case SESSION_SUSPENDED:
+		break;
+	default:
+		FAILMSGF("unexpected session state %d", ss->state);
+	}
+	const bool was_suspended = (ss->state == SESSION_SUSPENDED);
+	if (was_suspended) {
+		MUX_LOG(WARNING, ss, "session resume timed out");
+	} else {
+		MUX_LOG(WARNING, ss, "session timeout");
+	}
+	session_reset(ss);
+	if (ss->state == SESSION_CLOSED) {
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CLOSED,
+				(union mux_event_data){
+					.closed.clean = ss->wire.rx_eof,
+					.closed.expired = was_suspended });
+		}
+	}
+}
+
+static void mux_probe(struct mux_session *ss)
+{
+	if (ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
+
+	if (!session_send_oob(ss, MUX_CTRL_PROBE, NULL, 0)) {
+		return;
+	}
+}
+
+/* Handle an inbound PING (spec §5.3.2): immediately queue a PONG whose
+ * payload is a byte-for-byte copy of the PING payload.  Silently discards
+ * the PING when rate limit is exceeded or a PONG is already queued. */
+void session_recv_ping(
+	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	const size_t frame_size)
+{
+	const intmax_t now = clock_monotonic_ns();
+	/* Rate limit: at most one PONG per MUX_PING_RATE_LIMIT_NS. */
+	if (now - ss->ping_recv_last_ns < MUX_PING_RATE_LIMIT_NS) {
+		ringbuf_consume(ss->wire.recvbuf, frame_size);
+		return;
+	}
+	/* Drop if a PONG is already waiting to be sent. */
+	if (oobbuf_has_pong(ss)) {
+		ringbuf_consume(ss->wire.recvbuf, frame_size);
+		return;
+	}
+
+	/* Copy the PING payload from the receive buffer before discarding the
+	 * frame; session_send_oob will copy it into oobbuf. */
+	const unsigned char *ping_payload =
+		ringbuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE;
+	const bool queued =
+		session_send_oob(ss, MUX_CTRL_PONG, ping_payload, hdr->length);
+	ringbuf_consume(ss->wire.recvbuf, frame_size);
+	if (!queued) {
+		/* OOM: PONG is silently dropped; the peer's estimator will
+		 * time out and retry on the next measurement cycle. */
+		return;
+	}
+
+	ss->ping_recv_last_ns = now;
+}
+
+/* Expand the receive window of one stream to new_window bytes.  Called via
+ * table_iterate; only grows already-granted per-stream receive credit. */
+static bool update_stream_window_cb(
+	const struct hashtable *table, struct hashkey key, void *element,
+	void *data)
+{
+	UNUSED(table);
+	UNUSED(key);
+	const uint_fast32_t new_window = *(const uint_fast32_t *)data;
+	struct stream *restrict s = element;
+	if (new_window <= s->recv_window) {
+		return true;
+	}
+	s->recv_window = new_window;
+	s->quickack_budget = MUX_QUICKACK_BUDGET;
+	stream_check_ack(s);
+	return true;
+}
+
+/* Grow the effective session and stream windows from the current BDP.
+ * Both are monotonic floors; when stream_window rises, live streams receive
+ * the extra recv credit immediately instead of waiting for new traffic. */
+static void
+session_update_window(struct mux_session *restrict ss, const size_t bdp_bytes)
+{
+	const uint_least32_t floor_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	const uint_least32_t session_frames = (uint_least32_t)MAX(
+		bdp_bytes / MUX_MAX_PAYLOAD_SIZE, floor_frames);
+	/* Leave 25% headroom so stream credit does not bottleneck first. */
+	const uint_least32_t stream_frames = (uint_least32_t)MAX(
+		bdp_bytes * 5u / 4u / MUX_MAX_PAYLOAD_SIZE, floor_frames);
+	if (session_frames <= ss->session_window &&
+	    stream_frames <= ss->stream_window) {
+		return;
+	}
+	if (session_frames > ss->session_window) {
+		ss->session_window = session_frames;
+	}
+	if (stream_frames > ss->stream_window) {
+		ss->stream_window = stream_frames;
+		const uint_fast32_t new_window =
+			(uint_fast32_t)ss->stream_window * MUX_MAX_PAYLOAD_SIZE;
+		if (ss->sched.streams != NULL) {
+			uint_fast32_t w = new_window;
+			table_iterate(
+				ss->sched.streams, update_stream_window_cb, &w);
+		}
+	}
+	MUX_LOG_F(
+		INFO, ss, "estimator updated: session=%zu stream=%zu",
+		(size_t)ss->session_window * MUX_WINDOW_UNIT,
+		(size_t)ss->stream_window * MUX_WINDOW_UNIT);
+}
+
+/* Handle an inbound PONG (spec §5.3.3): feed the echoed timestamp into the
+ * estimator, then apply its current BDP to the live window floors. */
+void session_recv_pong(
+	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	const size_t frame_size)
+{
+	if (hdr->length < MUX_PING_PAYLOAD_SIZE) {
+		ringbuf_consume(ss->wire.recvbuf, frame_size);
+		return;
+	}
+
+	const intmax_t sent_ns = (intmax_t)read_uint64(
+		ringbuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE);
+	ringbuf_consume(ss->wire.recvbuf, frame_size);
+	estimator_calculate(ss, sent_ns);
+	session_update_window(ss, ss->estimator.bdp);
+}
+
+static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct mux_session *restrict ss = w->data;
+	ASSERT(loop == ss->loop);
+	UNUSED(loop);
+	CHECKMSGF(
+		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
+		ss->state);
+	MUX_LOG(VERBOSE, ss, "connection inactive, sending PROBE");
+	mux_probe(ss);
+	session_flush(ss);
+}
+
+static void idle_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct mux_session *restrict ss = w->data;
+	ASSERT(loop == ss->loop);
+	UNUSED(loop);
+	CHECKMSGF(
+		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
+		ss->state);
+	MUX_LOG(INFO, ss, "idle timeout, closing session");
+	session_reset(ss);
+	if (ss->state == SESSION_CLOSED) {
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CLOSED,
+				(union mux_event_data){
+					.closed.clean = ss->wire.rx_eof,
+				});
+		}
+	}
+}
+
+struct mux_session *
+session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
+{
+	const struct mux_config *const conf = opts->conf;
+	const int fd = opts->fd;
+	const unsigned char *const id = opts->id;
+
+	struct mux_session *ss = malloc(sizeof(struct mux_session));
+	if (ss == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	*ss = (struct mux_session){
+		.loop = loop,
+		.conf = *conf,
+		.pool = opts->pool,
+		.tag = opts->tag,
+		.callbacks = *opts->callbacks,
+		.userdata = opts->userdata,
+		.cnt = opts->cnt,
+#if WITH_TLS
+		.wire.tlsctx = opts->tlsctx,
+		.wire.tlsconn = opts->conn,
+#endif
+		.state = SESSION_INIT,
+		.last_modified = clock_monotonic_ns(),
+		.accepted = (fd >= 0),
+		.wire.rx_open = true,
+	};
+
+	ss->sched.streams = table_new(TABLE_FAST);
+	if (ss->sched.streams == NULL) {
+		free(ss);
+		return NULL;
+	}
+	ss->wire.recvbuf = ringbuf_new(131072);
+	if (ss->wire.recvbuf == NULL) {
+		LOGOOM();
+		table_free(ss->sched.streams);
+		free(ss);
+		return NULL;
+	}
+
+	memcpy(ss->handshake.session_id, id, MUX_SESSION_ID_LEN);
+	ss->handshake.has_session_id = (fd >= 0);
+
+	if (opts->identity != NULL) {
+		ss->handshake.identity = strdup(opts->identity);
+	}
+	if (opts->peer_id != NULL) {
+		ss->handshake.peer_id = strdup(opts->peer_id);
+	}
+
+	ev_io_init(&ss->w_socket, socket_cb, fd, EV_READ);
+	ss->w_socket.data = ss;
+
+	const double timeout = (double)conf->timeout;
+	ev_timer_init(&ss->w_timeout, timeout_cb, 0.0, timeout);
+	ss->w_timeout.data = ss;
+
+	const double keepalive = (double)conf->keepalive;
+	ev_timer_init(&ss->w_keepalive, keepalive_cb, 0.0, keepalive);
+	ss->w_keepalive.data = ss;
+
+	const double send_timeout =
+		(double)(conf->send_timeout > 0 ? conf->send_timeout :
+						  conf->timeout);
+	ev_timer_init(&ss->w_send_timeout, send_timeout_cb, 0.0, send_timeout);
+	ss->w_send_timeout.data = ss;
+
+	const double connect_timeout = (double)conf->connect_timeout;
+	ev_timer_init(
+		&ss->w_connect_timeout, connect_timeout_cb, 0.0,
+		connect_timeout);
+	ss->w_connect_timeout.data = ss;
+
+	sched_init(ss);
+
+	const double idle_timeout = (double)conf->idle_timeout;
+	ev_timer_init(&ss->w_idle_timeout, idle_cb, 0.0, idle_timeout);
+	ss->w_idle_timeout.data = ss;
+	/* Resolve 0-sentinels (auto stream/session window) and record auto-mode
+	 * flags.  Must be called after all ev_timer_init calls so that the
+	 * subsequent ev_timer_set calls inside session_set_config are safe. */
+	estimator_init(ss);
+	session_set_config(ss, conf);
+	COUNTER_ADD(ss->cnt.num_session_created, 1);
+	return ss;
+}
+
+/* Initiate an immediate graceful shutdown: abandon all in-progress transfers,
+ * close all streams, discard all buffered data, then enter SESSION_CLOSING so
+ * that the transport-level close handshake (TLS close_notify then TCP FIN) can
+ * proceed. */
+void session_initiate_shutdown(struct mux_session *restrict ss)
+{
+	if (ss->state != SESSION_ESTABLISHED &&
+	    ss->state != SESSION_HANDSHAKE) {
+		/* Not actively transferring data.  Force-close without
+		 * allowing reconnection (session_reset would schedule a
+		 * reconnect for outbound sessions, leaving the session
+		 * alive with an active timer). */
+		if (ss->state != SESSION_CLOSED) {
+			session_set_state(ss, SESSION_CLOSED);
+			session_stop(ss);
+			session_cleanup(ss);
+		}
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CLOSED,
+				(union mux_event_data){
+					.closed.clean = ss->wire.rx_eof });
+		}
+		return;
+	}
+	MUX_LOG(INFO, ss,
+		"initiating graceful shutdown; dropping in-flight data");
+
+	/* Stop all timers and the idle scheduler; keep the socket watcher. */
+	struct ev_loop *restrict loop = ss->loop;
+	ev_idle_stop(loop, &ss->sched.w_sched);
+	ev_timer_stop(loop, &ss->w_timeout);
+	ev_timer_stop(loop, &ss->w_keepalive);
+	ev_timer_stop(loop, &ss->w_send_timeout);
+	ev_timer_stop(loop, &ss->w_connect_timeout);
+	ev_timer_stop(loop, &ss->sched.w_coalesce);
+	ev_timer_stop(loop, &ss->w_idle_timeout);
+	estimator_stop(ss);
+
+	/* Free all streams: closes local fds, drains queues; no protocol
+	 * frames are sent (per spec §5.6: streams are implicitly aborted). */
+	sched_free_streams(ss);
+
+	/* Discard all pending session-level data. */
+	wire_discard_buffers(ss);
+	mux_frame_list_clear(&ss->unacked, &ss->pool);
+	COUNTER_SUB(ss->cnt.unacked_frames, ss->unacked_frames);
+	ss->unacked_frames = 0;
+	ss->retransmit_cursor = NULL;
+
+	session_set_state(ss, SESSION_CLOSING);
+	ss->wire.tx_pending = true;
+	session_update_watcher(ss);
+}
+
+void session_close(struct mux_session *restrict ss)
+{
+	MUX_LOG(VERBOSE, ss, "finalizing");
+	session_stop(ss);
+	session_cleanup(ss);
+	ringbuf_free(ss->wire.recvbuf);
+
+	free(ss->handshake.identity);
+	free(ss->handshake.peer_id);
+	free(ss->handshake.peer_identity);
+	COUNTER_ADD(ss->cnt.num_session_finalized, 1);
+	free(ss);
+}
+
+void session_set_config(
+	struct mux_session *restrict ss, const struct mux_config *restrict conf)
+{
+	const bool was_auto_window = ss->auto_window;
+	ss->conf = *conf;
+	/* Automatic mode requires both windows to be 0; any other combination
+	 * is manual mode and uses the configured frame counts directly. */
+	ss->auto_window =
+		(conf->stream_window <= 0 && conf->session_window <= 0);
+	if (ss->auto_window) {
+		const uint_least32_t floor_frames =
+			MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+		if (!was_auto_window) {
+			/* Switching from manual to auto: reset to the initial
+			 * floor so the estimator re-probes from a clean state
+			 * rather than inheriting an arbitrary manual value. */
+			ss->session_window = floor_frames;
+			ss->stream_window = floor_frames;
+		} else {
+			/* Already in auto mode: preserve the learned values,
+			 * enforcing only the floor. */
+			if (ss->session_window < floor_frames) {
+				ss->session_window = floor_frames;
+			}
+			if (ss->stream_window < floor_frames) {
+				ss->stream_window = floor_frames;
+			}
+		}
+	} else {
+		ss->session_window = (uint_least32_t)conf->session_window;
+		ss->stream_window = (uint_least32_t)conf->stream_window;
+	}
+
+	const double timeout = (double)conf->timeout;
+	ev_timer_set(&ss->w_timeout, 0.0, timeout);
+	if (ev_is_active(&ss->w_timeout)) {
+		ev_timer_again(ss->loop, &ss->w_timeout);
+	}
+
+	const double keepalive = (double)conf->keepalive;
+	ev_timer_set(&ss->w_keepalive, 0.0, keepalive);
+	if (ev_is_active(&ss->w_keepalive)) {
+		ev_timer_again(ss->loop, &ss->w_keepalive);
+	}
+
+	const double send_timeout =
+		(double)(conf->send_timeout > 0 ? conf->send_timeout :
+						  conf->timeout);
+	ev_timer_set(&ss->w_send_timeout, 0.0, send_timeout);
+	if (ss->w_socket.fd != -1 &&
+	    socket_user_timeout(ss->w_socket.fd, conf->send_timeout * 1000) ==
+		    0) {
+		ss->w_send_timeout.repeat = 0.0;
+	}
+	if (ss->w_send_timeout.repeat > 0.0) {
+		if (ev_is_active(&ss->w_send_timeout)) {
+			ev_timer_again(ss->loop, &ss->w_send_timeout);
+		}
+	} else {
+		ev_timer_stop(ss->loop, &ss->w_send_timeout);
+	}
+
+	const double connect_timeout = (double)conf->connect_timeout;
+	ev_timer_set(&ss->w_connect_timeout, 0.0, connect_timeout);
+	if (ev_is_active(&ss->w_connect_timeout)) {
+		ev_timer_again(ss->loop, &ss->w_connect_timeout);
+	}
+
+	const double idle_timeout = (double)conf->idle_timeout;
+	if (idle_timeout > 0.0) {
+		ev_timer_set(&ss->w_idle_timeout, 0.0, idle_timeout);
+		if (ev_is_active(&ss->w_idle_timeout)) {
+			ev_timer_again(ss->loop, &ss->w_idle_timeout);
+		}
+	} else {
+		ev_timer_stop(ss->loop, &ss->w_idle_timeout);
+		ev_timer_set(&ss->w_idle_timeout, 0.0, 0.0);
+	}
+
+	if (ss->auto_window) {
+		estimator_seed(
+			ss, (size_t)ss->session_window * MUX_WINDOW_UNIT);
+	}
+}
+
+void session_drain(struct mux_session *restrict ss)
+{
+	ss->draining = true;
+	/* If the session is already idle (established with no active streams),
+	 * initiate a graceful shutdown immediately rather than waiting for a
+	 * stream to close. */
+	if (ss->state == SESSION_ESTABLISHED && ss->sched.streams != NULL &&
+	    table_size(ss->sched.streams) == 0) {
+		session_initiate_shutdown(ss);
+	}
+}
+
+void session_start(struct mux_session *restrict ss)
+{
+	if (ss->w_socket.fd == -1) {
+		/* Client session without transport; caller must supply a
+		 * connected fd via mux_attach_fd() before I/O begins. */
+		return;
+	}
+	MUX_LOG(VERBOSE, ss, "starting");
+
+#if WITH_TLS
+	if (!wire_tls_start(ss)) {
+		MUX_LOG(ERROR, ss, "TLS start failed");
+		session_reset(ss);
+		return;
+	}
+#endif
+
+	if (socket_user_timeout(
+		    ss->w_socket.fd, ss->conf.send_timeout * 1000) == 0) {
+		ss->w_send_timeout.repeat = 0.0;
+	}
+	handshake_start(ss);
+	session_update_watcher(ss);
+	ev_timer_again(ss->loop, &ss->w_connect_timeout);
+}
+
+void session_attach_fd(struct mux_session *restrict ss, const int fd)
+{
+	CHECKMSGF(
+		ss->state == SESSION_INIT || ss->state == SESSION_SUSPENDED ||
+			ss->state == SESSION_CLOSED,
+		"session_attach_fd: unexpected state %d", ss->state);
+
+	/* Transitioning out of SUSPENDED: stop the resume timeout. */
+	if (ss->state == SESSION_SUSPENDED) {
+		ev_timer_stop(ss->loop, &ss->w_timeout);
+	}
+
+	if (ss->sched.streams == NULL) {
+		ss->sched.streams = table_new(TABLE_FAST);
+		if (ss->sched.streams == NULL) {
+			LOGOOM();
+			CLOSE_FD(fd);
+			return;
+		}
+	}
+	ss->wire.rx_open = true;
+	ss->wire.tx_pending = false;
+	ss->wire.rx_eof = false;
+#if WITH_TLS
+	ss->wire.tls_want = 0;
+#endif
+	ss->draining = false;
+
+	ev_io_set(&ss->w_socket, fd, EV_WRITE);
+	if (socket_user_timeout(fd, ss->conf.send_timeout * 1000) == 0) {
+		ss->w_send_timeout.repeat = 0.0;
+	}
+	session_set_state(ss, SESSION_CONNECT);
+	ev_io_start(ss->loop, &ss->w_socket);
+	ev_timer_again(ss->loop, &ss->w_connect_timeout);
+
+	MUX_LOG_F(DEBUG, ss, "transport attached [fd:%d]", fd);
+}
+
+struct stream *session_open_stream(struct mux_session *restrict ss)
+{
+	if (ss->state == SESSION_CLOSED) {
+		MUX_LOG(VERBOSE, ss, "open_stream: session closed");
+		return NULL;
+	}
+	if (ss->state != SESSION_ESTABLISHED) {
+		MUX_LOG_F(
+			VERBOSE, ss,
+			"open_stream: session not established (state=%s)",
+			session_state_str[ss->state]);
+		return NULL;
+	}
+	if (ss->handshake.peer_rejects_inbound_streams) {
+		MUX_LOG(ERROR, ss, "peer does not accept inbound streams");
+		return NULL;
+	}
+	if (ss->conf.max_halfopen > 0 &&
+	    ss->num_halfopen >= (size_t)ss->conf.max_halfopen) {
+		MUX_LOG_F(
+			VERBOSE, ss, "open_stream: max_halfopen (%d) reached",
+			ss->conf.max_halfopen);
+		return NULL;
+	}
+	if (ss->conf.max_streams > 0 &&
+	    table_size(ss->sched.streams) - ss->sched.num_tombstones >=
+		    (size_t)ss->conf.max_streams) {
+		MUX_LOG_F(
+			VERBOSE, ss, "open_stream: max_streams (%d) reached",
+			ss->conf.max_streams);
+		return NULL;
+	}
+	const uint_fast16_t id = sched_alloc_stream_id(ss);
+	if (id == STREAMID_CTRL) {
+		/* All stream IDs in this parity class are active (spec §5.1);
+		 * reject the request and wait for existing streams to close. */
+		MUX_LOG(VERBOSE, ss, "open_stream: stream IDs exhausted");
+		return NULL;
+	}
+
+	struct stream *s = stream_new(ss, id, true);
+	if (s == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	if (!sched_add_stream(ss, s)) {
+		MUX_LOG(ERROR, ss, "open_stream: stream_add failed");
+		free(s);
+		return NULL;
+	}
+	s->send_window = MUX_DEFAULT_SEND_WINDOW;
+	COUNTER_ADD(ss->cnt.num_stream_opened, 1);
+	COUNTER_ADD(ss->cnt.num_streams, 1);
+	MUX_LOG_F(DEBUG, ss, "opened stream %" PRIuFAST16, id);
+	sched_wake(ss, s);
+	MUX_LOG_F(
+		VERYVERBOSE, ss, "queued initial SYN for stream %" PRIuLEAST16,
+		s->id);
+	return s;
+}
+
+/* Discard all unsent non-RST frames for stream_id from the send queue.
+ * RST frames are preserved so that a previously-queued RST is never suppressed.
+ * A frame already partially flushed to wire (pos > 0) must be delivered in
+ * full to preserve framing sync, so it is never discarded. */
+void session_discard_stream_frames(
+	struct mux_session *restrict ss, const uint_fast16_t stream_id)
+{
+	struct mux_frame *prev = NULL;
+	struct mux_frame *frame = ss->wire.sendbuf.head;
+	while (frame != NULL) {
+		struct mux_frame *const next = frame->next;
+		bool discard = false;
+		if (frame->pos == 0 && frame->len >= MUX_FRAME_HEADER_SIZE) {
+			struct mux_header hdr;
+			mux_read_header(frame->data, &hdr);
+			discard =
+				(hdr.stream_id == stream_id &&
+				 (hdr.flags & MUX_FLAG_RST) == 0);
+		}
+		if (!discard) {
+			prev = frame;
+			frame = next;
+			continue;
+		}
+
+		struct mux_frame *const removed =
+			mux_frame_list_remove_after(&ss->wire.sendbuf, prev);
+		ASSERT(removed == frame);
+		(void)removed;
+		if (ss->retransmit_copy == frame) {
+			ss->retransmit_copy = NULL;
+		}
+		mux_frame_put(&ss->pool, frame);
+		frame = next;
+	}
+}
+
+bool session_send_ctrl(
+	struct mux_session *ss, const uint_fast16_t stream_id,
+	const uint_fast8_t flags, const uint_fast32_t extra)
+{
+	if (flags & MUX_FLAG_RST) {
+		COUNTER_ADD(ss->cnt.num_rst_sent, 1);
+	}
+	unsigned char *p = sendbuf_reserve_ctrl(ss);
+	if (p == NULL) {
+		LOGOOM();
+		return false;
+	}
+
+	const uint_fast32_t clamped = MIN(extra, (uint_fast32_t)UINT16_MAX);
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = flags,
+		.length = 0,
+		.stream_id = stream_id,
+		.extra = clamped,
+	};
+
+	mux_write_header(p, &hdr);
+
+	session_log_frame_header(ss, "frame out", p, &hdr);
+	mux_notify_write(ss);
+	return true;
+}
+
+bool session_send_oob(
+	struct mux_session *restrict ss, const uint_fast8_t extra,
+	const unsigned char *restrict payload, const size_t payload_len)
+{
+	ASSERT(payload_len <= MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *frame = mux_frame_get(&ss->pool);
+	if (frame == NULL) {
+		LOGOOM();
+		return false;
+	}
+	frame->pos = 0;
+	frame->len = MUX_FRAME_HEADER_SIZE + payload_len;
+	mux_frame_list_push(&ss->wire.oobbuf, frame);
+
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = 0,
+		.length = (uint_least16_t)payload_len,
+		.stream_id = STREAMID_CTRL,
+		.extra = extra,
+	};
+	mux_write_header(frame->data, &hdr);
+	unsigned char *restrict payload_ptr =
+		frame->data + MUX_FRAME_HEADER_SIZE;
+	if (payload_len > 0) {
+		if (payload != NULL) {
+			memcpy(payload_ptr, payload, payload_len);
+		} else {
+			memset(payload_ptr, 0, payload_len);
+		}
+	}
+
+	session_log_frame_header(ss, "frame out", frame->data, &hdr);
+	mux_notify_write(ss);
+	return true;
+}
+
+/* -------------------------------------------------------------------------
+ * Send Path
+ * Frame buffer management, send/recv flush, scheduler and control packet path.
+ * ---------------------------------------------------------------------- */
+
+void session_handshake_done(struct mux_session *ss)
+{
+	MUX_LOG(VERBOSE, ss, "mux negotiation completed");
+	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
+	session_set_state(ss, SESSION_ESTABLISHED);
+	const intmax_t t = clock_monotonic_ns();
+	if (LOGLEVEL(NOTICE)) {
+		char str[32];
+		format_duration(
+			str, sizeof(str),
+			make_duration_nanos(t - ss->last_modified));
+		if (ss->peer_addr.sa.sa_family != AF_UNSPEC) {
+			char peer_str[64];
+			sa_format(
+				peer_str, sizeof(peer_str), &ss->peer_addr.sa);
+			MUX_LOG_F(
+				NOTICE, ss,
+				"session established peer=%s setup=%s",
+				peer_str, str);
+		} else {
+			MUX_LOG_F(
+				NOTICE, ss, "session established setup=%s",
+				str);
+		}
+	}
+	ss->last_modified = t;
+
+	ev_timer_again(ss->loop, &ss->w_timeout);
+
+	if (!ss->accepted) {
+		if (ss->conf.idle_timeout > 0 &&
+		    table_size(ss->sched.streams) == 0) {
+			ev_timer_again(ss->loop, &ss->w_idle_timeout);
+		}
+	}
+
+	/* Re-activate any streams queued while the session was suspended.
+	 * INIT/CLOSED streams placed in the data queue before establishment are
+	 * redirected to the lp queue by sched_next_data on first encounter.
+	 * Data-ready streams need EV_WRITE; lp queue streams need EV_IDLE. */
+	if (ss->sched.sched_head != NULL) {
+		ss->wire.tx_pending = true;
+	}
+	if (ss->sched.lp_head != NULL && ss->wire.sendbuf.head == NULL) {
+		ev_idle_start(ss->loop, &ss->sched.w_sched);
+	}
+	/* Re-arm w_coalesce if the session resumes with a preserved backlog:
+	 * delay list entries (Nagle / ACK coalescing held before suspension) or
+	 * a session-level ACK backlog (recv_seq != ack_seq carried across the
+	 * transport break).  sched_coalesce_arm is idempotent, so calling it
+	 * here is also safe on a fresh establish with no backlog. */
+	if (ss->sched.delay_head != NULL || ss->recv_seq != ss->ack_seq) {
+		sched_coalesce_arm(ss);
+	}
+
+	/* If draining was requested before the handshake completed and there
+	 * are no active streams, initiate a graceful shutdown immediately. */
+	if (ss->draining && ss->sched.streams != NULL &&
+	    table_size(ss->sched.streams) == 0) {
+		session_initiate_shutdown(ss);
+	}
+}
+
+/* Trim @p count frames from the unacked list (session-ACK increment path).
+ * Advances last_ack_recv by count.  Returns false and logs an error if
+ * count exceeds the current unacked list length, indicating a protocol
+ * violation (peer acknowledged more frames than were sent).
+ * Clears send_stalled and wakes the scheduler when the unacked count
+ * drops back below session_window. */
+bool session_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
+{
+	if (count > ss->unacked_frames) {
+		MUX_LOG_F(
+			ERROR, ss,
+			"session ACK overflow: count=%" PRIuFAST32
+			" unacked=%zu",
+			count, ss->unacked_frames);
+		return false;
+	}
+	if (count == 0) {
+		return true;
+	}
+	const uint_fast32_t trim = count;
+	/* Update logical counters upfront. */
+	ss->unacked_frames -= trim;
+	COUNTER_SUB(ss->cnt.unacked_frames, trim);
+	ss->last_ack_recv += trim;
+	/* Pop physical frames, handling partial consumption of packed frames. */
+	size_t remaining = trim;
+	while (remaining > 0) {
+		struct mux_frame *f = ss->unacked.head;
+		if (f->unacked_count > remaining) {
+			f->unacked_count -= remaining;
+			remaining = 0;
+		} else {
+			remaining -= f->unacked_count;
+			(void)mux_frame_list_pop(&ss->unacked);
+			mux_frame_put(&ss->pool, f);
+		}
+	}
+	if (ss->send_stalled &&
+	    ss->unacked_frames < (size_t)ss->session_window) {
+		MUX_LOG_F(
+			DEBUG, ss,
+			"send stall cleared by session ACK: acked=%" PRIuFAST32
+			" unacked=%zu limit=%" PRIuLEAST32 " ready=%d",
+			trim, ss->unacked_frames, ss->session_window,
+			ss->sched.sched_head != NULL);
+		ss->send_stalled = false;
+		mux_notify_write(ss);
+	}
+	return true;
+}
+
+/* Close the transport layer only, preserving stream state and the unacked
+ * list so that the session can be resumed over a new connection.
+ * Called when a transport error occurs on an established session or on a
+ * client session mid-resume-handshake (SESSION_HANDSHAKE, has_session_id,
+ * !accepted).  Sets state to SESSION_SUSPENDED and starts the resume timeout. */
+void session_suspend(struct mux_session *restrict ss)
+{
+	ASSERT(ss->state == SESSION_ESTABLISHED ||
+	       (ss->state == SESSION_HANDSHAKE && !ss->accepted &&
+		ss->handshake.has_session_id));
+	if (ss->state == SESSION_HANDSHAKE) {
+		MUX_LOG(WARNING, ss,
+			"transport lost during resume handshake; re-suspending");
+	} else {
+		MUX_LOG(WARNING, ss,
+			"transport lost; session suspended awaiting resume");
+	}
+	session_set_state(ss, SESSION_SUSPENDED);
+
+	/* Move partially flushed frames into the resume log before transport
+	 * teardown.  Detaching the list first transfers ownership to
+	 * session_track_sent and avoids double-free paths through session_reset. */
+	if (ss->wire.sendbuf.head != NULL) {
+		struct mux_frame_list captured = ss->wire.sendbuf;
+		ss->wire.sendbuf = (struct mux_frame_list){ 0 };
+		struct mux_frame *frame;
+		while ((frame = mux_frame_list_pop(&captured)) != NULL) {
+			if (frame == ss->retransmit_copy) {
+				mux_frame_put(&ss->pool, frame);
+			} else {
+				session_track_sent(ss, frame);
+			}
+		}
+	}
+	ss->retransmit_copy = NULL;
+
+	/* OOB controls never replay across resume; drop the stale transport state. */
+	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
+
+	/* Resume replay always restarts from the current unacked head. */
+	ss->retransmit_cursor = ss->unacked.head;
+
+	/* Close transport. */
+	ev_io_stop(ss->loop, &ss->w_socket);
+	ev_idle_stop(ss->loop, &ss->sched.w_sched);
+	ev_timer_stop(ss->loop, &ss->w_keepalive);
+	ev_timer_stop(ss->loop, &ss->w_send_timeout);
+	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
+	ev_timer_stop(ss->loop, &ss->sched.w_coalesce);
+	ev_timer_stop(ss->loop, &ss->w_idle_timeout);
+
+	wire_conn_free(ss);
+	if (ss->w_socket.fd != -1) {
+		CLOSE_FD(ss->w_socket.fd);
+		ss->w_socket.fd = -1;
+	}
+	ringbuf_reset(ss->wire.recvbuf);
+	ss->wire.rx_open = true;
+	ss->wire.tx_pending = false;
+#if WITH_TLS
+	ss->wire.tls_want = 0;
+#endif
+
+	/* Wait for peer to reconnect.  Server waits for resume_timeout; client
+	 * waits for send_timeout (the reconnect window). */
+	double wait;
+	if (!ss->accepted && ss->conf.send_timeout > 0) {
+		wait = (double)ss->conf.send_timeout;
+	} else {
+		wait = (double)ss->conf.resume_timeout;
+	}
+	ev_timer_set(&ss->w_timeout, wait, 0.0);
+	ev_timer_start(ss->loop, &ss->w_timeout);
+
+	/* Notify the upper layer after the session enters SUSPENDED. Dialed
+	 * sessions may reconnect immediately; accepted sessions typically wait
+	 * for the peer to resume. */
+	if (ss->callbacks.on_event != NULL) {
+		ss->callbacks.on_event(
+			ss->userdata, ss, MUX_EVENT_SUSPENDED,
+			(union mux_event_data){ 0 });
+	}
+}
+
+/* Called on the suspended (or still-established) session when a client
+ * reconnects with a matching session_id.  Migrates the new fd from the
+ * transient session @p new_ss, sends ServerHello, starts retransmission,
+ * and destroys @p new_ss.
+ * Returns false if session_suspend or client_resume_seq fails. */
+bool session_resume_transport(
+	struct mux_session *restrict ss, struct mux_session *restrict new_ss,
+	const uint_least32_t client_resume_seq)
+{
+	/* Handle the race where the server session is still ESTABLISHED when
+	 * the client reconnects (transport loss not yet detected server-side).
+	 * Suspend the old transport first so the resume logic finds canonical
+	 * SUSPENDED state. */
+	if (ss->state == SESSION_ESTABLISHED) {
+		session_suspend(ss);
+		if (ss->state != SESSION_SUSPENDED) {
+			/* session_suspend hit the unacked cap and reset ss. */
+			if (ss->callbacks.on_event != NULL) {
+				ss->callbacks.on_event(
+					ss->userdata, ss, MUX_EVENT_CLOSED,
+					(union mux_event_data){ 0 });
+			}
+			return false;
+		}
+	}
+
+	MUX_LOG_F(
+		INFO, ss,
+		"resuming from suspended state, client_resume_seq=%" PRIuLEAST32,
+		client_resume_seq);
+
+	/* Trim the frames the client already received. */
+	if (!session_resume_ack_recv(ss, client_resume_seq)) {
+		session_reset(ss);
+		/* The suspended session is now CLOSED but still in the caller's
+		 * session list; emit MUX_EVENT_CLOSED via on_event so the owner
+		 * can remove and clean it up. */
+		if (ss->callbacks.on_event != NULL) {
+			ss->callbacks.on_event(
+				ss->userdata, ss, MUX_EVENT_CLOSED,
+				(union mux_event_data){
+					.closed.clean = ss->wire.rx_eof });
+		}
+		return false;
+	}
+
+	/* Migrate the transport fd from the transient session. */
+	const int new_fd = new_ss->w_socket.fd;
+	/* Stop the transient's socket watcher before stealing its fd.
+	 * Without this, session_reset(new_ss) -> session_stop -> ev_io_stop
+	 * would fire on an active watcher with fd=-1, triggering a libev
+	 * assertion (ev_io_stop: illegal fd). */
+	ev_io_stop(new_ss->loop, &new_ss->w_socket);
+	new_ss->w_socket.fd = -1; /* prevent close in new_ss cleanup */
+#if WITH_TLS
+	wire_migrate_tlsconn(ss, new_ss);
+#endif
+	if (ss->w_socket.fd != -1) {
+		CLOSE_FD(ss->w_socket.fd);
+	}
+
+	/* Reset transport buffers */
+	wire_discard_buffers(ss);
+	ss->wire.rx_open = true;
+	ss->wire.tx_pending = false;
+#if WITH_TLS
+	ss->wire.tls_want = 0;
+#endif
+
+	ev_io_set(&ss->w_socket, new_fd, EV_READ | EV_WRITE);
+
+	/* Stop the resume timeout that was running on the suspended session.
+	 * Restore w_timeout.repeat, which session_transport_lost clobbered by
+	 * repurposing the watcher as a one-shot suspension timer. */
+	ev_timer_stop(ss->loop, &ss->w_timeout);
+	ss->w_timeout.repeat = (double)ss->conf.timeout;
+	ev_timer_stop(ss->loop, &ss->w_send_timeout);
+	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
+
+	/* Destroy the transient session.  Its fd is already stolen above.
+	 * The caller's socket_cb post-dispatch will finish the transient
+	 * session teardown after we return. */
+	session_reset(new_ss);
+
+	/* Send ServerHello identifying the client back to itself. */
+	session_set_state(ss, SESSION_HANDSHAKE);
+	ev_timer_again(ss->loop, &ss->w_connect_timeout);
+	if (!handshake_enqueue_hello(ss, PROTO_MSG_SERVER_HELLO, true)) {
+		/* handshake_enqueue_hello already called session_reset(ss); inform the
+		 * caller so it can remove the suspended session from its list. */
+		if (ss->state == SESSION_CLOSED) {
+			if (ss->callbacks.on_event != NULL) {
+				ss->callbacks.on_event(
+					ss->userdata, ss, MUX_EVENT_CLOSED,
+					(union mux_event_data){
+						.closed.clean =
+							ss->wire.rx_eof });
+			}
+		}
+		return false;
+	}
+	session_handshake_done(ss);
+
+	/* Position retransmit cursor and start I/O. */
+	if (ss->retransmit_cursor != NULL) {
+		ss->wire.tx_pending = true;
+	}
+	ev_io_start(ss->loop, &ss->w_socket);
+	ev_timer_again(ss->loop, &ss->w_timeout);
+	session_update_watcher(ss);
+	return true;
+}
+
+/* After receiving a resume_seq in a hello, advance the unacked list to
+ * reflect frames the peer has already processed.  @p peer_ack is the
+ * peer's cumulative last_ack_recv; the delta from ss->last_ack_recv is
+ * the trim count.  Sets the retransmit cursor to the new list head.
+ * Returns false on protocol violation; caller must call session_reset. */
+bool session_resume_ack_recv(
+	struct mux_session *restrict ss, const uint_least32_t peer_ack)
+{
+	if (peer_ack < ss->last_ack_recv) {
+		MUX_LOG_F(
+			ERROR, ss,
+			"session resume: peer_ack %" PRIuLEAST32
+			" < last_ack_recv %" PRIuLEAST32,
+			peer_ack, ss->last_ack_recv);
+		return false;
+	}
+	const uint_least32_t trim = peer_ack - ss->last_ack_recv;
+	if (!session_ack_trim(ss, (uint_fast32_t)trim)) {
+		return false;
+	}
+	/* Position the retransmit cursor at the first remaining frame. */
+	ss->retransmit_cursor = ss->unacked.head;
+	return true;
+}

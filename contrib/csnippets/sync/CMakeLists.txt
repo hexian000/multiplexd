@@ -1,0 +1,13 @@
+target_sources(csnippets
+    PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/dispatcher.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/executor.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/queue.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared_mutex.c"
+    PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/dispatcher.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/executor.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/queue.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared_mutex.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/task.h"
+)
