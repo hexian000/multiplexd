@@ -202,6 +202,34 @@ static void relay_dispatch_on_event(void *p)
 		t->relay.cb.on_event(t->callback_data, t, event, data);
 	}
 }
+
+/* Task argument for on_established / on_resumed relays. */
+struct relay_connected_arg {
+	struct tunnel *t;
+	intmax_t lat_ns;
+};
+
+static void relay_dispatch_on_established(void *p)
+{
+	struct relay_connected_arg *restrict arg = p;
+	struct tunnel *restrict t = arg->t;
+	const intmax_t lat_ns = arg->lat_ns;
+	free(arg);
+	if (t->relay.cb.on_established != NULL) {
+		t->relay.cb.on_established(t->callback_data, t, lat_ns);
+	}
+}
+
+static void relay_dispatch_on_resumed(void *p)
+{
+	struct relay_connected_arg *restrict arg = p;
+	struct tunnel *restrict t = arg->t;
+	const intmax_t lat_ns = arg->lat_ns;
+	free(arg);
+	if (t->relay.cb.on_resumed != NULL) {
+		t->relay.cb.on_resumed(t->callback_data, t, lat_ns);
+	}
+}
 #endif /* WITH_THREADS */
 
 static const double tunnel_reconnect_delays[] = {
@@ -365,7 +393,7 @@ handle_connected(struct tunnel *restrict t, const union mux_event_data edata)
 			return;
 		}
 		/* Wiring into identities[].tunnels[] is done by the server thread
-		 * in server.c handle_connected after the event is dispatched.
+		 * in server.c server_on_established after the event is dispatched.
 		 * Here we only update the diagnostic tag. */
 		const struct server *const srv = t->relay.srv;
 		bool matched = false;
@@ -433,6 +461,65 @@ static void tunnel_on_event(
 		break;
 	default:
 		break;
+	}
+
+	/* MUX_EVENT_ESTABLISHED and MUX_EVENT_RESUMED bypass on_event and are
+	 * routed to their dedicated callbacks instead. */
+	if (event == MUX_EVENT_ESTABLISHED) {
+#if WITH_THREADS
+		if (t->relay.cb.on_established != NULL) {
+			struct relay_connected_arg *restrict arg =
+				malloc(sizeof(*arg));
+			if (arg == NULL) {
+				LOGOOM();
+				return;
+			}
+			*arg = (struct relay_connected_arg){
+				.t = t, .lat_ns = edata.connected.ns
+			};
+			(void)dispatcher_invoke(
+				t->relay.srv->disp,
+				(struct task){
+					.func = relay_dispatch_on_established,
+					.data = arg });
+			ev_async_send(
+				t->relay.srv->loop, &t->relay.srv->w_async);
+		}
+#else
+		if (t->relay.cb.on_established != NULL) {
+			t->relay.cb.on_established(
+				t->callback_data, t, edata.connected.ns);
+		}
+#endif
+		return;
+	}
+	if (event == MUX_EVENT_RESUMED) {
+#if WITH_THREADS
+		if (t->relay.cb.on_resumed != NULL) {
+			struct relay_connected_arg *restrict arg =
+				malloc(sizeof(*arg));
+			if (arg == NULL) {
+				LOGOOM();
+				return;
+			}
+			*arg = (struct relay_connected_arg){
+				.t = t, .lat_ns = edata.connected.ns
+			};
+			(void)dispatcher_invoke(
+				t->relay.srv->disp,
+				(struct task){
+					.func = relay_dispatch_on_resumed,
+					.data = arg });
+			ev_async_send(
+				t->relay.srv->loop, &t->relay.srv->w_async);
+		}
+#else
+		if (t->relay.cb.on_resumed != NULL) {
+			t->relay.cb.on_resumed(
+				t->callback_data, t, edata.connected.ns);
+		}
+#endif
+		return;
 	}
 
 #if WITH_THREADS

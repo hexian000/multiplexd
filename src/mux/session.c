@@ -93,11 +93,6 @@ session_set_state(struct mux_session *ss, enum session_state newstate)
 	}
 
 	ss->state = newstate;
-	if (newstate == SESSION_CONNECT) {
-		ss->connect_started = clock_monotonic_ns();
-	} else if (newstate == SESSION_HANDSHAKE && ss->accepted) {
-		ss->connect_started = clock_monotonic_ns();
-	}
 
 	if ((newstate == SESSION_CONNECT || newstate == SESSION_HANDSHAKE) &&
 	    oldstate != SESSION_CONNECT && oldstate != SESSION_HANDSHAKE) {
@@ -1245,6 +1240,9 @@ session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
 		.last_modified = clock_monotonic_ns(),
 		.accepted = (fd >= 0),
 		.wire.rx_open = true,
+		/* For accepted sessions, start timing from creation so setup time
+		 * covers from accept() to SESSION_ESTABLISHED. */
+		.connect_started = (fd >= 0) ? clock_monotonic_ns() : 0,
 	};
 
 	ss->sched.streams = table_new(TABLE_FAST);
@@ -1531,6 +1529,10 @@ void session_attach_fd(struct mux_session *restrict ss, const int fd)
 	if (socket_user_timeout(fd, ss->conf.send_timeout * 1000) == 0) {
 		ss->w_send_timeout.repeat = 0.0;
 	}
+	/* Start timing from attach so setup time covers from socket creation
+	 * (tunnel_do_connect calls us immediately after connect()) to
+	 * SESSION_ESTABLISHED. */
+	ss->connect_started = clock_monotonic_ns();
 	session_set_state(ss, SESSION_CONNECT);
 	ev_io_start(ss->loop, &ss->w_socket);
 	ev_timer_again(ss->loop, &ss->w_connect_timeout);
@@ -1711,28 +1713,28 @@ void session_handshake_done(struct mux_session *ss)
 {
 	MUX_LOG(VERBOSE, ss, "mux negotiation completed");
 	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
+	/* Distinguish fresh establish from resume before session_set_state
+	 * clears connect_started and updates peer_addr. */
+	const bool is_resume = (ss->peer_addr.sa.sa_family != AF_UNSPEC);
 	session_set_state(ss, SESSION_ESTABLISHED);
-	const intmax_t t = clock_monotonic_ns();
 	if (LOGLEVEL(NOTICE)) {
 		char str[32];
 		format_duration(
 			str, sizeof(str),
-			make_duration_nanos(t - ss->last_modified));
+			make_duration_nanos(ss->last_connect_latency_ns));
+		const char *const verb = is_resume ? "resumed" : "established";
 		if (ss->peer_addr.sa.sa_family != AF_UNSPEC) {
 			char peer_str[64];
 			sa_format(
 				peer_str, sizeof(peer_str), &ss->peer_addr.sa);
 			MUX_LOG_F(
-				NOTICE, ss,
-				"session established peer=%s setup=%s",
+				NOTICE, ss, "session %s peer=%s setup=%s", verb,
 				peer_str, str);
 		} else {
-			MUX_LOG_F(
-				NOTICE, ss, "session established setup=%s",
-				str);
+			MUX_LOG_F(NOTICE, ss, "session %s setup=%s", verb, str);
 		}
 	}
-	ss->last_modified = t;
+	ss->last_modified = clock_monotonic_ns();
 
 	ev_timer_again(ss->loop, &ss->w_timeout);
 
@@ -1987,6 +1989,9 @@ bool session_resume_transport(
 	/* Destroy the transient session.  Its fd is already stolen above.
 	 * The caller's socket_cb post-dispatch will finish the transient
 	 * session teardown after we return. */
+	/* Transfer the attach timestamp so setup time covers from session_new()
+	 * to SESSION_ESTABLISHED on the resumed session too. */
+	ss->connect_started = new_ss->connect_started;
 	session_reset(new_ss);
 
 	/* Send ServerHello identifying the client back to itself. */

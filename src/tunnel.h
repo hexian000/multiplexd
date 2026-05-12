@@ -20,11 +20,20 @@ struct tunnel;
 /* Callbacks invoked on the server loop for session lifecycle events.
  * Inbound stream policy is enforced by tunnel layer; streams are accepted
  * by default, then attached to sockets via tunnel_open_stream().
- * on_event fires for all mux events including MUX_EVENT_CLOSED. */
+ * on_event fires for all mux events except MUX_EVENT_ESTABLISHED and
+ * MUX_EVENT_RESUMED, which are routed to on_established and on_resumed. */
 struct tunnel_callbacks {
 	void (*on_event)(
 		void *data, struct tunnel *t, enum mux_event,
 		union mux_event_data);
+	/* Fired when a handshake completes as a fresh session.  May fire more
+	 * than once on the same tunnel when the server rejects a resume
+	 * attempt and the client falls back to a new session; implementations
+	 * must be idempotent with respect to any session pool they maintain. */
+	void (*on_established)(void *data, struct tunnel *t, intmax_t lat_ns);
+	/* Fired when the peer confirmed that the suspended session has been
+	 * successfully resumed on the new transport. */
+	void (*on_resumed)(void *data, struct tunnel *t, intmax_t lat_ns);
 	struct mux_session *(*on_resume)(
 		void *data, struct tunnel *new_t,
 		const unsigned char *session_id);

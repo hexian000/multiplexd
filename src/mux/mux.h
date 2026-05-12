@@ -232,8 +232,7 @@ void mux_start(struct mux_session *ss);
  * Valid from SESSION_INIT (initial connect) or SESSION_SUSPENDED (resume).
  * The caller is responsible for creating the socket, calling connect(), and
  * configuring TCP options before passing fd here.  Takes ownership of fd.
- * Transitions the session from SESSION_INIT or SESSION_SUSPENDED to
- * SESSION_CONNECT. */
+ * Transitions the session to SESSION_CONNECT. */
 void mux_attach_fd(struct mux_session *ss, int fd);
 
 /* --- Session accessors --- */

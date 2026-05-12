@@ -233,9 +233,10 @@ static void session_on_connected(
 	SESSION_EVLOGF(srv, t, "session %s (setup: %s)", verb, lat_str);
 }
 
-static void handle_connected(
-	struct server *restrict srv, struct tunnel *restrict t, intmax_t lat_ns)
+static void
+server_on_established(void *data, struct tunnel *restrict t, intmax_t lat_ns)
 {
+	struct server *restrict srv = data;
 	const bool is_server = tunnel_is_accepted(t);
 	LOGN_F("[fd:%d] %s session established", tunnel_fd(t),
 	       is_server ? "server" : "client");
@@ -250,17 +251,31 @@ static void handle_connected(
 				break;
 			}
 		}
-		/* Wire the dialed session into the matching identity pool. */
+		/* Wire the dialed session into the matching identity pool.
+		 * Guard against duplicate wiring: if the server rejected a
+		 * resume attempt the mux layer fires ESTABLISHED again on the
+		 * same tunnel object, but the tunnel is already in the pool. */
 		const char *const peer_id = tunnel_peer_identity(t);
 		if (peer_id != NULL) {
 			for (size_t i = 0; i < srv->num_identities; i++) {
-				if (srv->identities[i].peer_identity != NULL &&
+				if (srv->identities[i].peer_identity == NULL ||
 				    strcmp(srv->identities[i].peer_identity,
-					   peer_id) == 0) {
-					(void)identity_listener_add(
-						&srv->identities[i], t);
-					break;
+					   peer_id) != 0) {
+					continue;
 				}
+				struct identity_listener *const sl =
+					&srv->identities[i];
+				bool in_pool = false;
+				for (size_t j = 0; j < sl->num_tunnels; j++) {
+					if (sl->tunnels[j] == t) {
+						in_pool = true;
+						break;
+					}
+				}
+				if (!in_pool) {
+					(void)identity_listener_add(sl, t);
+				}
+				break;
 			}
 		}
 		return;
@@ -279,9 +294,10 @@ static void handle_connected(
 	}
 }
 
-static void handle_resumed(
-	struct server *restrict srv, struct tunnel *restrict t, intmax_t lat_ns)
+static void
+server_on_resumed(void *data, struct tunnel *restrict t, intmax_t lat_ns)
 {
+	struct server *restrict srv = data;
 	const bool is_server = tunnel_is_accepted(t);
 	LOGN_F("[fd:%d] %s session resumed", tunnel_fd(t),
 	       is_server ? "server" : "client");
@@ -372,7 +388,7 @@ static void tunnel_on_event(
 	case MUX_EVENT_CONNECT:
 		break;
 	case MUX_EVENT_ESTABLISHED:
-		handle_connected(srv, t, edata.connected.ns);
+		/* Routed to on_established; not fired through on_event. */
 		break;
 	case MUX_EVENT_CONNECT_FAILED:
 		break;
@@ -380,7 +396,7 @@ static void tunnel_on_event(
 		/* Handled by the tunnel layer; no server-level action needed. */
 		break;
 	case MUX_EVENT_RESUMED:
-		handle_resumed(srv, t, edata.connected.ns);
+		/* Routed to on_resumed; not fired through on_event. */
 		break;
 	case MUX_EVENT_LOST:
 		handle_disconnected(srv, t);
@@ -628,6 +644,8 @@ static void mux_serve(
 	struct mux_config mux_conf = server_make_mux_config(srv);
 	const struct tunnel_callbacks callbacks = {
 		.on_event = tunnel_on_event,
+		.on_established = server_on_established,
+		.on_resumed = server_on_resumed,
 		.on_resume = tunnel_on_resume,
 	};
 	unsigned char sid[MUX_SESSION_ID_LEN];
@@ -691,6 +709,8 @@ static bool strnull_eq(const char *a, const char *b)
 
 static const struct tunnel_callbacks client_callbacks = {
 	.on_event = tunnel_on_event,
+	.on_established = server_on_established,
+	.on_resumed = server_on_resumed,
 };
 
 #if WITH_TLS
@@ -1595,7 +1615,7 @@ bool server_start(struct server *restrict s)
 	/* Create one dedicated mux session per identity.mux_connect address.
 	 * The session announces identity_claim in the hello; the peer's
 	 * identity is discovered after the handshake and used to wire the
-	 * session to the matching identity listener in handle_connected. */
+	 * session to the matching identity listener in server_on_established. */
 	{
 		const size_t n = conf->identity_connect_count;
 		if (n > 0) {
