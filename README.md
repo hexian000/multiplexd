@@ -33,7 +33,6 @@ multiplexd is a TCP stream multiplexer that tunnels many concurrent connections 
   - [Dependencies](#dependencies)
   - [Build Instructions](#build-instructions)
   - [Build Options](#build-options)
-- [Protocol Specification](#protocol-specification)
 - [Deployment Notes](#deployment-notes)
   - [TLS Security Model](#tls-security-model)
   - [Connection Backoff](#connection-backoff)
@@ -82,13 +81,29 @@ multiplexd supports simultaneous forward and reverse forwarding over a single mu
 
 ### Protocol
 
-Unlike HTTP/2, multiplexd operates on octets, not requests: streams are ordered byte sequences with no framing, methods, or headers above the mux layer. The wire format is a fixed 8-byte frame header followed by an optional payload; a small set of control frames and a single hello exchange are the only shared session state.
+multiplexd streams are ordered byte sequences with no framing, methods, or headers above the mux layer. The wire format is a fixed 8-byte frame header followed by an optional payload; a small set of control frames and a single hello exchange are the only shared session state. Compared to existing multiplexing protocols:
+
+- **vs. HTTP/2 ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113)) / gRPC**: HTTP/2 and gRPC operate on requests and responses with mandatory HPACK-compressed headers; each stream carries exactly one HTTP transaction or RPC call with method routing and per-call metadata. multiplexd operates on raw octets with no request semantics, headers, or framing above the mux layer.
+- **vs. SSH connection protocol ([RFC 4254](https://www.rfc-editor.org/rfc/rfc4254))**: SSH requires a `channel-open` request per stream that names the service and destination, adding a round-trip before any payload can flow and imposing per-stream framing overhead; multiplexd has no channel requests, no per-stream negotiation, and no service-layer framing — the target is fixed at session configuration time.
 
 See [doc/spec.md](doc/spec.md) for the full wire protocol and state-machine specification.
 
 ### Implementation
 
 The design prioritises transparent TCP semantics (full half-close support, session resumption invisible to applications), inter-stream fairness (DRR scheduling), and coexistence of bulk and interactive streams without latency inflation.
+
+| Feature                    | multiplexd                                                                       | grpc-go streaming                                                                                         | OpenSSH port forwarding                                                    |
+| -------------------------- | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| **Stream model**           | Raw byte sequences; fixed 8-byte header                                          | One RPC call per stream; HPACK headers                                                                    | Named channel; `SSH_MSG_CHANNEL_DATA` frames                               |
+| **New stream setup**       | SYN + first data in one flight; no per-stream round-trip                         | HEADERS frame; no per-stream round-trip                                                                   | `channel-open` + `channel-open-confirmation`; one RTT before first payload |
+| **TCP half-close**         | FIN end-to-end transparent                                                       | END_STREAM bound to RPC lifecycle; no general TCP half-close semantics                                    | Channel EOF maps to TCP FIN; half-close preserved                          |
+| **Session resumption**     | Transparent; unacknowledged frames replayed                                      | None                                                                                                      | None                                                                       |
+| **Inter-stream fairness**  | Deficit round-robin scheduler; byte-granularity fairness                         | Round-robin scheduler; frame-granularity fairness                                                         | No inter-stream scheduling; systematically skewed under load               |
+| **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)                                   | Per-channel byte window only                                               |
+| **Adaptive window tuning** | Two-phase BDP estimator (`STARTUP` / `TRACK`)                                    | Single-phase BDP estimator                                                                                | Fixed; manual tuning                                                       |
+| **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                                                      | None                                                                       |
+| **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                                             | Re-execs master; existing child processes drains naturally                 |
+| **Observability**          | Health, stats, Prometheus metrics (built-in; no code changes)                    | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors (requires instrumentation) | None                                                                       |
 
 See [doc/impl.md](doc/impl.md) for runtime topology, send/receive paths, and maintainer-facing invariants.
 
@@ -343,20 +358,6 @@ cmake -DENABLE_TLS=OFF ..
 | `ENABLE_SYSTEMD`    | OFF     | Enable systemd state notify (`BUILD_STATIC=OFF`)                 |
 | `ENABLE_THREADS`    | OFF     | Enable multithread offloading                                    |
 | `FORCE_POSIX`       | OFF     | Use POSIX.1 APIs only                                            |
-
-## Protocol Specification
-
-Every frame begins with a fixed 8-byte header:
-
-| Field     | Size    | Description                                                         |
-| --------- | ------- | ------------------------------------------------------------------- |
-| Version   | 1 byte  | Protocol version (currently `0x01`)                                 |
-| Flags     | 1 byte  | `FIN`/`SYN`/`RST`/`PUSH`/`ACK` control bits                         |
-| Length    | 2 bytes | Payload length in bytes (0–16384)                                   |
-| Stream ID | 2 bytes | Stream identifier; 0 = session control, odd = client, even = server |
-| Extra     | 2 bytes | Window increment (SYN/ACK frames) or RST status code                |
-
-The full wire protocol and state-machine details are documented in [`doc/spec.md`](doc/spec.md).
 
 ## Deployment Notes
 
