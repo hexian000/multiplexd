@@ -50,18 +50,23 @@ static void task_mux_start(void *p)
 static void tunnel_set_tag_part(
 	char *restrict buf, const size_t buflen, const char *restrict text)
 {
-	if (snprintf(buf, buflen, "%s", text) < 0) {
+	const int ret = snprintf(buf, buflen, "%s", text);
+	if (ret < 0) {
 		buf[0] = '\0';
 	}
+	/* Truncation (ret >= buflen) is benign: snprintf guarantees
+	 * null-termination in all non-error cases. */
 }
 
 static void tunnel_set_tag(
 	char *restrict tag, const size_t taglen, const char *restrict my,
 	const char *restrict arrow, const char *restrict peer)
 {
-	if (snprintf(tag, taglen, "%s%s%s:", my, arrow, peer) < 0) {
+	const int ret = snprintf(tag, taglen, "%s%s%s:", my, arrow, peer);
+	if (ret < 0) {
 		tag[0] = '\0';
 	}
+	/* Truncation benign: snprintf null-terminates. */
 }
 
 struct tunnel {
@@ -475,13 +480,15 @@ static void tunnel_on_event(
 				return;
 			}
 			*arg = (struct relay_connected_arg){
-				.t = t, .lat_ns = edata.connected.ns
+				.t = t,
+				.lat_ns = edata.connected.ns,
 			};
 			(void)dispatcher_invoke(
 				t->relay.srv->disp,
 				(struct task){
 					.func = relay_dispatch_on_established,
-					.data = arg });
+					.data = arg,
+				});
 			ev_async_send(
 				t->relay.srv->loop, &t->relay.srv->w_async);
 		}
@@ -503,13 +510,15 @@ static void tunnel_on_event(
 				return;
 			}
 			*arg = (struct relay_connected_arg){
-				.t = t, .lat_ns = edata.connected.ns
+				.t = t,
+				.lat_ns = edata.connected.ns,
 			};
 			(void)dispatcher_invoke(
 				t->relay.srv->disp,
 				(struct task){
 					.func = relay_dispatch_on_resumed,
-					.data = arg });
+					.data = arg,
+				});
 			ev_async_send(
 				t->relay.srv->loop, &t->relay.srv->w_async);
 		}
@@ -529,13 +538,17 @@ static void tunnel_on_event(
 			LOGOOM();
 			return;
 		}
-		*arg = (struct relay_event_arg){ .t = t,
-						 .event = event,
-						 .data = edata };
+		*arg = (struct relay_event_arg){
+			.t = t,
+			.event = event,
+			.data = edata,
+		};
 		(void)dispatcher_invoke(
 			t->relay.srv->disp,
-			(struct task){ .func = relay_dispatch_on_event,
-				       .data = arg });
+			(struct task){
+				.func = relay_dispatch_on_event,
+				.data = arg,
+			});
 		ev_async_send(t->relay.srv->loop, &t->relay.srv->w_async);
 	}
 #else

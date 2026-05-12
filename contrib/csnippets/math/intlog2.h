@@ -14,6 +14,7 @@
 
 #include <assert.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* If C23 is available, prefer stdc */
@@ -80,10 +81,10 @@ static inline int countl_zeroull(unsigned long long x)
 /* Layer 1: De Bruijn baseline — always available, no guards */
 
 /** @brief De Bruijn lookup table for 32-bit BSR (bit scan reverse). */
-extern const int debruijn_bsr32[32];
+extern const int intlog2_debruijn_bsr32[32];
 
 /** @brief De Bruijn lookup table for 32-bit BSF (bit scan forward). */
-extern const int debruijn_bsf32[32];
+extern const int intlog2_debruijn_bsf32[32];
 
 #ifdef UINT32_MAX
 /** @brief Calculate base-2 logarithm for uint32_t using De Bruijn sequence. */
@@ -95,14 +96,16 @@ static inline int log2u32(uint32_t x)
 	x |= x >> 4u;
 	x |= x >> 8u;
 	x |= x >> 16u;
-	return debruijn_bsr32[(x * UINT32_C(0x07C4ACDD)) >> 27u];
+	/* De Bruijn constant for 32-bit BSR; pairs with intlog2_debruijn_bsr32[] */
+	return intlog2_debruijn_bsr32[(x * UINT32_C(0x07C4ACDD)) >> 27u];
 }
 
 /** @brief Count trailing zeros for uint32_t using De Bruijn sequence. */
 static inline int countr_zerou32(uint32_t x)
 {
 	assert(x > 0);
-	return debruijn_bsf32[((x & -x) * UINT32_C(0x077CB531)) >> 27u];
+	/* De Bruijn constant for 32-bit BSF; pairs with intlog2_debruijn_bsf32[] */
+	return intlog2_debruijn_bsf32[((x & -x) * UINT32_C(0x077CB531)) >> 27u];
 }
 
 /** @brief Count leading zeros for uint32_t (x=0 returns 32). */
@@ -113,7 +116,7 @@ static inline int countl_zerou32(uint32_t x)
 #endif /* UINT32_MAX */
 
 /** @brief De Bruijn lookup table for 64-bit BSR (bit scan reverse). */
-extern const int debruijn_bsr64[64];
+extern const int intlog2_debruijn_bsr64[64];
 
 /** @brief Calculate base-2 logarithm for uint_fast64_t using De Bruijn sequence. */
 static inline int log2u64(uint_fast64_t x)
@@ -125,22 +128,24 @@ static inline int log2u64(uint_fast64_t x)
 	x |= x >> 8u;
 	x |= x >> 16u;
 	x |= x >> 32u;
-	return debruijn_bsr64
-		[(x * (uint_fast64_t)0x03F79D71B4CB0A89ULL &
-		  (uint_fast64_t)0xFFFFFFFFFFFFFFFFULL) >>
+	/* De Bruijn constant for 64-bit BSR; pairs with intlog2_debruijn_bsr64[] */
+	return intlog2_debruijn_bsr64
+		[((x * (uint_fast64_t)0x03F79D71B4CB0A89ULL) &
+		  UINT64_C(0xFFFFFFFFFFFFFFFF)) >>
 		 58u];
 }
 
 /** @brief De Bruijn lookup table for 64-bit BSF (bit scan forward). */
-extern const int debruijn_bsf64[64];
+extern const int intlog2_debruijn_bsf64[64];
 
 /** @brief Count trailing zeros for uint_fast64_t using De Bruijn sequence. */
 static inline int countr_zerou64(uint_fast64_t x)
 {
 	assert(x > 0);
-	return debruijn_bsf64
-		[((x & -x) * (uint_fast64_t)0x0257EDD4D0F22CE3ULL &
-		  (uint_fast64_t)0xFFFFFFFFFFFFFFFFULL) >>
+	/* De Bruijn constant for 64-bit BSF; pairs with intlog2_debruijn_bsf64[] */
+	return intlog2_debruijn_bsf64
+		[(((x & -x) * (uint_fast64_t)0x0257EDD4D0F22CE3ULL) &
+		  UINT64_C(0xFFFFFFFFFFFFFFFF)) >>
 		 58u];
 }
 
@@ -302,6 +307,12 @@ int log2umax(uintmax_t x);
 int countr_zeromax(uintmax_t x);
 int countl_zeromax(uintmax_t x);
 #endif /* UINTMAX_MAX <= ULLONG_MAX */
+
+/* size_t must alias unsigned int, long, or long long for the
+ * _Generic dispatch in intlog2() and countr_zero() to cover it. */
+static_assert(
+	sizeof(size_t) <= sizeof(unsigned long long),
+	"size_t wider than unsigned long long: intlog2/countr_zero dispatch incomplete");
 
 /* Layer 4: Public _Generic macros */
 

@@ -7,31 +7,26 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <threads.h>
 
-/* size_t must alias unsigned int, long, or long long for the
- * _Generic dispatch in intlog2() and countr_zero() to cover it. */
-static_assert(
-	sizeof(size_t) <= sizeof(unsigned long long),
-	"size_t wider than unsigned long long: intlog2/countr_zero dispatch incomplete");
-
-const int debruijn_bsr32[32] = {
+const int intlog2_debruijn_bsr32[32] = {
 	0, 9,  1,  10, 13, 21, 2,  29, 11, 14, 16, 18, 22, 25, 3, 30,
 	8, 12, 20, 28, 15, 17, 24, 7,  19, 27, 23, 6,  26, 5,  4, 31,
 };
 
-const int debruijn_bsf32[32] = {
+const int intlog2_debruijn_bsf32[32] = {
 	0,  1,	28, 2,	29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4,  8,
 	31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6,  11, 5,  10, 9,
 };
 
-const int debruijn_bsr64[64] = {
+const int intlog2_debruijn_bsr64[64] = {
 	0,  47, 1,  56, 48, 27, 2,  60, 57, 49, 41, 37, 28, 16, 3,  61,
 	54, 58, 35, 52, 50, 42, 21, 44, 38, 32, 29, 23, 17, 11, 4,  62,
 	46, 55, 26, 59, 40, 36, 15, 53, 34, 51, 20, 43, 31, 22, 10, 45,
 	25, 39, 14, 33, 19, 30, 9,  24, 13, 18, 8,  12, 7,  6,	5,  63,
 };
 
-const int debruijn_bsf64[64] = {
+const int intlog2_debruijn_bsf64[64] = {
 	0,  1,	2,  36, 3,  47, 59, 37, 44, 4,	7,  48, 60, 30, 54, 38,
 	34, 45, 5,  28, 26, 8,	49, 10, 61, 51, 31, 19, 55, 22, 39, 12,
 	63, 35, 46, 58, 43, 6,	29, 53, 33, 27, 25, 9,	50, 18, 21, 11,
@@ -162,9 +157,10 @@ static uintmax_t find_bsr_const(int w, int k, int table[])
 }
 
 /* Thread-local De Bruijn state for wide uintmax_t. */
-static _Thread_local struct {
+static thread_local struct {
 	bool init;
 	bool use_db; /* false when UINTMAX_W is not a power of 2 */
+	int shift;
 	uintmax_t bsr_const;
 	uintmax_t bsf_const;
 	int bsr_table[UINTMAX_W];
@@ -191,6 +187,7 @@ static void tl_db_init(void)
 		return;
 	}
 	tl_db.use_db = true;
+	tl_db.shift = w - k;
 
 	/* BSF constant: any De Bruijn sequence works. */
 	uintmax_t bsf_seq = fkt_gen(k);
@@ -219,36 +216,28 @@ static int bsr_bisect(uintmax_t x)
 
 int log2umax(uintmax_t x)
 {
+	assert(x > 0);
 	tl_db_init();
 	if (tl_db.use_db) {
 		int w = UINTMAX_W;
-		int k = 0;
-		for (int tmp = w; tmp > 1; tmp >>= 1) {
-			k++;
-		}
 		uintmax_t v = x;
 		for (int s = 1; s < w; s <<= 1) {
 			v |= v >> s;
 		}
-		int shift = w - k;
-		return tl_db.bsr_table[(tl_db.bsr_const * v) >> shift];
+		return tl_db.bsr_table[(tl_db.bsr_const * v) >> tl_db.shift];
 	}
 	return bsr_bisect(x);
 }
 
 int countr_zeromax(uintmax_t x)
 {
+	assert(x > 0);
 	tl_db_init();
 	if (tl_db.use_db) {
-		int w = UINTMAX_W;
-		int k = 0;
-		for (int tmp = w; tmp > 1; tmp >>= 1) {
-			k++;
-		}
-		int shift = w - k;
 		uintmax_t lsb = x & (uintmax_t)(-(intmax_t)x);
-		return tl_db.bsf_table[(tl_db.bsf_const * lsb) >> shift];
+		return tl_db.bsf_table[(tl_db.bsf_const * lsb) >> tl_db.shift];
 	}
+	/* log2(x & -x) == ctz(x) for any nonzero x */
 	return bsr_bisect(x & (uintmax_t)(-(intmax_t)x));
 }
 

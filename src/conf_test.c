@@ -273,7 +273,103 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_partial_tls_config)
 					    "}");
 	T_EXPECT(conf == NULL);
 }
-#endif
+
+T_DECLARE_CASE(test_conf_parsefile_authcerts_array)
+{
+	/* Verify that the authcerts array is parsed and stored correctly. */
+	struct config *conf =
+		parse_tmpconf("{"
+			      "\"mux_listen\":\"127.0.0.1:9000\","
+			      "\"tls\":{"
+			      "\"cert\":\"certdata\","
+			      "\"key\":\"keydata\","
+			      "\"authcerts\":[\"ca1.pem\",\"ca2.pem\"]"
+			      "}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->authcerts_count, 2);
+	T_EXPECT_STREQ(conf->authcerts[0], "ca1.pem");
+	T_EXPECT_STREQ(conf->authcerts[1], "ca2.pem");
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_dump_tls_fields)
+{
+	/* Verify that tls.cert, tls.key, and tls.authcerts survive a
+	 * dump/parse round-trip, exercising dump_tls. */
+	struct config *orig = conf_new();
+	T_CHECK(orig != NULL);
+	orig->mux_connect = strdup("127.0.0.1:7777");
+	orig->tls_cert = strdup("certdata");
+	orig->tls_key = strdup("keydata");
+	orig->authcerts = malloc(sizeof(char *));
+	T_CHECK(orig->authcerts != NULL);
+	orig->authcerts[0] = strdup("authcertdata");
+	T_CHECK(orig->authcerts[0] != NULL);
+	orig->authcerts_count = 1;
+	T_CHECK(orig->mux_connect != NULL);
+	T_CHECK(orig->tls_cert != NULL);
+	T_CHECK(orig->tls_key != NULL);
+
+	char tmpl[] = "/tmp/conf_tls_dump_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(conf_dumpfile(orig, tmpl));
+
+	struct config *reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT_STREQ(reparsed->tls_cert, "certdata");
+	T_EXPECT_STREQ(reparsed->tls_key, "keydata");
+	T_EXPECT_EQ((int)reparsed->authcerts_count, 1);
+	T_EXPECT_STREQ(reparsed->authcerts[0], "authcertdata");
+
+	conf_free(reparsed);
+	conf_free(orig);
+}
+
+T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
+{
+	/* conf_inline_pem must replace @path fields with the file's content. */
+	char cert_tmpl[] = "/tmp/conf_inline_cert_XXXXXX";
+	char key_tmpl[] = "/tmp/conf_inline_key_XXXXXX";
+	T_CHECK(write_tmpfile(cert_tmpl, "CERTCONTENT") == 0);
+	T_CHECK(write_tmpfile(key_tmpl, "KEYCONTENT") == 0);
+
+	struct config *conf = conf_new();
+	T_CHECK(conf != NULL);
+
+	char cert_at[256], key_at[256];
+	(void)snprintf(cert_at, sizeof(cert_at), "@%s", cert_tmpl);
+	(void)snprintf(key_at, sizeof(key_at), "@%s", key_tmpl);
+	conf->tls_cert = strdup(cert_at);
+	conf->tls_key = strdup(key_at);
+	T_CHECK(conf->tls_cert != NULL);
+	T_CHECK(conf->tls_key != NULL);
+
+	T_EXPECT(conf_inline_pem(conf));
+	T_EXPECT_STREQ(conf->tls_cert, "CERTCONTENT");
+	T_EXPECT_STREQ(conf->tls_key, "KEYCONTENT");
+
+	(void)unlink(cert_tmpl);
+	(void)unlink(key_tmpl);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_inline_pem_fails_for_missing_file)
+{
+	/* conf_inline_pem must return false if an @path file does not exist. */
+	struct config *conf = conf_new();
+	T_CHECK(conf != NULL);
+	conf->tls_cert = strdup("@/tmp/conf_inline_nonexistent_XXXXXX.pem");
+	conf->tls_key = strdup("plaintext");
+	T_CHECK(conf->tls_cert != NULL);
+	T_CHECK(conf->tls_key != NULL);
+
+	T_EXPECT(!conf_inline_pem(conf));
+	conf_free(conf);
+}
+#endif /* WITH_TLS */
 
 T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 {
@@ -310,6 +406,119 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 	conf_free(conf);
 }
 
+T_DECLARE_CASE(test_conf_parsefile_unknown_root_key)
+{
+	/* Unknown keys at the root level must be warned about but not fail. */
+	struct config *conf =
+		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\","
+			      "\"nosuchkey\":\"value\"}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_STREQ(conf->mux_listen, "127.0.0.1:9000");
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_unknown_mux_key)
+{
+	/* Unknown keys inside a scope must be warned about but not fail. */
+	struct config *conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
+			      "\"mux\":{\"nosuchfield\":1}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_STREQ(conf->mux_connect, "127.0.0.1:9000");
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_mem_pressure_config)
+{
+	/* Verify that the mux.mem_pressure sub-object is parsed correctly. */
+	struct config *conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
+			      "\"mux\":{\"mem_pressure\":"
+			      "{\"hi\":1000,\"lo\":500}}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(conf->mux.mem_pressure_hi, 1000);
+	T_EXPECT_EQ(conf->mux.mem_pressure_lo, 500);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_session_window_positive)
+{
+	/* Setting only session_window hits the positive-value clamping path
+	 * inside parse_mux_session_window; the post-parse normalisation then
+	 * resets both windows to auto (0) because stream_window is not set. */
+	struct config *conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
+			      "\"mux\":{\"session_window\":65536}}");
+	T_CHECK(conf != NULL);
+	/* Both normalised to auto after mixed-mode detection. */
+	T_EXPECT_EQ(conf->mux.session_window, 0);
+	T_EXPECT_EQ(conf->mux.stream_window, 0);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_both_windows_positive)
+{
+	/* When both stream_window and session_window are given positive values,
+	 * the parser stores them in units (divided by MUX_MAX_PAYLOAD_SIZE)
+	 * and the normalisation leaves them unchanged.
+	 * 32768/16384=2, 131072/16384=8. */
+	struct config *conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
+			      "\"mux\":{"
+			      "\"stream_window\":32768,"
+			      "\"session_window\":131072}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(conf->mux.stream_window, 2);
+	T_EXPECT_EQ(conf->mux.session_window, 8);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_max_startups_valid)
+{
+	/* A well-formed max_startups string must be parsed into the three
+	 * throttle fields. */
+	struct config *conf =
+		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\","
+			      "\"max_startups\":\"10:50:200\"}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(conf->startup_limit_start, 10);
+	T_EXPECT_EQ(conf->startup_limit_rate, 50);
+	T_EXPECT_EQ(conf->startup_limit_full, 200);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_dump_identity_fields)
+{
+	/* Verify that identity.claim and identity.mux_connect survive a
+	 * dump/parse round-trip, exercising dump_identity_scope. */
+	struct config *orig = conf_new();
+	T_CHECK(orig != NULL);
+	orig->mux_connect = strdup("127.0.0.1:7777");
+	orig->identity_claim = strdup("mynode");
+	T_CHECK(orig->mux_connect != NULL);
+	T_CHECK(orig->identity_claim != NULL);
+	orig->identity_connect = malloc(sizeof(char *));
+	T_CHECK(orig->identity_connect != NULL);
+	orig->identity_connect[0] = strdup("127.0.0.1:9001");
+	T_CHECK(orig->identity_connect[0] != NULL);
+	orig->identity_connect_count = 1;
+
+	char tmpl[] = "/tmp/conf_id_dump_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(conf_dumpfile(orig, tmpl));
+
+	struct config *reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT_STREQ(reparsed->identity_claim, "mynode");
+	T_EXPECT_EQ((int)reparsed->identity_connect_count, 1);
+
+	conf_free(reparsed);
+	conf_free(orig);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -331,7 +540,18 @@ int main(void)
 	T_RUN_CASE(t, test_conf_parsefile_mixed_window_mode_normalized_to_auto);
 #if WITH_TLS
 	T_RUN_CASE(t, test_conf_parsefile_rejects_partial_tls_config);
+	T_RUN_CASE(t, test_conf_parsefile_authcerts_array);
+	T_RUN_CASE(t, test_conf_dump_tls_fields);
+	T_RUN_CASE(t, test_conf_inline_pem_replaces_at_path);
+	T_RUN_CASE(t, test_conf_inline_pem_fails_for_missing_file);
 #endif
 	T_RUN_CASE(t, test_conf_parsefile_ignores_comment_keys);
+	T_RUN_CASE(t, test_conf_parsefile_unknown_root_key);
+	T_RUN_CASE(t, test_conf_parsefile_unknown_mux_key);
+	T_RUN_CASE(t, test_conf_parsefile_mem_pressure_config);
+	T_RUN_CASE(t, test_conf_parsefile_session_window_positive);
+	T_RUN_CASE(t, test_conf_parsefile_both_windows_positive);
+	T_RUN_CASE(t, test_conf_parsefile_max_startups_valid);
+	T_RUN_CASE(t, test_conf_dump_identity_fields);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

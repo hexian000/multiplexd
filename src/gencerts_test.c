@@ -216,6 +216,57 @@ T_DECLARE_CASE(test_gencerts_with_signing_cert)
 	free(origdir);
 }
 
+T_DECLARE_CASE(test_gencerts_ecdsa_p224)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char *origdir = enter_tmpdir(tmpl);
+	T_CHECK(origdir != NULL);
+
+	const bool ok = gencerts("p224", "p224.example", NULL, "ecdsa", 224);
+	T_EXPECT(ok);
+	if (ok) {
+		T_EXPECT_EQ(access("p224-cert.pem", F_OK), 0);
+		T_EXPECT_EQ(access("p224-key.pem", F_OK), 0);
+	}
+
+	leave_tmpdir(origdir, tmpl);
+	free(origdir);
+}
+
+T_DECLARE_CASE(test_gencerts_ecdsa_p384)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char *origdir = enter_tmpdir(tmpl);
+	T_CHECK(origdir != NULL);
+
+	const bool ok = gencerts("p384", "p384.example", NULL, "ecdsa", 384);
+	T_EXPECT(ok);
+	if (ok) {
+		T_EXPECT_EQ(access("p384-cert.pem", F_OK), 0);
+		T_EXPECT_EQ(access("p384-key.pem", F_OK), 0);
+	}
+
+	leave_tmpdir(origdir, tmpl);
+	free(origdir);
+}
+
+T_DECLARE_CASE(test_gencerts_ecdsa_p521)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char *origdir = enter_tmpdir(tmpl);
+	T_CHECK(origdir != NULL);
+
+	const bool ok = gencerts("p521", "p521.example", NULL, "ecdsa", 521);
+	T_EXPECT(ok);
+	if (ok) {
+		T_EXPECT_EQ(access("p521-cert.pem", F_OK), 0);
+		T_EXPECT_EQ(access("p521-key.pem", F_OK), 0);
+	}
+
+	leave_tmpdir(origdir, tmpl);
+	free(origdir);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -228,6 +279,9 @@ int main(void)
 	T_RUN_CASE(t, test_gencerts_refuses_overwrite_existing_files);
 	T_RUN_CASE(t, test_gencerts_multiple_names);
 	T_RUN_CASE(t, test_gencerts_with_signing_cert);
+	T_RUN_CASE(t, test_gencerts_ecdsa_p224);
+	T_RUN_CASE(t, test_gencerts_ecdsa_p384);
+	T_RUN_CASE(t, test_gencerts_ecdsa_p521);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 

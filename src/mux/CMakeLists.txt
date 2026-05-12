@@ -105,9 +105,15 @@ add_mux_test(dispatch_test
     dispatch_test.c
 )
 
+add_mux_test(dispatch_fuzz_test
+    frame.c frame.h
+    dispatch_fuzz_test.c
+)
+
 add_mux_test(wire_test
     frame.c frame.h
     wire.c wire.h
+    ../gencerts.c ../gencerts.h
     wire_test.c
 )
 

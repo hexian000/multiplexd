@@ -258,18 +258,21 @@ static void format_frame_flags(
 	}
 	const uint_fast8_t unknown = flags & (uint_fast8_t)(~MUX_FLAG_MASK);
 	if (unknown != 0) {
-		if (snprintf(
-			    p, (size_t)(end - p), "%sUNKNOWN(0x%02x)",
-			    wrote ? "|" : "", unknown) < 0 &&
-		    buflen > 0) {
+		const int ret = snprintf(
+			p, (size_t)(end - p), "%sUNKNOWN(0x%02x)",
+			wrote ? "|" : "", unknown);
+		if (ret < 0 && buflen > 0) {
 			buf[0] = '\0';
 		}
+		/* Truncation benign: snprintf null-terminates. */
 		return;
 	}
 	if (!wrote) {
-		if (snprintf(buf, buflen, "NONE") < 0 && buflen > 0) {
+		const int ret = snprintf(buf, buflen, "NONE");
+		if (ret < 0 && buflen > 0) {
 			buf[0] = '\0';
 		}
+		/* Truncation benign: snprintf null-terminates. */
 	} else if (p < end) {
 		*p = '\0';
 	}
@@ -989,7 +992,8 @@ connect_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 			ss->callbacks.on_event(
 				ss->userdata, ss, MUX_EVENT_CLOSED,
 				(union mux_event_data){
-					.closed.clean = ss->wire.rx_eof });
+					.closed.clean = ss->wire.rx_eof,
+				});
 		}
 	}
 }
@@ -1052,7 +1056,8 @@ static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 				ss->userdata, ss, MUX_EVENT_CLOSED,
 				(union mux_event_data){
 					.closed.clean = ss->wire.rx_eof,
-					.closed.expired = was_suspended });
+					.closed.expired = was_suspended,
+				});
 		}
 	}
 }
@@ -1326,7 +1331,8 @@ void session_initiate_shutdown(struct mux_session *restrict ss)
 			ss->callbacks.on_event(
 				ss->userdata, ss, MUX_EVENT_CLOSED,
 				(union mux_event_data){
-					.closed.clean = ss->wire.rx_eof });
+					.closed.clean = ss->wire.rx_eof,
+				});
 		}
 		return;
 	}
@@ -1948,7 +1954,8 @@ bool session_resume_transport(
 			ss->callbacks.on_event(
 				ss->userdata, ss, MUX_EVENT_CLOSED,
 				(union mux_event_data){
-					.closed.clean = ss->wire.rx_eof });
+					.closed.clean = ss->wire.rx_eof,
+				});
 		}
 		return false;
 	}
@@ -2005,8 +2012,8 @@ bool session_resume_transport(
 				ss->callbacks.on_event(
 					ss->userdata, ss, MUX_EVENT_CLOSED,
 					(union mux_event_data){
-						.closed.clean =
-							ss->wire.rx_eof });
+						.closed.clean = ss->wire.rx_eof,
+					});
 			}
 		}
 		return false;

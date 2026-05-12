@@ -34,14 +34,6 @@
  * accepted stream (peer-initiated): "[N] me <- peer:"
  * connected stream (locally-initiated): "[N] me -> peer:"
  * me/peer use identity, fall back to IP, finally fall back to "[fd:N]". */
-static void stream_set_tag_part(
-	char *restrict buf, const size_t buflen, const char *restrict text)
-{
-	if (snprintf(buf, buflen, "%s", text) < 0) {
-		buf[0] = '\0';
-	}
-}
-
 int stream_format_tag(
 	char *restrict buf, size_t buflen, const struct stream *restrict s)
 {
@@ -52,33 +44,36 @@ int stream_format_tag(
 
 	char me[64];
 	if (ss->handshake.identity != NULL) {
-		stream_set_tag_part(me, sizeof(me), ss->handshake.identity);
+		(void)snprintf(me, sizeof(me), "%s", ss->handshake.identity);
 	} else {
 		union sockaddr_max addr;
 		if (socket_get_addr(ss->w_socket.fd, &addr) > 0) {
 			sa_format(me, sizeof(me), &addr.sa);
 		} else {
-			if (snprintf(
-				    me, sizeof(me), "[fd:%d]",
-				    ss->w_socket.fd) < 0) {
+			const int ret = snprintf(
+				me, sizeof(me), "[fd:%d]", ss->w_socket.fd);
+			if (ret < 0) {
 				me[0] = '\0';
 			}
+			/* Truncation benign: snprintf null-terminates. */
 		}
 	}
 
 	char peer[64];
 	if (ss->handshake.peer_identity != NULL) {
-		stream_set_tag_part(
-			peer, sizeof(peer), ss->handshake.peer_identity);
+		(void)snprintf(
+			peer, sizeof(peer), "%s", ss->handshake.peer_identity);
 	} else if (ss->handshake.peer_id != NULL) {
-		stream_set_tag_part(peer, sizeof(peer), ss->handshake.peer_id);
+		(void)snprintf(peer, sizeof(peer), "%s", ss->handshake.peer_id);
 	} else if (ss->peer_addr.sa.sa_family != AF_UNSPEC) {
 		sa_format(peer, sizeof(peer), &ss->peer_addr.sa);
 	} else {
-		if (snprintf(peer, sizeof(peer), "[fd:%d]", ss->w_socket.fd) <
-		    0) {
+		const int ret = snprintf(
+			peer, sizeof(peer), "[fd:%d]", ss->w_socket.fd);
+		if (ret < 0) {
 			peer[0] = '\0';
 		}
+		/* Truncation benign: snprintf null-terminates. */
 	}
 
 	return snprintf(
