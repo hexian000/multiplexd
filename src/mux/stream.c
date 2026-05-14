@@ -562,7 +562,6 @@ struct stream *stream_new(
 		.unacked_bytes = 0,
 		.deficit = 0,
 	};
-	stream_set_state(s, active_open ? STREAM_INIT : STREAM_SYN_RECEIVED);
 	ev_io_init(&s->socket.w_io, local_cb, -1, EV_NONE);
 	s->socket.w_io.data = s;
 	const double timeout = (double)conf->send_timeout;
@@ -573,7 +572,13 @@ struct stream *stream_new(
 		free(s);
 		return NULL;
 	}
-
+	if (active_open) {
+		COUNTER_ADD(ss->cnt.num_stream_opened, 1);
+	} else {
+		COUNTER_ADD(ss->cnt.num_stream_accepted, 1);
+	}
+	COUNTER_ADD(ss->cnt.num_streams, 1);
+	stream_set_state(s, active_open ? STREAM_INIT : STREAM_SYN_RECEIVED);
 	ev_timer_init(&s->w_tombstone, tombstone_cb, 0.0, 0.0);
 	s->w_tombstone.data = s;
 	STREAM_LOG_F(DEBUG, s, "created, state=%s", stream_state_str[s->state]);
@@ -860,11 +865,41 @@ uint_fast32_t stream_grant_inc(const struct stream *restrict s)
 	return grant;
 }
 
+/* In auto-window mode, lazily sync recv_window down to the current session
+ * stream_window target whenever the safety constraint is satisfied: all
+ * credit already granted to the peer has been consumed (outstanding == 0 or
+ * buffered + outstanding fits inside the new target).  Called at the top of
+ * stream_check_ack so every grant evaluation sees the up-to-date window. */
+static void stream_try_shrink_recv_window(struct stream *restrict s)
+{
+	if (!s->session->auto_window) {
+		return;
+	}
+	const uint_fast32_t target =
+		(uint_fast32_t)s->session->stream_window * MUX_MAX_PAYLOAD_SIZE;
+	if (target >= s->recv_window) {
+		return;
+	}
+	/* outstanding = credit peer may still spend (wrapping subtraction). */
+	const uint_fast32_t outstanding =
+		(uint_fast32_t)(s->grant_sent - s->bytes_received);
+	if (s->buffered_bytes + outstanding > target) {
+		return;
+	}
+	STREAM_LOG_F(
+		DEBUG, s,
+		"recv_window shrink: %" PRIuLEAST32 " -> %" PRIuFAST32
+		" (buffered=%" PRIuLEAST32 " outstanding=%" PRIuFAST32 ")",
+		s->recv_window, target, s->buffered_bytes, outstanding);
+	s->recv_window = target;
+}
+
 void stream_check_ack(struct stream *restrict s)
 {
 	if (s->state == STREAM_CLOSED) {
 		return;
 	}
+	stream_try_shrink_recv_window(s);
 	if (s->ack_pending) {
 		return;
 	}

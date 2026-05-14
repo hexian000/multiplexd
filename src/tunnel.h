@@ -100,6 +100,11 @@ const unsigned char *tunnel_session_id(const struct tunnel *t);
 
 /* Snapshot of per-tunnel statistics. */
 struct tunnel_stats {
+	/* borrowed pointer to the identity string for this tunnel's pool;
+	 * NULL for the top-level mux_tunnel (no identity pool) */
+	const char *peer_identity;
+	/* total tunnels in this identity's pool (1 for mux_tunnel) */
+	size_t num_tunnels;
 	bool established;
 	size_t rx_window;
 	size_t tx_window;

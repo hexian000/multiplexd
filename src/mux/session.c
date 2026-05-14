@@ -1127,39 +1127,44 @@ static bool update_stream_window_cb(
 	return true;
 }
 
-/* Grow the effective session and stream windows from the current BDP.
- * Both are monotonic floors; when stream_window rises, live streams receive
- * the extra recv credit immediately instead of waiting for new traffic. */
+/* Apply the current BDP estimate to the session and stream window floors.
+ * Both windows are derived from bdp_bytes + bdp_bytes/4 and are updated
+ * bidirectionally.  On shrink, per-stream recv_window is left intact so the
+ * peer can drain already-granted credit naturally.  On grow, live streams
+ * receive the extra recv credit immediately. */
 static void
 session_update_window(struct mux_session *restrict ss, const size_t bdp_bytes)
 {
 	const uint_least32_t floor_frames =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
-	const uint_least32_t session_frames = (uint_least32_t)MAX(
-		bdp_bytes / MUX_MAX_PAYLOAD_SIZE, floor_frames);
-	/* Leave 25% headroom so stream credit does not bottleneck first. */
-	const uint_least32_t stream_frames = (uint_least32_t)MAX(
-		bdp_bytes * 5u / 4u / MUX_MAX_PAYLOAD_SIZE, floor_frames);
-	if (session_frames <= ss->session_window &&
-	    stream_frames <= ss->stream_window) {
+	/* Add a fixed headroom fraction so neither window bottlenecks the other.
+	 * The same value is used for session and stream to avoid double-headroom. */
+	const size_t window_bytes = bdp_bytes + bdp_bytes / 4;
+	const uint_least32_t frames = (uint_least32_t)MAX(
+		window_bytes / MUX_MAX_PAYLOAD_SIZE, floor_frames);
+
+	if (ss->session_window == frames && ss->stream_window == frames) {
 		return;
 	}
-	if (session_frames > ss->session_window) {
-		ss->session_window = session_frames;
-	}
-	if (stream_frames > ss->stream_window) {
-		ss->stream_window = stream_frames;
-		const uint_fast32_t new_window =
-			(uint_fast32_t)ss->stream_window * MUX_MAX_PAYLOAD_SIZE;
-		if (ss->sched.streams != NULL) {
-			uint_fast32_t w = new_window;
+	ss->session_window = frames;
+
+	if (ss->stream_window != frames) {
+		const uint_least32_t old_stream = ss->stream_window;
+		ss->stream_window = frames;
+		if (frames > old_stream && ss->sched.streams != NULL) {
+			uint_fast32_t w =
+				(uint_fast32_t)frames * MUX_MAX_PAYLOAD_SIZE;
 			table_iterate(
 				ss->sched.streams, update_stream_window_cb, &w);
 		}
+		/* On shrink: leave per-stream recv_window intact now; each
+		 * stream lazily syncs its recv_window down inside
+		 * stream_check_ack once outstanding peer credit is consumed
+		 * and the safety constraint is satisfied. */
 	}
 	MUX_LOG_F(
-		INFO, ss, "estimator updated: session=%zu stream=%zu",
-		(size_t)ss->session_window * MUX_WINDOW_UNIT,
+		INFO, ss, "estimator updated: bdp=%zu session=%zu stream=%zu",
+		bdp_bytes, (size_t)ss->session_window * MUX_WINDOW_UNIT,
 		(size_t)ss->stream_window * MUX_WINDOW_UNIT);
 }
 
@@ -1593,12 +1598,10 @@ struct stream *session_open_stream(struct mux_session *restrict ss)
 	}
 	if (!sched_add_stream(ss, s)) {
 		MUX_LOG(ERROR, ss, "open_stream: stream_add failed");
-		free(s);
+		stream_free(s);
 		return NULL;
 	}
 	s->send_window = MUX_DEFAULT_SEND_WINDOW;
-	COUNTER_ADD(ss->cnt.num_stream_opened, 1);
-	COUNTER_ADD(ss->cnt.num_streams, 1);
 	MUX_LOG_F(DEBUG, ss, "opened stream %" PRIuFAST16, id);
 	sched_wake(ss, s);
 	MUX_LOG_F(

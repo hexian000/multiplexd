@@ -46,28 +46,23 @@ struct evlog_entry {
 	char message[256];
 };
 
+/* Session event ring buffer; owned by the server thread. */
+struct evlog {
+	struct evlog_entry entries[16];
+	size_t len; /* valid entries */
+	size_t pos; /* next write position */
+};
+
 /*
- * Performance monitoring is split into two routes:
+ * Two monitoring routes feed `server_stats()`:
  *
- *   counters route — `struct server_counters`, embedded in `struct server`.
- *     Fields are updated from any thread via the pointer block
- *     `struct session_counters` (see mux/mux.h) using the COUNTER_ADD/SUB/
- *     LOAD/STORE macros with memory_order_relaxed.
- *     Two semantic kinds live here:
- *       - monotonic counters (lifecycle, traffic, RST, errors, reconnects)
- *       - aggregated gauges that need cross-thread updates
- *         (recv_buffered_bytes, send_buffered_frames, unacked_frames),
- *         which use atomic add/sub for the same reason.
+ *   counters route — `struct server_counters` in `struct server`.
+ *     Updated from any thread via `struct session_counters` (mux/mux.h)
+ *     using COUNTER_* macros with memory_order_relaxed.
  *
- *   stats route — `struct server_runtime_stats`, embedded in `struct server`.
- *     Owned exclusively by the server thread; updated by direct access
- *     without atomics or pointer indirection.  Used for one-shot
- *     diagnostic samples (event log, stream-establish latency ring).
- *     `tunnel_stats()` is also part of this route: per-tunnel gauges
- *     are collected at snapshot time from the owning session.
- *
- * `server_stats()` produces a unified snapshot (`struct server_stats`)
- * combining both routes for the API server.
+ *   stats route — diagnostic fields in `struct server`, server-thread-only.
+ *     Covers the event log, stream-establish latency ring, and per-tunnel
+ *     gauges collected at snapshot time by `tunnel_stats()`.
  */
 
 /* Live cumulative counters and aggregated gauges embedded in struct server
@@ -76,160 +71,139 @@ struct evlog_entry {
  * consumers computing rates must handle a decrease in value as a counter
  * reset. */
 struct server_counters {
-	/* accepted connections from mux_listener */
-	uintmax_t num_accepted;
-	/* served connections from mux_listener (reached num_halfopen++) */
-	uintmax_t num_served;
-
-	/* accepted connections from tcp_listener */
-	uintmax_t num_accepted_tcp;
-	/* served connections from tcp_listener */
-	uintmax_t num_served_tcp;
-
-	/* accepted connections from api_listener */
-	uintmax_t num_accepted_api;
-	/* served connections from api_listener */
-	uintmax_t num_served_api;
-
-	/* session lifecycle counters (monotonic) */
-#if WITH_THREADS
-	atomic_uintmax_t num_session_created;
-	atomic_uintmax_t num_session_connect;
-	atomic_uintmax_t num_session_connected;
-	atomic_uintmax_t num_session_disconnected;
-	atomic_uintmax_t num_session_finalized;
-#else
-	uintmax_t num_session_created;
-	uintmax_t num_session_connect;
-	uintmax_t num_session_connected;
-	uintmax_t num_session_disconnected;
-	uintmax_t num_session_finalized;
-#endif
-	/* session gauges: maintained alongside the monotonic counters above */
-#if WITH_THREADS
-	/* sessions currently in ESTABLISHED state */
-	atomic_size_t num_sessions;
-	/* sessions currently in CONNECT or HANDSHAKE state */
-	atomic_size_t num_session_halfopen;
-#else
-	/* sessions currently in ESTABLISHED state */
-	size_t num_sessions;
-	/* sessions currently in CONNECT or HANDSHAKE state */
-	size_t num_session_halfopen;
-#endif
-	/* stream gauges: maintained alongside the monotonic counters above */
-#if WITH_THREADS
-	/* streams currently in any active (non-closed) state */
-	atomic_size_t num_streams;
-	/* streams currently in INIT, SYN_SENT, or SYN_RECEIVED state */
-	atomic_size_t num_stream_halfopen;
-#else
-	/* streams currently in any active (non-closed) state */
-	size_t num_streams;
-	/* streams currently in INIT, SYN_SENT, or SYN_RECEIVED state */
-	size_t num_stream_halfopen;
-#endif
-	/* stream lifecycle counters (monotonic) */
-#if WITH_THREADS
-	atomic_uintmax_t num_stream_opened;
-	/* total passive-open streams accepted from remote peer */
-	atomic_uintmax_t num_stream_accepted;
-	/* total active-open streams whose first flight used SYN|PUSH */
-	atomic_uintmax_t num_stream_fastopen;
-	atomic_uintmax_t num_stream_established;
-	atomic_uintmax_t num_stream_succeeded;
-	atomic_uintmax_t num_stream_failed;
-#else
-	uintmax_t num_stream_opened;
-	/* total passive-open streams accepted from remote peer */
-	uintmax_t num_stream_accepted;
-	/* total active-open streams whose first flight used SYN|PUSH */
-	uintmax_t num_stream_fastopen;
-	uintmax_t num_stream_established;
-	uintmax_t num_stream_succeeded;
-	uintmax_t num_stream_failed;
-#endif
-
-	/* mux connections dropped by startup_limit */
-	uintmax_t num_rejected;
+	/* listener counters — updated on the server thread only */
+	struct {
+		/* accepted connections from mux_listener */
+		uintmax_t num_accepted;
+		/* served connections from mux_listener (reached num_halfopen++) */
+		uintmax_t num_served;
+		/* accepted/served connections from tcp_listener */
+		uintmax_t num_accepted_tcp;
+		uintmax_t num_served_tcp;
+		/* accepted/served connections from api_listener */
+		uintmax_t num_accepted_api;
+		uintmax_t num_served_api;
+		/* mux connections dropped by startup_limit */
+		uintmax_t num_rejected;
 #if WITH_TLS
-	/* TLS accept failures (server mode) */
-	uintmax_t num_tls_failures;
+		/* TLS accept failures (server mode) */
+		uintmax_t num_tls_failures;
 #endif
-	/* client-mode reconnect attempts */
+	};
+
+	/* session lifecycle counters (monotonic) and gauges */
+	struct {
 #if WITH_THREADS
-	atomic_uintmax_t num_reconnects;
-	/* RST frames sent (aggregated) */
-	atomic_uintmax_t num_rst_sent;
-	/* RST frames received (aggregated) */
-	atomic_uintmax_t num_rst_recv;
-	/* stream_abort() calls (aggregated) */
-	atomic_uintmax_t num_stream_errors;
+		atomic_uintmax_t num_session_created;
+		atomic_uintmax_t num_session_connect;
+		atomic_uintmax_t num_session_connected;
+		atomic_uintmax_t num_session_disconnected;
+		atomic_uintmax_t num_session_finalized;
+		/* sessions currently in ESTABLISHED state */
+		atomic_size_t num_sessions;
+		/* sessions currently in CONNECT or HANDSHAKE state */
+		atomic_size_t num_session_halfopen;
 #else
-	uintmax_t num_reconnects;
-	/* RST frames sent (aggregated) */
-	uintmax_t num_rst_sent;
-	/* RST frames received (aggregated) */
-	uintmax_t num_rst_recv;
-	/* stream_abort() calls (aggregated) */
-	uintmax_t num_stream_errors;
+		uintmax_t num_session_created;
+		uintmax_t num_session_connect;
+		uintmax_t num_session_connected;
+		uintmax_t num_session_disconnected;
+		uintmax_t num_session_finalized;
+		/* sessions currently in ESTABLISHED state */
+		size_t num_sessions;
+		/* sessions currently in CONNECT or HANDSHAKE state */
+		size_t num_session_halfopen;
 #endif
+	};
 
-	/* bytes currently buffered in per-stream recvbuf rings (aggregated) */
+	/* stream lifecycle counters (monotonic) and gauges */
+	struct {
 #if WITH_THREADS
-	atomic_size_t recv_buffered_bytes;
-	/* frames currently queued in per-stream send_queue (aggregated) */
-	atomic_size_t send_buffered_frames;
-	/* frames held in the session unacked list (aggregated, spec §6.7.2) */
-	atomic_size_t unacked_frames;
-
-	/* aggregated traffic counters; updated atomically by session threads. */
-	atomic_uintmax_t traffic_byt_mux_recv;
-	atomic_uintmax_t traffic_byt_mux_sent;
-	atomic_uintmax_t traffic_byt_local_recv;
-	atomic_uintmax_t traffic_byt_local_sent;
+		/* streams currently in any active (non-closed) state */
+		atomic_size_t num_streams;
+		/* streams currently in INIT, SYN_SENT, or SYN_RECEIVED state */
+		atomic_size_t num_stream_halfopen;
+		atomic_uintmax_t num_stream_opened;
+		/* total passive-open streams accepted from remote peer */
+		atomic_uintmax_t num_stream_accepted;
+		/* total active-open streams whose first flight used SYN|PUSH */
+		atomic_uintmax_t num_stream_fastopen;
+		atomic_uintmax_t num_stream_established;
+		atomic_uintmax_t num_stream_succeeded;
+		atomic_uintmax_t num_stream_failed;
 #else
-	size_t recv_buffered_bytes;
-	/* frames currently queued in per-stream send_queue (aggregated) */
-	size_t send_buffered_frames;
-	/* frames held in the session unacked list (aggregated, spec §6.7.2) */
-	size_t unacked_frames;
-
-	/* aggregated traffic counters. */
-	uintmax_t traffic_byt_mux_recv;
-	uintmax_t traffic_byt_mux_sent;
-	uintmax_t traffic_byt_local_recv;
-	uintmax_t traffic_byt_local_sent;
+		/* streams currently in any active (non-closed) state */
+		size_t num_streams;
+		/* streams currently in INIT, SYN_SENT, or SYN_RECEIVED state */
+		size_t num_stream_halfopen;
+		uintmax_t num_stream_opened;
+		/* total passive-open streams accepted from remote peer */
+		uintmax_t num_stream_accepted;
+		/* total active-open streams whose first flight used SYN|PUSH */
+		uintmax_t num_stream_fastopen;
+		uintmax_t num_stream_established;
+		uintmax_t num_stream_succeeded;
+		uintmax_t num_stream_failed;
 #endif
-};
+	};
 
-/* One-shot diagnostic samples owned by the server thread (stats route).
- * Accessed without synchronization; consumers must run on the server
- * thread or call server_stats() to obtain a snapshot copy. */
-struct server_runtime_stats {
-	/* ring buffer of SYN->SYN|ACK latency samples */
-	size_t stream_establish_count;
-	intmax_t stream_establish_ns[256];
+	/* error and control counters */
+	struct {
+#if WITH_THREADS
+		/* client-mode reconnect attempts */
+		atomic_uintmax_t num_reconnects;
+		/* RST frames sent (aggregated) */
+		atomic_uintmax_t num_rst_sent;
+		/* RST frames received (aggregated) */
+		atomic_uintmax_t num_rst_recv;
+		/* stream_abort() calls (aggregated) */
+		atomic_uintmax_t num_stream_errors;
+#else
+		/* client-mode reconnect attempts */
+		uintmax_t num_reconnects;
+		/* RST frames sent (aggregated) */
+		uintmax_t num_rst_sent;
+		/* RST frames received (aggregated) */
+		uintmax_t num_rst_recv;
+		/* stream_abort() calls (aggregated) */
+		uintmax_t num_stream_errors;
+#endif
+	};
 
-	/* ring buffer recording session established/disconnected events */
-	struct evlog_entry eventlog[16];
-	/* number of valid entries */
-	size_t eventlog_len;
-	/* next write position */
-	size_t eventlog_pos;
-};
+	/* per-stream buffer gauges (aggregated) */
+	struct {
+#if WITH_THREADS
+		/* bytes currently buffered in per-stream recvbuf rings */
+		atomic_size_t recv_buffered_bytes;
+		/* frames currently queued in per-stream send_queue */
+		atomic_size_t send_buffered_frames;
+		/* frames held in the session unacked list (spec §6.7.2) */
+		atomic_size_t unacked_frames;
+#else
+		/* bytes currently buffered in per-stream recvbuf rings */
+		size_t recv_buffered_bytes;
+		/* frames currently queued in per-stream send_queue */
+		size_t send_buffered_frames;
+		/* frames held in the session unacked list (spec §6.7.2) */
+		size_t unacked_frames;
+#endif
+	};
 
-/* Per-identity snapshot populated by server_stats(). */
-struct identity_stats {
-	/* borrowed pointer into identity_peers[i].id */
-	const char *id;
-	/* number of tunnels in the pool */
-	size_t num_tunnels;
-	/* true when at least one session is in MUX_STATE_ESTABLISHED */
-	bool connected;
-	/* tunnel statistics from the first established session;
-	 * zero-initialised when !connected */
-	struct tunnel_stats tunnel;
+	/* aggregated traffic byte counters */
+	struct {
+#if WITH_THREADS
+		/* updated atomically by session threads */
+		atomic_uintmax_t traffic_byt_mux_recv;
+		atomic_uintmax_t traffic_byt_mux_sent;
+		atomic_uintmax_t traffic_byt_local_recv;
+		atomic_uintmax_t traffic_byt_local_sent;
+#else
+		uintmax_t traffic_byt_mux_recv;
+		uintmax_t traffic_byt_mux_sent;
+		uintmax_t traffic_byt_local_recv;
+		uintmax_t traffic_byt_local_sent;
+#endif
+	};
 };
 
 /* Collected snapshot of server statistics; all fields are plain (non-atomic)
@@ -274,15 +248,23 @@ struct server_stats {
 	uintmax_t traffic_byt_local_recv;
 	uintmax_t traffic_byt_local_sent;
 
-	/* --- stats route snapshot (mirrors struct server_runtime_stats
+	/* --- stats route snapshot (mirrors the runtime diagnostic fields
 	 * and per-identity tunnel_stats) --- */
+	/* number of latency samples in the ring (capped at 256); 0 = no data */
 	size_t stream_establish_count;
-	intmax_t stream_establish_ns[256];
-	struct evlog_entry eventlog[16];
-	size_t eventlog_len;
-	size_t eventlog_pos;
-	struct identity_stats identities[16];
-	size_t num_identities;
+	/* SYN->SYN|ACK latency percentiles (ns); valid when count > 0 */
+	intmax_t stream_establish_p50;
+	intmax_t stream_establish_p90;
+	intmax_t stream_establish_p99;
+	intmax_t stream_establish_pmax;
+
+	/* borrowed pointer into struct server; valid until free(server_stats(s)) */
+	const struct evlog *evlog;
+
+	/* number of entries in tunnels[] (mux_tunnel + identity pool members) */
+	size_t num_tunnels;
+	/* one entry per active tunnel; peer_identity is NULL for mux_tunnel */
+	struct tunnel_stats tunnels[];
 };
 
 struct server {
@@ -355,7 +337,11 @@ struct server {
 #endif
 
 	struct server_counters counters;
-	struct server_runtime_stats runtime;
+
+	/* stats route: server-thread-only diagnostics; read via server_stats() */
+	size_t stream_establish_count; /* SYN->SYN|ACK latency ring: count */
+	intmax_t stream_establish_ns[256]; /* SYN->SYN|ACK latency samples (ns) */
+	struct evlog evlog; /* session event ring buffer */
 
 	/* Rate tracking state for POST /stats bandwidth display */
 	struct {
@@ -394,11 +380,10 @@ void server_stop(struct server *s);
 void server_free(struct server *s);
 
 /**
- * @brief Collect a consistent snapshot of all server statistics.
+ * @brief Allocate and return a consistent snapshot of all server statistics.
  * @param s The server to inspect.
- * @param out Output snapshot filled on success.
+ * @return Heap-allocated snapshot; caller must free(). NULL on OOM (logged).
  */
-void server_stats(
-	const struct server *restrict s, struct server_stats *restrict out);
+struct server_stats *server_stats(const struct server *restrict s);
 
 #endif /* SERVER_H */

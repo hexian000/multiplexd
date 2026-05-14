@@ -3654,7 +3654,7 @@ T_DECLARE_CASE(test_bdp_auto_session_window_matches_stream_window)
 	T_EXPECT(
 		fx.cli->session_window >
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
-	/* Stream target carries 25% headroom: stream_window >= session_window. */
+	/* Both windows derive from the same target; stream_window == session_window. */
 	T_EXPECT(fx.cli->stream_window >= fx.cli->session_window);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 
@@ -3710,8 +3710,8 @@ cleanup:
 
 /* -------------------------------------------------------------------------
  * test_bdp_auto_stream_window_tracks_session_window: in automatic window
- * mode, session_update_window derives stream_window with a 25% headroom
- * over the session BDP so stream_window >= session_window after any update.
+ * mode, session_update_window sets both session_window and stream_window to
+ * the same target (bdp + headroom), so stream_window == session_window.
  * ---------------------------------------------------------------------- */
 
 T_DECLARE_CASE(test_bdp_auto_stream_window_tracks_session_window)
@@ -3764,7 +3764,7 @@ T_DECLARE_CASE(test_bdp_auto_stream_window_tracks_session_window)
 	ringbuf_produce(fx.cli->wire.recvbuf, frame_size);
 	session_recv_pong(fx.cli, &hdr, frame_size);
 
-	/* Stream target carries 25% headroom: stream_window >= session_window. */
+	/* Both windows derive from the same target; stream_window == session_window. */
 	T_EXPECT(fx.cli->stream_window >= fx.cli->session_window);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 

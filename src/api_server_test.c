@@ -779,8 +779,14 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	T_CHECK(fx.srv.identities != NULL);
 	fx.srv.num_identities = 2;
 	fx.srv.identities[0].peer_identity = "peer-offline";
-	fx.srv.identities[0].tunnels = NULL;
-	fx.srv.identities[0].num_tunnels = 0;
+	struct tunnel *t0 = make_established_tunnel(&fx, "peer-offline", 0);
+	T_CHECK(t0 != NULL);
+	/* Reset to non-established so tunnel_stats() reports !established. */
+	tunnel_session(t0)->state = SESSION_CONNECT;
+	fx.srv.identities[0].tunnels = malloc(sizeof(struct tunnel *));
+	T_CHECK(fx.srv.identities[0].tunnels != NULL);
+	fx.srv.identities[0].tunnels[0] = t0;
+	fx.srv.identities[0].num_tunnels = 1;
 	fx.srv.identities[1].peer_identity = "peer-online";
 	struct tunnel *restrict t1 =
 		make_established_tunnel(&fx, "peer-online", 3);
@@ -933,8 +939,8 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 	STORE_STAT(fx.srv.counters.traffic_byt_local_recv, 3456);
 	STORE_STAT(fx.srv.counters.traffic_byt_local_sent, 4567);
 	fx.srv.counters.num_stream_established = 2;
-	fx.srv.runtime.stream_establish_ns[0] = 1000 * 1000;
-	fx.srv.runtime.stream_establish_ns[1] = 2 * 1000 * 1000;
+	fx.srv.stream_establish_ns[0] = 1000 * 1000;
+	fx.srv.stream_establish_ns[1] = 2 * 1000 * 1000;
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);

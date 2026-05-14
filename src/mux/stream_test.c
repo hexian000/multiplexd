@@ -393,6 +393,80 @@ T_DECLARE_CASE(test_stream_recv_fin_with_rx_eof_shuts_down_write)
 	teardown_fixture(&fx);
 }
 
+/* When auto_window is enabled and the session stream_window has been reduced
+ * below a stream's recv_window, stream_check_ack must shrink recv_window as
+ * soon as no outstanding peer credit remains and all buffered bytes fit within
+ * the new target. */
+T_DECLARE_CASE(test_stream_check_ack_shrinks_recv_window_when_safe)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.auto_window = true;
+	/* New BDP target: 2 frames. */
+	fx.ss.stream_window = 2;
+
+	struct stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+
+	/* Force recv_window to a larger old value. */
+	const uint_fast32_t old_window = 8u * MUX_MAX_PAYLOAD_SIZE;
+	s->recv_window = old_window;
+	/* No outstanding credit: grant_sent == bytes_received. */
+	s->grant_sent = 0;
+	s->bytes_received = 0;
+	s->buffered_bytes = 0;
+
+	stream_check_ack(s);
+
+	const uint_fast32_t expected =
+		(uint_fast32_t)fx.ss.stream_window * MUX_MAX_PAYLOAD_SIZE;
+	T_EXPECT_EQ(s->recv_window, expected);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* stream_check_ack must NOT shrink recv_window while there is still
+ * outstanding credit the peer may spend (buffered + outstanding > target). */
+T_DECLARE_CASE(test_stream_check_ack_does_not_shrink_while_outstanding)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.auto_window = true;
+	/* New BDP target: 2 frames. */
+	fx.ss.stream_window = 2;
+
+	struct stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+
+	const uint_fast32_t old_window = 8u * MUX_MAX_PAYLOAD_SIZE;
+	s->recv_window = old_window;
+
+	/* Peer still has three frames of outstanding credit, which exceeds the
+	 * two-frame target: buffered(0) + outstanding(3) > target(2). */
+	s->bytes_received = 0;
+	s->grant_sent = 3u * (uint_least32_t)MUX_MAX_PAYLOAD_SIZE;
+	s->buffered_bytes = 0;
+
+	const uint_fast32_t target =
+		(uint_fast32_t)fx.ss.stream_window * MUX_MAX_PAYLOAD_SIZE;
+	/* outstanding > target so the shrink must be deferred. */
+	T_CHECK((uint_fast32_t)(s->grant_sent - s->bytes_received) > target);
+
+	stream_check_ack(s);
+
+	T_EXPECT_EQ(s->recv_window, old_window);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -405,5 +479,7 @@ int main(void)
 	T_RUN_CASE(t, test_stream_close_with_unread_data_sends_rst);
 	T_RUN_CASE(t, test_stream_shutdown_marks_rx_eof);
 	T_RUN_CASE(t, test_stream_recv_fin_with_rx_eof_shuts_down_write);
+	T_RUN_CASE(t, test_stream_check_ack_shrinks_recv_window_when_safe);
+	T_RUN_CASE(t, test_stream_check_ack_does_not_shrink_while_outstanding);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

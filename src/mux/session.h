@@ -195,13 +195,13 @@ struct mux_session {
 	bool draining : 1;
 
 	/* Effective unacked-frame cap for the session; updated from the learned
-	 * BDP whenever automatic window sizing is enabled.  Monotonically
-	 * non-decreasing: a lower BDP estimate does not shrink it. */
+	 * BDP whenever automatic window sizing is enabled.  Tracks the BDP
+	 * bidirectionally: grows and shrinks with the estimate. */
 	uint_least32_t session_window;
 	/* Effective per-stream receive window (frames); in auto mode tracks the
 	 * BDP with headroom so per-stream credit is never the bottleneck.
-	 * Monotonically non-decreasing: BDP growth expands it; a lower BDP
-	 * estimate is ignored. */
+	 * Tracks the BDP bidirectionally: grows and shrinks with the estimate;
+	 * already-granted per-stream recv_window is not clawed back on shrink. */
 	uint_least32_t stream_window;
 	/* Peer's effective per-stream receive window (frames); updated
 	 * unconditionally on each SYN and SYN|ACK (supports shrinking);

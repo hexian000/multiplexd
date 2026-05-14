@@ -342,6 +342,12 @@ void stream_close(struct stream *s)
 	free(s);
 }
 
+void stream_free(struct stream *s)
+{
+	fuzz_untrack_stream(s);
+	free(s);
+}
+
 void stream_recv_rst(struct stream *s)
 {
 	(void)s;

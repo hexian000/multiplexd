@@ -191,12 +191,11 @@ static struct tunnel *tunnel_iter_next(
 static void
 server_evlogf(struct server *restrict srv, const char *restrict fmt, ...)
 {
-	struct server_runtime_stats *restrict stats = &srv->runtime;
-	const size_t evlog_size = ARRAY_SIZE(stats->eventlog);
+	struct evlog *restrict evlog = &srv->evlog;
+	const size_t evlog_size = ARRAY_SIZE(evlog->entries);
 	const time_t now = time(NULL);
 	/* Format directly into the candidate slot. */
-	struct evlog_entry *restrict entry =
-		&stats->eventlog[stats->eventlog_pos];
+	struct evlog_entry *restrict entry = &evlog->entries[evlog->pos];
 	va_list ap;
 	va_start(ap, fmt);
 	if (vsnprintf(entry->message, sizeof(entry->message), fmt, ap) < 0) {
@@ -204,10 +203,9 @@ server_evlogf(struct server *restrict srv, const char *restrict fmt, ...)
 	}
 	va_end(ap);
 	/* Merge into the previous entry if the message is identical. */
-	if (stats->eventlog_len > 0) {
-		const size_t prev =
-			(stats->eventlog_pos + evlog_size - 1) % evlog_size;
-		struct evlog_entry *restrict last = &stats->eventlog[prev];
+	if (evlog->len > 0) {
+		const size_t prev = (evlog->pos + evlog_size - 1) % evlog_size;
+		struct evlog_entry *restrict last = &evlog->entries[prev];
 		if (strncmp(last->message, entry->message,
 			    sizeof(last->message)) == 0) {
 			last->timestamp = now;
@@ -217,9 +215,9 @@ server_evlogf(struct server *restrict srv, const char *restrict fmt, ...)
 	}
 	entry->timestamp = now;
 	entry->count = 1;
-	stats->eventlog_pos = (stats->eventlog_pos + 1) % evlog_size;
-	if (stats->eventlog_len < evlog_size) {
-		stats->eventlog_len++;
+	evlog->pos = (evlog->pos + 1) % evlog_size;
+	if (evlog->len < evlog_size) {
+		evlog->len++;
 	}
 }
 
@@ -316,10 +314,10 @@ handle_disconnected(struct server *restrict srv, struct tunnel *restrict t)
 static void
 handle_stream_established(struct server *restrict srv, intmax_t lat_ns)
 {
-	const size_t idx = srv->runtime.stream_establish_count %
-			   ARRAY_SIZE(srv->runtime.stream_establish_ns);
-	srv->runtime.stream_establish_ns[idx] = lat_ns;
-	srv->runtime.stream_establish_count++;
+	const size_t idx = srv->stream_establish_count %
+			   ARRAY_SIZE(srv->stream_establish_ns);
+	srv->stream_establish_ns[idx] = lat_ns;
+	srv->stream_establish_count++;
 }
 
 static void handle_closed(
@@ -1807,10 +1805,59 @@ void server_free(struct server *srv)
 	free(srv);
 }
 
-void server_stats(
+static int cmp_intmax(const void *a, const void *b)
+{
+	const intmax_t va = *(const intmax_t *)a;
+	const intmax_t vb = *(const intmax_t *)b;
+	if (va < vb) {
+		return -1;
+	}
+	if (va > vb) {
+		return 1;
+	}
+	return 0;
+}
+
+/* Fills the p50/p90/p99/pmax percentile fields in *out from the latency ring
+ * buffer and returns the number of samples used (0 when the ring is empty). */
+static size_t calc_stream_percentiles(
 	const struct server *restrict s, struct server_stats *restrict out)
 {
-	*out = (struct server_stats){ 0 };
+	const size_t ring = ARRAY_SIZE(s->stream_establish_ns);
+	const size_t count = MIN(s->stream_establish_count, ring);
+	if (count == 0) {
+		return 0;
+	}
+	intmax_t samples[256];
+	for (size_t i = 0; i < count; i++) {
+		const size_t idx = (s->stream_establish_count - i - 1) % ring;
+		samples[i] = s->stream_establish_ns[idx];
+	}
+	qsort(samples, count, sizeof(samples[0]), cmp_intmax);
+	const size_t i50 = (50 * count) / 100;
+	const size_t i90 = (90 * count) / 100;
+	const size_t i99 = (99 * count) / 100;
+	out->stream_establish_p50 = samples[i50 < count ? i50 : count - 1];
+	out->stream_establish_p90 = samples[i90 < count ? i90 : count - 1];
+	out->stream_establish_p99 = samples[i99 < count ? i99 : count - 1];
+	out->stream_establish_pmax = samples[count - 1];
+	return count;
+}
+
+struct server_stats *server_stats(const struct server *restrict s)
+{
+	/* Count tunnels: mux_tunnel (0 or 1) plus all identity pool members. */
+	size_t n = (s->mux_tunnel != NULL ? 1 : 0);
+	for (size_t i = 0; i < s->num_identities; i++) {
+		n += s->identities[i].num_tunnels;
+	}
+
+	struct server_stats *out =
+		calloc(1, sizeof(*out) + n * sizeof(out->tunnels[0]));
+	if (out == NULL) {
+		LOGOOM();
+		return NULL;
+	}
 
 	const struct server_counters *restrict c = &s->counters;
 	out->num_accepted = c->num_accepted;
@@ -1906,30 +1953,26 @@ void server_stats(
 	out->unacked_frames = c->unacked_frames;
 #endif
 
-	const struct server_runtime_stats *restrict r = &s->runtime;
-	out->stream_establish_count = r->stream_establish_count;
-	memcpy(out->stream_establish_ns, r->stream_establish_ns,
-	       sizeof(out->stream_establish_ns));
-	memcpy(out->eventlog, r->eventlog, sizeof(out->eventlog));
-	out->eventlog_len = r->eventlog_len;
-	out->eventlog_pos = r->eventlog_pos;
+	out->stream_establish_count = calc_stream_percentiles(s, out);
+	out->evlog = &s->evlog;
 
-	out->num_identities =
-		MIN(s->num_identities, ARRAY_SIZE(out->identities));
-	for (size_t i = 0; i < out->num_identities; i++) {
+	size_t idx = 0;
+	if (s->mux_tunnel != NULL) {
+		out->tunnels[idx].peer_identity = NULL;
+		out->tunnels[idx].num_tunnels = 1;
+		tunnel_stats(s->mux_tunnel, &out->tunnels[idx]);
+		idx++;
+	}
+	for (size_t i = 0; i < s->num_identities; i++) {
 		const struct identity_listener *restrict sl = &s->identities[i];
-		out->identities[i].id = sl->peer_identity;
-		out->identities[i].num_tunnels = sl->num_tunnels;
-		out->identities[i].connected = false;
 		for (size_t j = 0; j < sl->num_tunnels; j++) {
-			if (tunnel_state(sl->tunnels[j]) ==
-			    MUX_STATE_ESTABLISHED) {
-				out->identities[i].connected = true;
-				tunnel_stats(
-					sl->tunnels[j],
-					&out->identities[i].tunnel);
-				break;
-			}
+			out->tunnels[idx].peer_identity = sl->peer_identity;
+			out->tunnels[idx].num_tunnels = sl->num_tunnels;
+			tunnel_stats(sl->tunnels[j], &out->tunnels[idx]);
+			idx++;
 		}
 	}
+	out->num_tunnels = idx;
+
+	return out;
 }

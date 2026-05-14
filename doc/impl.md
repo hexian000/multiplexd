@@ -491,9 +491,9 @@ cannot starve a live stream forever.
 
 Automatic mode requires both configured window fields to be zero. The effective
 session cap and per-stream receive window both start at
-`MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT` frames and then grow
-monotonically from the learned BDP; when the session cap is reached,
-`send_stalled` throttles payload scheduling rather than closing the session.
+`MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT` frames and track the BDP estimate
+bidirectionally; when the session cap is reached, `send_stalled` throttles
+payload scheduling rather than closing the session.
 
 ## 11. Delayed ACK and Coalescing Timer Behavior
 
@@ -538,8 +538,9 @@ session leaves the steady-state path.
 
 The estimator is active only in automatic mode (`session_window = 0` and
 `stream_window = 0` in config). It learns a byte-domain BDP from inbound
-payload-driven probe cycles; `session_window` and `stream_window` are monotonic
-frame-domain projections of that estimate, not the raw estimate itself.
+payload-driven probe cycles; `session_window` and `stream_window` are
+frame-domain projections of that estimate derived from `bdp + bdp/4`, and
+track it bidirectionally.
 
 ```mermaid
 flowchart LR
@@ -547,9 +548,12 @@ flowchart LR
   B --> C[queue PING and accumulate sample]
   C --> D[PONG]
   D --> E[estimator_calculate]
-  E --> F[session_window target]
-  E --> G[stream_window target = 1.25x]
-  G --> H[expand live stream recv_window]
+  E --> F[bdp = pure physical BDP]
+  F --> G[session_update_window]
+  G --> H[session_window = stream_window = bdp + bdp/4]
+  H --> I[grow: expand live stream recv_window immediately;
+shrink: lazily sync recv_window down in stream_check_ack
+once outstanding peer credit is consumed]
 ```
 
 ### 12.1 Core Equations
@@ -565,11 +569,17 @@ valid_cycle = sample >= 2 * MUX_MAX_PAYLOAD_SIZE
 window_limited = sample + MUX_MAX_PAYLOAD_SIZE >= cycle_window_bytes
 rtt_sample = (now_ns - probe_sent_ns) / 1e9
 bw_sample = sample / rtt_sample
-target = max(sample_max, bw_max * rtt_min * 1.25)
+target = clamp(max(sample_max, bw_max * rtt_min), MIN_BDP, BDP_LIMIT)
 floor_frames = MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT
-session_window = max(floor(bdp / MUX_MAX_PAYLOAD_SIZE), floor_frames)
-stream_window = max(floor((bdp * 5 / 4) / MUX_MAX_PAYLOAD_SIZE), floor_frames)
+window_bytes = bdp + bdp / 4
+window_frames = max(floor(window_bytes / MUX_MAX_PAYLOAD_SIZE), floor_frames)
+session_window = window_frames
+stream_window  = window_frames
 ```
+
+`bdp` is the pure physical BDP with no headroom. The fixed headroom fraction
+(`bdp / 4`) is added exclusively in `session_update_window` so that the two
+sites never independently amplify it.
 
 ### 12.2 Probe Lifecycle
 
@@ -595,25 +605,42 @@ completed by PONG or by timeout detection on the next payload.
 
 **`TRACK`**
 
-| Condition                        | Action                                                               | Next phase           |
-| -------------------------------- | -------------------------------------------------------------------- | -------------------- |
-| `valid_cycle && target > bdp`    | `bdp = min(target, BDP_LIMIT)`                                       | `TRACK`              |
-| `valid_cycle && window_limited`  | increment `saturated_rounds`; if it reaches 2, re-probe aggressively | `TRACK` or `STARTUP` |
-| `valid_cycle && !window_limited` | `saturated_rounds = 0`                                               | `TRACK`              |
+| Condition                                                         | Action                                                                                   | Next phase           |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | -------------------- |
+| `!valid_cycle`                                                    | no change to `bdp`; `bw_wnd`/`sample_wnd` age naturally                                  | `TRACK`              |
+| `valid_cycle`, rtt_min aged, `rtt_sample >= INFLATE_HI * rtt_min` | increment `inflated_rounds`; when it reaches `INFLATE_ROUNDS`, force-age and reset `bdp` | `TRACK`              |
+| `valid_cycle`, rtt_min aged, `rtt_sample <= INFLATE_LO * rtt_min` | clear `inflated_rounds`                                                                  | `TRACK`              |
+| `valid_cycle` (any ratio)                                         | `bdp = clamp(max(sample_max, bw_max * rtt_min), MIN_BDP, BDP_LIMIT)` (bidirectional)     | `TRACK`              |
+| `valid_cycle && window_limited`                                   | increment `saturated_rounds`; if it reaches 2, re-probe aggressively                     | `TRACK` or `STARTUP` |
+| `valid_cycle && !window_limited`                                  | `saturated_rounds = 0`                                                                   | `TRACK`              |
 
-Constants: `BDP_LIMIT = 16 MiB`, `RTT_WND_NS = 300 s`, `BW_WND_NS = 600 s`.
+**RTT inflation force-age** collapses all three slots of `bw_wnd` and
+`sample_wnd` to the current cycle's values, then clears both `inflated_rounds`
+and `saturated_rounds`. The guard `now - rtt_wnd[0].t >= RTT_WND_NS / 4`
+skips the inflation check until `rtt_min` has been calibrated for at least
+75 s, preventing false force-ages during warm-up.
+
+Constants: `BDP_LIMIT = UINT16_MAX * MUX_WINDOW_UNIT` (≈ 1 GiB; single
+WINDOW_UPDATE grant encoding limit), `MIN_BDP = MUX_INITIAL_SEND_WINDOW`,
+`RTT_WND_NS = 300 s`, `BW_WND_NS = 600 s`,
+`INFLATE_HI = 1.5`, `INFLATE_LO = 1.2`, `INFLATE_ROUNDS = 3`.
 
 ### 12.4 Window Update and Lifecycle
 
-| Event                     | Result                                                                                                                                                        |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Manual mode               | The estimator is inert; configured frame counts are used as-is.                                                                                               |
-| Automatic mode            | Mixed config is normalised away; effective windows start at `floor_frames` and grow monotonically.                                                            |
-| `session_update_window()` | `session_window` tracks raw BDP in frames; `stream_window` tracks `1.25x` BDP in frames; live streams expand `recv_window` immediately when the target grows. |
-| `estimator_stop()`        | Reset phase, RTT/BW filters, probe state, and rate-limit timestamp; bump `epoch_ns`; keep the current effective windows in place across reconnect.            |
+| Event                     | Result                                                                                                                                                                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Manual mode               | The estimator is inert; configured frame counts are used as-is.                                                                                                                                                                                               |
+| Automatic mode            | Mixed config is normalised away; effective windows start at `floor_frames` and track the BDP bidirectionally.                                                                                                                                                 |
+| `session_update_window()` | Both `session_window` and `stream_window` are set to `window_frames`; live streams expand `recv_window` immediately on grow; on shrink, each stream's `recv_window` is lazily synced down by `stream_check_ack` once `buffered_bytes + outstanding ≤ target`. |
+| `estimator_stop()`        | Reset phase, RTT/BW filters, probe state, and rate-limit timestamp; bump `epoch_ns`; keep the current effective windows in place across reconnect.                                                                                                            |
 
-The raw `bdp` estimate may move down, but effective windows do not shrink and
-already granted stream credit is never clawed back.
+When `bdp` decreases, `session_window` and `stream_window` follow it down.
+Each stream's `recv_window` is lazily synced to the new target inside
+`stream_check_ack`: the shrink is applied as soon as
+`buffered_bytes + outstanding ≤ target`, where `outstanding = grant_sent -
+bytes_received` is the credit the peer may still spend.  Until that
+condition holds, the stream retains the old (larger) window so the peer is
+never asked to respect a limit below what it has already been granted.
 
 ## 13. Two Local I/O Modes
 

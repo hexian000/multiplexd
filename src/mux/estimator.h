@@ -45,13 +45,18 @@ struct estimator_ctx {
 	struct estimator_wnd_slot bw_wnd[3];
 	/* 3-slot windowed maximum sample size; [0].val is the max, 0.0 = uninit. */
 	struct estimator_wnd_slot sample_wnd[3];
-	/* BDP estimate in bytes; 0 = none yet. */
+	/* Pure physical BDP estimate in bytes, with no headroom; 0 = none yet.
+	 * Headroom is added by session_update_window, not stored here. */
 	size_t bdp;
 	/* Estimator phase: STARTUP grows the window aggressively; TRACK refines
 	 * the BDP estimate using windowed BW and sample statistics. */
 	enum estimator_phase phase;
 	/* Consecutive window-limited rounds counted in TRACK phase. */
 	uint_least8_t saturated_rounds;
+	/* Consecutive valid cycles with rtt_sample >= INFLATE_HI * rtt_min;
+	 * reset to 0 when ratio drops below INFLATE_LO or rtt_min is not
+	 * yet aged past RTT_WND_NS/4. Triggers force-age at INFLATE_ROUNDS. */
+	uint_least8_t inflated_rounds;
 	bool ping_in_flight : 1;
 	/* true when the session was send-stalled (unacked >= session_window)
 	 * at the moment the probe PING was fired; used in STARTUP to detect

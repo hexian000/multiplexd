@@ -132,56 +132,6 @@ static bool parse_bool(const char *s)
 			     strcmp(s, "t") == 0 || strcmp(s, "true") == 0);
 }
 
-struct stream_percentiles {
-	intmax_t p50;
-	intmax_t p90;
-	intmax_t p99;
-	intmax_t pmax;
-};
-
-static int comp_intmax(const void *a, const void *b)
-{
-	const intmax_t va = *(const intmax_t *)a;
-	const intmax_t vb = *(const intmax_t *)b;
-	if (va < vb) {
-		return -1;
-	}
-	if (va > vb) {
-		return 1;
-	}
-	return 0;
-}
-
-static size_t api_stream_percentiles(
-	const struct server_stats *restrict stats,
-	struct stream_percentiles *restrict out)
-{
-	*out = (struct stream_percentiles){ 0 };
-	const size_t count =
-		MIN(stats->stream_establish_count,
-		    ARRAY_SIZE(stats->stream_establish_ns));
-	if (count == 0) {
-		return 0;
-	}
-
-	intmax_t samples[ARRAY_SIZE(stats->stream_establish_ns)];
-	for (size_t i = 0; i < count; i++) {
-		const size_t idx = (stats->stream_establish_count - i - 1) %
-				   ARRAY_SIZE(stats->stream_establish_ns);
-		samples[i] = stats->stream_establish_ns[idx];
-	}
-
-	qsort(samples, count, sizeof(samples[0]), comp_intmax);
-	const size_t i50 = (count * 50) / 100;
-	const size_t i90 = (count * 90) / 100;
-	const size_t i99 = (count * 99) / 100;
-	out->p50 = samples[i50 < count ? i50 : count - 1];
-	out->p90 = samples[i90 < count ? i90 : count - 1];
-	out->p99 = samples[i99 < count ? i99 : count - 1];
-	out->pmax = samples[count - 1];
-	return count;
-}
-
 /* Writes an HTTP response with the given status code and empty body. */
 static void respond_status(struct api_ctx *restrict ctx, const int code)
 {
@@ -262,11 +212,11 @@ static void append_stateful_stats(
 						 s->rate_tracker.byt_local_sent;
 		FORMAT_BYTES(tx_local, (double)byt_local_sent / dt);
 		BUF_APPENDF(
-			ctx->rbuf, "%-20s: Rx %s/s, Tx %s/s\n",
-			"Mux Throughput", rx_mux, tx_mux);
+			ctx->rbuf, "Mux Throughput      : Rx %s/s, Tx %s/s\n",
+			rx_mux, tx_mux);
 		BUF_APPENDF(
-			ctx->rbuf, "%-20s: Rx %s/s, Tx %s/s\n",
-			"TCP Throughput", rx_local, tx_local);
+			ctx->rbuf, "TCP Throughput      : Rx %s/s, Tx %s/s\n",
+			rx_local, tx_local);
 	}
 	{
 		char load_str[16] = "(unknown)";
@@ -278,7 +228,7 @@ static void append_stateful_stats(
 		}
 		FORMAT_DURATION(dt_str, make_duration(dt));
 		BUF_APPENDF(
-			ctx->rbuf, "%-20s: %s (last %s)\n", "Server Load",
+			ctx->rbuf, "Server Load         : %s (last %s)\n",
 			load_str, dt_str);
 	}
 
@@ -289,39 +239,34 @@ static void append_stateful_stats(
 	s->rate_tracker.timestamp = now;
 }
 
-/* Appends the per-identity session status section to the response body. */
+/* Appends the per-tunnel session status section to the response body. */
 static void append_sessions(
 	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
 {
 	BUF_APPENDSTR(ctx->rbuf, "\n> Sessions\n");
-	for (size_t i = 0; i < stats->num_identities; i++) {
-		const struct identity_stats *restrict ident =
-			&stats->identities[i];
-		if (!ident->connected) {
-			BUF_APPENDF(ctx->rbuf, "%-20s: offline\n", ident->id);
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		const struct tunnel_stats *restrict t = &stats->tunnels[i];
+		const char *id =
+			t->peer_identity != NULL ? t->peer_identity : "(mux)";
+		if (!t->established) {
+			BUF_APPENDF(ctx->rbuf, "%-20s: offline\n", id);
 			continue;
 		}
-		if (ident->tunnel.rtt_ns > 0) {
-			const double rtt_s =
-				(double)ident->tunnel.rtt_ns * 1e-9;
-			FORMAT_BYTES(
-				rx_str,
-				(double)ident->tunnel.rx_window / rtt_s);
-			FORMAT_BYTES(
-				tx_str,
-				(double)ident->tunnel.tx_window / rtt_s);
+		if (t->rtt_ns > 0) {
+			const double rtt_s = (double)t->rtt_ns * 1e-9;
+			FORMAT_BYTES(rx_str, (double)t->rx_window / rtt_s);
+			FORMAT_BYTES(tx_str, (double)t->tx_window / rtt_s);
 			FORMAT_DURATION(
-				rtt_str,
-				make_duration_nanos(ident->tunnel.rtt_ns));
+				rtt_str, make_duration_nanos(t->rtt_ns));
 			BUF_APPENDF(
 				ctx->rbuf,
-				"%-20s: BW=Rx %s/s, Tx %s/s; RTT %s\n",
-				ident->id, rx_str, tx_str, rtt_str);
+				"%-20s: BW=Rx %s/s, Tx %s/s; RTT %s\n", id,
+				rx_str, tx_str, rtt_str);
 		} else {
-			FORMAT_BYTES(rx_str, ident->tunnel.rx_window);
-			FORMAT_BYTES(tx_str, ident->tunnel.tx_window);
+			FORMAT_BYTES(rx_str, t->rx_window);
+			FORMAT_BYTES(tx_str, t->tx_window);
 			BUF_APPENDF(
-				ctx->rbuf, "%-20s: W=Rx %s, Tx %s\n", ident->id,
+				ctx->rbuf, "%-20s: W=Rx %s, Tx %s\n", id,
 				rx_str, tx_str);
 		}
 	}
@@ -332,12 +277,13 @@ static void append_eventlog(
 	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
 {
 	BUF_APPENDSTR(ctx->rbuf, "\n> Recent Events\n");
-	const size_t evlog_size = ARRAY_SIZE(stats->eventlog);
-	const size_t n = MIN(stats->eventlog_len, 10);
+	const struct evlog *restrict evlog = stats->evlog;
+	const size_t evlog_size = ARRAY_SIZE(evlog->entries);
+	const size_t n = MIN(evlog->len, 10);
 	for (size_t i = 0; i < n; i++) {
 		const size_t idx =
-			(stats->eventlog_pos + evlog_size - 1 - i) % evlog_size;
-		const struct evlog_entry *restrict e = &stats->eventlog[idx];
+			(evlog->pos + evlog_size - 1 - i) % evlog_size;
+		const struct evlog_entry *restrict e = &evlog->entries[idx];
 		char ts[32] = "(unknown)";
 		if (e->timestamp != (time_t)-1) {
 			(void)format_rfc3339(
@@ -373,11 +319,11 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 
 	struct server *restrict s = ctx->s;
 	const struct config *restrict conf = s->conf;
-	struct server_stats stats;
-	server_stats(s, &stats);
-	struct stream_percentiles stream_percentiles;
-	const size_t stream_samples =
-		api_stream_percentiles(&stats, &stream_percentiles);
+	struct server_stats *restrict stats = server_stats(s);
+	if (stats == NULL) {
+		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
+		return;
+	}
 
 	const intmax_t now = clock_monotonic_ns();
 	const time_t server_time = time(NULL);
@@ -399,91 +345,97 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 			ctx->rbuf, "%s %s\n  %s\n\n", PROJECT_NAME, PROJECT_VER,
 			PROJECT_HOMEPAGE);
 	}
-	BUF_APPENDF(ctx->rbuf, "%-20s: %s\n", "Server Time", timestamp);
+	BUF_APPENDF(ctx->rbuf, "Server Time         : %s\n", timestamp);
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %s (mode: %s)\n", "Uptime", str_uptime,
+		ctx->rbuf, "Uptime              : %s (mode: %s)\n", str_uptime,
 		server_modestr(conf));
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %zu / %ju (+%zu)\n", "Sessions",
-		stats.num_sessions,
-		stats.num_session_created - stats.num_session_finalized,
-		stats.num_session_halfopen);
+		ctx->rbuf, "Sessions            : %zu / %ju (+%zu)\n",
+		stats->num_sessions,
+		stats->num_session_created - stats->num_session_finalized,
+		stats->num_session_halfopen);
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %zu (+%zu)\n", "Streams", stats.num_streams,
-		stats.num_stream_halfopen);
+		ctx->rbuf, "Streams             : %zu (+%zu)\n",
+		stats->num_streams, stats->num_stream_halfopen);
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %ju active (%ju fastopen), %ju passive\n",
-		"Stream Opens", stats.num_stream_opened,
-		stats.num_stream_fastopen, stats.num_stream_accepted);
-	if (stream_samples > 0) {
+		ctx->rbuf,
+		"Stream Opens        : %ju active (%ju fastopen), %ju passive\n",
+		stats->num_stream_opened, stats->num_stream_fastopen,
+		stats->num_stream_accepted);
+	if (stats->stream_establish_count > 0) {
 		FORMAT_DURATION(
-			p50_str, make_duration_nanos(stream_percentiles.p50));
+			p50_str,
+			make_duration_nanos(stats->stream_establish_p50));
 		FORMAT_DURATION(
-			p90_str, make_duration_nanos(stream_percentiles.p90));
+			p90_str,
+			make_duration_nanos(stats->stream_establish_p90));
 		FORMAT_DURATION(
-			p99_str, make_duration_nanos(stream_percentiles.p99));
+			p99_str,
+			make_duration_nanos(stats->stream_establish_p99));
 		FORMAT_DURATION(
-			pmax_str, make_duration_nanos(stream_percentiles.pmax));
+			pmax_str,
+			make_duration_nanos(stats->stream_establish_pmax));
 		BUF_APPENDF(
-			ctx->rbuf, "%-20s: P50=%s P90=%s P99=%s MAX=%s\n",
-			"Stream Latency", p50_str, p90_str, p99_str, pmax_str);
+			ctx->rbuf,
+			"Stream Latency      : P50=%s P90=%s P99=%s MAX=%s\n",
+			p50_str, p90_str, p99_str, pmax_str);
 	} else {
-		BUF_APPENDF(
-			ctx->rbuf, "%-20s: %s\n", "Stream Latency", "(never)");
+		BUF_APPENDF(ctx->rbuf, "Stream Latency      : %s\n", "(never)");
 	}
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %ju accepted, %ju served (%ju rejected)\n",
-		"Mux Listener", stats.num_accepted, stats.num_served,
-		stats.num_rejected);
+		ctx->rbuf,
+		"Mux Listener        : %ju accepted, %ju served (%ju rejected)\n",
+		stats->num_accepted, stats->num_served, stats->num_rejected);
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %ju accepted, %ju served\n", "TCP Listener",
-		stats.num_accepted_tcp, stats.num_served_tcp);
+		ctx->rbuf, "TCP Listener        : %ju accepted, %ju served\n",
+		stats->num_accepted_tcp, stats->num_served_tcp);
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %ju accepted, %ju served\n", "API Listener",
-		stats.num_accepted_api, stats.num_served_api);
+		ctx->rbuf, "API Listener        : %ju accepted, %ju served\n",
+		stats->num_accepted_api, stats->num_served_api);
 #if WITH_TLS
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %ju\n", "TLS Failures",
-		stats.num_tls_failures);
+		ctx->rbuf, "TLS Failures        : %ju\n",
+		stats->num_tls_failures);
 #endif
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %ju\n", "Reconnects", stats.num_reconnects);
+		ctx->rbuf, "Reconnects          : %ju\n",
+		stats->num_reconnects);
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: sent %ju, recv %ju\n", "RST Frames",
-		stats.num_rst_sent, stats.num_rst_recv);
+		ctx->rbuf, "RST Frames          : sent %ju, recv %ju\n",
+		stats->num_rst_sent, stats->num_rst_recv);
 	BUF_APPENDF(
-		ctx->rbuf, "%-20s: %ju\n", "Stream Errors",
-		stats.num_stream_errors);
+		ctx->rbuf, "Stream Errors       : %ju\n",
+		stats->num_stream_errors);
 	{
 		const size_t frame_size = 16384;
-		FORMAT_BYTES(rx_buf, stats.recv_buffered_bytes);
+		FORMAT_BYTES(rx_buf, stats->recv_buffered_bytes);
 		FORMAT_BYTES(
 			tx_buf,
-			(stats.send_buffered_frames + stats.unacked_frames) *
+			(stats->send_buffered_frames + stats->unacked_frames) *
 				frame_size);
 		BUF_APPENDF(
-			ctx->rbuf, "%-20s: Rx %s, Tx %s\n", "Buffered Data",
+			ctx->rbuf, "Buffered Data       : Rx %s, Tx %s\n",
 			rx_buf, tx_buf);
 	}
 	{
-		FORMAT_BYTES(rx_mux, stats.traffic_byt_mux_recv);
-		FORMAT_BYTES(tx_mux, stats.traffic_byt_mux_sent);
-		FORMAT_BYTES(rx_local, stats.traffic_byt_local_recv);
-		FORMAT_BYTES(tx_local, stats.traffic_byt_local_sent);
+		FORMAT_BYTES(rx_mux, stats->traffic_byt_mux_recv);
+		FORMAT_BYTES(tx_mux, stats->traffic_byt_mux_sent);
+		FORMAT_BYTES(rx_local, stats->traffic_byt_local_recv);
+		FORMAT_BYTES(tx_local, stats->traffic_byt_local_sent);
 		BUF_APPENDF(
-			ctx->rbuf, "%-20s: Rx %s, Tx %s\n", "Mux Traffic",
+			ctx->rbuf, "Mux Traffic         : Rx %s, Tx %s\n",
 			rx_mux, tx_mux);
 		BUF_APPENDF(
-			ctx->rbuf, "%-20s: Rx %s, Tx %s\n", "TCP Traffic",
+			ctx->rbuf, "TCP Traffic         : Rx %s, Tx %s\n",
 			rx_local, tx_local);
 	}
 
 	if (!stateless) {
-		append_stateful_stats(ctx, &stats, now, s->started);
+		append_stateful_stats(ctx, stats, now, s->started);
 	}
 
-	append_sessions(ctx, &stats);
-	append_eventlog(ctx, &stats);
+	append_sessions(ctx, stats);
+	append_eventlog(ctx, stats);
 
 	char date_str[32];
 	const size_t date_len = http_date(date_str, sizeof(date_str));
@@ -501,17 +453,18 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		(int)date_len, date_str,
 		ctx->keepalive ? "keep-alive" : "close", ctx->rbuf.len);
 	BUF_APPEND(ctx->wbuf, ctx->rbuf.data, ctx->rbuf.len);
+	free(stats);
 }
 
 /* Handles GET /metrics — Prometheus text format (version 0.0.4). */
 static void handle_metrics(struct api_ctx *restrict ctx)
 {
 	struct server *restrict s = ctx->s;
-	struct server_stats stats;
-	server_stats(s, &stats);
-	struct stream_percentiles stream_percentiles;
-	const size_t stream_samples =
-		api_stream_percentiles(&stats, &stream_percentiles);
+	struct server_stats *restrict stats = server_stats(s);
+	if (stats == NULL) {
+		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
+		return;
+	}
 	const intmax_t now = clock_monotonic_ns();
 	const double uptime = (double)(now - s->started) / 1e9;
 
@@ -530,7 +483,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_sessions gauge\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_sessions %ju\n",
-		stats.num_session_created - stats.num_session_finalized);
+		stats->num_session_created - stats->num_session_finalized);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -538,7 +491,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_sessions_established gauge\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_sessions_established %zu\n",
-		stats.num_sessions);
+		stats->num_sessions);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -546,12 +499,12 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_sessions_halfopen gauge\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_sessions_halfopen %zu\n",
-		stats.num_session_halfopen);
+		stats->num_session_halfopen);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf, "# HELP multiplexd_streams Active mux streams\n"
 			   "# TYPE multiplexd_streams gauge\n");
-	VBUF_APPENDF(ctx->cbuf, "multiplexd_streams %zu\n", stats.num_streams);
+	VBUF_APPENDF(ctx->cbuf, "multiplexd_streams %zu\n", stats->num_streams);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -559,7 +512,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_streams_halfopen gauge\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_streams_halfopen %zu\n",
-		stats.num_stream_halfopen);
+		stats->num_stream_halfopen);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -567,7 +520,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_stream_open_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_stream_open_total %ju\n",
-		stats.num_stream_opened);
+		stats->num_stream_opened);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -575,7 +528,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_stream_accept_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_stream_accept_total %ju\n",
-		stats.num_stream_accepted);
+		stats->num_stream_accepted);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -583,26 +536,26 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_stream_fastopen_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_stream_fastopen_total %ju\n",
-		stats.num_stream_fastopen);
+		stats->num_stream_fastopen);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
 		"# HELP multiplexd_stream_establish_latency_seconds Active-open stream establishment latency from SYN to SYN|ACK\n"
 		"# TYPE multiplexd_stream_establish_latency_seconds summary\n");
-	if (stream_samples > 0) {
+	if (stats->stream_establish_count > 0) {
 		VBUF_APPENDF(
 			ctx->cbuf,
 			"multiplexd_stream_establish_latency_seconds{quantile=\"0.5\"} %g\n"
 			"multiplexd_stream_establish_latency_seconds{quantile=\"0.9\"} %g\n"
 			"multiplexd_stream_establish_latency_seconds{quantile=\"0.99\"} %g\n",
-			(double)stream_percentiles.p50 * 1e-9,
-			(double)stream_percentiles.p90 * 1e-9,
-			(double)stream_percentiles.p99 * 1e-9);
+			(double)stats->stream_establish_p50 * 1e-9,
+			(double)stats->stream_establish_p90 * 1e-9,
+			(double)stats->stream_establish_p99 * 1e-9);
 	}
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_stream_establish_latency_seconds_count %ju\n",
-		stats.num_stream_established);
+		stats->num_stream_established);
 
 	/* --- Counters --- */
 	VBUF_APPENDSTR(
@@ -612,15 +565,15 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_connections_accepted_total{listener=\"mux\"} %ju\n",
-		stats.num_accepted);
+		stats->num_accepted);
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_connections_accepted_total{listener=\"tcp\"} %ju\n",
-		stats.num_accepted_tcp);
+		stats->num_accepted_tcp);
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_connections_accepted_total{listener=\"api\"} %ju\n",
-		stats.num_accepted_api);
+		stats->num_accepted_api);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -629,15 +582,15 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_connections_served_total{listener=\"mux\"} %ju\n",
-		stats.num_served);
+		stats->num_served);
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_connections_served_total{listener=\"tcp\"} %ju\n",
-		stats.num_served_tcp);
+		stats->num_served_tcp);
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_connections_served_total{listener=\"api\"} %ju\n",
-		stats.num_served_api);
+		stats->num_served_api);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -645,7 +598,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_connections_rejected_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_connections_rejected_total %ju\n",
-		stats.num_rejected);
+		stats->num_rejected);
 
 #if WITH_TLS
 	VBUF_APPENDSTR(
@@ -654,7 +607,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_tls_failures_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_tls_failures_total %ju\n",
-		stats.num_tls_failures);
+		stats->num_tls_failures);
 #endif
 
 	VBUF_APPENDSTR(
@@ -663,7 +616,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_reconnects_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_reconnects_total %ju\n",
-		stats.num_reconnects);
+		stats->num_reconnects);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -672,26 +625,26 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_bytes_total{direction=\"recv\",link=\"mux\"} %ju\n",
-		stats.traffic_byt_mux_recv);
+		stats->traffic_byt_mux_recv);
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_bytes_total{direction=\"sent\",link=\"mux\"} %ju\n",
-		stats.traffic_byt_mux_sent);
+		stats->traffic_byt_mux_sent);
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_bytes_total{direction=\"recv\",link=\"local\"} %ju\n",
-		stats.traffic_byt_local_recv);
+		stats->traffic_byt_local_recv);
 	VBUF_APPENDF(
 		ctx->cbuf,
 		"multiplexd_bytes_total{direction=\"sent\",link=\"local\"} %ju\n",
-		stats.traffic_byt_local_sent);
+		stats->traffic_byt_local_sent);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf, "# HELP multiplexd_rst_sent_total RST frames sent\n"
 			   "# TYPE multiplexd_rst_sent_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_rst_sent_total %ju\n",
-		stats.num_rst_sent);
+		stats->num_rst_sent);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -699,7 +652,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_rst_recv_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_rst_recv_total %ju\n",
-		stats.num_rst_recv);
+		stats->num_rst_recv);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -707,7 +660,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_stream_errors_total counter\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_stream_errors_total %ju\n",
-		stats.num_stream_errors);
+		stats->num_stream_errors);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -715,7 +668,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_recv_buffered_bytes gauge\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_recv_buffered_bytes %zu\n",
-		stats.recv_buffered_bytes);
+		stats->recv_buffered_bytes);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -723,7 +676,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_send_buffered_frames gauge\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_send_buffered_frames %zu\n",
-		stats.send_buffered_frames);
+		stats->send_buffered_frames);
 
 	VBUF_APPENDSTR(
 		ctx->cbuf,
@@ -731,17 +684,20 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"# TYPE multiplexd_unacked_frames gauge\n");
 	VBUF_APPENDF(
 		ctx->cbuf, "multiplexd_unacked_frames %zu\n",
-		stats.unacked_frames);
+		stats->unacked_frames);
 
-	/* Per-identity window bytes: emit for all connected identities. */
+	/* Per-tunnel window bytes: emit for all established tunnels. */
 	{
 		bool rx_hdr = false, tx_hdr = false;
-		for (size_t i = 0; i < stats.num_identities; i++) {
-			const struct identity_stats *restrict ident =
-				&stats.identities[i];
-			if (!ident->connected) {
+		for (size_t i = 0; i < stats->num_tunnels; i++) {
+			const struct tunnel_stats *restrict t =
+				&stats->tunnels[i];
+			if (!t->established) {
 				continue;
 			}
+			const char *id = t->peer_identity != NULL ?
+						 t->peer_identity :
+						 "(mux)";
 			if (!rx_hdr) {
 				VBUF_APPENDSTR(
 					ctx->cbuf,
@@ -752,7 +708,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 			VBUF_APPENDF(
 				ctx->cbuf,
 				"multiplexd_session_rx_window_bytes{identity=\"%s\"} %zu\n",
-				ident->id, ident->tunnel.rx_window);
+				id, t->rx_window);
 			if (!tx_hdr) {
 				VBUF_APPENDSTR(
 					ctx->cbuf,
@@ -763,16 +719,15 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 			VBUF_APPENDF(
 				ctx->cbuf,
 				"multiplexd_session_tx_window_bytes{identity=\"%s\"} %zu\n",
-				ident->id, ident->tunnel.tx_window);
+				id, t->tx_window);
 		}
 	}
 
-	/* Per-identity RTT: emit only for connected identities with a measurement. */
+	/* Per-tunnel RTT: emit only for established tunnels with a measurement. */
 	bool rtt_header_written = false;
-	for (size_t i = 0; i < stats.num_identities; i++) {
-		const struct identity_stats *restrict ident =
-			&stats.identities[i];
-		if (!ident->connected || ident->tunnel.rtt_ns <= 0) {
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		const struct tunnel_stats *restrict t = &stats->tunnels[i];
+		if (!t->established || t->rtt_ns <= 0) {
 			continue;
 		}
 		if (!rtt_header_written) {
@@ -782,10 +737,12 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 				"# TYPE multiplexd_session_rtt_seconds gauge\n");
 			rtt_header_written = true;
 		}
+		const char *id =
+			t->peer_identity != NULL ? t->peer_identity : "(mux)";
 		VBUF_APPENDF(
 			ctx->cbuf,
 			"multiplexd_session_rtt_seconds{identity=\"%s\"} %g\n",
-			ident->id, (double)ident->tunnel.rtt_ns * 1e-9);
+			id, (double)t->rtt_ns * 1e-9);
 	}
 
 	{
@@ -818,6 +775,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		(int)date_len, date_str,
 		ctx->keepalive ? "keep-alive" : "close", ctx->cbuf->len);
 	/* body is in cbuf; send_cb will follow up with cbuf after wbuf */
+	free(stats);
 }
 
 /* Routes the parsed HTTP request to the appropriate handler. */

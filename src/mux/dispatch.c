@@ -362,12 +362,10 @@ static void dispatch_no_stream(
 		}
 		if (!sched_add_stream(ss, s)) {
 			MUX_LOG(ERROR, ss, "failed to add stream to table");
-			free(s);
+			stream_free(s);
 			ringbuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
-		COUNTER_ADD(ss->cnt.num_stream_accepted, 1);
-		COUNTER_ADD(ss->cnt.num_streams, 1);
 		/* Cap the initial send window at our own receive-buffer size
 		 * (stream_window).  A malicious peer could advertise extra = UINT16_MAX
 		 * and force the send_queue to grow without bound; capping at

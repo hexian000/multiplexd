@@ -22,9 +22,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BDP_LIMIT ((size_t)16 * 1024 * 1024)
+/* Single WINDOW_UPDATE grant encoding limit: Extra is uint16 in MUX_WINDOW_UNIT
+ * bytes.  Capping BDP here keeps every credit advertisement expressible in
+ * one frame. */
+#define BDP_LIMIT ((size_t)UINT16_MAX * MUX_WINDOW_UNIT)
+/* Minimum BDP: never shrink below the initial send window floor. */
+#define MIN_BDP ((size_t)MUX_INITIAL_SEND_WINDOW)
 #define RTT_WND_NS (INTMAX_C(300) * INTMAX_C(1000000000))
 #define BW_WND_NS (INTMAX_C(600) * INTMAX_C(1000000000))
+/* RTT/BDP inflation thresholds. */
+#define INFLATE_HI 1.5
+#define INFLATE_LO 1.2
+#define INFLATE_ROUNDS 3
 
 /* 3-slot windowed min/max filter (Kathleen Nichols, 2012): s[0] is the
  * current best sample, s[1] is the staged replacement when s[0] ages out,
@@ -168,6 +177,98 @@ void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
 	est->ping_in_flight = true;
 }
 
+static void estimator_phase_startup(
+	struct estimator_ctx *restrict est, const bool valid_cycle,
+	const bool window_limited)
+{
+	if (!valid_cycle && est->probe_was_stalled) {
+		/* A fully stalled window can still justify slow-start growth. */
+		est->bdp = MIN(est->bdp + est->cycle_window_bytes, BDP_LIMIT);
+	} else if (valid_cycle && window_limited) {
+		/* The window capped delivery, so grow aggressively. */
+		est->bdp = MIN(est->bdp + est->sample, BDP_LIMIT);
+	} else if (valid_cycle) {
+		/* The sample fit inside the window; switch to steady tracking. */
+		est->phase = EST_TRACK;
+		est->saturated_rounds = 0;
+	}
+}
+
+static void estimator_phase_track(
+	struct estimator_ctx *restrict est, const bool valid_cycle,
+	const bool window_limited, const intmax_t now_ns,
+	const double rtt_sample, const double rtt_min, const double bw_sample,
+	double bw_max, double sample_max)
+{
+	if (!valid_cycle) {
+		/* Idle: leave bdp unchanged; bw_wnd/sample_wnd age
+		 * naturally over BW_WND_NS; wnd_max_update resets to
+		 * the current sample when the window expires. */
+		return;
+	}
+
+	/* RTT inflation detection and force-age.  Only act when rtt_min
+	 * is stable (aged >= RTT_WND_NS/4 ≈ 75 s) to avoid acting on an
+	 * uncalibrated baseline. */
+	if (now_ns - est->rtt_wnd[0].t < RTT_WND_NS / 4) {
+		/* rtt_min not yet calibrated; do not count inflation. */
+		est->inflated_rounds = 0;
+	} else {
+		const double ratio = rtt_sample / rtt_min;
+		if (ratio <= INFLATE_LO) {
+			est->inflated_rounds = 0;
+		} else if (
+			ratio >= INFLATE_HI &&
+			++est->inflated_rounds >= INFLATE_ROUNDS) {
+			/* Force-age: collapse all 3 slots of bw_wnd
+			 * and sample_wnd to the current sample.
+			 * bw_sample is a valid physical-bandwidth
+			 * estimate even during bufferbloat: the
+			 * bottleneck capacity is unchanged; only
+			 * queuing delay is inflated. */
+			const struct estimator_wnd_slot bw_slot = {
+				.val = bw_sample, .t = now_ns
+			};
+			const struct estimator_wnd_slot smp_slot = {
+				.val = (double)est->sample, .t = now_ns
+			};
+			est->bw_wnd[0] = est->bw_wnd[1] = est->bw_wnd[2] =
+				bw_slot;
+			est->sample_wnd[0] = est->sample_wnd[1] =
+				est->sample_wnd[2] = smp_slot;
+			bw_max = bw_sample;
+			sample_max = (double)est->sample;
+			est->inflated_rounds = 0;
+			est->saturated_rounds = 0;
+		}
+		/* Hysteresis: ratio in (INFLATE_LO, INFLATE_HI) leaves
+		 * inflated_rounds unchanged. */
+	}
+
+	/* Bidirectional target: pure physical BDP, no headroom.
+	 * Headroom is added by session_update_window. */
+	{
+		double target = MAX(sample_max, bw_max * rtt_min);
+		if (target < (double)MIN_BDP) {
+			target = (double)MIN_BDP;
+		}
+		if (target > (double)BDP_LIMIT) {
+			target = (double)BDP_LIMIT;
+		}
+		est->bdp = (size_t)target;
+	}
+
+	/* STARTUP re-probe path: unchanged semantics. */
+	if (!window_limited) {
+		est->saturated_rounds = 0;
+	} else if (++est->saturated_rounds >= 2) {
+		/* BDP may have grown past the current estimate;
+		 * switch back to STARTUP after two saturated
+		 * rounds to avoid a premature re-probe. */
+		est->phase = EST_STARTUP;
+	}
+}
+
 void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns)
 {
 	struct estimator_ctx *restrict est = &ss->estimator;
@@ -220,38 +321,12 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 
 	switch (est->phase) {
 	case EST_STARTUP:
-		if (!valid_cycle && est->probe_was_stalled) {
-			/* A fully stalled window can still justify slow-start growth. */
-			est->bdp = MIN(
-				est->bdp + est->cycle_window_bytes, BDP_LIMIT);
-		} else if (valid_cycle && window_limited) {
-			/* The window capped delivery, so grow aggressively. */
-			est->bdp = MIN(est->bdp + est->sample, BDP_LIMIT);
-		} else if (valid_cycle) {
-			/* The sample fit inside the window; switch to steady tracking. */
-			est->phase = EST_TRACK;
-			est->saturated_rounds = 0;
-		}
+		estimator_phase_startup(est, valid_cycle, window_limited);
 		break;
 	case EST_TRACK:
-		if (valid_cycle) {
-			const double target =
-				MAX(sample_max, bw_max * rtt_min * 1.25);
-			if (target > (double)est->bdp) {
-				est->bdp =
-					(size_t)MIN(target, (double)BDP_LIMIT);
-			}
-			if (window_limited) {
-				/* BDP may have grown past the current estimate;
-				 * switch back to STARTUP after two saturated
-				 * rounds to avoid a premature re-probe. */
-				if (++est->saturated_rounds >= 2) {
-					est->phase = EST_STARTUP;
-				}
-			} else {
-				est->saturated_rounds = 0;
-			}
-		}
+		estimator_phase_track(
+			est, valid_cycle, window_limited, now_ns, rtt_sample,
+			rtt_min, bw_sample, bw_max, sample_max);
 		break;
 	default:
 		FAILMSGF("invalid estimator phase: %d", est->phase);
@@ -264,8 +339,9 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 	MUX_LOG_F(
 		INFO, ss,
 		"PONG: rtt_min=%.1f ms bw=%.0f B/s (max=%.0f B/s)"
-		" in %.1f ms bdp=%zu B phase=%s stalled=%d",
-		rtt_min * 1000.0, bw_sample, bw_max, rtt_sample * 1000.0,
-		est->bdp, est->phase == EST_STARTUP ? "STARTUP" : "TRACK",
-		(int)est->probe_was_stalled);
+		" in %.1f ms bdp=%zu B phase=%s stalled=%d infl=%u",
+		rtt_min * 1000.0, bw_sample, est->bw_wnd[0].val,
+		rtt_sample * 1000.0, est->bdp,
+		est->phase == EST_STARTUP ? "STARTUP" : "TRACK",
+		(int)est->probe_was_stalled, (unsigned)est->inflated_rounds);
 }
