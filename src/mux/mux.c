@@ -94,21 +94,14 @@ const struct mux_config *mux_conf(const struct mux_session *ss)
 	return &ss->conf;
 }
 
-void mux_stream_window(
-	const struct mux_session *ss, size_t *restrict rx_bytes,
-	size_t *restrict tx_bytes)
+void mux_session_stats(
+	const struct mux_session *ss, struct mux_session_stats *restrict out)
 {
-	*rx_bytes = (size_t)ss->stream_window * MUX_WINDOW_UNIT;
-	*tx_bytes = (size_t)ss->peer_stream_window * MUX_WINDOW_UNIT;
-}
-
-intmax_t mux_session_rtt_ns(const struct mux_session *ss)
-{
-	const double val = ss->estimator.rtt_wnd[0].val;
-	if (val == 0.0) {
-		return 0;
-	}
-	return (intmax_t)(val * 1e9);
+	out->rx_window = (size_t)ss->stream_window * MUX_WINDOW_UNIT;
+	out->tx_window = (size_t)ss->peer_stream_window * MUX_WINDOW_UNIT;
+	const double rtt = ss->estimator.rtt_wnd[0].val;
+	out->rtt_ns = rtt == 0.0 ? 0 : (intmax_t)(rtt * 1e9);
+	out->bdp = ss->estimator.bdp;
 }
 
 size_t mux_frame_object_size(void)
@@ -150,7 +143,7 @@ void mux_stream_io_modify(
 		return;
 	}
 	/* Deliver any conditions that are already satisfied for the new events. */
-	struct stream *const s = w->stream;
+	struct mux_stream *const s = w->stream;
 	if (s == NULL) {
 		return;
 	}
@@ -176,7 +169,7 @@ void mux_stream_io_modify(
 void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w)
 {
 	ev_clear_pending(loop, w);
-	struct stream *const s = w->stream;
+	struct mux_stream *const s = w->stream;
 	if (s != NULL) {
 		s->direct.w_io = NULL;
 	}
@@ -186,23 +179,23 @@ void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w)
 
 /* --- Stream operations --- */
 
-struct stream *mux_open_stream(struct mux_session *ss)
+struct mux_stream *mux_open_stream(struct mux_session *ss)
 {
 	return session_open_stream(ss);
 }
 
-void mux_stream_attach(struct stream *s, const int fd)
+void mux_stream_attach(struct mux_stream *s, const int fd)
 {
 	stream_attach_fd(s, fd);
 }
 
-uint_least16_t mux_stream_id(const struct stream *s)
+uint_least16_t mux_stream_id(const struct mux_stream *s)
 {
 	return s->id;
 }
 
 int mux_stream_send(
-	struct stream *restrict s, const void *restrict buf,
+	struct mux_stream *restrict s, const void *restrict buf,
 	size_t *restrict len)
 {
 	if (s->state != STREAM_INIT && s->state != STREAM_ESTABLISHED &&
@@ -249,7 +242,7 @@ int mux_stream_send(
 }
 
 int mux_stream_recv(
-	struct stream *restrict s, void *restrict buf, size_t *restrict len)
+	struct mux_stream *restrict s, void *restrict buf, size_t *restrict len)
 {
 	if (s->rst_received) {
 		errno = ECONNRESET;
@@ -296,7 +289,7 @@ int mux_stream_recv(
 	return 0;
 }
 
-void mux_stream_shutdown(struct stream *s)
+void mux_stream_shutdown(struct mux_stream *s)
 {
 	if (s->state == STREAM_CLOSED) {
 		return;
@@ -304,7 +297,7 @@ void mux_stream_shutdown(struct stream *s)
 	stream_shutdown(s);
 }
 
-void mux_stream_close(struct stream *s)
+void mux_stream_close(struct mux_stream *s)
 {
 	if (s->state == STREAM_CLOSED) {
 		return;

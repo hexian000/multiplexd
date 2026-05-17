@@ -19,6 +19,7 @@
 #include "utils/slog.h"
 
 #include <ev.h>
+
 #include <strings.h>
 #include <sys/socket.h>
 
@@ -31,9 +32,6 @@
 #include <time.h>
 
 enum { HTTP_MAX_ENTITY = 8192 };
-
-#define IDENTITY_KEY(id_str)                                                   \
-	((struct hashkey){ .len = strlen(id_str), .data = (id_str) })
 
 /* Inactivity timeout in seconds */
 #define API_TIMEOUT 30.0
@@ -253,15 +251,13 @@ static void append_sessions(
 			continue;
 		}
 		if (t->rtt_ns > 0) {
-			const double rtt_s = (double)t->rtt_ns * 1e-9;
-			FORMAT_BYTES(rx_str, (double)t->rx_window / rtt_s);
-			FORMAT_BYTES(tx_str, (double)t->tx_window / rtt_s);
+			FORMAT_BYTES(rx_str, t->rx_window);
+			FORMAT_BYTES(tx_str, t->tx_window);
 			FORMAT_DURATION(
 				rtt_str, make_duration_nanos(t->rtt_ns));
 			BUF_APPENDF(
-				ctx->rbuf,
-				"%-20s: BW=Rx %s/s, Tx %s/s; RTT %s\n", id,
-				rx_str, tx_str, rtt_str);
+				ctx->rbuf, "%-20s: W=Rx %s, Tx %s; RTT %s\n",
+				id, rx_str, tx_str, rtt_str);
 		} else {
 			FORMAT_BYTES(rx_str, t->rx_window);
 			FORMAT_BYTES(tx_str, t->tx_window);
@@ -454,6 +450,106 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		ctx->keepalive ? "keep-alive" : "close", ctx->rbuf.len);
 	BUF_APPEND(ctx->wbuf, ctx->rbuf.data, ctx->rbuf.len);
 	free(stats);
+}
+
+/* The four helpers below each emit one complete Prometheus metric family for
+ * per-tunnel data.  Keeping each family in its own loop guarantees that all
+ * samples for a given metric name are contiguous, as required by the
+ * Prometheus text format exposition specification.
+ * Tunnels without a peer identity (the top-level mux_tunnel) are skipped. */
+
+static void append_metrics_tunnel_rx_window(
+	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
+{
+	bool hdr = false;
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		const struct tunnel_stats *restrict t = &stats->tunnels[i];
+		if (!t->established || t->peer_identity == NULL) {
+			continue;
+		}
+		if (!hdr) {
+			VBUF_APPENDSTR(
+				ctx->cbuf,
+				"# HELP multiplexd_session_rx_window_bytes Per-stream receive window size per identity session\n"
+				"# TYPE multiplexd_session_rx_window_bytes gauge\n");
+			hdr = true;
+		}
+		VBUF_APPENDF(
+			ctx->cbuf,
+			"multiplexd_session_rx_window_bytes{identity=\"%s\",tag=\"%s\"} %zu\n",
+			t->peer_identity, t->tag, t->rx_window);
+	}
+}
+
+static void append_metrics_tunnel_tx_window(
+	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
+{
+	bool hdr = false;
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		const struct tunnel_stats *restrict t = &stats->tunnels[i];
+		if (!t->established || t->peer_identity == NULL) {
+			continue;
+		}
+		if (!hdr) {
+			VBUF_APPENDSTR(
+				ctx->cbuf,
+				"# HELP multiplexd_session_tx_window_bytes Per-stream send window size per identity session\n"
+				"# TYPE multiplexd_session_tx_window_bytes gauge\n");
+			hdr = true;
+		}
+		VBUF_APPENDF(
+			ctx->cbuf,
+			"multiplexd_session_tx_window_bytes{identity=\"%s\",tag=\"%s\"} %zu\n",
+			t->peer_identity, t->tag, t->tx_window);
+	}
+}
+
+static void append_metrics_tunnel_rtt(
+	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
+{
+	bool hdr = false;
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		const struct tunnel_stats *restrict t = &stats->tunnels[i];
+		if (!t->established || t->peer_identity == NULL ||
+		    t->rtt_ns <= 0) {
+			continue;
+		}
+		if (!hdr) {
+			VBUF_APPENDSTR(
+				ctx->cbuf,
+				"# HELP multiplexd_session_rtt_seconds Windowed-minimum round-trip time per identity session\n"
+				"# TYPE multiplexd_session_rtt_seconds gauge\n");
+			hdr = true;
+		}
+		VBUF_APPENDF(
+			ctx->cbuf,
+			"multiplexd_session_rtt_seconds{identity=\"%s\",tag=\"%s\"} %g\n",
+			t->peer_identity, t->tag, (double)t->rtt_ns * 1e-9);
+	}
+}
+
+static void append_metrics_tunnel_bdp(
+	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
+{
+	bool hdr = false;
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		const struct tunnel_stats *restrict t = &stats->tunnels[i];
+		if (!t->established || t->peer_identity == NULL ||
+		    t->bdp == 0) {
+			continue;
+		}
+		if (!hdr) {
+			VBUF_APPENDSTR(
+				ctx->cbuf,
+				"# HELP multiplexd_session_bdp_bytes Raw bandwidth-delay product estimate per identity session, no headroom\n"
+				"# TYPE multiplexd_session_bdp_bytes gauge\n");
+			hdr = true;
+		}
+		VBUF_APPENDF(
+			ctx->cbuf,
+			"multiplexd_session_bdp_bytes{identity=\"%s\",tag=\"%s\"} %zu\n",
+			t->peer_identity, t->tag, t->bdp);
+	}
 }
 
 /* Handles GET /metrics — Prometheus text format (version 0.0.4). */
@@ -686,64 +782,11 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		ctx->cbuf, "multiplexd_unacked_frames %zu\n",
 		stats->unacked_frames);
 
-	/* Per-tunnel window bytes: emit for all established tunnels. */
-	{
-		bool rx_hdr = false, tx_hdr = false;
-		for (size_t i = 0; i < stats->num_tunnels; i++) {
-			const struct tunnel_stats *restrict t =
-				&stats->tunnels[i];
-			if (!t->established) {
-				continue;
-			}
-			const char *id = t->peer_identity != NULL ?
-						 t->peer_identity :
-						 "(mux)";
-			if (!rx_hdr) {
-				VBUF_APPENDSTR(
-					ctx->cbuf,
-					"# HELP multiplexd_session_rx_window_bytes Per-stream receive window size per identity session\n"
-					"# TYPE multiplexd_session_rx_window_bytes gauge\n");
-				rx_hdr = true;
-			}
-			VBUF_APPENDF(
-				ctx->cbuf,
-				"multiplexd_session_rx_window_bytes{identity=\"%s\"} %zu\n",
-				id, t->rx_window);
-			if (!tx_hdr) {
-				VBUF_APPENDSTR(
-					ctx->cbuf,
-					"# HELP multiplexd_session_tx_window_bytes Per-stream send window size per identity session\n"
-					"# TYPE multiplexd_session_tx_window_bytes gauge\n");
-				tx_hdr = true;
-			}
-			VBUF_APPENDF(
-				ctx->cbuf,
-				"multiplexd_session_tx_window_bytes{identity=\"%s\"} %zu\n",
-				id, t->tx_window);
-		}
-	}
-
-	/* Per-tunnel RTT: emit only for established tunnels with a measurement. */
-	bool rtt_header_written = false;
-	for (size_t i = 0; i < stats->num_tunnels; i++) {
-		const struct tunnel_stats *restrict t = &stats->tunnels[i];
-		if (!t->established || t->rtt_ns <= 0) {
-			continue;
-		}
-		if (!rtt_header_written) {
-			VBUF_APPENDSTR(
-				ctx->cbuf,
-				"# HELP multiplexd_session_rtt_seconds Windowed-minimum round-trip time per identity session\n"
-				"# TYPE multiplexd_session_rtt_seconds gauge\n");
-			rtt_header_written = true;
-		}
-		const char *id =
-			t->peer_identity != NULL ? t->peer_identity : "(mux)";
-		VBUF_APPENDF(
-			ctx->cbuf,
-			"multiplexd_session_rtt_seconds{identity=\"%s\"} %g\n",
-			id, (double)t->rtt_ns * 1e-9);
-	}
+	/* Per-tunnel metrics: one loop per family keeps all samples contiguous. */
+	append_metrics_tunnel_rx_window(ctx, stats);
+	append_metrics_tunnel_tx_window(ctx, stats);
+	append_metrics_tunnel_rtt(ctx, stats);
+	append_metrics_tunnel_bdp(ctx, stats);
 
 	{
 		struct timespec cpu_ts;

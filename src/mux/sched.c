@@ -48,7 +48,7 @@ static bool stream_free_and_decount_cb(
 {
 	UNUSED(table);
 	UNUSED(key);
-	struct stream *restrict s = element;
+	struct mux_stream *restrict s = element;
 	struct mux_session *restrict ss = data;
 	if (s->state != STREAM_CLOSED) {
 		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
@@ -68,7 +68,7 @@ void sched_free_streams(struct mux_session *restrict ss)
 	/* Clear delay_pending on all queued streams so that the O(1) removal
 	 * in stream_stop() will not chase already-freed neighbour pointers
 	 * during bulk teardown via stream_free -> stream_stop. */
-	for (struct stream *d = ss->sched.delay_head; d != NULL;
+	for (struct mux_stream *d = ss->sched.delay_head; d != NULL;
 	     d = d->delay_next) {
 		d->delay_pending = false;
 	}
@@ -84,7 +84,8 @@ void sched_free_streams(struct mux_session *restrict ss)
 	}
 }
 
-bool sched_add_stream(struct mux_session *restrict ss, struct stream *restrict s)
+bool sched_add_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	void *elem = s;
 	const struct hashkey key = STREAMID_KEY(s->id);
@@ -100,8 +101,8 @@ bool sched_add_stream(struct mux_session *restrict ss, struct stream *restrict s
 	return true;
 }
 
-static void
-sched_remove_stream(struct mux_session *restrict ss, struct stream *restrict s)
+static void sched_remove_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	void *elem = NULL;
 	const struct hashkey key = STREAMID_KEY(s->id);
@@ -129,7 +130,7 @@ sched_remove_stream(struct mux_session *restrict ss, struct stream *restrict s)
 	}
 }
 
-struct stream *sched_find_stream(
+struct mux_stream *sched_find_stream(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id)
 {
 	if (ss->sched.streams == NULL) {
@@ -189,9 +190,9 @@ uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss)
 	return id;
 }
 
-static struct stream *sched_dequeue(struct mux_session *restrict ss)
+static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
 {
-	struct stream *s = ss->sched.sched_head;
+	struct mux_stream *s = ss->sched.sched_head;
 	if (s != NULL) {
 		ss->sched.sched_head = s->next;
 		if (ss->sched.sched_head == NULL) {
@@ -204,7 +205,7 @@ static struct stream *sched_dequeue(struct mux_session *restrict ss)
 }
 
 void sched_delay_remove(
-	struct mux_session *restrict ss, struct stream *restrict s)
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	if (s->delay_prev != NULL) {
 		s->delay_prev->delay_next = s->delay_next;
@@ -221,7 +222,7 @@ void sched_delay_remove(
 }
 
 static void
-sched_enqueue(struct mux_session *restrict ss, struct stream *restrict s)
+sched_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	/* Avoid double-enqueue: drr_active is already owned by the current DRR
 	 * turn, lp_ready already owns s->next, and tombstones re-enter only
@@ -243,7 +244,7 @@ sched_enqueue(struct mux_session *restrict ss, struct stream *restrict s)
  * while another queue, drr_active, or the tombstone timer still owns the
  * stream node. */
 static void
-sched_lp_enqueue(struct mux_session *restrict ss, struct stream *restrict s)
+sched_lp_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	if (s->is_ready || s == ss->sched.drr_active) {
 		return;
@@ -263,7 +264,7 @@ sched_lp_enqueue(struct mux_session *restrict ss, struct stream *restrict s)
 	}
 }
 
-void sched_wake(struct mux_session *restrict ss, struct stream *restrict s)
+void sched_wake(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	if (ss->state != SESSION_ESTABLISHED) {
 		/* Before SESSION_ESTABLISHED the split queues are not active yet. */
@@ -288,7 +289,7 @@ void sched_wake(struct mux_session *restrict ss, struct stream *restrict s)
 }
 
 void sched_delay(
-	struct mux_session *restrict ss, struct stream *restrict s,
+	struct mux_session *restrict ss, struct mux_stream *restrict s,
 	const uint_fast8_t ticks)
 {
 	if (s->delay_pending) {
@@ -313,7 +314,7 @@ void sched_delay(
 
 /* Send ACK and/or FIN control frames for the stream. */
 static void sched_send_ctrl_flags(
-	struct mux_session *restrict ss, struct stream *restrict s)
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	const bool has_ack_pending =
 		(s->state != STREAM_INIT && s->state != STREAM_SYN_SENT &&
@@ -375,7 +376,7 @@ static bool flush_ctrl_cb(
 	UNUSED(table);
 	UNUSED(key);
 	struct mux_session *restrict ss = data;
-	struct stream *restrict s = element;
+	struct mux_stream *restrict s = element;
 	/* Skip tombstone streams: they have no live I/O and stream_check_ack
 	 * already guards CLOSED state, but skipping here avoids spurious
 	 * sched_wake calls originating from sched_send_ctrl_flags. */
@@ -417,7 +418,7 @@ sched_finish_round(struct mux_session *restrict ss, const bool last)
 bool sched_next_data(struct mux_session *restrict ss)
 {
 	for (;;) {
-		struct stream *s;
+		struct mux_stream *s;
 		bool last;
 		const bool fresh_dequeue = (ss->sched.drr_active == NULL);
 
@@ -563,7 +564,7 @@ bool sched_next_data(struct mux_session *restrict ss)
 
 /* Send SYN or SYN|PUSH for a stream in STREAM_INIT state. */
 static void
-sched_send_syn(struct mux_session *restrict ss, struct stream *restrict s)
+sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	struct mux_frame *frame = stream_dequeue_send(s);
 	if (frame != NULL) {
@@ -610,7 +611,7 @@ static void sched_cb(struct ev_loop *loop, ev_idle *w, const int revents)
 	/* Drain the low-priority lifecycle queue.  Stop and re-queue if
 	 * sendbuf is occupied (session_flush re-arms EV_IDLE on drain). */
 	while (ss->sched.lp_head != NULL) {
-		struct stream *const s = ss->sched.lp_head;
+		struct mux_stream *const s = ss->sched.lp_head;
 		ss->sched.lp_head = s->next;
 		if (ss->sched.lp_head == NULL) {
 			ss->sched.lp_tail = NULL;
@@ -674,8 +675,8 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	/* Walk the list in-place: survivors stay; expired nodes are removed in
 	 * O(1) and scheduled.  Reentrant sched_delay calls prepend to
 	 * delay_head and are visited in the next tick. */
-	for (struct stream *s = ss->sched.delay_head; s != NULL;) {
-		struct stream *const next = s->delay_next;
+	for (struct mux_stream *s = ss->sched.delay_head; s != NULL;) {
+		struct mux_stream *const next = s->delay_next;
 		if (s->delay_ticks > 1) {
 			s->delay_ticks--;
 			s = next;

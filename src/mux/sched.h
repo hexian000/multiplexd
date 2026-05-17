@@ -13,7 +13,7 @@
 #include <stdint.h>
 
 struct mux_session;
-struct stream;
+struct mux_stream;
 struct hashtable;
 
 /* Send scheduler: round-robin ready queue (EV_IDLE), coalescing delay queue
@@ -24,24 +24,24 @@ struct hashtable;
 void sched_free_streams(struct mux_session *ss);
 
 /* Insert a stream into the table; returns false on alloc failure or duplicate ID. */
-bool sched_add_stream(struct mux_session *ss, struct stream *s);
+bool sched_add_stream(struct mux_session *ss, struct mux_stream *s);
 
 /* Look up a stream by ID; returns NULL if not found. */
-struct stream *
+struct mux_stream *
 sched_find_stream(struct mux_session *ss, uint_fast16_t stream_id);
 
 /* Return the next unused stream ID; returns STREAMID_CTRL when IDs are exhausted. */
 uint_least16_t sched_alloc_stream_id(struct mux_session *ss);
 
 /* Remove a stream from the coalescing delay list. */
-void sched_delay_remove(struct mux_session *ss, struct stream *s);
+void sched_delay_remove(struct mux_session *ss, struct mux_stream *s);
 
 /* Enqueue a stream onto the ready queue and arm the appropriate watcher. */
-void sched_wake(struct mux_session *ss, struct stream *s);
+void sched_wake(struct mux_session *ss, struct mux_stream *s);
 
 /* Arm the coalescing delay list for a stream. */
 void sched_delay(
-	struct mux_session *restrict ss, struct stream *restrict s,
+	struct mux_session *restrict ss, struct mux_stream *restrict s,
 	const uint_fast8_t ticks);
 
 /* Dequeue one data-ready stream from the DRR queue and produce at most one

@@ -105,7 +105,7 @@ static int g_stream_start_calls;
 static int g_stream_recv_fin_calls;
 static int g_estimator_add_calls;
 static uintmax_t g_last_estimator_bytes;
-static struct stream *g_sched_find_stream;
+static struct mux_stream *g_sched_find_stream;
 
 /* on_accept mock control */
 static bool g_on_accept_result;
@@ -117,17 +117,17 @@ static bool g_on_accept_result;
 /* stream_new allocates; stream_close frees.  When on_accept returns true,
  * the stream survives dispatch_no_stream and must be freed at cleanup. */
 #define FUZZ_MAX_LIVE_STREAMS 64
-static struct stream *g_live_streams[FUZZ_MAX_LIVE_STREAMS];
+static struct mux_stream *g_live_streams[FUZZ_MAX_LIVE_STREAMS];
 static int g_live_stream_count;
 
-static void fuzz_track_stream(struct stream *s)
+static void fuzz_track_stream(struct mux_stream *s)
 {
 	if (g_live_stream_count < FUZZ_MAX_LIVE_STREAMS) {
 		g_live_streams[g_live_stream_count++] = s;
 	}
 }
 
-static void fuzz_untrack_stream(struct stream *s)
+static void fuzz_untrack_stream(struct mux_stream *s)
 {
 	for (int i = 0; i < g_live_stream_count; i++) {
 		if (g_live_streams[i] == s) {
@@ -198,7 +198,7 @@ consume_frame(struct mux_session *restrict ss, const size_t frame_size)
 
 int stream_format_tag(
 	char *restrict buf, const size_t buflen,
-	const struct stream *restrict s)
+	const struct mux_stream *restrict s)
 {
 	(void)s;
 	return snprintf(buf, buflen, "[stream]:");
@@ -291,7 +291,7 @@ bool handshake_process_hello(
 	return g_handshake_result;
 }
 
-struct stream *sched_find_stream(
+struct mux_stream *sched_find_stream(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id)
 {
 	(void)ss;
@@ -304,7 +304,8 @@ struct stream *sched_find_stream(
 
 /* No-op: max_streams is set to 0 in the fuzz session, skipping the
  * table_size check.  We track accepted streams separately for cleanup. */
-bool sched_add_stream(struct mux_session *restrict ss, struct stream *restrict s)
+bool sched_add_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	fuzz_track_stream(s);
@@ -312,7 +313,8 @@ bool sched_add_stream(struct mux_session *restrict ss, struct stream *restrict s
 }
 
 /* on_accept callback: controls stream acceptance per iteration. */
-static bool fuzz_on_accept(void *ud, struct mux_session *ss, struct stream *s)
+static bool
+fuzz_on_accept(void *ud, struct mux_session *ss, struct mux_stream *s)
 {
 	(void)ud;
 	(void)ss;
@@ -321,12 +323,12 @@ static bool fuzz_on_accept(void *ud, struct mux_session *ss, struct stream *s)
 	return g_on_accept_result;
 }
 
-struct stream *stream_new(
+struct mux_stream *stream_new(
 	struct mux_session *restrict ss, const uint_fast16_t id,
 	const bool active_open)
 {
 	(void)active_open;
-	struct stream *const s = calloc(1, sizeof(*s));
+	struct mux_stream *const s = calloc(1, sizeof(*s));
 	if (s != NULL) {
 		s->session = ss;
 		s->id = (uint_least16_t)id;
@@ -336,26 +338,26 @@ struct stream *stream_new(
 	return s;
 }
 
-void stream_close(struct stream *s)
+void stream_close(struct mux_stream *s)
 {
 	fuzz_untrack_stream(s);
 	free(s);
 }
 
-void stream_free(struct stream *s)
+void stream_free(struct mux_stream *s)
 {
 	fuzz_untrack_stream(s);
 	free(s);
 }
 
-void stream_recv_rst(struct stream *s)
+void stream_recv_rst(struct mux_stream *s)
 {
 	(void)s;
 	g_stream_recv_rst_calls++;
 }
 
 void stream_recv_window(
-	struct stream *restrict s, const uint_fast32_t window_inc)
+	struct mux_stream *restrict s, const uint_fast32_t window_inc)
 {
 	g_stream_recv_window_calls++;
 	g_last_window_inc = window_inc;
@@ -363,14 +365,14 @@ void stream_recv_window(
 					  window_inc * MUX_WINDOW_UNIT);
 }
 
-void stream_start(struct stream *s)
+void stream_start(struct mux_stream *s)
 {
 	g_stream_start_calls++;
 	s->state = STREAM_ESTABLISHED;
 }
 
 void stream_recv_copy(
-	struct stream *restrict s, const unsigned char *restrict payload,
+	struct mux_stream *restrict s, const unsigned char *restrict payload,
 	const size_t payload_len)
 {
 	(void)s;
@@ -378,7 +380,7 @@ void stream_recv_copy(
 	(void)payload_len;
 }
 
-void stream_recv_fin(struct stream *s)
+void stream_recv_fin(struct mux_stream *s)
 {
 	(void)s;
 	g_stream_recv_fin_calls++;
@@ -604,7 +606,7 @@ T_DECLARE_CASE(test_dispatch_fuzz)
 		/* -- Pre-inserted stream (exercises dispatch_by_stream) ---- */
 		/* 75 % of iterations have a pre-existing stream so that
 		 * dispatch_by_stream is reached often. */
-		struct stream prestream = { 0 };
+		struct mux_stream prestream = { 0 };
 		uint_least16_t target_id = 0;
 		if (prng_range(4u) != 0u) {
 			/* Use a valid peer-parity stream ID for the role. */

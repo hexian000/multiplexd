@@ -88,7 +88,7 @@ enum accept_mode {
 struct test_stream {
 	mux_stream_io w_io;
 	struct mux_test_fixture *fx;
-	struct stream *s;
+	struct mux_stream *s;
 
 	/* Receive accumulation */
 	unsigned char *recv_buf;
@@ -212,8 +212,8 @@ static int wait_until(
  * test_stream helpers
  * ---------------------------------------------------------------------- */
 
-static struct test_stream *
-test_stream_new(struct mux_test_fixture *restrict fx, struct stream *restrict s)
+static struct test_stream *test_stream_new(
+	struct mux_test_fixture *restrict fx, struct mux_stream *restrict s)
 {
 	struct test_stream *ts = malloc(sizeof(struct test_stream));
 	if (ts == NULL) {
@@ -364,7 +364,8 @@ stream_io_cb(struct ev_loop *loop, mux_stream_io *w, const int revents)
  * Session callbacks
  * ---------------------------------------------------------------------- */
 
-static bool on_accept_cb(void *data, struct mux_session *ss, struct stream *s)
+static bool
+on_accept_cb(void *data, struct mux_session *ss, struct mux_stream *s)
 {
 	UNUSED(ss);
 	struct mux_test_fixture *restrict fx = data;
@@ -974,7 +975,7 @@ T_DECLARE_CASE(test_send_recv_small)
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x42);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		free(payload);
@@ -1046,7 +1047,7 @@ T_DECLARE_CASE(test_idle_scheduler_stops_while_sendbuf_blocked)
 	frame->len = MUX_FRAME_HEADER_SIZE;
 	mux_frame_list_push(&fx.cli->wire.sendbuf, frame);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;
@@ -1108,7 +1109,7 @@ T_DECLARE_CASE(test_nagle_releases_queued_small_frame_on_ack)
 	memcpy(expected, payload_a, sizeof(payload_a));
 	memcpy(expected + sizeof(payload_a), payload_b, sizeof(payload_b));
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;
@@ -1169,7 +1170,7 @@ T_DECLARE_CASE(test_send_recv_large)
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0x7F);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		free(payload);
@@ -1222,7 +1223,7 @@ T_DECLARE_CASE(test_half_close)
 	unsigned char payload[64];
 	fill_payload(payload, sizeof(payload), 0x11);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;
@@ -1269,7 +1270,7 @@ T_DECLARE_CASE(test_rst_on_unread_data)
 	unsigned char payload[64];
 	fill_payload(payload, sizeof(payload), 0xAB);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;
@@ -1329,7 +1330,7 @@ T_DECLARE_CASE(test_multi_stream)
 		streams[i] = NULL;
 	}
 	for (int i = 0; i < MULTI_CONCURRENCY; i++) {
-		struct stream *s = mux_open_stream(fx.cli);
+		struct mux_stream *s = mux_open_stream(fx.cli);
 		if (s == NULL) {
 			T_FATAL("mux_open_stream returned NULL");
 			goto cleanup_payloads;
@@ -1408,7 +1409,7 @@ T_DECLARE_CASE(test_server_open_send_recv)
 	fill_payload(payload, PAYLOAD_SMALL, 0x55);
 
 	/* Server actively opens a stream toward the client. */
-	struct stream *s = mux_open_stream(fx.srv);
+	struct mux_stream *s = mux_open_stream(fx.srv);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream(srv) returned NULL");
 		free(payload);
@@ -1482,7 +1483,7 @@ T_DECLARE_CASE(test_client_open_server_sends_first)
 	fx.accept_send_len = PAYLOAD_SMALL;
 
 	/* Client opens a stream; it does not send any data – it only receives. */
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream(cli) returned NULL");
 		free(payload);
@@ -1544,7 +1545,7 @@ T_DECLARE_CASE(test_graceful_close_server_initiated)
 	fill_payload(payload, sizeof(payload), 0xD4);
 
 	/* Server opens and will send payload then FIN. */
-	struct stream *s = mux_open_stream(fx.srv);
+	struct mux_stream *s = mux_open_stream(fx.srv);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream(srv) returned NULL");
 		goto cleanup;
@@ -1627,7 +1628,7 @@ T_DECLARE_CASE(test_simultaneous_close)
 	fx.accept_send_len = PAYLOAD_SMALL;
 
 	/* Client opens a stream and sends cli_payload + FIN. */
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		free(cli_payload);
@@ -1720,7 +1721,7 @@ T_DECLARE_CASE(test_rst_from_client)
 
 	/* Server opens a stream and sends data; this data will land in the
 	 * client-side receive buffer, triggering RST on close. */
-	struct stream *s = mux_open_stream(fx.srv);
+	struct mux_stream *s = mux_open_stream(fx.srv);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream(srv) returned NULL");
 		goto cleanup;
@@ -1762,7 +1763,7 @@ T_DECLARE_CASE(test_active_open_shutdown_before_synack)
 		goto cleanup;
 	}
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;
@@ -2207,12 +2208,12 @@ raw_stream_io_noop_cb(struct ev_loop *loop, mux_stream_io *w, const int revents)
 
 struct raw_stream_fixture {
 	struct raw_fixture base;
-	struct stream *accepted_stream;
+	struct mux_stream *accepted_stream;
 	mux_stream_io w_stream;
 };
 
-static bool
-raw_stream_on_accept_cb(void *data, struct mux_session *ss, struct stream *s)
+static bool raw_stream_on_accept_cb(
+	void *data, struct mux_session *ss, struct mux_stream *s)
 {
 	UNUSED(ss);
 	struct raw_stream_fixture *sfx = data;
@@ -2448,7 +2449,7 @@ T_DECLARE_CASE(test_interop_i3_ack_fin_credit)
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0xA1);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		free(payload);
@@ -2552,7 +2553,7 @@ T_DECLARE_CASE(test_interop_i6_fast_open_16384)
 	unsigned char payload[MUX_DEFAULT_SEND_WINDOW];
 	fill_payload(payload, sizeof(payload), 0xB2);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;
@@ -3170,7 +3171,7 @@ T_DECLARE_CASE(test_resume_retransmit)
 	fill_payload(srv_payload, payload_len, 0x9C);
 
 	{
-		struct stream *cli_s = mux_open_stream(fx.cli);
+		struct mux_stream *cli_s = mux_open_stream(fx.cli);
 		if (cli_s == NULL) {
 			T_FATAL("mux_open_stream returned NULL");
 			goto cleanup;
@@ -3184,7 +3185,7 @@ T_DECLARE_CASE(test_resume_retransmit)
 			fx.cli_streams[fx.n_cli_streams++] = cli_ts;
 		}
 
-		struct stream *srv_s = mux_open_stream(fx.srv);
+		struct mux_stream *srv_s = mux_open_stream(fx.srv);
 		if (srv_s == NULL) {
 			T_FATAL("mux_open_stream(srv) returned NULL");
 			goto cleanup;
@@ -3490,7 +3491,7 @@ T_DECLARE_CASE(test_nodelay_reverse_large)
 	fx.accept_send_len = PAYLOAD_LARGE;
 
 	/* Client opens a stream; it does not send any data – it only receives. */
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream(cli) returned NULL");
 		free(payload);
@@ -3882,7 +3883,7 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x4E);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;
@@ -3950,7 +3951,7 @@ T_DECLARE_CASE(test_bdp_stop_resets_learned_state)
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x68);
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;
@@ -4007,7 +4008,7 @@ cleanup:
  * ---------------------------------------------------------------------- */
 
 struct stream_established_ctx {
-	const struct stream *s;
+	const struct mux_stream *s;
 };
 
 static int pred_stream_established(void *ptr)
@@ -4031,7 +4032,7 @@ T_DECLARE_CASE(test_send_queue_saturates_read_credit)
 		goto cleanup;
 	}
 
-	struct stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
 		T_FATAL("mux_open_stream returned NULL");
 		goto cleanup;

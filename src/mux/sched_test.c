@@ -61,7 +61,7 @@ sched_timer_noop_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 
 int stream_format_tag(
 	char *restrict buf, const size_t buflen,
-	const struct stream *restrict s)
+	const struct mux_stream *restrict s)
 {
 	(void)s;
 	return snprintf(buf, buflen, "[stream]:");
@@ -85,20 +85,20 @@ bool session_send_ctrl(
 	return true;
 }
 
-uint_fast32_t stream_grant_inc(const struct stream *s)
+uint_fast32_t stream_grant_inc(const struct mux_stream *s)
 {
 	(void)s;
 	return g_stream_grant_inc;
 }
 
-void stream_mark_fin_sent(struct stream *s)
+void stream_mark_fin_sent(struct mux_stream *s)
 {
 	(void)s;
 	g_mark_fin_sent_calls++;
 }
 
 bool session_send_push(
-	struct mux_session *ss, struct stream *s, struct mux_frame *frame)
+	struct mux_session *ss, struct mux_stream *s, struct mux_frame *frame)
 {
 	(void)ss;
 	(void)s;
@@ -107,12 +107,12 @@ bool session_send_push(
 	return true;
 }
 
-struct mux_frame *stream_dequeue_send(struct stream *restrict s)
+struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 {
 	return mux_frame_list_pop(&s->send_queue);
 }
 
-void stream_on_send(struct stream *restrict s)
+void stream_on_send(struct mux_stream *restrict s)
 {
 	(void)s;
 	g_stream_on_send_calls++;
@@ -124,13 +124,13 @@ void session_flush(struct mux_session *ss)
 	g_flush_calls++;
 }
 
-void stream_mark_syn_sent(struct stream *s)
+void stream_mark_syn_sent(struct mux_stream *s)
 {
 	g_mark_syn_sent_calls++;
 	s->state = STREAM_SYN_SENT;
 }
 
-void stream_free(struct stream *s)
+void stream_free(struct mux_stream *s)
 {
 	g_stream_free_calls++;
 	free(s);
@@ -144,7 +144,7 @@ void session_emit_ack(struct mux_session *ss)
 
 static int g_stream_check_ack_calls;
 
-void stream_check_ack(struct stream *s)
+void stream_check_ack(struct mux_stream *s)
 {
 	(void)s;
 	g_stream_check_ack_calls++;
@@ -238,7 +238,7 @@ T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
-	struct stream stream = { .id = 3 };
+	struct mux_stream stream = { .id = 3 };
 
 	sched_test_reset();
 	ss.conf.idle_timeout = 1;
@@ -256,8 +256,8 @@ T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
 T_DECLARE_CASE(test_sched_free_streams_clears_stream_counter)
 {
 	struct mux_session ss = make_session();
-	struct stream *first = calloc(1, sizeof(*first));
-	struct stream *second = calloc(1, sizeof(*second));
+	struct mux_stream *first = calloc(1, sizeof(*first));
+	struct mux_stream *second = calloc(1, sizeof(*second));
 
 	sched_test_bind_watchers(&ss);
 	T_CHECK(first != NULL);
@@ -282,7 +282,7 @@ T_DECLARE_CASE(test_sched_wake_enqueues_only_once)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
-	struct stream stream = {
+	struct mux_stream stream = {
 		.id = 5,
 		.state = STREAM_ESTABLISHED,
 	};
@@ -303,9 +303,9 @@ T_DECLARE_CASE(test_sched_dequeue_preserves_fifo_order)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
-	struct stream first = { .id = 1 };
-	struct stream second = { .id = 3 };
-	struct stream third = { .id = 5 };
+	struct mux_stream first = { .id = 1 };
+	struct mux_stream second = { .id = 3 };
+	struct mux_stream third = { .id = 5 };
 
 	sched_enqueue(&ss, &first);
 	sched_enqueue(&ss, &second);
@@ -323,9 +323,9 @@ T_DECLARE_CASE(test_sched_delay_remove_handles_head_middle_and_tail)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
-	struct stream first = { .id = 1, .delay_pending = true };
-	struct stream second = { .id = 3, .delay_pending = true };
-	struct stream third = { .id = 5, .delay_pending = true };
+	struct mux_stream first = { .id = 1, .delay_pending = true };
+	struct mux_stream second = { .id = 3, .delay_pending = true };
+	struct mux_stream third = { .id = 5, .delay_pending = true };
 
 	ss.sched.delay_head = &first;
 	first.delay_next = &second;
@@ -352,7 +352,7 @@ T_DECLARE_CASE(test_sched_send_ctrl_flags_emits_ack_and_fin)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
-	struct stream stream = {
+	struct mux_stream stream = {
 		.id = 7,
 		.state = STREAM_ESTABLISHED,
 		.ack_pending = true,
@@ -380,7 +380,7 @@ T_DECLARE_CASE(test_sched_next_data_sends_frame_and_resets_deficit_on_drain)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
-	struct stream stream = {
+	struct mux_stream stream = {
 		.id = 9,
 		.state = STREAM_ESTABLISHED,
 	};
@@ -405,7 +405,7 @@ T_DECLARE_CASE(test_sched_cb_sends_syn_for_init_stream)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
-	struct stream stream = {
+	struct mux_stream stream = {
 		.id = 11,
 		.state = STREAM_INIT,
 	};

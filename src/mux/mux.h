@@ -22,7 +22,7 @@
 struct mux_callbacks;
 struct mux_frame;
 struct mux_session;
-struct stream;
+struct mux_stream;
 
 #if WITH_TLS
 struct tls_context;
@@ -57,8 +57,8 @@ struct mux_frame_allocator {
  * Use in frame pool implementations instead of sizeof(struct mux_frame). */
 size_t mux_frame_object_size(void);
 
-/* Traffic byte counters; embedded in session_counters. */
-struct traffic_counters {
+/* Traffic byte counters; embedded in mux_session_counters. */
+struct mux_traffic_counters {
 #if WITH_THREADS
 	atomic_uintmax_t *byt_mux_recv;
 	atomic_uintmax_t *byt_mux_sent;
@@ -76,7 +76,7 @@ struct traffic_counters {
  * (counters route; see src/server.h).  Pointer fields point to
  * server_counters atomic or plain counters depending on the build mode.
  * NULL pointers are silently skipped by COUNTER_*. */
-struct session_counters {
+struct mux_session_counters {
 #if WITH_THREADS
 	atomic_uintmax_t *num_session_created;
 	atomic_uintmax_t *num_session_connect;
@@ -122,19 +122,7 @@ struct session_counters {
 	size_t *send_buffered_frames;
 	size_t *unacked_frames;
 #endif
-	struct traffic_counters traffic;
-};
-
-struct socket_opts {
-	bool tcp_keepalive;
-	bool tcp_nodelay;
-	bool tcp_reuseport;
-	int tcp_sndbuf;
-	int tcp_rcvbuf;
-#if WITH_TCP_NOTSENT_LOWAT
-	int tcp_notsent_lowat;
-#endif
-	int backlog;
+	struct mux_traffic_counters traffic;
 };
 
 /* --- Mux configuration subset --- */
@@ -196,7 +184,7 @@ struct mux_session_opts {
 	/* Internal peer label for diagnostics; NOT transmitted; copied if non-NULL. */
 	const char *peer_id;
 	/* Pointer-block into server_stats; all NULL pointers are silently skipped. */
-	struct session_counters cnt;
+	struct mux_session_counters cnt;
 	/* Frame allocator; data field is set by the caller per-session. */
 	struct mux_frame_allocator pool;
 	/* Non-owning pointer to the session log tag buffer; must outlive the session. */
@@ -260,15 +248,23 @@ const unsigned char *mux_session_id(const struct mux_session *ss);
 /* Returns a read-only pointer to the session's configuration snapshot. */
 const struct mux_config *mux_conf(const struct mux_session *ss);
 
-/* Returns the effective per-stream receive (rx) and send (tx) windows in bytes.
- * rx: local window advertised to the peer; tx: peer's window limiting our sends. */
-void mux_stream_window(
-	const struct mux_session *ss, size_t *restrict rx_bytes,
-	size_t *restrict tx_bytes);
+/* Snapshot of per-session estimator state.  Filled by mux_session_stats(). */
+struct mux_session_stats {
+	/* Per-stream receive window advertised to the peer, in bytes. */
+	size_t rx_window;
+	/* Per-stream send window limited by the peer, in bytes. */
+	size_t tx_window;
+	/* Windowed-minimum RTT from PING/PONG probes, in nanoseconds;
+	 * 0 when no measurement has been completed yet. */
+	intmax_t rtt_ns;
+	/* Raw physical BDP estimate in bytes, no headroom;
+	 * 0 when the estimator has not yet produced a value. */
+	size_t bdp;
+};
 
-/* Returns the windowed-minimum round-trip time in nanoseconds measured via
- * PING/PONG probes, or 0 when no measurement has been completed yet. */
-intmax_t mux_session_rtt_ns(const struct mux_session *ss);
+/* Populate *out with a consistent snapshot of session estimator state. */
+void mux_session_stats(
+	const struct mux_session *ss, struct mux_session_stats *restrict out);
 
 /* --- Session mutators --- */
 
@@ -348,7 +344,7 @@ union mux_event_data {
  *             return the matching mux_session, or NULL for a fresh session.
  */
 struct mux_callbacks {
-	bool (*on_accept)(void *data, struct mux_session *, struct stream *);
+	bool (*on_accept)(void *data, struct mux_session *, struct mux_stream *);
 	void (*on_event)(
 		void *data, struct mux_session *, enum mux_event,
 		union mux_event_data);
@@ -369,7 +365,7 @@ struct mux_stream_io {
 	EV_WATCHER(mux_stream_io)
 	/* private */
 	struct ev_loop *loop;
-	struct stream *stream;
+	struct mux_stream *stream;
 	/* EV_READ | EV_WRITE */
 	int events;
 };
@@ -399,20 +395,20 @@ void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w);
 
 /* Open a new outbound stream.  Returns NULL when the session is not
  * established or the halfopen backlog is full. */
-struct stream *mux_open_stream(struct mux_session *ss);
+struct mux_stream *mux_open_stream(struct mux_session *ss);
 
 /* Attach a local socket fd to a stream; takes ownership of fd.
  * Data transfer is blocked until the peer replies with SYN|ACK.
  * Mutually exclusive with mux_stream_io_start(). */
-void mux_stream_attach(struct stream *s, int fd);
+void mux_stream_attach(struct mux_stream *s, int fd);
 
-uint_least16_t mux_stream_id(const struct stream *s);
+uint_least16_t mux_stream_id(const struct mux_stream *s);
 
 /* Queue up to *len bytes for sending.  On return *len holds bytes queued
  * (may be less if the window is partially full, or zero when exhausted —
  * retry after EV_WRITE).  Returns -1/EINVAL when not in a writable state. */
 int mux_stream_send(
-	struct stream *s, const void *restrict buf, size_t *restrict len);
+	struct mux_stream *s, const void *restrict buf, size_t *restrict len);
 
 /* Copy up to *len bytes from the receive buffer.  On return *len holds bytes
  * copied; zero means peer FIN.  Returns -1/ECONNRESET on RST, -1/EAGAIN
@@ -424,13 +420,14 @@ int mux_stream_send(
  * valid; the caller is expected to follow up with mux_stream_shutdown()
  * or mux_stream_close(). */
 int mux_stream_recv(
-	struct stream *restrict s, void *restrict buf, size_t *restrict len);
+	struct mux_stream *restrict s, void *restrict buf,
+	size_t *restrict len);
 
 /* Half-close the write side (shutdown(fd, SHUT_WR)). */
-void mux_stream_shutdown(struct stream *s);
+void mux_stream_shutdown(struct mux_stream *s);
 
 /* Close with close(fd) semantics: RST if receive buffer has unread data,
  * otherwise no protocol frame is sent (caller must have sent RST or FIN). */
-void mux_stream_close(struct stream *s);
+void mux_stream_close(struct mux_stream *s);
 
 #endif /* MUX_H */

@@ -3,31 +3,28 @@
 
 #include "tunnel.h"
 
-#include "server.h"
-#include "util.h"
-
 #include "mux/mux.h"
 #include "os/clock.h"
 #include "os/socket.h"
-#include <stdint.h>
+#include "server.h"
 #if WITH_THREADS
 #include "sync/dispatcher.h"
 #endif
 #include "sync/task.h"
+#include "util.h"
 #include "utils/arraysize.h"
 #include "utils/minmax.h"
 #include "utils/slog.h"
 
 #include <ev.h>
 
+#include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
-#include <sys/socket.h>
-
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #if WITH_THREADS
 #include <threads.h>
 #endif
@@ -42,7 +39,7 @@ static void task_mux_start(void *p)
 		if (!LOGLEVEL(level)) {                                        \
 			break;                                                 \
 		}                                                              \
-		LOG_F(level, "%s " format, (t)->tag, __VA_ARGS__);             \
+		LOG_F(level, "%s: " format, (t)->tag, __VA_ARGS__);            \
 	} while (0)
 
 #define TUNNEL_LOG(level, t, message) TUNNEL_LOG_F(level, t, "%s", message)
@@ -62,7 +59,7 @@ static void tunnel_set_tag(
 	char *restrict tag, const size_t taglen, const char *restrict my,
 	const char *restrict arrow, const char *restrict peer)
 {
-	const int ret = snprintf(tag, taglen, "%s%s%s:", my, arrow, peer);
+	const int ret = snprintf(tag, taglen, "%s%s%s", my, arrow, peer);
 	if (ret < 0) {
 		tag[0] = '\0';
 	}
@@ -110,17 +107,41 @@ struct tunnel {
 	char *identity;
 	char *peer_id;
 	char *peer_identity;
-	/* Session log tag: "my <= peer:" or "my => peer:". Owned buffer. */
+	/* Session log tag: "my <= peer" or "my => peer". Owned buffer. */
 	char tag[256];
 	/* Socket options cached at creation; updated on reload. */
 	struct socket_opts mux_socket;
 	struct socket_opts local_socket;
+	/* Per-tunnel stream lifecycle counters; updated by the session thread
+	 * via mux_session_counters pointer-block. */
+	struct {
+#if WITH_THREADS
+		atomic_size_t num_streams;
+		atomic_size_t num_stream_halfopen;
+		atomic_uintmax_t num_stream_opened;
+		atomic_uintmax_t num_stream_accepted;
+		atomic_uintmax_t num_stream_fastopen;
+		atomic_uintmax_t num_stream_established;
+		atomic_uintmax_t num_stream_succeeded;
+		atomic_uintmax_t num_stream_failed;
+#else
+		size_t num_streams;
+		size_t num_stream_halfopen;
+		uintmax_t num_stream_opened;
+		uintmax_t num_stream_accepted;
+		uintmax_t num_stream_fastopen;
+		uintmax_t num_stream_established;
+		uintmax_t num_stream_succeeded;
+		uintmax_t num_stream_failed;
+#endif
+	} stream_cnt;
+	/* SYN->SYN|ACK latency ring; written on the server thread only. */
+	size_t stream_establish_count;
+	intmax_t stream_establish_ns[256];
 };
 
-static const struct mux_config *tunnel_conf(const struct tunnel *t);
-
 static bool stream_connect(
-	const struct tunnel *restrict t, struct stream *stream,
+	const struct tunnel *restrict t, struct mux_stream *stream,
 	const char *target)
 {
 	union sockaddr_max connect_addr;
@@ -174,7 +195,7 @@ static bool stream_connect(
 }
 
 static bool
-tunnel_on_accept(void *data, struct mux_session *ss, struct stream *stream)
+tunnel_on_accept(void *data, struct mux_session *ss, struct mux_stream *stream)
 {
 	UNUSED(ss);
 	const struct tunnel *restrict t = data;
@@ -341,6 +362,11 @@ tunnel_reconnect_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	tunnel_schedule_reconnect(t);
 }
 
+static const struct mux_config *tunnel_conf(const struct tunnel *t)
+{
+	return mux_conf(t->ss);
+}
+
 /* Dirty disconnect on a dialed tunnel: attempt to reconnect immediately
  * (attempt 0) before engaging the backoff timer, unless demand-triggered
  * reconnect is in use. */
@@ -437,6 +463,14 @@ static bool handle_closed(struct tunnel *restrict t)
 	return false;
 }
 
+static void handle_stream_established(struct tunnel *t, intmax_t lat_ns)
+{
+	const size_t idx =
+		t->stream_establish_count % ARRAY_SIZE(t->stream_establish_ns);
+	t->stream_establish_ns[idx] = lat_ns;
+	t->stream_establish_count++;
+}
+
 static void tunnel_on_event(
 	void *data, struct mux_session *ss, enum mux_event event,
 	union mux_event_data edata)
@@ -459,6 +493,9 @@ static void tunnel_on_event(
 	case MUX_EVENT_RESUMED:
 		handle_connected(t, edata);
 		break;
+	case MUX_EVENT_STREAM_ESTABLISHED:
+		handle_stream_established(t, edata.stream_established.ns);
+		return;
 	case MUX_EVENT_CLOSED:
 		if (!handle_closed(t)) {
 			return;
@@ -611,7 +648,7 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 	struct tls_connection *const conn = opts->conn;
 #endif
 
-	struct tunnel *restrict t = malloc(sizeof(struct tunnel));
+	struct tunnel *restrict t = calloc(1, sizeof(struct tunnel));
 	if (t == NULL) {
 		return NULL;
 	}
@@ -732,16 +769,19 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 			.num_sessions = &srv->counters.num_sessions,
 			.num_session_halfopen =
 				&srv->counters.num_session_halfopen,
-			.num_streams = &srv->counters.num_streams,
+			.num_streams = &t->stream_cnt.num_streams,
 			.num_stream_halfopen =
-				&srv->counters.num_stream_halfopen,
-			.num_stream_opened = &srv->counters.num_stream_opened,
-			.num_stream_accepted = &srv->counters.num_stream_accepted,
-			.num_stream_fastopen = &srv->counters.num_stream_fastopen,
+				&t->stream_cnt.num_stream_halfopen,
+			.num_stream_opened = &t->stream_cnt.num_stream_opened,
+			.num_stream_accepted =
+				&t->stream_cnt.num_stream_accepted,
+			.num_stream_fastopen =
+				&t->stream_cnt.num_stream_fastopen,
 			.num_stream_established =
-				&srv->counters.num_stream_established,
-			.num_stream_succeeded = &srv->counters.num_stream_succeeded,
-			.num_stream_failed = &srv->counters.num_stream_failed,
+				&t->stream_cnt.num_stream_established,
+			.num_stream_succeeded =
+				&t->stream_cnt.num_stream_succeeded,
+			.num_stream_failed = &t->stream_cnt.num_stream_failed,
 			.num_rst_sent = &srv->counters.num_rst_sent,
 			.num_rst_recv = &srv->counters.num_rst_recv,
 			.num_stream_errors = &srv->counters.num_stream_errors,
@@ -882,6 +922,24 @@ void tunnel_close(struct tunnel *t)
 	free(t);
 }
 
+static void task_mux_shutdown(void *p)
+{
+	mux_shutdown(p);
+}
+
+static void task_set_shutting_down(void *p)
+{
+	struct tunnel *restrict t = p;
+	t->shutting_down = true;
+	ev_timer_stop(t->loop, &t->w_reconnect);
+}
+
+void tunnel_shutdown(struct tunnel *t)
+{
+	tunnel_dispatch(t, (struct task){ task_set_shutting_down, t });
+	tunnel_dispatch(t, (struct task){ task_mux_shutdown, t->ss });
+}
+
 int tunnel_fd(const struct tunnel *t)
 {
 	return mux_fd(t->ss);
@@ -890,11 +948,6 @@ int tunnel_fd(const struct tunnel *t)
 enum mux_state tunnel_state(const struct tunnel *t)
 {
 	return mux_state(t->ss);
-}
-
-static const struct mux_config *tunnel_conf(const struct tunnel *t)
-{
-	return mux_conf(t->ss);
 }
 
 struct mux_session *tunnel_session(const struct tunnel *t)
@@ -930,9 +983,44 @@ const unsigned char *tunnel_session_id(const struct tunnel *t)
 void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 {
 	out->established = mux_state(t->ss) == MUX_STATE_ESTABLISHED;
-	mux_stream_window(t->ss, &out->rx_window, &out->tx_window);
+	out->tag = t->tag;
+	struct mux_session_stats snap;
+	mux_session_stats(t->ss, &snap);
+	out->rx_window = snap.rx_window;
+	out->tx_window = snap.tx_window;
+	out->rtt_ns = snap.rtt_ns;
+	out->bdp = snap.bdp;
 	out->last_changed = t->last_changed;
-	out->rtt_ns = mux_session_rtt_ns(t->ss);
+#if WITH_THREADS
+	out->num_streams = atomic_load_explicit(
+		&t->stream_cnt.num_streams, memory_order_relaxed);
+	out->num_stream_halfopen = atomic_load_explicit(
+		&t->stream_cnt.num_stream_halfopen, memory_order_relaxed);
+	out->num_stream_opened = atomic_load_explicit(
+		&t->stream_cnt.num_stream_opened, memory_order_relaxed);
+	out->num_stream_accepted = atomic_load_explicit(
+		&t->stream_cnt.num_stream_accepted, memory_order_relaxed);
+	out->num_stream_fastopen = atomic_load_explicit(
+		&t->stream_cnt.num_stream_fastopen, memory_order_relaxed);
+	out->num_stream_established = atomic_load_explicit(
+		&t->stream_cnt.num_stream_established, memory_order_relaxed);
+	out->num_stream_succeeded = atomic_load_explicit(
+		&t->stream_cnt.num_stream_succeeded, memory_order_relaxed);
+	out->num_stream_failed = atomic_load_explicit(
+		&t->stream_cnt.num_stream_failed, memory_order_relaxed);
+#else
+	out->num_streams = t->stream_cnt.num_streams;
+	out->num_stream_halfopen = t->stream_cnt.num_stream_halfopen;
+	out->num_stream_opened = t->stream_cnt.num_stream_opened;
+	out->num_stream_accepted = t->stream_cnt.num_stream_accepted;
+	out->num_stream_fastopen = t->stream_cnt.num_stream_fastopen;
+	out->num_stream_established = t->stream_cnt.num_stream_established;
+	out->num_stream_succeeded = t->stream_cnt.num_stream_succeeded;
+	out->num_stream_failed = t->stream_cnt.num_stream_failed;
+#endif
+	out->stream_establish_count = t->stream_establish_count;
+	memcpy(out->stream_establish_ns, t->stream_establish_ns,
+	       sizeof(t->stream_establish_ns));
 }
 
 struct open_stream_arg {
@@ -946,7 +1034,7 @@ static void open_stream_task(void *p)
 	struct open_stream_arg *restrict arg = p;
 	struct tunnel *restrict t = arg->t;
 	const int fd = arg->fd;
-	struct stream *stream = mux_open_stream(arg->ss);
+	struct mux_stream *stream = mux_open_stream(arg->ss);
 	if (stream == NULL) {
 		/* Demand-triggered reconnect: if the session is idle-closed or
 		 * suspended and idle_timeout is set, initiate a new transport
@@ -995,10 +1083,12 @@ struct reload_arg {
 	struct socket_opts local_socket;
 	bool drain;
 	bool update_connect_addr;
-	char *connect_addr; /* owned; NULL is valid */
+	/* Owned; NULL is valid. */
+	char *connect_addr;
 	bool disable_reconnect;
 	bool update_forward_addr;
-	char *forward_addr; /* owned; NULL is valid */
+	/* Owned; NULL is valid. */
+	char *forward_addr;
 };
 
 static void reload_task(void *p)
@@ -1062,22 +1152,4 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		}
 	}
 	tunnel_dispatch(t, (struct task){ reload_task, arg });
-}
-
-static void task_mux_shutdown(void *p)
-{
-	mux_shutdown(p);
-}
-
-static void task_set_shutting_down(void *p)
-{
-	struct tunnel *restrict t = p;
-	t->shutting_down = true;
-	ev_timer_stop(t->loop, &t->w_reconnect);
-}
-
-void tunnel_shutdown(struct tunnel *t)
-{
-	tunnel_dispatch(t, (struct task){ task_set_shutting_down, t });
-	tunnel_dispatch(t, (struct task){ task_mux_shutdown, t->ss });
 }

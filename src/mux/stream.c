@@ -35,7 +35,7 @@
  * connected stream (locally-initiated): "[N] me -> peer:"
  * me/peer use identity, fall back to IP, finally fall back to "[fd:N]". */
 int stream_format_tag(
-	char *restrict buf, size_t buflen, const struct stream *restrict s)
+	char *restrict buf, size_t buflen, const struct mux_stream *restrict s)
 {
 	const struct mux_session *const ss = s->session;
 	/* Peer-initiated: server session with odd ID, or client session with even ID. */
@@ -104,11 +104,11 @@ static const char *stream_state_str[] = {
 	[STREAM_CLOSED] = "CLOSED",
 };
 
-static void stream_stop(struct stream *s);
-static inline bool stream_can_send_data(const struct stream *restrict s);
+static void stream_stop(struct mux_stream *s);
+static inline bool stream_can_send_data(const struct mux_stream *restrict s);
 
-static void
-stream_set_state(struct stream *restrict s, const enum stream_state newstate)
+static void stream_set_state(
+	struct mux_stream *restrict s, const enum stream_state newstate)
 {
 	const enum stream_state oldstate = s->state;
 	const bool new_halfopen = newstate == STREAM_INIT ||
@@ -138,7 +138,7 @@ stream_set_state(struct stream *restrict s, const enum stream_state newstate)
 	}
 }
 
-static inline void stream_mark_closed(struct stream *restrict s)
+static inline void stream_mark_closed(struct mux_stream *restrict s)
 {
 	const bool was_init = (s->state == STREAM_INIT);
 	stream_stop(s);
@@ -166,12 +166,12 @@ static inline void stream_mark_closed(struct stream *restrict s)
 }
 
 static inline bool
-stream_can_shutdown_write_now(const struct stream *restrict s)
+stream_can_shutdown_write_now(const struct mux_stream *restrict s)
 {
 	return s->is_direct || s->socket.connected;
 }
 
-static void stream_shutdown_local_write(struct stream *restrict s)
+static void stream_shutdown_local_write(struct mux_stream *restrict s)
 {
 	if (s->tx_shutdown) {
 		return;
@@ -182,7 +182,7 @@ static void stream_shutdown_local_write(struct stream *restrict s)
 	s->tx_shutdown = true;
 }
 
-static void update_watcher(struct stream *restrict s)
+static void update_watcher(struct mux_stream *restrict s)
 {
 	if (s->state == STREAM_CLOSED) {
 		return;
@@ -228,7 +228,7 @@ static void update_watcher(struct stream *restrict s)
 	modify_io_events(s->session->loop, &s->socket.w_io, events);
 }
 
-static void stream_stop(struct stream *s)
+static void stream_stop(struct mux_stream *s)
 {
 	/* stream_free and EV_IDLE cleanup both pass through here. */
 	ev_timer_stop(s->session->loop, &s->w_tombstone);
@@ -256,7 +256,8 @@ static void stream_stop(struct stream *s)
 }
 
 /* Abort the stream locally and emit one peer-visible RST. */
-static void stream_abort(struct stream *restrict s, const enum mux_status code)
+static void
+stream_abort(struct mux_stream *restrict s, const enum mux_status code)
 {
 	STREAM_LOG(DEBUG, s, "aborting (RST)");
 	COUNTER_ADD(s->session->cnt.num_stream_errors, 1);
@@ -273,7 +274,8 @@ static void stream_abort(struct stream *restrict s, const enum mux_status code)
  * Stop the timer when the receive queue is empty; reset (ev_timer_again) on
  * progress, or arm it for the first time when blocked with pending data.
  */
-static void update_send_timeout(struct stream *restrict s, const bool progress)
+static void
+update_send_timeout(struct mux_stream *restrict s, const bool progress)
 {
 	if (s->socket.w_timeout.repeat <= 0.0) {
 		return;
@@ -287,7 +289,7 @@ static void update_send_timeout(struct stream *restrict s, const bool progress)
 	}
 }
 
-static void stream_flush_local(struct stream *s)
+static void stream_flush_local(struct mux_stream *s)
 {
 	bool made_progress = false;
 	while (ringbuf_readable(s->recvbuf) > 0) {
@@ -360,7 +362,7 @@ static void stream_flush_local(struct stream *s)
  * @p revents contains no interesting bits.
  */
 static inline void
-stream_feed_user(struct stream *restrict s, const int revents)
+stream_feed_user(struct mux_stream *restrict s, const int revents)
 {
 	if (!s->is_direct) {
 		return;
@@ -376,7 +378,7 @@ stream_feed_user(struct stream *restrict s, const int revents)
 	ev_feed_event(w->loop, w, filtered);
 }
 
-void stream_on_send(struct stream *restrict s)
+void stream_on_send(struct mux_stream *restrict s)
 {
 	/* Re-evaluate the socket-mode watcher after a frame has been dequeued
 	 * from send_queue by the mux scheduler.  Freeing one slot may restore
@@ -394,7 +396,8 @@ void stream_on_send(struct stream *restrict s)
 	}
 }
 
-static inline void stream_queue_send(struct stream *s, struct mux_frame *frame)
+static inline void
+stream_queue_send(struct mux_stream *s, struct mux_frame *frame)
 {
 	frame->pos = 0;
 	s->queued_send_bytes +=
@@ -404,13 +407,13 @@ static inline void stream_queue_send(struct stream *s, struct mux_frame *frame)
 	COUNTER_ADD(s->session->cnt.send_buffered_frames, 1);
 }
 
-static inline bool stream_can_send_data(const struct stream *restrict s)
+static inline bool stream_can_send_data(const struct mux_stream *restrict s)
 {
 	return s->state == STREAM_INIT || s->state == STREAM_ESTABLISHED ||
 	       s->state == STREAM_CLOSE_WAIT;
 }
 
-static void recv_cb(struct stream *restrict s)
+static void recv_cb(struct mux_stream *restrict s)
 {
 	if (s->rx_eof || !stream_can_send_data(s)) {
 		return;
@@ -465,7 +468,7 @@ static void recv_cb(struct stream *restrict s)
 	session_eager_flush(s->session, s);
 }
 
-static void local_on_connected(struct stream *restrict s)
+static void local_on_connected(struct mux_stream *restrict s)
 {
 	ev_timer_stop(s->session->loop, &s->socket.w_timeout);
 	const int sockerr = socket_get_error(s->socket.w_io.fd);
@@ -480,7 +483,7 @@ static void local_on_connected(struct stream *restrict s)
 	s->socket.connected = true;
 }
 
-static void send_cb(struct stream *restrict s)
+static void send_cb(struct mux_stream *restrict s)
 {
 	if (!s->socket.connected) {
 		local_on_connected(s);
@@ -495,7 +498,7 @@ static void send_cb(struct stream *restrict s)
 static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ | EV_WRITE);
-	struct stream *restrict s = w->data;
+	struct mux_stream *restrict s = w->data;
 	ASSERT(!s->is_direct);
 	ASSERT(loop == s->session->loop);
 	UNUSED(loop);
@@ -517,7 +520,7 @@ static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct stream *restrict s = w->data;
+	struct mux_stream *restrict s = w->data;
 	ASSERT(loop == s->session->loop);
 	UNUSED(loop);
 	ASSERT(!s->is_direct);
@@ -530,7 +533,7 @@ static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void tombstone_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct stream *restrict s = w->data;
+	struct mux_stream *restrict s = w->data;
 	ASSERT(loop == s->session->loop);
 	UNUSED(loop);
 	ASSERT(s->state == STREAM_CLOSED);
@@ -542,16 +545,16 @@ static void tombstone_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	sched_wake(s->session, s);
 }
 
-struct stream *stream_new(
+struct mux_stream *stream_new(
 	struct mux_session *restrict ss, const uint_fast16_t id,
 	const bool active_open)
 {
-	struct stream *s = malloc(sizeof(struct stream));
+	struct mux_stream *s = malloc(sizeof(struct mux_stream));
 	if (s == NULL) {
 		return NULL;
 	}
 	const struct mux_config *restrict conf = &ss->conf;
-	*s = (struct stream){
+	*s = (struct mux_stream){
 		.id = id,
 		.state = STREAM_INIT,
 		.session = ss,
@@ -586,7 +589,7 @@ struct stream *stream_new(
 }
 
 /* Detach the user watcher from the stream without invoking any callback. */
-static void stream_detach_user(struct stream *restrict s)
+static void stream_detach_user(struct mux_stream *restrict s)
 {
 	if (!s->is_direct) {
 		return;
@@ -601,7 +604,7 @@ static void stream_detach_user(struct stream *restrict s)
 	s->direct.w_io = NULL;
 }
 
-void stream_free(struct stream *s)
+void stream_free(struct mux_stream *s)
 {
 	if (s == NULL) {
 		return;
@@ -630,7 +633,7 @@ void stream_free(struct stream *s)
 	free(s);
 }
 
-void stream_attach_fd(struct stream *s, const int fd)
+void stream_attach_fd(struct mux_stream *s, const int fd)
 {
 	ASSERT(s->state == STREAM_SYN_RECEIVED || s->state == STREAM_INIT ||
 	       s->state == STREAM_SYN_SENT);
@@ -671,7 +674,7 @@ void stream_attach_fd(struct stream *s, const int fd)
 
 void stream_io_start(struct ev_loop *loop, struct mux_stream_io *w)
 {
-	struct stream *s = w->stream;
+	struct mux_stream *s = w->stream;
 	ASSERT(s != NULL);
 	ASSERT(s->state == STREAM_SYN_RECEIVED || s->state == STREAM_INIT ||
 	       s->state == STREAM_SYN_SENT);
@@ -704,7 +707,7 @@ void stream_io_start(struct ev_loop *loop, struct mux_stream_io *w)
 	}
 }
 
-void stream_mark_syn_sent(struct stream *s)
+void stream_mark_syn_sent(struct mux_stream *s)
 {
 	ASSERT(s->state == STREAM_INIT);
 	stream_set_state(s, STREAM_SYN_SENT);
@@ -717,7 +720,7 @@ void stream_mark_syn_sent(struct stream *s)
 	}
 }
 
-static inline void stream_notify_writable(struct stream *restrict s)
+static inline void stream_notify_writable(struct mux_stream *restrict s)
 {
 	if (!s->is_direct) {
 		update_watcher(s);
@@ -725,7 +728,7 @@ static inline void stream_notify_writable(struct stream *restrict s)
 	stream_feed_user(s, EV_WRITE);
 }
 
-void stream_start(struct stream *s)
+void stream_start(struct mux_stream *s)
 {
 	STREAM_LOG(VERBOSE, s, "starting");
 	ASSERT(s->state == STREAM_SYN_SENT);
@@ -739,7 +742,7 @@ void stream_start(struct stream *s)
 	stream_notify_writable(s);
 }
 
-struct mux_frame *stream_dequeue_send(struct stream *restrict s)
+struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 {
 	/* Allow first payload in pre-SYN stage, then regular established states. */
 	if (!stream_can_send_data(s)) {
@@ -836,7 +839,7 @@ static double session_pressure_scale(const struct mux_session *restrict ss)
  * down by session_pressure_scale() when session-level pressure is active;
  * always grants at least one MUX_WINDOW_UNIT while grantable allows, so
  * no stream can be permanently starved. */
-uint_fast32_t stream_grant_inc(const struct stream *restrict s)
+uint_fast32_t stream_grant_inc(const struct mux_stream *restrict s)
 {
 	const uint_fast32_t grantable = stream_grantable_bytes(s);
 	/* Sub-unit grantable cannot be expressed on the wire (spec §6.4:
@@ -870,7 +873,7 @@ uint_fast32_t stream_grant_inc(const struct stream *restrict s)
  * credit already granted to the peer has been consumed (outstanding == 0 or
  * buffered + outstanding fits inside the new target).  Called at the top of
  * stream_check_ack so every grant evaluation sees the up-to-date window. */
-static void stream_try_shrink_recv_window(struct stream *restrict s)
+static void stream_try_shrink_recv_window(struct mux_stream *restrict s)
 {
 	if (!s->session->auto_window) {
 		return;
@@ -894,7 +897,7 @@ static void stream_try_shrink_recv_window(struct stream *restrict s)
 	s->recv_window = target;
 }
 
-void stream_check_ack(struct stream *restrict s)
+void stream_check_ack(struct mux_stream *restrict s)
 {
 	if (s->state == STREAM_CLOSED) {
 		return;
@@ -941,7 +944,7 @@ void stream_check_ack(struct stream *restrict s)
 	}
 }
 
-static inline void stream_notify_readable(struct stream *restrict s)
+static inline void stream_notify_readable(struct mux_stream *restrict s)
 {
 	if (s->is_direct) {
 		stream_feed_user(s, EV_READ);
@@ -955,7 +958,7 @@ static inline void stream_notify_readable(struct stream *restrict s)
 }
 
 void stream_recv_copy(
-	struct stream *restrict s, const unsigned char *restrict payload,
+	struct mux_stream *restrict s, const unsigned char *restrict payload,
 	size_t payload_len)
 {
 	/*
@@ -1011,7 +1014,7 @@ void stream_recv_copy(
 	stream_notify_readable(s);
 }
 
-void stream_recv_window(struct stream *s, const uint_fast32_t window_inc)
+void stream_recv_window(struct mux_stream *s, const uint_fast32_t window_inc)
 {
 	const uint_fast32_t inc_bytes = window_inc * MUX_WINDOW_UNIT;
 
@@ -1061,7 +1064,7 @@ void stream_recv_window(struct stream *s, const uint_fast32_t window_inc)
 	}
 }
 
-void stream_mark_fin_sent(struct stream *s)
+void stream_mark_fin_sent(struct mux_stream *s)
 {
 	if (s->state == STREAM_FIN_WAIT || s->state == STREAM_CLOSING) {
 		return;
@@ -1087,7 +1090,7 @@ void stream_mark_fin_sent(struct stream *s)
 	}
 }
 
-void stream_recv_fin(struct stream *s)
+void stream_recv_fin(struct mux_stream *s)
 {
 	if (s->state == STREAM_CLOSE_WAIT || s->state == STREAM_CLOSING) {
 		return;
@@ -1129,7 +1132,7 @@ void stream_recv_fin(struct stream *s)
 	stream_feed_user(s, EV_READ);
 }
 
-static void stream_rst_notify_direct(struct stream *restrict s)
+static void stream_rst_notify_direct(struct mux_stream *restrict s)
 {
 	struct mux_stream_io *const w = s->direct.w_io;
 	if (w == NULL) {
@@ -1139,13 +1142,13 @@ static void stream_rst_notify_direct(struct stream *restrict s)
 	ev_invoke(w->loop, w, EV_READ);
 }
 
-static void stream_rst_notify_socket(struct stream *restrict s)
+static void stream_rst_notify_socket(struct mux_stream *restrict s)
 {
 	/* Abortively close the local socket to propagate RST to the peer. */
 	socket_set_linger(s->socket.w_io.fd, true, 0);
 }
 
-void stream_recv_rst(struct stream *s)
+void stream_recv_rst(struct mux_stream *s)
 {
 	STREAM_LOG(DEBUG, s, "received RST");
 	s->rst_received = true;
@@ -1175,7 +1178,7 @@ void stream_recv_rst(struct stream *s)
 	stream_mark_closed(s);
 }
 
-void stream_close(struct stream *s)
+void stream_close(struct mux_stream *s)
 {
 	if (s->state == STREAM_CLOSED) {
 		return;
@@ -1200,7 +1203,7 @@ void stream_close(struct stream *s)
 	stream_mark_closed(s);
 }
 
-void stream_shutdown(struct stream *s)
+void stream_shutdown(struct mux_stream *s)
 {
 	STREAM_LOG(VERBOSE, s, "local shutdown (write-EOF)");
 	s->rx_eof = true;

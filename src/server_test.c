@@ -762,16 +762,6 @@ static struct wait_stats wait_stats_snapshot(const struct server *restrict s)
 {
 	struct wait_stats st = { 0 };
 #if WITH_THREADS
-	const uintmax_t stream_opened = atomic_load_explicit(
-		&s->counters.num_stream_opened, memory_order_relaxed);
-	const uintmax_t stream_accepted = atomic_load_explicit(
-		&s->counters.num_stream_accepted, memory_order_relaxed);
-	const uintmax_t stream_established = atomic_load_explicit(
-		&s->counters.num_stream_established, memory_order_relaxed);
-	const uintmax_t stream_succeeded = atomic_load_explicit(
-		&s->counters.num_stream_succeeded, memory_order_relaxed);
-	const uintmax_t stream_failed = atomic_load_explicit(
-		&s->counters.num_stream_failed, memory_order_relaxed);
 	const uintmax_t session_connect = atomic_load_explicit(
 		&s->counters.num_session_connect, memory_order_relaxed);
 	const uintmax_t session_connected = atomic_load_explicit(
@@ -779,24 +769,27 @@ static struct wait_stats wait_stats_snapshot(const struct server *restrict s)
 	const uintmax_t session_disconnected = atomic_load_explicit(
 		&s->counters.num_session_disconnected, memory_order_relaxed);
 #else
-	const uintmax_t stream_opened = s->counters.num_stream_opened;
-	const uintmax_t stream_accepted = s->counters.num_stream_accepted;
-	const uintmax_t stream_established = s->counters.num_stream_established;
-	const uintmax_t stream_succeeded = s->counters.num_stream_succeeded;
-	const uintmax_t stream_failed = s->counters.num_stream_failed;
 	const uintmax_t session_connect = s->counters.num_session_connect;
 	const uintmax_t session_connected = s->counters.num_session_connected;
 	const uintmax_t session_disconnected =
 		s->counters.num_session_disconnected;
 #endif
-	st.num_streams = (size_t)((stream_opened + stream_accepted) -
-				  (stream_succeeded + stream_failed));
-	st.num_halfopen_streams = (size_t)((stream_opened + stream_accepted) -
-					   stream_established);
 	st.num_established_sessions =
 		(size_t)(session_connected - session_disconnected);
 	st.num_halfopen_sessions =
 		(size_t)(session_connect - session_connected);
+	struct server_stats *restrict snap = server_stats(s);
+	if (snap != NULL) {
+		st.num_streams = (size_t)((snap->num_stream_opened +
+					   snap->num_stream_accepted) -
+					  (snap->num_stream_succeeded +
+					   snap->num_stream_failed));
+		st.num_halfopen_streams =
+			(size_t)((snap->num_stream_opened +
+				  snap->num_stream_accepted) -
+				 snap->num_stream_established);
+		free(snap);
+	}
 	return st;
 }
 

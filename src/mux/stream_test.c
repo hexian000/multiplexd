@@ -142,10 +142,10 @@ static void teardown_fixture(struct stream_fixture *restrict fx)
 	}
 }
 
-static struct stream *
+static struct mux_stream *
 make_stream(struct stream_fixture *restrict fx, const uint_fast16_t id)
 {
-	struct stream *const s = stream_new(&fx->ss, id, true);
+	struct mux_stream *const s = stream_new(&fx->ss, id, true);
 	if (s != NULL) {
 		s->state = STREAM_ESTABLISHED;
 	}
@@ -174,7 +174,7 @@ T_DECLARE_CASE(test_stream_grant_inc_uses_available_window)
 		return;
 	}
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
 	s->grant_sent = 0;
 	T_EXPECT_EQ(stream_grant_inc(s), (uint_fast32_t)4);
@@ -196,7 +196,7 @@ T_DECLARE_CASE(test_stream_grant_inc_scales_under_pressure)
 	fx.ss.recv_buffered_bytes = 4 * (size_t)MUX_FRAME_SIZE;
 	fx.ss.stream_window = 8;
 
-	struct stream *const s = stream_new(&fx.ss, 1, true);
+	struct mux_stream *const s = stream_new(&fx.ss, 1, true);
 	T_CHECK(s != NULL);
 	s->state = STREAM_ESTABLISHED;
 	s->grant_sent = 0;
@@ -214,7 +214,7 @@ T_DECLARE_CASE(test_stream_dequeue_send_updates_queue_counters)
 		return;
 	}
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	struct mux_frame *frame;
 	T_CHECK(s != NULL);
 	frame = make_payload_frame(&fx.ss.pool, 32);
@@ -242,7 +242,7 @@ T_DECLARE_CASE(test_stream_recv_window_grows_send_credit)
 		return;
 	}
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
 	s->is_direct = true;
 	s->send_window = 0;
@@ -263,7 +263,7 @@ T_DECLARE_CASE(test_stream_recv_fin_advances_state)
 		return;
 	}
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
 
 	s->state = STREAM_ESTABLISHED;
@@ -286,7 +286,7 @@ T_DECLARE_CASE(test_stream_recv_rst_discards_buffered_data)
 		return;
 	}
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	unsigned char payload[16] = { 0 };
 	T_CHECK(s != NULL);
 	s->is_direct = true;
@@ -311,7 +311,7 @@ T_DECLARE_CASE(test_stream_close_with_unread_data_sends_rst)
 		return;
 	}
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	unsigned char payload[8] = { 0 };
 	T_CHECK(s != NULL);
 	s->is_direct = true;
@@ -340,7 +340,7 @@ T_DECLARE_CASE(test_stream_shutdown_marks_rx_eof)
 		return;
 	}
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
 
 	stream_shutdown(s);
@@ -361,7 +361,7 @@ T_DECLARE_CASE(test_stream_recv_fin_with_rx_eof_shuts_down_write)
 		return;
 	}
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
 
 	/* Simulate: local app already hit EOF; local FIN was sent; peer FIN
@@ -408,7 +408,7 @@ T_DECLARE_CASE(test_stream_check_ack_shrinks_recv_window_when_safe)
 	/* New BDP target: 2 frames. */
 	fx.ss.stream_window = 2;
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
 
 	/* Force recv_window to a larger old value. */
@@ -442,7 +442,7 @@ T_DECLARE_CASE(test_stream_check_ack_does_not_shrink_while_outstanding)
 	/* New BDP target: 2 frames. */
 	fx.ss.stream_window = 2;
 
-	struct stream *const s = make_stream(&fx, 1);
+	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
 
 	const uint_fast32_t old_window = 8u * MUX_MAX_PAYLOAD_SIZE;

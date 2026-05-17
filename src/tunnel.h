@@ -10,6 +10,7 @@
 #define TUNNEL_H
 
 #include "mux/mux.h"
+#include "util.h"
 
 #include <ev.h>
 #include <stdbool.h>
@@ -103,6 +104,8 @@ struct tunnel_stats {
 	/* borrowed pointer to the identity string for this tunnel's pool;
 	 * NULL for the top-level mux_tunnel (no identity pool) */
 	const char *peer_identity;
+	/* borrowed pointer to the tunnel's diagnostic tag ("my <= peer") */
+	const char *tag;
 	/* total tunnels in this identity's pool (1 for mux_tunnel) */
 	size_t num_tunnels;
 	bool established;
@@ -112,6 +115,25 @@ struct tunnel_stats {
 	/* Windowed-minimum RTT from PING/PONG probes, in nanoseconds; 0 if
 	 * no measurement has been completed yet. */
 	intmax_t rtt_ns;
+	/* Raw physical BDP estimate in bytes, no headroom; 0 if not yet
+	 * estimated. */
+	size_t bdp;
+	/* Stream lifecycle counters (per-tunnel snapshot; aggregated by
+	 * server_stats() across all active tunnels). */
+	size_t num_streams;
+	size_t num_stream_halfopen;
+	uintmax_t num_stream_opened;
+	uintmax_t num_stream_accepted;
+	uintmax_t num_stream_fastopen;
+	uintmax_t num_stream_established;
+	uintmax_t num_stream_succeeded;
+	uintmax_t num_stream_failed;
+	/* SYN->SYN|ACK latency ring (ns).  stream_establish_count is the
+	 * monotonic write index; the ring holds the most recent
+	 * min(stream_establish_count, 256) samples.
+	 * Populated only for dialed tunnels (latency is measured client-side). */
+	size_t stream_establish_count;
+	intmax_t stream_establish_ns[256];
 };
 
 /* Populate *out with a consistent snapshot of tunnel statistics. */

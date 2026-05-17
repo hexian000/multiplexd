@@ -132,7 +132,7 @@ static struct tunnel *make_established_tunnel(
 	ss->peer_stream_window = 4;
 	ss->state = SESSION_ESTABLISHED;
 	for (size_t i = 0; i < num_streams; i++) {
-		struct stream *const s =
+		struct mux_stream *const s =
 			stream_new(ss, (uint_fast16_t)(i * 2u + 1u), true);
 		if (s == NULL) {
 			tunnel_close(t);
@@ -808,7 +808,7 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	apifx_teardown(&fx);
 }
 
-T_DECLARE_CASE(test_stats_identity_shows_bw_when_rtt_known)
+T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 {
 	struct apifx fx;
 	if (apifx_setup(&fx) != 0) {
@@ -834,10 +834,9 @@ T_DECLARE_CASE(test_stats_identity_shows_bw_when_rtt_known)
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_GET);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "peer-rtt"));
-	T_EXPECT(resp_contains(rctx.buf, "BW=Rx"));
+	T_EXPECT(resp_contains(rctx.buf, "W=Rx"));
 	T_EXPECT(resp_contains(rctx.buf, "RTT"));
-	/* Ensure the raw-window fallback is not emitted for this row */
-	T_EXPECT(!resp_contains(rctx.buf, ": W=Rx"));
+	T_EXPECT(!resp_contains(rctx.buf, "BW=Rx"));
 
 	apifx_teardown(&fx);
 }
@@ -870,10 +869,10 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	/* rx_window = 2 * 16384 = 32768, tx_window = 4 * 16384 = 65536 */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_rx_window_bytes{identity=\"peer-win\"} 32768"));
+		"multiplexd_session_rx_window_bytes{identity=\"peer-win\",tag=\"self => 127.0.0.1:1\"} 32768"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_tx_window_bytes{identity=\"peer-win\"} 65536"));
+		"multiplexd_session_tx_window_bytes{identity=\"peer-win\",tag=\"self => 127.0.0.1:1\"} 65536"));
 
 	apifx_teardown(&fx);
 }
@@ -938,9 +937,6 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 	STORE_STAT(fx.srv.counters.traffic_byt_mux_sent, 2345);
 	STORE_STAT(fx.srv.counters.traffic_byt_local_recv, 3456);
 	STORE_STAT(fx.srv.counters.traffic_byt_local_sent, 4567);
-	fx.srv.counters.num_stream_established = 2;
-	fx.srv.stream_establish_ns[0] = 1000 * 1000;
-	fx.srv.stream_establish_ns[1] = 2 * 1000 * 1000;
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
@@ -955,9 +951,6 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 	T_EXPECT(resp_contains(
 		rctx.buf,
 		"multiplexd_bytes_total{direction=\"sent\",link=\"local\"} 4567"));
-	T_EXPECT(resp_contains(
-		rctx.buf,
-		"multiplexd_stream_establish_latency_seconds_count 2"));
 
 	apifx_teardown(&fx);
 }
@@ -1025,7 +1018,7 @@ int main(void)
 	T_RUN_CASE(t, test_keepalive);
 	T_RUN_CASE(t, test_connection_close);
 	T_RUN_CASE(t, test_stats_get_includes_identity_rows);
-	T_RUN_CASE(t, test_stats_identity_shows_bw_when_rtt_known);
+	T_RUN_CASE(t, test_stats_identity_shows_window_when_rtt_known);
 	T_RUN_CASE(t, test_metrics_reports_identity_window_bytes);
 	T_RUN_CASE(t, test_stats_post_tracks_rate_deltas);
 	T_RUN_CASE(t, test_metrics_reports_non_zero_mux_counters);

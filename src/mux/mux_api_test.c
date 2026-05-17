@@ -98,11 +98,10 @@ T_DECLARE_CASE(test_mux_peer_addr_and_window_accessors)
 	ss.peer_addr.sa.sa_family = AF_UNIX;
 	T_EXPECT(mux_peer_addr(&ss) != NULL);
 	{
-		size_t rx = 0;
-		size_t tx = 0;
-		mux_stream_window(&ss, &rx, &tx);
-		T_EXPECT_EQ(rx, (size_t)(3 * MUX_WINDOW_UNIT));
-		T_EXPECT_EQ(tx, (size_t)(5 * MUX_WINDOW_UNIT));
+		struct mux_session_stats st = { 0 };
+		mux_session_stats(&ss, &st);
+		T_EXPECT_EQ(st.rx_window, (size_t)(3 * MUX_WINDOW_UNIT));
+		T_EXPECT_EQ(st.tx_window, (size_t)(5 * MUX_WINDOW_UNIT));
 	}
 }
 
@@ -110,7 +109,7 @@ T_DECLARE_CASE(test_mux_stream_send_rejects_invalid_state)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx);
-	struct stream s = {
+	struct mux_stream s = {
 		.state = STREAM_SYN_SENT,
 		.session = &ss,
 	};
@@ -128,7 +127,7 @@ T_DECLARE_CASE(test_mux_stream_send_queues_payload)
 	struct mux_session ss = make_session(&pool_ctx);
 	struct ev_loop *loop = NULL;
 	int fds[2] = { -1, -1 };
-	struct stream s = {
+	struct mux_stream s = {
 		.state = STREAM_INIT,
 		.session = &ss,
 		.send_window = 64,
@@ -158,7 +157,7 @@ T_DECLARE_CASE(test_mux_stream_recv_reports_eagain_and_reset)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx);
-	struct stream s = {
+	struct mux_stream s = {
 		.state = STREAM_ESTABLISHED,
 		.session = &ss,
 	};
@@ -183,7 +182,7 @@ T_DECLARE_CASE(test_mux_stream_io_stop_clears_stream_binding)
 	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx);
-	struct stream s = {
+	struct mux_stream s = {
 		.state = STREAM_ESTABLISHED,
 		.session = &ss,
 	};

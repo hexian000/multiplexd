@@ -72,7 +72,6 @@ multiplexd supports simultaneous forward and reverse forwarding over a single mu
 | Reverse |<-n-|            |    |            |<-n-| Remote  |
 | Target  |    |            |    |            |    | Apps    |
 +---------+    +------------+    +------------+    +---------+
-
 ```
 
 **Forward forwarding**: local apps connect to the client's `listen` address; the server forwards each mux stream to its `connect` target.

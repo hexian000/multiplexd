@@ -41,7 +41,7 @@ enum stream_state {
 	STREAM_CLOSED,
 };
 
-struct stream {
+struct mux_stream {
 	uint_least16_t id;
 
 	/* State flags (shared by both modes) */
@@ -69,9 +69,9 @@ struct stream {
 	uint_least8_t delay_ticks;
 	enum stream_state state;
 	struct mux_session *session;
-	struct stream *next;
-	struct stream *delay_prev;
-	struct stream *delay_next;
+	struct mux_stream *next;
+	struct mux_stream *delay_prev;
+	struct mux_stream *delay_next;
 
 	/* Local I/O: the two modes are mutually exclusive */
 	union {
@@ -117,7 +117,7 @@ struct stream {
 	ev_timer w_tombstone;
 };
 
-static inline uint_fast32_t stream_avail_window(const struct stream *s)
+static inline uint_fast32_t stream_avail_window(const struct mux_stream *s)
 {
 	return s->recv_window > s->buffered_bytes ?
 		       s->recv_window - s->buffered_bytes :
@@ -125,12 +125,12 @@ static inline uint_fast32_t stream_avail_window(const struct stream *s)
 }
 
 /* Wrapping subtraction is safe because outstanding data stays well below 2^31. */
-static inline uint_fast32_t stream_credit_avail(const struct stream *s)
+static inline uint_fast32_t stream_credit_avail(const struct mux_stream *s)
 {
 	return (uint_fast32_t)(s->send_window - s->bytes_sent);
 }
 
-static inline uint_fast32_t stream_read_credit_avail(const struct stream *s)
+static inline uint_fast32_t stream_read_credit_avail(const struct mux_stream *s)
 {
 	const uint_fast32_t send_credit = stream_credit_avail(s);
 	return send_credit > s->queued_send_bytes ?
@@ -139,7 +139,7 @@ static inline uint_fast32_t stream_read_credit_avail(const struct stream *s)
 }
 
 /* Remaining receive space after subtracting credit the peer may still spend. */
-static inline uint_fast32_t stream_grantable_bytes(const struct stream *s)
+static inline uint_fast32_t stream_grantable_bytes(const struct mux_stream *s)
 {
 	const uint_fast32_t outstanding =
 		(uint_fast32_t)(s->grant_sent - s->bytes_received);
@@ -149,49 +149,49 @@ static inline uint_fast32_t stream_grantable_bytes(const struct stream *s)
 
 /* Compute the window increment (in MUX_WINDOW_UNIT units) to grant the peer.
  * Applies session-level receive-pressure scaling; defined in stream.c. */
-uint_fast32_t stream_grant_inc(const struct stream *s);
+uint_fast32_t stream_grant_inc(const struct mux_stream *s);
 
-struct stream *
+struct mux_stream *
 stream_new(struct mux_session *restrict ss, uint_fast16_t id, bool active_open);
 
-void stream_free(struct stream *s);
+void stream_free(struct mux_stream *s);
 
-void stream_attach_fd(struct stream *s, int fd);
+void stream_attach_fd(struct mux_stream *s, int fd);
 
 void stream_io_start(struct ev_loop *loop, struct mux_stream_io *w);
 
-void stream_mark_syn_sent(struct stream *s);
+void stream_mark_syn_sent(struct mux_stream *s);
 
-void stream_start(struct stream *s);
+void stream_start(struct mux_stream *s);
 
-struct mux_frame *stream_dequeue_send(struct stream *restrict s);
+struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s);
 
-void stream_on_send(struct stream *restrict s);
+void stream_on_send(struct mux_stream *restrict s);
 
 void stream_recv_copy(
-	struct stream *restrict s, const unsigned char *restrict payload,
+	struct mux_stream *restrict s, const unsigned char *restrict payload,
 	size_t payload_len);
 
-void stream_check_ack(struct stream *restrict s);
+void stream_check_ack(struct mux_stream *restrict s);
 
-void stream_recv_window(struct stream *restrict s, uint_fast32_t window_inc);
+void stream_recv_window(struct mux_stream *restrict s, uint_fast32_t window_inc);
 
-void stream_mark_fin_sent(struct stream *s);
+void stream_mark_fin_sent(struct mux_stream *s);
 
-void stream_recv_fin(struct stream *s);
+void stream_recv_fin(struct mux_stream *s);
 
-void stream_recv_rst(struct stream *s);
+void stream_recv_rst(struct mux_stream *s);
 
 /* Close the stream with close(fd) semantics.
  * If the receive buffer has unread data, discard it and send RST to the peer.
  * Otherwise, perform an immediate teardown without sending any control frame
  * (the caller is responsible for prior protocol actions such as RST or FIN). */
-void stream_close(struct stream *s);
+void stream_close(struct mux_stream *s);
 
 /* Half-close the write side, equivalent to shutdown(fd, SHUT_WR).
  * Queues a FIN to the peer once all pending send data has been flushed.
  * The stream remains readable until the peer FIN arrives. */
-void stream_shutdown(struct stream *s);
+void stream_shutdown(struct mux_stream *s);
 
 /* Format a stream log prefix into buf.
  * accepted stream: "me <- peer [N]:"
@@ -199,6 +199,6 @@ void stream_shutdown(struct stream *s);
  * me/peer use identity, fall back to IP, finally fall back to "[fd:N]".
  * Returns the snprintf byte count. */
 int stream_format_tag(
-	char *restrict buf, size_t buflen, const struct stream *restrict s);
+	char *restrict buf, size_t buflen, const struct mux_stream *restrict s);
 
 #endif /* MUX_STREAM_H */

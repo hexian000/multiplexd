@@ -33,6 +33,7 @@
 #include "utils/slog.h"
 
 #include <ev.h>
+
 #include <sys/socket.h>
 
 #include <inttypes.h>
@@ -51,9 +52,6 @@
 
 #define SESSIONID_KEY(id_ptr)                                                  \
 	((struct hashkey){ .len = MUX_SESSION_ID_LEN, .data = (id_ptr) })
-
-#define IDENTITY_KEY(id_str)                                                   \
-	((struct hashkey){ .len = strlen(id_str), .data = (id_str) })
 
 /* Iterator over all tunnel objects owned by a server.
  * Yields mux_tunnel first, then each identities[i].tunnels[j] in order,
@@ -311,15 +309,6 @@ handle_disconnected(struct server *restrict srv, struct tunnel *restrict t)
 	SESSION_EVLOG(srv, t, "session disconnected");
 }
 
-static void
-handle_stream_established(struct server *restrict srv, intmax_t lat_ns)
-{
-	const size_t idx = srv->stream_establish_count %
-			   ARRAY_SIZE(srv->stream_establish_ns);
-	srv->stream_establish_ns[idx] = lat_ns;
-	srv->stream_establish_count++;
-}
-
 static void handle_closed(
 	struct server *restrict srv, struct tunnel *restrict t,
 	const union mux_event_data edata)
@@ -400,7 +389,7 @@ static void tunnel_on_event(
 		handle_disconnected(srv, t);
 		break;
 	case MUX_EVENT_STREAM_ESTABLISHED:
-		handle_stream_established(srv, edata.stream_established.ns);
+		/* Consumed by the tunnel layer before reaching the relay. */
 		break;
 	case MUX_EVENT_CLOSED:
 		handle_closed(srv, t, edata);
@@ -1818,30 +1807,67 @@ static int cmp_intmax(const void *a, const void *b)
 	return 0;
 }
 
-/* Fills the p50/p90/p99/pmax percentile fields in *out from the latency ring
- * buffer and returns the number of samples used (0 when the ring is empty). */
-static size_t calc_stream_percentiles(
-	const struct server *restrict s, struct server_stats *restrict out)
+/* Sum stream lifecycle counters from one accepted tunnel into *data. */
+static bool sum_accepted_stream_cnt(
+	const struct hashtable *table, struct hashkey key, void *element,
+	void *data)
 {
-	const size_t ring = ARRAY_SIZE(s->stream_establish_ns);
-	const size_t count = MIN(s->stream_establish_count, ring);
-	if (count == 0) {
+	UNUSED(table);
+	UNUSED(key);
+	struct server_stats *restrict out = data;
+	struct tunnel_stats snap;
+	tunnel_stats(element, &snap);
+	out->num_streams += snap.num_streams;
+	out->num_stream_halfopen += snap.num_stream_halfopen;
+	out->num_stream_opened += snap.num_stream_opened;
+	out->num_stream_accepted += snap.num_stream_accepted;
+	out->num_stream_fastopen += snap.num_stream_fastopen;
+	out->num_stream_established += snap.num_stream_established;
+	out->num_stream_succeeded += snap.num_stream_succeeded;
+	out->num_stream_failed += snap.num_stream_failed;
+	return true;
+}
+
+/* Fills the p50/p90/p99/pmax percentile fields in *out by merging the latency
+ * rings from all dialed tunnels already snapshotted in out->tunnels[].
+ * Returns the total number of samples used (0 when all rings are empty). */
+static size_t calc_stream_percentiles(struct server_stats *restrict out)
+{
+	size_t total = 0;
+	for (size_t i = 0; i < out->num_tunnels; i++) {
+		total +=
+			MIN(out->tunnels[i].stream_establish_count,
+			    ARRAY_SIZE(out->tunnels[i].stream_establish_ns));
+	}
+	if (total == 0) {
 		return 0;
 	}
-	intmax_t samples[256];
-	for (size_t i = 0; i < count; i++) {
-		const size_t idx = (s->stream_establish_count - i - 1) % ring;
-		samples[i] = s->stream_establish_ns[idx];
+	intmax_t *samples = malloc(total * sizeof(*samples));
+	if (samples == NULL) {
+		LOGOOM();
+		return 0;
 	}
-	qsort(samples, count, sizeof(samples[0]), cmp_intmax);
-	const size_t i50 = (50 * count) / 100;
-	const size_t i90 = (90 * count) / 100;
-	const size_t i99 = (99 * count) / 100;
-	out->stream_establish_p50 = samples[i50 < count ? i50 : count - 1];
-	out->stream_establish_p90 = samples[i90 < count ? i90 : count - 1];
-	out->stream_establish_p99 = samples[i99 < count ? i99 : count - 1];
-	out->stream_establish_pmax = samples[count - 1];
-	return count;
+	size_t n = 0;
+	for (size_t i = 0; i < out->num_tunnels; i++) {
+		const struct tunnel_stats *ts = &out->tunnels[i];
+		const size_t ring = ARRAY_SIZE(ts->stream_establish_ns);
+		const size_t count = MIN(ts->stream_establish_count, ring);
+		for (size_t j = 0; j < count; j++) {
+			const size_t idx =
+				(ts->stream_establish_count - j - 1) % ring;
+			samples[n++] = ts->stream_establish_ns[idx];
+		}
+	}
+	qsort(samples, n, sizeof(samples[0]), cmp_intmax);
+	const size_t i50 = (50 * n) / 100;
+	const size_t i90 = (90 * n) / 100;
+	const size_t i99 = (99 * n) / 100;
+	out->stream_establish_p50 = samples[i50 < n ? i50 : n - 1];
+	out->stream_establish_p90 = samples[i90 < n ? i90 : n - 1];
+	out->stream_establish_p99 = samples[i99 < n ? i99 : n - 1];
+	out->stream_establish_pmax = samples[n - 1];
+	free(samples);
+	return n;
 }
 
 struct server_stats *server_stats(const struct server *restrict s)
@@ -1886,22 +1912,6 @@ struct server_stats *server_stats(const struct server *restrict s)
 		atomic_load_explicit(&c->num_sessions, memory_order_relaxed);
 	out->num_session_halfopen = atomic_load_explicit(
 		&c->num_session_halfopen, memory_order_relaxed);
-	out->num_streams =
-		atomic_load_explicit(&c->num_streams, memory_order_relaxed);
-	out->num_stream_halfopen = atomic_load_explicit(
-		&c->num_stream_halfopen, memory_order_relaxed);
-	out->num_stream_opened = atomic_load_explicit(
-		&c->num_stream_opened, memory_order_relaxed);
-	out->num_stream_accepted = atomic_load_explicit(
-		&c->num_stream_accepted, memory_order_relaxed);
-	out->num_stream_fastopen = atomic_load_explicit(
-		&c->num_stream_fastopen, memory_order_relaxed);
-	out->num_stream_established = atomic_load_explicit(
-		&c->num_stream_established, memory_order_relaxed);
-	out->num_stream_succeeded = atomic_load_explicit(
-		&c->num_stream_succeeded, memory_order_relaxed);
-	out->num_stream_failed = atomic_load_explicit(
-		&c->num_stream_failed, memory_order_relaxed);
 	out->num_rst_sent =
 		atomic_load_explicit(&c->num_rst_sent, memory_order_relaxed);
 	out->num_rst_recv =
@@ -1932,14 +1942,6 @@ struct server_stats *server_stats(const struct server *restrict s)
 	out->num_session_finalized = c->num_session_finalized;
 	out->num_sessions = c->num_sessions;
 	out->num_session_halfopen = c->num_session_halfopen;
-	out->num_streams = c->num_streams;
-	out->num_stream_halfopen = c->num_stream_halfopen;
-	out->num_stream_opened = c->num_stream_opened;
-	out->num_stream_accepted = c->num_stream_accepted;
-	out->num_stream_fastopen = c->num_stream_fastopen;
-	out->num_stream_established = c->num_stream_established;
-	out->num_stream_succeeded = c->num_stream_succeeded;
-	out->num_stream_failed = c->num_stream_failed;
 	out->num_rst_sent = c->num_rst_sent;
 	out->num_rst_recv = c->num_rst_recv;
 	out->num_stream_errors = c->num_stream_errors;
@@ -1953,9 +1955,7 @@ struct server_stats *server_stats(const struct server *restrict s)
 	out->unacked_frames = c->unacked_frames;
 #endif
 
-	out->stream_establish_count = calc_stream_percentiles(s, out);
-	out->evlog = &s->evlog;
-
+	/* Populate dialed tunnels first; stream aggregation reads their snapshots. */
 	size_t idx = 0;
 	if (s->mux_tunnel != NULL) {
 		out->tunnels[idx].peer_identity = NULL;
@@ -1973,6 +1973,27 @@ struct server_stats *server_stats(const struct server *restrict s)
 		}
 	}
 	out->num_tunnels = idx;
+
+	/* Aggregate stream counters from dialed tunnels (already snapshotted). */
+	for (size_t i = 0; i < out->num_tunnels; i++) {
+		const struct tunnel_stats *ts = &out->tunnels[i];
+		out->num_streams += ts->num_streams;
+		out->num_stream_halfopen += ts->num_stream_halfopen;
+		out->num_stream_opened += ts->num_stream_opened;
+		out->num_stream_accepted += ts->num_stream_accepted;
+		out->num_stream_fastopen += ts->num_stream_fastopen;
+		out->num_stream_established += ts->num_stream_established;
+		out->num_stream_succeeded += ts->num_stream_succeeded;
+		out->num_stream_failed += ts->num_stream_failed;
+	}
+	/* Aggregate stream counters from accepted (inbound) tunnels. */
+	if (s->accepted_tunnels != NULL) {
+		table_iterate(
+			s->accepted_tunnels, sum_accepted_stream_cnt, out);
+	}
+
+	out->stream_establish_count = calc_stream_percentiles(out);
+	out->evlog = &s->evlog;
 
 	return out;
 }

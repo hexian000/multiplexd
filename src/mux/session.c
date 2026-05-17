@@ -512,7 +512,7 @@ flush_sendbuf(struct mux_session *restrict ss, bool *restrict made_progress)
 }
 
 bool session_send_push(
-	struct mux_session *ss, struct stream *s, struct mux_frame *frame)
+	struct mux_session *ss, struct mux_stream *s, struct mux_frame *frame)
 {
 	ASSERT(frame->len > MUX_FRAME_HEADER_SIZE);
 	ASSERT(ss->wire.sendbuf.head == NULL);
@@ -793,7 +793,7 @@ static void recv_cb(struct mux_session *ss)
 }
 
 void session_eager_flush(
-	struct mux_session *restrict ss, struct stream *restrict s)
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	const bool was_pending = ss->wire.tx_pending;
 	sched_wake(ss, s);
@@ -1117,7 +1117,7 @@ static bool update_stream_window_cb(
 	UNUSED(table);
 	UNUSED(key);
 	const uint_fast32_t new_window = *(const uint_fast32_t *)data;
-	struct stream *restrict s = element;
+	struct mux_stream *restrict s = element;
 	if (new_window <= s->recv_window) {
 		return true;
 	}
@@ -1551,7 +1551,7 @@ void session_attach_fd(struct mux_session *restrict ss, const int fd)
 	MUX_LOG_F(DEBUG, ss, "transport attached [fd:%d]", fd);
 }
 
-struct stream *session_open_stream(struct mux_session *restrict ss)
+struct mux_stream *session_open_stream(struct mux_session *restrict ss)
 {
 	if (ss->state == SESSION_CLOSED) {
 		MUX_LOG(VERBOSE, ss, "open_stream: session closed");
@@ -1591,7 +1591,7 @@ struct stream *session_open_stream(struct mux_session *restrict ss)
 		return NULL;
 	}
 
-	struct stream *s = stream_new(ss, id, true);
+	struct mux_stream *s = stream_new(ss, id, true);
 	if (s == NULL) {
 		LOGOOM();
 		return NULL;

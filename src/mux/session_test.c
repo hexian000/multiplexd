@@ -309,7 +309,7 @@ T_DECLARE_CASE(test_session_resume_ack_recv_advances_cursor)
 T_DECLARE_CASE(test_session_open_stream_enforces_limits)
 {
 	struct session_fixture fx;
-	struct stream *existing = NULL;
+	struct mux_stream *existing = NULL;
 	if (setup_fixture(&fx) != 0) {
 		T_FATAL("setup_fixture failed");
 		return;
@@ -338,7 +338,7 @@ T_DECLARE_CASE(test_session_open_stream_success_sets_default_send_window)
 		return;
 	}
 
-	struct stream *const s = session_open_stream(&fx.ss);
+	struct mux_stream *const s = session_open_stream(&fx.ss);
 	T_CHECK(s != NULL);
 	T_EXPECT_EQ(s->id, (uint_least16_t)1);
 	T_EXPECT_EQ(s->send_window, (uint_least32_t)MUX_DEFAULT_SEND_WINDOW);
@@ -476,7 +476,7 @@ T_DECLARE_CASE(test_session_handshake_done_rearms_coalesce_for_delay_list)
 		return;
 	}
 
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 1,
 		.delay_pending = true,
 		.delay_ticks = 2,

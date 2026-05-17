@@ -57,7 +57,7 @@ struct evlog {
  * Two monitoring routes feed `server_stats()`:
  *
  *   counters route — `struct server_counters` in `struct server`.
- *     Updated from any thread via `struct session_counters` (mux/mux.h)
+ *     Updated from any thread via `struct mux_session_counters` (mux/mux.h)
  *     using COUNTER_* macros with memory_order_relaxed.
  *
  *   stats route — diagnostic fields in `struct server`, server-thread-only.
@@ -113,37 +113,6 @@ struct server_counters {
 		size_t num_sessions;
 		/* sessions currently in CONNECT or HANDSHAKE state */
 		size_t num_session_halfopen;
-#endif
-	};
-
-	/* stream lifecycle counters (monotonic) and gauges */
-	struct {
-#if WITH_THREADS
-		/* streams currently in any active (non-closed) state */
-		atomic_size_t num_streams;
-		/* streams currently in INIT, SYN_SENT, or SYN_RECEIVED state */
-		atomic_size_t num_stream_halfopen;
-		atomic_uintmax_t num_stream_opened;
-		/* total passive-open streams accepted from remote peer */
-		atomic_uintmax_t num_stream_accepted;
-		/* total active-open streams whose first flight used SYN|PUSH */
-		atomic_uintmax_t num_stream_fastopen;
-		atomic_uintmax_t num_stream_established;
-		atomic_uintmax_t num_stream_succeeded;
-		atomic_uintmax_t num_stream_failed;
-#else
-		/* streams currently in any active (non-closed) state */
-		size_t num_streams;
-		/* streams currently in INIT, SYN_SENT, or SYN_RECEIVED state */
-		size_t num_stream_halfopen;
-		uintmax_t num_stream_opened;
-		/* total passive-open streams accepted from remote peer */
-		uintmax_t num_stream_accepted;
-		/* total active-open streams whose first flight used SYN|PUSH */
-		uintmax_t num_stream_fastopen;
-		uintmax_t num_stream_established;
-		uintmax_t num_stream_succeeded;
-		uintmax_t num_stream_failed;
 #endif
 	};
 
@@ -224,6 +193,7 @@ struct server_stats {
 	uintmax_t num_session_finalized;
 	size_t num_sessions;
 	size_t num_session_halfopen;
+	/* --- stream counters (aggregated from tunnel_stats[] at snapshot time) --- */
 	size_t num_streams;
 	size_t num_stream_halfopen;
 	uintmax_t num_stream_opened;
@@ -339,8 +309,6 @@ struct server {
 	struct server_counters counters;
 
 	/* stats route: server-thread-only diagnostics; read via server_stats() */
-	size_t stream_establish_count; /* SYN->SYN|ACK latency ring: count */
-	intmax_t stream_establish_ns[256]; /* SYN->SYN|ACK latency samples (ns) */
 	struct evlog evlog; /* session event ring buffer */
 
 	/* Rate tracking state for POST /stats bandwidth display */

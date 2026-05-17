@@ -43,7 +43,7 @@ is_valid_peer_stream_id(struct mux_session *ss, const uint_fast16_t stream_id)
 }
 
 static bool
-validate_flags_by_stream(const struct stream *s, const uint_fast8_t flags)
+validate_flags_by_stream(const struct mux_stream *s, const uint_fast8_t flags)
 {
 	const uint_fast8_t non_rst_flags = flags & ~MUX_FLAG_RST;
 
@@ -98,7 +98,7 @@ is_ignorable_unknown_terminal_frame(const struct mux_header *restrict hdr)
 }
 
 static void process_syn_payload(
-	struct mux_session *restrict ss, struct stream *restrict s,
+	struct mux_session *restrict ss, struct mux_stream *restrict s,
 	const struct mux_header *restrict hdr, const size_t frame_size)
 {
 	/* stream_start() has already collapsed SYN_SENT before SYN|PUSH reaches here. */
@@ -119,7 +119,7 @@ static void process_syn_payload(
 
 /* Process frame for a known stream (found in stream table) */
 static void dispatch_by_stream(
-	struct mux_session *ss, struct stream *restrict s,
+	struct mux_session *ss, struct mux_stream *restrict s,
 	const struct mux_header *restrict hdr)
 {
 	const uint_fast16_t stream_id = hdr->stream_id;
@@ -354,7 +354,7 @@ static void dispatch_no_stream(
 			return;
 		}
 
-		struct stream *s = stream_new(ss, stream_id, false);
+		struct mux_stream *s = stream_new(ss, stream_id, false);
 		if (s == NULL) {
 			MUX_LOG(ERROR, ss, "stream allocation failed");
 			ringbuf_consume(ss->wire.recvbuf, frame_size);
@@ -583,7 +583,7 @@ void dispatch_frame(struct mux_session *ss)
 			COUNTER_ADD(ss->cnt.num_rst_recv, 1);
 		}
 
-		struct stream *s = sched_find_stream(ss, hdr.stream_id);
+		struct mux_stream *s = sched_find_stream(ss, hdr.stream_id);
 		if (s != NULL) {
 			dispatch_by_stream(ss, s, &hdr);
 		} else {

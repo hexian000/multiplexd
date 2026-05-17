@@ -29,7 +29,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-struct stream;
+struct mux_stream;
 struct mux_session;
 struct tls_context;
 struct tls_connection;
@@ -79,21 +79,21 @@ struct sched_ctx {
 	 * Used to exclude tombstones from the max_streams admission gate. */
 	size_t num_tombstones;
 	/* Round-robin ready queue head and tail. */
-	struct stream *sched_head;
-	struct stream *sched_tail;
+	struct mux_stream *sched_head;
+	struct mux_stream *sched_tail;
 	/* Tail of the ready queue at the start of the current scheduling round;
 	 * used by the EV_WRITE data path to enforce DRR round fairness. */
-	struct stream *round_end;
+	struct mux_stream *round_end;
 	/* Currently active DRR stream: dequeued and holding remaining deficit.
 	 * Not in the ready queue; NULL when no stream is mid-round. */
-	struct stream *drr_active;
+	struct mux_stream *drr_active;
 	/* Coalescing delay list: streams waiting for the next w_coalesce tick. */
-	struct stream *delay_head;
+	struct mux_stream *delay_head;
 	/* Low-priority queue for lifecycle events (INIT SYN / CLOSED cleanup).
 	 * Drained in EV_IDLE; kept separate from the DRR data queue so the
 	 * data path never skips over INIT/CLOSED streams. */
-	struct stream *lp_head;
-	struct stream *lp_tail;
+	struct mux_stream *lp_head;
+	struct mux_stream *lp_tail;
 	ev_idle w_sched;
 	/* Fixed-period coalescing timer: flushes Nagle-held frames and
 	 * sub-threshold window updates every MUX_COALESCING_INTERVAL seconds. */
@@ -122,7 +122,7 @@ struct handshake_ctx {
 	char *peer_identity;
 };
 
-/* COUNTER_ADD/SUB/LOAD/STORE operate on session_counters pointer fields.
+/* COUNTER_ADD/SUB/LOAD/STORE operate on mux_session_counters pointer fields.
  * All macros are NULL-safe: when the pointer argument is NULL the
  * operation is silently skipped (returns 0 for ADD/SUB/LOAD). */
 #if WITH_THREADS
@@ -150,12 +150,12 @@ struct mux_session {
 	/* Non-owning pointer to the session log tag buffer; set at creation time. */
 	char *tag;
 	/* Pointer block into server_stats; NULL pointers are silently skipped. */
-	struct session_counters cnt;
+	struct mux_session_counters cnt;
 	/* Local counter for tracking. */
 	size_t num_halfopen;
 	/* Per-session frame counters for internal flow control.
 	 * These are also pushed to the server-level aggregates via
-	 * session_counters pointers when available (non-NULL). */
+	 * mux_session_counters pointers when available (non-NULL). */
 	size_t recv_buffered_bytes;
 	size_t send_buffered_frames;
 	size_t unacked_frames;
@@ -294,7 +294,7 @@ void session_initiate_shutdown(struct mux_session *restrict ss);
 void session_drain(struct mux_session *ss);
 
 /* Open a new locally-initiated stream; returns NULL when the session rejects it. */
-struct stream *session_open_stream(struct mux_session *restrict ss);
+struct mux_stream *session_open_stream(struct mux_session *restrict ss);
 
 /* Remove all unsent non-RST frames for stream_id from the session send buffer.
  * RST frames are preserved so a previously-queued RST is never suppressed.
@@ -308,7 +308,7 @@ void session_update_watcher(struct mux_session *restrict ss);
 
 /* Enqueue a PUSH data frame for stream s into the send buffer; takes ownership of frame. */
 bool session_send_push(
-	struct mux_session *ss, struct stream *s, struct mux_frame *frame);
+	struct mux_session *ss, struct mux_stream *s, struct mux_frame *frame);
 
 /* Enqueue a packed control frame for stream_id with the given flags and extra value. */
 bool session_send_ctrl(
@@ -330,7 +330,7 @@ void session_flush(struct mux_session *restrict ss);
  * Must only be called from stream.c:recv_cb(); do not call from any path
  * that may already be inside session.c:send_cb(). */
 void session_eager_flush(
-	struct mux_session *restrict ss, struct stream *restrict s);
+	struct mux_session *restrict ss, struct mux_stream *restrict s);
 
 /* Co-unit internal interface: used by handshake.c and dispatch.c.
  * Do not call from unrelated translation units. */

@@ -39,7 +39,7 @@ static int g_stream_start_calls;
 static int g_stream_recv_fin_calls;
 static int g_estimator_add_calls;
 static uintmax_t g_last_estimator_bytes;
-static struct stream *g_sched_find_stream;
+static struct mux_stream *g_sched_find_stream;
 
 static void dispatch_test_reset(void)
 {
@@ -80,7 +80,7 @@ consume_frame(struct mux_session *restrict ss, const size_t frame_size)
 
 int stream_format_tag(
 	char *restrict buf, const size_t buflen,
-	const struct stream *restrict s)
+	const struct mux_stream *restrict s)
 {
 	(void)s;
 	return snprintf(buf, buflen, "[stream]:");
@@ -172,7 +172,7 @@ bool handshake_process_hello(
 	return g_handshake_result;
 }
 
-struct stream *sched_find_stream(
+struct mux_stream *sched_find_stream(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id)
 {
 	(void)ss;
@@ -183,7 +183,8 @@ struct stream *sched_find_stream(
 	return NULL;
 }
 
-bool sched_add_stream(struct mux_session *restrict ss, struct stream *restrict s)
+bool sched_add_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	void *elem = s;
 	ss->sched.streams =
@@ -191,12 +192,12 @@ bool sched_add_stream(struct mux_session *restrict ss, struct stream *restrict s
 	return ss->sched.streams != NULL;
 }
 
-struct stream *stream_new(
+struct mux_stream *stream_new(
 	struct mux_session *restrict ss, const uint_fast16_t id,
 	const bool active_open)
 {
 	(void)active_open;
-	struct stream *const s = calloc(1, sizeof(*s));
+	struct mux_stream *const s = calloc(1, sizeof(*s));
 	if (s != NULL) {
 		s->session = ss;
 		s->id = (uint_least16_t)id;
@@ -205,24 +206,24 @@ struct stream *stream_new(
 	return s;
 }
 
-void stream_close(struct stream *s)
+void stream_close(struct mux_stream *s)
 {
 	free(s);
 }
 
-void stream_free(struct stream *s)
+void stream_free(struct mux_stream *s)
 {
 	free(s);
 }
 
-void stream_recv_rst(struct stream *s)
+void stream_recv_rst(struct mux_stream *s)
 {
 	(void)s;
 	g_stream_recv_rst_calls++;
 }
 
 void stream_recv_window(
-	struct stream *restrict s, const uint_fast32_t window_inc)
+	struct mux_stream *restrict s, const uint_fast32_t window_inc)
 {
 	g_stream_recv_window_calls++;
 	g_last_window_inc = window_inc;
@@ -230,14 +231,14 @@ void stream_recv_window(
 					  window_inc * MUX_WINDOW_UNIT);
 }
 
-void stream_start(struct stream *s)
+void stream_start(struct mux_stream *s)
 {
 	g_stream_start_calls++;
 	s->state = STREAM_ESTABLISHED;
 }
 
 void stream_recv_copy(
-	struct stream *restrict s, const unsigned char *restrict payload,
+	struct mux_stream *restrict s, const unsigned char *restrict payload,
 	size_t payload_len)
 {
 	(void)s;
@@ -245,7 +246,7 @@ void stream_recv_copy(
 	(void)payload_len;
 }
 
-void stream_recv_fin(struct stream *s)
+void stream_recv_fin(struct mux_stream *s)
 {
 	(void)s;
 	g_stream_recv_fin_calls++;
@@ -291,7 +292,7 @@ static void fill_frame(
 static void
 insert_dummy_stream(struct mux_session *restrict ss, const uint_least16_t id)
 {
-	struct stream *dummy = calloc(1, sizeof(*dummy));
+	struct mux_stream *dummy = calloc(1, sizeof(*dummy));
 	void *elem = dummy;
 	T_CHECK(dummy != NULL);
 	dummy->id = id;
@@ -324,9 +325,9 @@ static void free_stream_table(struct mux_session *restrict ss)
 
 T_DECLARE_CASE(test_validate_flags_by_stream_states)
 {
-	struct stream syn_sent = { .state = STREAM_SYN_SENT };
-	struct stream close_wait = { .state = STREAM_CLOSE_WAIT };
-	struct stream established = { .state = STREAM_ESTABLISHED };
+	struct mux_stream syn_sent = { .state = STREAM_SYN_SENT };
+	struct mux_stream close_wait = { .state = STREAM_CLOSE_WAIT };
+	struct mux_stream established = { .state = STREAM_ESTABLISHED };
 
 	T_EXPECT(validate_flags_by_stream(
 		&syn_sent, MUX_FLAG_SYN | MUX_FLAG_ACK));
@@ -586,7 +587,7 @@ T_DECLARE_CASE(test_dispatch_frame_stops_after_handshake_when_write_pending)
 T_DECLARE_CASE(test_dispatch_by_stream_invalid_flags_send_rst)
 {
 	struct mux_session ss = make_session(false);
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 2,
 		.state = STREAM_CLOSE_WAIT,
 	};
@@ -611,7 +612,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_invalid_flags_send_rst)
 T_DECLARE_CASE(test_dispatch_by_stream_ack_fin_grants_credit_and_fin)
 {
 	struct mux_session ss = make_session(false);
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 2,
 		.state = STREAM_ESTABLISHED,
 		.send_window = MUX_DEFAULT_SEND_WINDOW,
@@ -636,7 +637,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_ack_fin_grants_credit_and_fin)
 T_DECLARE_CASE(test_dispatch_by_stream_closed_terminal_fin_is_ignored)
 {
 	struct mux_session ss = make_session(false);
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 2,
 		.state = STREAM_CLOSED,
 	};
@@ -661,7 +662,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_closed_push_sends_rst)
 {
 	struct mux_session ss = make_session(false);
 	struct mux_frame frame = { 0 };
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 2,
 		.state = STREAM_CLOSED,
 	};
@@ -692,7 +693,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_closed_push_rst_dedup)
 {
 	struct mux_session ss = make_session(false);
 	struct mux_frame frame = { 0 };
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 2,
 		.state = STREAM_CLOSED,
 	};
@@ -721,7 +722,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_closed_push_rst_dedup)
 T_DECLARE_CASE(test_dispatch_by_stream_closed_rst_is_ignored)
 {
 	struct mux_session ss = make_session(false);
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 2,
 		.state = STREAM_CLOSED,
 	};
@@ -744,7 +745,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_closed_rst_is_ignored)
 T_DECLARE_CASE(test_dispatch_by_stream_syn_ack_starts_stream)
 {
 	struct mux_session ss = make_session(false);
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 2,
 		.state = STREAM_SYN_SENT,
 		.send_window = MUX_DEFAULT_SEND_WINDOW,
@@ -771,7 +772,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_syn_ack_starts_stream)
 T_DECLARE_CASE(test_dispatch_by_stream_syn_ack_retransmit_on_established)
 {
 	struct mux_session ss = make_session(false);
-	struct stream s = {
+	struct mux_stream s = {
 		.id = 2,
 		.state = STREAM_ESTABLISHED,
 		.send_window = MUX_DEFAULT_SEND_WINDOW,

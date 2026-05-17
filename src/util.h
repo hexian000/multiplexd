@@ -64,6 +64,18 @@ static inline void modify_io_events(
 	}
 }
 
+struct socket_opts {
+	bool tcp_keepalive;
+	bool tcp_nodelay;
+	bool tcp_reuseport;
+	int tcp_sndbuf;
+	int tcp_rcvbuf;
+#if WITH_TCP_NOTSENT_LOWAT
+	int tcp_notsent_lowat;
+#endif
+	int backlog;
+};
+
 /**
  * @brief Sets TCP_NOTSENT_LOWAT on the socket; no-op on unsupported platforms.
  * @param fd The socket file descriptor.
