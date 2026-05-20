@@ -1111,7 +1111,7 @@ void session_recv_ping(
 /* Expand the receive window of one stream to new_window bytes.  Called via
  * table_iterate; only grows already-granted per-stream receive credit. */
 static bool update_stream_window_cb(
-	const struct hashtable *table, struct hashkey key, void *element,
+	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
 	UNUSED(table);
@@ -1255,7 +1255,11 @@ session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
 		.connect_started = (fd >= 0) ? clock_monotonic_ns() : 0,
 	};
 
-	ss->sched.streams = table_new(TABLE_FAST);
+	ss->sched.streams = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_PTR.hash,
+		.eq = TABLE_OPTS_PTR.eq,
+		.flags = TABLE_FAST,
+	});
 	if (ss->sched.streams == NULL) {
 		free(ss);
 		return NULL;
@@ -1521,7 +1525,11 @@ void session_attach_fd(struct mux_session *restrict ss, const int fd)
 	}
 
 	if (ss->sched.streams == NULL) {
-		ss->sched.streams = table_new(TABLE_FAST);
+		ss->sched.streams = table_new(&(struct table_opts){
+			.hash = TABLE_OPTS_PTR.hash,
+			.eq = TABLE_OPTS_PTR.eq,
+			.flags = TABLE_FAST,
+		});
 		if (ss->sched.streams == NULL) {
 			LOGOOM();
 			CLOSE_FD(fd);

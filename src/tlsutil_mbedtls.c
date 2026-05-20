@@ -355,7 +355,8 @@ static struct tls_context *tls_ctx_init(
 #ifdef MBEDTLS_LEGACY_RNG
 	mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
 #endif
-	/* See OpenSSL backend for the rationale: private CA gates identity. */
+	/* See OpenSSL backend for the rationale: private CA gates transport
+	 * authentication; application-level identity comes from the hello. */
 	mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 	/* mbedtls_ssl_set_hostname() is always called in tls_connect (see
 	 * comment there); this callback clears the resulting CN-mismatch

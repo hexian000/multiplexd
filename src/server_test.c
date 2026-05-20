@@ -1025,13 +1025,13 @@ fixture_setup(struct test_fixture *restrict fx, const enum mock_mode mode)
 
 	g_setup_stage = "server_a_tcp_port";
 	if (wait_for_listener_port(
-		    fx, &fx->srv_a->tcp_listener, &fx->tcp_port_a,
+		    fx, &fx->srv_a->local_listener, &fx->tcp_port_a,
 		    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) != 0) {
 		return -1;
 	}
 	g_setup_stage = "server_b_tcp_port";
 	if (wait_for_listener_port(
-		    fx, &fx->srv_b->tcp_listener, &fx->tcp_port_b,
+		    fx, &fx->srv_b->local_listener, &fx->tcp_port_b,
 		    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) != 0) {
 		return -1;
 	}
@@ -1653,6 +1653,241 @@ cleanup:
 	fixture_teardown(&fx);
 }
 
+/* Predicate: srv_a's config pointer has been replaced (reload completed). */
+struct reload_wait_ctx {
+	const struct test_fixture *fx;
+	const struct config *old_conf;
+};
+
+static int reload_done_predicate(void *ptr)
+{
+	const struct reload_wait_ctx *restrict ctx = ptr;
+	return ctx->fx->srv_a->conf != ctx->old_conf ? 1 : 0;
+}
+
+/*
+ * test_server_config_reload – exercises server_reload() (the SIGHUP path),
+ * server_drain_tunnels(), server_reload_listeners(), server_reload_mux_tunnel(),
+ * and server_reload_identity_tunnels().
+ *
+ * Steps:
+ *   1. Establish a two-server pair and verify echo works.
+ *   2. Dump srv_a's config to a tempfile (clearing the "version=2" type tag
+ *      so conf_parsefile accepts it as "version=1").
+ *   3. Invoke srv_a's SIGHUP watcher via ev_invoke so signal_cb runs
+ *      synchronously before ev_run processes any other event.
+ *   4. Update fx.conf_a to the new config to avoid a double-free on teardown.
+ *   5. Wait for the session to be re-established (srv_b reconnects after drain).
+ *   6. Verify echo still works after the reload.
+ */
+T_DECLARE_CASE(test_server_config_reload)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		T_FATAL("fixture_setup failed");
+	}
+
+	/* Pre-reload echo sanity check. */
+	const int fd_before = connect_local(&fx, fx.tcp_port_a);
+	if (fd_before < 0) {
+		fixture_teardown(&fx);
+		T_FATAL("connect_local failed before reload");
+	}
+	if (wait_for_streams_ready(&fx, 1) != 0) {
+		close(fd_before);
+		fixture_teardown(&fx);
+		T_FATAL("streams not ready before reload");
+	}
+	T_CHECK(send_and_expect_echo(
+			&fx, fd_before, "pre", 3,
+			(double)ECHO_WAIT_TIMEOUT_MS / 1000.0) == 0);
+	close(fd_before);
+
+	/* Wait for the stream to close so the session is idle before drain. */
+	if (wait_for_streams_exact(&fx, 0) != 0) {
+		fixture_teardown(&fx);
+		T_FATAL("stream not drained before reload");
+	}
+
+	/* Write the config to a tempfile.  The test config carries
+	 * type="...version=2" which conf_parsefile rejects; temporarily clear
+	 * it so conf_dumpfile emits the canonical CONF_TYPE ("version=1"). */
+	char tmp_path[] = "/tmp/server_reload_XXXXXX";
+	const int tmp_fd = mkstemp(tmp_path);
+	if (tmp_fd < 0) {
+		fixture_teardown(&fx);
+		T_FATAL("mkstemp failed");
+	}
+	close(tmp_fd);
+
+	char *const saved_type = fx.conf_a->type;
+	fx.conf_a->type = NULL;
+	const bool dump_ok = conf_dumpfile(fx.conf_a, tmp_path);
+	fx.conf_a->type = saved_type;
+	if (!dump_ok) {
+		(void)unlink(tmp_path);
+		fixture_teardown(&fx);
+		T_FATAL("conf_dumpfile failed");
+	}
+
+	/* Trigger reload: point srv_a at the tempfile and invoke its SIGHUP
+	 * watcher directly.  ev_feed_signal_event would fire srv_b's watcher
+	 * too, causing a noisy "failed to reload config: (null)" error. */
+	fx.srv_a->conf_path = tmp_path;
+	ev_invoke(fx.loop, &fx.srv_a->w_sighup, EV_SIGNAL);
+
+	/* Wait for signal_cb to run and server_reload() to swap the config.
+	 * After this point fx.conf_a is a dangling pointer (freed by reload). */
+	struct reload_wait_ctx reload_ctx = {
+		.fx = &fx,
+		.old_conf = fx.conf_a,
+	};
+	if (wait_until(&fx, 1.0, reload_done_predicate, &reload_ctx) != 0) {
+		(void)unlink(tmp_path);
+		fixture_teardown(&fx);
+		T_FATAL("server_reload did not swap config within timeout");
+	}
+	/* Update tracked pointer so fixture_teardown frees the new config. */
+	fx.conf_a = fx.srv_a->conf;
+
+	/* Wait for the session to be re-established after the drain. */
+	if (wait_until(&fx, 2.0, sessions_ready_wait_predicate, &fx) != 0) {
+		(void)unlink(tmp_path);
+		fixture_teardown(&fx);
+		T_FATAL("session not re-established after reload");
+	}
+
+	/* Post-reload echo – the server must still forward traffic. */
+	const int fd_after = connect_local(&fx, fx.tcp_port_a);
+	if (fd_after < 0) {
+		(void)unlink(tmp_path);
+		fixture_teardown(&fx);
+		T_FATAL("connect_local failed after reload");
+	}
+	if (wait_for_streams_ready(&fx, 1) != 0) {
+		close(fd_after);
+		(void)unlink(tmp_path);
+		fixture_teardown(&fx);
+		T_FATAL("streams not ready after reload");
+	}
+	T_CHECK(send_and_expect_echo(
+			&fx, fd_after, "post", 4,
+			(double)ECHO_WAIT_TIMEOUT_MS / 1000.0) == 0);
+	close(fd_after);
+
+	(void)unlink(tmp_path);
+	fixture_teardown(&fx);
+}
+
+/*
+ * test_server_max_sessions_rejects – exercises the max_sessions branch of
+ * is_startup_limited(), which rejects new mux connections when the number of
+ * established sessions already exceeds the configured maximum.
+ *
+ * Approach: after the fixture establishes one real session (num_sessions==1),
+ * lower max_sessions to 1 and artificially bump the counter to 2 so the guard
+ * fires on the next inbound mux connection.  The raw TCP connection is then
+ * expected to be closed immediately by the server (read() returns 0).
+ */
+T_DECLARE_CASE(test_server_max_sessions_rejects)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		T_FATAL("fixture_setup failed");
+	}
+
+	/* Clamp the limit below the faked session count. */
+	fx.srv_a->conf->max_sessions = 1;
+
+	/* Fake num_sessions == 2 so the check (2 > 1) fires. */
+#if WITH_THREADS
+	atomic_store_explicit(
+		&fx.srv_a->counters.num_sessions, 2, memory_order_relaxed);
+#else
+	fx.srv_a->counters.num_sessions = 2;
+#endif
+
+	/* Open a raw TCP connection to the mux listener; expect immediate
+	 * close (server rejects it via is_startup_limited). */
+	const int raw = connect_local(&fx, fx.mux_port_a);
+	if (raw < 0) {
+		fixture_teardown(&fx);
+		T_FATAL("connect_local to mux port failed");
+	}
+
+	/* Drive until the connection is rejected and closed.  The server
+	 * increments num_rejected and closes the fd synchronously inside
+	 * mux_serve, so the rejection should appear within one event-loop
+	 * iteration. */
+	const int revents = wait_fd_events(
+		&fx, raw, EV_READ, (double)CONNECT_WAIT_TIMEOUT_MS / 1000.0);
+	T_CHECK((revents & EV_READ) != 0);
+
+	char buf[1];
+	const ssize_t n = read(raw, buf, sizeof(buf));
+	T_EXPECT_EQ(n, (ssize_t)0); /* peer closed the connection */
+	close(raw);
+
+	/* Verify the rejection counter was incremented. */
+	T_EXPECT(fx.srv_a->counters.num_rejected > 0);
+
+	/* Restore the faked counter so the fixture tears down cleanly. */
+#if WITH_THREADS
+	atomic_store_explicit(
+		&fx.srv_a->counters.num_sessions, 1, memory_order_relaxed);
+#else
+	fx.srv_a->counters.num_sessions = 1;
+#endif
+	fx.srv_a->conf->max_sessions = 0;
+
+	fixture_teardown(&fx);
+}
+
+/*
+ * test_server_graceful_shutdown_via_signal – exercises the SIGTERM branch of
+ * signal_cb(), which stops all listeners, initiates graceful session shutdown,
+ * and starts a two-second deadline timer.
+ *
+ * Steps:
+ *   1. Establish a two-server pair.
+ *   2. Invoke srv_a's SIGTERM watcher via ev_invoke so only srv_a's
+ *      signal_cb fires (avoids disturbing srv_b's watcher).
+ *   3. Drive the event loop until the listeners on srv_a are stopped.
+ *   4. Verify that fixture_teardown completes cleanly (server_stop +
+ *      server_free are safe after the signal handler ran).
+ */
+T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		T_FATAL("fixture_setup failed");
+	}
+
+	/* Invoke srv_a's SIGTERM watcher directly; using ev_feed_signal_event
+	 * would also fire srv_b's watcher and complicate teardown ordering. */
+	ev_invoke(fx.loop, &fx.srv_a->w_sigterm, EV_SIGNAL);
+
+	/* Drive until signal_cb has stopped the mux listener (synchronous
+	 * side-effect of the signal handler). */
+	const ev_tstamp deadline =
+		ev_time() + (double)SETUP_WAIT_TIMEOUT_MS / 1000.0;
+	while (fx.srv_a->mux_listener.w_accept.fd != -1 &&
+	       ev_time() < deadline) {
+		drive_loop_once(&fx);
+	}
+	T_CHECK(fx.srv_a->mux_listener.w_accept.fd == -1);
+	T_CHECK(fx.srv_a->local_listener.w_accept.fd == -1);
+
+	/* Let any pending shutdown tasks settle before tearing down. */
+	drive_loop_once(&fx);
+	drive_loop_once(&fx);
+
+	fixture_teardown(&fx);
+}
+
 int main(void)
 {
 	init(0, NULL);
@@ -1668,6 +1903,9 @@ int main(void)
 	T_RUN_CASE(t, test_listener_reuse_after_stream_churn);
 	T_RUN_CASE(t, test_cross_direction_overlap);
 	T_RUN_CASE(t, test_large_payload_then_half_close);
+	T_RUN_CASE(t, test_server_config_reload);
+	T_RUN_CASE(t, test_server_max_sessions_rejects);
+	T_RUN_CASE(t, test_server_graceful_shutdown_via_signal);
 
 	unloadlibs();
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;

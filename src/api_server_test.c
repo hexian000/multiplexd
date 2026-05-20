@@ -22,6 +22,7 @@
  */
 
 #include "api_server.h"
+#include "algo/hashtable.h"
 #include "conf.h"
 #include "mux/sched.h"
 #include "mux/session.h"
@@ -220,19 +221,21 @@ static void apifx_teardown(struct apifx *restrict fx)
 	if (fx == NULL) {
 		return;
 	}
-	if (fx->srv.identities != NULL) {
-		for (size_t i = 0; i < fx->srv.num_identities; i++) {
-			for (size_t j = 0;
-			     j < fx->srv.identities[i].num_tunnels; j++) {
-				tunnel_close(fx->srv.identities[i].tunnels[j]);
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(fx->srv.identities, &cursor, NULL, &elem)) {
+			struct identity_listener *sl = elem;
+			for (size_t j = 0; j < sl->num_tunnels; j++) {
+				tunnel_close(sl->tunnels[j]);
 			}
-			free(fx->srv.identities[i].tunnels);
-			fx->srv.identities[i].tunnels = NULL;
-			fx->srv.identities[i].num_tunnels = 0;
+			free(sl->tunnels);
+			sl->tunnels = NULL;
+			sl->num_tunnels = 0;
+			free(sl);
 		}
-		free(fx->srv.identities);
+		table_free(fx->srv.identities);
 		fx->srv.identities = NULL;
-		fx->srv.num_identities = 0;
 	}
 	if (fx->cli_fd >= 0) {
 		close(fx->cli_fd);
@@ -775,26 +778,45 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 		T_FATAL("apifx_setup failed");
 	}
 
-	fx.srv.identities = calloc(2, sizeof(*fx.srv.identities));
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
 	T_CHECK(fx.srv.identities != NULL);
-	fx.srv.num_identities = 2;
-	fx.srv.identities[0].peer_identity = "peer-offline";
+	struct identity_listener *sl0 = calloc(1, sizeof(*sl0));
+	T_CHECK(sl0 != NULL);
+	sl0->peer_identity = "peer-offline";
 	struct tunnel *t0 = make_established_tunnel(&fx, "peer-offline", 0);
 	T_CHECK(t0 != NULL);
 	/* Reset to non-established so tunnel_stats() reports !established. */
 	tunnel_session(t0)->state = SESSION_CONNECT;
-	fx.srv.identities[0].tunnels = malloc(sizeof(struct tunnel *));
-	T_CHECK(fx.srv.identities[0].tunnels != NULL);
-	fx.srv.identities[0].tunnels[0] = t0;
-	fx.srv.identities[0].num_tunnels = 1;
-	fx.srv.identities[1].peer_identity = "peer-online";
+	sl0->tunnels = malloc(sizeof(struct tunnel *));
+	T_CHECK(sl0->tunnels != NULL);
+	sl0->tunnels[0] = t0;
+	sl0->num_tunnels = 1;
+	{
+		void *slot = sl0;
+		fx.srv.identities =
+			table_set(fx.srv.identities, sl0->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
+	struct identity_listener *sl1 = calloc(1, sizeof(*sl1));
+	T_CHECK(sl1 != NULL);
+	sl1->peer_identity = "peer-online";
 	struct tunnel *restrict t1 =
 		make_established_tunnel(&fx, "peer-online", 3);
 	T_CHECK(t1 != NULL);
-	fx.srv.identities[1].tunnels = malloc(sizeof(struct tunnel *));
-	T_CHECK(fx.srv.identities[1].tunnels != NULL);
-	fx.srv.identities[1].tunnels[0] = t1;
-	fx.srv.identities[1].num_tunnels = 1;
+	sl1->tunnels = malloc(sizeof(struct tunnel *));
+	T_CHECK(sl1->tunnels != NULL);
+	sl1->tunnels[0] = t1;
+	sl1->num_tunnels = 1;
+	{
+		void *slot = sl1;
+		fx.srv.identities =
+			table_set(fx.srv.identities, sl1->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_GET);
@@ -815,20 +837,31 @@ T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 		T_FATAL("apifx_setup failed");
 	}
 
-	fx.srv.identities = calloc(1, sizeof(*fx.srv.identities));
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
 	T_CHECK(fx.srv.identities != NULL);
-	fx.srv.num_identities = 1;
-	fx.srv.identities[0].peer_identity = "peer-rtt";
+	struct identity_listener *sl_rtt = calloc(1, sizeof(*sl_rtt));
+	T_CHECK(sl_rtt != NULL);
+	sl_rtt->peer_identity = "peer-rtt";
 	struct tunnel *restrict t1 =
 		make_established_tunnel(&fx, "peer-rtt", 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
 	/* 20 ms RTT — stored in seconds in the estimator window */
 	ss->estimator.rtt_wnd[0].val = 0.020;
-	fx.srv.identities[0].tunnels = malloc(sizeof(struct tunnel *));
-	T_CHECK(fx.srv.identities[0].tunnels != NULL);
-	fx.srv.identities[0].tunnels[0] = t1;
-	fx.srv.identities[0].num_tunnels = 1;
+	sl_rtt->tunnels = malloc(sizeof(struct tunnel *));
+	T_CHECK(sl_rtt->tunnels != NULL);
+	sl_rtt->tunnels[0] = t1;
+	sl_rtt->num_tunnels = 1;
+	{
+		void *slot = sl_rtt;
+		fx.srv.identities = table_set(
+			fx.srv.identities, sl_rtt->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_GET);
@@ -848,20 +881,31 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 		T_FATAL("apifx_setup failed");
 	}
 
-	fx.srv.identities = calloc(1, sizeof(*fx.srv.identities));
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
 	T_CHECK(fx.srv.identities != NULL);
-	fx.srv.num_identities = 1;
-	fx.srv.identities[0].peer_identity = "peer-win";
+	struct identity_listener *sl_win = calloc(1, sizeof(*sl_win));
+	T_CHECK(sl_win != NULL);
+	sl_win->peer_identity = "peer-win";
 	struct tunnel *restrict t1 =
 		make_established_tunnel(&fx, "peer-win", 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
 	ss->stream_window = 2;
 	ss->peer_stream_window = 4;
-	fx.srv.identities[0].tunnels = malloc(sizeof(struct tunnel *));
-	T_CHECK(fx.srv.identities[0].tunnels != NULL);
-	fx.srv.identities[0].tunnels[0] = t1;
-	fx.srv.identities[0].num_tunnels = 1;
+	sl_win->tunnels = malloc(sizeof(struct tunnel *));
+	T_CHECK(sl_win->tunnels != NULL);
+	sl_win->tunnels[0] = t1;
+	sl_win->num_tunnels = 1;
+	{
+		void *slot = sl_win;
+		fx.srv.identities = table_set(
+			fx.srv.identities, sl_win->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
@@ -869,10 +913,10 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	/* rx_window = 2 * 16384 = 32768, tx_window = 4 * 16384 = 65536 */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_rx_window_bytes{identity=\"peer-win\",tag=\"self => 127.0.0.1:1\"} 32768"));
+		"multiplexd_session_rx_window_bytes{session=\"peer-win\",role=\"client\"} 32768"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_tx_window_bytes{identity=\"peer-win\",tag=\"self => 127.0.0.1:1\"} 65536"));
+		"multiplexd_session_tx_window_bytes{session=\"peer-win\",role=\"client\"} 65536"));
 
 	apifx_teardown(&fx);
 }
@@ -912,7 +956,7 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx2, REQ_STATS_POST);
 	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
 	T_EXPECT(resp_contains(rctx2.buf, "Mux Throughput"));
-	T_EXPECT(resp_contains(rctx2.buf, "TCP Throughput"));
+	T_EXPECT(resp_contains(rctx2.buf, "Stream Throughput"));
 	T_EXPECT(resp_contains(rctx2.buf, "Server Load"));
 	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uintmax_t)3072);
 	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uintmax_t)6144);

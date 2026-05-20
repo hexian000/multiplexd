@@ -213,7 +213,7 @@ static void append_stateful_stats(
 			ctx->rbuf, "Mux Throughput      : Rx %s/s, Tx %s/s\n",
 			rx_mux, tx_mux);
 		BUF_APPENDF(
-			ctx->rbuf, "TCP Throughput      : Rx %s/s, Tx %s/s\n",
+			ctx->rbuf, "Stream Throughput   : Rx %s/s, Tx %s/s\n",
 			rx_local, tx_local);
 	}
 	{
@@ -383,7 +383,7 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		"Mux Listener        : %ju accepted, %ju served (%ju rejected)\n",
 		stats->num_accepted, stats->num_served, stats->num_rejected);
 	BUF_APPENDF(
-		ctx->rbuf, "TCP Listener        : %ju accepted, %ju served\n",
+		ctx->rbuf, "Stream Listener     : %ju accepted, %ju served\n",
 		stats->num_accepted_tcp, stats->num_served_tcp);
 	BUF_APPENDF(
 		ctx->rbuf, "API Listener        : %ju accepted, %ju served\n",
@@ -422,7 +422,7 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 			ctx->rbuf, "Mux Traffic         : Rx %s, Tx %s\n",
 			rx_mux, tx_mux);
 		BUF_APPENDF(
-			ctx->rbuf, "TCP Traffic         : Rx %s, Tx %s\n",
+			ctx->rbuf, "Stream Traffic      : Rx %s, Tx %s\n",
 			rx_local, tx_local);
 	}
 
@@ -452,105 +452,94 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 	free(stats);
 }
 
-/* The four helpers below each emit one complete Prometheus metric family for
- * per-tunnel data.  Keeping each family in its own loop guarantees that all
- * samples for a given metric name are contiguous, as required by the
- * Prometheus text format exposition specification.
- * Tunnels without a peer identity (the top-level mux_tunnel) are skipped. */
+/* Emits # HELP and # TYPE lines, then one unlabeled sample.
+ * name, type, and help must be string literals. */
+#define APPEND_METRIC(cbuf, name, type, help, fmt, val)                        \
+	do {                                                                   \
+		VBUF_APPENDSTR(                                                \
+			(cbuf), "# HELP " name " " help "\n"                   \
+				"# TYPE " name " " type "\n");                 \
+		VBUF_APPENDF((cbuf), name " " fmt "\n", (val));                \
+	} while (0)
 
-static void append_metrics_tunnel_rx_window(
-	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
-{
-	bool hdr = false;
-	for (size_t i = 0; i < stats->num_tunnels; i++) {
-		const struct tunnel_stats *restrict t = &stats->tunnels[i];
-		if (!t->established || t->peer_identity == NULL) {
-			continue;
-		}
-		if (!hdr) {
-			VBUF_APPENDSTR(
-				ctx->cbuf,
-				"# HELP multiplexd_session_rx_window_bytes Per-stream receive window size per identity session\n"
-				"# TYPE multiplexd_session_rx_window_bytes gauge\n");
-			hdr = true;
-		}
-		VBUF_APPENDF(
-			ctx->cbuf,
-			"multiplexd_session_rx_window_bytes{identity=\"%s\",tag=\"%s\"} %zu\n",
-			t->peer_identity, t->tag, t->rx_window);
-	}
-}
+/* Emits a metric family with {listener} label for mux, tcp, and api values. */
+#define APPEND_METRIC_LISTENER(                                                \
+	cbuf, name, type, help, mux_val, tcp_val, api_val)                     \
+	do {                                                                   \
+		VBUF_APPENDSTR(                                                \
+			(cbuf), "# HELP " name " " help "\n"                   \
+				"# TYPE " name " " type "\n");                 \
+		VBUF_APPENDF(                                                  \
+			(cbuf),                                                \
+			name "{listener=\"mux\"} %ju\n" name                   \
+			     "{listener=\"local\"} %ju\n" name                 \
+			     "{listener=\"api\"} %ju\n",                       \
+			(mux_val), (tcp_val), (api_val));                      \
+	} while (0)
 
-static void append_metrics_tunnel_tx_window(
-	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
-{
-	bool hdr = false;
-	for (size_t i = 0; i < stats->num_tunnels; i++) {
-		const struct tunnel_stats *restrict t = &stats->tunnels[i];
-		if (!t->established || t->peer_identity == NULL) {
-			continue;
-		}
-		if (!hdr) {
-			VBUF_APPENDSTR(
-				ctx->cbuf,
-				"# HELP multiplexd_session_tx_window_bytes Per-stream send window size per identity session\n"
-				"# TYPE multiplexd_session_tx_window_bytes gauge\n");
-			hdr = true;
-		}
-		VBUF_APPENDF(
-			ctx->cbuf,
-			"multiplexd_session_tx_window_bytes{identity=\"%s\",tag=\"%s\"} %zu\n",
-			t->peer_identity, t->tag, t->tx_window);
-	}
-}
+/* Emits the bytes counter family with {direction, link} labels. */
+#define APPEND_METRIC_BYTES(                                                   \
+	cbuf, name, help, mux_recv, mux_sent, local_recv, local_sent)          \
+	do {                                                                   \
+		VBUF_APPENDSTR(                                                \
+			(cbuf), "# HELP " name " " help "\n"                   \
+				"# TYPE " name " counter\n");                  \
+		VBUF_APPENDF(                                                  \
+			(cbuf),                                                \
+			name "{direction=\"recv\",link=\"mux\"} %ju\n" name    \
+			     "{direction=\"sent\",link=\"mux\"} %ju\n" name    \
+			     "{direction=\"recv\",link=\"local\"} %ju\n" name  \
+			     "{direction=\"sent\",link=\"local\"} %ju\n",      \
+			(mux_recv), (mux_sent), (local_recv), (local_sent));   \
+	} while (0)
 
-static void append_metrics_tunnel_rtt(
-	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
-{
-	bool hdr = false;
-	for (size_t i = 0; i < stats->num_tunnels; i++) {
-		const struct tunnel_stats *restrict t = &stats->tunnels[i];
-		if (!t->established || t->peer_identity == NULL ||
-		    t->rtt_ns <= 0) {
-			continue;
-		}
-		if (!hdr) {
-			VBUF_APPENDSTR(
-				ctx->cbuf,
-				"# HELP multiplexd_session_rtt_seconds Windowed-minimum round-trip time per identity session\n"
-				"# TYPE multiplexd_session_rtt_seconds gauge\n");
-			hdr = true;
-		}
-		VBUF_APPENDF(
-			ctx->cbuf,
-			"multiplexd_session_rtt_seconds{identity=\"%s\",tag=\"%s\"} %g\n",
-			t->peer_identity, t->tag, (double)t->rtt_ns * 1e-9);
-	}
-}
+/* Emits a latency summary family: quantiles (when has_samples) and _count. */
+#define APPEND_METRIC_LATENCY_SUMMARY(                                         \
+	cbuf, name, help, has_samples, p50, p90, p99, count)                   \
+	do {                                                                   \
+		VBUF_APPENDSTR(                                                \
+			(cbuf), "# HELP " name " " help "\n"                   \
+				"# TYPE " name " summary\n");                  \
+		if (has_samples) {                                             \
+			VBUF_APPENDF(                                          \
+				(cbuf),                                        \
+				name "{quantile=\"0.5\"} %g\n" name            \
+				     "{quantile=\"0.9\"} %g\n" name            \
+				     "{quantile=\"0.99\"} %g\n",               \
+				(p50), (p90), (p99));                          \
+		}                                                              \
+		VBUF_APPENDF((cbuf), name "_count %ju\n", (count));            \
+	} while (0)
 
-static void append_metrics_tunnel_bdp(
-	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
-{
-	bool hdr = false;
-	for (size_t i = 0; i < stats->num_tunnels; i++) {
-		const struct tunnel_stats *restrict t = &stats->tunnels[i];
-		if (!t->established || t->peer_identity == NULL ||
-		    t->bdp == 0) {
-			continue;
-		}
-		if (!hdr) {
-			VBUF_APPENDSTR(
-				ctx->cbuf,
-				"# HELP multiplexd_session_bdp_bytes Raw bandwidth-delay product estimate per identity session, no headroom\n"
-				"# TYPE multiplexd_session_bdp_bytes gauge\n");
-			hdr = true;
-		}
-		VBUF_APPENDF(
-			ctx->cbuf,
-			"multiplexd_session_bdp_bytes{identity=\"%s\",tag=\"%s\"} %zu\n",
-			t->peer_identity, t->tag, t->bdp);
-	}
-}
+/* Emits one complete Prometheus metric family for per-tunnel data.
+ * name, type, and help must be string literals.  extra_skip is an additional
+ * filter expression (referencing t) evaluated after the base checks.
+ * Keeping each family in its own loop guarantees contiguous samples,
+ * as required by the Prometheus text format exposition specification. */
+#define APPEND_TUNNEL_METRIC(                                                  \
+	cbuf, stats, name, type, help, extra_skip, fmt, val)                   \
+	do {                                                                   \
+		bool hdr = false;                                              \
+		for (size_t i = 0; i < (stats)->num_tunnels; i++) {            \
+			const struct tunnel_stats *restrict t =                \
+				&(stats)->tunnels[i];                          \
+			if (!t->established || t->session == NULL ||           \
+			    (extra_skip)) {                                    \
+				continue;                                      \
+			}                                                      \
+			if (!hdr) {                                            \
+				VBUF_APPENDSTR(                                \
+					(cbuf), "# HELP " name " " help "\n"   \
+						"# TYPE " name " " type "\n"); \
+				hdr = true;                                    \
+			}                                                      \
+			VBUF_APPENDF(                                          \
+				(cbuf),                                        \
+				name "{session=\"%s\",role=\"%s\"} " fmt "\n", \
+				t->session, t->accepted ? "server" : "client", \
+				(val));                                        \
+		}                                                              \
+	} while (0)
 
 /* Handles GET /metrics — Prometheus text format (version 0.0.4). */
 static void handle_metrics(struct api_ctx *restrict ctx)
@@ -567,238 +556,123 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	VBUF_RESET(ctx->cbuf);
 
 	/* --- Gauges --- */
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_uptime_seconds Seconds since server start\n"
-		"# TYPE multiplexd_uptime_seconds gauge\n");
-	VBUF_APPENDF(ctx->cbuf, "multiplexd_uptime_seconds %.3f\n", uptime);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_sessions Total mux session objects\n"
-		"# TYPE multiplexd_sessions gauge\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_sessions %ju\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_uptime_seconds", "gauge",
+		"Seconds since server start", "%.3f", uptime);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_sessions", "gauge",
+		"Total mux session objects", "%ju",
 		stats->num_session_created - stats->num_session_finalized);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_sessions_established Established mux sessions\n"
-		"# TYPE multiplexd_sessions_established gauge\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_sessions_established %zu\n",
-		stats->num_sessions);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_sessions_halfopen Half-open mux sessions (after accept, before established)\n"
-		"# TYPE multiplexd_sessions_halfopen gauge\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_sessions_halfopen %zu\n",
-		stats->num_session_halfopen);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf, "# HELP multiplexd_streams Active mux streams\n"
-			   "# TYPE multiplexd_streams gauge\n");
-	VBUF_APPENDF(ctx->cbuf, "multiplexd_streams %zu\n", stats->num_streams);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_streams_halfopen Half-open mux streams (SYN sent, before SYN-ACK)\n"
-		"# TYPE multiplexd_streams_halfopen gauge\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_streams_halfopen %zu\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_sessions_established", "gauge",
+		"Established mux sessions", "%zu", stats->num_sessions);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_sessions_halfopen", "gauge",
+		"Half-open mux sessions (after accept, before established)",
+		"%zu", stats->num_session_halfopen);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_streams", "gauge", "Active mux streams",
+		"%zu", stats->num_streams);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_streams_halfopen", "gauge",
+		"Half-open mux streams (SYN sent, before SYN-ACK)", "%zu",
 		stats->num_stream_halfopen);
 
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_stream_open_total Total successful active-open stream creations\n"
-		"# TYPE multiplexd_stream_open_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_stream_open_total %ju\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_stream_open_total", "counter",
+		"Total successful active-open stream creations", "%ju",
 		stats->num_stream_opened);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_stream_accept_total Total successful passive-open stream creations\n"
-		"# TYPE multiplexd_stream_accept_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_stream_accept_total %ju\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_stream_accept_total", "counter",
+		"Total successful passive-open stream creations", "%ju",
 		stats->num_stream_accepted);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_stream_fastopen_total Total active-open streams whose first flight used SYN|PUSH\n"
-		"# TYPE multiplexd_stream_fastopen_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_stream_fastopen_total %ju\n",
-		stats->num_stream_fastopen);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_stream_establish_latency_seconds Active-open stream establishment latency from SYN to SYN|ACK\n"
-		"# TYPE multiplexd_stream_establish_latency_seconds summary\n");
-	if (stats->stream_establish_count > 0) {
-		VBUF_APPENDF(
-			ctx->cbuf,
-			"multiplexd_stream_establish_latency_seconds{quantile=\"0.5\"} %g\n"
-			"multiplexd_stream_establish_latency_seconds{quantile=\"0.9\"} %g\n"
-			"multiplexd_stream_establish_latency_seconds{quantile=\"0.99\"} %g\n",
-			(double)stats->stream_establish_p50 * 1e-9,
-			(double)stats->stream_establish_p90 * 1e-9,
-			(double)stats->stream_establish_p99 * 1e-9);
-	}
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_stream_establish_latency_seconds_count %ju\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_stream_fastopen_total", "counter",
+		"Total active-open streams whose first flight used SYN|PUSH",
+		"%ju", stats->num_stream_fastopen);
+	APPEND_METRIC_LATENCY_SUMMARY(
+		ctx->cbuf, "multiplexd_stream_establish_latency_seconds",
+		"Active-open stream establishment latency from SYN to SYN|ACK",
+		stats->stream_establish_count > 0,
+		(double)stats->stream_establish_p50 * 1e-9,
+		(double)stats->stream_establish_p90 * 1e-9,
+		(double)stats->stream_establish_p99 * 1e-9,
 		stats->num_stream_established);
 
 	/* --- Counters --- */
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_connections_accepted_total Total accepted connections\n"
-		"# TYPE multiplexd_connections_accepted_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_connections_accepted_total{listener=\"mux\"} %ju\n",
-		stats->num_accepted);
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_connections_accepted_total{listener=\"tcp\"} %ju\n",
-		stats->num_accepted_tcp);
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_connections_accepted_total{listener=\"api\"} %ju\n",
-		stats->num_accepted_api);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_connections_served_total Connections that reached protocol setup\n"
-		"# TYPE multiplexd_connections_served_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_connections_served_total{listener=\"mux\"} %ju\n",
-		stats->num_served);
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_connections_served_total{listener=\"tcp\"} %ju\n",
-		stats->num_served_tcp);
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_connections_served_total{listener=\"api\"} %ju\n",
-		stats->num_served_api);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_connections_rejected_total Connections dropped by startup_limit\n"
-		"# TYPE multiplexd_connections_rejected_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_connections_rejected_total %ju\n",
+	APPEND_METRIC_LISTENER(
+		ctx->cbuf, "multiplexd_connections_accepted_total", "counter",
+		"Total accepted connections", stats->num_accepted,
+		stats->num_accepted_tcp, stats->num_accepted_api);
+	APPEND_METRIC_LISTENER(
+		ctx->cbuf, "multiplexd_connections_served_total", "counter",
+		"Connections that reached protocol setup", stats->num_served,
+		stats->num_served_tcp, stats->num_served_api);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_connections_rejected_total", "counter",
+		"Connections dropped by startup_limit", "%ju",
 		stats->num_rejected);
 
 #if WITH_TLS
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_tls_failures_total TLS accept failures\n"
-		"# TYPE multiplexd_tls_failures_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_tls_failures_total %ju\n",
-		stats->num_tls_failures);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_tls_failures_total", "counter",
+		"TLS accept failures", "%ju", stats->num_tls_failures);
 #endif
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_reconnects_total Client-mode reconnect attempts\n"
-		"# TYPE multiplexd_reconnects_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_reconnects_total %ju\n",
-		stats->num_reconnects);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_bytes_total Total bytes transferred\n"
-		"# TYPE multiplexd_bytes_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_bytes_total{direction=\"recv\",link=\"mux\"} %ju\n",
-		stats->traffic_byt_mux_recv);
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_bytes_total{direction=\"sent\",link=\"mux\"} %ju\n",
-		stats->traffic_byt_mux_sent);
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_bytes_total{direction=\"recv\",link=\"local\"} %ju\n",
-		stats->traffic_byt_local_recv);
-	VBUF_APPENDF(
-		ctx->cbuf,
-		"multiplexd_bytes_total{direction=\"sent\",link=\"local\"} %ju\n",
-		stats->traffic_byt_local_sent);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf, "# HELP multiplexd_rst_sent_total RST frames sent\n"
-			   "# TYPE multiplexd_rst_sent_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_rst_sent_total %ju\n",
-		stats->num_rst_sent);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_rst_recv_total RST frames received\n"
-		"# TYPE multiplexd_rst_recv_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_rst_recv_total %ju\n",
-		stats->num_rst_recv);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_stream_errors_total Streams aborted due to local I/O errors\n"
-		"# TYPE multiplexd_stream_errors_total counter\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_stream_errors_total %ju\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_reconnects_total", "counter",
+		"Client-mode reconnect attempts", "%ju", stats->num_reconnects);
+	APPEND_METRIC_BYTES(
+		ctx->cbuf, "multiplexd_bytes_total", "Total bytes transferred",
+		stats->traffic_byt_mux_recv, stats->traffic_byt_mux_sent,
+		stats->traffic_byt_local_recv, stats->traffic_byt_local_sent);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_rst_sent_total", "counter",
+		"RST frames sent", "%ju", stats->num_rst_sent);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_rst_recv_total", "counter",
+		"RST frames received", "%ju", stats->num_rst_recv);
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_stream_errors_total", "counter",
+		"Streams aborted due to local I/O errors", "%ju",
 		stats->num_stream_errors);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_recv_buffered_bytes Bytes buffered in per-stream receive rings\n"
-		"# TYPE multiplexd_recv_buffered_bytes gauge\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_recv_buffered_bytes %zu\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_recv_buffered_bytes", "gauge",
+		"Bytes buffered in per-stream receive rings", "%zu",
 		stats->recv_buffered_bytes);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_send_buffered_frames Frames queued in per-stream send buffers\n"
-		"# TYPE multiplexd_send_buffered_frames gauge\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_send_buffered_frames %zu\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_send_buffered_frames", "gauge",
+		"Frames queued in per-stream send buffers", "%zu",
 		stats->send_buffered_frames);
-
-	VBUF_APPENDSTR(
-		ctx->cbuf,
-		"# HELP multiplexd_unacked_frames Frames held in the session unacked list (spec §6.7.2)\n"
-		"# TYPE multiplexd_unacked_frames gauge\n");
-	VBUF_APPENDF(
-		ctx->cbuf, "multiplexd_unacked_frames %zu\n",
+	APPEND_METRIC(
+		ctx->cbuf, "multiplexd_unacked_frames", "gauge",
+		"Frames held in the session unacked list (spec §6.7.2)", "%zu",
 		stats->unacked_frames);
 
 	/* Per-tunnel metrics: one loop per family keeps all samples contiguous. */
-	append_metrics_tunnel_rx_window(ctx, stats);
-	append_metrics_tunnel_tx_window(ctx, stats);
-	append_metrics_tunnel_rtt(ctx, stats);
-	append_metrics_tunnel_bdp(ctx, stats);
-
+	APPEND_TUNNEL_METRIC(
+		ctx->cbuf, stats, "multiplexd_session_rx_window_bytes", "gauge",
+		"Per-stream receive window size per identity session", false,
+		"%zu", t->rx_window);
+	APPEND_TUNNEL_METRIC(
+		ctx->cbuf, stats, "multiplexd_session_tx_window_bytes", "gauge",
+		"Per-stream send window size per identity session", false,
+		"%zu", t->tx_window);
+	APPEND_TUNNEL_METRIC(
+		ctx->cbuf, stats, "multiplexd_session_rtt_seconds", "gauge",
+		"Windowed-minimum round-trip time per identity session",
+		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9);
+	APPEND_TUNNEL_METRIC(
+		ctx->cbuf, stats, "multiplexd_session_bdp_bytes", "gauge",
+		"Raw bandwidth-delay product estimate per identity session, no headroom",
+		t->bdp == 0, "%zu", t->bdp);
 	{
 		struct timespec cpu_ts;
 		if (clock_process(&cpu_ts)) {
-			VBUF_APPENDSTR(
+			APPEND_METRIC(
 				ctx->cbuf,
-				"# HELP multiplexd_process_cpu_seconds_total Total process CPU time consumed\n"
-				"# TYPE multiplexd_process_cpu_seconds_total counter\n");
-			VBUF_APPENDF(
-				ctx->cbuf,
-				"multiplexd_process_cpu_seconds_total %g\n",
-				(double)TIMESPEC_NANO(cpu_ts) * 1e-9);
+				"multiplexd_process_cpu_seconds_total",
+				"counter", "Total process CPU time consumed",
+				"%g", (double)TIMESPEC_NANO(cpu_ts) * 1e-9);
 		}
 	}
 
@@ -820,6 +694,12 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	/* body is in cbuf; send_cb will follow up with cbuf after wbuf */
 	free(stats);
 }
+
+#undef APPEND_METRIC
+#undef APPEND_METRIC_LISTENER
+#undef APPEND_METRIC_BYTES
+#undef APPEND_METRIC_LATENCY_SUMMARY
+#undef APPEND_TUNNEL_METRIC
 
 /* Routes the parsed HTTP request to the appropriate handler. */
 static void api_handle(struct api_ctx *restrict ctx)

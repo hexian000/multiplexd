@@ -517,7 +517,11 @@ bool handshake_process_hello(
 						0);
 			}
 			sched_free_streams(ss);
-			ss->sched.streams = table_new(TABLE_FAST);
+			ss->sched.streams = table_new(&(struct table_opts){
+				.hash = TABLE_OPTS_PTR.hash,
+				.eq = TABLE_OPTS_PTR.eq,
+				.flags = TABLE_FAST,
+			});
 			if (ss->sched.streams == NULL) {
 				LOGOOM();
 				session_reset(ss);

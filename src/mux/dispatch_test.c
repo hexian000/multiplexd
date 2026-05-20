@@ -187,8 +187,8 @@ bool sched_add_stream(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	void *elem = s;
-	ss->sched.streams =
-		table_set(ss->sched.streams, STREAMID_KEY(s->id), &elem);
+	ss->sched.streams = table_set(
+		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
 	return ss->sched.streams != NULL;
 }
 
@@ -296,15 +296,19 @@ insert_dummy_stream(struct mux_session *restrict ss, const uint_least16_t id)
 	void *elem = dummy;
 	T_CHECK(dummy != NULL);
 	dummy->id = id;
-	ss->sched.streams = table_new(TABLE_FAST);
+	ss->sched.streams = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_PTR.hash,
+		.eq = TABLE_OPTS_PTR.eq,
+		.flags = TABLE_FAST,
+	});
 	T_CHECK(ss->sched.streams != NULL);
-	ss->sched.streams =
-		table_set(ss->sched.streams, STREAMID_KEY(id), &elem);
+	ss->sched.streams = table_set(
+		ss->sched.streams, (const void *)(uintptr_t)id, &elem);
 	T_CHECK(ss->sched.streams != NULL);
 }
 
 static bool free_stream_cb(
-	const struct hashtable *table, struct hashkey key, void *element,
+	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
 	(void)table;

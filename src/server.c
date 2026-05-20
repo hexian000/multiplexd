@@ -11,6 +11,7 @@
 #include "tunnel.h"
 #include "util.h"
 
+#include "algo/cityhash.h"
 #include "algo/hashtable.h"
 #include "math/rand.h"
 #include "os/clock.h"
@@ -50,25 +51,36 @@
 #include <string.h>
 #include <time.h>
 
-#define SESSIONID_KEY(id_ptr)                                                  \
-	((struct hashkey){ .len = MUX_SESSION_ID_LEN, .data = (id_ptr) })
+static uint_fast32_t sid_hash(const void *key, const uint_fast32_t seed)
+{
+	return cityhash64low_32(key, MUX_SESSION_ID_LEN, seed);
+}
+
+static bool sid_eq(const void *a, const void *b)
+{
+	return memcmp(a, b, MUX_SESSION_ID_LEN) == 0;
+}
+
+static const struct table_opts SESSION_TABLE_OPTS = {
+	.hash = sid_hash,
+	.eq = sid_eq,
+	.flags = 0,
+};
 
 /* Iterator over all tunnel objects owned by a server.
- * Yields mux_tunnel first, then each identities[i].tunnels[j] in order,
+ * Yields mux_tunnel first, then each identities[k].tunnels[j] in order,
  * then each identity_tunnels[i] (skipping NULLs), then all
  * accepted_sessions in table order.
  * Zero-initialize before first call; returns NULL when done. */
 struct tunnel_iter {
-	/* 0 = dialed (mux_tunnel + identities + identity_tunnels),
-	 * 1 = accepted_sessions */
+	/* 0 = mux_tunnel, 1 = identities, 2 = identity_tunnels, 3 = accepted */
 	size_t phase;
-	/* phase 0: 0           → mux_tunnel
-	 *           1..ns       → identities[sub-1].tunnels[sub2]
-	 *           ns+1..ns+ni → identity_tunnels[sub-ns-1]
-	 * phase 1: opaque table_next cursor */
+	/* opaque cursor for table_next (identities in phase 1, accepted in phase 3) */
 	size_t sub;
-	/* inner cursor: index within identities[sub-1].tunnels[] */
+	/* index within cur_sl->tunnels[] (phase 1) or identity_tunnels[] (phase 2) */
 	size_t sub2;
+	/* identity listener being drained (phase 1); NULL = fetch next via table_next */
+	struct identity_listener *cur_sl;
 };
 
 /* Add tunnel t to service listener sl's pool.
@@ -125,41 +137,45 @@ static struct tunnel *tunnel_iter_next(
 	const struct server *restrict s, struct tunnel_iter *restrict it)
 {
 	if (it->phase == 0) {
-		/* mux_tunnel slot */
-		if (it->sub == 0) {
-			it->sub = 1;
-			if (s->mux_tunnel != NULL) {
-				return s->mux_tunnel;
-			}
+		it->phase = 1;
+		if (s->mux_tunnel != NULL) {
+			return s->mux_tunnel;
 		}
-		/* identities slots: iterate over the pool for each identity */
-		while (it->sub <= s->num_identities) {
-			const struct identity_listener *const sl =
-				&s->identities[it->sub - 1];
-			if (it->sub2 < sl->num_tunnels) {
-				return sl->tunnels[it->sub2++];
+	}
+	if (it->phase == 1) {
+		for (;;) {
+			if (it->cur_sl != NULL) {
+				if (it->sub2 < it->cur_sl->num_tunnels) {
+					return it->cur_sl->tunnels[it->sub2++];
+				}
+				it->cur_sl = NULL;
+				it->sub2 = 0;
 			}
-			it->sub2 = 0;
-			it->sub++;
+			void *elem = NULL;
+			if (!table_next(s->identities, &it->sub, NULL, &elem)) {
+				break;
+			}
+			it->cur_sl = elem;
 		}
-		/* identity_tunnels slots */
-		const size_t base = s->num_identities + 1;
-		while (it->sub < base + s->num_identity_tunnels) {
-			struct tunnel *t = s->identity_tunnels[it->sub - base];
-			it->sub++;
+		it->phase = 2;
+		/* it->sub2 == 0 after the loop above */
+	}
+	if (it->phase == 2) {
+		while (it->sub2 < s->num_identity_tunnels) {
+			struct tunnel *t = s->identity_tunnels[it->sub2++];
 			if (t != NULL) {
 				return t;
 			}
 		}
-		it->phase = 1;
+		it->phase = 3;
 		it->sub = 0;
 	}
-	/* accepted_sessions */
+	/* phase 3: accepted_sessions */
 	void *elem = NULL;
-	if (!table_next(s->accepted_tunnels, &it->sub, NULL, &elem)) {
-		return NULL;
+	if (table_next(s->accepted_tunnels, &it->sub, NULL, &elem)) {
+		return elem;
 	}
-	return elem;
+	return NULL;
 }
 
 /* Log session establishment/close with peer address formatting */
@@ -253,14 +269,9 @@ server_on_established(void *data, struct tunnel *restrict t, intmax_t lat_ns)
 		 * same tunnel object, but the tunnel is already in the pool. */
 		const char *const peer_id = tunnel_peer_identity(t);
 		if (peer_id != NULL) {
-			for (size_t i = 0; i < srv->num_identities; i++) {
-				if (srv->identities[i].peer_identity == NULL ||
-				    strcmp(srv->identities[i].peer_identity,
-					   peer_id) != 0) {
-					continue;
-				}
-				struct identity_listener *const sl =
-					&srv->identities[i];
+			void *elem = NULL;
+			if (table_find(srv->identities, peer_id, &elem)) {
+				struct identity_listener *const sl = elem;
 				bool in_pool = false;
 				for (size_t j = 0; j < sl->num_tunnels; j++) {
 					if (sl->tunnels[j] == t) {
@@ -271,21 +282,15 @@ server_on_established(void *data, struct tunnel *restrict t, intmax_t lat_ns)
 				if (!in_pool) {
 					(void)identity_listener_add(sl, t);
 				}
-				break;
 			}
 		}
 		return;
 	}
 	const char *const peer_identity = tunnel_peer_identity(t);
 	if (peer_identity != NULL) {
-		for (size_t i = 0; i < srv->num_identities; i++) {
-			if (srv->identities[i].peer_identity != NULL &&
-			    strcmp(srv->identities[i].peer_identity,
-				   peer_identity) == 0) {
-				(void)identity_listener_add(
-					&srv->identities[i], t);
-				break;
-			}
+		void *elem = NULL;
+		if (table_find(srv->identities, peer_identity, &elem)) {
+			(void)identity_listener_add(elem, t);
 		}
 	}
 }
@@ -323,17 +328,20 @@ static void handle_closed(
 		THRD_ASSERT(smtx_lock(&srv->accepted_mu));
 #endif
 		srv->accepted_tunnels = table_del(
-			srv->accepted_tunnels,
-			SESSIONID_KEY(tunnel_session_id(t)), NULL);
+			srv->accepted_tunnels, tunnel_session_id(t), NULL);
 #if WITH_THREADS
 		THRD_ASSERT(smtx_unlock(&srv->accepted_mu));
 #endif
 	} else if (t == srv->mux_tunnel) {
 		srv->mux_tunnel = NULL;
 	}
-	for (size_t i = 0; i < srv->num_identities; i++) {
-		if (identity_listener_remove(&srv->identities[i], t)) {
-			break;
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(srv->identities, &cursor, NULL, &elem)) {
+			if (identity_listener_remove(elem, t)) {
+				break;
+			}
 		}
 	}
 	for (size_t i = 0; i < srv->num_identity_tunnels; i++) {
@@ -345,6 +353,14 @@ static void handle_closed(
 
 	/* Join the tunnel thread; the relay stopped it before dispatching
 	 * this event, so ev_run() has already returned by now. */
+	{
+		struct tunnel_stats snap;
+		tunnel_stats(t, &snap);
+		srv->counters.traffic_byt_mux_recv += snap.byt_mux_recv;
+		srv->counters.traffic_byt_mux_sent += snap.byt_mux_sent;
+		srv->counters.traffic_byt_local_recv += snap.byt_local_recv;
+		srv->counters.traffic_byt_local_sent += snap.byt_local_sent;
+	}
 	tunnel_close(t);
 
 	/* During graceful shutdown, exit the event loop once all sessions
@@ -353,10 +369,16 @@ static void handle_closed(
 	if (ev_is_active(&srv->w_shutdown) &&
 	    table_size(srv->accepted_tunnels) == 0 && srv->mux_tunnel == NULL) {
 		bool any_peer = false;
-		for (size_t i = 0; i < srv->num_identities; i++) {
-			if (srv->identities[i].num_tunnels > 0) {
-				any_peer = true;
-				break;
+		{
+			size_t cursor = 0;
+			void *elem;
+			while (table_next(
+				srv->identities, &cursor, NULL, &elem)) {
+				if (((struct identity_listener *)elem)
+					    ->num_tunnels > 0) {
+					any_peer = true;
+					break;
+				}
 			}
 		}
 		if (!any_peer) {
@@ -411,8 +433,7 @@ static struct mux_session *tunnel_on_resume(
 #endif
 	void *elem = NULL;
 	struct tunnel *candidate = NULL;
-	if (table_find(
-		    srv->accepted_tunnels, SESSIONID_KEY(session_id), &elem)) {
+	if (table_find(srv->accepted_tunnels, session_id, &elem)) {
 		candidate = elem;
 		const enum mux_state st = tunnel_state(candidate);
 		if (st != MUX_STATE_SUSPENDED && st != MUX_STATE_ESTABLISHED) {
@@ -562,7 +583,7 @@ server_new_session_id(const struct server *restrict s, unsigned char *sid)
 {
 	do {
 		proto_session_id_new(sid);
-	} while (table_find(s->accepted_tunnels, SESSIONID_KEY(sid), NULL));
+	} while (table_find(s->accepted_tunnels, sid, NULL));
 }
 
 static bool server_register_session(struct server *restrict s, struct tunnel *t)
@@ -571,9 +592,8 @@ static bool server_register_session(struct server *restrict s, struct tunnel *t)
 #if WITH_THREADS
 	THRD_ASSERT(smtx_lock(&s->accepted_mu));
 #endif
-	s->accepted_tunnels = table_set(
-		s->accepted_tunnels, SESSIONID_KEY(tunnel_session_id(t)),
-		&elem);
+	s->accepted_tunnels =
+		table_set(s->accepted_tunnels, tunnel_session_id(t), &elem);
 #if WITH_THREADS
 	THRD_ASSERT(smtx_unlock(&s->accepted_mu));
 #endif
@@ -649,7 +669,6 @@ static void mux_serve(
 		.id = sid,
 		.connect_addr = NULL,
 		.forward_addr = srv->conf->connect,
-		.bind_addr = srv->conf->mux_listen,
 		.identity = srv->conf->identity_claim,
 		.peer_id = NULL,
 #if WITH_TLS
@@ -838,8 +857,8 @@ static void server_reload_listeners(
 {
 	struct ev_loop *const loop = s->loop;
 	if (!strnull_eq(old_conf->listen, new_conf->listen)) {
-		if (s->tcp_listener.w_accept.fd != -1) {
-			listener_stop(&s->tcp_listener, loop);
+		if (s->local_listener.w_accept.fd != -1) {
+			listener_stop(&s->local_listener, loop);
 		}
 		if (new_conf->listen != NULL) {
 			union sockaddr_max addr;
@@ -851,7 +870,8 @@ static void server_reload_listeners(
 				       " on reload: %s",
 				       new_conf->listen);
 			} else if (!listener_start(
-					   &s->tcp_listener, loop, &addr.sa)) {
+					   &s->local_listener, loop,
+					   &addr.sa)) {
 				LOGE_F("failed to restart TCP listener"
 				       " on reload: %s",
 				       new_conf->listen);
@@ -916,7 +936,7 @@ static void server_reload_listeners(
 	}
 }
 
-/* Rebuild the identity_peers identity listener array if the peer table
+/* Rebuild the identity_peers identity listener hashtable if the peer table
  * changed; otherwise fix peer_identity and socket_opts pointers into the
  * new config. */
 static void server_reload_identities(
@@ -937,52 +957,83 @@ static void server_reload_identities(
 		}
 	}
 	if (!peers_changed) {
-		/* Same peer table: fix peer_identity pointers to point
-		 * into new_conf instead of old_conf. */
-		for (size_t i = 0; i < s->num_identities; i++) {
-			s->identities[i].peer_identity =
-				new_conf->identity_peers[i].id;
-			s->identities[i].listener.socket_opts =
-				&new_conf->local_socket;
-		}
-		return;
-	}
-	for (size_t i = 0; i < s->num_identities; i++) {
-		struct listener *restrict l = &s->identities[i].listener;
-		if (l->w_accept.fd != -1) {
-			listener_stop(l, s->loop);
-		}
-	}
-	struct identity_listener *new_svc = NULL;
-	if (new_np > 0) {
-		new_svc = malloc(new_np * sizeof(*new_svc));
-		if (new_svc == NULL) {
+		/* Same peer table: fix peer_identity pointers to point into
+		 * new_conf instead of old_conf, then rebuild the hashtable
+		 * since the key data pointers change. */
+		struct hashtable *new_tbl = table_new(&(struct table_opts){
+			.hash = TABLE_OPTS_STR.hash,
+			.eq = TABLE_OPTS_STR.eq,
+			.flags = TABLE_FAST,
+		});
+		if (new_tbl == NULL) {
 			LOGOOM();
 			return;
 		}
+		for (size_t i = 0; i < new_np; i++) {
+			const struct identity_peer *restrict p =
+				&new_conf->identity_peers[i];
+			void *elem = NULL;
+			if (!table_find(s->identities, p->id, &elem)) {
+				continue;
+			}
+			struct identity_listener *restrict sl = elem;
+			sl->peer_identity = p->id;
+			sl->listener.socket_opts = &new_conf->local_socket;
+			void *slot = sl;
+			new_tbl = table_set(new_tbl, sl->peer_identity, &slot);
+			if (slot == sl) {
+				LOGOOM();
+			}
+		}
+		table_free(s->identities);
+		s->identities = new_tbl;
+		return;
+	}
+	/* Stop old identity listeners. */
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(s->identities, &cursor, NULL, &elem)) {
+			struct identity_listener *restrict sl = elem;
+			if (sl->listener.w_accept.fd != -1) {
+				listener_stop(&sl->listener, s->loop);
+			}
+		}
+	}
+	struct hashtable *new_tbl = new_np > 0 ?
+					    table_new(&(struct table_opts){
+						    .hash = TABLE_OPTS_STR.hash,
+						    .eq = TABLE_OPTS_STR.eq,
+						    .flags = TABLE_FAST,
+					    }) :
+					    NULL;
+	if (new_np > 0 && new_tbl == NULL) {
+		LOGOOM();
+		goto free_old;
 	}
 	for (size_t i = 0; i < new_np; i++) {
 		const struct identity_peer *restrict p =
 			&new_conf->identity_peers[i];
-		struct identity_listener *restrict sl = &new_svc[i];
+		struct identity_listener *restrict sl = malloc(sizeof(*sl));
+		if (sl == NULL) {
+			LOGOOM();
+			break;
+		}
 		sl->peer_identity = p->id;
 		sl->tunnels = NULL;
 		sl->num_tunnels = 0;
 		sl->rr_next = 0;
-		/* Migrate live tunnel pool if peer_identity matches an existing
-		 * identity entry. */
-		for (size_t j = 0; j < s->num_identities; j++) {
-			if (s->identities[j].peer_identity != NULL &&
-			    p->id != NULL &&
-			    strcmp(s->identities[j].peer_identity, p->id) ==
-				    0) {
-				/* Transfer ownership of the pool array. */
-				sl->tunnels = s->identities[j].tunnels;
-				sl->num_tunnels = s->identities[j].num_tunnels;
-				sl->rr_next = s->identities[j].rr_next;
-				s->identities[j].tunnels = NULL;
-				s->identities[j].num_tunnels = 0;
-				break;
+		/* Migrate live tunnel pool if peer_identity matches. */
+		if (p->id != NULL) {
+			void *old_elem = NULL;
+			if (table_find(s->identities, p->id, &old_elem)) {
+				struct identity_listener *restrict old_sl =
+					old_elem;
+				sl->tunnels = old_sl->tunnels;
+				sl->num_tunnels = old_sl->num_tunnels;
+				sl->rr_next = old_sl->rr_next;
+				old_sl->tunnels = NULL;
+				old_sl->num_tunnels = 0;
 			}
 		}
 		listener_init(
@@ -1009,14 +1060,33 @@ static void server_reload_identities(
 				       p->id, str);
 			}
 		}
+		void *slot = sl;
+		new_tbl = table_set(new_tbl, sl->peer_identity, &slot);
+		if (slot == sl) {
+			/* OOM: sl not inserted; release it. */
+			if (sl->listener.w_accept.fd != -1) {
+				listener_stop(&sl->listener, s->loop);
+			}
+			free(sl->tunnels);
+			free(sl);
+			LOGOOM();
+		} else {
+			ASSERT(slot == NULL);
+		}
 	}
-	/* Free any orphaned pool arrays not migrated to the new table. */
-	for (size_t i = 0; i < s->num_identities; i++) {
-		free(s->identities[i].tunnels);
+free_old:
+	/* Free orphaned old entries (tunnel arrays not migrated). */
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(s->identities, &cursor, NULL, &elem)) {
+			struct identity_listener *sl = elem;
+			free(sl->tunnels);
+			free(sl);
+		}
 	}
-	free(s->identities);
-	s->identities = new_svc;
-	s->num_identities = new_np;
+	table_free(s->identities);
+	s->identities = new_tbl;
 }
 
 /* Create a new mux_connect tunnel if one is configured but not yet live. */
@@ -1196,10 +1266,16 @@ static void server_reload(struct server *restrict s)
 	 * listeners so that server_make_mux_config(), identity_tcp_serve(),
 	 * and mux_serve() all see the new configuration immediately. */
 	s->conf = new_conf;
-	s->tcp_listener.socket_opts = &new_conf->local_socket;
+	s->local_listener.socket_opts = &new_conf->local_socket;
 	s->mux_listener.socket_opts = &new_conf->mux_socket;
-	for (size_t i = 0; i < s->num_identities; i++) {
-		s->identities[i].listener.socket_opts = &new_conf->local_socket;
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(s->identities, &cursor, NULL, &elem)) {
+			((struct identity_listener *)elem)
+				->listener.socket_opts =
+				&new_conf->local_socket;
+		}
 	}
 
 #if WITH_TLS
@@ -1271,8 +1347,8 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		ev_signal_stop(loop, &s->w_sigint);
 		ev_signal_stop(loop, &s->w_sigterm);
 
-		if (s->tcp_listener.w_accept.fd != -1) {
-			listener_stop(&s->tcp_listener, loop);
+		if (s->local_listener.w_accept.fd != -1) {
+			listener_stop(&s->local_listener, loop);
 		}
 		if (s->mux_listener.w_accept.fd != -1) {
 			listener_stop(&s->mux_listener, loop);
@@ -1280,11 +1356,16 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		if (s->api_listener.w_accept.fd != -1) {
 			listener_stop(&s->api_listener, loop);
 		}
-		for (size_t i = 0; i < s->num_identities; i++) {
-			struct listener *restrict l =
-				&s->identities[i].listener;
-			if (l->w_accept.fd != -1) {
-				listener_stop(l, loop);
+		{
+			size_t cursor = 0;
+			void *elem;
+			while (table_next(s->identities, &cursor, NULL, &elem)) {
+				struct listener *restrict l =
+					&((struct identity_listener *)elem)
+						 ->listener;
+				if (l->w_accept.fd != -1) {
+					listener_stop(l, loop);
+				}
 			}
 		}
 
@@ -1297,7 +1378,8 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 				(s->accepted_tunnels != NULL ?
 					 table_size(s->accepted_tunnels) :
 					 0) +
-				1 + s->num_identities + s->num_identity_tunnels;
+				1 + table_size(s->identities) +
+				s->num_identity_tunnels;
 			struct tunnel *snapshot[n];
 			size_t count = 0;
 			struct tunnel_iter it = { 0 };
@@ -1316,10 +1398,16 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		    (s->accepted_tunnels == NULL ||
 		     table_size(s->accepted_tunnels) == 0)) {
 			bool any = false;
-			for (size_t i = 0; i < s->num_identities; i++) {
-				if (s->identities[i].num_tunnels > 0) {
-					any = true;
-					break;
+			{
+				size_t cursor = 0;
+				void *elem;
+				while (table_next(
+					s->identities, &cursor, NULL, &elem)) {
+					if (((struct identity_listener *)elem)
+						    ->num_tunnels > 0) {
+						any = true;
+						break;
+					}
 				}
 			}
 			if (!any) {
@@ -1349,10 +1437,9 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 		.loop = loop,
 		.conf = conf,
 		.identities = NULL,
-		.num_identities = 0,
 	};
 	listener_init(
-		&srv->tcp_listener, &conf->local_socket, tcp_serve, srv,
+		&srv->local_listener, &conf->local_socket, tcp_serve, srv,
 		&srv->counters.num_accepted_tcp);
 	listener_init(
 		&srv->mux_listener, &conf->mux_socket, mux_serve, srv,
@@ -1388,7 +1475,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 	}
 #endif
 
-	srv->accepted_tunnels = table_new(0);
+	srv->accepted_tunnels = table_new(&SESSION_TABLE_OPTS);
 	if (srv->accepted_tunnels == NULL) {
 		LOGOOM();
 		server_free(srv);
@@ -1483,7 +1570,7 @@ bool server_start(struct server *restrict s)
 			       conf->listen);
 			return false;
 		}
-		if (!listener_start(&s->tcp_listener, loop, &listen_addr.sa)) {
+		if (!listener_start(&s->local_listener, loop, &listen_addr.sa)) {
 			LOGE("failed to start TCP listener");
 			return false;
 		}
@@ -1554,8 +1641,11 @@ bool server_start(struct server *restrict s)
 	{
 		const size_t n = conf->identity_peers_count;
 		if (n > 0) {
-			s->identities =
-				malloc(n * sizeof(struct identity_listener));
+			s->identities = table_new(&(struct table_opts){
+				.hash = TABLE_OPTS_STR.hash,
+				.eq = TABLE_OPTS_STR.eq,
+				.flags = TABLE_FAST,
+			});
 			if (s->identities == NULL) {
 				LOGOOM();
 				return false;
@@ -1564,7 +1654,11 @@ bool server_start(struct server *restrict s)
 				const struct identity_peer *restrict p =
 					&conf->identity_peers[i];
 				struct identity_listener *restrict sl =
-					&s->identities[i];
+					malloc(sizeof(*sl));
+				if (sl == NULL) {
+					LOGOOM();
+					return false;
+				}
 				sl->peer_identity = p->id;
 				sl->tunnels = NULL;
 				sl->num_tunnels = 0;
@@ -1574,6 +1668,15 @@ bool server_start(struct server *restrict s)
 					identity_tcp_serve, s,
 					&s->counters.num_accepted_tcp);
 				sl->listener.data = sl;
+				void *elem = sl;
+				s->identities =
+					table_set(s->identities, p->id, &elem);
+				if (elem == sl) {
+					free(sl);
+					LOGOOM();
+					return false;
+				}
+				ASSERT(elem == NULL);
 				union sockaddr_max addr;
 				bool ok = true;
 				RESOLVE_BINDADDR(
@@ -1591,7 +1694,6 @@ bool server_start(struct server *restrict s)
 					       p->id, p->listen);
 					return false;
 				}
-				s->num_identities = i + 1;
 				if (LOGLEVEL(NOTICE)) {
 					char resolved[64];
 					sa_format(
@@ -1714,8 +1816,8 @@ void server_stop(struct server *srv)
 	dispatcher_tick(srv->disp);
 #endif
 
-	if (srv->tcp_listener.w_accept.fd != -1) {
-		listener_stop(&srv->tcp_listener, loop);
+	if (srv->local_listener.w_accept.fd != -1) {
+		listener_stop(&srv->local_listener, loop);
 	}
 	if (srv->mux_listener.w_accept.fd != -1) {
 		listener_stop(&srv->mux_listener, loop);
@@ -1723,10 +1825,14 @@ void server_stop(struct server *srv)
 	if (srv->api_listener.w_accept.fd != -1) {
 		listener_stop(&srv->api_listener, loop);
 	}
-	for (size_t i = 0; i < srv->num_identities; i++) {
-		struct listener *restrict l = &srv->identities[i].listener;
-		if (l->w_accept.fd != -1) {
-			listener_stop(l, loop);
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(srv->identities, &cursor, NULL, &elem)) {
+			struct identity_listener *restrict sl = elem;
+			if (sl->listener.w_accept.fd != -1) {
+				listener_stop(&sl->listener, loop);
+			}
 		}
 	}
 
@@ -1749,10 +1855,15 @@ void server_stop(struct server *srv)
 		}
 	}
 	srv->mux_tunnel = NULL;
-	for (size_t i = 0; i < srv->num_identities; i++) {
-		free(srv->identities[i].tunnels);
-		srv->identities[i].tunnels = NULL;
-		srv->identities[i].num_tunnels = 0;
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(srv->identities, &cursor, NULL, &elem)) {
+			struct identity_listener *restrict sl = elem;
+			free(sl->tunnels);
+			sl->tunnels = NULL;
+			sl->num_tunnels = 0;
+		}
 	}
 	free(srv->identity_tunnels);
 	srv->identity_tunnels = NULL;
@@ -1780,7 +1891,16 @@ void server_free(struct server *srv)
 #if WITH_THREADS
 	smtx_destroy(&srv->accepted_mu);
 #endif
-	free(srv->identities);
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(srv->identities, &cursor, NULL, &elem)) {
+			struct identity_listener *sl = elem;
+			free(sl->tunnels);
+			free(sl);
+		}
+	}
+	table_free(srv->identities);
 #if WITH_THREADS
 	if (srv->disp != NULL) {
 		dispatcher_destroy(srv->disp);
@@ -1815,7 +1935,7 @@ static int cmp_intmax(const void *a, const void *b)
 
 /* Sum stream lifecycle counters from one accepted tunnel into *data. */
 static bool sum_accepted_stream_cnt(
-	const struct hashtable *table, struct hashkey key, void *element,
+	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
 	UNUSED(table);
@@ -1831,6 +1951,42 @@ static bool sum_accepted_stream_cnt(
 	out->num_stream_established += snap.num_stream_established;
 	out->num_stream_succeeded += snap.num_stream_succeeded;
 	out->num_stream_failed += snap.num_stream_failed;
+	out->traffic_byt_mux_recv += snap.byt_mux_recv;
+	out->traffic_byt_mux_sent += snap.byt_mux_sent;
+	out->traffic_byt_local_recv += snap.byt_local_recv;
+	out->traffic_byt_local_sent += snap.byt_local_sent;
+	return true;
+}
+
+/* Context for two-pass collection of accepted tunnels not in any identity pool. */
+struct unmatched_accepted_ctx {
+	const struct server *s;
+	struct server_stats
+		*out; /* NULL = count pass, non-NULL = populate pass */
+	size_t val; /* count (count pass) or tunnels[] index (populate pass) */
+};
+
+/* table_iterate callback: count or snapshot accepted tunnels that are not
+ * wired into any identity pool (peer identity absent or not configured). */
+static bool collect_unmatched_accepted(
+	const struct hashtable *table, const void *key, void *element,
+	void *data)
+{
+	UNUSED(table);
+	UNUSED(key);
+	struct unmatched_accepted_ctx *ctx = data;
+	const char *const peer_id = tunnel_peer_identity(element);
+	if (peer_id != NULL && table_find(ctx->s->identities, peer_id, NULL)) {
+		return true; /* already counted via identity pool */
+	}
+	if (ctx->out == NULL) {
+		ctx->val++;
+	} else {
+		struct tunnel_stats *ts = &ctx->out->tunnels[ctx->val++];
+		ts->peer_identity = NULL;
+		ts->num_tunnels = 1;
+		tunnel_stats(element, ts);
+	}
 	return true;
 }
 
@@ -1878,10 +2034,22 @@ static size_t calc_stream_percentiles(struct server_stats *restrict out)
 
 struct server_stats *server_stats(const struct server *restrict s)
 {
-	/* Count tunnels: mux_tunnel (0 or 1) plus all identity pool members. */
+	/* Count tunnels: mux_tunnel (0 or 1) plus all identity pool members,
+	 * plus accepted tunnels not wired into any identity pool. */
 	size_t n = (s->mux_tunnel != NULL ? 1 : 0);
-	for (size_t i = 0; i < s->num_identities; i++) {
-		n += s->identities[i].num_tunnels;
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(s->identities, &cursor, NULL, &elem)) {
+			n += ((struct identity_listener *)elem)->num_tunnels;
+		}
+	}
+	struct unmatched_accepted_ctx unmatched_ctx = { .s = s };
+	if (s->accepted_tunnels != NULL) {
+		table_iterate(
+			s->accepted_tunnels, collect_unmatched_accepted,
+			&unmatched_ctx);
+		n += unmatched_ctx.val;
 	}
 
 	struct server_stats *out =
@@ -1926,14 +2094,10 @@ struct server_stats *server_stats(const struct server *restrict s)
 		&c->num_stream_errors, memory_order_relaxed);
 	out->num_reconnects =
 		atomic_load_explicit(&c->num_reconnects, memory_order_relaxed);
-	out->traffic_byt_mux_recv = atomic_load_explicit(
-		&c->traffic_byt_mux_recv, memory_order_relaxed);
-	out->traffic_byt_mux_sent = atomic_load_explicit(
-		&c->traffic_byt_mux_sent, memory_order_relaxed);
-	out->traffic_byt_local_recv = atomic_load_explicit(
-		&c->traffic_byt_local_recv, memory_order_relaxed);
-	out->traffic_byt_local_sent = atomic_load_explicit(
-		&c->traffic_byt_local_sent, memory_order_relaxed);
+	out->traffic_byt_mux_recv = c->traffic_byt_mux_recv;
+	out->traffic_byt_mux_sent = c->traffic_byt_mux_sent;
+	out->traffic_byt_local_recv = c->traffic_byt_local_recv;
+	out->traffic_byt_local_sent = c->traffic_byt_local_sent;
 	out->recv_buffered_bytes = atomic_load_explicit(
 		&c->recv_buffered_bytes, memory_order_relaxed);
 	out->send_buffered_frames = atomic_load_explicit(
@@ -1964,25 +2128,50 @@ struct server_stats *server_stats(const struct server *restrict s)
 	/* Populate dialed tunnels first; stream aggregation reads their snapshots. */
 	size_t idx = 0;
 	if (s->mux_tunnel != NULL) {
-		out->tunnels[idx].peer_identity = NULL;
-		out->tunnels[idx].num_tunnels = 1;
-		tunnel_stats(s->mux_tunnel, &out->tunnels[idx]);
+		struct tunnel_stats *ts = &out->tunnels[idx];
+		ts->peer_identity = NULL;
+		ts->num_tunnels = 1;
+		tunnel_stats(s->mux_tunnel, ts);
+		/* session already populated by tunnel_stats() */
 		idx++;
 	}
-	for (size_t i = 0; i < s->num_identities; i++) {
-		const struct identity_listener *restrict sl = &s->identities[i];
-		for (size_t j = 0; j < sl->num_tunnels; j++) {
-			out->tunnels[idx].peer_identity = sl->peer_identity;
-			out->tunnels[idx].num_tunnels = sl->num_tunnels;
-			tunnel_stats(sl->tunnels[j], &out->tunnels[idx]);
-			idx++;
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(s->identities, &cursor, NULL, &elem)) {
+			const struct identity_listener *restrict sl = elem;
+			for (size_t j = 0; j < sl->num_tunnels; j++) {
+				struct tunnel_stats *ts = &out->tunnels[idx];
+				ts->peer_identity = sl->peer_identity;
+				ts->num_tunnels = sl->num_tunnels;
+				tunnel_stats(sl->tunnels[j], ts);
+				if (ts->peer_identity != NULL) {
+					ts->session = ts->peer_identity;
+				}
+				idx++;
+			}
 		}
 	}
 	out->num_tunnels = idx;
+	/* Append accepted tunnels not wired into any identity pool. */
+	if (s->accepted_tunnels != NULL && unmatched_ctx.val > 0) {
+		unmatched_ctx.out = out;
+		unmatched_ctx.val = idx;
+		table_iterate(
+			s->accepted_tunnels, collect_unmatched_accepted,
+			&unmatched_ctx);
+		idx = unmatched_ctx.val;
+	}
+	out->num_tunnels = idx;
 
-	/* Aggregate stream counters from dialed tunnels (already snapshotted). */
+	/* Aggregate stream counters from dialed tunnels (already snapshotted).
+	 * Accepted tunnels are handled separately by sum_accepted_stream_cnt
+	 * to avoid double-counting tunnels that are also in identity pools. */
 	for (size_t i = 0; i < out->num_tunnels; i++) {
 		const struct tunnel_stats *ts = &out->tunnels[i];
+		if (ts->accepted) {
+			continue;
+		}
 		out->num_streams += ts->num_streams;
 		out->num_stream_halfopen += ts->num_stream_halfopen;
 		out->num_stream_opened += ts->num_stream_opened;
@@ -1991,6 +2180,10 @@ struct server_stats *server_stats(const struct server *restrict s)
 		out->num_stream_established += ts->num_stream_established;
 		out->num_stream_succeeded += ts->num_stream_succeeded;
 		out->num_stream_failed += ts->num_stream_failed;
+		out->traffic_byt_mux_recv += ts->byt_mux_recv;
+		out->traffic_byt_mux_sent += ts->byt_mux_sent;
+		out->traffic_byt_local_recv += ts->byt_local_recv;
+		out->traffic_byt_local_sent += ts->byt_local_sent;
 	}
 	/* Aggregate stream counters from accepted (inbound) tunnels. */
 	if (s->accepted_tunnels != NULL) {

@@ -55,7 +55,6 @@ struct tunnel_opts {
 	const unsigned char *id;
 	const char *connect_addr;
 	const char *forward_addr;
-	const char *bind_addr;
 	const char *identity;
 	const char *peer_id;
 #if WITH_TLS
@@ -106,6 +105,16 @@ struct tunnel_stats {
 	const char *peer_identity;
 	/* borrowed pointer to the tunnel's diagnostic tag ("my <= peer") */
 	const char *tag;
+	/* Formatted session label used as a Prometheus label value.
+	 * Always non-NULL: set by tunnel_stats() from the peer socket address
+	 * or connect address; may be overridden by server_stats() with the
+	 * pool's peer identity string. */
+	const char *session;
+	/* Buffer backing session when the peer socket address is formatted
+	 * as the fallback label; unused when session borrows a string. */
+	char session_buf[64];
+	/* true for passively-accepted (server-role) sessions */
+	bool accepted;
 	/* total tunnels in this identity's pool (1 for mux_tunnel) */
 	size_t num_tunnels;
 	bool established;
@@ -128,6 +137,13 @@ struct tunnel_stats {
 	uintmax_t num_stream_established;
 	uintmax_t num_stream_succeeded;
 	uintmax_t num_stream_failed;
+	/* Traffic byte counters (per-tunnel snapshot; aggregated by
+	 * server_stats() across all active tunnels plus closed-tunnel
+	 * accumulator in srv->counters). */
+	uintmax_t byt_mux_recv;
+	uintmax_t byt_mux_sent;
+	uintmax_t byt_local_recv;
+	uintmax_t byt_local_sent;
 	/* SYN->SYN|ACK latency ring (ns).  stream_establish_count is the
 	 * monotonic write index; the ring holds the most recent
 	 * min(stream_establish_count, 256) samples.

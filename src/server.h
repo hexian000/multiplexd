@@ -158,20 +158,14 @@ struct server_counters {
 #endif
 	};
 
-	/* aggregated traffic byte counters */
+	/* Traffic byte counters for closed tunnels; accumulated on the server
+	 * thread in handle_closed().  Active tunnel traffic is summed at
+	 * snapshot time in server_stats() via tunnel_stats(). */
 	struct {
-#if WITH_THREADS
-		/* updated atomically by session threads */
-		atomic_uintmax_t traffic_byt_mux_recv;
-		atomic_uintmax_t traffic_byt_mux_sent;
-		atomic_uintmax_t traffic_byt_local_recv;
-		atomic_uintmax_t traffic_byt_local_sent;
-#else
 		uintmax_t traffic_byt_mux_recv;
 		uintmax_t traffic_byt_mux_sent;
 		uintmax_t traffic_byt_local_recv;
 		uintmax_t traffic_byt_local_sent;
-#endif
 	};
 };
 
@@ -231,10 +225,25 @@ struct server_stats {
 	/* borrowed pointer into struct server; valid until free(server_stats(s)) */
 	const struct evlog *evlog;
 
-	/* number of entries in tunnels[] (mux_tunnel + identity pool members) */
+	/* number of entries in tunnels[] (mux_tunnel + identity pool members
+	 * + accepted tunnels not wired into any identity pool) */
 	size_t num_tunnels;
 	/* one entry per active tunnel; peer_identity is NULL for mux_tunnel */
 	struct tunnel_stats tunnels[];
+};
+
+/* Per-identity listener and the pool of mux sessions serving it. */
+struct identity_listener {
+	struct listener listener;
+	/* Peer identity expected in hellos — not owned. */
+	const char *peer_identity;
+	/* Active tunnels for this identity (dialed in client mode,
+	 * accepted with matching peer identity in server mode).
+	 * Owned array; all elements are non-NULL. */
+	struct tunnel **tunnels;
+	size_t num_tunnels;
+	/* Round-robin dispatch cursor into tunnels[]. */
+	size_t rr_next;
 };
 
 struct server {
@@ -257,24 +266,13 @@ struct server {
 	struct tls_context *client_tlsctx;
 #endif
 
-	struct listener tcp_listener;
 	struct listener mux_listener;
+	struct listener local_listener;
 	struct listener api_listener;
 
-	/* Per-identity listener and the pool of mux sessions serving it. */
-	struct identity_listener {
-		struct listener listener;
-		/* Peer identity expected in hellos — not owned. */
-		const char *peer_identity;
-		/* Active tunnels for this identity (dialed in client mode,
-		 * accepted with matching peer identity in server mode).
-		 * Owned array; all elements are non-NULL. */
-		struct tunnel **tunnels;
-		size_t num_tunnels;
-		/* Round-robin dispatch cursor into tunnels[]. */
-		size_t rr_next;
-	} *identities;
-	size_t num_identities;
+	/* Per-identity listeners keyed by peer_identity string.
+	 * Each value is a heap-allocated struct identity_listener *. */
+	struct hashtable *identities;
 
 	/* Keyed by tunnel_session_id() (the server-assigned 16-byte session
 	 * identity).  Contains accepted (inbound) sessions only; dialed

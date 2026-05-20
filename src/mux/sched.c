@@ -43,7 +43,7 @@
  * live-stream counter only for non-tombstone streams (tombstone/CLOSED streams
  * were already incremented in stream_mark_closed). */
 static bool stream_free_and_decount_cb(
-	const struct hashtable *table, struct hashkey key, void *element,
+	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
 	UNUSED(table);
@@ -88,8 +88,8 @@ bool sched_add_stream(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	void *elem = s;
-	const struct hashkey key = STREAMID_KEY(s->id);
-	ss->sched.streams = table_set(ss->sched.streams, key, &elem);
+	ss->sched.streams = table_set(
+		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
 	if (ss->sched.streams == NULL || elem == s) {
 		return false;
 	}
@@ -105,8 +105,8 @@ static void sched_remove_stream(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	void *elem = NULL;
-	const struct hashkey key = STREAMID_KEY(s->id);
-	ss->sched.streams = table_del(ss->sched.streams, key, &elem);
+	ss->sched.streams = table_del(
+		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
 	if (elem == NULL) {
 		return;
 	}
@@ -138,8 +138,9 @@ struct mux_stream *sched_find_stream(
 	}
 	void *elem = NULL;
 	const uint_least16_t id_key = (uint_least16_t)stream_id;
-	const struct hashkey key = STREAMID_KEY(id_key);
-	if (table_find(ss->sched.streams, key, &elem)) {
+	if (table_find(
+		    ss->sched.streams, (const void *)(uintptr_t)id_key,
+		    &elem)) {
 		return elem;
 	}
 	return NULL;
@@ -370,7 +371,7 @@ static void sched_send_ctrl_flags(
 }
 
 static bool flush_ctrl_cb(
-	const struct hashtable *table, struct hashkey key, void *element,
+	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
 	UNUSED(table);

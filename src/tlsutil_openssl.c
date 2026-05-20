@@ -401,7 +401,9 @@ struct tls_context *tls_ctx_client(
 	/* Verify the server's certificate against the pinned CA store.
 	 * Hostname verification is intentionally omitted: this deployment model
 	 * uses a private CA that issues certificates only to known peers, so
-	 * certificate possession itself constitutes identity proof.  A peer
+	 * a valid certificate establishes transport authenticity (the peer holds
+	 * a key signed by our CA).  Application-level identity is carried in the
+	 * protocol hello exchange, independent of the certificate.  A peer
 	 * whose certificate was not signed by the pinned CA is rejected before
 	 * any hostname check would apply.
 	 * IMPORTANT: the pinned CA must be privately controlled and must only

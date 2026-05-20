@@ -166,7 +166,11 @@ static struct mux_session make_session(void)
 		.tag = (char *)"[test]:",
 	};
 	T_CHECK(ss.loop != NULL);
-	ss.sched.streams = table_new(TABLE_FAST);
+	ss.sched.streams = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_PTR.hash,
+		.eq = TABLE_OPTS_PTR.eq,
+		.flags = TABLE_FAST,
+	});
 	T_CHECK(ss.sched.streams != NULL);
 	ss.w_socket.fd = -1;
 	ev_timer_init(&ss.w_idle_timeout, sched_timer_noop_cb, 0.0, 1.0);

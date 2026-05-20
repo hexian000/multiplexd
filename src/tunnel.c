@@ -3,6 +3,8 @@
 
 #include "tunnel.h"
 
+#include "algo/hashtable.h"
+#include "math/rand.h"
 #include "mux/mux.h"
 #include "os/clock.h"
 #include "os/socket.h"
@@ -135,6 +137,21 @@ struct tunnel {
 		uintmax_t num_stream_failed;
 #endif
 	} stream_cnt;
+	/* Per-tunnel traffic byte counters; updated by the session thread
+	 * via mux_session_counters pointer-block. */
+	struct {
+#if WITH_THREADS
+		atomic_uintmax_t byt_mux_recv;
+		atomic_uintmax_t byt_mux_sent;
+		atomic_uintmax_t byt_local_recv;
+		atomic_uintmax_t byt_local_sent;
+#else
+		uintmax_t byt_mux_recv;
+		uintmax_t byt_mux_sent;
+		uintmax_t byt_local_recv;
+		uintmax_t byt_local_sent;
+#endif
+	} traffic_cnt;
 	/* SYN->SYN|ACK latency ring; written on the server thread only. */
 	size_t stream_establish_count;
 	intmax_t stream_establish_ns[256];
@@ -259,7 +276,8 @@ static void relay_dispatch_on_resumed(void *p)
 #endif /* WITH_THREADS */
 
 static const double tunnel_reconnect_delays[] = {
-	0.2, 2.0, 2.0, 5.0, 5.0, 15.0, 15.0, 15.0, 60.0, 60.0, 120.0, 300.0,
+	0.2,  2.0,  2.0,  5.0,	 5.0,	15.0,  15.0,
+	15.0, 60.0, 60.0, 120.0, 300.0, 600.0,
 };
 
 static void tunnel_schedule_reconnect(struct tunnel *restrict t)
@@ -270,7 +288,8 @@ static void tunnel_schedule_reconnect(struct tunnel *restrict t)
 	const int idx =
 		CLAMP(t->reconnect_count, 0,
 		      (int)(ARRAY_SIZE(tunnel_reconnect_delays) - 1));
-	const double delay = tunnel_reconnect_delays[idx];
+	const double delay =
+		tunnel_reconnect_delays[idx] * (0.8 + frand() * 0.4);
 	t->reconnect_count++;
 #if WITH_THREADS
 	(void)atomic_fetch_add_explicit(
@@ -390,8 +409,9 @@ static void handle_transport_lost(struct tunnel *restrict t)
 	}
 }
 
-static void
-handle_connected(struct tunnel *restrict t, const union mux_event_data edata)
+static void handle_connected(
+	struct tunnel *restrict t, struct mux_session *restrict ss,
+	const union mux_event_data edata)
 {
 	t->reconnect_count = 0;
 
@@ -408,15 +428,7 @@ handle_connected(struct tunnel *restrict t, const union mux_event_data edata)
 		/* Update tag for accepted identity sessions once peer identity
 		 * is known from the completed handshake. */
 		const struct server *const srv = t->relay.srv;
-		bool matched = false;
-		for (size_t i = 0; i < srv->num_identities; i++) {
-			if (srv->identities[i].peer_identity != NULL &&
-			    strcmp(srv->identities[i].peer_identity, peer_id) ==
-				    0) {
-				matched = true;
-				break;
-			}
-		}
+		const bool matched = table_find(srv->identities, peer_id, NULL);
 		const char *const my = matched ? t->identity : "?";
 		tunnel_set_tag(t->tag, sizeof(t->tag), my, " <= ", peer_id);
 	} else {
@@ -425,22 +437,20 @@ handle_connected(struct tunnel *restrict t, const union mux_event_data edata)
 		}
 		/* Wiring into identities[].tunnels[] is done by the server thread
 		 * in server.c server_on_established after the event is dispatched.
-		 * Here we only update the diagnostic tag. */
-		const struct server *const srv = t->relay.srv;
-		bool matched = false;
-		for (size_t i = 0; i < srv->num_identities; i++) {
-			if (srv->identities[i].peer_identity != NULL &&
-			    strcmp(srv->identities[i].peer_identity, peer_id) ==
-				    0) {
-				matched = true;
-				break;
+		 * Here we update the diagnostic tag regardless of whether the
+		 * peer identity is a configured one. */
+		char my[64];
+		if (t->identity != NULL) {
+			tunnel_set_tag_part(my, sizeof(my), t->identity);
+		} else {
+			union sockaddr_max addr;
+			if (socket_get_addr(mux_fd(ss), &addr) > 0) {
+				(void)sa_format(my, sizeof(my), &addr.sa);
+			} else {
+				tunnel_set_tag_part(my, sizeof(my), "?");
 			}
 		}
-		const char *const my = t->identity != NULL ? t->identity : "?";
-		if (matched) {
-			tunnel_set_tag(
-				t->tag, sizeof(t->tag), my, " => ", peer_id);
-		}
+		tunnel_set_tag(t->tag, sizeof(t->tag), my, " => ", peer_id);
 	}
 }
 
@@ -475,7 +485,6 @@ static void tunnel_on_event(
 	void *data, struct mux_session *ss, enum mux_event event,
 	union mux_event_data edata)
 {
-	UNUSED(ss);
 	struct tunnel *restrict t = data;
 
 	/* Update reconnect state before relaying to the server loop. */
@@ -488,10 +497,10 @@ static void tunnel_on_event(
 		break;
 	case MUX_EVENT_ESTABLISHED:
 		t->last_changed = clock_monotonic_ns();
-		handle_connected(t, edata);
+		handle_connected(t, ss, edata);
 		break;
 	case MUX_EVENT_RESUMED:
-		handle_connected(t, edata);
+		handle_connected(t, ss, edata);
 		break;
 	case MUX_EVENT_STREAM_ESTABLISHED:
 		handle_stream_established(t, edata.stream_established.ns);
@@ -640,7 +649,6 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 	const unsigned char *const id = opts->id;
 	const char *const connect_addr = opts->connect_addr;
 	const char *const forward_addr = opts->forward_addr;
-	const char *const bind_addr = opts->bind_addr;
 	const char *const identity = opts->identity;
 	const char *const peer_id = opts->peer_id;
 #if WITH_TLS
@@ -709,7 +717,7 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 		char peer[64];
 		if (fd >= 0) {
 			/* Accepted session: peer addr from socket; my from
-			 * identity, then bind_addr config, then local socket. */
+			 * identity, then local socket address. */
 			{
 				union sockaddr_max addr;
 				if (socket_get_peer(fd, &addr) > 0) {
@@ -722,8 +730,6 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 			}
 			if (identity != NULL) {
 				tunnel_set_tag_part(my, sizeof(my), identity);
-			} else if (bind_addr != NULL) {
-				tunnel_set_tag_part(my, sizeof(my), bind_addr);
 			} else {
 				union sockaddr_max addr;
 				if (socket_get_addr(fd, &addr) > 0) {
@@ -789,14 +795,12 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 			.send_buffered_frames = &srv->counters.send_buffered_frames,
 			.unacked_frames = &srv->counters.unacked_frames,
 			.traffic = {
-				.byt_mux_recv =
-					&srv->counters.traffic_byt_mux_recv,
-				.byt_mux_sent =
-					&srv->counters.traffic_byt_mux_sent,
+				.byt_mux_recv = &t->traffic_cnt.byt_mux_recv,
+				.byt_mux_sent = &t->traffic_cnt.byt_mux_sent,
 				.byt_local_recv =
-					&srv->counters.traffic_byt_local_recv,
+					&t->traffic_cnt.byt_local_recv,
 				.byt_local_sent =
-					&srv->counters.traffic_byt_local_sent,
+					&t->traffic_cnt.byt_local_sent,
 			},
 		},
 #if WITH_TLS
@@ -984,6 +988,28 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 {
 	out->established = mux_state(t->ss) == MUX_STATE_ESTABLISHED;
 	out->tag = t->tag;
+	out->accepted = t->accepted;
+	/* Set the session label: prefer peer identity from the protocol hello;
+	 * otherwise format the peer socket address into session_buf; otherwise
+	 * borrow the configured connect address; otherwise "?". */
+	{
+		if (t->peer_identity != NULL) {
+			out->session = t->peer_identity;
+		} else {
+			const struct sockaddr *const sa = mux_peer_addr(t->ss);
+			if (sa != NULL) {
+				(void)sa_format(
+					out->session_buf,
+					sizeof(out->session_buf), sa);
+				out->session = out->session_buf;
+			} else if (t->connect_addr != NULL) {
+				out->session = t->connect_addr;
+			} else {
+				out->session = "?";
+			}
+		}
+		ASSERT(out->session != NULL);
+	}
 	struct mux_session_stats snap;
 	mux_session_stats(t->ss, &snap);
 	out->rx_window = snap.rx_window;
@@ -1008,6 +1034,14 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 		&t->stream_cnt.num_stream_succeeded, memory_order_relaxed);
 	out->num_stream_failed = atomic_load_explicit(
 		&t->stream_cnt.num_stream_failed, memory_order_relaxed);
+	out->byt_mux_recv = atomic_load_explicit(
+		&t->traffic_cnt.byt_mux_recv, memory_order_relaxed);
+	out->byt_mux_sent = atomic_load_explicit(
+		&t->traffic_cnt.byt_mux_sent, memory_order_relaxed);
+	out->byt_local_recv = atomic_load_explicit(
+		&t->traffic_cnt.byt_local_recv, memory_order_relaxed);
+	out->byt_local_sent = atomic_load_explicit(
+		&t->traffic_cnt.byt_local_sent, memory_order_relaxed);
 #else
 	out->num_streams = t->stream_cnt.num_streams;
 	out->num_stream_halfopen = t->stream_cnt.num_stream_halfopen;
@@ -1017,6 +1051,10 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	out->num_stream_established = t->stream_cnt.num_stream_established;
 	out->num_stream_succeeded = t->stream_cnt.num_stream_succeeded;
 	out->num_stream_failed = t->stream_cnt.num_stream_failed;
+	out->byt_mux_recv = t->traffic_cnt.byt_mux_recv;
+	out->byt_mux_sent = t->traffic_cnt.byt_mux_sent;
+	out->byt_local_recv = t->traffic_cnt.byt_local_recv;
+	out->byt_local_sent = t->traffic_cnt.byt_local_sent;
 #endif
 	out->stream_establish_count = t->stream_establish_count;
 	memcpy(out->stream_establish_ns, t->stream_establish_ns,

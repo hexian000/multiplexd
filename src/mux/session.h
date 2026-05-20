@@ -37,12 +37,6 @@ struct hashtable;
 
 #define STREAMID_CTRL 0
 
-#define STREAMID_KEY(id)                                                       \
-	((struct hashkey){                                                     \
-		.len = sizeof(uint_least16_t),                                 \
-		.data = &(id),                                                 \
-	})
-
 /* Session state */
 enum session_state {
 	/* Session object created, not yet started */
