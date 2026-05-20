@@ -2,8 +2,8 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /**
- * @file tlsutil.c
- * @brief TLS utility functions using OpenSSL.
+ * @file tlsutil_openssl.c
+ * @brief TLS utility functions implemented with OpenSSL.
  */
 
 #if WITH_TLS
@@ -13,7 +13,9 @@
 #include "utils/slog.h"
 
 #include <openssl/bio.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/opensslv.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -60,6 +62,18 @@ static struct tls_context *tls_ctx_new(const SSL_METHOD *method)
 			LOG_F(level, "%s: %s", (s), buf);                      \
 		}                                                              \
 	} while (0)
+
+void tls_secure_erase(void *ptr, size_t len)
+{
+	if (ptr != NULL && len > 0) {
+		OPENSSL_cleanse(ptr, len);
+	}
+}
+
+const char *tls_version(void)
+{
+	return "OpenSSL " OPENSSL_VERSION_STR;
+}
 
 static bool load_cert_from_bio(SSL_CTX *ctx, BIO *bio)
 {
@@ -403,27 +417,11 @@ struct tls_context *tls_ctx_client(
 	return ctx;
 }
 
-void tls_ctx_ref(struct tls_context *restrict ctx)
-{
-	SSL_CTX *const ssl_ctx = tls_ctx_raw(ctx);
-	if (ssl_ctx != NULL) {
-		ERR_clear_error();
-		if (SSL_CTX_up_ref(ssl_ctx) != 1) {
-			LOG_SSLERROR(ERROR, "SSL_CTX_up_ref");
-		}
-	}
-}
-
-void tls_ctx_unref(struct tls_context *restrict ctx)
+void tls_ctx_free(struct tls_context *restrict ctx)
 {
 	if (ctx != NULL) {
 		SSL_CTX_free(tls_ctx_raw(ctx));
 	}
-}
-
-void tls_ctx_free(struct tls_context *restrict ctx)
-{
-	tls_ctx_unref(ctx);
 }
 
 struct tls_connection *tls_accept(struct tls_context *ctx, const int fd)

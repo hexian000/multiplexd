@@ -32,7 +32,10 @@ multiplexd is a TCP stream multiplexer that tunnels many concurrent connections 
 - [Building](#building)
   - [Dependencies](#dependencies)
   - [Build Instructions](#build-instructions)
+  - [Running Tests](#running-tests)
+  - [Convenience Builds](#convenience-builds)
   - [Build Options](#build-options)
+  - [Developer Scripts](#developer-scripts)
 - [Deployment Notes](#deployment-notes)
   - [TLS Security Model](#tls-security-model)
   - [Connection Backoff](#connection-backoff)
@@ -108,7 +111,7 @@ See [doc/impl.md](doc/impl.md) for runtime topology, send/receive paths, and mai
 
 ## Generating Certificates
 
-multiplexd includes a built-in certificate generator for creating self-signed or CA-signed certificates.
+multiplexd includes a built-in certificate generator for creating self-signed or CA-signed certificates. This feature requires building with OpenSSL (`USE_TLS_LIBRARY=openssl`).
 
 ### Generate Self-Signed Certificates
 
@@ -151,6 +154,8 @@ Generated files: `<name>-cert.pem` and `<name>-key.pem`.
 ## Configuration
 
 Configuration files are JSON objects. At least one of `mux_listen`, `mux_connect`, or `identity.mux_connect` must be present. The optional `type` field, when present, must be `application/x-multiplexd-config; version=1`. See [`conf_schema.json`](conf_schema.json) for the complete reference, including options, types, defaults, and fixed validation ranges.
+
+Because JSON has no comments, multiplexd ignores any key whose name begins with `-`. The sample [`client.json`](client.json) and [`server.json`](server.json) files use this to carry template-only tuning notes such as `-mux`; these keys are skipped at load time and do not affect the running configuration.
 
 ### Server (server.json)
 
@@ -328,8 +333,9 @@ Required:
 - libev (>= 4.31)
 - json-c (>= 0.15)
 
-Recommended (can be disabled by `ENABLE_TLS=OFF`):
-- OpenSSL (>= 3.0)
+Recommended (can be disabled by `USE_TLS_LIBRARY=none`); one of:
+- OpenSSL >= 3.0
+- mbedTLS >= 3.6
 
 ### Build Instructions
 
@@ -339,17 +345,39 @@ cmake ..
 make
 ```
 
+### Running Tests
+
+```bash
+cmake --build . --target check
+
+# or rerun the registered tests directly
+ctest --output-on-failure
+```
+
+For targeted reruns during development, pass a regex to `ctest -R`, for example `ctest --output-on-failure -R server_test`.
+
 To build without TLS support:
 
 ```bash
-cmake -DENABLE_TLS=OFF ..
+cmake -DUSE_TLS_LIBRARY=none ..
 ```
+
+### Convenience Builds
+
+For common in-tree workflows, [`m.sh`](m.sh) wraps configure/build/test steps from the repository root:
+
+- `./m.sh d` builds a debug configuration with sanitizers and threads enabled, then runs `ctest`
+- `./m.sh r` rebuilds a release configuration with threads enabled
+- `./m.sh posix` rebuilds with `FORCE_POSIX=ON`
+- `./m.sh c` removes generated build artifacts
+
+See the script for the full preset list, including clang, cross, min-size, and profiling builds.
 
 ### Build Options
 
 | Option              | Default | Description                                                      |
 | ------------------- | ------- | ---------------------------------------------------------------- |
-| `ENABLE_TLS`        | ON      | Enable TLS 1.3 transport encryption (requires OpenSSL)           |
+| `USE_TLS_LIBRARY`   | auto    | TLS library to use (`auto`, `openssl`, `mbedtls`, `none`)        |
 | `BUILD_STATIC`      | OFF     | Build a static executable (incompatible with sanitizers/systemd) |
 | `BUILD_PIE`         | OFF     | Build a position-independent executable                          |
 | `LINK_STATIC_LIBS`  | OFF     | Link against static libraries                                    |
@@ -357,6 +385,14 @@ cmake -DENABLE_TLS=OFF ..
 | `ENABLE_SYSTEMD`    | OFF     | Enable systemd state notify (`BUILD_STATIC=OFF`)                 |
 | `ENABLE_THREADS`    | OFF     | Enable multithread offloading                                    |
 | `FORCE_POSIX`       | OFF     | Use POSIX.1 APIs only                                            |
+
+### Developer Scripts
+
+Run these helper scripts from the repository root:
+
+- [`scripts/bench.py`](scripts/bench.py) runs the iperf3 benchmark suite and writes a Markdown summary to `build/bench.md`
+- [`scripts/gcov.py`](scripts/gcov.py) configures a gcov coverage build, runs the test suite, and writes `build/gcov.md`
+- [`scripts/gprof.py`](scripts/gprof.py) runs a focused gprof benchmark build and writes `build/gprof.md`
 
 ## Deployment Notes
 
@@ -396,3 +432,4 @@ Thanks to:
 - [libev](http://software.schmorp.de/pkg/libev.html)
 - [json-c](https://github.com/json-c/json-c)
 - [OpenSSL](https://www.openssl.org/)
+- [mbedTLS](https://github.com/Mbed-TLS/mbedtls)

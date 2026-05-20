@@ -27,7 +27,7 @@
 static struct {
 	const char *conf_path;
 	const char *user_name;
-#if WITH_TLS
+#if WITH_OPENSSL
 	const char *gencerts;
 	const char *server_name;
 	const char *sign;
@@ -56,7 +56,7 @@ static void print_usage(const char *argv0)
 		"                             Debug, Verbose, VeryVerbose respectively (default: 4)\n"
 		"  --dump-config              dump resolved config with inlined PEM to stdout\n"
 		"\n"
-#if WITH_TLS
+#if WITH_OPENSSL
 		"Certificate generation options:\n"
 		"  --gencerts <name>[,<name>...]\n"
 		"                             generate certificate and key pairs\n"
@@ -137,7 +137,7 @@ static void parse_args(const int argc, char *const *argv)
 			args.dump_config = true;
 			continue;
 		}
-#if WITH_TLS
+#if WITH_OPENSSL
 		if (strcmp(argv[i], "--gencerts") == 0) {
 			OPT_REQUIRE_ARG(argc, argv, i);
 			args.gencerts = argv[++i];
@@ -190,7 +190,7 @@ int main(int argc, char **argv)
 	slog_setlevel(args.loglevel);
 	loadlibs();
 
-#if WITH_TLS
+#if WITH_OPENSSL
 	if (args.gencerts != NULL) {
 		const char *kt = (args.keytype != NULL) ? args.keytype : "rsa";
 		if (!gencerts(
@@ -225,7 +225,7 @@ int main(int argc, char **argv)
 	}
 
 	if (args.dump_config) {
-#if WITH_TLS
+#if WITH_OPENSSL
 		if (!conf_inline_pem(conf)) {
 			LOGF("failed to inline PEM references");
 			conf_free(conf);

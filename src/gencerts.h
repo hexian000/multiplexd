@@ -9,7 +9,7 @@
 #ifndef GENCERTS_H
 #define GENCERTS_H
 
-#if WITH_TLS
+#if WITH_OPENSSL
 
 #include <stdbool.h>
 
@@ -26,6 +26,6 @@ bool gencerts(
 	const char *names, const char *server_name, const char *sign_cert,
 	const char *keytype, int keysize);
 
-#endif /* WITH_TLS */
+#endif /* WITH_OPENSSL */
 
 #endif /* GENCERTS_H */

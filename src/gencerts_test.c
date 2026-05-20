@@ -7,7 +7,7 @@
 
 #include <stdlib.h>
 
-#if WITH_TLS
+#if WITH_OPENSSL
 
 #include "utils/slog.h"
 
@@ -285,11 +285,11 @@ int main(void)
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-#else /* !WITH_TLS */
+#else /* !WITH_OPENSSL */
 
 int main(void)
 {
 	return EXIT_SUCCESS;
 }
 
-#endif /* WITH_TLS */
+#endif /* WITH_OPENSSL */

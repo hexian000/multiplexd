@@ -701,6 +701,22 @@ static const struct tunnel_callbacks client_callbacks = {
 };
 
 #if WITH_TLS
+static void server_cleanse_tls_config(const struct config *restrict conf)
+{
+	if (conf->tls_cert != NULL) {
+		tls_secure_erase(conf->tls_cert, strlen(conf->tls_cert));
+	}
+	if (conf->tls_key != NULL) {
+		tls_secure_erase(conf->tls_key, strlen(conf->tls_key));
+	}
+	for (size_t i = 0; i < conf->authcerts_count; i++) {
+		if (conf->authcerts[i] != NULL) {
+			tls_secure_erase(
+				conf->authcerts[i], strlen(conf->authcerts[i]));
+		}
+	}
+}
+
 /* Build fresh server and client TLS contexts from new_conf.
  * On success, zeroes the sensitive credential strings and returns true.
  * On failure, frees any partially-created context and returns false;
@@ -742,12 +758,7 @@ static bool server_reload_make_tls(
 			return false;
 		}
 	}
-	memset(new_conf->tls_cert, 0, strlen(new_conf->tls_cert));
-	memset(new_conf->tls_key, 0, strlen(new_conf->tls_key));
-	for (size_t i = 0; i < new_conf->authcerts_count; i++) {
-		memset(new_conf->authcerts[i], 0,
-		       strlen(new_conf->authcerts[i]));
-	}
+	server_cleanse_tls_config(new_conf);
 	return true;
 }
 #endif /* WITH_TLS */
@@ -1407,12 +1418,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 				return NULL;
 			}
 		}
-		memset(conf->tls_cert, 0, strlen(conf->tls_cert));
-		memset(conf->tls_key, 0, strlen(conf->tls_key));
-		for (size_t i = 0; i < conf->authcerts_count; i++) {
-			memset(conf->authcerts[i], 0,
-			       strlen(conf->authcerts[i]));
-		}
+		server_cleanse_tls_config(conf);
 	}
 #endif
 

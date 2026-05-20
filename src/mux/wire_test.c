@@ -15,7 +15,9 @@
 #include <unistd.h>
 
 #if WITH_TLS
+#if WITH_OPENSSL
 #include "gencerts.h"
+#endif
 #include "tlsutil.h"
 #include "utils/slog.h"
 
@@ -275,6 +277,53 @@ static void wire_test_rm_tmpdir(const char *path)
 	(void)nftw(path, wire_test_rm_entry, 8, FTW_DEPTH | FTW_PHYS);
 }
 
+#if !WITH_OPENSSL
+/* Self-signed Ed25519 certificate with subjectAltName=DNS:test.example.
+ * Embedded fallback for non-OpenSSL backends (gencerts is OpenSSL-only). */
+static const char wire_test_cert_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIIBnzCCAUSgAwIBAgIUecJKZzpeqHlnY0oRsqh21j4TnWIwCgYIKoZIzj0EAwIw\n"
+	"FzEVMBMGA1UEAwwMdGVzdC5leGFtcGxlMCAXDTI2MDUxOTA0MTY0NloYDzIxMjYw\n"
+	"NDI1MDQxNjQ2WjAXMRUwEwYDVQQDDAx0ZXN0LmV4YW1wbGUwWTATBgcqhkjOPQIB\n"
+	"BggqhkjOPQMBBwNCAARxDnLchFLKZemHoErdO7W1ELzqeY2vC3T/6UtoZNlg6QyO\n"
+	"zK/OTtS2GhEml7xXctp17W6AYwW4rAr1/9SFFqDOo2wwajAdBgNVHQ4EFgQUhPN3\n"
+	"UVEB2laNlxV8HcHyq2HogFkwHwYDVR0jBBgwFoAUhPN3UVEB2laNlxV8HcHyq2Ho\n"
+	"gFkwFwYDVR0RBBAwDoIMdGVzdC5leGFtcGxlMA8GA1UdEwEB/wQFMAMBAf8wCgYI\n"
+	"KoZIzj0EAwIDSQAwRgIhAPYLykNErqBlLUdJJqhqMSKlfyn7/zAbR5nPJ1l7pC0F\n"
+	"AiEA4BLdR1o4TkZTakcr5TG9wcilxgYTKYwrR3Fw18gDAQw=\n"
+	"-----END CERTIFICATE-----\n";
+
+static const char wire_test_key_pem[] =
+	"-----BEGIN EC PRIVATE KEY-----\n"
+	"MHcCAQEEIPdNKDBJJsEP+Wl1IXsrahoxn0MfEyCEzWHZP7akCMwMoAoGCCqGSM49\n"
+	"AwEHoUQDQgAEcQ5y3IRSymXph6BK3Tu1tRC86nmNrwt0/+lLaGTZYOkMjsyvzk7U\n"
+	"thoRJpe8V3Lade1ugGMFuKwK9f/UhRagzg==\n"
+	"-----END EC PRIVATE KEY-----\n";
+
+static bool wire_test_write_pem(const char *path, const char *data)
+{
+	FILE *fp = fopen(path, "w");
+	if (fp == NULL) {
+		return false;
+	}
+	const size_t len = strlen(data);
+	const size_t n = fwrite(data, 1, len, fp);
+	const int closed = fclose(fp);
+	return n == len && closed == 0;
+}
+
+static bool wire_test_make_certs(void)
+{
+	if (!wire_test_write_pem("t-cert.pem", wire_test_cert_pem)) {
+		return false;
+	}
+	if (!wire_test_write_pem("t-key.pem", wire_test_key_pem)) {
+		return false;
+	}
+	return true;
+}
+#endif /* !WITH_OPENSSL */
+
 /* Generate a self-signed Ed25519 cert pair in a fresh tmpdir.
  * Returns the saved working directory (caller must free), or NULL on failure.
  * On success, cert_out and key_out hold absolute '@'-prefixed paths. */
@@ -295,7 +344,11 @@ static char *wire_test_setup_cert_dir(
 		free(origdir);
 		return NULL;
 	}
+#if WITH_OPENSSL
 	if (!gencerts("t", "test.example", NULL, "ed25519", 0)) {
+#else
+	if (!wire_test_make_certs()) {
+#endif
 		if (chdir(origdir) != 0) {
 			LOGW_F("chdir: (%d) %s", errno, strerror(errno));
 		}
@@ -408,7 +461,7 @@ T_DECLARE_CASE(test_wire_tls_start_creates_outbound_conn)
 	T_EXPECT(ss.wire.tlsconn != NULL);
 
 	wire_conn_free(&ss);
-	tls_ctx_unref(cli_ctx);
+	tls_ctx_free(cli_ctx);
 	close(fds[0]);
 	close(fds[1]);
 	wire_test_rm_tmpdir(tmpl);
@@ -440,7 +493,7 @@ T_DECLARE_CASE(test_wire_conn_free_clears_tlsconn)
 	wire_conn_free(&ss);
 	T_EXPECT(ss.wire.tlsconn == NULL);
 
-	tls_ctx_unref(ctx);
+	tls_ctx_free(ctx);
 	close(fds[0]);
 	close(fds[1]);
 	wire_test_rm_tmpdir(tmpl);
@@ -495,8 +548,8 @@ T_DECLARE_CASE(test_wire_tls_send_recv_data)
 	cli_ss.wire.tlsconn = NULL;
 	tls_conn_free(srv_conn);
 	tls_conn_free(cli_conn);
-	tls_ctx_unref(srv_ctx);
-	tls_ctx_unref(cli_ctx);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
 	close(fds[0]);
 	close(fds[1]);
 	wire_test_rm_tmpdir(tmpl);
@@ -563,8 +616,8 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 	cli_ss.wire.tlsconn = NULL;
 	tls_conn_free(srv_conn);
 	tls_conn_free(cli_conn);
-	tls_ctx_unref(srv_ctx);
-	tls_ctx_unref(cli_ctx);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
 	close(fds[0]);
 	close(fds[1]);
 	wire_test_rm_tmpdir(tmpl);

@@ -6,13 +6,13 @@
 
 /**
  * @file tlsutil.h
- * @brief Small wrapper utilities for OpenSSL-based TLS handling.
+ * @brief Backend-agnostic TLS compatibility layer.
  *
  * This header exposes a minimal, non-blocking-friendly API used across the
  * project to create TLS contexts (client/server), accept/connect TLS
- * connections and perform I/O and shutdown using OpenSSL.
+ * connections and perform I/O and shutdown.
  *
- * All functions operate on opaque pointers to keep OpenSSL types private to
+ * All functions operate on opaque pointers to keep backend types private to
  * the implementation. All public functions validate inputs where practical
  * and return appropriate status values on error.
  */
@@ -25,11 +25,13 @@
 struct tls_context; /* opaque */
 struct tls_connection; /* opaque */
 
-/** Increase the reference count of a TLS context. */
-void tls_ctx_ref(struct tls_context *ctx);
-
-/** Decrease the reference count of a TLS context. */
-void tls_ctx_unref(struct tls_context *ctx);
+/**
+ * @brief Return a human-readable name and version of the active TLS library.
+ *
+ * The returned string follows the format "<library> <version>" (e.g.
+ * "OpenSSL 3.0.13") and has static storage duration; it must not be freed.
+ */
+const char *tls_version(void);
 
 /**
  * @brief Error codes returned by tls_send/tls_recv.
@@ -37,7 +39,7 @@ void tls_ctx_unref(struct tls_context *ctx);
 enum tls_error {
 	/** No error. */
 	TLS_ERROR_NONE = 0,
-	/** A generic OpenSSL error (see error queue). */
+	/** A generic TLS/SSL error (see error queue). */
 	TLS_ERROR_SSL,
 	/** Operation would block and needs a read. */
 	TLS_ERROR_WANT_READ,
@@ -93,11 +95,21 @@ bool tls_load_authcerts(
 	struct tls_context *ctx, char *const *authcerts, size_t count);
 
 /**
+ * @brief Overwrite a memory region with zeros using the TLS library.
+ *
+ * Safe to call with NULL or zero length.
+ *
+ * @param ptr Buffer to clear in place.
+ * @param len Buffer size in bytes.
+ */
+void tls_secure_erase(void *ptr, size_t len);
+
+/**
  * @brief Initialize TLS server context with mutual authentication.
  *
  * The returned context enforces TLS 1.3 minimum and configures the context to
- * require a client certificate (mutual authentication). The context is tied
- * to the OpenSSL implementation and must be freed with @c tls_ctx_free().
+ * require a client certificate (mutual authentication). The context must be
+ * freed with @c tls_ctx_free().
  *
  * @param tls_cert PEM certificate data or filename (prefixed with '@'). MUST NOT be NULL.
  * @param tls_key PEM private key data or filename (prefixed with '@'). MUST NOT be NULL.
@@ -242,10 +254,10 @@ int tls_shutdown(struct tls_connection *conn, bool *want_read, bool *want_write)
 void tls_conn_free(struct tls_connection *conn);
 
 /**
- * @brief Log current OpenSSL error queue for @p s.
+ * @brief Log pending TLS errors for @p s.
  *
  * This is a thin wrapper around the internal logging used by the project and
- * prints all OpenSSL errors currently present in the thread's error queue.
+ * prints all pending TLS errors from the thread's error queue.
  *
  * @param s Context string used in the log message. May be NULL.
  */

@@ -15,6 +15,8 @@ const char *multiplexd_version(void);
 #cmakedefine01 WITH_TCP_NOTSENT_LOWAT
 #cmakedefine01 WITH_TCP_USER_TIMEOUT
 #cmakedefine01 WITH_TLS
+#cmakedefine01 WITH_OPENSSL
+#cmakedefine01 WITH_MBEDTLS
 #cmakedefine01 WITH_THREADS
 
 #endif /* CONFIG_H */

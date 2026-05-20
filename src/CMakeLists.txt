@@ -2,8 +2,6 @@ add_executable(multiplexd
     util.c util.h
     conf.c conf.h
     jsonutil.c jsonutil.h
-    tlsutil.c tlsutil.h
-    gencerts.c gencerts.h
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
@@ -70,18 +68,113 @@ message(STATUS "libev ${LIBEV_VERSION}: ${LIBEV_LIBRARY}")
 target_include_directories(multiplexd SYSTEM PRIVATE ${LIBEV_INCLUDE_DIR})
 target_link_libraries(multiplexd PRIVATE ${LIBEV_LIBRARY})
 
-# find OpenSSL
-if(ENABLE_TLS)
+# find a TLS library
+set(WITH_TLS FALSE)
+set(WITH_OPENSSL FALSE)
+set(WITH_MBEDTLS FALSE)
+set(TLS_SOURCES "")
+set(GENCERTS_SOURCES "")
+set(TLS_INCLUDES "")
+set(TLS_LIBS "")
+
+set(_tls_lib_effective "${USE_TLS_LIBRARY}")
+
+set(_tls_openssl_found FALSE)
+if(_tls_lib_effective STREQUAL "auto" OR _tls_lib_effective STREQUAL "openssl")
     if(BUILD_STATIC OR LINK_STATIC_LIBS)
         set(OPENSSL_USE_STATIC_LIBS TRUE)
     endif()
-    find_package(OpenSSL 3.0)
-    if(OpenSSL_FOUND)
-        message(STATUS "OpenSSL ${OPENSSL_VERSION}: ${OPENSSL_LIBRARIES}")
-        target_include_directories(multiplexd SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
-        target_link_libraries(multiplexd PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-        set(WITH_TLS TRUE)
+    find_package(OpenSSL 3.0 QUIET)
+    if(OpenSSL_FOUND AND TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
+        set(_tls_openssl_found TRUE)
     endif()
+endif()
+
+set(_tls_mbedtls_found FALSE)
+set(_tls_mbedtls_version "")
+if(_tls_lib_effective STREQUAL "auto" OR _tls_lib_effective STREQUAL "mbedtls")
+    find_path(MBEDTLS_INCLUDE_DIR NAMES mbedtls/build_info.h)
+    if(BUILD_STATIC OR LINK_STATIC_LIBS)
+        find_library(MBEDTLS_SSL_LIBRARY NAMES libmbedtls.a)
+        find_library(MBEDTLS_X509_LIBRARY NAMES libmbedx509.a)
+        find_library(MBEDTLS_CRYPTO_LIBRARY NAMES libmbedcrypto.a)
+    else()
+        find_library(MBEDTLS_SSL_LIBRARY NAMES mbedtls)
+        find_library(MBEDTLS_X509_LIBRARY NAMES mbedx509)
+        find_library(MBEDTLS_CRYPTO_LIBRARY NAMES mbedcrypto)
+    endif()
+    if(EXISTS "${MBEDTLS_INCLUDE_DIR}/mbedtls/build_info.h"
+       AND EXISTS "${MBEDTLS_SSL_LIBRARY}"
+       AND EXISTS "${MBEDTLS_X509_LIBRARY}"
+       AND EXISTS "${MBEDTLS_CRYPTO_LIBRARY}")
+        file(STRINGS "${MBEDTLS_INCLUDE_DIR}/mbedtls/build_info.h"
+            _tls_mbedtls_version_line
+            REGEX "^#define MBEDTLS_VERSION_NUMBER[ \t]+0x[0-9A-Fa-f]+")
+        file(STRINGS "${MBEDTLS_INCLUDE_DIR}/mbedtls/build_info.h"
+            _tls_mbedtls_version_str
+            REGEX "^#define MBEDTLS_VERSION_STRING[ \t]+\"[^\"]+\"")
+        string(REGEX REPLACE
+            ".*0x([0-9A-Fa-f]+).*" "\\1"
+            _tls_mbedtls_version_hex "${_tls_mbedtls_version_line}")
+        string(REGEX REPLACE
+            ".*\"([^\"]+)\".*" "\\1"
+            _tls_mbedtls_version "${_tls_mbedtls_version_str}")
+        # Require mbedTLS >= 3.6 (TLS 1.3 LTS).
+        if(_tls_mbedtls_version_hex AND
+           NOT "0x${_tls_mbedtls_version_hex}" VERSION_LESS "0x03060000")
+            set(_tls_mbedtls_found TRUE)
+        endif()
+    endif()
+endif()
+
+if(_tls_lib_effective STREQUAL "auto")
+    if(_tls_openssl_found)
+        set(_tls_lib_effective "openssl")
+    elseif(_tls_mbedtls_found)
+        set(_tls_lib_effective "mbedtls")
+    else()
+        set(_tls_lib_effective "none")
+    endif()
+endif()
+
+if(_tls_lib_effective STREQUAL "openssl")
+    if(NOT _tls_openssl_found)
+        message(FATAL_ERROR "USE_TLS_LIBRARY=openssl requested but OpenSSL >= 3.0 not found")
+    endif()
+    message(STATUS "TLS library: OpenSSL ${OPENSSL_VERSION}: ${OPENSSL_LIBRARIES}")
+    set(WITH_TLS TRUE)
+    set(WITH_OPENSSL TRUE)
+    set(TLS_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/tlsutil.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/tlsutil_openssl.c)
+    set(GENCERTS_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/gencerts.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/gencerts.h)
+    set(TLS_INCLUDES ${OPENSSL_INCLUDE_DIR})
+    set(TLS_LIBS OpenSSL::SSL OpenSSL::Crypto)
+elseif(_tls_lib_effective STREQUAL "mbedtls")
+    if(NOT _tls_mbedtls_found)
+        message(FATAL_ERROR "USE_TLS_LIBRARY=mbedtls requested but mbedTLS not found")
+    endif()
+    message(STATUS "TLS library: mbedTLS ${_tls_mbedtls_version}: ${MBEDTLS_SSL_LIBRARY}")
+    set(WITH_TLS TRUE)
+    set(WITH_MBEDTLS TRUE)
+    set(TLS_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/tlsutil.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/tlsutil_mbedtls.c)
+    set(GENCERTS_SOURCES "")
+    set(TLS_INCLUDES ${MBEDTLS_INCLUDE_DIR})
+    set(TLS_LIBS ${MBEDTLS_SSL_LIBRARY} ${MBEDTLS_X509_LIBRARY} ${MBEDTLS_CRYPTO_LIBRARY})
+elseif(_tls_lib_effective STREQUAL "none")
+    message(STATUS "TLS support disabled")
+else()
+    message(FATAL_ERROR "Invalid USE_TLS_LIBRARY: ${USE_TLS_LIBRARY}")
+endif()
+
+if(WITH_TLS)
+    target_sources(multiplexd PRIVATE ${TLS_SOURCES} ${GENCERTS_SOURCES})
+    target_include_directories(multiplexd SYSTEM PRIVATE ${TLS_INCLUDES})
+    target_link_libraries(multiplexd PRIVATE ${TLS_LIBS})
 endif()
 
 # find json-c
@@ -150,8 +243,8 @@ function(add_src_test target_name)
     target_link_libraries(${target_name} PRIVATE ${LIBEV_LIBRARY})
 
     if(WITH_TLS)
-        target_include_directories(${target_name} SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
-        target_link_libraries(${target_name} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_include_directories(${target_name} SYSTEM PRIVATE ${TLS_INCLUDES})
+        target_link_libraries(${target_name} PRIVATE ${TLS_LIBS})
     endif()
 
     target_include_directories(${target_name} SYSTEM PRIVATE ${JSONC_INCLUDE_DIR})
@@ -195,27 +288,29 @@ add_src_test(conf_test
 # Utility function unit tests
 add_src_test(util_test
     util.c util.h
+    ${TLS_SOURCES}
     util_test.c
 )
 
 # Listener unit tests
 add_src_test(listener_test
     util.c util.h
+    ${TLS_SOURCES}
     listener.c listener.h
     listener_test.c
 )
 
 # Certificate generation tests (always registered; no-op when TLS disabled)
 add_src_test(gencerts_test
-    gencerts.c gencerts.h
-    tlsutil.c tlsutil.h
+    ${GENCERTS_SOURCES}
+    ${TLS_SOURCES}
     gencerts_test.c
 )
 
 # TLS context unit tests (always registered; no-op when TLS disabled)
 add_src_test(tlsutil_test
-    gencerts.c gencerts.h
-    tlsutil.c tlsutil.h
+    ${GENCERTS_SOURCES}
+    ${TLS_SOURCES}
     tlsutil_test.c
 )
 
@@ -224,8 +319,8 @@ add_src_test(tunnel_test
     util.c util.h
     conf.c conf.h
     jsonutil.c jsonutil.h
-    tlsutil.c tlsutil.h
-    gencerts.c gencerts.h
+    ${TLS_SOURCES}
+    ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
@@ -243,12 +338,12 @@ add_src_test(tunnel_test
 )
 
 # Server unit tests
-add_executable(server_test
+add_src_test(server_test
     util.c util.h
     conf.c conf.h
     jsonutil.c jsonutil.h
-    tlsutil.c tlsutil.h
-    gencerts.c gencerts.h
+    ${TLS_SOURCES}
+    ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
@@ -265,54 +360,13 @@ add_executable(server_test
     server_test.c
 )
 
-target_include_directories(server_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(server_test PRIVATE ${CMAKE_SOURCE_DIR}/contrib/csnippets)
-
-target_compile_options(server_test PRIVATE "-include${CMAKE_CURRENT_BINARY_DIR}/config.h")
-target_compile_options(server_test PRIVATE -pedantic -Wall -Wextra -Werror)
-
-if(FORCE_POSIX)
-    target_compile_definitions(server_test PRIVATE _POSIX_C_SOURCE=200809L)
-else()
-    target_compile_definitions(server_test PRIVATE _GNU_SOURCE)
-endif()
-
-target_include_directories(server_test SYSTEM PRIVATE ${LIBEV_INCLUDE_DIR})
-target_link_libraries(server_test PRIVATE ${LIBEV_LIBRARY})
-
-if(WITH_TLS)
-    target_include_directories(server_test SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(server_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-endif()
-
-target_include_directories(server_test SYSTEM PRIVATE ${JSONC_INCLUDE_DIR})
-target_link_libraries(server_test PRIVATE ${JSONC_LIBRARY})
-
-if(LIBM)
-    target_link_libraries(server_test PRIVATE m)
-endif()
-
-target_link_libraries(server_test PRIVATE csnippets)
-if(Threads_FOUND)
-    target_link_libraries(server_test PRIVATE Threads::Threads)
-endif()
-
-target_sources(server_test
-    PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/config.h"
-    "${CMAKE_CURRENT_BINARY_DIR}/version.c"
-)
-
-add_test(NAME server_test COMMAND server_test)
-add_dependencies(check server_test)
-
 # API server unit tests
-add_executable(api_server_test
+add_src_test(api_server_test
     util.c util.h
     conf.c conf.h
     jsonutil.c jsonutil.h
-    tlsutil.c tlsutil.h
-    gencerts.c gencerts.h
+    ${TLS_SOURCES}
+    ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
@@ -328,44 +382,3 @@ add_executable(api_server_test
     mux/wire.c mux/wire.h
     api_server_test.c
 )
-
-target_include_directories(api_server_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(api_server_test PRIVATE ${CMAKE_SOURCE_DIR}/contrib/csnippets)
-
-target_compile_options(api_server_test PRIVATE "-include${CMAKE_CURRENT_BINARY_DIR}/config.h")
-target_compile_options(api_server_test PRIVATE -pedantic -Wall -Wextra -Werror)
-
-if(FORCE_POSIX)
-    target_compile_definitions(api_server_test PRIVATE _POSIX_C_SOURCE=200809L)
-else()
-    target_compile_definitions(api_server_test PRIVATE _GNU_SOURCE)
-endif()
-
-target_include_directories(api_server_test SYSTEM PRIVATE ${LIBEV_INCLUDE_DIR})
-target_link_libraries(api_server_test PRIVATE ${LIBEV_LIBRARY})
-
-if(WITH_TLS)
-    target_include_directories(api_server_test SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(api_server_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-endif()
-
-target_include_directories(api_server_test SYSTEM PRIVATE ${JSONC_INCLUDE_DIR})
-target_link_libraries(api_server_test PRIVATE ${JSONC_LIBRARY})
-
-if(LIBM)
-    target_link_libraries(api_server_test PRIVATE m)
-endif()
-
-target_link_libraries(api_server_test PRIVATE csnippets)
-if(Threads_FOUND)
-    target_link_libraries(api_server_test PRIVATE Threads::Threads)
-endif()
-
-target_sources(api_server_test
-    PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/config.h"
-    "${CMAKE_CURRENT_BINARY_DIR}/version.c"
-)
-
-add_test(NAME api_server_test COMMAND api_server_test)
-add_dependencies(check api_server_test)

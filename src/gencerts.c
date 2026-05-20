@@ -8,7 +8,7 @@
 
 #include "gencerts.h"
 
-#if WITH_TLS
+#if WITH_OPENSSL
 
 #include "os/clock.h"
 #include "utils/slog.h"
@@ -207,9 +207,9 @@ static bool create_certificate(
 		return false;
 	}
 
-	X509_NAME *name = X509_get_subject_name(cert);
+	X509_NAME *name = X509_NAME_new();
 	if (name == NULL) {
-		LOG_SSLERROR("X509_get_subject_name");
+		LOG_SSLERROR("X509_NAME_new");
 		X509_free(cert);
 		return false;
 	}
@@ -217,6 +217,7 @@ static bool create_certificate(
 		    name, "C", MBSTRING_ASC, (unsigned char *)"US", -1, -1,
 		    0) == 0) {
 		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
+		X509_NAME_free(name);
 		X509_free(cert);
 		return false;
 	}
@@ -224,6 +225,7 @@ static bool create_certificate(
 		    name, "ST", MBSTRING_ASC, (unsigned char *)"California", -1,
 		    -1, 0) == 0) {
 		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
+		X509_NAME_free(name);
 		X509_free(cert);
 		return false;
 	}
@@ -231,6 +233,7 @@ static bool create_certificate(
 		    name, "L", MBSTRING_ASC, (unsigned char *)"Mountain View",
 		    -1, -1, 0) == 0) {
 		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
+		X509_NAME_free(name);
 		X509_free(cert);
 		return false;
 	}
@@ -238,6 +241,7 @@ static bool create_certificate(
 		    name, "O", MBSTRING_ASC,
 		    (unsigned char *)"Your Organization", -1, -1, 0) == 0) {
 		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
+		X509_NAME_free(name);
 		X509_free(cert);
 		return false;
 	}
@@ -245,6 +249,7 @@ static bool create_certificate(
 		    name, "OU", MBSTRING_ASC, (unsigned char *)"Your Unit", -1,
 		    -1, 0) == 0) {
 		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
+		X509_NAME_free(name);
 		X509_free(cert);
 		return false;
 	}
@@ -252,9 +257,17 @@ static bool create_certificate(
 		    name, "CN", MBSTRING_ASC, (unsigned char *)server_name, -1,
 		    -1, 0) == 0) {
 		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
+		X509_NAME_free(name);
 		X509_free(cert);
 		return false;
 	}
+	if (X509_set_subject_name(cert, name) == 0) {
+		LOG_SSLERROR("X509_set_subject_name");
+		X509_NAME_free(name);
+		X509_free(cert);
+		return false;
+	}
+	X509_NAME_free(name);
 
 	X509V3_CTX v3ctx;
 	X509V3_set_ctx_nodb(&v3ctx);
@@ -557,4 +570,4 @@ bool gencerts(
 	return success;
 }
 
-#endif /* WITH_TLS */
+#endif /* WITH_OPENSSL */

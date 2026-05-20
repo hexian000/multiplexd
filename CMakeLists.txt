@@ -59,7 +59,10 @@ option(FORCE_POSIX "Build the core features using POSIX.1 APIs only" OFF)
 option(ENABLE_THREADS "Enable thread offloading" OFF)
 option(LINK_STATIC_LIBS "Link against static libraries" OFF)
 option(ENABLE_SYSTEMD "Enable systemd integration" OFF)
-option(ENABLE_TLS "Enable TLS support" ON)
+set(USE_TLS_LIBRARY "auto" CACHE STRING
+    "TLS library to use: auto|openssl|mbedtls|none")
+set_property(CACHE USE_TLS_LIBRARY PROPERTY STRINGS
+    auto openssl mbedtls none)
 
 if(ENABLE_SANITIZERS AND BUILD_STATIC)
     message(FATAL_ERROR "ENABLE_SANITIZERS is incompatible with BUILD_STATIC")

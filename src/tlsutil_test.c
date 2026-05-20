@@ -9,7 +9,9 @@
 
 #if WITH_TLS
 
+#if WITH_OPENSSL
 #include "gencerts.h"
+#endif
 #include "utils/slog.h"
 
 #include <errno.h>
@@ -41,6 +43,54 @@ static void rm_tmpdir(const char *path)
 	(void)nftw(path, rm_entry, 8, FTW_DEPTH | FTW_PHYS);
 }
 
+#if !WITH_OPENSSL
+/* Self-signed Ed25519 certificate with subjectAltName=DNS:test.example.
+ * The companion private key follows. These literals stand in for the
+ * gencerts() helper, which is OpenSSL-only. */
+static const char test_cert_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIIBnzCCAUSgAwIBAgIUecJKZzpeqHlnY0oRsqh21j4TnWIwCgYIKoZIzj0EAwIw\n"
+	"FzEVMBMGA1UEAwwMdGVzdC5leGFtcGxlMCAXDTI2MDUxOTA0MTY0NloYDzIxMjYw\n"
+	"NDI1MDQxNjQ2WjAXMRUwEwYDVQQDDAx0ZXN0LmV4YW1wbGUwWTATBgcqhkjOPQIB\n"
+	"BggqhkjOPQMBBwNCAARxDnLchFLKZemHoErdO7W1ELzqeY2vC3T/6UtoZNlg6QyO\n"
+	"zK/OTtS2GhEml7xXctp17W6AYwW4rAr1/9SFFqDOo2wwajAdBgNVHQ4EFgQUhPN3\n"
+	"UVEB2laNlxV8HcHyq2HogFkwHwYDVR0jBBgwFoAUhPN3UVEB2laNlxV8HcHyq2Ho\n"
+	"gFkwFwYDVR0RBBAwDoIMdGVzdC5leGFtcGxlMA8GA1UdEwEB/wQFMAMBAf8wCgYI\n"
+	"KoZIzj0EAwIDSQAwRgIhAPYLykNErqBlLUdJJqhqMSKlfyn7/zAbR5nPJ1l7pC0F\n"
+	"AiEA4BLdR1o4TkZTakcr5TG9wcilxgYTKYwrR3Fw18gDAQw=\n"
+	"-----END CERTIFICATE-----\n";
+
+static const char test_key_pem[] =
+	"-----BEGIN EC PRIVATE KEY-----\n"
+	"MHcCAQEEIPdNKDBJJsEP+Wl1IXsrahoxn0MfEyCEzWHZP7akCMwMoAoGCCqGSM49\n"
+	"AwEHoUQDQgAEcQ5y3IRSymXph6BK3Tu1tRC86nmNrwt0/+lLaGTZYOkMjsyvzk7U\n"
+	"thoRJpe8V3Lade1ugGMFuKwK9f/UhRagzg==\n"
+	"-----END EC PRIVATE KEY-----\n";
+
+static bool write_pem_file(const char *path, const char *data)
+{
+	FILE *fp = fopen(path, "w");
+	if (fp == NULL) {
+		return false;
+	}
+	const size_t len = strlen(data);
+	const size_t n = fwrite(data, 1, len, fp);
+	const int closed = fclose(fp);
+	return n == len && closed == 0;
+}
+
+static bool make_test_certs(void)
+{
+	if (!write_pem_file("t-cert.pem", test_cert_pem)) {
+		return false;
+	}
+	if (!write_pem_file("t-key.pem", test_key_pem)) {
+		return false;
+	}
+	return true;
+}
+#endif /* !WITH_OPENSSL */
+
 /* Generate a self-signed Ed25519 cert in tmpdir; build absolute @ paths.
  * Returns origdir (must be freed) or NULL on failure. */
 static char *setup_cert_dir(
@@ -60,7 +110,11 @@ static char *setup_cert_dir(
 		free(origdir);
 		return NULL;
 	}
+#if WITH_OPENSSL
 	if (!gencerts("t", "test.example", NULL, "ed25519", 0)) {
+#else
+	if (!make_test_certs()) {
+#endif
 		if (chdir(origdir) != 0) {
 			LOGW_F("chdir: (%d) %s", errno, strerror(errno));
 		}
@@ -212,7 +266,7 @@ T_DECLARE_CASE(test_tls_ctx_server_created)
 		tls_ctx_server(cert_path, key_path, authcerts, 1, NULL);
 	T_EXPECT(ctx != NULL);
 	if (ctx != NULL) {
-		tls_ctx_unref(ctx);
+		tls_ctx_free(ctx);
 	}
 
 	rm_tmpdir(tmpl);
@@ -233,32 +287,8 @@ T_DECLARE_CASE(test_tls_ctx_client_created)
 		tls_ctx_client(cert_path, key_path, authcerts, 1, NULL);
 	T_EXPECT(ctx != NULL);
 	if (ctx != NULL) {
-		tls_ctx_unref(ctx);
+		tls_ctx_free(ctx);
 	}
-
-	rm_tmpdir(tmpl);
-}
-
-T_DECLARE_CASE(test_tls_ctx_ref_unref)
-{
-	(void)_t_;
-	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
-	char cert_path[PATH_MAX + 2];
-	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
-		tls_ctx_server(cert_path, key_path, authcerts, 1, NULL);
-	T_CHECK(ctx != NULL);
-
-	/* ref increments the refcount, two unref calls should be safe. */
-	tls_ctx_ref(ctx);
-	tls_ctx_unref(ctx); /* drops the extra ref */
-	tls_ctx_unref(ctx); /* drops the original ref */
 
 	rm_tmpdir(tmpl);
 }
@@ -280,7 +310,7 @@ T_DECLARE_CASE(test_tls_load_key_empty_fails)
 	T_CHECK(ctx != NULL);
 	T_EXPECT(!tls_load_key(ctx, empty));
 	if (ctx != NULL) {
-		tls_ctx_unref(ctx);
+		tls_ctx_free(ctx);
 	}
 
 	rm_tmpdir(tmpl);
@@ -303,7 +333,7 @@ T_DECLARE_CASE(test_tls_load_cert_missing_file_fails)
 	T_CHECK(ctx != NULL);
 	T_EXPECT(!tls_load_cert(ctx, missing));
 	if (ctx != NULL) {
-		tls_ctx_unref(ctx);
+		tls_ctx_free(ctx);
 	}
 
 	rm_tmpdir(tmpl);
@@ -330,7 +360,7 @@ T_DECLARE_CASE(test_tls_load_authcerts_rejects_invalid_entries)
 	T_EXPECT(!tls_load_authcerts(ctx, authcerts_null, 1));
 	T_EXPECT(!tls_load_authcerts(ctx, authcerts_empty, 1));
 	if (ctx != NULL) {
-		tls_ctx_unref(ctx);
+		tls_ctx_free(ctx);
 	}
 
 	rm_tmpdir(tmpl);
@@ -355,10 +385,10 @@ T_DECLARE_CASE(test_tls_ctx_invalid_ciphersuites_are_ignored)
 	T_EXPECT(server != NULL);
 	T_EXPECT(client != NULL);
 	if (server != NULL) {
-		tls_ctx_unref(server);
+		tls_ctx_free(server);
 	}
 	if (client != NULL) {
-		tls_ctx_unref(client);
+		tls_ctx_free(client);
 	}
 
 	rm_tmpdir(tmpl);
@@ -388,7 +418,7 @@ T_DECLARE_CASE(test_tls_accept_and_connect_validate_inputs)
 		tls_conn_free(conn);
 	}
 	if (ctx != NULL) {
-		tls_ctx_unref(ctx);
+		tls_ctx_free(ctx);
 	}
 
 	rm_tmpdir(tmpl);
@@ -417,7 +447,7 @@ T_DECLARE_CASE(test_tls_load_cert_from_memory_succeeds)
 	T_EXPECT(tls_load_cert(ctx, pem));
 	free(pem);
 
-	tls_ctx_unref(ctx);
+	tls_ctx_free(ctx);
 	rm_tmpdir(tmpl);
 }
 
@@ -443,7 +473,7 @@ T_DECLARE_CASE(test_tls_load_key_from_memory_succeeds)
 	T_EXPECT(tls_load_key(ctx, pem));
 	free(pem);
 
-	tls_ctx_unref(ctx);
+	tls_ctx_free(ctx);
 	rm_tmpdir(tmpl);
 }
 
@@ -493,8 +523,8 @@ T_DECLARE_CASE(test_tls_full_handshake_and_io)
 
 	tls_conn_free(cli_conn);
 	tls_conn_free(srv_conn);
-	tls_ctx_unref(cli_ctx);
-	tls_ctx_unref(srv_ctx);
+	tls_ctx_free(cli_ctx);
+	tls_ctx_free(srv_ctx);
 	close(fds[0]);
 	close(fds[1]);
 	rm_tmpdir(tmpl);
@@ -507,7 +537,6 @@ int main(void)
 	T_RUN_CASE(t, test_tls_ctx_bad_cert_fails);
 	T_RUN_CASE(t, test_tls_ctx_server_created);
 	T_RUN_CASE(t, test_tls_ctx_client_created);
-	T_RUN_CASE(t, test_tls_ctx_ref_unref);
 	T_RUN_CASE(t, test_tls_load_key_empty_fails);
 	T_RUN_CASE(t, test_tls_load_cert_missing_file_fails);
 	T_RUN_CASE(t, test_tls_load_authcerts_rejects_invalid_entries);

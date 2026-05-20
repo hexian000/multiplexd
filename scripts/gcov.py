@@ -34,7 +34,7 @@ KNOWN_BOOL_OPTIONS = {
 	"ENABLE_THREADS": "ON",
 	"LINK_STATIC_LIBS": "OFF",
 	"ENABLE_SYSTEMD": "OFF",
-	"ENABLE_TLS": "ON",
+	"USE_TLS_LIBRARY": "auto",
 }
 CACHE_LINE_RE = re.compile(r"^([A-Za-z0-9_]+):[^=]+=(.*)$")
 HIT_COUNT_RE = re.compile(r"^([0-9]+)")

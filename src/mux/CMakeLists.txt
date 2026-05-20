@@ -24,7 +24,7 @@ function(add_mux_test target_name)
     add_executable(${target_name}
         ../util.c ../util.h
         ../jsonutil.c ../jsonutil.h
-        ../tlsutil.c ../tlsutil.h
+        ${TLS_SOURCES}
         ${ARGN}
     )
 
@@ -44,8 +44,8 @@ function(add_mux_test target_name)
     target_link_libraries(${target_name} PRIVATE ${LIBEV_LIBRARY})
 
     if(WITH_TLS)
-        target_include_directories(${target_name} SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
-        target_link_libraries(${target_name} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_include_directories(${target_name} SYSTEM PRIVATE ${TLS_INCLUDES})
+        target_link_libraries(${target_name} PRIVATE ${TLS_LIBS})
     endif()
 
     target_include_directories(${target_name} SYSTEM PRIVATE ${JSONC_INCLUDE_DIR})
@@ -113,7 +113,7 @@ add_mux_test(dispatch_fuzz_test
 add_mux_test(wire_test
     frame.c frame.h
     wire.c wire.h
-    ../gencerts.c ../gencerts.h
+    ${GENCERTS_SOURCES}
     wire_test.c
 )
 

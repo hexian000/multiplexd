@@ -711,9 +711,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     binary_path = build_dir / "bin" / "multiplexd"
     if not binary_path.exists():
         raise SystemExit("expected binary not found: %s" % binary_path)
-    if args.tls and build_cache.get("ENABLE_TLS") == "OFF":
+    if args.tls and build_cache.get("USE_TLS_LIBRARY") == "none":
         raise SystemExit(
-            "TLS requested, but %s was configured with ENABLE_TLS=OFF"
+            "TLS requested, but %s was configured with USE_TLS_LIBRARY=none"
             % build_dir
         )
     server_config_path, client_config_path = prepare_runtime_assets(

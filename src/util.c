@@ -19,7 +19,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #if WITH_TLS
-#include <openssl/opensslv.h>
+#include "tlsutil.h"
 #endif
 #include <pwd.h>
 #include <sys/socket.h>
@@ -114,7 +114,7 @@ void loadlibs(void)
 	LOGD_F("%s: %s", PROJECT_NAME, PROJECT_VER);
 	LOGD_F("libev: %d.%d", ev_version_major(), ev_version_minor());
 #if WITH_TLS
-	LOGD("OpenSSL: " OPENSSL_VERSION_TEXT);
+	LOGD_F("%s", tls_version());
 #endif
 }
 

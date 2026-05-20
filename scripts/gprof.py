@@ -30,7 +30,7 @@ KNOWN_BOOL_OPTIONS = {
 	"ENABLE_THREADS": "OFF",
 	"LINK_STATIC_LIBS": "OFF",
 	"ENABLE_SYSTEMD": "OFF",
-	"ENABLE_TLS": "ON",
+	"USE_TLS_LIBRARY": "auto",
 }
 CACHE_LINE_RE = re.compile(r"^([A-Za-z0-9_]+):[^=]+=(.*)$")
 
@@ -245,8 +245,8 @@ def build_configure_command(
 		command.append("-DCMAKE_C_COMPILER=%s" % compiler)
 	for key, default in KNOWN_BOOL_OPTIONS.items():
 		value = base_cache.get(key, default)
-		if key == "ENABLE_TLS":
-			value = "ON" if use_tls else "OFF"
+		if key == "USE_TLS_LIBRARY":
+			value = "auto" if use_tls else "none"
 		command.append("-D%s=%s" % (key, value))
 	return command
 
@@ -731,9 +731,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 	binary_path = profile_build_dir / "bin" / "multiplexd"
 	if not binary_path.exists():
 		raise SystemExit("expected binary not found: %s" % binary_path)
-	if args.tls and base_cache.get("ENABLE_TLS") == "OFF" and args.skip_configure:
+	if args.tls and base_cache.get("USE_TLS_LIBRARY") == "none" and args.skip_configure:
 		raise SystemExit(
-			"TLS requested with --skip-configure, but base build cache has ENABLE_TLS=OFF"
+			"TLS requested with --skip-configure, but base build cache has USE_TLS_LIBRARY=none"
 		)
 
 	command_timeout_seconds = compute_command_timeout_seconds(
