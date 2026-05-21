@@ -279,7 +279,8 @@ static bool parse_mux_session_window(void *ud, const struct jutil_value *value)
 static const struct field_desc mux_field_table[] = {
 	{ "connect_timeout", FIELD_INT,
 	  offsetof(struct mux_config, connect_timeout) },
-	{ "timeout", FIELD_INT, offsetof(struct mux_config, timeout) },
+	{ "ping_timeout", FIELD_INT,
+	  offsetof(struct mux_config, ping_timeout) },
 	{ "keepalive", FIELD_INT, offsetof(struct mux_config, keepalive) },
 	{ "send_timeout", FIELD_INT,
 	  offsetof(struct mux_config, send_timeout) },
@@ -557,11 +558,11 @@ static struct config conf_default(void)
 		.identity_peers = NULL,
 		.identity_peers_count = 0,
 		.mux = {
-			.timeout = 60,
-			.resume_timeout = 120,
-			.keepalive = 25,
-			.send_timeout = 15,
 			.connect_timeout = 15,
+			.keepalive = 300,
+			.ping_timeout = 15,
+			.send_timeout = 15,
+			.resume_timeout = 600,
 			.max_halfopen = 256,
 			.stream_window = 0,
 			.session_window = 0,
@@ -680,44 +681,23 @@ static bool conf_check(struct config *restrict conf)
 	}
 #endif
 	/* Warn before clamping so the user sees the raw configured values. */
-	if (conf->mux.keepalive > conf->mux.timeout) {
-		LOGW_F("mux.keepalive (%d) > mux.timeout (%d): values may be"
-		       " swapped; mux.keepalive will be clamped to mux.timeout",
-		       conf->mux.keepalive, conf->mux.timeout);
+	if (conf->mux.keepalive < conf->mux.ping_timeout) {
+		LOGW_F("mux.keepalive (%d) < mux.ping_timeout (%d): "
+		       "mux.keepalive will be clamped to mux.ping_timeout",
+		       conf->mux.keepalive, conf->mux.ping_timeout);
 	}
-	if (conf->mux.send_timeout > conf->mux.timeout) {
-		LOGW_F("mux.send_timeout (%d) > mux.timeout (%d): values may be"
-		       " swapped; mux.send_timeout will be clamped to mux.timeout",
-		       conf->mux.send_timeout, conf->mux.timeout);
-	}
-	if (conf->mux.connect_timeout > conf->mux.timeout) {
-		LOGW_F("mux.connect_timeout (%d) > mux.timeout (%d): values may"
-		       " be swapped; mux.connect_timeout will be clamped to"
-		       " mux.timeout",
-		       conf->mux.connect_timeout, conf->mux.timeout);
-	}
-	if (conf->mux.resume_timeout < conf->mux.timeout) {
-		LOGW_F("mux.resume_timeout (%d) < mux.timeout (%d):"
-		       " mux.resume_timeout will be clamped to mux.timeout",
-		       conf->mux.resume_timeout, conf->mux.timeout);
-	}
-	if (conf->mux.idle_timeout > 0 &&
-	    conf->mux.idle_timeout < conf->mux.keepalive) {
-		LOGW_F("mux.idle_timeout (%d) < mux.keepalive (%d):"
-		       " session may be evicted before keepalive fires",
-		       conf->mux.idle_timeout, conf->mux.keepalive);
-	}
-	conf->mux.timeout = CLAMP(conf->mux.timeout, 5, 86400);
-	conf->mux.keepalive = CLAMP(conf->mux.keepalive, 1, conf->mux.timeout);
+	conf->mux.ping_timeout = CLAMP(conf->mux.ping_timeout, 4, 86400);
+	conf->mux.keepalive =
+		CLAMP(conf->mux.keepalive, conf->mux.ping_timeout, 86400);
 	conf->mux.send_timeout =
-		CLAMP(conf->mux.send_timeout, 5, conf->mux.timeout);
+		CLAMP(conf->mux.send_timeout, 10, conf->mux.ping_timeout);
 	conf->mux.connect_timeout =
-		CLAMP(conf->mux.connect_timeout, 5, conf->mux.timeout);
+		CLAMP(conf->mux.connect_timeout, 10, conf->mux.ping_timeout);
 	conf->mux.resume_timeout =
-		CLAMP(conf->mux.resume_timeout, conf->mux.timeout, 86400);
+		CLAMP(conf->mux.resume_timeout, conf->mux.ping_timeout, 86400);
 	if (conf->mux.idle_timeout > 0) {
 		conf->mux.idle_timeout =
-			CLAMP(conf->mux.idle_timeout, 5, 31557600);
+			CLAMP(conf->mux.idle_timeout, 10, 86400);
 	} else {
 		conf->mux.idle_timeout = 0;
 	}

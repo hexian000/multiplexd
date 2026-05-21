@@ -87,6 +87,7 @@ static struct mux_session make_session(void)
 		.session_window = 4,
 		.stream_window = 4,
 		.tag = (char *)"[test]:",
+		.conf.ping_timeout = 4,
 	};
 }
 
@@ -128,7 +129,8 @@ T_DECLARE_CASE(test_estimator_stop_resets_all_learned_state)
 T_DECLARE_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight)
 {
 	struct mux_session ss = make_session();
-	const intmax_t now = MUX_PING_TIMEOUT_NS - 1;
+	const intmax_t now =
+		(intmax_t)ss.conf.ping_timeout * INTMAX_C(1000000000) - 1;
 
 	estimator_test_reset();
 	set_clock_sequence(&now, 1);
@@ -148,9 +150,11 @@ T_DECLARE_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight)
 T_DECLARE_CASE(test_estimator_add_timeout_discards_cycle_and_restarts_probe)
 {
 	struct mux_session ss = make_session();
+	const intmax_t ping_timeout_ns =
+		(intmax_t)ss.conf.ping_timeout * INTMAX_C(1000000000);
 	const intmax_t seq[] = {
-		MUX_PING_TIMEOUT_NS + 1, /* now_ns for timeout check */
-		MUX_PING_TIMEOUT_NS + 1, /* sent_ns for probe start */
+		ping_timeout_ns + 1, /* now_ns for timeout check */
+		ping_timeout_ns + 1, /* sent_ns for probe start */
 	};
 
 	estimator_test_reset();

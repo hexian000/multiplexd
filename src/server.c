@@ -366,8 +366,8 @@ static void handle_closed(
 	/* During graceful shutdown, exit the event loop once all sessions
 	 * have finished their close handshake.
 	 * All accepted sessions gone and no dialed sessions remaining. */
-	if (ev_is_active(&srv->w_shutdown) &&
-	    table_size(srv->accepted_tunnels) == 0 && srv->mux_tunnel == NULL) {
+	if (srv->shutting_down && table_size(srv->accepted_tunnels) == 0 &&
+	    srv->mux_tunnel == NULL) {
 		bool any_peer = false;
 		{
 			size_t cursor = 0;
@@ -382,7 +382,7 @@ static void handle_closed(
 			}
 		}
 		if (!any_peer) {
-			ev_timer_stop(srv->loop, &srv->w_shutdown);
+			ev_timer_stop(srv->loop, &srv->w_maintenance);
 			ev_break(srv->loop, EVBREAK_ALL);
 		}
 	}
@@ -1307,13 +1307,70 @@ static void server_reload(struct server *restrict s)
 	(void)systemd_notify(SYSTEMD_STATE_READY);
 }
 
-static void
-shutdown_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	UNUSED(w);
-	LOGW("shutdown timeout: forcing exit");
-	ev_break(loop, EVBREAK_ALL);
+	struct server *restrict srv = w->data;
+
+	/* Task 1 (highest priority): shutdown deadline polling.
+	 * When shutting_down, check the 2 s force-exit deadline and skip the
+	 * non-shutdown tasks below. */
+	if (srv->shutting_down) {
+		const intmax_t elapsed_ns =
+			clock_monotonic_ns() - srv->shutdown_start_ns;
+		if (elapsed_ns >= (intmax_t)2000000000) {
+			LOGW("shutdown timeout: forcing exit");
+			ev_break(loop, EVBREAK_ALL);
+		}
+		return;
+	}
+
+	/* Task 2: system suspend/resume detection via wall-clock jump.
+	 * CLOCK_MONOTONIC does not advance during system suspend; clock_unix()
+	 * (CLOCK_REALTIME) does.  A gap larger than mux.ping_timeout seconds means
+	 * the system resumed from suspend; drop all transports so the mux
+	 * sessions re-establish their TCP connections via w_reconnect. */
+	struct timespec now_ts;
+	if (clock_unix(&now_ts)) {
+		const time_t now_wall = now_ts.tv_sec;
+		const time_t delta = now_wall - srv->last_maintenance_wall;
+		srv->last_maintenance_wall = now_wall;
+		if (delta > (time_t)srv->conf->mux.ping_timeout) {
+			LOGW_F("wall-clock jump of %lds detected, dropping all transports",
+			       (long)delta);
+			const size_t n =
+				(srv->accepted_tunnels != NULL ?
+					 table_size(srv->accepted_tunnels) :
+					 0) +
+				1 + table_size(srv->identities) +
+				srv->num_identity_tunnels;
+			struct tunnel *snapshot[n];
+			size_t count = 0;
+			struct tunnel_iter it = { 0 };
+			struct tunnel *t;
+			while ((t = tunnel_iter_next(srv, &it)) != NULL) {
+				snapshot[count++] = t;
+			}
+			for (size_t i = 0; i < count; i++) {
+				tunnel_drop_transport(snapshot[i]);
+			}
+		}
+	} else {
+		LOGE("clock_unix failed");
+	}
+
+	/* Task 3: slowly drain the frame pool to avoid holding excess cached
+	 * memory.  Release at most one object per tick (~1 per second). */
+#if WITH_THREADS
+	{
+		struct mux_frame *frame = mqueue_pop(srv->frame_pool);
+		if (frame != NULL) {
+			free(frame);
+		}
+	}
+#else
+	mcache_shrink(srv->frame_pool, 1);
+#endif
 }
 
 #if WITH_THREADS
@@ -1417,10 +1474,10 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		}
 
 		/* Keep the event loop running; it exits when all sessions close
-		 * or the 2-second deadline fires. */
-		ev_timer_init(&s->w_shutdown, shutdown_timeout_cb, 2.0, 0.0);
-		s->w_shutdown.data = s;
-		ev_timer_start(loop, &s->w_shutdown);
+		 * (handled in handle_closed) or the 2-second deadline fires
+		 * (handled in maintenance_cb). */
+		s->shutting_down = true;
+		s->shutdown_start_ns = clock_monotonic_ns();
 		break;
 	default:
 		break;
@@ -1795,6 +1852,11 @@ bool server_start(struct server *restrict s)
 	ev_signal_start(loop, &s->w_sigint);
 	ev_signal_start(loop, &s->w_sigterm);
 
+	s->last_maintenance_wall = time(NULL);
+	ev_timer_init(&s->w_maintenance, maintenance_cb, 1.0, 1.0);
+	s->w_maintenance.data = s;
+	ev_timer_start(loop, &s->w_maintenance);
+
 	LOGN("server started");
 	return true;
 }
@@ -1810,7 +1872,7 @@ void server_stop(struct server *srv)
 	ev_signal_stop(loop, &srv->w_sighup);
 	ev_signal_stop(loop, &srv->w_sigint);
 	ev_signal_stop(loop, &srv->w_sigterm);
-	ev_timer_stop(loop, &srv->w_shutdown);
+	ev_timer_stop(loop, &srv->w_maintenance);
 #if WITH_THREADS
 	ev_async_stop(loop, &srv->w_async);
 	dispatcher_tick(srv->disp);
@@ -2145,9 +2207,6 @@ struct server_stats *server_stats(const struct server *restrict s)
 				ts->peer_identity = sl->peer_identity;
 				ts->num_tunnels = sl->num_tunnels;
 				tunnel_stats(sl->tunnels[j], ts);
-				if (ts->peer_identity != NULL) {
-					ts->session = ts->peer_identity;
-				}
 				idx++;
 			}
 		}

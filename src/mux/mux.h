@@ -136,10 +136,10 @@ struct mux_config {
 
 	/* Timeout in seconds for a single TCP-connect and mux-handshake attempt. */
 	int connect_timeout;
-	/* Inactivity timeout in seconds before the session is considered dead. */
-	int timeout;
-	/* Interval in seconds between keepalive probes. */
+	/* Interval in seconds between keepalive PING probes. */
 	int keepalive;
+	/* Timeout in seconds to wait for a PING response before the session is considered dead. */
+	int ping_timeout;
 	/* Timeout in seconds for a blocked send before the session is reset. */
 	int send_timeout;
 	/* Seconds of stream-idle time before the session is shut down. */

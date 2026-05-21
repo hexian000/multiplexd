@@ -455,13 +455,13 @@ static int setup_handshake_fixture(struct session_fixture *restrict fx)
 	}
 	fx->ss.state = SESSION_HANDSHAKE;
 	/* session_handshake_done calls ev_timer_stop(&w_connect_timeout) and
-	 * ev_timer_again on w_timeout and w_keepalive; the repeat interval must
+	 * ev_timer_again on w_keepalive; the repeat interval must
 	 * be > 0 for ev_timer_again to actually start the watcher. */
 	ev_timer_init(
 		&fx->ss.w_connect_timeout, session_test_timer_cb, 0.0, 0.0);
 	fx->ss.w_connect_timeout.data = &fx->ss;
-	ev_timer_init(&fx->ss.w_timeout, session_test_timer_cb, 0.0, 5.0);
-	fx->ss.w_timeout.data = &fx->ss;
+	ev_timer_init(&fx->ss.w_ping_timeout, session_test_timer_cb, 0.0, 5.0);
+	fx->ss.w_ping_timeout.data = &fx->ss;
 	ev_timer_init(&fx->ss.w_keepalive, session_test_timer_cb, 0.0, 5.0);
 	fx->ss.w_keepalive.data = &fx->ss;
 	ev_timer_init(&fx->ss.w_send_timeout, session_test_timer_cb, 0.0, 5.0);

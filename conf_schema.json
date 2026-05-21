@@ -143,46 +143,46 @@
                     "minimum": 0
                 },
                 "connect_timeout": {
-                    "description": "Maximum time in seconds for a single TCP-connect and mux-handshake attempt. Clamped to [5, mux.timeout]. Default: 15.",
+                    "description": "Maximum time in seconds for a single TCP-connect and mux-handshake attempt. Clamped to [10, mux.ping_timeout]. Default: 15.",
                     "type": "integer",
-                    "minimum": 5,
+                    "minimum": 10,
                     "maximum": 86400,
                     "default": 15
                 },
-                "timeout": {
-                    "description": "Session inactivity timeout in seconds. Clamped to [5, 86400]. Default: 60.",
+                "ping_timeout": {
+                    "description": "Timeout in seconds to wait for a PING response before the session is considered dead. Clamped to [10, 86400]. Default: 15.",
                     "type": "integer",
-                    "minimum": 5,
+                    "minimum": 10,
                     "maximum": 86400,
-                    "default": 60
+                    "default": 15
                 },
                 "keepalive": {
-                    "description": "Keepalive probe interval in seconds. Clamped to [1, mux.timeout]. Default: 25.",
+                    "description": "Keepalive PING probe interval in seconds. Clamped to [10, mux.ping_timeout]. Default: 300.",
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 10,
                     "maximum": 86400,
-                    "default": 25
+                    "default": 300
                 },
                 "send_timeout": {
-                    "description": "Send completion timeout in seconds. Clamped to [5, mux.timeout]. Default: 15.",
+                    "description": "Send completion timeout in seconds. Clamped to [10, mux.ping_timeout]. Default: 15.",
                     "type": "integer",
-                    "minimum": 5,
+                    "minimum": 10,
                     "maximum": 86400,
                     "default": 15
                 },
                 "idle_timeout": {
-                    "description": "Session idle timeout in seconds. 0 disables idle eviction; otherwise clamped to [5, 31557600]. Default: 0.",
+                    "description": "Session idle timeout in seconds. 0 disables idle eviction; otherwise clamped to [10, 86400]. Default: 0.",
                     "type": "integer",
                     "minimum": 0,
-                    "maximum": 31557600,
+                    "maximum": 86400,
                     "default": 0
                 },
                 "resume_timeout": {
-                    "description": "Maximum time in seconds a suspended server session waits for a client reconnect. Must be >= mux.timeout; values below mux.timeout are clamped up to mux.timeout. Default: 120.",
+                    "description": "Maximum time in seconds a suspended server session waits for a client reconnect. Must be >= mux.ping_timeout; values below mux.ping_timeout are clamped up to mux.ping_timeout. Default: 600.",
                     "type": "integer",
-                    "minimum": 5,
+                    "minimum": 10,
                     "maximum": 86400,
-                    "default": 120
+                    "default": 600
                 },
                 "session_window": {
                     "description": "Maximum total in-flight frames per session. Both stream_window and session_window must be 0 for automatic BDP-driven sizing; a mixed configuration (exactly one set to 0) produces a warning and treats both as 0. Fixed range when non-zero: [65536, 268435456]. Default: 0.",

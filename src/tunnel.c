@@ -944,6 +944,30 @@ void tunnel_shutdown(struct tunnel *t)
 	tunnel_dispatch(t, (struct task){ task_mux_shutdown, t->ss });
 }
 
+static void task_drop_transport(void *p)
+{
+	const struct tunnel *restrict t = p;
+	const int fd = mux_fd(t->ss);
+	if (fd < 0) {
+		return;
+	}
+	/* Close the transport socket so the mux layer detects transport
+	 * loss (MUX_EVENT_LOST / MUX_EVENT_SUSPENDED) and w_reconnect
+	 * re-establishes the connection.  The mux session itself is kept
+	 * alive in SUSPENDED state; its session ID is preserved for resumption. */
+	if (close(fd) != 0) {
+		const int err = errno;
+		TUNNEL_LOG_F(
+			DEBUG, t, "drop_transport close: (%d) %s", err,
+			strerror(err));
+	}
+}
+
+void tunnel_drop_transport(struct tunnel *t)
+{
+	tunnel_dispatch(t, (struct task){ task_drop_transport, t });
+}
+
 int tunnel_fd(const struct tunnel *t)
 {
 	return mux_fd(t->ss);
@@ -989,27 +1013,6 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	out->established = mux_state(t->ss) == MUX_STATE_ESTABLISHED;
 	out->tag = t->tag;
 	out->accepted = t->accepted;
-	/* Set the session label: prefer peer identity from the protocol hello;
-	 * otherwise format the peer socket address into session_buf; otherwise
-	 * borrow the configured connect address; otherwise "?". */
-	{
-		if (t->peer_identity != NULL) {
-			out->session = t->peer_identity;
-		} else {
-			const struct sockaddr *const sa = mux_peer_addr(t->ss);
-			if (sa != NULL) {
-				(void)sa_format(
-					out->session_buf,
-					sizeof(out->session_buf), sa);
-				out->session = out->session_buf;
-			} else if (t->connect_addr != NULL) {
-				out->session = t->connect_addr;
-			} else {
-				out->session = "?";
-			}
-		}
-		ASSERT(out->session != NULL);
-	}
 	struct mux_session_stats snap;
 	mux_session_stats(t->ss, &snap);
 	out->rx_window = snap.rx_window;

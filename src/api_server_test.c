@@ -102,7 +102,7 @@ static struct tunnel *make_established_tunnel(
 {
 	static const struct tunnel_callbacks cb = { 0 };
 	static const unsigned char session_id[MUX_SESSION_ID_LEN] = { 0 };
-	fx->conf.mux.timeout = 60;
+	fx->conf.mux.ping_timeout = 60;
 	fx->conf.mux.keepalive = 25;
 	fx->conf.mux.send_timeout = 15;
 	fx->conf.mux.connect_timeout = 15;
@@ -913,10 +913,10 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	/* rx_window = 2 * 16384 = 32768, tx_window = 4 * 16384 = 65536 */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_rx_window_bytes{session=\"peer-win\",role=\"client\"} 32768"));
+		"multiplexd_session_rx_window_bytes{identity=\"peer-win\"} 32768"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_tx_window_bytes{session=\"peer-win\",role=\"client\"} 65536"));
+		"multiplexd_session_tx_window_bytes{identity=\"peer-win\"} 65536"));
 
 	apifx_teardown(&fx);
 }

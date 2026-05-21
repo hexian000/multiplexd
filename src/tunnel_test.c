@@ -43,7 +43,7 @@ static const struct mux_frame_allocator g_pool = {
 };
 
 static const struct mux_config g_conf = {
-	.timeout = 5,
+	.ping_timeout = 5,
 	.keepalive = 1,
 	.send_timeout = 1,
 	.connect_timeout = 1,

@@ -59,7 +59,7 @@ T_DECLARE_CASE(test_conf_new_default_fields)
 	/* Default type is NULL — no type annotation in a freshly created conf. */
 	T_EXPECT(conf->type == NULL);
 	/* Default timeouts are positive. */
-	T_EXPECT(conf->mux.timeout > 0);
+	T_EXPECT(conf->mux.ping_timeout > 0);
 	T_EXPECT(conf->mux.keepalive > 0);
 	conf_free(conf);
 }
@@ -230,8 +230,8 @@ T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 		parse_tmpconf("{"
 			      "\"mux_connect\":\"127.0.0.1:9000\","
 			      "\"mux\":{"
-			      "\"timeout\":10,"
-			      "\"keepalive\":20,"
+			      "\"ping_timeout\":10,"
+			      "\"keepalive\":5,"
 			      "\"send_timeout\":30,"
 			      "\"connect_timeout\":40,"
 			      "\"resume_timeout\":1,"
@@ -240,12 +240,12 @@ T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 			      "\"loglevel\":999"
 			      "}");
 	T_CHECK(conf != NULL);
-	T_EXPECT_EQ(conf->mux.timeout, 10);
+	T_EXPECT_EQ(conf->mux.ping_timeout, 10);
 	T_EXPECT_EQ(conf->mux.keepalive, 10);
 	T_EXPECT_EQ(conf->mux.send_timeout, 10);
 	T_EXPECT_EQ(conf->mux.connect_timeout, 10);
 	T_EXPECT_EQ(conf->mux.resume_timeout, 10);
-	T_EXPECT_EQ(conf->mux.idle_timeout, 5);
+	T_EXPECT_EQ(conf->mux.idle_timeout, 10);
 	T_EXPECT_EQ(conf->loglevel, LOG_LEVEL_VERYVERBOSE);
 	T_EXPECT(conf->mux.reject_inbound);
 	conf_free(conf);
@@ -382,8 +382,8 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 			      "\"-mux_connect\":\"should-be-ignored\","
 			      "\"-loglevel\":0,"
 			      "\"mux\":{"
-			      "\"timeout\":30,"
-			      "\"-timeout\":999,"
+			      "\"ping_timeout\":30,"
+			      "\"-ping_timeout\":999,"
 			      "\"-nodelay\":false"
 			      "},"
 			      "\"-tcp\":{\"nodelay\":false},"
@@ -397,8 +397,8 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 	T_EXPECT(strcmp(conf->mux_connect, "127.0.0.1:9000") == 0);
 	/* loglevel must stay at the default (not overwritten by -loglevel). */
 	T_EXPECT_EQ(conf->loglevel, LOG_LEVEL_NOTICE);
-	/* mux.timeout must be 30, not 999 from the commented key. */
-	T_EXPECT_EQ(conf->mux.timeout, 30);
+	/* mux.ping_timeout must be 30, not 999 from the commented key. */
+	T_EXPECT_EQ(conf->mux.ping_timeout, 30);
 	/* mux.nodelay default is true; -nodelay:false must be ignored. */
 	T_EXPECT(conf->mux.nodelay);
 	/* identity.claim must be "me", not "ignored". */

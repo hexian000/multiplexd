@@ -131,7 +131,8 @@ void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
 	struct estimator_ctx *restrict est = &ss->estimator;
 	if (est->ping_in_flight) {
 		const intmax_t now_ns = clock_monotonic_ns();
-		if (now_ns - est->probe_sent_ns >= MUX_PING_TIMEOUT_NS) {
+		if (now_ns - est->probe_sent_ns >=
+		    (intmax_t)ss->conf.ping_timeout * INTMAX_C(1000000000)) {
 			LOGD_F("PING timeout; discarding cycle, sample=%zu",
 			       est->sample);
 			est->ping_in_flight = false;
@@ -175,6 +176,7 @@ void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
 	}
 	est->probe_sent_ns = sent_ns;
 	est->ping_in_flight = true;
+	ev_timer_again(ss->loop, &ss->w_ping_timeout);
 }
 
 static void estimator_phase_startup(

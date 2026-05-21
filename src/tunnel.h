@@ -87,6 +87,13 @@ void tunnel_close(struct tunnel *t);
  * through on_event when done. */
 void tunnel_shutdown(struct tunnel *t);
 
+/* Drop the underlying transport connection without closing the mux session.
+ * Dispatched to the tunnel loop; shuts down the socket so the mux layer
+ * detects transport loss (MUX_EVENT_LOST) and w_reconnect re-establishes
+ * the connection.  The mux session enters SUSPENDED state; its session ID
+ * and stream state are preserved for resumption. */
+void tunnel_drop_transport(struct tunnel *t);
+
 /* --- Accessors --- */
 
 int tunnel_fd(const struct tunnel *t);
@@ -105,15 +112,8 @@ struct tunnel_stats {
 	const char *peer_identity;
 	/* borrowed pointer to the tunnel's diagnostic tag ("my <= peer") */
 	const char *tag;
-	/* Formatted session label used as a Prometheus label value.
-	 * Always non-NULL: set by tunnel_stats() from the peer socket address
-	 * or connect address; may be overridden by server_stats() with the
-	 * pool's peer identity string. */
-	const char *session;
-	/* Buffer backing session when the peer socket address is formatted
-	 * as the fallback label; unused when session borrows a string. */
-	char session_buf[64];
-	/* true for passively-accepted (server-role) sessions */
+	/* true for passively-accepted (server-role) tunnels; used by
+	 * server_stats() to avoid double-counting stream counters. */
 	bool accepted;
 	/* total tunnels in this identity's pool (1 for mux_tunnel) */
 	size_t num_tunnels;

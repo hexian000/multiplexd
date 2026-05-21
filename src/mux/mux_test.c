@@ -577,10 +577,11 @@ static void pending_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 
 	struct mux_test_fixture *restrict fx = pa->fx;
 	const struct mux_config srv_conf = {
-		.timeout = 30,
+		.ping_timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
 		.connect_timeout = 10,
+		.resume_timeout = 30,
 		.idle_timeout = 0,
 		.max_streams = 64,
 		.stream_window = 4,
@@ -625,10 +626,11 @@ static struct mux_config make_cli_conf(const bool nodelay)
 {
 	return (struct mux_config){
 		.nodelay = nodelay,
-		.timeout = 30,
+		.ping_timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
 		.connect_timeout = 10,
+		.resume_timeout = 30,
 		.idle_timeout = 0,
 		.max_streams = 64,
 		.stream_window = 4,
@@ -1886,10 +1888,11 @@ static int raw_fixture_setup(
 	fx->raw_fd = fds[1];
 
 	const struct mux_config srv_conf = {
-		.timeout = 30,
+		.ping_timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
 		.connect_timeout = 10,
+		.resume_timeout = 30,
 		.idle_timeout = 0,
 		.max_streams = 64,
 		.stream_window = 4,

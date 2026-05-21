@@ -87,12 +87,6 @@
 /* Minimum nanoseconds between honouring consecutive inbound PINGs (1 s). */
 #define MUX_PING_RATE_LIMIT_NS (INTMAX_C(1000000000))
 
-/* Maximum nanoseconds to wait for a PONG before abandoning the in-flight
- * BDP cycle and starting a new one.  Decoupled from MUX_PING_RATE_LIMIT_NS
- * so that high-latency links (e.g. satellite) do not lose every cycle to
- * spurious timeouts. */
-#define MUX_PING_TIMEOUT_NS (INTMAX_C(4000000000))
-
 /* Frame structure.  Payload starts at data[MUX_FRAME_HEADER_SIZE]. */
 struct mux_frame {
 	union {

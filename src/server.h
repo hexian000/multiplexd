@@ -292,8 +292,18 @@ struct server {
 	ev_signal w_sighup;
 	ev_signal w_sigint;
 	ev_signal w_sigterm;
-	/* Graceful shutdown deadline: fires 2 s after signal to force exit. */
-	ev_timer w_shutdown;
+	/* Maintenance timer: runs every second for frame-pool release, system
+	 * suspend detection, and (when shutting_down) the 2 s force-exit deadline. */
+	ev_timer w_maintenance;
+	/* Set by signal_cb on SIGINT/SIGTERM; suppresses non-shutdown tasks in
+	 * maintenance_cb and gates the early-exit check in handle_closed. */
+	bool shutting_down;
+	/* Monotonic timestamp (ns) when shutdown was initiated; used by
+	 * maintenance_cb to enforce the 2 s force-exit deadline. */
+	intmax_t shutdown_start_ns;
+	/* Wall-clock timestamp of the previous maintenance tick; used to detect
+	 * large time jumps (system suspend/resume) for transport reconnection. */
+	time_t last_maintenance_wall;
 	/* Cross-thread relay: ev_async + dispatcher for session threads. */
 #if WITH_THREADS
 	ev_async w_async;

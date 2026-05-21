@@ -244,10 +244,13 @@ static void append_sessions(
 	BUF_APPENDSTR(ctx->rbuf, "\n> Sessions\n");
 	for (size_t i = 0; i < stats->num_tunnels; i++) {
 		const struct tunnel_stats *restrict t = &stats->tunnels[i];
-		const char *id =
-			t->peer_identity != NULL ? t->peer_identity : "(mux)";
+		if (t->peer_identity == NULL) {
+			continue;
+		}
 		if (!t->established) {
-			BUF_APPENDF(ctx->rbuf, "%-20s: offline\n", id);
+			BUF_APPENDF(
+				ctx->rbuf, "%-20s: offline\n",
+				t->peer_identity);
 			continue;
 		}
 		if (t->rtt_ns > 0) {
@@ -257,13 +260,13 @@ static void append_sessions(
 				rtt_str, make_duration_nanos(t->rtt_ns));
 			BUF_APPENDF(
 				ctx->rbuf, "%-20s: W=Rx %s, Tx %s; RTT %s\n",
-				id, rx_str, tx_str, rtt_str);
+				t->peer_identity, rx_str, tx_str, rtt_str);
 		} else {
 			FORMAT_BYTES(rx_str, t->rx_window);
 			FORMAT_BYTES(tx_str, t->tx_window);
 			BUF_APPENDF(
-				ctx->rbuf, "%-20s: W=Rx %s, Tx %s\n", id,
-				rx_str, tx_str);
+				ctx->rbuf, "%-20s: W=Rx %s, Tx %s\n",
+				t->peer_identity, rx_str, tx_str);
 		}
 	}
 }
@@ -523,7 +526,7 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		for (size_t i = 0; i < (stats)->num_tunnels; i++) {            \
 			const struct tunnel_stats *restrict t =                \
 				&(stats)->tunnels[i];                          \
-			if (!t->established || t->session == NULL ||           \
+			if (!t->established || t->peer_identity == NULL ||     \
 			    (extra_skip)) {                                    \
 				continue;                                      \
 			}                                                      \
@@ -534,10 +537,8 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 				hdr = true;                                    \
 			}                                                      \
 			VBUF_APPENDF(                                          \
-				(cbuf),                                        \
-				name "{session=\"%s\",role=\"%s\"} " fmt "\n", \
-				t->session, t->accepted ? "server" : "client", \
-				(val));                                        \
+				(cbuf), name "{identity=\"%s\"} " fmt "\n",    \
+				t->peer_identity, (val));                      \
 		}                                                              \
 	} while (0)
 

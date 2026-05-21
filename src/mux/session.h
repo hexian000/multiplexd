@@ -169,8 +169,8 @@ struct mux_session {
 	/* Event watchers */
 	struct {
 		ev_io w_socket;
-		ev_timer w_timeout;
 		ev_timer w_keepalive;
+		ev_timer w_ping_timeout;
 		ev_timer w_send_timeout;
 		ev_timer w_connect_timeout;
 		ev_timer w_idle_timeout;

@@ -692,7 +692,7 @@ static struct config *make_config(
 		.connect = connect_to ? strdup(connect_to) : NULL,
 		.mux =
 			{
-				.timeout = 5,
+				.ping_timeout = 5,
 				.keepalive = 1,
 				.send_timeout = 1,
 				.connect_timeout = 1,
