@@ -457,132 +457,90 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 	free(stats);
 }
 
-/* Emits # HELP and # TYPE lines, then one unlabeled sample. */
-#define APPEND_METRIC(cbuf, name, type, help, fmt, val)                        \
-	do {                                                                   \
-		VBUF_APPENDF(                                                  \
-			(cbuf),                                                \
-			"# HELP multiplexd_%s %s\n"                            \
-			"# TYPE multiplexd_%s %s\n"                            \
-			"multiplexd_%s " fmt "\n",                             \
-			(name), (help), (name), (type), (name), (val));        \
+/* Appends all per-tunnel Prometheus metrics. */
+static struct vbuffer *append_tunnel_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats)
+{
+#define APPEND_TUNNEL_METRIC_DIR(name, help, fmt, rx_val, tx_val)                      \
+	do {                                                                           \
+		bool hdr = false;                                                      \
+		for (size_t i = 0; i < stats->num_tunnels; i++) {                      \
+			const struct tunnel_stats *restrict t =                        \
+				&stats->tunnels[i];                                    \
+			if (!t->established || t->peer_identity == NULL) {             \
+				continue;                                              \
+			}                                                              \
+			if (!hdr) {                                                    \
+				VBUF_APPENDF(                                          \
+					cbuf,                                          \
+					"# HELP multiplexd_%s %s\n"                    \
+					"# TYPE multiplexd_%s counter\n",              \
+					(name), (help), (name));                       \
+				hdr = true;                                            \
+			}                                                              \
+			VBUF_APPENDF(                                                  \
+				cbuf,                                                  \
+				"multiplexd_%s{identity=\"%s\",direction=\"rx\"} " fmt \
+				"\n"                                                   \
+				"multiplexd_%s{identity=\"%s\",direction=\"tx\"} " fmt \
+				"\n",                                                  \
+				(name), t->peer_identity, (rx_val), (name),            \
+				t->peer_identity, (tx_val));                           \
+		}                                                                      \
 	} while (0)
 
-/* Emits a metric family with {listener} label for mux, tcp, and api values. */
-#define APPEND_METRIC_LISTENER(                                                \
-	cbuf, name, type, help, mux_val, tcp_val, api_val)                     \
-	do {                                                                   \
-		VBUF_APPENDF(                                                  \
-			(cbuf),                                                \
-			"# HELP multiplexd_%s %s\n"                            \
-			"# TYPE multiplexd_%s %s\n"                            \
-			"multiplexd_%s{listener=\"mux\"}  %ju\n"               \
-			"multiplexd_%s{listener=\"local\"} %ju\n"              \
-			"multiplexd_%s{listener=\"api\"}  %ju\n",              \
-			(name), (help), (name), (type), (name), (mux_val),     \
-			(name), (tcp_val), (name), (api_val));                 \
-	} while (0)
-
-/* Emits a bytes counter family with {direction} label. */
-
-#define APPEND_METRIC_LATENCY_SUMMARY(                                         \
-	cbuf, name, help, has_samples, p50, p90, p99, count)                   \
-	do {                                                                   \
-		if (has_samples) {                                             \
-			VBUF_APPENDF(                                          \
-				(cbuf),                                        \
-				"# HELP multiplexd_%s %s\n"                    \
-				"# TYPE multiplexd_%s summary\n"               \
-				"multiplexd_%s{quantile=\"0.5\"}  %g\n"        \
-				"multiplexd_%s{quantile=\"0.9\"}  %g\n"        \
-				"multiplexd_%s{quantile=\"0.99\"} %g\n"        \
-				"multiplexd_%s_count %ju\n",                   \
-				(name), (help), (name), (name), (p50), (name), \
-				(p90), (name), (p99), (name), (count));        \
-		} else {                                                       \
-			VBUF_APPENDF(                                          \
-				(cbuf),                                        \
-				"# HELP multiplexd_%s %s\n"                    \
-				"# TYPE multiplexd_%s summary\n"               \
-				"multiplexd_%s_count %ju\n",                   \
-				(name), (help), (name), (name), (count));      \
-		}                                                              \
-	} while (0)
-
-/* Emits one complete Prometheus metric family for per-tunnel data.
- * extra_skip is an additional filter expression (referencing t) evaluated
- * after the base checks.  Keeping each family in its own loop guarantees
- * contiguous samples, as required by the Prometheus text format
- * exposition specification. */
-#define APPEND_TUNNEL_METRIC(                                                  \
-	cbuf, stats, name, type, help, extra_skip, fmt, val)                   \
+#define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val)                 \
 	do {                                                                   \
 		bool hdr = false;                                              \
-		for (size_t i = 0; i < (stats)->num_tunnels; i++) {            \
+		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
 			const struct tunnel_stats *restrict t =                \
-				&(stats)->tunnels[i];                          \
+				&stats->tunnels[i];                            \
 			if (!t->established || t->peer_identity == NULL ||     \
 			    (extra_skip)) {                                    \
 				continue;                                      \
 			}                                                      \
 			if (!hdr) {                                            \
 				VBUF_APPENDF(                                  \
-					(cbuf),                                \
+					cbuf,                                  \
 					"# HELP multiplexd_%s %s\n"            \
-					"# TYPE multiplexd_%s %s\n"            \
-					"multiplexd_%s{identity=\"%s\"} " fmt  \
-					"\n",                                  \
-					(name), (help), (name), (type),        \
-					(name), t->peer_identity, (val));      \
+					"# TYPE multiplexd_%s gauge\n",        \
+					(name), (help), (name));               \
 				hdr = true;                                    \
-			} else {                                               \
-				VBUF_APPENDF(                                  \
-					(cbuf),                                \
-					"multiplexd_%s{identity=\"%s\"} " fmt  \
-					"\n",                                  \
-					(name), t->peer_identity, (val));      \
 			}                                                      \
+			VBUF_APPENDF(                                          \
+				cbuf,                                          \
+				"multiplexd_%s{identity=\"%s\"} " fmt "\n",    \
+				(name), t->peer_identity, (val));              \
 		}                                                              \
 	} while (0)
 
-/* Emits one complete Prometheus metric family for per-tunnel data with
- * {identity,direction} labels.  rx_val and tx_val are expressions referencing
- * t. */
-#define APPEND_TUNNEL_METRIC_DIR(                                                              \
-	cbuf, stats, name, type, help, fmt, rx_val, tx_val)                                    \
-	do {                                                                                   \
-		bool hdr = false;                                                              \
-		for (size_t i = 0; i < (stats)->num_tunnels; i++) {                            \
-			const struct tunnel_stats *restrict t =                                \
-				&(stats)->tunnels[i];                                          \
-			if (!t->established || t->peer_identity == NULL) {                     \
-				continue;                                                      \
-			}                                                                      \
-			if (!hdr) {                                                            \
-				VBUF_APPENDF(                                                  \
-					(cbuf),                                                \
-					"# HELP multiplexd_%s %s\n"                            \
-					"# TYPE multiplexd_%s %s\n"                            \
-					"multiplexd_%s{identity=\"%s\",direction=\"rx\"} " fmt \
-					"\n"                                                   \
-					"multiplexd_%s{identity=\"%s\",direction=\"tx\"} " fmt \
-					"\n",                                                  \
-					(name), (help), (name), (type),                        \
-					(name), t->peer_identity, (rx_val),                    \
-					(name), t->peer_identity, (tx_val));                   \
-				hdr = true;                                                    \
-			} else {                                                               \
-				VBUF_APPENDF(                                                  \
-					(cbuf),                                                \
-					"multiplexd_%s{identity=\"%s\",direction=\"rx\"} " fmt \
-					"\n"                                                   \
-					"multiplexd_%s{identity=\"%s\",direction=\"tx\"} " fmt \
-					"\n",                                                  \
-					(name), t->peer_identity, (rx_val),                    \
-					(name), t->peer_identity, (tx_val));                   \
-			}                                                                      \
-		}                                                                              \
-	} while (0)
+	APPEND_TUNNEL_METRIC_DIR(
+		"session_bytes_total",
+		"Wire bytes on the mux link per identity session", "%ju",
+		t->byt_mux_recv, t->byt_mux_sent);
+	APPEND_TUNNEL_METRIC_DIR(
+		"session_payload_bytes_total",
+		"PUSH-frame payload bytes on the mux link per identity session",
+		"%ju", t->byt_push_recv, t->byt_push_sent);
+	APPEND_TUNNEL_METRIC_DIR(
+		"session_window_bytes",
+		"Per-stream window size per identity session", "%zu",
+		t->rx_window, t->tx_window);
+	APPEND_TUNNEL_METRIC(
+		"session_rtt_seconds",
+		"Windowed-minimum round-trip time per identity session",
+		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9);
+	APPEND_TUNNEL_METRIC(
+		"session_bdp_bytes",
+		"Raw bandwidth-delay product estimate per identity session",
+		t->bdp == 0, "%zu", t->bdp);
+
+#undef APPEND_TUNNEL_METRIC_DIR
+#undef APPEND_TUNNEL_METRIC
+
+	return cbuf;
+}
 
 /* Handles GET /metrics — Prometheus text format (version 0.0.4). */
 static void handle_metrics(struct api_ctx *restrict ctx)
@@ -597,6 +555,31 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	const double uptime = (double)(now - s->started) / 1e9;
 
 	VBUF_RESET(ctx->cbuf);
+
+	/* Emits # HELP and # TYPE lines, then one unlabeled sample. */
+#define APPEND_METRIC(cbuf, name, type, help, fmt, val)                        \
+	do {                                                                   \
+		VBUF_APPENDF(                                                  \
+			(cbuf),                                                \
+			"# HELP multiplexd_%s %s\n"                            \
+			"# TYPE multiplexd_%s %s\n"                            \
+			"multiplexd_%s " fmt "\n",                             \
+			(name), (help), (name), (type), (name), (val));        \
+	} while (0)
+
+#define APPEND_METRIC_LISTENER(                                                \
+	cbuf, name, type, help, mux_val, tcp_val, api_val)                     \
+	do {                                                                   \
+		VBUF_APPENDF(                                                  \
+			(cbuf),                                                \
+			"# HELP multiplexd_%s %s\n"                            \
+			"# TYPE multiplexd_%s %s\n"                            \
+			"multiplexd_%s{listener=\"mux\"}  %ju\n"               \
+			"multiplexd_%s{listener=\"local\"} %ju\n"              \
+			"multiplexd_%s{listener=\"api\"}  %ju\n",              \
+			(name), (help), (name), (type), (name), (mux_val),     \
+			(name), (tcp_val), (name), (api_val));                 \
+	} while (0)
 
 	/* --- Gauges --- */
 	APPEND_METRIC(
@@ -633,14 +616,38 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		ctx->cbuf, "stream_fastopen_total", "counter",
 		"Total active-open streams whose first flight used SYN|PUSH",
 		"%ju", stats->num_stream_fastopen);
-	APPEND_METRIC_LATENCY_SUMMARY(
-		ctx->cbuf, "stream_establish_latency_seconds",
-		"Active-open stream establishment latency from SYN to SYN|ACK",
-		stats->stream_establish_count > 0,
-		(double)stats->stream_establish_p50 * 1e-9,
-		(double)stats->stream_establish_p90 * 1e-9,
-		(double)stats->stream_establish_p99 * 1e-9,
-		stats->num_stream_established);
+	if (stats->stream_establish_count > 0) {
+		VBUF_APPENDF(
+			ctx->cbuf,
+			"# HELP multiplexd_%s %s\n"
+			"# TYPE multiplexd_%s summary\n"
+			"multiplexd_%s{quantile=\"0.5\"}  %g\n"
+			"multiplexd_%s{quantile=\"0.9\"}  %g\n"
+			"multiplexd_%s{quantile=\"0.99\"} %g\n"
+			"multiplexd_%s_count %ju\n",
+			"stream_establish_latency_seconds",
+			"Active-open stream establishment latency from SYN to SYN|ACK",
+			"stream_establish_latency_seconds",
+			"stream_establish_latency_seconds",
+			(double)stats->stream_establish_p50 * 1e-9,
+			"stream_establish_latency_seconds",
+			(double)stats->stream_establish_p90 * 1e-9,
+			"stream_establish_latency_seconds",
+			(double)stats->stream_establish_p99 * 1e-9,
+			"stream_establish_latency_seconds",
+			stats->num_stream_established);
+	} else {
+		VBUF_APPENDF(
+			ctx->cbuf,
+			"# HELP multiplexd_%s %s\n"
+			"# TYPE multiplexd_%s summary\n"
+			"multiplexd_%s_count %ju\n",
+			"stream_establish_latency_seconds",
+			"Active-open stream establishment latency from SYN to SYN|ACK",
+			"stream_establish_latency_seconds",
+			"stream_establish_latency_seconds",
+			stats->num_stream_established);
+	}
 
 	/* --- Counters --- */
 	APPEND_METRIC_LISTENER(
@@ -687,27 +694,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"Frames held in the session unacked list (spec §6.7.2)", "%zu",
 		stats->unacked_frames);
 
-	/* Per-tunnel metrics: one loop per family keeps all samples contiguous. */
-	APPEND_TUNNEL_METRIC_DIR(
-		ctx->cbuf, stats, "session_bytes_total", "counter",
-		"Wire bytes on the mux link per identity session", "%ju",
-		t->byt_mux_recv, t->byt_mux_sent);
-	APPEND_TUNNEL_METRIC_DIR(
-		ctx->cbuf, stats, "session_payload_bytes_total", "counter",
-		"PUSH-frame payload bytes on the mux link per identity session",
-		"%ju", t->byt_push_recv, t->byt_push_sent);
-	APPEND_TUNNEL_METRIC_DIR(
-		ctx->cbuf, stats, "session_window_bytes", "gauge",
-		"Per-stream window size per identity session", "%zu",
-		t->rx_window, t->tx_window);
-	APPEND_TUNNEL_METRIC(
-		ctx->cbuf, stats, "session_rtt_seconds", "gauge",
-		"Windowed-minimum round-trip time per identity session",
-		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9);
-	APPEND_TUNNEL_METRIC(
-		ctx->cbuf, stats, "session_bdp_bytes", "gauge",
-		"Raw bandwidth-delay product estimate per identity session",
-		t->bdp == 0, "%zu", t->bdp);
+	ctx->cbuf = append_tunnel_metrics(ctx->cbuf, stats);
 	{
 		struct timespec cpu_ts;
 		if (clock_process(&cpu_ts)) {
@@ -723,13 +710,10 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		ctx->cbuf->len);
 	/* body is in cbuf; send_cb will follow up with cbuf after wbuf */
 	free(stats);
-}
 
 #undef APPEND_METRIC
 #undef APPEND_METRIC_LISTENER
-#undef APPEND_METRIC_LATENCY_SUMMARY
-#undef APPEND_TUNNEL_METRIC
-#undef APPEND_TUNNEL_METRIC_DIR
+}
 
 /* Handles GET /config — serializes the active configuration as JSON. */
 static void handle_config_get(struct api_ctx *restrict ctx)
