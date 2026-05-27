@@ -363,6 +363,8 @@ static void handle_closed(
 		tunnel_stats(t, &snap);
 		srv->counters.traffic_byt_mux_recv += snap.byt_mux_recv;
 		srv->counters.traffic_byt_mux_sent += snap.byt_mux_sent;
+		srv->counters.traffic_byt_push_recv += snap.byt_push_recv;
+		srv->counters.traffic_byt_push_sent += snap.byt_push_sent;
 	}
 	tunnel_close(t);
 
@@ -2077,6 +2079,8 @@ struct server_stats *server_stats(const struct server *restrict s)
 		atomic_load_explicit(&c->num_reconnects, memory_order_relaxed);
 	out->traffic_byt_mux_recv = c->traffic_byt_mux_recv;
 	out->traffic_byt_mux_sent = c->traffic_byt_mux_sent;
+	out->traffic_byt_push_recv = c->traffic_byt_push_recv;
+	out->traffic_byt_push_sent = c->traffic_byt_push_sent;
 	out->recv_buffered_bytes = atomic_load_explicit(
 		&c->recv_buffered_bytes, memory_order_relaxed);
 	out->send_buffered_frames = atomic_load_explicit(
@@ -2097,6 +2101,8 @@ struct server_stats *server_stats(const struct server *restrict s)
 	out->num_reconnects = c->num_reconnects;
 	out->traffic_byt_mux_recv = c->traffic_byt_mux_recv;
 	out->traffic_byt_mux_sent = c->traffic_byt_mux_sent;
+	out->traffic_byt_push_recv = c->traffic_byt_push_recv;
+	out->traffic_byt_push_sent = c->traffic_byt_push_sent;
 	out->recv_buffered_bytes = c->recv_buffered_bytes;
 	out->send_buffered_frames = c->send_buffered_frames;
 	out->unacked_frames = c->unacked_frames;
@@ -2156,6 +2162,8 @@ struct server_stats *server_stats(const struct server *restrict s)
 		out->num_stream_failed += ts->num_stream_failed;
 		out->traffic_byt_mux_recv += ts->byt_mux_recv;
 		out->traffic_byt_mux_sent += ts->byt_mux_sent;
+		out->traffic_byt_push_recv += ts->byt_push_recv;
+		out->traffic_byt_push_sent += ts->byt_push_sent;
 	}
 	/* Aggregate stream counters from accepted (inbound) tunnels. */
 	if (s->accepted_tunnels != NULL) {

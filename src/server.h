@@ -164,6 +164,8 @@ struct server_counters {
 	struct {
 		uintmax_t traffic_byt_mux_recv;
 		uintmax_t traffic_byt_mux_sent;
+		uintmax_t traffic_byt_push_recv;
+		uintmax_t traffic_byt_push_sent;
 	};
 };
 
@@ -207,6 +209,8 @@ struct server_stats {
 	size_t unacked_frames;
 	uintmax_t traffic_byt_mux_recv;
 	uintmax_t traffic_byt_mux_sent;
+	uintmax_t traffic_byt_push_recv;
+	uintmax_t traffic_byt_push_sent;
 
 	/* --- stats route snapshot (mirrors the runtime diagnostic fields
 	 * and per-identity tunnel_stats) --- */
@@ -319,6 +323,7 @@ struct server {
 	/* Rate tracking state for POST /stats bandwidth display */
 	struct {
 		uintmax_t byt_mux_recv, byt_mux_sent;
+		uintmax_t byt_push_recv, byt_push_sent;
 		intmax_t timestamp;
 		bool is_set;
 	} rate_tracker;
