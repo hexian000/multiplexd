@@ -171,6 +171,13 @@ static void session_cleanup(struct mux_session *restrict ss)
 	ss->retransmit_copy = NULL;
 }
 
+static void handshake_cleanup(struct mux_session *restrict ss)
+{
+	free(ss->handshake.identity);
+	free(ss->handshake.peer_id);
+	free(ss->handshake.peer_identity);
+}
+
 void session_reset(struct mux_session *ss)
 {
 	if (ss->state == SESSION_CLOSED) {
@@ -1365,10 +1372,7 @@ void session_close(struct mux_session *restrict ss)
 	session_stop(ss);
 	session_cleanup(ss);
 	ringbuf_free(ss->wire.recvbuf);
-
-	free(ss->handshake.identity);
-	free(ss->handshake.peer_id);
-	free(ss->handshake.peer_identity);
+	handshake_cleanup(ss);
 	COUNTER_ADD(ss->cnt.num_session_finalized, 1);
 	free(ss);
 }

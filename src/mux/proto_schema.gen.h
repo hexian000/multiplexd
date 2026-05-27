@@ -7,31 +7,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "codec/json.h"
+
 /** @name Struct types
  *  @{ */
 
 struct json_proto_extensions {
-    bool has_reject_inbound :1;
-    bool reject_inbound :1;
+    struct json_string identity;
 
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *identity;
-    size_t identity_len;
+    bool reject_inbound;
 };
 
 struct json_proto {
-    bool has_extensions :1;
-    bool has_msgid :1;
-    bool has_resume_seq :1;
-
     struct json_proto_extensions extensions;
 
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *session_id;
-    size_t session_id_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *type;
-    size_t type_len;
+    struct json_string session_id;
+    struct json_string type;
 
     unsigned resume_seq;
 
@@ -44,8 +35,7 @@ struct json_proto {
  *  @{ */
 
 /* Unmarshal json (length bytes) into *obj; the buffer is modified in-place. */
-/* String fields point into the json buffer (keep it valid). Dynamic-key fields */
-/* are heap-copied (free with json_proto_free). Returns true on success. */
+/* The function zero-initializes *obj and applies schema defaults before parsing; pointer fields of set keys then point into the json buffer (keep it valid). Returns true on success. */
 bool json_proto_unmarshal(
     struct json_proto *obj, char *json, size_t length);
 
@@ -63,7 +53,7 @@ int json_proto_marshal(char *buf, size_t bufsz, const struct json_proto *obj);
 /** @name Free
  *  @{ */
 
-/* Free heap-allocated fields inside *obj (dynamic-key iterators are freed). */
+/* Free heap-allocated fields inside *obj (arrays). */
 void json_proto_free(struct json_proto *obj);
 
 /** @} */

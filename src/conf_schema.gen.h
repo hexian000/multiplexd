@@ -7,87 +7,48 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "codec/json.h"
+
 /** @name Struct types
  *  @{ */
 
 struct json_conf_tls {
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *cert;
-    size_t cert_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *ciphersuites;
-    size_t ciphersuites_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *key;
-    size_t key_len;
+    struct json_string cert;
+    struct json_string ciphersuites;
+    struct json_string key;
 
-    /* string array: elements point into caller's json buffer; NULL when absent */
-    char **authcerts;
-    size_t *authcerts_lens;
+    struct json_string *authcerts;
     size_t authcerts_count;
 };
 
 struct json_conf_tcp {
-    bool has_backlog :1;
-    bool has_keepalive :1;
-    bool has_nodelay :1;
-    bool has_notsent_lowat :1;
-    bool has_rcvbuf :1;
-    bool has_reuseport :1;
-    bool has_sndbuf :1;
-    bool keepalive :1;
-    bool nodelay :1;
-    bool reuseport :1;
-
     unsigned backlog;
     uintmax_t notsent_lowat;
     uintmax_t rcvbuf;
     uintmax_t sndbuf;
+
+    bool keepalive;
+    bool nodelay;
+    bool reuseport;
 };
 
 struct json_conf_mux_tcp {
-    bool has_backlog :1;
-    bool has_keepalive :1;
-    bool has_nodelay :1;
-    bool has_notsent_lowat :1;
-    bool has_rcvbuf :1;
-    bool has_reuseport :1;
-    bool has_sndbuf :1;
-    bool keepalive :1;
-    bool nodelay :1;
-    bool reuseport :1;
-
     unsigned backlog;
     uintmax_t notsent_lowat;
     uintmax_t rcvbuf;
     uintmax_t sndbuf;
+
+    bool keepalive;
+    bool nodelay;
+    bool reuseport;
 };
 
 struct json_conf_mux_mem_pressure {
-    bool has_hi :1;
-    bool has_lo :1;
-
     uintmax_t hi;
     uintmax_t lo;
 };
 
 struct json_conf_mux {
-    bool has_connect_timeout :1;
-    bool has_idle_timeout :1;
-    bool has_keepalive :1;
-    bool has_max_halfopen :1;
-    bool has_max_streams :1;
-    bool has_mem_pressure :1;
-    bool has_nodelay :1;
-    bool has_ping_timeout :1;
-    bool has_resume_timeout :1;
-    bool has_send_timeout :1;
-    bool has_session_window :1;
-    bool has_stream_window :1;
-    bool has_tcp :1;
-    bool has_timeout :1;
-    bool nodelay :1;
-
     struct json_conf_mux_mem_pressure mem_pressure;
     struct json_conf_mux_tcp tcp;
 
@@ -102,59 +63,34 @@ struct json_conf_mux {
     unsigned session_window;
     unsigned stream_window;
     unsigned timeout;
+
+    bool nodelay;
 };
 
 struct json_conf_identity {
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *claim;
-    size_t claim_len;
+    struct json_string claim;
 
-    /* string array: elements point into caller's json buffer; NULL when absent */
-    char **mux_connect;
-    size_t *mux_connect_lens;
+    struct json_string *mux_connect;
     size_t mux_connect_count;
 
-    /* dynamic-key object: raw JSON (walk with json_parse + json_obj_next) */
-    char *listen_json;
-    size_t listen_len;
+    struct json_string listen_json;
 };
 
 struct json_conf {
-    bool has_identity :1;
-    bool has_loglevel :1;
-    bool has_max_sessions :1;
-    bool has_mux :1;
-    bool has_tcp :1;
-    bool has_tls :1;
-
     struct json_conf_identity identity;
     struct json_conf_mux mux;
     struct json_conf_tcp tcp;
     struct json_conf_tls tls;
 
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *api_listen;
-    size_t api_listen_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *connect;
-    size_t connect_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *listen;
-    size_t listen_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *max_startups;
-    size_t max_startups_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *mux_connect;
-    size_t mux_connect_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *mux_listen;
-    size_t mux_listen_len;
-    /* zero-copy: points into caller's json buffer; NULL when absent */
-    char *type;
-    size_t type_len;
+    struct json_string api_listen;
+    struct json_string connect;
+    struct json_string listen;
+    struct json_string max_startups;
+    struct json_string mux_connect;
+    struct json_string mux_listen;
+    struct json_string type;
 
-    unsigned loglevel;
+    uintmax_t loglevel;
     uintmax_t max_sessions;
 };
 
@@ -164,8 +100,7 @@ struct json_conf {
  *  @{ */
 
 /* Unmarshal json (length bytes) into *obj; the buffer is modified in-place. */
-/* String fields point into the json buffer (keep it valid). Dynamic-key fields */
-/* are heap-copied (free with json_conf_free). Returns true on success. */
+/* The function zero-initializes *obj and applies schema defaults before parsing; pointer fields of set keys then point into the json buffer (keep it valid). Returns true on success. */
 bool json_conf_unmarshal(
     struct json_conf *obj, char *json, size_t length);
 
@@ -183,7 +118,7 @@ int json_conf_marshal(char *buf, size_t bufsz, const struct json_conf *obj);
 /** @name Free
  *  @{ */
 
-/* Free heap-allocated fields inside *obj (dynamic-key iterators are freed). */
+/* Free heap-allocated fields inside *obj (arrays). */
 void json_conf_free(struct json_conf *obj);
 
 /** @} */

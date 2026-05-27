@@ -91,18 +91,21 @@ static bool json_proto_extensions_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_proto_extensions){
+        .reject_inbound = false,
+    };
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_proto_extensions_lookup(key_, key_len_);
         switch (k_) {
         case JSON_PROTO_EXTENSIONS_IDENTITY: {
-            if (!json_parse_string(val_, val_len_, &obj->identity, &obj->identity_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->identity.str, &obj->identity.len)) { return false; }
+            if (obj->identity.len > 255u) { return false; }
             break;
         }
         case JSON_PROTO_EXTENSIONS_REJECT_INBOUND: {
-            { bool bv_;
-            if (!json_parse_bool(val_, val_len_, &bv_)) { return false; }
-            obj->reject_inbound = bv_; obj->has_reject_inbound = true; }
+            if (!json_parse_bool(val_, val_len_, &obj->reject_inbound)) { return false; }
             break;
         }
         default:
@@ -119,6 +122,13 @@ bool json_proto_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_proto){
+        .extensions = {
+            .reject_inbound = false,
+        },
+    };
+    int required_ = 2;
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_proto_lookup(key_, key_len_);
@@ -127,33 +137,35 @@ bool json_proto_unmarshal(
             if (!json_proto_extensions_unmarshal(&obj->extensions, val_, val_len_)) {
                 return false;
             }
-            obj->has_extensions = true;
             break;
         }
         case JSON_PROTO_MSGID: {
             if (!json_parse_imax(val_, val_len_, &obj->msgid)) { return false; }
-            obj->has_msgid = true;
+            if (obj->msgid != INTMAX_C(0) && obj->msgid != INTMAX_C(1)) { return false; }
+            required_--;
             break;
         }
         case JSON_PROTO_RESUME_SEQ: {
             if (!json_parse_uint(val_, val_len_, &obj->resume_seq)) { return false; }
-            obj->has_resume_seq = true;
+            if (obj->resume_seq > 4294967295u) { return false; }
             break;
         }
         case JSON_PROTO_SESSION_ID: {
-            if (!json_parse_string(val_, val_len_, &obj->session_id, &obj->session_id_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->session_id.str, &obj->session_id.len)) { return false; }
+            if (obj->session_id.len < 24u) { return false; }
+            if (obj->session_id.len > 24u) { return false; }
             break;
         }
         case JSON_PROTO_TYPE: {
-            if (!json_parse_string(val_, val_len_, &obj->type, &obj->type_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->type.str, &obj->type.len)) { return false; }
+            required_--;
             break;
         }
         default:
             break;
         }
     }
-    if (!obj->has_msgid) { return false; }
-    if (obj->type == NULL) { return false; }
+    if (required_) { return false; }
     return true;
 }
 
@@ -186,21 +198,19 @@ static int json_proto_extensions_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
-    if (obj->identity != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "identity");
-        first_ = false;
-        EMIT_STR(obj->identity, obj->identity_len);
+    if (obj->identity.str != NULL) {
+        EMIT("\"%s\":", "identity");
+        EMIT_STR(obj->identity.str, obj->identity.len);
+        EMIT("%s", ",");
     }
-    if (obj->has_reject_inbound) {
-        EMIT("%s\"%s\":%s", first_ ? "" : ",", "reject_inbound",
-            obj->reject_inbound ? "true" : "false");
-        first_ = false;
-    }
+    EMIT("\"%s\":%s,", "reject_inbound",
+        obj->reject_inbound ? "true" : "false");
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;
@@ -211,34 +221,29 @@ int json_proto_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
-    if (obj->has_extensions) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "extensions");
-        first_ = false;
-        EMIT_SUB(json_proto_extensions_marshal, &obj->extensions);
-    }
-    EMIT("%s\"%s\":%jd", first_ ? "" : ",", "msgid",
+    EMIT("\"%s\":", "extensions");
+    EMIT_SUB(json_proto_extensions_marshal, &obj->extensions);
+    EMIT("%s", ",");
+    EMIT("\"%s\":%jd,", "msgid",
         (intmax_t)obj->msgid);
-    first_ = false;
-    if (obj->has_resume_seq) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "resume_seq",
-            (uintmax_t)obj->resume_seq);
-        first_ = false;
+    EMIT("\"%s\":%ju,", "resume_seq",
+        (uintmax_t)obj->resume_seq);
+    if (obj->session_id.str != NULL) {
+        EMIT("\"%s\":", "session_id");
+        EMIT_STR(obj->session_id.str, obj->session_id.len);
+        EMIT("%s", ",");
     }
-    if (obj->session_id != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "session_id");
-        first_ = false;
-        EMIT_STR(obj->session_id, obj->session_id_len);
-    }
-    if (obj->type != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "type");
-        first_ = false;
-        EMIT_STR(obj->type, obj->type_len);
+    if (obj->type.str != NULL) {
+        EMIT("\"%s\":", "type");
+        EMIT_STR(obj->type.str, obj->type.len);
+        EMIT("%s", ",");
     }
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;

@@ -55,24 +55,23 @@ static int proto_hello_build(
 	}
 	/* Strings in raw are borrowed; do not call json_proto_free(). */
 	const struct json_proto raw = {
-		.type = (char *)PROTO_TYPE,
-		.type_len = sizeof(PROTO_TYPE) - 1,
-		.has_msgid = true,
+		.type = { .str = (char *)PROTO_TYPE, .len = sizeof(PROTO_TYPE) - 1 },
 		.msgid = msg->msgid,
-		.session_id = msg->has_session_id ? id_b64 : NULL,
-		.session_id_len = msg->has_session_id ? SESSION_ID_B64 : 0,
-		.has_resume_seq = msg->has_resume_seq,
-		.resume_seq = (unsigned)msg->resume_seq,
-		.has_extensions = true,
+		.session_id = {
+			.str = msg->has_session_id ? id_b64 : NULL,
+			.len = msg->has_session_id ? SESSION_ID_B64 : 0,
+		},
+		.resume_seq = msg->has_resume_seq ? (unsigned)msg->resume_seq : 0,
 		.extensions = {
-			.has_reject_inbound = msg->reject_inbound,
 			.reject_inbound = msg->reject_inbound,
-			.identity = msg->has_identity
-				? (char *)msg->identity
-				: NULL,
-			.identity_len = msg->has_identity
-				? strlen(msg->identity)
-				: 0,
+			.identity = {
+				.str = msg->has_identity
+					? (char *)msg->identity
+					: NULL,
+				.len = msg->has_identity
+					? strlen(msg->identity)
+					: 0,
+			},
 		},
 	};
 	const int json_sz = json_proto_marshal(NULL, 0, &raw);
@@ -170,46 +169,39 @@ static bool proto_hello_parse(
 		return false;
 	}
 
-	if (obj.type == NULL) {
+	if (obj.type.str == NULL) {
 		LOGE("protocol hello: missing type");
 		json_proto_free(&obj);
 		return false;
 	}
-	if (!proto_parse_type(obj.type, &out->version)) {
-		json_proto_free(&obj);
-		return false;
-	}
-	if (!obj.has_msgid) {
-		LOGE("protocol hello: missing msgid");
+	if (!proto_parse_type(obj.type.str, &out->version)) {
 		json_proto_free(&obj);
 		return false;
 	}
 	out->msgid = (int)obj.msgid;
 	out->reject_inbound = obj.extensions.reject_inbound;
 
-	if (obj.session_id != NULL &&
-	    !proto_parse_session_id(obj.session_id, out->session_id)) {
+	if (obj.session_id.str != NULL &&
+	    !proto_parse_session_id(obj.session_id.str, out->session_id)) {
 		LOGE("protocol hello: invalid session_id");
 		json_proto_free(&obj);
 		return false;
 	}
-	out->has_session_id = obj.session_id != NULL;
+	out->has_session_id = obj.session_id.str != NULL;
 
-	if (obj.has_resume_seq) {
-		out->resume_seq = (uint_least32_t)obj.resume_seq;
-	}
-	out->has_resume_seq = obj.has_resume_seq;
+	out->resume_seq = (uint_least32_t)obj.resume_seq;
+	out->has_resume_seq = (obj.resume_seq != 0);
 
 	out->has_identity = false;
-	if (obj.extensions.identity != NULL) {
-		const size_t id_len = strlen(obj.extensions.identity);
+	if (obj.extensions.identity.str != NULL) {
+		const size_t id_len = obj.extensions.identity.len;
 		if (id_len >= sizeof(out->identity)) {
 			LOGE("protocol hello: identity too long");
 			json_proto_free(&obj);
 			return false;
 		}
 		out->has_identity = true;
-		memcpy(out->identity, obj.extensions.identity, id_len + 1);
+		memcpy(out->identity, obj.extensions.identity.str, id_len + 1);
 	}
 	json_proto_free(&obj);
 	return true;
@@ -288,10 +280,10 @@ static bool process_hello_server(
 	struct mux_session *restrict ss,
 	const struct proto_hello *restrict peer_hello)
 {
-	/* Check whether this is a resume attempt (peer's session_id matches a
-	 * suspended session we own). */
-	if (peer_hello->has_session_id && peer_hello->has_resume_seq &&
-	    ss->callbacks.on_resume != NULL) {
+	/* Check whether this is a resume attempt: a ClientHello carrying a
+	 * session_id is always a resume attempt (session_id presence is the
+	 * discriminant, not has_resume_seq, because resume_seq=0 is valid). */
+	if (peer_hello->has_session_id && ss->callbacks.on_resume != NULL) {
 		struct mux_session *suspended = ss->callbacks.on_resume(
 			ss->userdata, ss, peer_hello->session_id);
 		if (suspended != NULL) {
@@ -369,9 +361,11 @@ static bool process_hello_client(
 	struct mux_session *restrict ss,
 	const struct proto_hello *restrict peer_hello)
 {
+	/* A resume is confirmed when the server echoes back the same session_id
+	 * the client stored (session_id match is the discriminant; has_resume_seq
+	 * is not used because resume_seq=0 is valid and may not be transmitted). */
 	const bool is_confirmed_resume =
-		peer_hello->has_resume_seq && ss->handshake.has_session_id &&
-		peer_hello->has_session_id &&
+		ss->handshake.has_session_id && peer_hello->has_session_id &&
 		memcmp(peer_hello->session_id, ss->handshake.session_id,
 		       MUX_SESSION_ID_LEN) == 0;
 	if (is_confirmed_resume) {

@@ -33,7 +33,6 @@
             "description": "Log verbosity: 0=silence, 1=fatal, 2=error, 3=warning, 4=notice, 5=info, 6=debug, 7=verbose, 8=veryverbose. Default: 4.",
             "type": "integer",
             "minimum": 0,
-            "maximum": 8,
             "default": 4
         },
         "max_sessions": {
@@ -145,21 +144,21 @@
                 "connect_timeout": {
                     "description": "Maximum time in seconds for a single TCP-connect and mux-handshake attempt. Clamped to [10, 86400]. Default: 15.",
                     "type": "integer",
-                    "minimum": 10,
+                    "minimum": 0,
                     "maximum": 86400,
                     "default": 15
                 },
                 "timeout": {
                     "description": "Session inactivity timeout in seconds. The session is considered dead when no data is received for this duration. Clamped to [10, 86400]. Default: 60.",
                     "type": "integer",
-                    "minimum": 10,
+                    "minimum": 0,
                     "maximum": 86400,
                     "default": 60
                 },
                 "ping_timeout": {
                     "description": "Timeout in seconds to wait for a PING response in the BDP estimator before discarding the measurement cycle. Clamped to [10, 86400]. Default: 15.",
                     "type": "integer",
-                    "minimum": 10,
+                    "minimum": 0,
                     "maximum": 86400,
                     "default": 15
                 },
@@ -187,7 +186,7 @@
                 "resume_timeout": {
                     "description": "Maximum time in seconds a suspended server session waits for a client reconnect. Clamped to [10, 86400]. Default: 600.",
                     "type": "integer",
-                    "minimum": 10,
+                    "minimum": 0,
                     "maximum": 86400,
                     "default": 600
                 },

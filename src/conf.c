@@ -65,8 +65,8 @@ conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 	return true;
 }
 
-static struct identity_peer *
-identity_listen_upsert(struct config *restrict conf, const char *restrict id)
+static struct identity_peer *identity_listen_upsert(
+	struct config *restrict conf, const char *restrict id, size_t id_len)
 {
 	for (size_t i = 0; i < conf->identity.peers_count; i++) {
 		if (strcmp(conf->identity.peers[i].id, id) == 0) {
@@ -86,7 +86,7 @@ identity_listen_upsert(struct config *restrict conf, const char *restrict id)
 	}
 	conf->identity.peers = entries;
 	entries[n] = (struct identity_peer){
-		.id = strdup(id),
+		.id = strndup(id, id_len),
 		.listen = NULL,
 	};
 	if (entries[n].id == NULL) {
@@ -98,7 +98,7 @@ identity_listen_upsert(struct config *restrict conf, const char *restrict id)
 }
 
 static bool identity_listen_cb(
-	struct config *restrict conf, const char *restrict key,
+	struct config *restrict conf, const char *restrict key, size_t key_len,
 	char *restrict val, size_t val_len)
 {
 	if (key[0] == '-') {
@@ -109,12 +109,13 @@ static bool identity_listen_cb(
 		LOGE_F("identity.listen.%s: must be a string", key);
 		return false;
 	}
-	struct identity_peer *restrict p = identity_listen_upsert(conf, key);
+	struct identity_peer *restrict p =
+		identity_listen_upsert(conf, key, key_len);
 	if (p == NULL) {
 		return false;
 	}
 	free(p->listen);
-	p->listen = strdup(v.str);
+	p->listen = strndup(v.str, v.len);
 	if (p->listen == NULL) {
 		LOGOOM();
 		return false;
@@ -128,322 +129,191 @@ static bool identity_listen_cb(
 static bool
 conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 {
-	/* Root string fields: strdup zero-copy pointers. */
-#define STRDUP_FIELD(dst, src)                                                 \
+	/* Root string fields: strndup zero-copy pointers using known lengths. */
+#define STRNDUP_FIELD(dst, jstr)                                               \
 	do {                                                                   \
-		(dst) = (src) != NULL ? strdup(src) : NULL;                    \
-		if ((src) != NULL && (dst) == NULL) {                          \
+		(dst) = (jstr).str != NULL ? strndup((jstr).str, (jstr).len) : \
+					     NULL;                             \
+		if ((jstr).str != NULL && (dst) == NULL) {                     \
 			LOGOOM();                                              \
 			return false;                                          \
 		}                                                              \
 	} while (0)
-	STRDUP_FIELD(cfg->type, obj->type);
-	STRDUP_FIELD(cfg->api_listen, obj->api_listen);
-	STRDUP_FIELD(cfg->mux_listen, obj->mux_listen);
-	STRDUP_FIELD(cfg->mux_connect, obj->mux_connect);
-	STRDUP_FIELD(cfg->listen, obj->listen);
-	STRDUP_FIELD(cfg->connect, obj->connect);
-#undef STRDUP_FIELD
+	STRNDUP_FIELD(cfg->type, obj->type);
+	STRNDUP_FIELD(cfg->api_listen, obj->api_listen);
+	STRNDUP_FIELD(cfg->mux_listen, obj->mux_listen);
+	STRNDUP_FIELD(cfg->mux_connect, obj->mux_connect);
+	STRNDUP_FIELD(cfg->listen, obj->listen);
+	STRNDUP_FIELD(cfg->connect, obj->connect);
+#undef STRNDUP_FIELD
 
-	if (obj->has_loglevel) {
-		cfg->loglevel = (int)obj->loglevel;
-	}
-	if (obj->has_max_sessions) {
-		cfg->max_sessions = (int)obj->max_sessions;
-	}
-	if (!conf_parse_max_startups(cfg, obj->max_startups)) {
+	cfg->loglevel = (int)obj->loglevel;
+	cfg->max_sessions = (int)obj->max_sessions;
+	if (!conf_parse_max_startups(cfg, obj->max_startups.str)) {
 		return false;
 	}
 
 #if WITH_TLS
-	if (obj->has_tls) {
-		cfg->tls_cert =
-			obj->tls.cert != NULL ? strdup(obj->tls.cert) : NULL;
-		if (obj->tls.cert != NULL && cfg->tls_cert == NULL) {
+	cfg->tls_cert = obj->tls.cert.str != NULL ?
+				strndup(obj->tls.cert.str, obj->tls.cert.len) :
+				NULL;
+	if (obj->tls.cert.str != NULL && cfg->tls_cert == NULL) {
+		LOGOOM();
+		return false;
+	}
+	cfg->tls_key = obj->tls.key.str != NULL ?
+			       strndup(obj->tls.key.str, obj->tls.key.len) :
+			       NULL;
+	if (obj->tls.key.str != NULL && cfg->tls_key == NULL) {
+		LOGOOM();
+		return false;
+	}
+	cfg->tls_ciphersuites = obj->tls.ciphersuites.str != NULL ?
+					strndup(obj->tls.ciphersuites.str,
+						obj->tls.ciphersuites.len) :
+					NULL;
+	if (obj->tls.ciphersuites.str != NULL &&
+	    cfg->tls_ciphersuites == NULL) {
+		LOGOOM();
+		return false;
+	}
+	if (obj->tls.authcerts_count > 0) {
+		cfg->tls_authcerts = (char **)malloc(
+			obj->tls.authcerts_count * sizeof(*cfg->tls_authcerts));
+		if (cfg->tls_authcerts == NULL) {
 			LOGOOM();
 			return false;
 		}
-		cfg->tls_key =
-			obj->tls.key != NULL ? strdup(obj->tls.key) : NULL;
-		if (obj->tls.key != NULL && cfg->tls_key == NULL) {
-			LOGOOM();
-			return false;
-		}
-		cfg->tls_ciphersuites = obj->tls.ciphersuites != NULL ?
-						strdup(obj->tls.ciphersuites) :
-						NULL;
-		if (obj->tls.ciphersuites != NULL &&
-		    cfg->tls_ciphersuites == NULL) {
-			LOGOOM();
-			return false;
-		}
-		if (obj->tls.authcerts_count > 0) {
-			cfg->tls_authcerts = (char **)malloc(
-				obj->tls.authcerts_count *
-				sizeof(*cfg->tls_authcerts));
-			if (cfg->tls_authcerts == NULL) {
+		cfg->tls_authcerts_count = obj->tls.authcerts_count;
+		for (size_t i = 0; i < obj->tls.authcerts_count; i++) {
+			cfg->tls_authcerts[i] =
+				strndup(obj->tls.authcerts[i].str,
+					obj->tls.authcerts[i].len);
+			if (cfg->tls_authcerts[i] == NULL) {
 				LOGOOM();
+				cfg->tls_authcerts_count = i;
 				return false;
-			}
-			cfg->tls_authcerts_count = obj->tls.authcerts_count;
-			for (size_t i = 0; i < obj->tls.authcerts_count; i++) {
-				cfg->tls_authcerts[i] =
-					strdup(obj->tls.authcerts[i]);
-				if (cfg->tls_authcerts[i] == NULL) {
-					LOGOOM();
-					cfg->tls_authcerts_count = i;
-					return false;
-				}
 			}
 		}
 	}
 #endif /* WITH_TLS */
 
-	if (obj->has_mux) {
-		if (obj->mux.has_nodelay) {
-			cfg->mux.nodelay = obj->mux.nodelay;
-		}
-		if (obj->mux.has_tcp) {
-			if (obj->mux.tcp.has_reuseport) {
-				cfg->mux_tcp.tcp_reuseport =
-					obj->mux.tcp.reuseport;
-			}
-			if (obj->mux.tcp.has_keepalive) {
-				cfg->mux_tcp.tcp_keepalive =
-					obj->mux.tcp.keepalive;
-			}
-			if (obj->mux.tcp.has_nodelay) {
-				cfg->mux_tcp.tcp_nodelay = obj->mux.tcp.nodelay;
-			}
-			if (obj->mux.tcp.has_sndbuf) {
-				cfg->mux_tcp.tcp_sndbuf =
-					(int)obj->mux.tcp.sndbuf;
-			}
-			if (obj->mux.tcp.has_rcvbuf) {
-				cfg->mux_tcp.tcp_rcvbuf =
-					(int)obj->mux.tcp.rcvbuf;
-			}
+	cfg->mux.nodelay = obj->mux.nodelay;
+	cfg->mux_tcp.tcp_reuseport = obj->mux.tcp.reuseport;
+	cfg->mux_tcp.tcp_keepalive = obj->mux.tcp.keepalive;
+	cfg->mux_tcp.tcp_nodelay = obj->mux.tcp.nodelay;
+	cfg->mux_tcp.tcp_sndbuf = (int)obj->mux.tcp.sndbuf;
+	cfg->mux_tcp.tcp_rcvbuf = (int)obj->mux.tcp.rcvbuf;
 #if WITH_TCP_NOTSENT_LOWAT
-			if (obj->mux.tcp.has_notsent_lowat) {
-				cfg->mux_tcp.tcp_notsent_lowat =
-					(int)obj->mux.tcp.notsent_lowat;
-			}
+	cfg->mux_tcp.tcp_notsent_lowat = (int)obj->mux.tcp.notsent_lowat;
 #else
-			if (obj->mux.tcp.has_notsent_lowat) {
-				LOGW("unknown config: \"mux.tcp.notsent_lowat\"");
-			}
+	if (obj->mux.tcp.notsent_lowat != 0) {
+		LOGW("unknown config: \"mux.tcp.notsent_lowat\"");
+	}
 #endif
-			if (obj->mux.tcp.has_backlog) {
-				cfg->mux_tcp.backlog =
-					(int)obj->mux.tcp.backlog;
-			}
-		}
-		if (obj->mux.has_max_halfopen) {
-			cfg->mux.max_halfopen = (int)obj->mux.max_halfopen;
-		}
-		if (obj->mux.has_max_streams) {
-			cfg->mux.max_streams = (int)obj->mux.max_streams;
-		}
-		if (obj->mux.has_connect_timeout) {
-			cfg->mux.connect_timeout =
-				(int)obj->mux.connect_timeout;
-		}
-		if (obj->mux.has_timeout) {
-			cfg->mux.timeout = (int)obj->mux.timeout;
-		}
-		if (obj->mux.has_ping_timeout) {
-			cfg->mux.ping_timeout = (int)obj->mux.ping_timeout;
-		}
-		if (obj->mux.has_keepalive) {
-			cfg->mux.keepalive = (int)obj->mux.keepalive;
-		}
-		if (obj->mux.has_send_timeout) {
-			cfg->mux.send_timeout = (int)obj->mux.send_timeout;
-		}
-		if (obj->mux.has_idle_timeout) {
-			cfg->mux.idle_timeout = (int)obj->mux.idle_timeout;
-		}
-		if (obj->mux.has_resume_timeout) {
-			cfg->mux.resume_timeout = (int)obj->mux.resume_timeout;
-		}
-		if (obj->mux.has_session_window) {
-			const uintmax_t v = obj->mux.session_window;
-			if (v == 0) {
-				cfg->mux.session_window = 0;
-			} else {
-				cfg->mux.session_window = (int)CLAMP(
-					v / MUX_MAX_PAYLOAD_SIZE,
-					MUX_INITIAL_SEND_WINDOW /
-						MUX_WINDOW_UNIT,
-					16384);
-			}
-		}
-		if (obj->mux.has_stream_window) {
-			const uintmax_t v = obj->mux.stream_window;
-			if (v == 0) {
-				cfg->mux.stream_window = 0;
-			} else {
-				cfg->mux.stream_window = (int)CLAMP(
-					v / MUX_MAX_PAYLOAD_SIZE, 1, 1024);
-			}
-		}
-		if (obj->mux.has_mem_pressure) {
-			if (obj->mux.mem_pressure.has_hi) {
-				cfg->mux.mem_pressure_hi =
-					(int)obj->mux.mem_pressure.hi;
-			}
-			if (obj->mux.mem_pressure.has_lo) {
-				cfg->mux.mem_pressure_lo =
-					(int)obj->mux.mem_pressure.lo;
-			}
+	cfg->mux_tcp.backlog = (int)obj->mux.tcp.backlog;
+	cfg->mux.max_halfopen = (int)obj->mux.max_halfopen;
+	cfg->mux.max_streams = (int)obj->mux.max_streams;
+	cfg->mux.connect_timeout = (int)obj->mux.connect_timeout;
+	cfg->mux.timeout = (int)obj->mux.timeout;
+	cfg->mux.ping_timeout = (int)obj->mux.ping_timeout;
+	cfg->mux.keepalive = (int)obj->mux.keepalive;
+	cfg->mux.send_timeout = (int)obj->mux.send_timeout;
+	cfg->mux.idle_timeout = (int)obj->mux.idle_timeout;
+	cfg->mux.resume_timeout = (int)obj->mux.resume_timeout;
+	{
+		const uintmax_t v = obj->mux.session_window;
+		if (v == 0) {
+			cfg->mux.session_window = 0;
+		} else {
+			cfg->mux.session_window = (int)CLAMP(
+				v / MUX_MAX_PAYLOAD_SIZE,
+				MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT,
+				16384);
 		}
 	}
-
-	if (obj->has_tcp) {
-		if (obj->tcp.has_reuseport) {
-			cfg->tcp.tcp_reuseport = obj->tcp.reuseport;
-		}
-		if (obj->tcp.has_keepalive) {
-			cfg->tcp.tcp_keepalive = obj->tcp.keepalive;
-		}
-		if (obj->tcp.has_nodelay) {
-			cfg->tcp.tcp_nodelay = obj->tcp.nodelay;
-		}
-		if (obj->tcp.has_sndbuf) {
-			cfg->tcp.tcp_sndbuf = (int)obj->tcp.sndbuf;
-		}
-		if (obj->tcp.has_rcvbuf) {
-			cfg->tcp.tcp_rcvbuf = (int)obj->tcp.rcvbuf;
-		}
-#if WITH_TCP_NOTSENT_LOWAT
-		if (obj->tcp.has_notsent_lowat) {
-			cfg->tcp.tcp_notsent_lowat =
-				(int)obj->tcp.notsent_lowat;
-		}
-#else
-		if (obj->tcp.has_notsent_lowat) {
-			LOGW("unknown config: \"tcp.notsent_lowat\"");
-		}
-#endif
-		if (obj->tcp.has_backlog) {
-			cfg->tcp.backlog = (int)obj->tcp.backlog;
+	{
+		const uintmax_t v = obj->mux.stream_window;
+		if (v == 0) {
+			cfg->mux.stream_window = 0;
+		} else {
+			cfg->mux.stream_window =
+				(int)CLAMP(v / MUX_MAX_PAYLOAD_SIZE, 1, 1024);
 		}
 	}
+	cfg->mux.mem_pressure_hi = (int)obj->mux.mem_pressure.hi;
+	cfg->mux.mem_pressure_lo = (int)obj->mux.mem_pressure.lo;
 
-	if (obj->has_identity) {
-		cfg->identity.claim = obj->identity.claim != NULL ?
-					      strdup(obj->identity.claim) :
-					      NULL;
-		if (obj->identity.claim != NULL &&
-		    cfg->identity.claim == NULL) {
+	cfg->tcp.tcp_reuseport = obj->tcp.reuseport;
+	cfg->tcp.tcp_keepalive = obj->tcp.keepalive;
+	cfg->tcp.tcp_nodelay = obj->tcp.nodelay;
+	cfg->tcp.tcp_sndbuf = (int)obj->tcp.sndbuf;
+	cfg->tcp.tcp_rcvbuf = (int)obj->tcp.rcvbuf;
+#if WITH_TCP_NOTSENT_LOWAT
+	cfg->tcp.tcp_notsent_lowat = (int)obj->tcp.notsent_lowat;
+#else
+	if (obj->tcp.notsent_lowat != 0) {
+		LOGW("unknown config: \"tcp.notsent_lowat\"");
+	}
+#endif
+	cfg->tcp.backlog = (int)obj->tcp.backlog;
+
+	cfg->identity.claim = obj->identity.claim.str != NULL ?
+				      strndup(obj->identity.claim.str,
+					      obj->identity.claim.len) :
+				      NULL;
+	if (obj->identity.claim.str != NULL && cfg->identity.claim == NULL) {
+		LOGOOM();
+		return false;
+	}
+	if (obj->identity.mux_connect_count > 0) {
+		cfg->identity.mux_connect = (char **)malloc(
+			obj->identity.mux_connect_count *
+			sizeof(*cfg->identity.mux_connect));
+		if (cfg->identity.mux_connect == NULL) {
 			LOGOOM();
 			return false;
 		}
-		if (obj->identity.mux_connect_count > 0) {
-			cfg->identity.mux_connect = (char **)malloc(
-				obj->identity.mux_connect_count *
-				sizeof(*cfg->identity.mux_connect));
-			if (cfg->identity.mux_connect == NULL) {
+		cfg->identity.mux_connect_count =
+			obj->identity.mux_connect_count;
+		for (size_t i = 0; i < obj->identity.mux_connect_count; i++) {
+			cfg->identity.mux_connect[i] =
+				strndup(obj->identity.mux_connect[i].str,
+					obj->identity.mux_connect[i].len);
+			if (cfg->identity.mux_connect[i] == NULL) {
 				LOGOOM();
+				cfg->identity.mux_connect_count = i;
 				return false;
-			}
-			cfg->identity.mux_connect_count =
-				obj->identity.mux_connect_count;
-			for (size_t i = 0; i < obj->identity.mux_connect_count;
-			     i++) {
-				cfg->identity.mux_connect[i] =
-					strdup(obj->identity.mux_connect[i]);
-				if (cfg->identity.mux_connect[i] == NULL) {
-					LOGOOM();
-					cfg->identity.mux_connect_count = i;
-					return false;
-				}
 			}
 		}
-		/* identity.listen: heap-allocated raw JSON fragment. Walk it
-		 * now and strdup each peer address before json_conf_free. */
-		if (obj->identity.listen_json != NULL) {
-			struct json_val parsed = json_parse(
-				obj->identity.listen_json,
-				obj->identity.listen_len);
-			if (parsed.type != JSON_OBJECT) {
-				LOGE("identity.listen: must be an object");
+	}
+	/* identity.listen: raw JSON fragment pointing into the json buffer.
+	 * Walk it now and strdup each peer address before json_conf_free. */
+	if (obj->identity.listen_json.str != NULL) {
+		struct json_val parsed = json_parse(
+			obj->identity.listen_json.str,
+			obj->identity.listen_json.len);
+		if (parsed.type != JSON_OBJECT) {
+			LOGE("identity.listen: must be an object");
+			return false;
+		}
+		json_iter it = parsed.iter;
+		char *key;
+		size_t key_len;
+		char *val;
+		size_t val_len;
+		while (json_obj_next(
+			obj->identity.listen_json.str,
+			obj->identity.listen_json.len, &it, &key, &key_len,
+			&val, &val_len)) {
+			if (!identity_listen_cb(
+				    cfg, key, key_len, val, val_len)) {
 				return false;
-			}
-			json_iter it = parsed.iter;
-			char *key;
-			size_t key_len;
-			char *val;
-			size_t val_len;
-			while (json_obj_next(
-				obj->identity.listen_json,
-				obj->identity.listen_len, &it, &key, &key_len,
-				&val, &val_len)) {
-				if (!identity_listen_cb(
-					    cfg, key, val, val_len)) {
-					return false;
-				}
 			}
 		}
 	}
 
 	return true;
-}
-
-static struct config conf_default(void)
-{
-	const struct config conf = {
-		.type = NULL,
-		.api_listen = NULL,
-		.mux_listen = NULL,
-		.listen = NULL,
-#if WITH_TLS
-		.tls_cert = NULL,
-		.tls_key = NULL,
-		.tls_ciphersuites = NULL,
-		.tls_authcerts = NULL,
-		.tls_authcerts_count = 0,
-#endif /* WITH_TLS */
-		.mux = {
-			.nodelay = true,
-			.connect_timeout = 15,
-			.timeout = 60,
-			.keepalive = 25,
-			.ping_timeout = 15,
-			.send_timeout = 15,
-			.resume_timeout = 600,
-			.max_halfopen = 256,
-			.stream_window = 0,
-			.session_window = 0,
-		},
-		.mux_tcp = {
-			.tcp_keepalive = false,
-			.tcp_nodelay = true,
-			.tcp_reuseport = false,
-#if WITH_TCP_NOTSENT_LOWAT
-			.tcp_notsent_lowat = 131072,
-#endif
-			.backlog = 16,
-		},
-		.tcp = {
-			.tcp_keepalive = true,
-			.tcp_nodelay = true,
-			.tcp_reuseport = false,
-#if WITH_TCP_NOTSENT_LOWAT
-			.tcp_notsent_lowat = 0,
-#endif
-			.backlog = 16,
-		},
-		.identity = {
-			.claim = NULL,
-			.mux_connect = NULL,
-			.mux_connect_count = 0,
-			.peers = NULL,
-			.peers_count = 0,
-		},
-		.loglevel = LOG_LEVEL_NOTICE,
-	};
-	return conf;
 }
 
 static bool conf_check_type(const char *restrict type)
@@ -667,7 +537,21 @@ struct config *conf_new(void)
 		LOGOOM();
 		return NULL;
 	}
-	*conf = conf_default();
+	*conf = (struct config){ 0 };
+	char empty[] = "{}";
+	struct json_conf obj = { 0 };
+	if (!json_conf_unmarshal(&obj, empty, sizeof(empty) - 1)) {
+		/* Cannot fail on a well-formed empty object; treat as OOM. */
+		LOGOOM();
+		free(conf);
+		return NULL;
+	}
+	const bool ok = conf_load(conf, &obj);
+	json_conf_free(&obj);
+	if (!ok) {
+		conf_free(conf);
+		return NULL;
+	}
 	return conf;
 }
 
@@ -678,7 +562,7 @@ struct config *conf_parse(char *json, const size_t len)
 		LOGOOM();
 		return NULL;
 	}
-	*conf = conf_default();
+	*conf = (struct config){ 0 };
 	struct json_conf obj = { 0 };
 	if (!json_conf_unmarshal(&obj, json, len)) {
 		LOGE("failed to process configuration");
@@ -780,35 +664,38 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		listen_vbuf != NULL ? (char *)listen_vbuf->data : NULL;
 	const size_t listen_len = listen_vbuf != NULL ? listen_vbuf->len : 0;
 
-	/* Build per-element lengths for identity.mux_connect. */
-	size_t *id_mc_lens = NULL;
+	/* Build json_string arrays for identity.mux_connect. */
+	struct json_string *id_mc_arr = NULL;
 	if (conf->identity.mux_connect_count > 0) {
-		id_mc_lens = malloc(
-			conf->identity.mux_connect_count * sizeof(*id_mc_lens));
-		if (id_mc_lens == NULL) {
+		id_mc_arr = malloc(
+			conf->identity.mux_connect_count * sizeof(*id_mc_arr));
+		if (id_mc_arr == NULL) {
 			VBUF_FREE(listen_vbuf);
 			LOGOOM();
 			return NULL;
 		}
 		for (size_t i = 0; i < conf->identity.mux_connect_count; i++) {
-			id_mc_lens[i] = strlen(conf->identity.mux_connect[i]);
+			id_mc_arr[i].str = conf->identity.mux_connect[i];
+			id_mc_arr[i].len =
+				strlen(conf->identity.mux_connect[i]);
 		}
 	}
 
 #if WITH_TLS
-	/* Build per-element lengths for tls.authcerts. */
-	size_t *authcerts_lens = NULL;
+	/* Build json_string arrays for tls.authcerts. */
+	struct json_string *authcerts_arr = NULL;
 	if (conf->tls_authcerts_count > 0) {
-		authcerts_lens = malloc(
-			conf->tls_authcerts_count * sizeof(*authcerts_lens));
-		if (authcerts_lens == NULL) {
-			free(id_mc_lens);
+		authcerts_arr = malloc(
+			conf->tls_authcerts_count * sizeof(*authcerts_arr));
+		if (authcerts_arr == NULL) {
+			free(id_mc_arr);
 			VBUF_FREE(listen_vbuf);
 			LOGOOM();
 			return NULL;
 		}
 		for (size_t i = 0; i < conf->tls_authcerts_count; i++) {
-			authcerts_lens[i] = strlen(conf->tls_authcerts[i]);
+			authcerts_arr[i].str = conf->tls_authcerts[i];
+			authcerts_arr[i].len = strlen(conf->tls_authcerts[i]);
 		}
 	}
 #endif /* WITH_TLS */
@@ -840,151 +727,129 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 
 	const char *const type_str =
 		conf->type != NULL ? conf->type : CONF_TYPE;
-	const bool has_identity = conf->identity.claim != NULL ||
-				  conf->identity.mux_connect_count > 0 ||
-				  listen_json != NULL;
 	const struct json_conf raw = {
-		.type = (char *)type_str,
-		.type_len = strlen(type_str),
-		.api_listen = conf->api_listen,
-		.api_listen_len =
-			conf->api_listen != NULL ? strlen(conf->api_listen) : 0,
-		.mux_listen = conf->mux_listen,
-		.mux_listen_len =
-			conf->mux_listen != NULL ? strlen(conf->mux_listen) : 0,
-		.mux_connect = conf->mux_connect,
-		.mux_connect_len =
-			conf->mux_connect != NULL ? strlen(conf->mux_connect) :
-						    0,
-		.listen = conf->listen,
-		.listen_len = conf->listen != NULL ? strlen(conf->listen) : 0,
-		.connect = conf->connect,
-		.connect_len =
-			conf->connect != NULL ? strlen(conf->connect) : 0,
-		.loglevel = (uintmax_t)conf->loglevel,
-		.has_loglevel = true,
+		.type = { .str = (char *)type_str, .len = strlen(type_str) },
+		.api_listen = {
+			.str = conf->api_listen,
+			.len = conf->api_listen != NULL ?
+				       strlen(conf->api_listen) :
+				       0,
+		},
+		.mux_listen = {
+			.str = conf->mux_listen,
+			.len = conf->mux_listen != NULL ?
+				       strlen(conf->mux_listen) :
+				       0,
+		},
+		.mux_connect = {
+			.str = conf->mux_connect,
+			.len = conf->mux_connect != NULL ?
+				       strlen(conf->mux_connect) :
+				       0,
+		},
+		.listen = {
+			.str = conf->listen,
+			.len = conf->listen != NULL ? strlen(conf->listen) : 0,
+		},
+		.connect = {
+			.str = conf->connect,
+			.len = conf->connect != NULL ? strlen(conf->connect) : 0,
+		},
+		.loglevel = (unsigned)conf->loglevel,
 		.max_sessions = (uintmax_t)conf->max_sessions,
-		.has_max_sessions = conf->max_sessions != 0,
-		.max_startups = (char *)max_startups,
-		.max_startups_len = max_startups_len,
+		.max_startups = {
+			.str = (char *)max_startups,
+			.len = max_startups_len,
+		},
 #if WITH_TLS
 		.tls = {
-			.cert = conf->tls_cert,
-			.cert_len = conf->tls_cert != NULL ?
-					    strlen(conf->tls_cert) :
-					    0,
-			.key = conf->tls_key,
-			.key_len =
-				conf->tls_key != NULL ? strlen(conf->tls_key) :
-							0,
-			.ciphersuites = conf->tls_ciphersuites,
-			.ciphersuites_len = conf->tls_ciphersuites != NULL ?
-						    strlen(conf->tls_ciphersuites) :
-						    0,
-			.authcerts = conf->tls_authcerts,
-			.authcerts_lens = authcerts_lens,
+			.cert = {
+				.str = conf->tls_cert,
+				.len = conf->tls_cert != NULL ?
+					       strlen(conf->tls_cert) :
+					       0,
+			},
+			.key = {
+				.str = conf->tls_key,
+				.len = conf->tls_key != NULL ?
+					       strlen(conf->tls_key) :
+					       0,
+			},
+			.ciphersuites = {
+				.str = conf->tls_ciphersuites,
+				.len = conf->tls_ciphersuites != NULL ?
+					       strlen(conf->tls_ciphersuites) :
+					       0,
+			},
+			.authcerts = authcerts_arr,
 			.authcerts_count = conf->tls_authcerts_count,
 		},
-		.has_tls = conf->tls_cert != NULL || conf->tls_key != NULL ||
-			   conf->tls_authcerts_count > 0,
 #endif /* WITH_TLS */
 		.mux = {
 			.nodelay = conf->mux.nodelay,
-			.has_nodelay = conf->mux.nodelay,
 			.tcp = {
 				.reuseport = conf->mux_tcp.tcp_reuseport,
-				.has_reuseport = conf->mux_tcp.tcp_reuseport,
 				.keepalive = conf->mux_tcp.tcp_keepalive,
-				.has_keepalive = conf->mux_tcp.tcp_keepalive,
 				.nodelay = conf->mux_tcp.tcp_nodelay,
-				.has_nodelay = conf->mux_tcp.tcp_nodelay,
 				.sndbuf = (uintmax_t)conf->mux_tcp.tcp_sndbuf,
-				.has_sndbuf = conf->mux_tcp.tcp_sndbuf != 0,
 				.rcvbuf = (uintmax_t)conf->mux_tcp.tcp_rcvbuf,
-				.has_rcvbuf = conf->mux_tcp.tcp_rcvbuf != 0,
 #if WITH_TCP_NOTSENT_LOWAT
 				.notsent_lowat =
 					(uintmax_t)conf->mux_tcp
 						.tcp_notsent_lowat,
-				.has_notsent_lowat =
-					conf->mux_tcp.tcp_notsent_lowat != 0,
 #endif
-				.backlog = (uintmax_t)conf->mux_tcp.backlog,
-				.has_backlog = conf->mux_tcp.backlog != 0,
+				.backlog = (unsigned)conf->mux_tcp.backlog,
 			},
-			.has_tcp = true,
-			.max_halfopen = (uintmax_t)conf->mux.max_halfopen,
-			.has_max_halfopen = conf->mux.max_halfopen != 0,
+			.max_halfopen = (unsigned)conf->mux.max_halfopen,
 			.max_streams = (uintmax_t)conf->mux.max_streams,
-			.has_max_streams = conf->mux.max_streams != 0,
-			.connect_timeout = (uintmax_t)conf->mux.connect_timeout,
-			.has_connect_timeout = conf->mux.connect_timeout != 0,
-			.timeout = (uintmax_t)conf->mux.timeout,
-			.has_timeout = conf->mux.timeout != 0,
-			.ping_timeout = (uintmax_t)conf->mux.ping_timeout,
-			.has_ping_timeout = conf->mux.ping_timeout != 0,
-			.keepalive = (uintmax_t)conf->mux.keepalive,
-			.has_keepalive = conf->mux.keepalive != 0,
-			.send_timeout = (uintmax_t)conf->mux.send_timeout,
-			.has_send_timeout = conf->mux.send_timeout != 0,
-			.idle_timeout = (uintmax_t)conf->mux.idle_timeout,
-			.has_idle_timeout = conf->mux.idle_timeout != 0,
-			.resume_timeout = (uintmax_t)conf->mux.resume_timeout,
-			.has_resume_timeout = conf->mux.resume_timeout != 0,
-			.session_window = session_window_bytes,
-			.has_session_window = true,
-			.stream_window = stream_window_bytes,
-			.has_stream_window = true,
+			.connect_timeout = (unsigned)conf->mux.connect_timeout,
+			.timeout = (unsigned)conf->mux.timeout,
+			.ping_timeout = (unsigned)conf->mux.ping_timeout,
+			.keepalive = (unsigned)conf->mux.keepalive,
+			.send_timeout = (unsigned)conf->mux.send_timeout,
+			.idle_timeout = (unsigned)conf->mux.idle_timeout,
+			.resume_timeout = (unsigned)conf->mux.resume_timeout,
+		.session_window = (unsigned)session_window_bytes,
+			.stream_window = (unsigned)stream_window_bytes,
 			.mem_pressure = {
 				.hi = (uintmax_t)conf->mux.mem_pressure_hi,
-				.has_hi = conf->mux.mem_pressure_hi != 0,
 				.lo = (uintmax_t)conf->mux.mem_pressure_lo,
-				.has_lo = conf->mux.mem_pressure_lo != 0,
 			},
-			.has_mem_pressure = conf->mux.mem_pressure_hi != 0,
 		},
-		.has_mux = true,
 		.tcp = {
 			.reuseport = conf->tcp.tcp_reuseport,
-			.has_reuseport = conf->tcp.tcp_reuseport,
 			.keepalive = conf->tcp.tcp_keepalive,
-			.has_keepalive = conf->tcp.tcp_keepalive,
 			.nodelay = conf->tcp.tcp_nodelay,
-			.has_nodelay = conf->tcp.tcp_nodelay,
 			.sndbuf = (uintmax_t)conf->tcp.tcp_sndbuf,
-			.has_sndbuf = conf->tcp.tcp_sndbuf != 0,
 			.rcvbuf = (uintmax_t)conf->tcp.tcp_rcvbuf,
-			.has_rcvbuf = conf->tcp.tcp_rcvbuf != 0,
 #if WITH_TCP_NOTSENT_LOWAT
-			.notsent_lowat =
-				(uintmax_t)conf->tcp.tcp_notsent_lowat,
-			.has_notsent_lowat = conf->tcp.tcp_notsent_lowat != 0,
+			.notsent_lowat = (uintmax_t)conf->tcp.tcp_notsent_lowat,
 #endif
-			.backlog = (uintmax_t)conf->tcp.backlog,
-			.has_backlog = conf->tcp.backlog != 0,
+			.backlog = (unsigned)conf->tcp.backlog,
 		},
-		.has_tcp = true,
 		.identity = {
-			.claim = conf->identity.claim,
-			.claim_len = conf->identity.claim != NULL ?
-					     strlen(conf->identity.claim) :
-					     0,
-			.mux_connect = conf->identity.mux_connect,
-			.mux_connect_lens = id_mc_lens,
+			.claim = {
+				.str = conf->identity.claim,
+				.len = conf->identity.claim != NULL ?
+					       strlen(conf->identity.claim) :
+					       0,
+			},
+			.mux_connect = id_mc_arr,
 			.mux_connect_count = conf->identity.mux_connect_count,
-			.listen_json = listen_json,
-			.listen_len = listen_len,
+			.listen_json = {
+				.str = listen_json,
+				.len = listen_len,
+			},
 		},
-		.has_identity = has_identity,
 	};
 
 	/* Two-pass marshal: measure then fill. */
 	const int json_sz = json_conf_marshal(NULL, 0, &raw);
 	if (json_sz <= 0) {
 		VBUF_FREE(listen_vbuf);
-		free(id_mc_lens);
+		free(id_mc_arr);
 #if WITH_TLS
-		free(authcerts_lens);
+		free(authcerts_arr);
 #endif
 		LOGOOM();
 		return NULL;
@@ -992,9 +857,9 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 	char *out = malloc((size_t)json_sz + 1);
 	if (out == NULL) {
 		VBUF_FREE(listen_vbuf);
-		free(id_mc_lens);
+		free(id_mc_arr);
 #if WITH_TLS
-		free(authcerts_lens);
+		free(authcerts_arr);
 #endif
 		LOGOOM();
 		return NULL;
@@ -1003,9 +868,9 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 	out[json_sz] = '\0';
 
 	VBUF_FREE(listen_vbuf);
-	free(id_mc_lens);
+	free(id_mc_arr);
 #if WITH_TLS
-	free(authcerts_lens);
+	free(authcerts_arr);
 #endif
 
 	if (lenp != NULL) {

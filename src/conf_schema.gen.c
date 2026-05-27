@@ -268,8 +268,7 @@ enum json_conf_tls_key {
 
 static void json_conf_tls_free(struct json_conf_tls *obj)
 {
-    free((void *)obj->authcerts);
-    free(obj->authcerts_lens);
+    free(obj->authcerts);
 }
 
 static void json_conf_tcp_free(struct json_conf_tcp *obj)
@@ -295,9 +294,7 @@ static void json_conf_mux_free(struct json_conf_mux *obj)
 
 static void json_conf_identity_free(struct json_conf_identity *obj)
 {
-    free(obj->listen_json);
-    free((void *)obj->mux_connect);
-    free(obj->mux_connect_lens);
+    free(obj->mux_connect);
 }
 
 void json_conf_free(struct json_conf *obj)
@@ -318,44 +315,34 @@ static bool json_conf_tls_unmarshal_authcerts(
 {
     const struct json_val arr_ = json_parse(val_, val_len_);
     if (arr_.type != JSON_ARRAY) { return false; }
-    char **items_ = NULL;
-    size_t *lens_ = NULL;
+    struct json_string *items_ = NULL;
     size_t count_ = 0, cap_ = 0;
     json_iter ait_ = arr_.iter;
     char *av_; size_t alen_;
     while (json_arr_next(val_, val_len_, &ait_, &av_, &alen_)) {
         const struct json_val sv_ = json_parse(av_, alen_);
         if (sv_.type != JSON_STRING) {
-            free((void *)items_);
-            free(lens_);
+            free(items_);
             return false;
         }
         if (count_ >= cap_) {
             const size_t nc_ = cap_ ? cap_ * 2 : 4;
-            char **na_ = (char **)realloc((void *)items_, nc_ * sizeof(*na_));
+            struct json_string *na_ = realloc(items_, nc_ * sizeof(*na_));
             if (na_ == NULL) {
-                free((void *)items_);
-                free(lens_);
+                free(items_);
                 return false;
             }
-            size_t *nl_ = realloc(lens_, nc_ * sizeof(*nl_));
-            if (nl_ == NULL) {
-                free((void *)na_);
-                free(lens_);
-                return false;
-            }
-            items_ = na_; lens_ = nl_; cap_ = nc_;
+            items_ = na_; cap_ = nc_;
         }
-        items_[count_] = sv_.str;
-        lens_[count_] = sv_.len;
+        items_[count_].str = sv_.str;
+        items_[count_].len = sv_.len;
         count_++;
     }
     if (count_ == 0) {
-        items_ = (char **)malloc(sizeof(*items_));
+        items_ = malloc(sizeof(*items_));
         if (!items_) { return false; }
     }
     obj->authcerts = items_;
-    obj->authcerts_lens = lens_;
     obj->authcerts_count = count_;
     return true;
 }
@@ -367,24 +354,27 @@ static bool json_conf_tls_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_conf_tls){ 0 };
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_conf_tls_lookup(key_, key_len_);
         switch (k_) {
         case JSON_CONF_TLS_AUTHCERTS: {
             if (!json_conf_tls_unmarshal_authcerts(obj, val_, val_len_)) { return false; }
+            if (obj->authcerts_count < 1u) { return false; }
             break;
         }
         case JSON_CONF_TLS_CERT: {
-            if (!json_parse_string(val_, val_len_, &obj->cert, &obj->cert_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->cert.str, &obj->cert.len)) { return false; }
             break;
         }
         case JSON_CONF_TLS_CIPHERSUITES: {
-            if (!json_parse_string(val_, val_len_, &obj->ciphersuites, &obj->ciphersuites_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->ciphersuites.str, &obj->ciphersuites.len)) { return false; }
             break;
         }
         case JSON_CONF_TLS_KEY: {
-            if (!json_parse_string(val_, val_len_, &obj->key, &obj->key_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->key.str, &obj->key.len)) { return false; }
             break;
         }
         default:
@@ -401,46 +391,46 @@ static bool json_conf_tcp_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_conf_tcp){
+        .backlog = 16u,
+        .keepalive = true,
+        .nodelay = true,
+        .notsent_lowat = UINTMAX_C(0),
+        .reuseport = false,
+    };
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_conf_tcp_lookup(key_, key_len_);
         switch (k_) {
         case JSON_CONF_TCP_BACKLOG: {
             if (!json_parse_uint(val_, val_len_, &obj->backlog)) { return false; }
-            obj->has_backlog = true;
+            if (obj->backlog < 1u) { return false; }
+            if (obj->backlog > 4096u) { return false; }
             break;
         }
         case JSON_CONF_TCP_KEEPALIVE: {
-            { bool bv_;
-            if (!json_parse_bool(val_, val_len_, &bv_)) { return false; }
-            obj->keepalive = bv_; obj->has_keepalive = true; }
+            if (!json_parse_bool(val_, val_len_, &obj->keepalive)) { return false; }
             break;
         }
         case JSON_CONF_TCP_NODELAY: {
-            { bool bv_;
-            if (!json_parse_bool(val_, val_len_, &bv_)) { return false; }
-            obj->nodelay = bv_; obj->has_nodelay = true; }
+            if (!json_parse_bool(val_, val_len_, &obj->nodelay)) { return false; }
             break;
         }
         case JSON_CONF_TCP_NOTSENT_LOWAT: {
             if (!json_parse_umax(val_, val_len_, &obj->notsent_lowat)) { return false; }
-            obj->has_notsent_lowat = true;
             break;
         }
         case JSON_CONF_TCP_RCVBUF: {
             if (!json_parse_umax(val_, val_len_, &obj->rcvbuf)) { return false; }
-            obj->has_rcvbuf = true;
             break;
         }
         case JSON_CONF_TCP_REUSEPORT: {
-            { bool bv_;
-            if (!json_parse_bool(val_, val_len_, &bv_)) { return false; }
-            obj->reuseport = bv_; obj->has_reuseport = true; }
+            if (!json_parse_bool(val_, val_len_, &obj->reuseport)) { return false; }
             break;
         }
         case JSON_CONF_TCP_SNDBUF: {
             if (!json_parse_umax(val_, val_len_, &obj->sndbuf)) { return false; }
-            obj->has_sndbuf = true;
             break;
         }
         default:
@@ -457,46 +447,46 @@ static bool json_conf_mux_tcp_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_conf_mux_tcp){
+        .backlog = 16u,
+        .keepalive = false,
+        .nodelay = true,
+        .notsent_lowat = UINTMAX_C(131072),
+        .reuseport = false,
+    };
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_conf_mux_tcp_lookup(key_, key_len_);
         switch (k_) {
         case JSON_CONF_MUX_TCP_BACKLOG: {
             if (!json_parse_uint(val_, val_len_, &obj->backlog)) { return false; }
-            obj->has_backlog = true;
+            if (obj->backlog < 1u) { return false; }
+            if (obj->backlog > 4096u) { return false; }
             break;
         }
         case JSON_CONF_MUX_TCP_KEEPALIVE: {
-            { bool bv_;
-            if (!json_parse_bool(val_, val_len_, &bv_)) { return false; }
-            obj->keepalive = bv_; obj->has_keepalive = true; }
+            if (!json_parse_bool(val_, val_len_, &obj->keepalive)) { return false; }
             break;
         }
         case JSON_CONF_MUX_TCP_NODELAY: {
-            { bool bv_;
-            if (!json_parse_bool(val_, val_len_, &bv_)) { return false; }
-            obj->nodelay = bv_; obj->has_nodelay = true; }
+            if (!json_parse_bool(val_, val_len_, &obj->nodelay)) { return false; }
             break;
         }
         case JSON_CONF_MUX_TCP_NOTSENT_LOWAT: {
             if (!json_parse_umax(val_, val_len_, &obj->notsent_lowat)) { return false; }
-            obj->has_notsent_lowat = true;
             break;
         }
         case JSON_CONF_MUX_TCP_RCVBUF: {
             if (!json_parse_umax(val_, val_len_, &obj->rcvbuf)) { return false; }
-            obj->has_rcvbuf = true;
             break;
         }
         case JSON_CONF_MUX_TCP_REUSEPORT: {
-            { bool bv_;
-            if (!json_parse_bool(val_, val_len_, &bv_)) { return false; }
-            obj->reuseport = bv_; obj->has_reuseport = true; }
+            if (!json_parse_bool(val_, val_len_, &obj->reuseport)) { return false; }
             break;
         }
         case JSON_CONF_MUX_TCP_SNDBUF: {
             if (!json_parse_umax(val_, val_len_, &obj->sndbuf)) { return false; }
-            obj->has_sndbuf = true;
             break;
         }
         default:
@@ -513,18 +503,21 @@ static bool json_conf_mux_mem_pressure_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_conf_mux_mem_pressure){
+        .hi = UINTMAX_C(0),
+        .lo = UINTMAX_C(0),
+    };
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_conf_mux_mem_pressure_lookup(key_, key_len_);
         switch (k_) {
         case JSON_CONF_MUX_MEM_PRESSURE_HI: {
             if (!json_parse_umax(val_, val_len_, &obj->hi)) { return false; }
-            obj->has_hi = true;
             break;
         }
         case JSON_CONF_MUX_MEM_PRESSURE_LO: {
             if (!json_parse_umax(val_, val_len_, &obj->lo)) { return false; }
-            obj->has_lo = true;
             break;
         }
         default:
@@ -541,83 +534,103 @@ static bool json_conf_mux_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_conf_mux){
+        .connect_timeout = 15u,
+        .idle_timeout = 0u,
+        .keepalive = 25u,
+        .max_halfopen = 256u,
+        .mem_pressure = {
+            .hi = UINTMAX_C(0),
+            .lo = UINTMAX_C(0),
+        },
+        .nodelay = true,
+        .ping_timeout = 15u,
+        .resume_timeout = 600u,
+        .send_timeout = 15u,
+        .session_window = 0u,
+        .stream_window = 0u,
+        .tcp = {
+            .backlog = 16u,
+            .keepalive = false,
+            .nodelay = true,
+            .notsent_lowat = UINTMAX_C(131072),
+            .reuseport = false,
+        },
+        .timeout = 60u,
+    };
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_conf_mux_lookup(key_, key_len_);
         switch (k_) {
         case JSON_CONF_MUX_CONNECT_TIMEOUT: {
             if (!json_parse_uint(val_, val_len_, &obj->connect_timeout)) { return false; }
-            obj->has_connect_timeout = true;
+            if (obj->connect_timeout > 86400u) { return false; }
             break;
         }
         case JSON_CONF_MUX_IDLE_TIMEOUT: {
             if (!json_parse_uint(val_, val_len_, &obj->idle_timeout)) { return false; }
-            obj->has_idle_timeout = true;
+            if (obj->idle_timeout > 86400u) { return false; }
             break;
         }
         case JSON_CONF_MUX_KEEPALIVE: {
             if (!json_parse_uint(val_, val_len_, &obj->keepalive)) { return false; }
-            obj->has_keepalive = true;
+            if (obj->keepalive > 86400u) { return false; }
             break;
         }
         case JSON_CONF_MUX_MAX_HALFOPEN: {
             if (!json_parse_uint(val_, val_len_, &obj->max_halfopen)) { return false; }
-            obj->has_max_halfopen = true;
+            if (obj->max_halfopen > 4096u) { return false; }
             break;
         }
         case JSON_CONF_MUX_MAX_STREAMS: {
             if (!json_parse_umax(val_, val_len_, &obj->max_streams)) { return false; }
-            obj->has_max_streams = true;
             break;
         }
         case JSON_CONF_MUX_MEM_PRESSURE: {
             if (!json_conf_mux_mem_pressure_unmarshal(&obj->mem_pressure, val_, val_len_)) {
                 return false;
             }
-            obj->has_mem_pressure = true;
             break;
         }
         case JSON_CONF_MUX_NODELAY: {
-            { bool bv_;
-            if (!json_parse_bool(val_, val_len_, &bv_)) { return false; }
-            obj->nodelay = bv_; obj->has_nodelay = true; }
+            if (!json_parse_bool(val_, val_len_, &obj->nodelay)) { return false; }
             break;
         }
         case JSON_CONF_MUX_PING_TIMEOUT: {
             if (!json_parse_uint(val_, val_len_, &obj->ping_timeout)) { return false; }
-            obj->has_ping_timeout = true;
+            if (obj->ping_timeout > 86400u) { return false; }
             break;
         }
         case JSON_CONF_MUX_RESUME_TIMEOUT: {
             if (!json_parse_uint(val_, val_len_, &obj->resume_timeout)) { return false; }
-            obj->has_resume_timeout = true;
+            if (obj->resume_timeout > 86400u) { return false; }
             break;
         }
         case JSON_CONF_MUX_SEND_TIMEOUT: {
             if (!json_parse_uint(val_, val_len_, &obj->send_timeout)) { return false; }
-            obj->has_send_timeout = true;
+            if (obj->send_timeout > 86400u) { return false; }
             break;
         }
         case JSON_CONF_MUX_SESSION_WINDOW: {
             if (!json_parse_uint(val_, val_len_, &obj->session_window)) { return false; }
-            obj->has_session_window = true;
+            if (obj->session_window > 268435456u) { return false; }
             break;
         }
         case JSON_CONF_MUX_STREAM_WINDOW: {
             if (!json_parse_uint(val_, val_len_, &obj->stream_window)) { return false; }
-            obj->has_stream_window = true;
+            if (obj->stream_window > 16777216u) { return false; }
             break;
         }
         case JSON_CONF_MUX_TCP: {
             if (!json_conf_mux_tcp_unmarshal(&obj->tcp, val_, val_len_)) {
                 return false;
             }
-            obj->has_tcp = true;
             break;
         }
         case JSON_CONF_MUX_TIMEOUT: {
             if (!json_parse_uint(val_, val_len_, &obj->timeout)) { return false; }
-            obj->has_timeout = true;
+            if (obj->timeout > 86400u) { return false; }
             break;
         }
         default:
@@ -632,44 +645,34 @@ static bool json_conf_identity_unmarshal_mux_connect(
 {
     const struct json_val arr_ = json_parse(val_, val_len_);
     if (arr_.type != JSON_ARRAY) { return false; }
-    char **items_ = NULL;
-    size_t *lens_ = NULL;
+    struct json_string *items_ = NULL;
     size_t count_ = 0, cap_ = 0;
     json_iter ait_ = arr_.iter;
     char *av_; size_t alen_;
     while (json_arr_next(val_, val_len_, &ait_, &av_, &alen_)) {
         const struct json_val sv_ = json_parse(av_, alen_);
         if (sv_.type != JSON_STRING) {
-            free((void *)items_);
-            free(lens_);
+            free(items_);
             return false;
         }
         if (count_ >= cap_) {
             const size_t nc_ = cap_ ? cap_ * 2 : 4;
-            char **na_ = (char **)realloc((void *)items_, nc_ * sizeof(*na_));
+            struct json_string *na_ = realloc(items_, nc_ * sizeof(*na_));
             if (na_ == NULL) {
-                free((void *)items_);
-                free(lens_);
+                free(items_);
                 return false;
             }
-            size_t *nl_ = realloc(lens_, nc_ * sizeof(*nl_));
-            if (nl_ == NULL) {
-                free((void *)na_);
-                free(lens_);
-                return false;
-            }
-            items_ = na_; lens_ = nl_; cap_ = nc_;
+            items_ = na_; cap_ = nc_;
         }
-        items_[count_] = sv_.str;
-        lens_[count_] = sv_.len;
+        items_[count_].str = sv_.str;
+        items_[count_].len = sv_.len;
         count_++;
     }
     if (count_ == 0) {
-        items_ = (char **)malloc(sizeof(*items_));
+        items_ = malloc(sizeof(*items_));
         if (!items_) { return false; }
     }
     obj->mux_connect = items_;
-    obj->mux_connect_lens = lens_;
     obj->mux_connect_count = count_;
     return true;
 }
@@ -681,18 +684,19 @@ static bool json_conf_identity_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_conf_identity){ 0 };
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_conf_identity_lookup(key_, key_len_);
         switch (k_) {
         case JSON_CONF_IDENTITY_CLAIM: {
-            if (!json_parse_string(val_, val_len_, &obj->claim, &obj->claim_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->claim.str, &obj->claim.len)) { return false; }
             break;
         }
         case JSON_CONF_IDENTITY_LISTEN: {
-            obj->listen_json = strndup(val_, val_len_);
-            if (obj->listen_json == NULL) { return false; }
-            obj->listen_len = val_len_;
+            obj->listen_json.str = val_;
+            obj->listen_json.len = val_len_;
             break;
         }
         case JSON_CONF_IDENTITY_MUX_CONNECT: {
@@ -713,74 +717,104 @@ bool json_conf_unmarshal(
     if (root_.type != JSON_OBJECT) { return false; }
     json_iter iter_ = root_.iter;
     char *key_; size_t key_len_; char *val_; size_t val_len_;
+    *obj = (struct json_conf){
+        .loglevel = UINTMAX_C(4),
+        .mux = {
+            .connect_timeout = 15u,
+            .idle_timeout = 0u,
+            .keepalive = 25u,
+            .max_halfopen = 256u,
+            .mem_pressure = {
+                .hi = UINTMAX_C(0),
+                .lo = UINTMAX_C(0),
+            },
+            .nodelay = true,
+            .ping_timeout = 15u,
+            .resume_timeout = 600u,
+            .send_timeout = 15u,
+            .session_window = 0u,
+            .stream_window = 0u,
+            .tcp = {
+                .backlog = 16u,
+                .keepalive = false,
+                .nodelay = true,
+                .notsent_lowat = UINTMAX_C(131072),
+                .reuseport = false,
+            },
+            .timeout = 60u,
+        },
+        .tcp = {
+            .backlog = 16u,
+            .keepalive = true,
+            .nodelay = true,
+            .notsent_lowat = UINTMAX_C(0),
+            .reuseport = false,
+        },
+    };
+
     while (json_obj_next(json, length, &iter_,
             &key_, &key_len_, &val_, &val_len_)) {
         const int k_ = json_conf_lookup(key_, key_len_);
         switch (k_) {
         case JSON_CONF_API_LISTEN: {
-            if (!json_parse_string(val_, val_len_, &obj->api_listen, &obj->api_listen_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->api_listen.str, &obj->api_listen.len)) { return false; }
             break;
         }
         case JSON_CONF_CONNECT: {
-            if (!json_parse_string(val_, val_len_, &obj->connect, &obj->connect_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->connect.str, &obj->connect.len)) { return false; }
             break;
         }
         case JSON_CONF_IDENTITY: {
             if (!json_conf_identity_unmarshal(&obj->identity, val_, val_len_)) {
                 return false;
             }
-            obj->has_identity = true;
             break;
         }
         case JSON_CONF_LISTEN: {
-            if (!json_parse_string(val_, val_len_, &obj->listen, &obj->listen_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->listen.str, &obj->listen.len)) { return false; }
             break;
         }
         case JSON_CONF_LOGLEVEL: {
-            if (!json_parse_uint(val_, val_len_, &obj->loglevel)) { return false; }
-            obj->has_loglevel = true;
+            if (!json_parse_umax(val_, val_len_, &obj->loglevel)) { return false; }
             break;
         }
         case JSON_CONF_MAX_SESSIONS: {
             if (!json_parse_umax(val_, val_len_, &obj->max_sessions)) { return false; }
-            obj->has_max_sessions = true;
             break;
         }
         case JSON_CONF_MAX_STARTUPS: {
-            if (!json_parse_string(val_, val_len_, &obj->max_startups, &obj->max_startups_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->max_startups.str, &obj->max_startups.len)) { return false; }
             break;
         }
         case JSON_CONF_MUX: {
             if (!json_conf_mux_unmarshal(&obj->mux, val_, val_len_)) {
                 return false;
             }
-            obj->has_mux = true;
             break;
         }
         case JSON_CONF_MUX_CONNECT: {
-            if (!json_parse_string(val_, val_len_, &obj->mux_connect, &obj->mux_connect_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->mux_connect.str, &obj->mux_connect.len)) { return false; }
             break;
         }
         case JSON_CONF_MUX_LISTEN: {
-            if (!json_parse_string(val_, val_len_, &obj->mux_listen, &obj->mux_listen_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->mux_listen.str, &obj->mux_listen.len)) { return false; }
             break;
         }
         case JSON_CONF_TCP: {
             if (!json_conf_tcp_unmarshal(&obj->tcp, val_, val_len_)) {
                 return false;
             }
-            obj->has_tcp = true;
             break;
         }
         case JSON_CONF_TLS: {
             if (!json_conf_tls_unmarshal(&obj->tls, val_, val_len_)) {
                 return false;
             }
-            obj->has_tls = true;
             break;
         }
         case JSON_CONF_TYPE: {
-            if (!json_parse_string(val_, val_len_, &obj->type, &obj->type_len)) { return false; }
+            if (!json_parse_string(val_, val_len_, &obj->type.str, &obj->type.len)) { return false; }
+            if (!(obj->type.len == 42u && memcmp(obj->type.str, "application/x-multiplexd-config; version=1", 42) == 0)) { return false; }
             break;
         }
         default:
@@ -819,35 +853,35 @@ static int json_conf_tls_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
     if (obj->authcerts != NULL) {
-        EMIT("%s\"%s\":[" , first_ ? "" : ",", "authcerts");
-        first_ = false;
+        EMIT("\"%s\":[", "authcerts");
         for (size_t i_ = 0; i_ < obj->authcerts_count; i_++) {
             if (i_ > 0) { if (buf && bufsz > (size_t)n_) buf[n_] = ','; n_++; }
-            EMIT_STR(obj->authcerts[i_], obj->authcerts_lens[i_]);
+            EMIT_STR(obj->authcerts[i_].str, obj->authcerts[i_].len);
         }
-        EMIT("%s", "]");
+        EMIT("%s", "],");
     }
-    if (obj->cert != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "cert");
-        first_ = false;
-        EMIT_STR(obj->cert, obj->cert_len);
+    if (obj->cert.str != NULL) {
+        EMIT("\"%s\":", "cert");
+        EMIT_STR(obj->cert.str, obj->cert.len);
+        EMIT("%s", ",");
     }
-    if (obj->ciphersuites != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "ciphersuites");
-        first_ = false;
-        EMIT_STR(obj->ciphersuites, obj->ciphersuites_len);
+    if (obj->ciphersuites.str != NULL) {
+        EMIT("\"%s\":", "ciphersuites");
+        EMIT_STR(obj->ciphersuites.str, obj->ciphersuites.len);
+        EMIT("%s", ",");
     }
-    if (obj->key != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "key");
-        first_ = false;
-        EMIT_STR(obj->key, obj->key_len);
+    if (obj->key.str != NULL) {
+        EMIT("\"%s\":", "key");
+        EMIT_STR(obj->key.str, obj->key.len);
+        EMIT("%s", ",");
     }
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;
@@ -858,46 +892,26 @@ static int json_conf_tcp_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
-    if (obj->has_backlog) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "backlog",
-            (uintmax_t)obj->backlog);
-        first_ = false;
-    }
-    if (obj->has_keepalive) {
-        EMIT("%s\"%s\":%s", first_ ? "" : ",", "keepalive",
-            obj->keepalive ? "true" : "false");
-        first_ = false;
-    }
-    if (obj->has_nodelay) {
-        EMIT("%s\"%s\":%s", first_ ? "" : ",", "nodelay",
-            obj->nodelay ? "true" : "false");
-        first_ = false;
-    }
-    if (obj->has_notsent_lowat) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "notsent_lowat",
-            (uintmax_t)obj->notsent_lowat);
-        first_ = false;
-    }
-    if (obj->has_rcvbuf) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "rcvbuf",
-            (uintmax_t)obj->rcvbuf);
-        first_ = false;
-    }
-    if (obj->has_reuseport) {
-        EMIT("%s\"%s\":%s", first_ ? "" : ",", "reuseport",
-            obj->reuseport ? "true" : "false");
-        first_ = false;
-    }
-    if (obj->has_sndbuf) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "sndbuf",
-            (uintmax_t)obj->sndbuf);
-        first_ = false;
-    }
+    EMIT("\"%s\":%ju,", "backlog",
+        (uintmax_t)obj->backlog);
+    EMIT("\"%s\":%s,", "keepalive",
+        obj->keepalive ? "true" : "false");
+    EMIT("\"%s\":%s,", "nodelay",
+        obj->nodelay ? "true" : "false");
+    EMIT("\"%s\":%ju,", "notsent_lowat",
+        (uintmax_t)obj->notsent_lowat);
+    EMIT("\"%s\":%ju,", "rcvbuf",
+        (uintmax_t)obj->rcvbuf);
+    EMIT("\"%s\":%s,", "reuseport",
+        obj->reuseport ? "true" : "false");
+    EMIT("\"%s\":%ju,", "sndbuf",
+        (uintmax_t)obj->sndbuf);
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;
@@ -908,46 +922,26 @@ static int json_conf_mux_tcp_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
-    if (obj->has_backlog) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "backlog",
-            (uintmax_t)obj->backlog);
-        first_ = false;
-    }
-    if (obj->has_keepalive) {
-        EMIT("%s\"%s\":%s", first_ ? "" : ",", "keepalive",
-            obj->keepalive ? "true" : "false");
-        first_ = false;
-    }
-    if (obj->has_nodelay) {
-        EMIT("%s\"%s\":%s", first_ ? "" : ",", "nodelay",
-            obj->nodelay ? "true" : "false");
-        first_ = false;
-    }
-    if (obj->has_notsent_lowat) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "notsent_lowat",
-            (uintmax_t)obj->notsent_lowat);
-        first_ = false;
-    }
-    if (obj->has_rcvbuf) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "rcvbuf",
-            (uintmax_t)obj->rcvbuf);
-        first_ = false;
-    }
-    if (obj->has_reuseport) {
-        EMIT("%s\"%s\":%s", first_ ? "" : ",", "reuseport",
-            obj->reuseport ? "true" : "false");
-        first_ = false;
-    }
-    if (obj->has_sndbuf) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "sndbuf",
-            (uintmax_t)obj->sndbuf);
-        first_ = false;
-    }
+    EMIT("\"%s\":%ju,", "backlog",
+        (uintmax_t)obj->backlog);
+    EMIT("\"%s\":%s,", "keepalive",
+        obj->keepalive ? "true" : "false");
+    EMIT("\"%s\":%s,", "nodelay",
+        obj->nodelay ? "true" : "false");
+    EMIT("\"%s\":%ju,", "notsent_lowat",
+        (uintmax_t)obj->notsent_lowat);
+    EMIT("\"%s\":%ju,", "rcvbuf",
+        (uintmax_t)obj->rcvbuf);
+    EMIT("\"%s\":%s,", "reuseport",
+        obj->reuseport ? "true" : "false");
+    EMIT("\"%s\":%ju,", "sndbuf",
+        (uintmax_t)obj->sndbuf);
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;
@@ -958,21 +952,16 @@ static int json_conf_mux_mem_pressure_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
-    if (obj->has_hi) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "hi",
-            (uintmax_t)obj->hi);
-        first_ = false;
-    }
-    if (obj->has_lo) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "lo",
-            (uintmax_t)obj->lo);
-        first_ = false;
-    }
+    EMIT("\"%s\":%ju,", "hi",
+        (uintmax_t)obj->hi);
+    EMIT("\"%s\":%ju,", "lo",
+        (uintmax_t)obj->lo);
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;
@@ -983,81 +972,42 @@ static int json_conf_mux_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
-    if (obj->has_connect_timeout) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "connect_timeout",
-            (uintmax_t)obj->connect_timeout);
-        first_ = false;
-    }
-    if (obj->has_idle_timeout) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "idle_timeout",
-            (uintmax_t)obj->idle_timeout);
-        first_ = false;
-    }
-    if (obj->has_keepalive) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "keepalive",
-            (uintmax_t)obj->keepalive);
-        first_ = false;
-    }
-    if (obj->has_max_halfopen) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "max_halfopen",
-            (uintmax_t)obj->max_halfopen);
-        first_ = false;
-    }
-    if (obj->has_max_streams) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "max_streams",
-            (uintmax_t)obj->max_streams);
-        first_ = false;
-    }
-    if (obj->has_mem_pressure) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "mem_pressure");
-        first_ = false;
-        EMIT_SUB(json_conf_mux_mem_pressure_marshal, &obj->mem_pressure);
-    }
-    if (obj->has_nodelay) {
-        EMIT("%s\"%s\":%s", first_ ? "" : ",", "nodelay",
-            obj->nodelay ? "true" : "false");
-        first_ = false;
-    }
-    if (obj->has_ping_timeout) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "ping_timeout",
-            (uintmax_t)obj->ping_timeout);
-        first_ = false;
-    }
-    if (obj->has_resume_timeout) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "resume_timeout",
-            (uintmax_t)obj->resume_timeout);
-        first_ = false;
-    }
-    if (obj->has_send_timeout) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "send_timeout",
-            (uintmax_t)obj->send_timeout);
-        first_ = false;
-    }
-    if (obj->has_session_window) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "session_window",
-            (uintmax_t)obj->session_window);
-        first_ = false;
-    }
-    if (obj->has_stream_window) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "stream_window",
-            (uintmax_t)obj->stream_window);
-        first_ = false;
-    }
-    if (obj->has_tcp) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "tcp");
-        first_ = false;
-        EMIT_SUB(json_conf_mux_tcp_marshal, &obj->tcp);
-    }
-    if (obj->has_timeout) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "timeout",
-            (uintmax_t)obj->timeout);
-        first_ = false;
-    }
+    EMIT("\"%s\":%ju,", "connect_timeout",
+        (uintmax_t)obj->connect_timeout);
+    EMIT("\"%s\":%ju,", "idle_timeout",
+        (uintmax_t)obj->idle_timeout);
+    EMIT("\"%s\":%ju,", "keepalive",
+        (uintmax_t)obj->keepalive);
+    EMIT("\"%s\":%ju,", "max_halfopen",
+        (uintmax_t)obj->max_halfopen);
+    EMIT("\"%s\":%ju,", "max_streams",
+        (uintmax_t)obj->max_streams);
+    EMIT("\"%s\":", "mem_pressure");
+    EMIT_SUB(json_conf_mux_mem_pressure_marshal, &obj->mem_pressure);
+    EMIT("%s", ",");
+    EMIT("\"%s\":%s,", "nodelay",
+        obj->nodelay ? "true" : "false");
+    EMIT("\"%s\":%ju,", "ping_timeout",
+        (uintmax_t)obj->ping_timeout);
+    EMIT("\"%s\":%ju,", "resume_timeout",
+        (uintmax_t)obj->resume_timeout);
+    EMIT("\"%s\":%ju,", "send_timeout",
+        (uintmax_t)obj->send_timeout);
+    EMIT("\"%s\":%ju,", "session_window",
+        (uintmax_t)obj->session_window);
+    EMIT("\"%s\":%ju,", "stream_window",
+        (uintmax_t)obj->stream_window);
+    EMIT("\"%s\":", "tcp");
+    EMIT_SUB(json_conf_mux_tcp_marshal, &obj->tcp);
+    EMIT("%s", ",");
+    EMIT("\"%s\":%ju,", "timeout",
+        (uintmax_t)obj->timeout);
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;
@@ -1068,30 +1018,29 @@ static int json_conf_identity_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
-    if (obj->claim != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "claim");
-        first_ = false;
-        EMIT_STR(obj->claim, obj->claim_len);
+    if (obj->claim.str != NULL) {
+        EMIT("\"%s\":", "claim");
+        EMIT_STR(obj->claim.str, obj->claim.len);
+        EMIT("%s", ",");
     }
-    if (obj->listen_json != NULL) {
-        EMIT("%s\"%s\":%.*s", first_ ? "" : ",", "listen",
-            (int)obj->listen_len, obj->listen_json);
-        first_ = false;
+    if (obj->listen_json.str != NULL) {
+        EMIT("\"%s\":%.*s,", "listen",
+            (int)obj->listen_json.len, obj->listen_json.str);
     }
     if (obj->mux_connect != NULL) {
-        EMIT("%s\"%s\":[" , first_ ? "" : ",", "mux_connect");
-        first_ = false;
+        EMIT("\"%s\":[", "mux_connect");
         for (size_t i_ = 0; i_ < obj->mux_connect_count; i_++) {
             if (i_ > 0) { if (buf && bufsz > (size_t)n_) buf[n_] = ','; n_++; }
-            EMIT_STR(obj->mux_connect[i_], obj->mux_connect_lens[i_]);
+            EMIT_STR(obj->mux_connect[i_].str, obj->mux_connect[i_].len);
         }
-        EMIT("%s", "]");
+        EMIT("%s", "],");
     }
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;
@@ -1102,76 +1051,63 @@ int json_conf_marshal(
 {
     int n_ = 0;
     int r_;
-    bool first_ = true;
 
     EMIT("%s", "{");
+    const int n_start_ = n_;
 
-    if (obj->api_listen != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "api_listen");
-        first_ = false;
-        EMIT_STR(obj->api_listen, obj->api_listen_len);
+    if (obj->api_listen.str != NULL) {
+        EMIT("\"%s\":", "api_listen");
+        EMIT_STR(obj->api_listen.str, obj->api_listen.len);
+        EMIT("%s", ",");
     }
-    if (obj->connect != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "connect");
-        first_ = false;
-        EMIT_STR(obj->connect, obj->connect_len);
+    if (obj->connect.str != NULL) {
+        EMIT("\"%s\":", "connect");
+        EMIT_STR(obj->connect.str, obj->connect.len);
+        EMIT("%s", ",");
     }
-    if (obj->has_identity) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "identity");
-        first_ = false;
-        EMIT_SUB(json_conf_identity_marshal, &obj->identity);
+    EMIT("\"%s\":", "identity");
+    EMIT_SUB(json_conf_identity_marshal, &obj->identity);
+    EMIT("%s", ",");
+    if (obj->listen.str != NULL) {
+        EMIT("\"%s\":", "listen");
+        EMIT_STR(obj->listen.str, obj->listen.len);
+        EMIT("%s", ",");
     }
-    if (obj->listen != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "listen");
-        first_ = false;
-        EMIT_STR(obj->listen, obj->listen_len);
+    EMIT("\"%s\":%ju,", "loglevel",
+        (uintmax_t)obj->loglevel);
+    EMIT("\"%s\":%ju,", "max_sessions",
+        (uintmax_t)obj->max_sessions);
+    if (obj->max_startups.str != NULL) {
+        EMIT("\"%s\":", "max_startups");
+        EMIT_STR(obj->max_startups.str, obj->max_startups.len);
+        EMIT("%s", ",");
     }
-    if (obj->has_loglevel) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "loglevel",
-            (uintmax_t)obj->loglevel);
-        first_ = false;
+    EMIT("\"%s\":", "mux");
+    EMIT_SUB(json_conf_mux_marshal, &obj->mux);
+    EMIT("%s", ",");
+    if (obj->mux_connect.str != NULL) {
+        EMIT("\"%s\":", "mux_connect");
+        EMIT_STR(obj->mux_connect.str, obj->mux_connect.len);
+        EMIT("%s", ",");
     }
-    if (obj->has_max_sessions) {
-        EMIT("%s\"%s\":%ju", first_ ? "" : ",", "max_sessions",
-            (uintmax_t)obj->max_sessions);
-        first_ = false;
+    if (obj->mux_listen.str != NULL) {
+        EMIT("\"%s\":", "mux_listen");
+        EMIT_STR(obj->mux_listen.str, obj->mux_listen.len);
+        EMIT("%s", ",");
     }
-    if (obj->max_startups != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "max_startups");
-        first_ = false;
-        EMIT_STR(obj->max_startups, obj->max_startups_len);
-    }
-    if (obj->has_mux) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "mux");
-        first_ = false;
-        EMIT_SUB(json_conf_mux_marshal, &obj->mux);
-    }
-    if (obj->mux_connect != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "mux_connect");
-        first_ = false;
-        EMIT_STR(obj->mux_connect, obj->mux_connect_len);
-    }
-    if (obj->mux_listen != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "mux_listen");
-        first_ = false;
-        EMIT_STR(obj->mux_listen, obj->mux_listen_len);
-    }
-    if (obj->has_tcp) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "tcp");
-        first_ = false;
-        EMIT_SUB(json_conf_tcp_marshal, &obj->tcp);
-    }
-    if (obj->has_tls) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "tls");
-        first_ = false;
-        EMIT_SUB(json_conf_tls_marshal, &obj->tls);
-    }
-    if (obj->type != NULL) {
-        EMIT("%s\"%s\":", first_ ? "" : ",", "type");
-        first_ = false;
-        EMIT_STR(obj->type, obj->type_len);
+    EMIT("\"%s\":", "tcp");
+    EMIT_SUB(json_conf_tcp_marshal, &obj->tcp);
+    EMIT("%s", ",");
+    EMIT("\"%s\":", "tls");
+    EMIT_SUB(json_conf_tls_marshal, &obj->tls);
+    EMIT("%s", ",");
+    if (obj->type.str != NULL) {
+        EMIT("\"%s\":", "type");
+        EMIT_STR(obj->type.str, obj->type.len);
+        EMIT("%s", ",");
     }
 
+    if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");
 
     return n_;
