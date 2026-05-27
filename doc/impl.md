@@ -632,22 +632,22 @@ completed by PONG or by timeout detection on the next payload.
 
 **`STARTUP`**
 
-| Condition                           | Action                         | Next phase |
-| ----------------------------------- | ------------------------------ | ---------- |
-| `!valid_cycle && probe_was_stalled` | `bdp += cycle_window_bytes`    | `STARTUP`  |
-| `valid_cycle && window_limited`     | `bdp += sample`                | `STARTUP`  |
-| `valid_cycle && !window_limited`    | `saturated_rounds = 0`         | `TRACK`    |
+| Condition                           | Action                      | Next phase |
+| ----------------------------------- | --------------------------- | ---------- |
+| `!valid_cycle && probe_was_stalled` | `bdp += cycle_window_bytes` | `STARTUP`  |
+| `valid_cycle && window_limited`     | `bdp += sample`             | `STARTUP`  |
+| `valid_cycle && !window_limited`    | `saturated_rounds = 0`      | `TRACK`    |
 
 **`TRACK`**
 
-| Condition                                                         | Action                                                                                   | Next phase           |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | -------------------- |
-| `!valid_cycle`                                                    | no change to `bdp`; `bw_wnd`/`sample_wnd` age naturally                                  | `TRACK`              |
-| `valid_cycle`, rtt_min aged, `rtt_sample >= INFLATE_HI * rtt_min` | increment `inflated_rounds`; when it reaches `INFLATE_ROUNDS`, force-age and reset `bdp` | `TRACK`              |
-| `valid_cycle`, rtt_min aged, `rtt_sample <= INFLATE_LO * rtt_min` | clear `inflated_rounds`                                                                  | `TRACK`              |
+| Condition                                                         | Action                                                                                     | Next phase           |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | -------------------- |
+| `!valid_cycle`                                                    | no change to `bdp`; `bw_wnd`/`sample_wnd` age naturally                                    | `TRACK`              |
+| `valid_cycle`, rtt_min aged, `rtt_sample >= INFLATE_HI * rtt_min` | increment `inflated_rounds`; when it reaches `INFLATE_ROUNDS`, force-age and reset `bdp`   | `TRACK`              |
+| `valid_cycle`, rtt_min aged, `rtt_sample <= INFLATE_LO * rtt_min` | clear `inflated_rounds`                                                                    | `TRACK`              |
 | `valid_cycle` (any ratio)                                         | `bdp = max(sample_max, bw_max * rtt_min)` (raw; `effective_bdp` gets clamped windowed max) | `TRACK`              |
-| `valid_cycle && window_limited`                                   | increment `saturated_rounds`; if it reaches 2, re-probe aggressively                     | `TRACK` or `STARTUP` |
-| `valid_cycle && !window_limited`                                  | `saturated_rounds = 0`                                                                   | `TRACK`              |
+| `valid_cycle && window_limited`                                   | increment `saturated_rounds`; if it reaches 2, re-probe aggressively                       | `TRACK` or `STARTUP` |
+| `valid_cycle && !window_limited`                                  | `saturated_rounds = 0`                                                                     | `TRACK`              |
 
 **RTT inflation force-age** collapses all three slots of `bw_wnd` and
 `sample_wnd` to the current cycle's values, then clears both `inflated_rounds`
@@ -667,7 +667,7 @@ WINDOW_UPDATE grant encoding limit), `BDP_MIN = MUX_INITIAL_SEND_WINDOW`,
 | Manual mode               | The estimator is inert; configured frame counts are used as-is.                                                                                                                                                                                               |
 | Automatic mode            | Mixed config is normalised away; effective windows start at `floor_frames` and track the BDP bidirectionally.                                                                                                                                                 |
 | `session_update_window()` | Both `session_window` and `stream_window` are set to `window_frames`; live streams expand `recv_window` immediately on grow; on shrink, each stream's `recv_window` is lazily synced down by `stream_check_ack` once `buffered_bytes + outstanding ≤ target`. |
-| `estimator_stop()`        | Reset phase, RTT/BW filters, and probe state; bump `epoch_ns`; preserve `effective_bdp` and seed `bdp_wnd` with it so the window is maintained across reconnect until new measurements arrive.                                                              |
+| `estimator_stop()`        | Reset phase, RTT/BW filters, and probe state; bump `epoch_ns`; preserve `effective_bdp` and seed `bdp_wnd` with it so the window is maintained across reconnect until new measurements arrive.                                                                |
 
 When `effective_bdp` decreases, `session_window` and `stream_window` follow it down.
 Each stream's `recv_window` is lazily synced to the new target inside

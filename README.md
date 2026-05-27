@@ -5,7 +5,7 @@
 [![Downloads](https://img.shields.io/github/downloads/hexian000/multiplexd/total.svg)](https://github.com/hexian000/multiplexd/releases)
 [![Release](https://img.shields.io/github/release/hexian000/multiplexd.svg?style=flat)](https://github.com/hexian000/multiplexd/releases)
 
-multiplexd is a TCP stream multiplexer that carries many concurrent connections over a single transport session while preserving transparent TCP semantics end to end. The design centers on three concerns: minimizing per-stream overhead (a fixed 8-byte frame header, no per-stream negotiation, SYN and first data combined in one flight), maintaining fairness across co-resident streams (deficit round-robin scheduling with byte-granularity accounting, a two-phase BDP estimator that adapts flow-control windows to measured path capacity), and surviving transport interruptions without application-visible disruption (unacknowledged frames are replayed in order over the new transport on reconnect). Security is provided by TLS 1.3 mutual authentication against a closed, explicitly provisioned trust set — the system CA store is never consulted.
+multiplexd is a TCP stream multiplexer with zero-RTT stream open, deficit round-robin scheduling, two-phase BDP flow-control estimation, transparent session resumption with unacknowledged-frame replay, and TLS 1.3 mutual authentication against a private trust store.
 
 **Table of Contents**
 - [Features](#features)
@@ -32,6 +32,8 @@ multiplexd is a TCP stream multiplexer that carries many concurrent connections 
     - [`GET /stats`](#get-stats)
     - [`POST /stats`](#post-stats)
     - [`GET /metrics`](#get-metrics)
+    - [`GET /config`](#get-config)
+    - [`PUT /config`](#put-config)
 - [Usage](#usage)
 - [Building](#building)
   - [Dependencies](#dependencies)
@@ -51,7 +53,7 @@ multiplexd is a TCP stream multiplexer that carries many concurrent connections 
 
 ### Protocol Efficiency
 
-- **Minimal frame overhead**: A fixed 8-byte header covers version, flags, length, stream ID, and a context-dependent extra field. No per-stream channel names, method routing, or compression state.
+- **Low frame overhead**: A fixed 8-byte header covers version, flags, length, stream ID, and a context-dependent extra field. No per-stream channel names, method routing, or compression state.
 - **Zero-RTT stream open**: The SYN flag and first data payload are sent in a single frame, so a new stream delivers its first bytes without a dedicated round-trip.
 - **No per-stream negotiation**: The forward target is fixed at session configuration time. Accepted streams carry no per-stream metadata beyond the stream ID.
 - **Up to 65535 concurrent streams**: 32768 client-initiated and 32767 server-initiated, with a configurable per-session limit via `max_streams`.
@@ -72,7 +74,7 @@ multiplexd is a TCP stream multiplexer that carries many concurrent connections 
 
 ### Security and Operations
 
-- **mTLS with closed trust store**: TLS 1.3 mutual authentication against an explicit set of trusted certificates. The system CA store is never consulted. TLS can be disabled on trusted networks.
+- **mTLS with private trust store**: TLS 1.3 mutual authentication against an explicit set of trusted certificates. The system CA store is never consulted. TLS can be disabled on trusted networks.
 - **Hot configuration reload**: Sending `SIGHUP` reloads the configuration and gracefully drains existing sessions. TLS certificates, keys, and trust roots take effect for new sessions immediately.
 - **Multi-peer routing**: The `identity` block lets a node maintain simultaneous sessions with multiple named peers, with per-peer listeners and round-robin distribution across parallel tunnels.
 - **Built-in observability**: Health check, plain-text stats, and Prometheus-compatible metrics endpoints available with no instrumentation or code changes.
@@ -95,9 +97,9 @@ multiplexd supports simultaneous forward and reverse forwarding over a single mu
 +---------+    +------------+    +------------+    +---------+
 ```
 
-**Forward forwarding**: local apps connect to the client's `listen` address; the server forwards each mux stream to its `connect` target.
+**Forward**: local apps connect to the client's `listen` address; the server forwards each mux stream to its `connect` target.
 
-**Reverse forwarding**: remote apps connect to the server's `listen` address; the client forwards each mux stream to its `connect` target. The server can push connections to targets reachable only by the client.
+**Reverse**: remote apps connect to the server's `listen` address; the client forwards each mux stream to its `connect` target. The server can push connections to targets reachable only by the client.
 
 ### Protocol
 
@@ -106,24 +108,24 @@ multiplexd streams are ordered byte sequences with no framing, methods, or heade
 - **vs. HTTP/2 ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113)) / gRPC**: HTTP/2 and gRPC operate on requests and responses with mandatory HPACK-compressed headers; each stream carries exactly one HTTP transaction or RPC call with method routing and per-call metadata. multiplexd operates on raw octets with no request semantics, headers, or framing above the mux layer.
 - **vs. SSH connection protocol ([RFC 4254](https://www.rfc-editor.org/rfc/rfc4254))**: SSH requires a `channel-open` request per stream that names the service and destination, adding a round-trip before any payload can flow and imposing per-stream framing overhead; multiplexd has no channel requests, no per-stream negotiation, and no service-layer framing — the target is fixed at session configuration time.
 
-| Feature                    | multiplexd                                                                       | grpc-go streaming                                                                                         | OpenSSH port forwarding                                                    |
-| -------------------------- | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| **Stream model**           | Raw byte sequences; fixed 8-byte header                                          | One RPC call per stream; HPACK headers                                                                    | Named channel; `SSH_MSG_CHANNEL_DATA` frames                               |
-| **New stream setup**       | SYN + first data in one flight; no per-stream round-trip                         | HEADERS frame; no per-stream round-trip                                                                   | `channel-open` + `channel-open-confirmation`; one RTT before first payload |
-| **TCP half-close**         | FIN end-to-end transparent                                                       | END_STREAM bound to RPC lifecycle; no general TCP half-close semantics                                    | Channel EOF maps to TCP FIN; half-close preserved                          |
-| **Session resumption**     | Transparent; unacknowledged frames replayed                                      | None                                                                                                      | None                                                                       |
-| **Inter-stream fairness**  | Deficit round-robin scheduler; byte-granularity fairness                         | Round-robin scheduler; frame-granularity fairness                                                         | No inter-stream scheduling; systematically skewed under load               |
-| **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)                                   | Per-channel byte window only                                               |
-| **Adaptive window tuning** | Two-phase BDP estimator (`STARTUP` / `TRACK`)                                    | Monotonic BDP estimator                                                                                   | Fixed; manual tuning                                                       |
-| **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                                                      | None                                                                       |
-| **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                                             | Re-execs master; existing child processes drains naturally                 |
-| **Observability**          | Health, stats, Prometheus metrics (built-in; no code changes)                    | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors (requires instrumentation) | None                                                                       |
+| Feature                    | multiplexd                                                                       | grpc-go streaming                                                              | OpenSSH port forwarding                                                    |
+| -------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| **Stream model**           | Raw byte sequences; fixed 8-byte header                                          | One RPC call per stream; HPACK headers                                         | Named channel; `SSH_MSG_CHANNEL_DATA` frames                               |
+| **New stream setup**       | SYN + first data in one flight; no per-stream round-trip                         | HEADERS frame; no per-stream round-trip                                        | `channel-open` + `channel-open-confirmation`; one RTT before first payload |
+| **TCP half-close**         | FIN end-to-end transparent                                                       | END_STREAM bound to RPC lifecycle; no general TCP half-close semantics         | Channel EOF maps to TCP FIN; half-close preserved                          |
+| **Session resumption**     | Transparent; unacknowledged frames replayed                                      | None                                                                           | None                                                                       |
+| **Inter-stream fairness**  | Deficit round-robin scheduler; byte-granularity fairness                         | Round-robin scheduler; frame-granularity fairness                              | No inter-stream scheduling; systematically skewed under load               |
+| **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)        | Per-channel byte window only                                               |
+| **Adaptive window tuning** | Two-phase BDP estimator (`STARTUP` / `TRACK`)                                    | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
+| **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                           | None                                                                       |
+| **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                  | Re-execs master; existing child processes drains naturally                 |
+| **Observability**          | Health check, plain-text stats, Prometheus metrics                               | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors | None                                                                       |
 
 See [doc/spec.md](doc/spec.md) for the full wire protocol and state-machine specification.
 
 ### Implementation
 
-The design prioritises transparent TCP semantics (full half-close support, session resumption invisible to applications), inter-stream fairness (DRR scheduling), and coexistence of bulk and interactive streams without latency inflation.
+The design prioritizes transparent TCP semantics (full half-close support, session resumption invisible to applications), inter-stream fairness (DRR scheduling), and coexistence of bulk and interactive streams without latency inflation.
 
 See [doc/impl.md](doc/impl.md) for runtime topology, send/receive paths, and maintainer-facing invariants.
 
@@ -324,6 +326,14 @@ Same as `GET /stats`, plus per-interval bandwidth rates and server CPU load deri
 
 Returns metrics in Prometheus exposition format, including cumulative counters and gauges for current session/stream counts and server load.
 
+#### `GET /config`
+
+Returns the currently active configuration as JSON, with all `@path` references inlined as PEM strings. Equivalent to `--dump-config` at runtime.
+
+#### `PUT /config`
+
+Replaces the active configuration with the JSON body of the request and performs a hot reload, identical in effect to `SIGHUP` with a new config file. Returns `204 No Content` on success or `400 Bad Request` if the body fails to parse.
+
 ## Usage
 
 ```bash
@@ -418,7 +428,7 @@ Run these helper scripts from the repository root:
 
 ### TLS Security Model
 
-With TLS enabled, multiplexd uses TLS 1.3 with mutual certificate authentication and a closed trust store defined solely by `authcerts`. Each peer must present a certificate and matching private key, and a peer is accepted only if its certificate chains to a certificate explicitly configured in `authcerts`. Tunnel confidentiality, integrity, and peer authentication therefore depend on your provisioned certificate set, not on the system CA store, DNS names, or the public Web PKI.
+With TLS enabled, multiplexd uses TLS 1.3 with mutual certificate authentication and a private trust store defined solely by `authcerts`. Each peer must present a certificate and matching private key, and a peer is accepted only if its certificate chains to a certificate explicitly configured in `authcerts`. Tunnel confidentiality, integrity, and peer authentication therefore depend on your provisioned certificate set, not on the system CA store, DNS names, or the public Web PKI.
 
 Operational requirements:
 
@@ -437,7 +447,9 @@ The `max_startups` option (`start:rate:full` format) applies connection backoff 
 
 ### Configuration Reload
 
-Sending SIGHUP reloads the configuration file and drains all existing sessions: each session stops accepting new inbound streams, completes its current streams gracefully, then reconnects with the updated configuration. Settings that can be changed with a SIGHUP include:
+There are two ways to trigger a reload: send `SIGHUP` to the process, or issue a `PUT /config` request to the API server. Both are equivalent in effect. `PUT /config` accepts the new configuration as a JSON body instead of reading from the config file, which makes it scriptable without touching the filesystem.
+
+On reload, all existing sessions drain: each session stops accepting new inbound streams, completes its current streams gracefully, then reconnects with the updated configuration. There is no timeout on the drain phase — a session with long-lived streams may remain open indefinitely. Settings that can be changed at runtime include:
 
 - `loglevel` — applied immediately.
 - Live mux behavior applied to sessions before they drain: timeouts, keepalive, stream and session windows, `max_streams`, `max_halfopen`, `nodelay`, and `mem_pressure` thresholds.
