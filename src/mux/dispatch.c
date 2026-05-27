@@ -258,9 +258,7 @@ static void dispatch_by_stream(
 	 * This includes ACK|FIN: Extra carries a credit grant, not a status code. */
 	if (flags & MUX_FLAG_ACK) {
 		const uint_fast32_t credit_before = stream_credit_avail(s);
-		/* Nagle: clear unacked bytes before stream_recv_window so that
-		 * the watcher update and scheduler wakeup inside see the
-		 * unlocked state and re-enable EV_READ / dequeue correctly. */
+		/* Nagle: clear before stream_recv_window; see SYN|ACK above. */
 		s->unacked_bytes = 0;
 		stream_recv_window(s, hdr->extra);
 		if (credit_before == 0 && hdr->extra > 0) {
@@ -277,6 +275,8 @@ static void dispatch_by_stream(
 
 	if ((flags & MUX_FLAG_PUSH) && hdr->length > 0) {
 		estimator_add(ss, hdr->length);
+		COUNTER_ADD(
+			ss->cnt.traffic.byt_push_recv, (uintmax_t)hdr->length);
 		stream_recv_copy(
 			s,
 			ringbuf_read_ptr(ss->wire.recvbuf) +

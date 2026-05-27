@@ -1,0 +1,55 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "multiplexd Protocol Hello Message",
+    "description": "Wire format for the hello message exchanged during session handshake (spec §5.2.2).",
+    "type": "object",
+    "required": [
+        "type",
+        "msgid"
+    ],
+    "properties": {
+        "type": {
+            "type": "string",
+            "description": "MIME media type string; must parse as application/x-multiplexd-proto with parameter version=1 (spec §5.2.2)."
+        },
+        "msgid": {
+            "type": "integer",
+            "description": "Message identifier: 0 = ClientHello, 1 = ServerHello (spec §5.2.2).",
+            "enum": [
+                0,
+                1
+            ]
+        },
+        "session_id": {
+            "type": "string",
+            "description": "24-character Base64 (RFC 4648 standard alphabet, with padding) encoding of the 16-byte server-assigned session identity (spec §5.2.2).",
+            "minLength": 24,
+            "maxLength": 24,
+            "pattern": "^[A-Za-z0-9+/]{22}==$"
+        },
+        "resume_seq": {
+            "type": "integer",
+            "description": "Number of the peer's non-stream-0 frames processed by this endpoint; used for session resumption (spec §5.7, §5.8).",
+            "minimum": 0,
+            "maximum": 4294967295
+        },
+        "extensions": {
+            "type": "object",
+            "description": "Extension negotiation object; absent is treated as {} (spec §5.2.2). Unrecognised keys MUST be silently ignored.",
+            "properties": {
+                "reject_inbound": {
+                    "type": "boolean",
+                    "description": "When true, the sender cannot accept new inbound streams (spec §5.2.3.1).",
+                    "default": false
+                },
+                "identity": {
+                    "type": "string",
+                    "description": "UTF-8 identity claim; maximum 255 octets, NUL character excluded (spec §5.2.3.2).",
+                    "maxLength": 255
+                }
+            },
+            "additionalProperties": true
+        }
+    },
+    "additionalProperties": true
+}

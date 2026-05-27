@@ -5,10 +5,14 @@
 [![Downloads](https://img.shields.io/github/downloads/hexian000/multiplexd/total.svg)](https://github.com/hexian000/multiplexd/releases)
 [![Release](https://img.shields.io/github/release/hexian000/multiplexd.svg?style=flat)](https://github.com/hexian000/multiplexd/releases)
 
-multiplexd is a TCP stream multiplexer that tunnels many concurrent connections through a single transport session.
+multiplexd is a TCP stream multiplexer that carries many concurrent connections over a single transport session while preserving transparent TCP semantics end to end. The design centers on three concerns: minimizing per-stream overhead (a fixed 8-byte frame header, no per-stream negotiation, SYN and first data combined in one flight), maintaining fairness across co-resident streams (deficit round-robin scheduling with byte-granularity accounting, a two-phase BDP estimator that adapts flow-control windows to measured path capacity), and surviving transport interruptions without application-visible disruption (unacknowledged frames are replayed in order over the new transport on reconnect). Security is provided by TLS 1.3 mutual authentication against a closed, explicitly provisioned trust set — the system CA store is never consulted.
 
 **Table of Contents**
 - [Features](#features)
+  - [Protocol Efficiency](#protocol-efficiency)
+  - [Reliability](#reliability)
+  - [Performance and Fairness](#performance-and-fairness)
+  - [Security and Operations](#security-and-operations)
 - [Architecture](#architecture)
   - [Port Forwarding](#port-forwarding)
   - [Protocol](#protocol)
@@ -45,20 +49,34 @@ multiplexd is a TCP stream multiplexer that tunnels many concurrent connections 
 
 ## Features
 
-- **Stream Multiplexing**: A single transport session can carry up to 65535 concurrent TCP streams (32768 client-initiated, 32767 server-initiated), with a configurable per-session limit via `max_streams`.
-- **High Throughput, Low Latency Impact**: Bulk transfers continue efficiently while latency-sensitive streams remain responsive. Stream fastopen combines the SYN with the first data payload in one flight, saving a round-trip on new streams.
-- **mTLS Security**: Protocol confidentiality, integrity, and peer authentication rely on TLS 1.3 mutual authentication with an explicit trust set, without relying on the system CA store. On trusted networks, TLS can be disabled to reduce overhead.
-- **Session Resumption**: On transport loss both sides suspend; the client reconnects and replays all unacknowledged frames in order over the new transport, so in-flight streams survive a brief disconnect transparently. Reconnect starts with an immediate attempt and falls back to exponential backoff.
-- **Bidirectional Forwarding**: Forward and reverse port forwarding can run simultaneously over the same session with no separate control channel.
-- **Thread Offloading**: Each session runs on a dedicated thread when `ENABLE_THREADS=ON`. Multiple parallel tunnels to the same peer spread load across CPU cores.
-- **Hot Configuration Reload**: The configuration file can be reloaded at runtime without restarting the process. TLS certificates, keys, and trust roots are rotated for newly accepted sessions and future outbound reconnects immediately.
-- **Built-in Observability**: Health checks, text stats, and Prometheus-compatible metrics expose runtime status and traffic counters.
-- **Fair Bandwidth Sharing**: A deficit round-robin (DRR) scheduler distributes outbound bandwidth fairly across active streams at byte granularity, so no single stream can starve the rest.
-- **Two-Level Flow Control**: A per-stream sliding receive window limits in-flight data per stream; a session-wide unacked-frame cap halts new payload scheduling while retransmits and control frames still pass through, so a slow peer cannot deadlock the session.
-- **Memory Throttling**: Receive window grants are linearly throttled as aggregate buffer occupancy rises between `mem_pressure.lo` and `mem_pressure.hi`, limiting buffer growth under load.
-- **Automatic Window Tuning**: A two-phase BDP estimator learns bandwidth and RTT from payload-driven PING/PONG cycles with no extra traffic. `STARTUP` grows the window aggressively until it is no longer the bottleneck; `TRACK` maintains it and re-enters `STARTUP` only when path capacity appears to have grown. Windows grow monotonically and granted credit is never clawed back.
-- **TCP Half-Close Support**: FIN-based half-close behavior is preserved end to end across the tunnel.
-- **Standards-compliant**: Built for ISO C11 and POSIX.1-2008, with additional features available on supported platforms.
+### Protocol Efficiency
+
+- **Minimal frame overhead**: A fixed 8-byte header covers version, flags, length, stream ID, and a context-dependent extra field. No per-stream channel names, method routing, or compression state.
+- **Zero-RTT stream open**: The SYN flag and first data payload are sent in a single frame, so a new stream delivers its first bytes without a dedicated round-trip.
+- **No per-stream negotiation**: The forward target is fixed at session configuration time. Accepted streams carry no per-stream metadata beyond the stream ID.
+- **Up to 65535 concurrent streams**: 32768 client-initiated and 32767 server-initiated, with a configurable per-session limit via `max_streams`.
+
+### Reliability
+
+- **Transparent session resumption**: On transport loss, both sides enter a suspended state. The client reconnects and replays all unacknowledged frames in order over the new transport; active streams continue without application-visible disruption. Reconnect starts immediately and backs off exponentially.
+- **TCP half-close**: FIN-based half-close semantics are preserved end to end across the tunnel.
+- **Bidirectional forwarding**: Forward and reverse port forwarding can run simultaneously over the same session with no separate control channel.
+
+### Performance and Fairness
+
+- **Deficit round-robin (DRR) scheduler**: Outbound bandwidth is distributed fairly across active streams at byte granularity, preventing any single stream from starving others regardless of message size.
+- **Two-phase BDP estimator**: `STARTUP` grows the flow-control window aggressively until it is no longer the bottleneck; `TRACK` maintains it and re-enters `STARTUP` only when path capacity appears to have increased. Windows grow monotonically — granted credit is never clawed back.
+- **Two-level flow control**: A per-stream sliding receive window bounds per-stream in-flight data; a session-wide unacknowledged-frame cap blocks new payload scheduling while retransmits and control frames pass through unaffected, preventing a slow peer from deadlocking the session.
+- **Memory back-pressure**: Receive-window grants are linearly throttled as aggregate buffer occupancy rises between `mem_pressure.lo` and `mem_pressure.hi`, bounding memory growth under sustained load.
+- **Thread offloading**: With `ENABLE_THREADS=ON`, each session runs on a dedicated thread. Parallel tunnels to the same peer distribute load across CPU cores.
+
+### Security and Operations
+
+- **mTLS with closed trust store**: TLS 1.3 mutual authentication against an explicit set of trusted certificates. The system CA store is never consulted. TLS can be disabled on trusted networks.
+- **Hot configuration reload**: Sending `SIGHUP` reloads the configuration and gracefully drains existing sessions. TLS certificates, keys, and trust roots take effect for new sessions immediately.
+- **Multi-peer routing**: The `identity` block lets a node maintain simultaneous sessions with multiple named peers, with per-peer listeners and round-robin distribution across parallel tunnels.
+- **Built-in observability**: Health check, plain-text stats, and Prometheus-compatible metrics endpoints available with no instrumentation or code changes.
+- **Standards-compliant**: ISO C11 and POSIX.1-2008, with platform-specific extensions available where supported.
 
 ## Architecture
 
@@ -88,12 +106,6 @@ multiplexd streams are ordered byte sequences with no framing, methods, or heade
 - **vs. HTTP/2 ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113)) / gRPC**: HTTP/2 and gRPC operate on requests and responses with mandatory HPACK-compressed headers; each stream carries exactly one HTTP transaction or RPC call with method routing and per-call metadata. multiplexd operates on raw octets with no request semantics, headers, or framing above the mux layer.
 - **vs. SSH connection protocol ([RFC 4254](https://www.rfc-editor.org/rfc/rfc4254))**: SSH requires a `channel-open` request per stream that names the service and destination, adding a round-trip before any payload can flow and imposing per-stream framing overhead; multiplexd has no channel requests, no per-stream negotiation, and no service-layer framing — the target is fixed at session configuration time.
 
-See [doc/spec.md](doc/spec.md) for the full wire protocol and state-machine specification.
-
-### Implementation
-
-The design prioritises transparent TCP semantics (full half-close support, session resumption invisible to applications), inter-stream fairness (DRR scheduling), and coexistence of bulk and interactive streams without latency inflation.
-
 | Feature                    | multiplexd                                                                       | grpc-go streaming                                                                                         | OpenSSH port forwarding                                                    |
 | -------------------------- | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | **Stream model**           | Raw byte sequences; fixed 8-byte header                                          | One RPC call per stream; HPACK headers                                                                    | Named channel; `SSH_MSG_CHANNEL_DATA` frames                               |
@@ -106,6 +118,12 @@ The design prioritises transparent TCP semantics (full half-close support, sessi
 | **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                                                      | None                                                                       |
 | **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                                             | Re-execs master; existing child processes drains naturally                 |
 | **Observability**          | Health, stats, Prometheus metrics (built-in; no code changes)                    | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors (requires instrumentation) | None                                                                       |
+
+See [doc/spec.md](doc/spec.md) for the full wire protocol and state-machine specification.
+
+### Implementation
+
+The design prioritises transparent TCP semantics (full half-close support, session resumption invisible to applications), inter-stream fairness (DRR scheduling), and coexistence of bulk and interactive streams without latency inflation.
 
 See [doc/impl.md](doc/impl.md) for runtime topology, send/receive paths, and maintainer-facing invariants.
 
@@ -153,7 +171,7 @@ Generated files: `<name>-cert.pem` and `<name>-key.pem`.
 
 ## Configuration
 
-Configuration files are JSON objects. At least one of `mux_listen`, `mux_connect`, or `identity.mux_connect` must be present. The optional `type` field, when present, must be `application/x-multiplexd-config; version=1`. See [`conf_schema.json`](conf_schema.json) for the complete reference, including options, types, defaults, and fixed validation ranges.
+Configuration files are JSON objects. At least one of `mux_listen`, `mux_connect`, or `identity.mux_connect` must be present. The optional `type` field, when present, must be `application/x-multiplexd-config; version=1`. See [`conf_schema.json`](src/conf_schema.json) for the complete reference, including options, types, defaults, and fixed validation ranges.
 
 Because JSON has no comments, multiplexd ignores any key whose name begins with `-`. The sample [`client.json`](client.json) and [`server.json`](server.json) files use this to carry template-only tuning notes such as `-mux`; these keys are skipped at load time and do not affect the running configuration.
 
@@ -331,7 +349,6 @@ Returns metrics in Prometheus exposition format, including cumulative counters a
 
 Required:
 - libev (>= 4.31)
-- json-c (>= 0.15)
 
 Recommended (can be disabled by `USE_TLS_LIBRARY=none`); one of:
 - OpenSSL >= 3.0
@@ -366,25 +383,28 @@ cmake -DUSE_TLS_LIBRARY=none ..
 
 For common in-tree workflows, [`m.sh`](m.sh) wraps configure/build/test steps from the repository root:
 
-- `./m.sh d` builds a debug configuration with sanitizers and threads enabled, then runs `ctest`
-- `./m.sh r` rebuilds a release configuration with threads enabled
+- `./m.sh gen` regenerates the C sources derived from JSON schemas (`*.gen.c` / `*.gen.h`); the generated files are committed to the repository, so builds without Python 3 are unaffected unless the schemas change
+- `./m.sh d` rebuilds a debug configuration with sanitizers enabled, then runs `ctest`
+- `./m.sh r` rebuilds a release configuration
 - `./m.sh posix` rebuilds with `FORCE_POSIX=ON`
 - `./m.sh c` removes generated build artifacts
+- `./m.sh` builds the existing configuration
 
 See the script for the full preset list, including clang, cross, min-size, and profiling builds.
 
 ### Build Options
 
-| Option              | Default | Description                                                      |
-| ------------------- | ------- | ---------------------------------------------------------------- |
-| `USE_TLS_LIBRARY`   | auto    | TLS library to use (`auto`, `openssl`, `mbedtls`, `none`)        |
-| `BUILD_STATIC`      | OFF     | Build a static executable (incompatible with sanitizers/systemd) |
-| `BUILD_PIE`         | OFF     | Build a position-independent executable                          |
-| `LINK_STATIC_LIBS`  | OFF     | Link against static libraries                                    |
-| `ENABLE_SANITIZERS` | OFF     | Enable address/leak/undefined sanitizers (`BUILD_STATIC=OFF`)    |
-| `ENABLE_SYSTEMD`    | OFF     | Enable systemd state notify (`BUILD_STATIC=OFF`)                 |
-| `ENABLE_THREADS`    | OFF     | Enable multithread offloading                                    |
-| `FORCE_POSIX`       | OFF     | Use POSIX.1 APIs only                                            |
+| Option               | Default | Description                                                      |
+| -------------------- | ------- | ---------------------------------------------------------------- |
+| `USE_TLS_LIBRARY`    | auto    | TLS library to use (`auto`, `openssl`, `mbedtls`, `none`)        |
+| `BUILD_STATIC`       | OFF     | Build a static executable (incompatible with sanitizers/systemd) |
+| `BUILD_PIE`          | OFF     | Build a position-independent executable                          |
+| `LINK_STATIC_LIBS`   | OFF     | Link against static libraries                                    |
+| `ENABLE_SANITIZERS`  | OFF     | Enable address/leak/undefined sanitizers (`BUILD_STATIC=OFF`)    |
+| `ENABLE_SYSTEMD`     | OFF     | Enable systemd state notify (`BUILD_STATIC=OFF`)                 |
+| `ENABLE_THREADS`     | OFF     | Enable multithread offloading                                    |
+| `ENABLE_ALLOC_CACHE` | ON      | Enable allocation caching and pooling                            |
+| `FORCE_POSIX`        | OFF     | Use POSIX.1 APIs only                                            |
 
 ### Developer Scripts
 
@@ -430,6 +450,5 @@ Sending SIGHUP reloads the configuration file and drains all existing sessions: 
 
 Thanks to:
 - [libev](http://software.schmorp.de/pkg/libev.html)
-- [json-c](https://github.com/json-c/json-c)
 - [OpenSSL](https://www.openssl.org/)
 - [mbedTLS](https://github.com/Mbed-TLS/mbedtls)

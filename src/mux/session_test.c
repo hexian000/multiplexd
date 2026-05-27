@@ -460,8 +460,8 @@ static int setup_handshake_fixture(struct session_fixture *restrict fx)
 	ev_timer_init(
 		&fx->ss.w_connect_timeout, session_test_timer_cb, 0.0, 0.0);
 	fx->ss.w_connect_timeout.data = &fx->ss;
-	ev_timer_init(&fx->ss.w_ping_timeout, session_test_timer_cb, 0.0, 5.0);
-	fx->ss.w_ping_timeout.data = &fx->ss;
+	ev_timer_init(&fx->ss.w_timeout, session_test_timer_cb, 0.0, 5.0);
+	fx->ss.w_timeout.data = &fx->ss;
 	ev_timer_init(&fx->ss.w_keepalive, session_test_timer_cb, 0.0, 5.0);
 	fx->ss.w_keepalive.data = &fx->ss;
 	ev_timer_init(&fx->ss.w_send_timeout, session_test_timer_cb, 0.0, 5.0);

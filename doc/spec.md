@@ -959,9 +959,10 @@ The gate is *open* when the unacked list length is strictly less than the cap
 (C), and *closed* when it equals or exceeds C.  If no cap is configured, the
 gate is always open and no stalling occurs.
 
-When the gate is closed, the endpoint MUST NOT transmit any non-stream-0 frame
-except RST.  The gate reopens, and normal transmission resumes, as soon as
-incoming session ACKs reduce the unacked list length to strictly less than C.
+When the gate is closed, the endpoint MUST NOT transmit new PUSH frames for any
+non-stream-0 stream.  The gate reopens, and normal PUSH transmission resumes,
+as soon as incoming session ACKs reduce the unacked list length to strictly less
+than C.
 
 The following frames are exempt from the gate and MUST NOT be stalled
 regardless of gate state:
@@ -969,17 +970,23 @@ regardless of gate state:
 -  All stream-0 frames: keepalive probes (PROBE), RTT probes (PING and PONG),
    and session ACKs.
 -  RST frames for any stream.
+-  ACK frames (credit grants) and FIN frames (stream half-close) for any
+   non-stream-0 stream.
 
 Stream-0 frames are exempt because they carry the session ACKs that unblock the
 stalled sender and the RTT probes that maintain session liveness.  RST frames
 are exempt because streams must always be abortable regardless of gate state.
+ACK and FIN frames are exempt so that the peer can continue delivering data to
+us and streams can complete their close handshake while PUSH transmission is
+stalled; without them the peer's receive pipeline and stream lifecycle would
+stall independently of the session window condition.
 
 The send-stall gate operates at the session level and is independent of the
-per-stream credit model (Section 6.1).  Transmitting a non-RST non-stream-0
-frame requires both conditions to hold: the stream MUST have available
-per-stream credit AND the gate MUST be open.  A stream with available credit
-may still be blocked at the session level; conversely, opening the gate does
-not grant per-stream credit.
+per-stream credit model (Section 6.1).  Transmitting a PUSH frame for a
+non-stream-0 stream requires both conditions to hold: the stream MUST have
+available per-stream credit AND the gate MUST be open.  A stream with available
+credit may still be blocked at the session level; conversely, opening the gate
+does not grant per-stream credit.
 
 ### 6.3.  Receiver State
 

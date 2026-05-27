@@ -67,7 +67,7 @@ tunnel connect the process to the mux core; session is the coordination
 object; dispatch, sched, handshake, estimator, and wire each own one slice of
 behavior but coordinate only through session and stream state.
 
-### 1.2 Where Control Lives
+### 1.2 Control Ownership by Subsystem
 
 | Question                                                  | Owning code            |
 | --------------------------------------------------------- | ---------------------- |
@@ -84,7 +84,7 @@ behavior but coordinate only through session and stream state.
 The public mux API is intentionally thin. Most entry points schedule or forward
 work into session and stream internals rather than owning policy themselves.
 
-| Surface                            | Hidden behavior                                                                                                 |
+| Surface                            | Underlying Behavior                                                                                             |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `mux_new` / `mux_close`            | Construct and finally release the session coordination object, including watchers, queues, and counters wiring. |
 | `mux_start` / `mux_attach_fd`      | Choose between accepted-session handshake, outbound connect, or resume re-entry.                                |
@@ -99,15 +99,15 @@ threading rules live in §20.
 
 ## 3. Runtime State Carriers
 
-| Object  | Owns                                                                                                                                                              | Non-obvious consequence                                                                                                                       |
+| Object  | Owns                                                                                                                                                              | Implicit Consequence                                                                                                                          |
 | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | Session | transport fd/TLS state, session sendbuf, fixed receive ring, ctrlbuf, unacked list, retransmit cursor, stream table, ready queue, timers, optional stats pointers | It is the only place where dispatch, sched, handshake, estimator, and wire meet; none of those submodules owns transport state independently. |
-| Stream  | send queue, grow-on-demand receive ring, flow-control counters, half-close/reset flags, local I/O mode, coalescing membership                                     | A stream can be logically closed before it disappears from the table; tombstone retention keeps late traffic deterministic.                   |
+| Stream  | send queue, receive ring sized by `recv_window`, flow-control counters, half-close/reset flags, local I/O mode, coalescing membership                             | A stream can be logically closed before it disappears from the table; tombstone retention keeps late traffic deterministic.                   |
 
-State enums are defined in `session.h` and `stream.h`; the diagrams below keep
-only the transitions whose runtime coupling matters elsewhere in this document.
+State enums are defined in `session.h` and `stream.h`; the diagrams below retain
+only the transitions whose runtime coupling is referenced elsewhere in this document.
 
-## 4. State Progression That Matters
+## 4. State Transition Reference
 
 ### 4.1 Session Progression
 
@@ -148,6 +148,12 @@ Entering `SESSION_SUSPENDED` is observable on both roles: dialed and accepted
 sessions both emit `MUX_EVENT_SUSPENDED`, while reconnect policy remains a
 tunnel-layer decision.
 
+One additional entry into `SESSION_SUSPENDED` is not shown in the diagram: a
+client session (`!accepted`) that has already received a `session_id` from the
+server may transition directly from `SESSION_HANDSHAKE` to `SESSION_SUSPENDED`
+on transport error. This preserves streams and the unacked list for replay even
+if the session was never fully established.
+
 ### 4.2 Stream Progression
 
 ```mermaid
@@ -179,11 +185,11 @@ stateDiagram-v2
 ```
 
 For non-INIT streams, `STREAM_CLOSED` is a protocol-visible tombstone rather
-than immediate removal. That delayed cleanup is what lets dispatch suppress
-duplicate late traffic without maintaining a second retired-stream map.
+than immediate removal. The delayed-cleanup policy allows dispatch to suppress
+duplicate late traffic without maintaining a separate retired-stream map.
 
-The next two sequences keep only the places where state labels hide important
-scheduler or callback handoffs: active open and graceful close.
+The following two sequence diagrams document the scheduler and callback handoffs
+at the key state transitions: active open and graceful close.
 
 ```mermaid
 sequenceDiagram
@@ -237,7 +243,7 @@ sequenceDiagram
 
 ## 5. libev Watcher Topology
 
-| Owner                | Watcher                 | Drives                                               | Coupling that matters                                                                                                                                                                                                    |
+| Owner                | Watcher                 | Drives                                               | Runtime Coupling                                                                                                                                                                                                         |
 | -------------------- | ----------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Session              | `w_socket`              | transport read/write                                 | gated by `rx_open` and `tx_pending` rather than watcher churn                                                                                                                                                            |
 | Session              | `w_timeout`             | activity timeout                                     | participates in hard teardown paths                                                                                                                                                                                      |
@@ -256,38 +262,38 @@ sequenceDiagram
 | Server               | `w_async` (threads)     | cross-thread event relay                             | drains the server-side dispatcher queue after tunnel-to-server async relay                                                                                                                                               |
 
 Per-stream coalescing uses `delay_ticks` and `delay_pending` flags instead of
-per-stream timers. That design keeps all delayed-grant state under the single
+per-stream timers, keeping all delayed-grant state under the single
 session-level `w_coalesce` clock.
 
 ### 5.1 Watcher Coupling Flags
 
-| Flag            | Purpose                                                                            |
-| --------------- | ---------------------------------------------------------------------------------- |
-| `rx_open`       | gates `EV_READ` on `w_socket`; cleared on transport EOF or error                   |
-| `tx_pending`    | gates `EV_WRITE` on `w_socket`; set when sendbuf or oobbuf has frames to flush     |
-| `is_ready`      | marks DRR ready-queue membership                                                   |
-| `lp_ready`      | marks low-priority (EV_IDLE lifecycle) queue membership for INIT/CLOSED processing |
-| `delay_pending` | marks membership in the shared coalescing delay list                               |
-| `nagle_flush`   | one-shot small-frame bypass after a delay-list expiry                              |
+| Flag            | Purpose                                                                                                                                                                          |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rx_open`       | gates `EV_READ` on `w_socket`; cleared on transport EOF or error                                                                                                                 |
+| `tx_pending`    | gates `EV_WRITE` on `w_socket`; set when sendbuf or oobbuf has frames to flush; also set by TCP FIN or TLS `close_notify` receipt to wake `send_cb` into the graceful-close path |
+| `is_ready`      | marks DRR ready-queue membership                                                                                                                                                 |
+| `lp_ready`      | marks low-priority (EV_IDLE lifecycle) queue membership for INIT/CLOSED processing                                                                                               |
+| `delay_pending` | marks membership in the shared coalescing delay list                                                                                                                             |
+| `nagle_flush`   | one-shot small-frame bypass after a delay-list expiry                                                                                                                            |
 
-## 6. Hello Handling as Implemented
+## 6. Hello Handshake Processing
 
 The wire format is specified in [spec.md](spec.md); the implementation-specific
 part is what the hello changes in runtime state.
 
-| Decision point              | Implementation consequence                                                                                                        |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Stream 0 route              | Hello, keepalive, and session ACK processing bypass the normal stream table.                                                      |
-| Unknown hello members       | Parsed permissively; only the known extensions change runtime behavior.                                                           |
-| `extensions.reject_inbound` | Latches `peer_rejects_inbound_streams`, which blocks future active opens.                                                         |
-| Initial ClientHello         | Server assigns the shared `session_id` and completes first-establishment handshake.                                               |
-| Resume ClientHello          | `on_resume` may swap the transient accepted session for a suspended one that steals the new transport and replays unacked frames. |
-| ServerHello on the client   | Matching `session_id` + `resume_seq` confirms resume; otherwise the client drops old streams and adopts the new session identity. |
-| Handshake completion        | Fires `MUX_EVENT_ESTABLISHED` or `MUX_EVENT_RESUMED` and re-arms steady-state watchers.                                           |
+| Decision point                        | Implementation consequence                                                                                                                                                                                                                                                |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stream 0 route                        | Hello, keepalive, and session ACK processing bypass the normal stream table.                                                                                                                                                                                              |
+| `extensions.reject_inbound`           | Latches `peer_rejects_inbound_streams`, which blocks future active opens.                                                                                                                                                                                                 |
+| Initial ClientHello                   | Server assigns the shared `session_id` and completes first-establishment handshake.                                                                                                                                                                                       |
+| Resume ClientHello                    | `on_resume` may swap the transient accepted session for a suspended one that steals the new transport and replays unacked frames.                                                                                                                                         |
+| ServerHello on the client             | Matching `session_id` + `resume_seq` confirms resume; otherwise the client drops old streams and adopts the new session identity.                                                                                                                                         |
+| TLS `close_notify` received on client | Clears `has_session_id`; next reconnect starts a fresh session. Contrast: a plain TCP FIN retains `has_session_id` so resume is attempted. `close_notify` signals an explicit server-side teardown (e.g. version mismatch); a bare TCP FIN may be a dirty transport loss. |
+| Handshake completion                  | Fires `MUX_EVENT_ESTABLISHED` or `MUX_EVENT_RESUMED` and re-arms steady-state watchers.                                                                                                                                                                                   |
 
-The two sequence diagrams stay separate because first establishment and resume
-have different ownership transfers even though both end in the same steady
-state.
+The two sequence diagrams are kept separate because first establishment and resume
+involve different ownership transfers, even though both conclude in the same
+steady state.
 
 ```mermaid
 sequenceDiagram
@@ -334,6 +340,13 @@ On the normal transport-loss path, both peers have already emitted
 accepted side has not noticed the break yet, `session_resume_transport()` forces
 it through `SESSION_SUSPENDED` before stealing the new fd.
 
+Resume replay may retransmit a prior SYN|ACK for a stream that has already
+reached `STREAM_ESTABLISHED` or `STREAM_FIN_WAIT`. `dispatch_by_stream()` detects
+this: it silently skips the SYN semantics (no second callback, no state
+transition) but still applies the piggybacked ACK credit. This makes retransmit
+replay safe even across streams whose opening handshake completed before the
+transport was lost.
+
 ## 7. Inbound Data Path
 
 ```mermaid
@@ -356,11 +369,10 @@ flowchart LR
   M -- direct --> O[mux_stream_recv]
 ```
 
-| Hidden rule                                                                                                                    | Why it matters                                                                                         |
-| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| The session keeps one fixed receive ring of `8 * MUX_FRAME_SIZE`; compaction happens only when contiguous tail space runs out. | Receive-side work stays bounded and frame parsing does not imply per-frame allocation.                 |
-| Unknown non-zero streams split into opening SYN, retired-stream traffic, and namespace violations.                             | Valid late traffic gets one terminal RST; session-level violations still close the whole session.      |
-| Local delivery happens after protocol buffering.                                                                               | Socket-attached and direct I/O share the same stream state and differ only at the final consumer edge. |
+| Design Constraint                                                                                                              | Significance                                                                                      |
+| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| The session keeps one fixed receive ring of `8 * MUX_FRAME_SIZE`; compaction happens only when contiguous tail space runs out. | Receive-side work stays bounded and frame parsing does not imply per-frame allocation.            |
+| Unknown non-zero streams split into opening SYN, retired-stream traffic, and namespace violations.                             | Valid late traffic gets one terminal RST; session-level violations still close the whole session. |
 
 ## 8. Outbound Data Path
 
@@ -381,12 +393,13 @@ flowchart LR
   K --> L[session ACK trim or resume replay]
 ```
 
-| Hidden rule                                                                        | Why it matters                                                                                                       |
-| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Socket-attached reads and `mux_stream_send()` feed the same per-stream send queue. | Local I/O mode does not change fairness or flow-control semantics.                                                   |
-| `sched_next_data()` applies state, send credit, and Nagle as one dequeue gate.     | A stalled sender can be blocked by any of the three; there is no single “sendable” bit.                              |
-| The session sendbuf holds at most one frame at a time.                             | Transport backpressure interleaves with scheduling decisions and prevents a hot stream from monopolising the socket. |
-| `w_send_timeout` matters only while that single frame remains pending.             | Send-stall detection tracks transport progress, not queue depth.                                                     |
+| Design Constraint                                                                                                                                                  | Significance                                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| Socket-attached reads and `mux_stream_send()` feed the same per-stream send queue.                                                                                 | Local I/O mode does not change fairness or flow-control semantics.                                                     |
+| `sched_next_data()` applies state, send credit, and Nagle as one dequeue gate.                                                                                     | A stalled sender can be blocked by any of the three; there is no single “sendable” bit.                                |
+| The session sendbuf holds at most one frame at a time.                                                                                                             | Transport backpressure interleaves with scheduling decisions and prevents a hot stream from monopolising the socket.   |
+| `w_send_timeout` matters only while that single frame remains pending.                                                                                             | Send-stall detection tracks transport progress, not queue depth.                                                       |
+| `session_eager_flush()` is called from socket-mode `recv_cb()` after reading local data; if no transport I/O is already in flight it inlines `send_cb()` directly. | Avoids one libev event loop iteration on the response path, halving round-trip latency for request/response workloads. |
 
 ## 9. Scheduler and Control Batching Internals
 
@@ -399,14 +412,23 @@ flowchart LR
 
 When `send_stalled` is set, `EV_WRITE` stops scheduling fresh payload but still
 flushes sendbuf, retransmit traffic, stream-0 control, and per-stream ACK/FIN
-so the peer can drain the bottleneck.
+so the peer can drain the bottleneck. The `oobbuf` queue (PROBE/PING/PONG
+frames) is also exempt from `send_stalled`: the BDP estimator continues to
+probe even during window exhaustion, which is exactly when an accurate BDP
+reading is most needed.
+
+Retransmit replay sends only PUSH data frames. `session_track_sent()` removes
+stream-0 control frames (hello, standalone ACK, keepalive) from the unacked
+list immediately after they are flushed to the wire, so they never appear in the
+replay sequence. Replaying expired session-management traffic to a resumed peer
+with fresh session state would be a protocol error.
 
 ### 9.2 Ready Queue Fairness Model (DRR)
 
 | Step | Action                                                                                                                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------- |
 | 1    | Use `drr_active` if present; otherwise dequeue the next ready stream.                                                         |
-| 2    | On the first successful send in a round, add one quantum (`MUX_MAX_PAYLOAD_SIZE`) to `deficit`.                               |
+| 2    | On the first dequeue of the stream in a round, add one quantum (`MUX_MAX_PAYLOAD_SIZE`) to `deficit`.                         |
 | 3    | Send one PUSH frame and subtract its payload length from `deficit`.                                                           |
 | 4    | If the next queued frame still fits in `deficit`, keep the stream in `drr_active`; otherwise re-enqueue it after `round_end`. |
 | 5    | Reset `deficit` when the stream drains; emit pending ACK/FIN after payload selection.                                         |
@@ -419,7 +441,7 @@ so the peer can drain the bottleneck.
 
 ### 9.3 Control Packing and Tombstones
 
-| Mechanism        | Rule                                                                                            | Why it exists                                                                                                      |
+| Mechanism        | Rule                                                                                            | Rationale                                                                                                          |
 | ---------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | `ctrlbuf`        | Pack control-only headers in 8-byte units; flush to sendbuf when full.                          | Standalone ACK, FIN, RST, and keepalive traffic share one batching path.                                           |
 | Tombstone linger | Non-INIT streams remain in the table for `MUX_TOMBSTONE_PERIOD_S` after `stream_mark_closed()`. | Dispatch can suppress duplicate late traffic and answer at most one final RST without a second retired-stream map. |
@@ -447,7 +469,7 @@ flowchart LR
 
 ### 10.1 Counter Roles
 
-| Counter set                     | Meaning                                                          | Hidden invariant                                                                             |
+| Counter set                     | Meaning                                                          | Implicit Invariant                                                                           |
 | ------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `send_window`, `bytes_sent`     | cumulative peer grant vs cumulative payload sent                 | Send credit is tracked cumulatively; the implementation does not reason in per-frame grants. |
 | `queued_send_bytes`             | payload accepted from the local producer but not yet transmitted | Read credit subtracts queued bytes as well as transmitted bytes.                             |
@@ -455,9 +477,15 @@ flowchart LR
 | `recv_window`, `buffered_bytes` | receive budget vs receive memory currently occupied              | Memory pressure scales grants without rewriting already-buffered data.                       |
 | `grant_sent`, `bytes_received`  | already-advertised receive credit vs cumulative bytes delivered  | The next grant is derived from the delta, not from current buffer occupancy alone.           |
 
-The least obvious gate is `stream_read_credit_avail()`: local socket reads stop
+The most subtle gate is `stream_read_credit_avail()`: local socket reads stop
 when `queued_send_bytes + bytes_sent` would exceed peer credit, so the sender
 cannot over-admit data into `send_queue`.
+
+On the receive side, `stream_recv_copy()` tolerates up to one
+`MUX_MAX_PAYLOAD_SIZE` of inbound data beyond `recv_window`. Credit is issued
+in `MUX_WINDOW_UNIT` chunks, so a peer may have slightly more credit outstanding
+than the current window value; the tolerance absorbs this quantization instead
+of triggering a spurious `FLOW_CONTROL_ERROR`.
 
 ### 10.2 Critical Gating Rule
 
@@ -573,17 +601,20 @@ valid_cycle = sample >= 2 * MUX_MAX_PAYLOAD_SIZE
 window_limited = sample + MUX_MAX_PAYLOAD_SIZE >= cycle_window_bytes
 rtt_sample = (now_ns - probe_sent_ns) / 1e9
 bw_sample = sample / rtt_sample
-target = clamp(max(sample_max, bw_max * rtt_min), MIN_BDP, BDP_LIMIT)
+bdp = max(sample_max, bw_max * rtt_min)              -- raw; unclamped
+effective_bdp = clamp(wndmax(bdp, BDP_WND_NS), BDP_MIN, BDP_MAX)
 floor_frames = MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT
-window_bytes = bdp + bdp / 4
+window_bytes = effective_bdp + effective_bdp / 4
 window_frames = max(floor(window_bytes / MUX_MAX_PAYLOAD_SIZE), floor_frames)
 session_window = window_frames
 stream_window  = window_frames
 ```
 
-`bdp` is the pure physical BDP with no headroom. The fixed headroom fraction
-(`bdp / 4`) is added exclusively in `session_update_window` so that the two
-sites never independently amplify it.
+`bdp` is the raw unclamped physical BDP estimate. `effective_bdp` applies
+`BDP_MIN`/`BDP_MAX` clamping and a windowed maximum filter to smooth
+short-term fluctuations before the windows are updated. The fixed headroom
+fraction (`effective_bdp / 4`) is added exclusively in `session_update_window`
+so that the two sites never independently amplify it.
 
 ### 12.2 Probe Lifecycle
 
@@ -601,11 +632,11 @@ completed by PONG or by timeout detection on the next payload.
 
 **`STARTUP`**
 
-| Condition                           | Action                                           | Next phase |
-| ----------------------------------- | ------------------------------------------------ | ---------- |
-| `!valid_cycle && probe_was_stalled` | `bdp = min(bdp + cycle_window_bytes, BDP_LIMIT)` | `STARTUP`  |
-| `valid_cycle && window_limited`     | `bdp = min(bdp + sample, BDP_LIMIT)`             | `STARTUP`  |
-| `valid_cycle && !window_limited`    | `saturated_rounds = 0`                           | `TRACK`    |
+| Condition                           | Action                         | Next phase |
+| ----------------------------------- | ------------------------------ | ---------- |
+| `!valid_cycle && probe_was_stalled` | `bdp += cycle_window_bytes`    | `STARTUP`  |
+| `valid_cycle && window_limited`     | `bdp += sample`                | `STARTUP`  |
+| `valid_cycle && !window_limited`    | `saturated_rounds = 0`         | `TRACK`    |
 
 **`TRACK`**
 
@@ -614,7 +645,7 @@ completed by PONG or by timeout detection on the next payload.
 | `!valid_cycle`                                                    | no change to `bdp`; `bw_wnd`/`sample_wnd` age naturally                                  | `TRACK`              |
 | `valid_cycle`, rtt_min aged, `rtt_sample >= INFLATE_HI * rtt_min` | increment `inflated_rounds`; when it reaches `INFLATE_ROUNDS`, force-age and reset `bdp` | `TRACK`              |
 | `valid_cycle`, rtt_min aged, `rtt_sample <= INFLATE_LO * rtt_min` | clear `inflated_rounds`                                                                  | `TRACK`              |
-| `valid_cycle` (any ratio)                                         | `bdp = clamp(max(sample_max, bw_max * rtt_min), MIN_BDP, BDP_LIMIT)` (bidirectional)     | `TRACK`              |
+| `valid_cycle` (any ratio)                                         | `bdp = max(sample_max, bw_max * rtt_min)` (raw; `effective_bdp` gets clamped windowed max) | `TRACK`              |
 | `valid_cycle && window_limited`                                   | increment `saturated_rounds`; if it reaches 2, re-probe aggressively                     | `TRACK` or `STARTUP` |
 | `valid_cycle && !window_limited`                                  | `saturated_rounds = 0`                                                                   | `TRACK`              |
 
@@ -624,8 +655,8 @@ and `saturated_rounds`. The guard `now - rtt_wnd[0].t >= RTT_WND_NS / 4`
 skips the inflation check until `rtt_min` has been calibrated for at least
 75 s, preventing false force-ages during warm-up.
 
-Constants: `BDP_LIMIT = UINT16_MAX * MUX_WINDOW_UNIT` (≈ 1 GiB; single
-WINDOW_UPDATE grant encoding limit), `MIN_BDP = MUX_INITIAL_SEND_WINDOW`,
+Constants: `BDP_MAX = UINT16_MAX * MUX_WINDOW_UNIT` (≈ 1 GiB; single
+WINDOW_UPDATE grant encoding limit), `BDP_MIN = MUX_INITIAL_SEND_WINDOW`,
 `RTT_WND_NS = 300 s`, `BW_WND_NS = 600 s`,
 `INFLATE_HI = 1.5`, `INFLATE_LO = 1.2`, `INFLATE_ROUNDS = 3`.
 
@@ -636,9 +667,9 @@ WINDOW_UPDATE grant encoding limit), `MIN_BDP = MUX_INITIAL_SEND_WINDOW`,
 | Manual mode               | The estimator is inert; configured frame counts are used as-is.                                                                                                                                                                                               |
 | Automatic mode            | Mixed config is normalised away; effective windows start at `floor_frames` and track the BDP bidirectionally.                                                                                                                                                 |
 | `session_update_window()` | Both `session_window` and `stream_window` are set to `window_frames`; live streams expand `recv_window` immediately on grow; on shrink, each stream's `recv_window` is lazily synced down by `stream_check_ack` once `buffered_bytes + outstanding ≤ target`. |
-| `estimator_stop()`        | Reset phase, RTT/BW filters, probe state, and rate-limit timestamp; bump `epoch_ns`; keep the current effective windows in place across reconnect.                                                                                                            |
+| `estimator_stop()`        | Reset phase, RTT/BW filters, and probe state; bump `epoch_ns`; preserve `effective_bdp` and seed `bdp_wnd` with it so the window is maintained across reconnect until new measurements arrive.                                                              |
 
-When `bdp` decreases, `session_window` and `stream_window` follow it down.
+When `effective_bdp` decreases, `session_window` and `stream_window` follow it down.
 Each stream's `recv_window` is lazily synced to the new target inside
 `stream_check_ack`: the shrink is applied as soon as
 `buffered_bytes + outstanding ≤ target`, where `outstanding = grant_sent -
@@ -664,9 +695,9 @@ conditions that still escalate to whole-session failure.
 
 ### 14.1 Session-Fatal Conditions
 
-| Trigger                            | Session-side result                                                                                                                                                         |
-| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Parse failure or transport failure | `session_reset()` transitions the session to `SESSION_CLOSED`, stops active watchers, tears down streams, drains sendbuf/recvbuf/ctrlbuf, and closes TLS / transport state. |
+| Trigger                            | Session-side result                                  |
+| ---------------------------------- | ---------------------------------------------------- |
+| Parse failure or transport failure | `session_reset()` → `SESSION_CLOSED`; non-resumable. |
 
 ### 14.2 Stream Abort Behavior
 
@@ -686,8 +717,8 @@ conditions that still escalate to whole-session failure.
 | Valid non-SYN frame for an unknown non-zero stream | treat it as late traffic for a retired stream id, emit one terminal RST, remember that the id was already reset, then drop later duplicates silently |
 | Late frame for an already closed live stream       | drop it in `dispatch_by_stream()` without reopening stream state                                                                                     |
 
-The point of this split is to keep the session alive during stream teardown
-while still telling the peer that the stream id is no longer live.
+This split keeps the session alive during stream teardown while still informing
+the peer that the stream id is no longer live.
 
 ```mermaid
 sequenceDiagram
@@ -742,9 +773,20 @@ a retired stream is handled by the single-RST path in Section 14.3 instead.
 | Client idle timeout enabled                                                         | tunnel layer  | suppress attempt 0 and automatic CLOSED-time backoff; reconnect becomes demand-triggered from `open_stream_task()`                                                                                                     |
 | Stream-id exhaustion                                                                | session layer | `session_open_stream()` returns `NULL`; session stays up and the caller retries after old streams leave the parity space                                                                                               |
 
-## 16. Non-Obvious Invariants for Maintainers
+### 15.1 Inbound Session Admission Control
 
-| Invariant                                                                                                                      | Why it matters                                                                                                                                                      |
+The mux listener applies a three-layer guard (`is_startup_limited()`) before
+creating an accepted tunnel:
+
+| Layer | Config field                                 | Behaviour                                                                                                                                                                                                            |
+| ----- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | `max_sessions`                               | Hard cap on fully established sessions; excess connections are rejected immediately.                                                                                                                                 |
+| 2     | `startup_limit_full`                         | Hard cap on half-open sessions; protects against SYN-flood-style connection floods.                                                                                                                                  |
+| 3     | `startup_limit_start` / `startup_limit_rate` | Probabilistic shedding: once half-open count exceeds `startup_limit_start`, new connections are admitted with probability `1 − startup_limit_rate`. Provides graceful load reduction before the hard cap is reached. |
+
+## 16. Implementation Invariants for Maintainers
+
+| Invariant                                                                                                                      | Significance                                                                                                                                                        |
 | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Scheduler cycle tail capture preserves the fairness boundary.                                                                  | Re-enqueued streams must not slip back into the current round.                                                                                                      |
 | Read credit subtracts `queued_send_bytes` as well as transmitted bytes.                                                        | The local producer must not outrun peer credit by filling `send_queue` ahead of the wire.                                                                           |
@@ -825,15 +867,15 @@ and `mux_stream_attach` do not cross to the server loop.
 
 ### 20.2 Cross-Loop Paths
 
-| Path                         | Primitive                                                        | Blocking | Why it exists                                                    |
+| Path                         | Primitive                                                        | Blocking | Rationale                                                        |
 | ---------------------------- | ---------------------------------------------------------------- | -------- | ---------------------------------------------------------------- |
 | Server -> tunnel control     | `dispatcher + ev_async` via `t->disp` and `t->w_async`           | no       | start/config/open/shutdown must execute on the mux owner loop    |
 | Tunnel -> server event relay | `dispatcher + ev_async` via `srv->disp` and `srv->w_relay_async` | no       | session events must update server bookkeeping on the server loop |
 | Resume lookup                | direct callback + shared `accepted_mu`                           | yes      | handshake needs an immediate answer before it can continue       |
 | Final teardown               | `thrd_join()`                                                    | yes      | last lifetime fence before freeing tunnel resources              |
 
-Only resume lookup and final teardown block. Ordinary event delivery,
-including `MUX_EVENT_CLOSED`, is asynchronous.
+Resume lookup and final teardown are the only synchronous cross-thread operations.
+Ordinary event delivery, including `MUX_EVENT_CLOSED`, is asynchronous.
 
 ### 20.3 Server-to-Tunnel Control Path
 
@@ -994,3 +1036,22 @@ Each live session receives the updated settings and is marked draining before th
 ### 21.3 Asynchronous Reconnect
 
 Once a drained session closes, the normal reconnect path (§15) re-dials using the updated address and the new TLS context from the already-swapped config. Accepted sessions do not reconnect; they are removed from the session table on close.
+
+## 22. Shared Frame Pool
+
+All sessions share a single frame pool owned by the server and passed to every
+tunnel via a `mux_frame_allocator` pointer block. This avoids per-session
+allocation overhead on the hot send path.
+
+| Build mode      | Implementation | Notes                                                                     |
+| --------------- | -------------- | ------------------------------------------------------------------------- |
+| `WITH_THREADS`  | `mpmc_queue`   | Lock-free push/pop; up to 128 frames (~2 MiB) pooled across all sessions. |
+| Single-threaded | `mcache`       | LRU cache; same 128-frame capacity; no atomic overhead.                   |
+
+The `w_maintenance` timer reclaims one frame per second when the pool is above
+its low-water mark, bounding idle memory retention without churning allocation.
+
+Frame allocation on the send path can partially fail: `mux_stream_send()` chunks
+the caller's buffer into frames one at a time and returns the number of bytes
+actually enqueued, which may be less than requested if the pool is exhausted.
+Callers must check the return value and retry or back off accordingly.

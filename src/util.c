@@ -9,24 +9,18 @@
 #include "util.h"
 
 #include "math/rand.h"
-#include "os/clock.h"
+#include "net/addr.h"
 #include "os/signal.h"
-#include "utils/debug.h"
+#include "os/socket.h"
 #include "utils/slog.h"
 
 #include <ev.h>
-#include <grp.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #if WITH_TLS
 #include "tlsutil.h"
 #endif
-#include <pwd.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include <errno.h>
 #include <inttypes.h>
@@ -38,7 +32,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <threads.h>
 #include <time.h>
 
 void socket_notsent_lowat(const int fd, const int bytes)
@@ -121,4 +114,39 @@ void loadlibs(void)
 void unloadlibs(void)
 {
 	LOGD("library cleanup complete");
+}
+
+/* RFC 1035: Section 2.3.4 */
+#define FQDN_MAX_LENGTH ((size_t)(255))
+
+bool resolve_addr(
+	union sockaddr_max *restrict addr, const char *restrict addrstr,
+	const enum sa_resolve_type type)
+{
+	const size_t addrlen = strlen(addrstr);
+	ASSERT(addrlen < FQDN_MAX_LENGTH + sizeof(":65535"));
+	char buf[addrlen + 1];
+	memcpy(buf, addrstr, addrlen);
+	buf[addrlen] = '\0';
+	char *hoststr, *portstr;
+	if (!splithostport(buf, &hoststr, &portstr)) {
+		return false;
+	}
+	return sa_resolve(addr, hoststr, portstr, type, PF_UNSPEC);
+}
+
+bool resolve_bindaddr(
+	union sockaddr_max *restrict addr, const char *restrict addrstr,
+	const enum sa_resolve_type type)
+{
+	const size_t addrlen = strlen(addrstr);
+	ASSERT(addrlen < FQDN_MAX_LENGTH + sizeof(":65535"));
+	char buf[addrlen + 1];
+	memcpy(buf, addrstr, addrlen);
+	buf[addrlen] = '\0';
+	char *hoststr, *portstr;
+	if (!splithostport(buf, &hoststr, &portstr)) {
+		return false;
+	}
+	return sa_resolve_bind(addr, hoststr, portstr, type);
 }

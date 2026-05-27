@@ -38,16 +38,16 @@ struct proto_hello {
 	 * Present in ServerHello (always) and in ClientHello only on resume.
 	 * Absent in an initial ClientHello; check has_session_id before use. */
 	unsigned char session_id[MUX_SESSION_ID_LEN];
-	bool has_session_id;
 	/* recv_seq of the sender; 0 on an initial (non-resume) hello */
 	uint_least32_t resume_seq;
-	bool has_resume_seq;
-	/* extensions.reject_inbound (spec §5.2.3.1); default false */
-	bool reject_inbound;
-	/* extensions.identity (spec §5.2.3.2) */
-	bool has_identity;
 	/* Identity string claimed by the sender (NUL-terminated, max 255 chars) */
 	char identity[256];
+	bool has_session_id : 1;
+	bool has_resume_seq : 1;
+	/* extensions.reject_inbound (spec §5.2.3.1); default false */
+	bool reject_inbound : 1;
+	/* extensions.identity (spec §5.2.3.2) */
+	bool has_identity : 1;
 };
 
 /* Build and enqueue a hello frame; include resume_seq when resuming. */

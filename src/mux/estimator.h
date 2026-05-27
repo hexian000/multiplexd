@@ -9,6 +9,8 @@
 #ifndef MUX_ESTIMATOR_H
 #define MUX_ESTIMATOR_H
 
+#include "algo/wndfilter.h"
+
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -16,11 +18,6 @@
 
 struct mux_frame;
 struct mux_session;
-
-struct estimator_wnd_slot {
-	double val;
-	intmax_t t;
-};
 
 enum estimator_phase { EST_STARTUP, EST_TRACK };
 
@@ -39,22 +36,23 @@ struct estimator_ctx {
 	size_t sample;
 	/* Snapshot of session_window * MUX_WINDOW_UNIT taken at probe start. */
 	size_t cycle_window_bytes;
-	/* 3-slot windowed minimum RTT; [0].val is the current min, 0.0 = uninit. */
-	struct estimator_wnd_slot rtt_wnd[3];
-	/* 3-slot windowed maximum BW; [0].val is the current max, 0.0 = uninit. */
-	struct estimator_wnd_slot bw_wnd[3];
-	/* 3-slot windowed maximum sample size; [0].val is the max, 0.0 = uninit. */
-	struct estimator_wnd_slot sample_wnd[3];
-	/* Pure physical BDP estimate in bytes, with no headroom; 0 = none yet.
-	 * Headroom is added by session_update_window, not stored here. */
+	/* Windowed minimum RTT; get == 0 means uninitialised. */
+	struct wndfilter rtt_wnd;
+	/* Windowed maximum bandwidth (bytes/s). */
+	struct wndfilter bw_wnd;
+	/* Windowed maximum sample size (bytes). */
+	struct wndfilter sample_wnd;
+	/* Pure physical BDP estimate in bytes; 0 = none yet.
+	 * Not clamped; BDP_MIN/BDP_MAX are applied only when computing
+	 * effective_bdp. */
 	size_t bdp;
 	/* Estimator phase: STARTUP grows the window aggressively; TRACK refines
 	 * the BDP estimate using windowed BW and sample statistics. */
 	enum estimator_phase phase;
 	/* Consecutive window-limited rounds counted in TRACK phase. */
 	uint_least8_t saturated_rounds;
-	/* Consecutive valid cycles with rtt_sample >= INFLATE_HI * rtt_min;
-	 * reset to 0 when ratio drops below INFLATE_LO or rtt_min is not
+	/* Consecutive valid cycles with rtt_sample >= 3/2 * rtt_min (INFLATE_HI);
+	 * reset to 0 when ratio drops below 6/5 (INFLATE_LO) or rtt_min is not
 	 * yet aged past RTT_WND_NS/4. Triggers force-age at INFLATE_ROUNDS. */
 	uint_least8_t inflated_rounds;
 	bool ping_in_flight : 1;
@@ -62,6 +60,12 @@ struct estimator_ctx {
 	 * at the moment the probe PING was fired; used in STARTUP to detect
 	 * window exhaustion even when the sample is too small to be valid. */
 	bool probe_was_stalled : 1;
+	/* Windowed maximum BDP over BDP_WND_NS; fed by each completed PONG cycle.
+	 * Seeded with effective_bdp on session suspend; ages out after BDP_WND_NS. */
+	struct wndfilter bdp_wnd;
+	/* Windowed maximum BDP clamped to [BDP_MIN, BDP_MAX]; read by
+	 * session_update_window.  Preserved across session suspend/resume. */
+	size_t effective_bdp;
 };
 
 void estimator_init(struct mux_session *restrict ss);
@@ -69,7 +73,9 @@ void estimator_init(struct mux_session *restrict ss);
 /* Reset estimator and seed BDP; called when automatic sizing is first enabled. */
 void estimator_seed(struct mux_session *restrict ss, size_t bdp);
 
-/* Reset all estimator state; only epoch_ns is preserved to discard stale PONGs. */
+/* Reset probe/phase state for session reconnect.  effective_bdp and bdp_wnd
+ * are preserved so the window is maintained until a new estimate arrives.
+ * epoch_ns is bumped to discard stale PONGs from the previous transport. */
 void estimator_stop(struct mux_session *restrict ss);
 
 /* Accumulate inbound payload bytes; no-op when automatic sizing is disabled. */

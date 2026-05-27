@@ -692,6 +692,7 @@ static struct config *make_config(
 		.connect = connect_to ? strdup(connect_to) : NULL,
 		.mux =
 			{
+				.timeout = 30,
 				.ping_timeout = 5,
 				.keepalive = 1,
 				.send_timeout = 1,
@@ -701,7 +702,7 @@ static struct config *make_config(
 				.stream_window = 2,
 				.session_window = 256,
 			},
-		.mux_socket =
+		.mux_tcp =
 			{
 				.tcp_keepalive = true,
 				.tcp_nodelay = true,
@@ -710,7 +711,7 @@ static struct config *make_config(
 				.tcp_rcvbuf = 0,
 				.backlog = 16,
 			},
-		.local_socket =
+		.tcp =
 			{
 				.tcp_keepalive = true,
 				.tcp_nodelay = true,
@@ -1723,8 +1724,19 @@ T_DECLARE_CASE(test_server_config_reload)
 
 	char *const saved_type = fx.conf_a->type;
 	fx.conf_a->type = NULL;
-	const bool dump_ok = conf_dumpfile(fx.conf_a, tmp_path);
+	size_t dump_len;
+	char *dump_json = conf_dump(fx.conf_a, &dump_len);
 	fx.conf_a->type = saved_type;
+	bool dump_ok = false;
+	if (dump_json != NULL) {
+		FILE *dump_fp = fopen(tmp_path, "w");
+		if (dump_fp != NULL) {
+			dump_ok = fwrite(dump_json, 1, dump_len, dump_fp) ==
+				  dump_len;
+			(void)fclose(dump_fp);
+		}
+		free(dump_json);
+	}
 	if (!dump_ok) {
 		(void)unlink(tmp_path);
 		fixture_teardown(&fx);

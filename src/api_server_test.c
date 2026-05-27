@@ -102,6 +102,7 @@ static struct tunnel *make_established_tunnel(
 {
 	static const struct tunnel_callbacks cb = { 0 };
 	static const unsigned char session_id[MUX_SESSION_ID_LEN] = { 0 };
+	fx->conf.mux.timeout = 600;
 	fx->conf.mux.ping_timeout = 60;
 	fx->conf.mux.keepalive = 25;
 	fx->conf.mux.send_timeout = 15;
@@ -112,10 +113,11 @@ static struct tunnel *make_established_tunnel(
 	fx->conf.mux.max_halfopen = 16;
 	fx->conf.mux.nodelay = true;
 
+	struct mux_config mux_cfg = conf_get_mux(&fx->conf);
 	const struct tunnel_opts opts = {
 		.cb = &cb,
 		.data = NULL,
-		.mux_conf = &fx->conf.mux,
+		.mux_conf = &mux_cfg,
 		.pool = { api_test_alloc, api_test_free, NULL },
 		.fd = -1,
 		.id = session_id,
@@ -631,7 +633,6 @@ T_DECLARE_CASE(test_metrics_get)
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_sessions "));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_stream_open_total"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_stream_fastopen_total"));
-	T_EXPECT(resp_contains(rctx.buf, "multiplexd_bytes_total"));
 	T_EXPECT(resp_contains(
 		rctx.buf, "multiplexd_stream_establish_latency_seconds_count"));
 
@@ -850,8 +851,8 @@ T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 		make_established_tunnel(&fx, "peer-rtt", 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
-	/* 20 ms RTT — stored in seconds in the estimator window */
-	ss->estimator.rtt_wnd[0].val = 0.020;
+	/* 20 ms RTT — stored in nanoseconds in the estimator window */
+	wndfilter_reset(&ss->estimator.rtt_wnd, 0, INTMAX_C(20000000));
 	sl_rtt->tunnels = malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_rtt->tunnels != NULL);
 	sl_rtt->tunnels[0] = t1;
@@ -913,10 +914,10 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	/* rx_window = 2 * 16384 = 32768, tx_window = 4 * 16384 = 65536 */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_rx_window_bytes{identity=\"peer-win\"} 32768"));
+		"multiplexd_session_window_bytes{identity=\"peer-win\",direction=\"rx\"} 32768"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_tx_window_bytes{identity=\"peer-win\"} 65536"));
+		"multiplexd_session_window_bytes{identity=\"peer-win\",direction=\"tx\"} 65536"));
 
 	apifx_teardown(&fx);
 }
@@ -929,10 +930,8 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	}
 
 	fx.srv.started = clock_monotonic_ns() - 5 * 1000 * 1000 * 1000LL;
-	STORE_STAT(fx.srv.counters.traffic_byt_mux_recv, 2048);
-	STORE_STAT(fx.srv.counters.traffic_byt_mux_sent, 4096);
-	STORE_STAT(fx.srv.counters.traffic_byt_local_recv, 1024);
-	STORE_STAT(fx.srv.counters.traffic_byt_local_sent, 512);
+	fx.srv.counters.traffic_byt_mux_recv = 2048;
+	fx.srv.counters.traffic_byt_mux_sent = 4096;
 
 	struct resp_wait_ctx rctx1;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx1, REQ_STATS_POST);
@@ -942,13 +941,9 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	T_EXPECT(fx.srv.rate_tracker.is_set);
 	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uintmax_t)2048);
 	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uintmax_t)4096);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_local_recv, (uintmax_t)1024);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_local_sent, (uintmax_t)512);
 
-	STORE_STAT(fx.srv.counters.traffic_byt_mux_recv, 3072);
-	STORE_STAT(fx.srv.counters.traffic_byt_mux_sent, 6144);
-	STORE_STAT(fx.srv.counters.traffic_byt_local_recv, 1536);
-	STORE_STAT(fx.srv.counters.traffic_byt_local_sent, 768);
+	fx.srv.counters.traffic_byt_mux_recv = 3072;
+	fx.srv.counters.traffic_byt_mux_sent = 6144;
 	fx.srv.rate_tracker.timestamp =
 		clock_monotonic_ns() - 2 * 1000 * 1000 * 1000LL;
 
@@ -956,12 +951,9 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx2, REQ_STATS_POST);
 	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
 	T_EXPECT(resp_contains(rctx2.buf, "Mux Throughput"));
-	T_EXPECT(resp_contains(rctx2.buf, "Stream Throughput"));
 	T_EXPECT(resp_contains(rctx2.buf, "Server Load"));
 	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uintmax_t)3072);
 	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uintmax_t)6144);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_local_recv, (uintmax_t)1536);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_local_sent, (uintmax_t)768);
 
 	apifx_teardown(&fx);
 }
@@ -977,10 +969,8 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 	STORE_STAT(fx.srv.counters.num_rst_sent, 11);
 	STORE_STAT(fx.srv.counters.num_rst_recv, 17);
 	STORE_STAT(fx.srv.counters.num_stream_errors, 19);
-	STORE_STAT(fx.srv.counters.traffic_byt_mux_recv, 1234);
-	STORE_STAT(fx.srv.counters.traffic_byt_mux_sent, 2345);
-	STORE_STAT(fx.srv.counters.traffic_byt_local_recv, 3456);
-	STORE_STAT(fx.srv.counters.traffic_byt_local_sent, 4567);
+	fx.srv.counters.traffic_byt_mux_recv = 1234;
+	fx.srv.counters.traffic_byt_mux_sent = 2345;
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
@@ -989,12 +979,6 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_rst_sent_total 11"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_rst_recv_total 17"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_stream_errors_total 19"));
-	T_EXPECT(resp_contains(
-		rctx.buf,
-		"multiplexd_bytes_total{direction=\"recv\",link=\"mux\"} 1234"));
-	T_EXPECT(resp_contains(
-		rctx.buf,
-		"multiplexd_bytes_total{direction=\"sent\",link=\"local\"} 4567"));
 
 	apifx_teardown(&fx);
 }

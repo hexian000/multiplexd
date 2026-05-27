@@ -104,7 +104,7 @@ static bool str_eq(const void *a, const void *b)
 static uint_fast32_t ptr_hash(const void *key, const uint_fast32_t seed)
 {
 	unsigned char buf[sizeof(key)];
-	memcpy(buf, &key, sizeof(buf));
+	memcpy(buf, (const void *)&key, sizeof(buf));
 	return cityhash64low_32(buf, sizeof(buf), seed);
 }
 
@@ -226,7 +226,7 @@ table_realloc(struct hashtable *restrict table, const size_t new_capacity)
 static inline struct hashtable *table_grow(struct hashtable *restrict table)
 {
 	static const size_t threshold =
-		2 * 1024 * 1024 / sizeof(struct hash_element);
+		(size_t)2 * 1024 * 1024 / sizeof(struct hash_element);
 	const size_t want =
 		table->size < threshold ? table->size : table->size / 3 + 1;
 	size_t estimated = table->size;

@@ -577,6 +577,7 @@ static void pending_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 
 	struct mux_test_fixture *restrict fx = pa->fx;
 	const struct mux_config srv_conf = {
+		.timeout = 30,
 		.ping_timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
@@ -626,6 +627,7 @@ static struct mux_config make_cli_conf(const bool nodelay)
 {
 	return (struct mux_config){
 		.nodelay = nodelay,
+		.timeout = 30,
 		.ping_timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
@@ -1888,6 +1890,7 @@ static int raw_fixture_setup(
 	fx->raw_fd = fds[1];
 
 	const struct mux_config srv_conf = {
+		.timeout = 30,
 		.ping_timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
@@ -3567,7 +3570,7 @@ static int pred_control_only_no_bdp(void *ptr)
 	if (ctx->ss->bytes_recv <= ctx->before_bytes_recv) {
 		return 0;
 	}
-	if (ctx->ss->estimator.bw_wnd[0].val > 0.0 ||
+	if (wndfilter_get(&ctx->ss->estimator.bw_wnd) > 0 ||
 	    ctx->ss->estimator.ping_in_flight) {
 		return -1;
 	}
@@ -3584,7 +3587,7 @@ static int pred_echo_and_bdp_cycle(void *ptr)
 	if (ctx->ts->recv_len < ctx->expected_len) {
 		return 0;
 	}
-	if (ctx->ss->estimator.rtt_wnd[0].val <= 0.0 ||
+	if (wndfilter_get(&ctx->ss->estimator.rtt_wnd) <= 0 ||
 	    ctx->ss->estimator.ping_in_flight) {
 		return 0;
 	}
@@ -3808,7 +3811,7 @@ T_DECLARE_CASE(test_bdp_control_only_no_cycle)
 		&fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_control_only_no_bdp,
 		&ctx);
 	T_EXPECT(ret == 0);
-	T_EXPECT(fx.cli->estimator.bw_wnd[0].val == 0.0);
+	T_EXPECT(wndfilter_get(&fx.cli->estimator.bw_wnd) == 0);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 
 cleanup:
@@ -3911,7 +3914,7 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
 	T_EXPECT(ret == 0);
-	T_EXPECT(fx.cli->estimator.rtt_wnd[0].val > 0.0);
+	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_SMALL);
 	if (ts->recv_len == PAYLOAD_SMALL) {
@@ -3977,7 +3980,7 @@ T_DECLARE_CASE(test_bdp_stop_resets_learned_state)
 	const int cycle_ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
 	T_EXPECT(cycle_ret == 0);
-	T_EXPECT(fx.cli->estimator.rtt_wnd[0].val > 0.0);
+	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
 
 	/* Clear last_probe_ns to bypass the send-side rate limit so that the
 	 * second estimator_add immediately queues a PING for the stop test. */
@@ -3987,7 +3990,7 @@ T_DECLARE_CASE(test_bdp_stop_resets_learned_state)
 
 	estimator_stop(fx.cli);
 	T_EXPECT_EQ(fx.cli->estimator.bdp, (uint_least32_t)0);
-	T_EXPECT(fx.cli->estimator.rtt_wnd[0].val == 0.0);
+	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) == 0);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 	T_EXPECT_EQ(fx.cli->estimator.probe_sent_ns, (intmax_t)0);
 

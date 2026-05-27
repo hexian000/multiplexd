@@ -14,6 +14,7 @@
 #include "mux/stream.h"
 #include "mux/wire.h"
 
+#include "algo/wndfilter.h"
 #include "utils/minmax.h"
 
 #include <ev.h>
@@ -99,8 +100,8 @@ void mux_session_stats(
 {
 	out->rx_window = (size_t)ss->stream_window * MUX_WINDOW_UNIT;
 	out->tx_window = (size_t)ss->peer_stream_window * MUX_WINDOW_UNIT;
-	const double rtt = ss->estimator.rtt_wnd[0].val;
-	out->rtt_ns = rtt == 0.0 ? 0 : (intmax_t)(rtt * 1e9);
+	const intmax_t rtt_ns = wndfilter_get(&ss->estimator.rtt_wnd);
+	out->rtt_ns = rtt_ns;
 	out->bdp = ss->estimator.bdp;
 }
 
@@ -232,9 +233,6 @@ int mux_stream_send(
 
 	const size_t queued = to_send - remaining;
 	if (queued > 0) {
-		COUNTER_ADD(
-			s->session->cnt.traffic.byt_local_recv,
-			(uintmax_t)queued);
 		sched_wake(s->session, s);
 	}
 	*len = queued;
@@ -280,7 +278,6 @@ int mux_stream_recv(
 	s->buffered_bytes -= (uint_least32_t)copied;
 	s->session->recv_buffered_bytes -= copied;
 	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, copied);
-	COUNTER_ADD(s->session->cnt.traffic.byt_local_sent, (uintmax_t)copied);
 
 	/* Check if we should send a window update. */
 	stream_check_ack(s);

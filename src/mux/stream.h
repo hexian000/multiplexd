@@ -194,8 +194,8 @@ void stream_close(struct mux_stream *s);
 void stream_shutdown(struct mux_stream *s);
 
 /* Format a stream log prefix into buf.
- * accepted stream: "me <- peer [N]:"
- * connected stream: "me -> peer [N]:"
+ * accepted stream (peer-initiated): "[N] me <- peer:"
+ * connected stream (locally-initiated): "[N] me -> peer:"
  * me/peer use identity, fall back to IP, finally fall back to "[fd:N]".
  * Returns the snprintf byte count. */
 int stream_format_tag(

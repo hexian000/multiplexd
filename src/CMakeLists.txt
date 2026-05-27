@@ -1,7 +1,6 @@
 add_executable(multiplexd
     util.c util.h
-    conf.c conf.h
-    jsonutil.c jsonutil.h
+    conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
@@ -37,6 +36,14 @@ endif()
 
 target_compile_options(multiplexd PRIVATE "-include${CMAKE_CURRENT_BINARY_DIR}/config.h")
 target_compile_options(multiplexd PRIVATE -pedantic -Wall -Wextra -Werror)
+
+# Generated files contain gperf output that does not conform to project
+# warning settings; disable all warnings for them here instead of using
+# #pragma inside the generated source.
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/conf_schema.gen.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/mux/proto_schema.gen.c
+    PROPERTIES COMPILE_OPTIONS "-w")
 
 if(LIBM)
     target_link_libraries(multiplexd PRIVATE m)
@@ -177,20 +184,6 @@ if(WITH_TLS)
     target_link_libraries(multiplexd PRIVATE ${TLS_LIBS})
 endif()
 
-# find json-c
-find_path(JSONC_INCLUDE_DIR NAMES json-c/json.h)
-if(BUILD_STATIC OR LINK_STATIC_LIBS)
-    find_library(JSONC_LIBRARY NAMES libjson-c.a)
-else()
-    find_library(JSONC_LIBRARY NAMES json-c)
-endif()
-if((NOT EXISTS "${JSONC_INCLUDE_DIR}/json-c/json.h") OR (NOT EXISTS ${JSONC_LIBRARY}))
-    message(FATAL_ERROR "json-c not found")
-endif()
-message(STATUS "json-c: ${JSONC_LIBRARY}")
-target_include_directories(multiplexd SYSTEM PRIVATE ${JSONC_INCLUDE_DIR})
-target_link_libraries(multiplexd PRIVATE ${JSONC_LIBRARY})
-
 install(TARGETS multiplexd DESTINATION bin)
 
 # generate config.h
@@ -217,13 +210,6 @@ add_subdirectory(mux)
 # Tests
 # =============================================================================
 
-# Write an LSAN suppression file for json-c internal allocations.
-file(WRITE "${CMAKE_BINARY_DIR}/lsan.supp"
-    "# json-c internal global allocations (gettext/locale argz state).\n"
-    "leak:__argz_add_sep\n"
-    "leak:json_c_get_locale_info\n"
-)
-
 function(add_src_test target_name)
     add_executable(${target_name} ${ARGN})
 
@@ -247,9 +233,6 @@ function(add_src_test target_name)
         target_link_libraries(${target_name} PRIVATE ${TLS_LIBS})
     endif()
 
-    target_include_directories(${target_name} SYSTEM PRIVATE ${JSONC_INCLUDE_DIR})
-    target_link_libraries(${target_name} PRIVATE ${JSONC_LIBRARY})
-
     if(LIBM)
         target_link_libraries(${target_name} PRIVATE m)
     endif()
@@ -266,22 +249,12 @@ function(add_src_test target_name)
     )
 
     add_test(NAME ${target_name} COMMAND ${target_name})
-    set_tests_properties(${target_name} PROPERTIES
-        ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_BINARY_DIR}/lsan.supp"
-    )
     add_dependencies(check ${target_name})
 endfunction()
 
-# JSON utility unit tests
-add_src_test(jsonutil_test
-    jsonutil.c jsonutil.h
-    jsonutil_test.c
-)
-
 # Configuration parser unit tests
 add_src_test(conf_test
-    jsonutil.c jsonutil.h
-    conf.c conf.h
+    conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     conf_test.c
 )
 
@@ -317,8 +290,7 @@ add_src_test(tlsutil_test
 # Tunnel unit tests
 add_src_test(tunnel_test
     util.c util.h
-    conf.c conf.h
-    jsonutil.c jsonutil.h
+    conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     ${TLS_SOURCES}
     ${GENCERTS_SOURCES}
     listener.c listener.h
@@ -327,7 +299,7 @@ add_src_test(tunnel_test
     api_server.c api_server.h
     mux/dispatch.c mux/dispatch.h
     mux/estimator.c mux/estimator.h
-    mux/handshake.c mux/handshake.h
+    mux/handshake.c mux/handshake.h mux/proto_schema.gen.c mux/proto_schema.gen.h
     mux/mux.c mux/mux.h
     mux/frame.c mux/frame.h
     mux/sched.c mux/sched.h
@@ -340,8 +312,7 @@ add_src_test(tunnel_test
 # Server unit tests
 add_src_test(server_test
     util.c util.h
-    conf.c conf.h
-    jsonutil.c jsonutil.h
+    conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     ${TLS_SOURCES}
     ${GENCERTS_SOURCES}
     listener.c listener.h
@@ -350,7 +321,7 @@ add_src_test(server_test
     api_server.c api_server.h
     mux/dispatch.c mux/dispatch.h
     mux/estimator.c mux/estimator.h
-    mux/handshake.c mux/handshake.h
+    mux/handshake.c mux/handshake.h mux/proto_schema.gen.c mux/proto_schema.gen.h
     mux/mux.c mux/mux.h
     mux/frame.c mux/frame.h
     mux/sched.c mux/sched.h
@@ -363,8 +334,7 @@ add_src_test(server_test
 # API server unit tests
 add_src_test(api_server_test
     util.c util.h
-    conf.c conf.h
-    jsonutil.c jsonutil.h
+    conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     ${TLS_SOURCES}
     ${GENCERTS_SOURCES}
     listener.c listener.h
@@ -373,7 +343,7 @@ add_src_test(api_server_test
     api_server.c api_server.h
     mux/dispatch.c mux/dispatch.h
     mux/estimator.c mux/estimator.h
-    mux/handshake.c mux/handshake.h
+    mux/handshake.c mux/handshake.h mux/proto_schema.gen.c mux/proto_schema.gen.h
     mux/mux.c mux/mux.h
     mux/frame.c mux/frame.h
     mux/sched.c mux/sched.h

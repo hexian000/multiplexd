@@ -87,16 +87,19 @@ static struct mux_session make_session(void)
 		.session_window = 4,
 		.stream_window = 4,
 		.tag = (char *)"[test]:",
+		.conf.timeout = 600,
 		.conf.ping_timeout = 4,
 	};
 }
 
-T_DECLARE_CASE(test_estimator_seed_clamps_bdp_to_limit)
+T_DECLARE_CASE(test_estimator_seed_clamps_effective_bdp_to_limit)
 {
 	struct mux_session ss = make_session();
 
 	estimator_seed(&ss, UINT32_MAX);
-	T_EXPECT_EQ(ss.estimator.bdp, (size_t)BDP_LIMIT);
+	/* bdp stores the raw seeded value; effective_bdp is clamped to BDP_MAX. */
+	T_EXPECT_EQ(ss.estimator.bdp, (size_t)UINT32_MAX);
+	T_EXPECT_EQ(ss.estimator.effective_bdp, (size_t)BDP_MAX);
 	T_EXPECT_EQ(ss.estimator.phase, (enum estimator_phase)EST_STARTUP);
 }
 
@@ -108,7 +111,7 @@ T_DECLARE_CASE(test_estimator_stop_resets_all_learned_state)
 	estimator_test_reset();
 	set_clock_sequence(&now, 1);
 	ss.estimator.bdp = 1234;
-	ss.estimator.rtt_wnd[0].val = 0.25;
+	wndfilter_reset(&ss.estimator.rtt_wnd, 0, INTMAX_C(250000000));
 	ss.estimator.probe_sent_ns = 10;
 	ss.estimator.cycle_window_bytes = 20;
 	ss.estimator.sample = 30;
@@ -123,7 +126,7 @@ T_DECLARE_CASE(test_estimator_stop_resets_all_learned_state)
 	T_EXPECT_EQ(ss.estimator.sample, (size_t)0);
 	T_EXPECT(!ss.estimator.ping_in_flight);
 	T_EXPECT_EQ(ss.estimator.bdp, (size_t)0);
-	T_EXPECT(ss.estimator.rtt_wnd[0].val == 0.0);
+	T_EXPECT(wndfilter_get(&ss.estimator.rtt_wnd) == 0);
 }
 
 T_DECLARE_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight)
@@ -301,8 +304,8 @@ T_DECLARE_CASE(
 
 	estimator_calculate(&ss, 100);
 	T_EXPECT_EQ(ss.estimator.phase, (enum estimator_phase)EST_TRACK);
-	T_EXPECT(ss.estimator.rtt_wnd[0].val > 0.0);
-	T_EXPECT(ss.estimator.bw_wnd[0].val > 0.0);
+	T_EXPECT(wndfilter_get(&ss.estimator.rtt_wnd) > 0);
+	T_EXPECT(wndfilter_get(&ss.estimator.bw_wnd) > 0);
 	T_EXPECT(!ss.estimator.ping_in_flight);
 }
 
@@ -352,29 +355,26 @@ T_DECLARE_CASE(test_estimator_track_bdp_shrinks_when_window_expires)
 	/* Seed a very large bdp; the fresh cycle should shrink it. */
 	ss.estimator.bdp = 4u * 1024u * 1024u;
 	/* Seed stale (expired) bw/sample windows with large values. */
-	ss.estimator.bw_wnd[0] = ss.estimator.bw_wnd[1] =
-		ss.estimator.bw_wnd[2] =
-			(struct estimator_wnd_slot){ .val = 1e9, .t = 0 };
-	ss.estimator.sample_wnd[0] = ss.estimator.sample_wnd[1] =
-		ss.estimator.sample_wnd[2] =
-			(struct estimator_wnd_slot){ .val = 1e10, .t = 0 };
+	wndfilter_reset(&ss.estimator.bw_wnd, 0, (intmax_t)1e9);
+	wndfilter_reset(&ss.estimator.sample_wnd, 0, (intmax_t)1e10);
 	/* Seed a valid rtt_min close to now so the inflation guard is skipped. */
-	ss.estimator.rtt_wnd[0] = ss.estimator.rtt_wnd[1] =
-		ss.estimator.rtt_wnd[2] = (struct estimator_wnd_slot){
-			.val = 0.01, .t = now_ns - INTMAX_C(1000000)
-		};
+	wndfilter_reset(
+		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000),
+		INTMAX_C(10000000));
 
 	estimator_calculate(&ss, sent_ns);
 
 	/* bw/sample windows expired → reset to current cycle values.
-	 * target = MAX(sample, bw * rtt_min); result is floored at MIN_BDP. */
+	 * target = MAX(sample, bw * rtt_min); bdp is the raw result, and
+	 * effective_bdp is clamped to [BDP_MIN, BDP_MAX]. */
 	T_EXPECT(ss.estimator.bdp < 4u * 1024u * 1024u);
-	T_EXPECT(ss.estimator.bdp >= (size_t)MIN_BDP);
+	T_EXPECT(ss.estimator.effective_bdp >= (size_t)BDP_MIN);
+	T_EXPECT(ss.estimator.effective_bdp < 4u * 1024u * 1024u);
 }
 
 /* TRACK force-age: INFLATE_ROUNDS consecutive cycles with rtt_sample ≥
  * INFLATE_HI * rtt_min collapse bw_wnd/sample_wnd to the current sample,
- * driving bdp to MIN_BDP when the sample itself is small. */
+ * driving bdp to BDP_MIN when the sample itself is small. */
 T_DECLARE_CASE(test_estimator_track_force_age_collapses_bdp_after_inflate_rounds)
 {
 	struct mux_session ss = make_session();
@@ -397,10 +397,8 @@ T_DECLARE_CASE(test_estimator_track_force_age_collapses_bdp_after_inflate_rounds
 
 	ss.estimator.phase = EST_TRACK;
 	ss.estimator.bdp = 4u * 1024u * 1024u; /* start large */
-	ss.estimator.rtt_wnd[0] = ss.estimator.rtt_wnd[1] =
-		ss.estimator.rtt_wnd[2] =
-			(struct estimator_wnd_slot){ .val = rtt_min,
-						     .t = rtt_min_t };
+	wndfilter_reset(
+		&ss.estimator.rtt_wnd, rtt_min_t, (intmax_t)(rtt_min * 1e9));
 	/* Large window so the sample is not window-limited. */
 	const size_t cycle_window = (size_t)ss.session_window * MUX_WINDOW_UNIT;
 
@@ -414,10 +412,9 @@ T_DECLARE_CASE(test_estimator_track_force_age_collapses_bdp_after_inflate_rounds
 		estimator_calculate(&ss, sent);
 	}
 
-	/* After INFLATE_ROUNDS inflated cycles, force-age fires: bdp is
-	 * recomputed from the (small) current sample, which is below MIN_BDP,
-	 * so the floor kicks in. */
-	T_EXPECT_EQ(ss.estimator.bdp, (size_t)MIN_BDP);
+	/* After INFLATE_ROUNDS inflated cycles, force-age fires: bdp is the raw
+	 * small sample; effective_bdp is floored at BDP_MIN. */
+	T_EXPECT_EQ(ss.estimator.effective_bdp, (size_t)BDP_MIN);
 	T_EXPECT_EQ(ss.estimator.inflated_rounds, (uint_least8_t)0);
 }
 
@@ -448,10 +445,8 @@ T_DECLARE_CASE(test_estimator_track_inflate_counter_cleared_when_ratio_drops)
 
 	ss.estimator.phase = EST_TRACK;
 	ss.estimator.bdp = 4u * 1024u * 1024u;
-	ss.estimator.rtt_wnd[0] = ss.estimator.rtt_wnd[1] =
-		ss.estimator.rtt_wnd[2] =
-			(struct estimator_wnd_slot){ .val = rtt_min,
-						     .t = rtt_min_t };
+	wndfilter_reset(
+		&ss.estimator.rtt_wnd, rtt_min_t, (intmax_t)(rtt_min * 1e9));
 	const size_t cycle_window = (size_t)ss.session_window * MUX_WINDOW_UNIT;
 
 	/* First two cycles: ratio ≥ INFLATE_HI → inflated_rounds increments. */
@@ -472,9 +467,9 @@ T_DECLARE_CASE(test_estimator_track_inflate_counter_cleared_when_ratio_drops)
 	estimator_calculate(&ss, sent[2]);
 
 	T_EXPECT_EQ(ss.estimator.inflated_rounds, (uint_least8_t)0);
-	/* No force-age: bdp may change via normal bidirectional tracking but
-	 * should not be reset to MIN_BDP solely due to force-age. */
-	T_EXPECT(ss.estimator.bdp >= (size_t)MIN_BDP);
+	/* No force-age: effective_bdp may change via normal bidirectional
+	 * tracking but should not be reset to BDP_MIN solely due to force-age. */
+	T_EXPECT(ss.estimator.effective_bdp >= (size_t)BDP_MIN);
 }
 
 /* TRACK inflation guard: when rtt_wnd[0] was updated too recently (less
@@ -493,12 +488,10 @@ T_DECLARE_CASE(test_estimator_track_inflate_skipped_when_rtt_min_uncalibrated)
 
 	ss.estimator.phase = EST_TRACK;
 	ss.estimator.bdp = 65536;
-	/* rtt_wnd[0].t is 1 s before now: now - t = 1 s < RTT_WND_NS/4 = 75 s. */
-	ss.estimator.rtt_wnd[0] = ss.estimator.rtt_wnd[1] =
-		ss.estimator.rtt_wnd[2] = (struct estimator_wnd_slot){
-			.val = 0.01,
-			.t = now_ns - INTMAX_C(1000000000),
-		};
+	/* rtt_wnd.s[0].t is 1 s before now: now - t = 1 s < RTT_WND_NS/4 = 75 s. */
+	wndfilter_reset(
+		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000000),
+		INTMAX_C(10000000));
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent_ns;
 	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
@@ -526,9 +519,7 @@ T_DECLARE_CASE(test_estimator_startup_ignores_rtt_inflation)
 
 	ss.estimator.phase = EST_STARTUP;
 	ss.estimator.bdp = 65536;
-	ss.estimator.rtt_wnd[0] = ss.estimator.rtt_wnd[1] =
-		ss.estimator.rtt_wnd[2] =
-			(struct estimator_wnd_slot){ .val = 0.01, .t = 0 };
+	wndfilter_reset(&ss.estimator.rtt_wnd, 0, INTMAX_C(10000000));
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent_ns;
 	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
@@ -541,9 +532,9 @@ T_DECLARE_CASE(test_estimator_startup_ignores_rtt_inflation)
 	T_EXPECT_EQ(ss.estimator.inflated_rounds, (uint_least8_t)0);
 }
 
-/* TRACK bidirectional: even when the derived target is very small, bdp is
- * never allowed to fall below MIN_BDP. */
-T_DECLARE_CASE(test_estimator_track_bdp_floored_at_min_bdp)
+/* TRACK bidirectional: even when the derived target is very small,
+ * effective_bdp is never allowed to fall below BDP_MIN. */
+T_DECLARE_CASE(test_estimator_track_effective_bdp_floored_at_min_bdp)
 {
 	struct mux_session ss = make_session();
 	/* Large rtt_sample makes bw_sample = sample / rtt tiny; rtt_min aged.
@@ -559,19 +550,13 @@ T_DECLARE_CASE(test_estimator_track_bdp_floored_at_min_bdp)
 	ss.estimator.phase = EST_TRACK;
 	ss.estimator.bdp = 4u * 1024u * 1024u;
 	/* Expire all bw/sample windows so they reset to current sample. */
-	ss.estimator.bw_wnd[0] = ss.estimator.bw_wnd[1] =
-		ss.estimator.bw_wnd[2] =
-			(struct estimator_wnd_slot){ .val = 1e6, .t = 0 };
-	ss.estimator.sample_wnd[0] = ss.estimator.sample_wnd[1] =
-		ss.estimator.sample_wnd[2] =
-			(struct estimator_wnd_slot){ .val = 1e10, .t = 0 };
+	wndfilter_reset(&ss.estimator.bw_wnd, 0, (intmax_t)1e6);
+	wndfilter_reset(&ss.estimator.sample_wnd, 0, (intmax_t)1e10);
 	/* rtt_min close to now: inflation guard skips; only bidirectional
 	 * targeting runs. */
-	ss.estimator.rtt_wnd[0] = ss.estimator.rtt_wnd[1] =
-		ss.estimator.rtt_wnd[2] = (struct estimator_wnd_slot){
-			.val = 1.0,
-			.t = now_ns - INTMAX_C(1000000),
-		};
+	wndfilter_reset(
+		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000),
+		INTMAX_C(1000000000));
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent_ns;
 	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
@@ -580,14 +565,15 @@ T_DECLARE_CASE(test_estimator_track_bdp_floored_at_min_bdp)
 
 	estimator_calculate(&ss, sent_ns);
 
-	/* target = MAX(32768, bw_sample * rtt_min) which is tiny; floor applies. */
-	T_EXPECT_EQ(ss.estimator.bdp, (size_t)MIN_BDP);
+	/* target = MAX(32768, bw_sample * rtt_min) which is tiny; bdp is the raw
+	 * result while effective_bdp is floored at BDP_MIN. */
+	T_EXPECT_EQ(ss.estimator.effective_bdp, (size_t)BDP_MIN);
 }
 
 int main(void)
 {
 	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_estimator_seed_clamps_bdp_to_limit);
+	T_RUN_CASE(t, test_estimator_seed_clamps_effective_bdp_to_limit);
 	T_RUN_CASE(t, test_estimator_stop_resets_all_learned_state);
 	T_RUN_CASE(
 		t, test_estimator_add_accumulates_sample_while_ping_in_flight);
@@ -617,6 +603,6 @@ int main(void)
 		t,
 		test_estimator_track_inflate_skipped_when_rtt_min_uncalibrated);
 	T_RUN_CASE(t, test_estimator_startup_ignores_rtt_inflation);
-	T_RUN_CASE(t, test_estimator_track_bdp_floored_at_min_bdp);
+	T_RUN_CASE(t, test_estimator_track_effective_bdp_floored_at_min_bdp);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

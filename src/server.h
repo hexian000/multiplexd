@@ -164,8 +164,6 @@ struct server_counters {
 	struct {
 		uintmax_t traffic_byt_mux_recv;
 		uintmax_t traffic_byt_mux_sent;
-		uintmax_t traffic_byt_local_recv;
-		uintmax_t traffic_byt_local_sent;
 	};
 };
 
@@ -209,8 +207,6 @@ struct server_stats {
 	size_t unacked_frames;
 	uintmax_t traffic_byt_mux_recv;
 	uintmax_t traffic_byt_mux_sent;
-	uintmax_t traffic_byt_local_recv;
-	uintmax_t traffic_byt_local_sent;
 
 	/* --- stats route snapshot (mirrors the runtime diagnostic fields
 	 * and per-identity tunnel_stats) --- */
@@ -251,14 +247,15 @@ struct server {
 	struct config *conf;
 	/* path to the config file, used for SIGHUP reload */
 	const char *conf_path;
+#if WITH_ALLOC_CACHE
 #if WITH_THREADS
-	/* Server-level lock-free frame pool shared across all tunnel threads.
-	 * Behaves as a leaky buffer: push failure frees the frame immediately. */
+	/* Server-level frame allocator shared across all tunnel threads. */
 	struct mpmc_queue *frame_pool;
 #else
-	/* Server-level frame allocator cache (single-threaded). */
+	/* Server-level frame allocator (single-threaded). */
 	struct mcache *frame_pool;
 #endif
+#endif /* WITH_ALLOC_CACHE */
 #if WITH_TLS
 	/* TLS context for accepted mux connections (server role). */
 	struct tls_context *server_tlsctx;
@@ -322,11 +319,23 @@ struct server {
 	/* Rate tracking state for POST /stats bandwidth display */
 	struct {
 		uintmax_t byt_mux_recv, byt_mux_sent;
-		uintmax_t byt_local_recv, byt_local_sent;
 		intmax_t timestamp;
 		bool is_set;
 	} rate_tracker;
 };
+
+/**
+ * @brief Apply a pre-parsed configuration to a running server (hot-reload).
+ *
+ * Takes ownership of new_conf. On success new_conf becomes s->conf and the
+ * function returns true. On failure (e.g., TLS setup error) new_conf is freed,
+ * the server retains its current configuration, and the function returns false.
+ *
+ * @param s The running server.
+ * @param new_conf Validated configuration to apply.
+ * @return true on success, false on failure.
+ */
+bool server_apply_config(struct server *restrict s, struct config *new_conf);
 
 /**
  * @brief Allocate and initialize a server instance.

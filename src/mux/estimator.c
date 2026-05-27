@@ -9,13 +9,17 @@
 #include "mux/estimator.h"
 
 #include "mux/frame.h"
+#include "mux/mux.h"
 #include "mux/session.h"
 
+#include "algo/wndfilter.h"
 #include "os/clock.h"
 #include "utils/debug.h"
 #include "utils/minmax.h"
 #include "utils/serialize.h"
 #include "utils/slog.h"
+
+#include <ev.h>
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -25,84 +29,14 @@
 /* Single WINDOW_UPDATE grant encoding limit: Extra is uint16 in MUX_WINDOW_UNIT
  * bytes.  Capping BDP here keeps every credit advertisement expressible in
  * one frame. */
-#define BDP_LIMIT ((size_t)UINT16_MAX * MUX_WINDOW_UNIT)
+#define BDP_MAX ((size_t)UINT16_MAX * MUX_WINDOW_UNIT)
 /* Minimum BDP: never shrink below the initial send window floor. */
-#define MIN_BDP ((size_t)MUX_INITIAL_SEND_WINDOW)
+#define BDP_MIN ((size_t)MUX_INITIAL_SEND_WINDOW)
 #define RTT_WND_NS (INTMAX_C(300) * INTMAX_C(1000000000))
 #define BW_WND_NS (INTMAX_C(600) * INTMAX_C(1000000000))
-/* RTT/BDP inflation thresholds. */
-#define INFLATE_HI 1.5
-#define INFLATE_LO 1.2
+#define BDP_WND_NS (INTMAX_C(7200) * INTMAX_C(1000000000))
+/* RTT inflation thresholds: LO = 6/5 (1.20), HI = 3/2 (1.50). */
 #define INFLATE_ROUNDS 3
-
-/* 3-slot windowed min/max filter (Kathleen Nichols, 2012): s[0] is the
- * current best sample, s[1] is the staged replacement when s[0] ages out,
- * and s[2] tracks the newest accepted sample. */
-static double
-wnd_sub(struct estimator_wnd_slot s[static 3],
-	const struct estimator_wnd_slot *restrict val, const intmax_t wnd_ns)
-{
-	const intmax_t dt = val->t - s[2].t;
-	if (val->t - s[0].t > wnd_ns) {
-		/* Rotate out expired slots. */
-		s[0] = s[1];
-		s[1] = s[2];
-		s[2] = *val;
-		if (val->t - s[0].t > wnd_ns) {
-			/* Two oldest slots expired in the same step. */
-			s[0] = s[1];
-			s[1] = s[2];
-			s[2] = *val;
-		}
-	} else if (s[1].t == s[0].t && dt > wnd_ns / 4) {
-		/* After a reset, spread the duplicated slots back across the window. */
-		s[2] = s[1] = *val;
-	} else if (s[2].t == s[1].t && dt > wnd_ns / 2) {
-		/* Restore mid-window coverage after a duplicated recent slot. */
-		s[2] = *val;
-	}
-	return s[0].val;
-}
-
-static double wnd_min_update(
-	struct estimator_wnd_slot s[static 3], const intmax_t t, const double v,
-	const intmax_t wnd_ns)
-{
-	const struct estimator_wnd_slot val = { .val = v, .t = t };
-	if (s[0].val == 0.0 || v <= s[0].val || t - s[2].t > wnd_ns) {
-		/* New global minimum, uninitialised, or all slots expired: reset. */
-		s[0] = s[1] = s[2] = val;
-		return v;
-	}
-	if (v <= s[1].val) {
-		/* Improves s[1]; also replace the most recent slot. */
-		s[2] = s[1] = val;
-	} else if (v <= s[2].val) {
-		/* Improves only the most recent slot. */
-		s[2] = val;
-	}
-	return wnd_sub(s, &val, wnd_ns);
-}
-
-static double wnd_max_update(
-	struct estimator_wnd_slot s[static 3], const intmax_t t, const double v,
-	const intmax_t wnd_ns)
-{
-	const struct estimator_wnd_slot val = { .val = v, .t = t };
-	if (s[0].val == 0.0 || v >= s[0].val || t - s[2].t > wnd_ns) {
-		/* New global maximum, uninitialised, or all slots expired: reset. */
-		s[0] = s[1] = s[2] = val;
-		return v;
-	}
-	if (v >= s[1].val) {
-		/* Improves s[1]; also replace the most recent slot. */
-		s[2] = s[1] = val;
-	} else if (v >= s[2].val) {
-		/* Improves only the most recent slot. */
-		s[2] = val;
-	}
-	return wnd_sub(s, &val, wnd_ns);
-}
 
 void estimator_init(struct mux_session *restrict ss)
 {
@@ -112,15 +46,27 @@ void estimator_init(struct mux_session *restrict ss)
 void estimator_seed(struct mux_session *restrict ss, const size_t bdp)
 {
 	estimator_init(ss);
-	ss->estimator.bdp = MIN(bdp, BDP_LIMIT);
+	ss->estimator.bdp = bdp;
+	ss->estimator.effective_bdp = CLAMP(bdp, BDP_MIN, BDP_MAX);
 }
 
 void estimator_stop(struct mux_session *restrict ss)
 {
 	const intmax_t now_ns = clock_monotonic_ns();
+	const size_t effective_bdp = ss->estimator.effective_bdp;
 	estimator_init(ss);
 	/* Ignore stale PONGs that arrive from the previous transport epoch. */
 	ss->estimator.epoch_ns = now_ns;
+	/* Seed bdp_wnd with the last known effective_bdp so session_update_window
+	 * continues to use the learned value across reconnect.  New measurements
+	 * will replace it via wndfilter_update_max as the probe cycle refines the
+	 * estimate; the preserved maximum ages out naturally after BDP_WND_NS. */
+	if (effective_bdp > 0) {
+		ss->estimator.effective_bdp = effective_bdp;
+		wndfilter_reset(
+			&ss->estimator.bdp_wnd, now_ns,
+			(intmax_t)effective_bdp);
+	}
 }
 
 void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
@@ -176,7 +122,6 @@ void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
 	}
 	est->probe_sent_ns = sent_ns;
 	est->ping_in_flight = true;
-	ev_timer_again(ss->loop, &ss->w_ping_timeout);
 }
 
 static void estimator_phase_startup(
@@ -185,10 +130,10 @@ static void estimator_phase_startup(
 {
 	if (!valid_cycle && est->probe_was_stalled) {
 		/* A fully stalled window can still justify slow-start growth. */
-		est->bdp = MIN(est->bdp + est->cycle_window_bytes, BDP_LIMIT);
+		est->bdp = est->bdp + est->cycle_window_bytes;
 	} else if (valid_cycle && window_limited) {
 		/* The window capped delivery, so grow aggressively. */
-		est->bdp = MIN(est->bdp + est->sample, BDP_LIMIT);
+		est->bdp = est->bdp + est->sample;
 	} else if (valid_cycle) {
 		/* The sample fit inside the window; switch to steady tracking. */
 		est->phase = EST_TRACK;
@@ -196,70 +141,70 @@ static void estimator_phase_startup(
 	}
 }
 
-static void estimator_phase_track(
+/* RTT inflation detection and force-age.  Only act when rtt_min is stable
+ * (aged >= RTT_WND_NS/4 ≈ 75 s) to avoid acting on an uncalibrated baseline.
+ * On triggered force-age, *bw_max and *sample_max are updated to the current
+ * cycle's values so the BDP calculation immediately reflects fresh data. */
+static bool estimator_handle_inflation(
+	struct estimator_ctx *restrict est, const intmax_t now_ns,
+	const intmax_t rtt_ns, const intmax_t rtt_min_ns,
+	const intmax_t bw_sample, intmax_t *restrict bw_max,
+	intmax_t *restrict sample_max)
+{
+	if (now_ns - est->rtt_wnd.s[0].t < RTT_WND_NS / 4) {
+		/* rtt_min not yet calibrated; do not count inflation. */
+		est->inflated_rounds = 0;
+		return false;
+	}
+	/* ratio = rtt_ns/rtt_min_ns; LO = 6/5 (1.20), HI = 3/2 (1.50). */
+	if (rtt_ns * 5 <= rtt_min_ns * 6) { /* ratio <= LO */
+		est->inflated_rounds = 0;
+		return false;
+	}
+	if (rtt_ns * 2 < rtt_min_ns * 3 || /* ratio < HI */
+	    ++est->inflated_rounds < INFLATE_ROUNDS) {
+		/* Hysteresis: ratio in (LO, HI) leaves inflated_rounds unchanged. */
+		return false;
+	}
+	/* Force-age: collapse all 3 slots of bw_wnd and sample_wnd to the
+	 * current sample.  bw_sample is a valid physical-bandwidth estimate
+	 * even during bufferbloat: bottleneck capacity is unchanged; only
+	 * queuing delay is inflated. */
+	wndfilter_reset(&est->bw_wnd, now_ns, bw_sample);
+	wndfilter_reset(&est->sample_wnd, now_ns, (intmax_t)est->sample);
+	*bw_max = bw_sample;
+	*sample_max = (intmax_t)est->sample;
+	est->inflated_rounds = 0;
+	est->saturated_rounds = 0;
+	return true;
+}
+
+static bool estimator_phase_track(
 	struct estimator_ctx *restrict est, const bool valid_cycle,
-	const bool window_limited, const intmax_t now_ns,
-	const double rtt_sample, const double rtt_min, const double bw_sample,
-	double bw_max, double sample_max)
+	const bool window_limited, const intmax_t now_ns, const intmax_t rtt_ns,
+	const intmax_t rtt_min_ns, const intmax_t bw_sample)
 {
 	if (!valid_cycle) {
 		/* Idle: leave bdp unchanged; bw_wnd/sample_wnd age
 		 * naturally over BW_WND_NS; wnd_max_update resets to
 		 * the current sample when the window expires. */
-		return;
+		return false;
 	}
-
-	/* RTT inflation detection and force-age.  Only act when rtt_min
-	 * is stable (aged >= RTT_WND_NS/4 ≈ 75 s) to avoid acting on an
-	 * uncalibrated baseline. */
-	if (now_ns - est->rtt_wnd[0].t < RTT_WND_NS / 4) {
-		/* rtt_min not yet calibrated; do not count inflation. */
-		est->inflated_rounds = 0;
-	} else {
-		const double ratio = rtt_sample / rtt_min;
-		if (ratio <= INFLATE_LO) {
-			est->inflated_rounds = 0;
-		} else if (
-			ratio >= INFLATE_HI &&
-			++est->inflated_rounds >= INFLATE_ROUNDS) {
-			/* Force-age: collapse all 3 slots of bw_wnd
-			 * and sample_wnd to the current sample.
-			 * bw_sample is a valid physical-bandwidth
-			 * estimate even during bufferbloat: the
-			 * bottleneck capacity is unchanged; only
-			 * queuing delay is inflated. */
-			const struct estimator_wnd_slot bw_slot = {
-				.val = bw_sample, .t = now_ns
-			};
-			const struct estimator_wnd_slot smp_slot = {
-				.val = (double)est->sample, .t = now_ns
-			};
-			est->bw_wnd[0] = est->bw_wnd[1] = est->bw_wnd[2] =
-				bw_slot;
-			est->sample_wnd[0] = est->sample_wnd[1] =
-				est->sample_wnd[2] = smp_slot;
-			bw_max = bw_sample;
-			sample_max = (double)est->sample;
-			est->inflated_rounds = 0;
-			est->saturated_rounds = 0;
-		}
-		/* Hysteresis: ratio in (INFLATE_LO, INFLATE_HI) leaves
-		 * inflated_rounds unchanged. */
-	}
-
+	intmax_t bw_max = wndfilter_get(&est->bw_wnd);
+	intmax_t sample_max = wndfilter_get(&est->sample_wnd);
+	const bool inflation = estimator_handle_inflation(
+		est, now_ns, rtt_ns, rtt_min_ns, bw_sample, &bw_max,
+		&sample_max);
 	/* Bidirectional target: pure physical BDP, no headroom.
 	 * Headroom is added by session_update_window. */
 	{
-		double target = MAX(sample_max, bw_max * rtt_min);
-		if (target < (double)MIN_BDP) {
-			target = (double)MIN_BDP;
-		}
-		if (target > (double)BDP_LIMIT) {
-			target = (double)BDP_LIMIT;
-		}
+		/* bw_max * rtt_min_ns may overflow intmax_t across BW/RTT window
+		 * boundaries; use double which is exact for results <= BDP_MAX. */
+		double target =
+			MAX((double)sample_max,
+			    (double)bw_max * (double)rtt_min_ns / 1e9);
 		est->bdp = (size_t)target;
 	}
-
 	/* STARTUP re-probe path: unchanged semantics. */
 	if (!window_limited) {
 		est->saturated_rounds = 0;
@@ -269,6 +214,7 @@ static void estimator_phase_track(
 		 * rounds to avoid a premature re-probe. */
 		est->phase = EST_STARTUP;
 	}
+	return inflation;
 }
 
 void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns)
@@ -288,8 +234,8 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 	}
 
 	const intmax_t now_ns = clock_monotonic_ns();
-	const double rtt_sample = (double)(now_ns - sent_ns) / 1e9;
-	if (rtt_sample <= 0.0) {
+	const intmax_t rtt_ns = now_ns - sent_ns;
+	if (rtt_ns <= 0) {
 		LOGD_F("invalid RTT sample: now=%" PRIdMAX " sent=%" PRIdMAX,
 		       now_ns, sent_ns);
 		est->ping_in_flight = false;
@@ -298,8 +244,11 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 		return;
 	}
 
-	const double rtt_min =
-		wnd_min_update(est->rtt_wnd, now_ns, rtt_sample, RTT_WND_NS);
+	const intmax_t rtt_min_ns =
+		wndfilter_get(&est->rtt_wnd) == 0 ?
+			wndfilter_reset(&est->rtt_wnd, now_ns, rtt_ns) :
+			wndfilter_update_min(
+				&est->rtt_wnd, RTT_WND_NS, now_ns, rtt_ns);
 
 	/* Smaller samples are too noisy to update bandwidth state. */
 	const bool valid_cycle =
@@ -309,41 +258,58 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 		est->sample + (size_t)MUX_MAX_PAYLOAD_SIZE >=
 		est->cycle_window_bytes;
 
-	double bw_sample = 0.0;
-	double bw_max = est->bw_wnd[0].val;
-	double sample_max = est->sample_wnd[0].val;
+	intmax_t bw_sample = 0;
 	if (valid_cycle) {
-		bw_sample = (double)est->sample / rtt_sample;
-		bw_max = wnd_max_update(
-			est->bw_wnd, now_ns, bw_sample, BW_WND_NS);
-		sample_max = wnd_max_update(
-			est->sample_wnd, now_ns, (double)est->sample,
-			BW_WND_NS);
+		/* sample <= session_window * MUX_WINDOW_UNIT <= 5/4 * BDP_MAX;
+		 * numerator <= 5/4 * BDP_MAX * 1e9 ≈ 1.34e18 < INTMAX_MAX. */
+		bw_sample =
+			(intmax_t)est->sample * INTMAX_C(1000000000) / rtt_ns;
+		(void)wndfilter_update_max(
+			&est->bw_wnd, BW_WND_NS, now_ns, bw_sample);
+		(void)wndfilter_update_max(
+			&est->sample_wnd, BW_WND_NS, now_ns,
+			(intmax_t)est->sample);
 	}
 
+	bool inflation = false;
 	switch (est->phase) {
 	case EST_STARTUP:
 		estimator_phase_startup(est, valid_cycle, window_limited);
 		break;
 	case EST_TRACK:
-		estimator_phase_track(
-			est, valid_cycle, window_limited, now_ns, rtt_sample,
-			rtt_min, bw_sample, bw_max, sample_max);
+		inflation = estimator_phase_track(
+			est, valid_cycle, window_limited, now_ns, rtt_ns,
+			rtt_min_ns, bw_sample);
 		break;
 	default:
 		FAILMSGF("invalid estimator phase: %d", est->phase);
 	}
 
+	/* Update the BDP_WND_NS windowed maximum BDP.  On RTT inflation the
+	 * window is force-aged to the corrected estimate to avoid letting an
+	 * inflated peak persist for up to 2 hours. */
+	const size_t bdp_clamped = CLAMP(est->bdp, BDP_MIN, BDP_MAX);
+	if (inflation) {
+		wndfilter_reset(&est->bdp_wnd, now_ns, (intmax_t)bdp_clamped);
+		est->effective_bdp = bdp_clamped;
+	} else {
+		est->effective_bdp = (size_t)wndfilter_update_max(
+			&est->bdp_wnd, BDP_WND_NS, now_ns,
+			(intmax_t)bdp_clamped);
+	}
+
 	est->ping_in_flight = false;
 	est->sample = 0;
 	est->last_probe_ns = now_ns;
+	const intmax_t bw_max = wndfilter_get(&est->bw_wnd);
 
 	MUX_LOG_F(
 		INFO, ss,
-		"PONG: rtt_min=%.1f ms bw=%.0f B/s (max=%.0f B/s)"
+		"PONG: rtt_min=%.1f ms bw=%" PRIdMAX " B/s (max=%" PRIdMAX
+		" B/s)"
 		" in %.1f ms bdp=%zu B phase=%s stalled=%d infl=%u",
-		rtt_min * 1000.0, bw_sample, est->bw_wnd[0].val,
-		rtt_sample * 1000.0, est->bdp,
+		(double)rtt_min_ns / 1e6, bw_sample, bw_max,
+		(double)rtt_ns / 1e6, est->bdp,
 		est->phase == EST_STARTUP ? "STARTUP" : "TRACK",
 		(int)est->probe_was_stalled, (unsigned)est->inflated_rounds);
 }

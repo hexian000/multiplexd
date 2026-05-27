@@ -14,7 +14,6 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdio.h>
 
 /* Per-peer listen entry inside the identity block. */
 struct identity_peer {
@@ -24,6 +23,18 @@ struct identity_peer {
 	char *listen;
 };
 
+/* Mirrors the JSON "identity" object. */
+struct conf_identity {
+	/* identity.claim */
+	char *claim;
+	/* identity.mux_connect array. */
+	char **mux_connect;
+	size_t mux_connect_count;
+	/* identity.listen entries, keyed by peer id. */
+	struct identity_peer *peers;
+	size_t peers_count;
+};
+
 struct config {
 	char *type;
 
@@ -31,33 +42,28 @@ struct config {
 	char *mux_listen;
 	char *mux_connect;
 	char *listen;
-	/* This node's identity announced in hellos, or NULL. */
-	char *identity_claim;
+	char *connect;
+
 #if WITH_TLS
 	char *tls_cert;
 	char *tls_key;
 	char *tls_ciphersuites;
-	char **authcerts;
-	size_t authcerts_count;
+	char **tls_authcerts;
+	size_t tls_authcerts_count;
 #endif
 
-	/* Outbound mux addresses from identity.mux_connect (array of strings). */
-	char **identity_connect;
-	size_t identity_connect_count;
-
-	/* Per-peer listen entries from identity.listen. */
-	struct identity_peer *identity_peers;
-	size_t identity_peers_count;
-
-	/* Stream forwarding address: where inbound streams are forwarded, or NULL. */
-	char *connect;
-
+	/* Mux session parameters; window fields in frame units. */
 	struct mux_config mux;
-	struct socket_opts mux_socket;
-	struct socket_opts local_socket;
+	/* TCP socket options for the mux transport socket. */
+	struct socket_opts mux_tcp;
+	/* TCP socket options for the local application socket. */
+	struct socket_opts tcp;
+
+	struct conf_identity identity;
 
 	int loglevel;
 	int max_sessions;
+	/* Parsed from the "max_startups" string field ("start:rate:full"). */
 	int startup_limit_start;
 	int startup_limit_rate;
 	int startup_limit_full;
@@ -77,20 +83,21 @@ struct config *conf_new(void);
 struct config *conf_parsefile(const char *path);
 
 /**
- * @brief Serialize a configuration to a file.
- * @param conf The configuration to dump.
- * @param path Output file path.
- * @return true on success, false on serialization or I/O failure.
+ * @brief Parse, validate, and normalize a configuration from a JSON buffer.
+ * @param json The JSON input buffer (modified in-place; need not be NUL-terminated).
+ * @param len The input length in bytes.
+ * @return A heap-allocated configuration on success, or NULL on failure.
  */
-bool conf_dumpfile(const struct config *conf, const char *path);
+struct config *conf_parse(char *json, size_t len);
 
 /**
- * @brief Serialize a configuration to an open stream.
- * @param conf The configuration to dump.
- * @param fp The output stream.
- * @return true on success, false on serialization or I/O failure.
+ * @brief Serialize a configuration to a heap-allocated JSON string.
+ * @param conf The configuration to serialize.
+ * @param lenp Optional output for the string length (excluding NUL).
+ * @return A heap-allocated NUL-terminated JSON string; caller must free().
+ *         Returns NULL on allocation or serialization failure.
  */
-bool conf_dump(const struct config *conf, FILE *fp);
+char *conf_dump(const struct config *conf, size_t *lenp);
 
 #if WITH_TLS
 /**
@@ -106,5 +113,12 @@ bool conf_inline_pem(struct config *conf);
  * @param conf The configuration to free; NULL is allowed.
  */
 void conf_free(struct config *conf);
+
+/**
+ * @brief Build a struct mux_config for the mux subsystem from the config.
+ *
+ * Copies conf->mux and sets reject_inbound from conf->connect.
+ */
+struct mux_config conf_get_mux(const struct config *conf);
 
 #endif /* CONF_H */

@@ -110,7 +110,7 @@ enum mux_flags {
 			MUX_FLAG_PUSH | MUX_FLAG_ACK,
 };
 
-/* Status codes carried in the Extra field when FIN or RST is set */
+/* Status codes carried in the Extra field when RST is set */
 enum mux_status {
 	MUX_STATUS_NO_ERROR = 0x0000,
 	MUX_STATUS_PROTOCOL_ERROR = 0x0001,

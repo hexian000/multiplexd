@@ -10,6 +10,7 @@
 
 #include "mux/frame.h"
 #include "mux/mux.h"
+#include "mux/sched.h"
 #include "mux/session.h"
 #include "util.h"
 
@@ -30,10 +31,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Format a stream log prefix into buf.  Returns the snprintf byte count.
+/* Format a stream log prefix into buf.
  * accepted stream (peer-initiated): "[N] me <- peer:"
  * connected stream (locally-initiated): "[N] me -> peer:"
- * me/peer use identity, fall back to IP, finally fall back to "[fd:N]". */
+ * me/peer use identity, fall back to IP, finally fall back to "[fd:N]".
+ * Returns the snprintf byte count. */
 int stream_format_tag(
 	char *restrict buf, size_t buflen, const struct mux_stream *restrict s)
 {
@@ -329,9 +331,6 @@ static void stream_flush_local(struct mux_stream *s)
 		s->buffered_bytes -= nwrite;
 		s->session->recv_buffered_bytes -= nwrite;
 		COUNTER_SUB(s->session->cnt.recv_buffered_bytes, nwrite);
-		COUNTER_ADD(
-			s->session->cnt.traffic.byt_local_sent,
-			(uintmax_t)nwrite);
 		STREAM_LOG_F(
 			VERBOSE, s,
 			"local send: %zu bytes, buffered=%" PRIuLEAST32, nwrite,
@@ -452,9 +451,6 @@ static void recv_cb(struct mux_stream *restrict s)
 	}
 
 	if (nread > 0) {
-		COUNTER_ADD(
-			s->session->cnt.traffic.byt_local_recv,
-			(uintmax_t)nread);
 		STREAM_LOG_F(VERBOSE, s, "local recv: %zu bytes", nread);
 		frame->len = MUX_FRAME_HEADER_SIZE + nread;
 
@@ -907,8 +903,7 @@ void stream_check_ack(struct mux_stream *restrict s)
 		return;
 	}
 	const uint_fast32_t grantable = stream_grantable_bytes(s);
-	/* Sub-unit grantable cannot be expressed on the wire (spec §6.4:
-	 * extra = floor(grantable / MUX_WINDOW_UNIT)); nothing to send. */
+	/* Sub-unit grantable cannot be sent; see stream_grant_inc(). */
 	if (grantable < (uint_fast32_t)MUX_WINDOW_UNIT) {
 		return;
 	}

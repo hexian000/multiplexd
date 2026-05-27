@@ -23,15 +23,6 @@ ROOT = Path.cwd().resolve()
 DEFAULT_BUILD_DIR = ROOT / "build"
 DEFAULT_PROFILE_BUILD_DIR = DEFAULT_BUILD_DIR / "gprof"
 DEFAULT_MARKDOWN_OUTPUT = DEFAULT_BUILD_DIR / "gprof.md"
-KNOWN_BOOL_OPTIONS = {
-	"BUILD_STATIC": "OFF",
-	"BUILD_PIE": "OFF",
-	"FORCE_POSIX": "OFF",
-	"ENABLE_THREADS": "OFF",
-	"LINK_STATIC_LIBS": "OFF",
-	"ENABLE_SYSTEMD": "OFF",
-	"USE_TLS_LIBRARY": "auto",
-}
 CACHE_LINE_RE = re.compile(r"^([A-Za-z0-9_]+):[^=]+=(.*)$")
 
 
@@ -222,7 +213,6 @@ def build_configure_command(
 	base_cache: Dict[str, str],
 	profile_build_dir: Path,
 	build_type: str,
-	use_tls: bool,
 ) -> List[str]:
 	command = [
 		cmake,
@@ -243,11 +233,6 @@ def build_configure_command(
 	compiler = base_cache.get("CMAKE_C_COMPILER")
 	if compiler:
 		command.append("-DCMAKE_C_COMPILER=%s" % compiler)
-	for key, default in KNOWN_BOOL_OPTIONS.items():
-		value = base_cache.get(key, default)
-		if key == "USE_TLS_LIBRARY":
-			value = "auto" if use_tls else "none"
-		command.append("-D%s=%s" % (key, value))
 	return command
 
 
@@ -717,7 +702,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 				base_cache,
 				profile_build_dir,
 				args.build_type,
-					args.tls,
 			),
 			cwd=ROOT,
 		)
@@ -731,10 +715,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 	binary_path = profile_build_dir / "bin" / "multiplexd"
 	if not binary_path.exists():
 		raise SystemExit("expected binary not found: %s" % binary_path)
-	if args.tls and base_cache.get("USE_TLS_LIBRARY") == "none" and args.skip_configure:
-		raise SystemExit(
-			"TLS requested with --skip-configure, but base build cache has USE_TLS_LIBRARY=none"
-		)
 
 	command_timeout_seconds = compute_command_timeout_seconds(
 		args.duration,

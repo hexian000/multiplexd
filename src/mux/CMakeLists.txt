@@ -1,9 +1,15 @@
+# Generated file contains gperf output; disable all warnings for it.
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/proto_schema.gen.c"
+    PROPERTIES COMPILE_OPTIONS "-w")
+
 target_sources(multiplexd
     PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/dispatch.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/estimator.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/frame.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/handshake.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/proto_schema.gen.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/mux.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/sched.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/session.c"
@@ -23,7 +29,6 @@ target_sources(multiplexd
 function(add_mux_test target_name)
     add_executable(${target_name}
         ../util.c ../util.h
-        ../jsonutil.c ../jsonutil.h
         ${TLS_SOURCES}
         ${ARGN}
     )
@@ -67,9 +72,6 @@ function(add_mux_test target_name)
     )
 
     add_test(NAME ${target_name} COMMAND ${target_name})
-    set_tests_properties(${target_name} PROPERTIES
-        ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_BINARY_DIR}/lsan.supp"
-    )
     add_dependencies(check ${target_name})
 endfunction()
 
@@ -79,6 +81,7 @@ add_mux_test(mux_test
     estimator.c estimator.h
     mux.c mux.h
     frame.c frame.h
+    proto_schema.gen.c proto_schema.gen.h
     sched.c sched.h
     session.c session.h
     stream.c stream.h
@@ -93,7 +96,14 @@ add_mux_test(frame_test
 
 add_mux_test(handshake_test
     frame.c frame.h
+    proto_schema.gen.c proto_schema.gen.h
     handshake_test.c
+)
+
+add_mux_test(handshake_fuzz_test
+    frame.c frame.h
+    proto_schema.gen.c proto_schema.gen.h
+    handshake_fuzz_test.c
 )
 
 add_mux_test(estimator_test
@@ -125,7 +135,7 @@ add_mux_test(session_test
     dispatch.c dispatch.h
     estimator.c estimator.h
     frame.c frame.h
-    handshake.c handshake.h
+    handshake.c handshake.h proto_schema.gen.c proto_schema.gen.h
     mux.c mux.h
     sched.c sched.h
     session.c session.h
@@ -138,7 +148,7 @@ add_mux_test(mux_api_test
     dispatch.c dispatch.h
     estimator.c estimator.h
     frame.c frame.h
-    handshake.c handshake.h
+    handshake.c handshake.h proto_schema.gen.c proto_schema.gen.h
     mux.c mux.h
     sched.c sched.h
     session.c session.h
@@ -151,7 +161,7 @@ add_mux_test(stream_test
     dispatch.c dispatch.h
     estimator.c estimator.h
     frame.c frame.h
-    handshake.c handshake.h
+    handshake.c handshake.h proto_schema.gen.c proto_schema.gen.h
     mux.c mux.h
     sched.c sched.h
     session.c session.h

@@ -22,6 +22,7 @@
 #include "mux/sched.h"
 
 #include "mux/frame.h"
+#include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/stream.h"
 #include "util.h"

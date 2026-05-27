@@ -59,6 +59,10 @@ option(FORCE_POSIX "Build the core features using POSIX.1 APIs only" OFF)
 option(ENABLE_THREADS "Enable thread offloading" OFF)
 option(LINK_STATIC_LIBS "Link against static libraries" OFF)
 option(ENABLE_SYSTEMD "Enable systemd integration" OFF)
+option(ENABLE_ALLOC_CACHE "Enable allocation caching and pooling" ON)
+if(ENABLE_ALLOC_CACHE)
+    set(WITH_ALLOC_CACHE TRUE)
+endif()
 set(USE_TLS_LIBRARY "auto" CACHE STRING
     "TLS library to use: auto|openssl|mbedtls|none")
 set_property(CACHE USE_TLS_LIBRARY PROPERTY STRINGS

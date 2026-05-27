@@ -10,6 +10,7 @@
 #define UTIL_H
 
 #include "net/addr.h"
+#include "os/socket.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
 
@@ -17,6 +18,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #if WITH_THREADS
@@ -65,9 +67,9 @@ static inline void modify_io_events(
 }
 
 struct socket_opts {
-	bool tcp_keepalive;
-	bool tcp_nodelay;
-	bool tcp_reuseport;
+	bool tcp_keepalive : 1;
+	bool tcp_nodelay : 1;
+	bool tcp_reuseport : 1;
 	int tcp_sndbuf;
 	int tcp_rcvbuf;
 #if WITH_TCP_NOTSENT_LOWAT
@@ -107,40 +109,12 @@ void init(int argc, char *const *argv);
 void loadlibs(void);
 void unloadlibs(void);
 
-/* RFC 1035: Section 2.3.4 */
-#define FQDN_MAX_LENGTH ((size_t)(255))
+bool resolve_addr(
+	union sockaddr_max *restrict addr, const char *restrict addrstr,
+	enum sa_resolve_type type);
 
-#define RESOLVE_ADDR(addr, addrstr, type, error)                               \
-	do {                                                                   \
-		const size_t addrlen = strlen((addrstr));                      \
-		ASSERT(addrlen < FQDN_MAX_LENGTH + sizeof(":65535"));          \
-		char buf[addrlen + 1];                                         \
-		memcpy(buf, (addrstr), addrlen);                               \
-		buf[addrlen] = '\0';                                           \
-		char *hoststr, *portstr;                                       \
-		if (!splithostport(buf, &hoststr, &portstr)) {                 \
-			error;                                                 \
-			break;                                                 \
-		}                                                              \
-		if (!sa_resolve_##type((addr), hoststr, portstr, PF_UNSPEC)) { \
-			error;                                                 \
-		}                                                              \
-	} while (0)
-
-#define RESOLVE_BINDADDR(addr, addrstr, type, error)                           \
-	do {                                                                   \
-		const size_t addrlen = strlen((addrstr));                      \
-		ASSERT(addrlen < FQDN_MAX_LENGTH + sizeof(":65535"));          \
-		char buf[addrlen + 1];                                         \
-		memcpy(buf, (addrstr), addrlen);                               \
-		buf[addrlen] = '\0';                                           \
-		char *hoststr, *portstr;                                       \
-		if (!splithostport(buf, &hoststr, &portstr)) {                 \
-			error;                                                 \
-		}                                                              \
-		if (!sa_resolve_##type((addr), hoststr, portstr)) {            \
-			error;                                                 \
-		}                                                              \
-	} while (0)
+bool resolve_bindaddr(
+	union sockaddr_max *restrict addr, const char *restrict addrstr,
+	enum sa_resolve_type type);
 
 #endif /* UTIL_H */

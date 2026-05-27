@@ -12,12 +12,14 @@
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
+#include "mux/mux.h"
 #include "mux/sched.h"
 #include "mux/stream.h"
 #include "mux/wire.h"
 #include "util.h"
 
 #include "algo/hashtable.h"
+#include "algo/wndfilter.h"
 
 #include "os/clock.h"
 #include "os/socket.h"
@@ -69,6 +71,7 @@ session_set_state(struct mux_session *ss, enum session_state newstate)
 	const enum session_state oldstate = ss->state;
 
 	if (oldstate == SESSION_ESTABLISHED) {
+		ev_timer_stop(ss->loop, &ss->w_timeout);
 		ev_timer_stop(ss->loop, &ss->w_keepalive);
 		ev_timer_stop(ss->loop, &ss->w_send_timeout);
 		estimator_stop(ss);
@@ -142,8 +145,8 @@ static void session_stop(struct mux_session *ss)
 	struct ev_loop *loop = ss->loop;
 	ev_io_stop(loop, &ss->w_socket);
 	ev_idle_stop(loop, &ss->sched.w_sched);
+	ev_timer_stop(loop, &ss->w_timeout);
 	ev_timer_stop(loop, &ss->w_keepalive);
-	ev_timer_stop(loop, &ss->w_ping_timeout);
 	ev_timer_stop(loop, &ss->w_send_timeout);
 	ev_timer_stop(loop, &ss->w_connect_timeout);
 	ev_timer_stop(loop, &ss->sched.w_coalesce);
@@ -215,7 +218,7 @@ void session_update_watcher(struct mux_session *restrict ss)
 		break;
 	case SESSION_SUSPENDED:
 		/* No transport I/O while waiting for reconnect. */
-		return;
+		/* falls through */
 	default:
 		return;
 	}
@@ -227,6 +230,22 @@ void session_update_watcher(struct mux_session *restrict ss)
  * Connection establishment, frame buffer management, frame parsing and
  * dispatch, send/recv flush, scheduler and control packet path.
  * ---------------------------------------------------------------------- */
+
+/* Call session_reset then fire MUX_EVENT_CLOSED if the session closed.
+ * expired is set when the event is triggered by a resume-timeout. */
+static void
+session_fire_closed(struct mux_session *restrict ss, const bool expired)
+{
+	session_reset(ss);
+	if (ss->state == SESSION_CLOSED && ss->callbacks.on_event != NULL) {
+		ss->callbacks.on_event(
+			ss->userdata, ss, MUX_EVENT_CLOSED,
+			(union mux_event_data){
+				.closed.clean = ss->wire.rx_eof,
+				.closed.expired = expired,
+			});
+	}
+}
 
 static void format_frame_flags(
 	char *restrict buf, const size_t buflen, const uint_fast8_t flags)
@@ -565,6 +584,8 @@ bool session_send_push(
 		s->bytes_sent += payload_len;
 		/* Track for Nagle algorithm: unacked data sent */
 		s->unacked_bytes += (uint_least32_t)payload_len;
+		COUNTER_ADD(
+			ss->cnt.traffic.byt_push_sent, (uintmax_t)payload_len);
 	}
 
 	s->grant_sent += raw_inc * MUX_WINDOW_UNIT;
@@ -785,6 +806,9 @@ static void recv_cb(struct mux_session *ss)
 	ringbuf_produce(ss->wire.recvbuf, nread);
 	ss->bytes_recv += (uintmax_t)nread;
 	COUNTER_ADD(ss->cnt.traffic.byt_mux_recv, (uintmax_t)nread);
+	if (ss->state == SESSION_ESTABLISHED) {
+		ev_timer_again(ss->loop, &ss->w_timeout);
+	}
 
 	dispatch_frame(ss);
 }
@@ -991,17 +1015,7 @@ connect_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	default:
 		FAILMSGF("unexpected session state %d", ss->state);
 	}
-	session_reset(ss);
-	if (ss->state == SESSION_CLOSED) {
-		if (ss->callbacks.on_event != NULL) {
-			ss->callbacks.on_event(
-				ss->userdata, ss, MUX_EVENT_CLOSED,
-				(union mux_event_data){
-					.closed.clean = ss->wire.rx_eof,
-					.closed.expired = was_suspended,
-				});
-		}
-	}
+	session_fire_closed(ss, was_suspended);
 }
 
 static void
@@ -1022,42 +1036,20 @@ send_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		session_suspend(ss);
 		return;
 	}
-	session_reset(ss);
-	if (ss->state == SESSION_CLOSED) {
-		if (ss->callbacks.on_event != NULL) {
-			ss->callbacks.on_event(
-				ss->userdata, ss, MUX_EVENT_CLOSED,
-				(union mux_event_data){
-					.closed.clean = ss->wire.rx_eof,
-				});
-		}
-	}
+	session_fire_closed(ss, false);
 }
 
-static void
-ping_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
 	struct mux_session *restrict ss = w->data;
 	ASSERT(loop == ss->loop);
 	UNUSED(loop);
-	switch (ss->state) {
-	case SESSION_ESTABLISHED:
-		break;
-	default:
-		FAILMSGF("unexpected session state %d", ss->state);
-	}
+	CHECKMSGF(
+		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
+		ss->state);
 	MUX_LOG(WARNING, ss, "session timeout");
-	session_reset(ss);
-	if (ss->state == SESSION_CLOSED) {
-		if (ss->callbacks.on_event != NULL) {
-			ss->callbacks.on_event(
-				ss->userdata, ss, MUX_EVENT_CLOSED,
-				(union mux_event_data){
-					.closed.clean = ss->wire.rx_eof,
-				});
-		}
-	}
+	session_fire_closed(ss, false);
 }
 
 /* Handle an inbound PING (spec §5.3.2): immediately queue a PONG whose
@@ -1115,7 +1107,8 @@ static bool update_stream_window_cb(
 }
 
 /* Apply the current BDP estimate to the session and stream window floors.
- * Both windows are derived from bdp_bytes + bdp_bytes/4 and are updated
+ * bdp_bytes is the windowed maximum BDP maintained by the estimator; both
+ * windows are derived from bdp_bytes + bdp_bytes/4 and are updated
  * bidirectionally.  On shrink, per-stream recv_window is left intact so the
  * peer can drain already-granted credit naturally.  On grow, live streams
  * receive the extra recv credit immediately. */
@@ -1150,7 +1143,8 @@ session_update_window(struct mux_session *restrict ss, const size_t bdp_bytes)
 		 * and the safety constraint is satisfied. */
 	}
 	MUX_LOG_F(
-		INFO, ss, "estimator updated: bdp=%zu session=%zu stream=%zu",
+		INFO, ss,
+		"estimator updated: max_bdp=%zu session=%zu stream=%zu",
 		bdp_bytes, (size_t)ss->session_window * MUX_WINDOW_UNIT,
 		(size_t)ss->stream_window * MUX_WINDOW_UNIT);
 }
@@ -1161,8 +1155,6 @@ void session_recv_pong(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
-	/* PONG proves the peer is alive; stop the ping-response deadline. */
-	ev_timer_stop(ss->loop, &ss->w_ping_timeout);
 	if (hdr->length < MUX_PING_PAYLOAD_SIZE) {
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
 		return;
@@ -1172,7 +1164,7 @@ void session_recv_pong(
 		ringbuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE);
 	ringbuf_consume(ss->wire.recvbuf, frame_size);
 	estimator_calculate(ss, sent_ns);
-	session_update_window(ss, ss->estimator.bdp);
+	session_update_window(ss, ss->estimator.effective_bdp);
 }
 
 static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
@@ -1184,14 +1176,11 @@ static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	CHECKMSGF(
 		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
 		ss->state);
-	MUX_LOG(VERBOSE, ss, "connection inactive, sending PING");
-	unsigned char payload[MUX_PING_PAYLOAD_SIZE];
-	write_uint64(payload, (uint_fast64_t)clock_monotonic_ns());
-	if (!session_send_oob(ss, MUX_CTRL_PING, payload, sizeof(payload))) {
+	MUX_LOG(VERBOSE, ss, "connection inactive, sending PROBE");
+	if (!session_send_oob(ss, MUX_CTRL_PROBE, NULL, 0)) {
 		return;
 	}
 	session_flush(ss);
-	ev_timer_again(ss->loop, &ss->w_ping_timeout);
 }
 
 static void idle_cb(struct ev_loop *loop, ev_timer *w, const int revents)
@@ -1279,17 +1268,15 @@ session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
 	ev_io_init(&ss->w_socket, socket_cb, fd, EV_READ);
 	ss->w_socket.data = ss;
 
-	const double ping_timeout = (double)conf->ping_timeout;
-	ev_timer_init(&ss->w_ping_timeout, ping_timeout_cb, 0.0, ping_timeout);
-	ss->w_ping_timeout.data = ss;
+	const double timeout = (double)conf->timeout;
+	ev_timer_init(&ss->w_timeout, timeout_cb, 0.0, timeout);
+	ss->w_timeout.data = ss;
 
 	const double keepalive = (double)conf->keepalive;
 	ev_timer_init(&ss->w_keepalive, keepalive_cb, 0.0, keepalive);
 	ss->w_keepalive.data = ss;
 
-	const double send_timeout =
-		(double)(conf->send_timeout > 0 ? conf->send_timeout :
-						  conf->ping_timeout);
+	const double send_timeout = (double)conf->send_timeout;
 	ev_timer_init(&ss->w_send_timeout, send_timeout_cb, 0.0, send_timeout);
 	ss->w_send_timeout.data = ss;
 
@@ -1345,7 +1332,7 @@ void session_initiate_shutdown(struct mux_session *restrict ss)
 	/* Stop all timers and the idle scheduler; keep the socket watcher. */
 	struct ev_loop *restrict loop = ss->loop;
 	ev_idle_stop(loop, &ss->sched.w_sched);
-	ev_timer_stop(loop, &ss->w_ping_timeout);
+	ev_timer_stop(loop, &ss->w_timeout);
 	ev_timer_stop(loop, &ss->w_keepalive);
 	ev_timer_stop(loop, &ss->w_send_timeout);
 	ev_timer_stop(loop, &ss->w_connect_timeout);
@@ -1419,10 +1406,10 @@ void session_set_config(
 		ss->stream_window = (uint_least32_t)conf->stream_window;
 	}
 
-	const double ping_timeout = (double)conf->ping_timeout;
-	ev_timer_set(&ss->w_ping_timeout, 0.0, ping_timeout);
-	if (ev_is_active(&ss->w_ping_timeout)) {
-		ev_timer_again(ss->loop, &ss->w_ping_timeout);
+	const double timeout = (double)conf->timeout;
+	ev_timer_set(&ss->w_timeout, 0.0, timeout);
+	if (ev_is_active(&ss->w_timeout)) {
+		ev_timer_again(ss->loop, &ss->w_timeout);
 	}
 
 	const double keepalive = (double)conf->keepalive;
@@ -1431,9 +1418,7 @@ void session_set_config(
 		ev_timer_again(ss->loop, &ss->w_keepalive);
 	}
 
-	const double send_timeout =
-		(double)(conf->send_timeout > 0 ? conf->send_timeout :
-						  conf->ping_timeout);
+	const double send_timeout = (double)conf->send_timeout;
 	ev_timer_set(&ss->w_send_timeout, 0.0, send_timeout);
 	if (ss->w_socket.fd != -1 &&
 	    socket_user_timeout(ss->w_socket.fd, conf->send_timeout * 1000) ==
@@ -1465,7 +1450,12 @@ void session_set_config(
 		ev_timer_set(&ss->w_idle_timeout, 0.0, 0.0);
 	}
 
-	if (ss->auto_window) {
+	/* Seed the estimator only when first entering auto mode.  In the
+	 * already-auto path the window and probe state have already converged;
+	 * calling estimator_seed would wipe the learned RTT/BW windows and
+	 * re-seed bdp from a window value that includes the 25 % headroom,
+	 * compounding the overshoot on every config reload. */
+	if (ss->auto_window && !was_auto_window) {
 		estimator_seed(
 			ss, (size_t)ss->session_window * MUX_WINDOW_UNIT);
 	}
@@ -1733,6 +1723,7 @@ void session_handshake_done(struct mux_session *ss)
 	 * clears connect_started and updates peer_addr. */
 	const bool is_resume = (ss->peer_addr.sa.sa_family != AF_UNSPEC);
 	session_set_state(ss, SESSION_ESTABLISHED);
+	ev_timer_again(ss->loop, &ss->w_timeout);
 	if (LOGLEVEL(NOTICE)) {
 		char str[32];
 		format_duration(
@@ -1882,8 +1873,8 @@ void session_suspend(struct mux_session *restrict ss)
 	/* Close transport. */
 	ev_io_stop(ss->loop, &ss->w_socket);
 	ev_idle_stop(ss->loop, &ss->sched.w_sched);
+	ev_timer_stop(ss->loop, &ss->w_timeout);
 	ev_timer_stop(ss->loop, &ss->w_keepalive);
-	ev_timer_stop(ss->loop, &ss->w_ping_timeout);
 	ev_timer_stop(ss->loop, &ss->w_send_timeout);
 	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
 	ev_timer_stop(ss->loop, &ss->sched.w_coalesce);

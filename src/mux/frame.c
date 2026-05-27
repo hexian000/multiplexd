@@ -8,6 +8,8 @@
 
 #include "mux/frame.h"
 
+#include "mux/mux.h"
+
 #include "utils/serialize.h"
 
 #include <stddef.h>

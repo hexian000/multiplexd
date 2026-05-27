@@ -8,8 +8,9 @@
 
 #include "mux/handshake.h"
 
-#include "jsonutil.h"
 #include "mux/frame.h"
+#include "mux/mux.h"
+#include "mux/proto_schema.gen.h"
 #include "mux/sched.h"
 #include "mux/session.h"
 #include "mux/wire.h"
@@ -30,7 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Hello wire format (spec §6.2.1): version=0, flags=0, length=json_len,
+/* Hello wire format (spec §5.2.1): version=0, flags=0, length=json_len,
  * stream_id=0, extra=0, followed by the JSON body on stream 0. */
 #define PROTO_MIME_TYPE "application/x-multiplexd-proto"
 #define PROTO_VERSION "1"
@@ -43,141 +44,57 @@ static int proto_hello_build(
 	unsigned char *const buf, const size_t buf_size,
 	const struct proto_hello *const msg)
 {
-	struct jutil_value *obj = jutil_new_object();
-	if (obj == NULL) {
-		return -1;
-	}
-	if (!jutil_object_set(obj, "type", jutil_new_string(PROTO_TYPE)) ||
-	    !jutil_object_set(obj, "msgid", jutil_new_int(msg->msgid))) {
-		jutil_free(obj);
-		return -1;
-	}
+	/* JSON carries session_id in base64. */
+	char id_b64[SESSION_ID_B64 + 1];
 	if (msg->has_session_id) {
-		/* JSON carries session_id in base64. */
-		char id_b64[SESSION_ID_B64 + 1];
-		{
-			size_t len = SESSION_ID_B64;
-			(void)base64_encode(
-				(unsigned char *)id_b64, &len, msg->session_id,
-				MUX_SESSION_ID_LEN);
-			id_b64[SESSION_ID_B64] = '\0';
-		}
-		if (!jutil_object_set(
-			    obj, "session_id", jutil_new_string(id_b64))) {
-			jutil_free(obj);
-			return -1;
-		}
+		size_t len = SESSION_ID_B64;
+		(void)base64_encode(
+			(unsigned char *)id_b64, &len, msg->session_id,
+			MUX_SESSION_ID_LEN);
+		id_b64[SESSION_ID_B64] = '\0';
 	}
-	if (msg->has_resume_seq &&
-	    !jutil_object_set(
-		    obj, "resume_seq",
-		    jutil_new_uint((uintmax_t)msg->resume_seq))) {
-		jutil_free(obj);
+	/* Strings in raw are borrowed; do not call json_proto_free(). */
+	const struct json_proto raw = {
+		.type = (char *)PROTO_TYPE,
+		.type_len = sizeof(PROTO_TYPE) - 1,
+		.has_msgid = true,
+		.msgid = msg->msgid,
+		.session_id = msg->has_session_id ? id_b64 : NULL,
+		.session_id_len = msg->has_session_id ? SESSION_ID_B64 : 0,
+		.has_resume_seq = msg->has_resume_seq,
+		.resume_seq = (unsigned)msg->resume_seq,
+		.has_extensions = true,
+		.extensions = {
+			.has_reject_inbound = msg->reject_inbound,
+			.reject_inbound = msg->reject_inbound,
+			.identity = msg->has_identity
+				? (char *)msg->identity
+				: NULL,
+			.identity_len = msg->has_identity
+				? strlen(msg->identity)
+				: 0,
+		},
+	};
+	const int json_sz = json_proto_marshal(NULL, 0, &raw);
+	if (json_sz <= 0 || (size_t)json_sz > MUX_MAX_PAYLOAD_SIZE) {
 		return -1;
 	}
-	{
-		struct jutil_value *const ext = jutil_new_object();
-		if (ext == NULL) {
-			jutil_free(obj);
-			return -1;
-		}
-		if (msg->reject_inbound &&
-		    !jutil_object_set(
-			    ext, "reject_inbound", jutil_new_bool(true))) {
-			jutil_free(ext);
-			jutil_free(obj);
-			return -1;
-		}
-		if (msg->has_identity &&
-		    !jutil_object_set(
-			    ext, "identity", jutil_new_string(msg->identity))) {
-			jutil_free(ext);
-			jutil_free(obj);
-			return -1;
-		}
-		/* ext owned by obj */
-		if (!jutil_object_set(obj, "extensions", ext)) {
-			jutil_free(ext);
-			jutil_free(obj);
-			return -1;
-		}
-	}
-	size_t json_len;
-	const char *json = jutil_print(obj, &json_len, false);
-	if (json == NULL || json_len > MUX_MAX_PAYLOAD_SIZE) {
-		jutil_free(obj);
-		return -1;
-	}
-	const size_t total = MUX_FRAME_HEADER_SIZE + json_len;
+	const size_t total = MUX_FRAME_HEADER_SIZE + (size_t)json_sz;
 	if (total <= buf_size) {
+		ASSERT((size_t)json_sz <= MUX_MAX_PAYLOAD_SIZE);
+		char json_buf[(size_t)json_sz + 1];
+		(void)json_proto_marshal(json_buf, (size_t)json_sz + 1, &raw);
 		const struct mux_header hdr = {
 			.version = 0,
 			.flags = 0,
-			.length = (uint_least16_t)json_len,
+			.length = (uint_least16_t)json_sz,
 			.stream_id = 0,
 			.extra = 0,
 		};
 		mux_write_header(buf, &hdr);
-		memcpy(buf + MUX_FRAME_HEADER_SIZE, json, json_len);
+		memcpy(buf + MUX_FRAME_HEADER_SIZE, json_buf, (size_t)json_sz);
 	}
-	jutil_free(obj);
 	return (int)total;
-}
-
-struct hello_parse_ctx {
-	const char *type;
-	int msgid;
-	bool has_msgid;
-	bool reject_inbound;
-	const char *session_id;
-	bool has_session_id;
-	uintmax_t resume_seq;
-	bool has_resume_seq;
-	/* identity extension */
-	bool has_identity;
-	const char *identity;
-};
-
-static bool
-extensions_parse_cb(void *ud, const char *key, const struct jutil_value *value)
-{
-	struct hello_parse_ctx *restrict ctx = ud;
-	if (strcmp(key, "reject_inbound") == 0) {
-		return jutil_get_bool(value, &ctx->reject_inbound);
-	}
-	if (strcmp(key, "identity") == 0) {
-		ctx->identity = jutil_get_string(value);
-		ctx->has_identity = ctx->identity != NULL;
-		return ctx->has_identity;
-	}
-	return true;
-}
-
-static bool
-proto_hello_parse_cb(void *ud, const char *key, const struct jutil_value *value)
-{
-	struct hello_parse_ctx *restrict ctx = ud;
-	if (strcmp(key, "type") == 0) {
-		ctx->type = jutil_get_string(value);
-		return ctx->type != NULL;
-	}
-	if (strcmp(key, "msgid") == 0) {
-		ctx->has_msgid = jutil_get_int(value, &ctx->msgid);
-		return ctx->has_msgid;
-	}
-	if (strcmp(key, "session_id") == 0) {
-		ctx->session_id = jutil_get_string(value);
-		ctx->has_session_id = ctx->session_id != NULL;
-		return ctx->has_session_id;
-	}
-	if (strcmp(key, "resume_seq") == 0) {
-		ctx->has_resume_seq = jutil_get_uint(value, &ctx->resume_seq);
-		return ctx->has_resume_seq;
-	}
-	if (strcmp(key, "extensions") == 0) {
-		return jutil_walk_object(ctx, value, extensions_parse_cb);
-	}
-	return true;
 }
 
 static bool proto_parse_type(const char *type, int *const version_out)
@@ -239,75 +156,62 @@ static bool proto_hello_parse(
 	const unsigned char *const json, const size_t json_len,
 	struct proto_hello *const out)
 {
-	struct jutil_value *obj = jutil_parse((const char *)json, json_len);
-	if (obj == NULL) {
-		LOGE("failed to parse protocol hello");
+	if (json_len > MUX_MAX_PAYLOAD_SIZE) {
+		LOGE("failed to parse protocol hello: too large");
 		return false;
 	}
-
-	struct hello_parse_ctx ctx = {
-		.type = NULL,
-		.msgid = -1,
-		.has_msgid = false,
-		.reject_inbound = false,
-		.session_id = NULL,
-		.has_session_id = false,
-		.resume_seq = 0,
-		.has_resume_seq = false,
-	};
-	if (!jutil_walk_object(&ctx, obj, proto_hello_parse_cb)) {
+	ASSERT(json_len <= MUX_MAX_PAYLOAD_SIZE);
+	char json_buf[json_len + 1];
+	memcpy(json_buf, json, json_len);
+	struct json_proto obj = { 0 };
+	if (!json_proto_unmarshal(&obj, json_buf, json_len)) {
 		LOGE("malformed protocol hello");
-		jutil_free(obj);
+		json_proto_free(&obj);
 		return false;
 	}
 
-	if (ctx.type == NULL) {
+	if (obj.type == NULL) {
 		LOGE("protocol hello: missing type");
-		jutil_free(obj);
+		json_proto_free(&obj);
 		return false;
 	}
-	if (!proto_parse_type(ctx.type, &out->version)) {
-		jutil_free(obj);
+	if (!proto_parse_type(obj.type, &out->version)) {
+		json_proto_free(&obj);
 		return false;
 	}
-
-	if (!ctx.has_msgid) {
+	if (!obj.has_msgid) {
 		LOGE("protocol hello: missing msgid");
-		jutil_free(obj);
+		json_proto_free(&obj);
 		return false;
 	}
+	out->msgid = (int)obj.msgid;
+	out->reject_inbound = obj.extensions.reject_inbound;
 
-	if (ctx.has_session_id &&
-	    !proto_parse_session_id(ctx.session_id, out->session_id)) {
+	if (obj.session_id != NULL &&
+	    !proto_parse_session_id(obj.session_id, out->session_id)) {
 		LOGE("protocol hello: invalid session_id");
-		jutil_free(obj);
+		json_proto_free(&obj);
 		return false;
 	}
+	out->has_session_id = obj.session_id != NULL;
 
-	if (ctx.has_resume_seq && ctx.resume_seq > (uintmax_t)UINT32_MAX) {
-		LOGE("protocol hello: invalid resume_seq");
-		jutil_free(obj);
-		return false;
+	if (obj.has_resume_seq) {
+		out->resume_seq = (uint_least32_t)obj.resume_seq;
 	}
+	out->has_resume_seq = obj.has_resume_seq;
 
-	out->msgid = ctx.msgid;
-	out->reject_inbound = ctx.reject_inbound;
-	out->has_session_id = ctx.has_session_id;
-	out->has_resume_seq = ctx.has_resume_seq;
-	out->resume_seq =
-		ctx.has_resume_seq ? (uint_least32_t)ctx.resume_seq : 0;
 	out->has_identity = false;
-	if (ctx.has_identity) {
-		const size_t id_len = strlen(ctx.identity);
+	if (obj.extensions.identity != NULL) {
+		const size_t id_len = strlen(obj.extensions.identity);
 		if (id_len >= sizeof(out->identity)) {
 			LOGE("protocol hello: identity too long");
-			jutil_free(obj);
+			json_proto_free(&obj);
 			return false;
 		}
 		out->has_identity = true;
-		memcpy(out->identity, ctx.identity, id_len + 1);
+		memcpy(out->identity, obj.extensions.identity, id_len + 1);
 	}
-	jutil_free(obj);
+	json_proto_free(&obj);
 	return true;
 }
 
@@ -377,6 +281,119 @@ bool handshake_enqueue_hello(
 	return true;
 }
 
+/* Server side: received ClientHello.
+ * Returns true if the handshake should continue to session_handshake_done.
+ * Returns false if the session was handed off (destroyed) or an error occurred. */
+static bool process_hello_server(
+	struct mux_session *restrict ss,
+	const struct proto_hello *restrict peer_hello)
+{
+	/* Check whether this is a resume attempt (peer's session_id matches a
+	 * suspended session we own). */
+	if (peer_hello->has_session_id && peer_hello->has_resume_seq &&
+	    ss->callbacks.on_resume != NULL) {
+		struct mux_session *suspended = ss->callbacks.on_resume(
+			ss->userdata, ss, peer_hello->session_id);
+		if (suspended != NULL) {
+			/* Hand off the resume to the old session.
+			 * That function sends ServerHello, retransmits,
+			 * and destroys this transient session. */
+			if (!session_resume_transport(
+				    suspended, ss, peer_hello->resume_seq)) {
+				session_reset(ss);
+			}
+			return false; /* this session is destroyed */
+		}
+		MUX_LOG(WARNING, ss,
+			"resume requested but no matching session found;"
+			" treating as fresh");
+	}
+	/* Fresh session: reply with our session_id. */
+	return handshake_enqueue_hello(ss, PROTO_MSG_SERVER_HELLO, false);
+}
+
+/* Client side, fresh-session path (spec §5.8.3 step 4): discard all preserved
+ * streams and unacked frames, reset counters, and adopt the server-assigned
+ * session_id.  Also clears peer_addr so that the upcoming
+ * session_handshake_done fires MUX_EVENT_ESTABLISHED, not MUX_EVENT_RESUMED. */
+static bool handshake_client_fresh(
+	struct mux_session *restrict ss,
+	const struct proto_hello *restrict peer_hello)
+{
+	if (ss->handshake.has_session_id) {
+		MUX_LOG_F(
+			WARNING, ss,
+			"server rejected resume, falling back to fresh"
+			" session (unacked=%zu streams=%zu)",
+			ss->unacked_frames,
+			ss->sched.streams != NULL ?
+				table_size(ss->sched.streams) :
+				0);
+	}
+	sched_free_streams(ss);
+	ss->sched.streams = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_PTR.hash,
+		.eq = TABLE_OPTS_PTR.eq,
+		.flags = TABLE_FAST,
+	});
+	if (ss->sched.streams == NULL) {
+		LOGOOM();
+		session_reset(ss);
+		return false;
+	}
+	mux_frame_list_clear(&ss->unacked, &ss->pool);
+	COUNTER_SUB(ss->cnt.unacked_frames, ss->unacked_frames);
+	ss->unacked_frames = 0;
+	ss->retransmit_cursor = NULL;
+	ss->send_seq = 0;
+	ss->recv_seq = 0;
+	ss->ack_seq = 0;
+	ss->last_ack_recv = 0;
+	ss->session_ack_ticks = 0;
+	memset(&ss->peer_addr, 0, sizeof(ss->peer_addr));
+	/* Adopt the server-assigned session id. */
+	if (peer_hello->has_session_id) {
+		memcpy(ss->handshake.session_id, peer_hello->session_id,
+		       MUX_SESSION_ID_LEN);
+		ss->handshake.has_session_id = true;
+	}
+	return true;
+}
+
+/* Client side: received ServerHello.
+ * A resume is confirmed when: (a) the ServerHello carries resume_seq, and
+ * (b) the session_id matches the server-assigned id stored after the previous
+ * handshake (spec §5.8.3).
+ * Returns true if the handshake should continue; false on error. */
+static bool process_hello_client(
+	struct mux_session *restrict ss,
+	const struct proto_hello *restrict peer_hello)
+{
+	const bool is_confirmed_resume =
+		peer_hello->has_resume_seq && ss->handshake.has_session_id &&
+		peer_hello->has_session_id &&
+		memcmp(peer_hello->session_id, ss->handshake.session_id,
+		       MUX_SESSION_ID_LEN) == 0;
+	if (is_confirmed_resume) {
+		/* Trim our unacked list using the server's resume_seq
+		 * (how many of our frames it received). */
+		if (!session_resume_ack_recv(ss, peer_hello->resume_seq)) {
+			session_reset(ss);
+			return false;
+		}
+		MUX_LOG_F(
+			INFO, ss,
+			"session resumed, resume_seq=%" PRIuLEAST32
+			" unacked=%zu",
+			peer_hello->resume_seq, ss->unacked_frames);
+	} else {
+		if (!handshake_client_fresh(ss, peer_hello)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool handshake_process_hello(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
@@ -401,7 +418,7 @@ bool handshake_process_hello(
 		"[fd:%d] hello recv:", ss->w_socket.fd);
 	const int expected_msgid =
 		ss->accepted ? PROTO_MSG_CLIENT_HELLO : PROTO_MSG_SERVER_HELLO;
-	struct proto_hello peer_hello;
+	struct proto_hello peer_hello = { 0 };
 	if (!proto_hello_parse(
 		    p + MUX_FRAME_HEADER_SIZE, (size_t)hdr->length,
 		    &peer_hello)) {
@@ -438,112 +455,16 @@ bool handshake_process_hello(
 			read_uint64(peer_hello.session_id + sizeof(uint64_t)));
 	}
 	ss->handshake.peer_rejects_inbound_streams = peer_hello.reject_inbound;
-	/* Store peer's identity when present */
 	if (peer_hello.has_identity) {
 		free(ss->handshake.peer_identity);
 		ss->handshake.peer_identity = strdup(peer_hello.identity);
 	}
-
-	const unsigned char *const peer_sid = peer_hello.session_id;
-
 	ringbuf_consume(ss->wire.recvbuf, frame_size);
-	if (ss->accepted) {
-		/* Server: received ClientHello.
-		 * Check whether this is a resume attempt (the peer's
-		 * session_id matches a suspended session we own). */
-		if (peer_hello.has_resume_seq &&
-		    ss->callbacks.on_resume != NULL) {
-			struct mux_session *suspended = ss->callbacks.on_resume(
-				ss->userdata, ss, peer_sid);
-			if (suspended != NULL) {
-				/* Hand off the resume to the old session.
-				 * That function sends ServerHello, retransmits,
-				 * and destroys this transient session. */
-				if (!session_resume_transport(
-					    suspended, ss,
-					    peer_hello.resume_seq)) {
-					session_reset(ss);
-				}
-				return false; /* this session is destroyed */
-			}
-			MUX_LOG(WARNING, ss,
-				"resume requested but no matching session found;"
-				" treating as fresh");
-		}
-		/* Fresh session: reply with our session_id. */
-		if (!handshake_enqueue_hello(
-			    ss, PROTO_MSG_SERVER_HELLO, false)) {
-			return false;
-		}
-	} else {
-		/* Client: received ServerHello.
-		 * A resume is confirmed when: (a) the ServerHello carries
-		 * resume_seq, and (b) the session_id matches the server-assigned
-		 * id stored after the previous handshake (spec §5.8.3). */
-		const bool is_confirmed_resume =
-			peer_hello.has_resume_seq &&
-			ss->handshake.has_session_id &&
-			peer_hello.has_session_id &&
-			memcmp(peer_sid, ss->handshake.session_id,
-			       MUX_SESSION_ID_LEN) == 0;
-		if (is_confirmed_resume) {
-			/* Confirmed resume: trim our unacked list using the
-			 * server's resume_seq (how many of our frames it got). */
-			if (!session_resume_ack_recv(
-				    ss, peer_hello.resume_seq)) {
-				session_reset(ss);
-				return false;
-			}
-			MUX_LOG_F(
-				INFO, ss,
-				"session resumed, resume_seq=%" PRIuLEAST32
-				" unacked=%zu",
-				peer_hello.resume_seq, ss->unacked_frames);
-		} else {
-			/* Server sent a fresh session (spec §5.8.3 step 4):
-			 * discard all preserved streams and unacked frames, clear
-			 * counters, and continue as a fresh session.  Also clear
-			 * peer_addr so that the upcoming session_handshake_done
-			 * correctly fires MUX_EVENT_ESTABLISHED, not MUX_EVENT_RESUMED. */
-			if (ss->handshake.has_session_id) {
-				/* A resume was attempted but the server rejected it. */
-				MUX_LOG_F(
-					WARNING, ss,
-					"server rejected resume, falling back to fresh"
-					" session (unacked=%zu streams=%zu)",
-					ss->unacked_frames,
-					ss->sched.streams != NULL ?
-						table_size(ss->sched.streams) :
-						0);
-			}
-			sched_free_streams(ss);
-			ss->sched.streams = table_new(&(struct table_opts){
-				.hash = TABLE_OPTS_PTR.hash,
-				.eq = TABLE_OPTS_PTR.eq,
-				.flags = TABLE_FAST,
-			});
-			if (ss->sched.streams == NULL) {
-				LOGOOM();
-				session_reset(ss);
-				return false;
-			}
-			mux_frame_list_clear(&ss->unacked, &ss->pool);
-			COUNTER_SUB(ss->cnt.unacked_frames, ss->unacked_frames);
-			ss->unacked_frames = 0;
-			ss->retransmit_cursor = NULL;
-			ss->send_seq = 0;
-			ss->recv_seq = 0;
-			ss->ack_seq = 0;
-			ss->last_ack_recv = 0;
-			ss->session_ack_ticks = 0;
-			memset(&ss->peer_addr, 0, sizeof(ss->peer_addr));
-			/* Adopt the server-assigned session id. */
-			if (peer_hello.has_session_id) {
-				memcpy(ss->handshake.session_id, peer_sid,
-				       MUX_SESSION_ID_LEN);
-				ss->handshake.has_session_id = true;
-			}
-		}
+
+	const bool ok = ss->accepted ? process_hello_server(ss, &peer_hello) :
+				       process_hello_client(ss, &peer_hello);
+	if (!ok) {
+		return false;
 	}
 	session_handshake_done(ss);
 	/* If resuming, start retransmitting from the cursor after handshake. */

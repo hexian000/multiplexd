@@ -232,11 +232,16 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 #endif
-		if (!conf_dump(conf, stdout)) {
+		size_t dump_len;
+		char *dump_json = conf_dump(conf, &dump_len);
+		if (dump_json == NULL) {
 			LOGF("failed to dump config");
 			conf_free(conf);
 			return EXIT_FAILURE;
 		}
+		(void)fwrite(dump_json, 1, dump_len, stdout);
+		(void)fputc('\n', stdout);
+		free(dump_json);
 		conf_free(conf);
 		return EXIT_SUCCESS;
 	}
@@ -256,13 +261,14 @@ int main(int argc, char **argv)
 				subsystems + pos, sizeof(subsystems) - pos,
 				"%smux client", pos > 0 ? ", " : "");
 		}
-		if (conf->identity_connect_count > 0) {
-			pos += snprintf(
+		if (conf->identity.mux_connect_count > 0) {
+			(void)snprintf(
 				subsystems + pos, sizeof(subsystems) - pos,
 				"%sidentity client (%zu address%s)",
 				pos > 0 ? ", " : "",
-				conf->identity_connect_count,
-				conf->identity_connect_count == 1 ? "" : "es");
+				conf->identity.mux_connect_count,
+				conf->identity.mux_connect_count == 1 ? "" :
+									"es");
 		}
 		LOGI_F("%s %s starting (%s)", PROJECT_NAME, PROJECT_VER,
 		       subsystems);

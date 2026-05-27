@@ -62,13 +62,15 @@ struct mux_traffic_counters {
 #if WITH_THREADS
 	atomic_uintmax_t *byt_mux_recv;
 	atomic_uintmax_t *byt_mux_sent;
-	atomic_uintmax_t *byt_local_recv;
-	atomic_uintmax_t *byt_local_sent;
+	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
+	atomic_uintmax_t *byt_push_recv;
+	atomic_uintmax_t *byt_push_sent;
 #else
 	uintmax_t *byt_mux_recv;
 	uintmax_t *byt_mux_sent;
-	uintmax_t *byt_local_recv;
-	uintmax_t *byt_local_sent;
+	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
+	uintmax_t *byt_push_recv;
+	uintmax_t *byt_push_sent;
 #endif
 };
 
@@ -136,9 +138,11 @@ struct mux_config {
 
 	/* Timeout in seconds for a single TCP-connect and mux-handshake attempt. */
 	int connect_timeout;
-	/* Interval in seconds between keepalive PING probes. */
+	/* Inactivity timeout in seconds before the session is considered dead. */
+	int timeout;
+	/* Interval in seconds between keepalive PROBE probes. */
 	int keepalive;
-	/* Timeout in seconds to wait for a PING response before the session is considered dead. */
+	/* Timeout in seconds for a PING response in the BDP estimator. */
 	int ping_timeout;
 	/* Timeout in seconds for a blocked send before the session is reset. */
 	int send_timeout;
@@ -158,9 +162,9 @@ struct mux_config {
 	int mem_pressure_lo;
 
 	/* Send frames immediately without coalescing. */
-	bool nodelay;
+	bool nodelay : 1;
 	/* Reject new inbound streams opened by the peer. */
-	bool reject_inbound;
+	bool reject_inbound : 1;
 
 #if WITH_TLS
 	/* TLS context for outbound reconnects; NULL leaves the existing context unchanged. */
@@ -257,7 +261,7 @@ struct mux_session_stats {
 	/* Windowed-minimum RTT from PING/PONG probes, in nanoseconds;
 	 * 0 when no measurement has been completed yet. */
 	intmax_t rtt_ns;
-	/* Raw physical BDP estimate in bytes, no headroom;
+	/* Raw physical BDP estimate in bytes;
 	 * 0 when the estimator has not yet produced a value. */
 	size_t bdp;
 };
@@ -334,10 +338,10 @@ union mux_event_data {
  * on_accept   Called for each new inbound stream.  Must call
  *             mux_stream_attach() or mux_stream_io_start() and return true
  *             to accept, or return false to reject.
-	 * on_event    Called on session lifecycle changes. Typical resume-capable
-	 *             sequence: CONNECT → ESTABLISHED, then LOST → SUSPENDED,
-	 *             then CONNECT → RESUMED. LOST fires whenever the session
-	 *             leaves ESTABLISHED.
+ * on_event    Called on session lifecycle changes. Typical resume-capable
+ *             sequence: CONNECT → ESTABLISHED, then LOST → SUSPENDED,
+ *             then CONNECT → RESUMED. LOST fires whenever the session
+ *             leaves ESTABLISHED.
  *             MUX_EVENT_CLOSED fires before mux_close.
  * on_resume   Called on the new (transient) session when a resume hello
  *             arrives.  Match session_id against suspended sessions and

@@ -30,6 +30,25 @@ static int write_tmpfile(char *restrict tmpl, const char *restrict content)
 	return 0;
 }
 
+static bool
+write_conf_file(const struct config *restrict conf, const char *restrict path)
+{
+	size_t len;
+	char *json = conf_dump(conf, &len);
+	if (json == NULL) {
+		return false;
+	}
+	FILE *fp = fopen(path, "w");
+	if (fp == NULL) {
+		free(json);
+		return false;
+	}
+	const bool ok = fwrite(json, 1, len, fp) == len;
+	(void)fclose(fp);
+	free(json);
+	return ok;
+}
+
 static struct config *parse_tmpconf(const char *restrict content)
 {
 	char tmpl[] = "/tmp/conf_test_XXXXXX";
@@ -44,9 +63,9 @@ static struct config *parse_tmpconf(const char *restrict content)
 static const struct identity_peer *
 find_peer(const struct config *restrict conf, const char *restrict id)
 {
-	for (size_t i = 0; i < conf->identity_peers_count; i++) {
-		if (strcmp(conf->identity_peers[i].id, id) == 0) {
-			return &conf->identity_peers[i];
+	for (size_t i = 0; i < conf->identity.peers_count; i++) {
+		if (strcmp(conf->identity.peers[i].id, id) == 0) {
+			return &conf->identity.peers[i];
 		}
 	}
 	return NULL;
@@ -119,7 +138,7 @@ T_DECLARE_CASE(test_conf_dump_roundtrip)
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
-	T_CHECK(conf_dumpfile(orig, tmpl));
+	T_CHECK(write_conf_file(orig, tmpl));
 
 	struct config *reparsed = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
@@ -147,7 +166,7 @@ T_DECLARE_CASE(test_conf_identity_connect_count)
 	struct config *conf = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
 	T_CHECK(conf != NULL);
-	T_EXPECT_EQ((int)conf->identity_connect_count, 2);
+	T_EXPECT_EQ((int)conf->identity.mux_connect_count, 2);
 	conf_free(conf);
 }
 
@@ -191,8 +210,8 @@ T_DECLARE_CASE(test_conf_parsefile_parses_identity_listen)
 			      "}"
 			      "}");
 	T_CHECK(conf != NULL);
-	T_EXPECT_EQ((int)conf->identity_connect_count, 1);
-	T_EXPECT_EQ((int)conf->identity_peers_count, 2);
+	T_EXPECT_EQ((int)conf->identity.mux_connect_count, 1);
+	T_EXPECT_EQ((int)conf->identity.peers_count, 2);
 	T_CHECK(find_peer(conf, "peer1") != NULL);
 	T_EXPECT_STREQ(find_peer(conf, "peer1")->listen, "127.0.0.1:9002");
 	T_CHECK(find_peer(conf, "peer2") != NULL);
@@ -230,6 +249,7 @@ T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 		parse_tmpconf("{"
 			      "\"mux_connect\":\"127.0.0.1:9000\","
 			      "\"mux\":{"
+			      "\"timeout\":5,"
 			      "\"ping_timeout\":10,"
 			      "\"keepalive\":5,"
 			      "\"send_timeout\":30,"
@@ -240,14 +260,17 @@ T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 			      "\"loglevel\":999"
 			      "}");
 	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(
+		conf->mux.timeout, 10); /* 5 â clamped up to floor 10 */
 	T_EXPECT_EQ(conf->mux.ping_timeout, 10);
-	T_EXPECT_EQ(conf->mux.keepalive, 10);
-	T_EXPECT_EQ(conf->mux.send_timeout, 10);
-	T_EXPECT_EQ(conf->mux.connect_timeout, 10);
-	T_EXPECT_EQ(conf->mux.resume_timeout, 10);
+	T_EXPECT_EQ(conf->mux.keepalive, 10); /* 5 → clamped up to floor 10 */
+	T_EXPECT_EQ(conf->mux.send_timeout, 30); /* independent [10,86400] */
+	T_EXPECT_EQ(conf->mux.connect_timeout, 40); /* independent [10,86400] */
+	T_EXPECT_EQ(
+		conf->mux.resume_timeout, 10); /* 1 → clamped up to floor 10 */
 	T_EXPECT_EQ(conf->mux.idle_timeout, 10);
 	T_EXPECT_EQ(conf->loglevel, LOG_LEVEL_VERYVERBOSE);
-	T_EXPECT(conf->mux.reject_inbound);
+	T_EXPECT(conf_get_mux(conf).reject_inbound);
 	conf_free(conf);
 }
 
@@ -286,9 +309,9 @@ T_DECLARE_CASE(test_conf_parsefile_authcerts_array)
 			      "\"authcerts\":[\"ca1.pem\",\"ca2.pem\"]"
 			      "}}");
 	T_CHECK(conf != NULL);
-	T_EXPECT_EQ((int)conf->authcerts_count, 2);
-	T_EXPECT_STREQ(conf->authcerts[0], "ca1.pem");
-	T_EXPECT_STREQ(conf->authcerts[1], "ca2.pem");
+	T_EXPECT_EQ((int)conf->tls_authcerts_count, 2);
+	T_EXPECT_STREQ(conf->tls_authcerts[0], "ca1.pem");
+	T_EXPECT_STREQ(conf->tls_authcerts[1], "ca2.pem");
 	conf_free(conf);
 }
 
@@ -301,11 +324,11 @@ T_DECLARE_CASE(test_conf_dump_tls_fields)
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	orig->tls_cert = strdup("certdata");
 	orig->tls_key = strdup("keydata");
-	orig->authcerts = malloc(sizeof(char *));
-	T_CHECK(orig->authcerts != NULL);
-	orig->authcerts[0] = strdup("authcertdata");
-	T_CHECK(orig->authcerts[0] != NULL);
-	orig->authcerts_count = 1;
+	orig->tls_authcerts = malloc(sizeof(char *));
+	T_CHECK(orig->tls_authcerts != NULL);
+	orig->tls_authcerts[0] = strdup("authcertdata");
+	T_CHECK(orig->tls_authcerts[0] != NULL);
+	orig->tls_authcerts_count = 1;
 	T_CHECK(orig->mux_connect != NULL);
 	T_CHECK(orig->tls_cert != NULL);
 	T_CHECK(orig->tls_key != NULL);
@@ -314,15 +337,15 @@ T_DECLARE_CASE(test_conf_dump_tls_fields)
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
-	T_CHECK(conf_dumpfile(orig, tmpl));
+	T_CHECK(write_conf_file(orig, tmpl));
 
 	struct config *reparsed = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
 	T_CHECK(reparsed != NULL);
 	T_EXPECT_STREQ(reparsed->tls_cert, "certdata");
 	T_EXPECT_STREQ(reparsed->tls_key, "keydata");
-	T_EXPECT_EQ((int)reparsed->authcerts_count, 1);
-	T_EXPECT_STREQ(reparsed->authcerts[0], "authcertdata");
+	T_EXPECT_EQ((int)reparsed->tls_authcerts_count, 1);
+	T_EXPECT_STREQ(reparsed->tls_authcerts[0], "authcertdata");
 
 	conf_free(reparsed);
 	conf_free(orig);
@@ -402,7 +425,7 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 	/* mux.nodelay default is true; -nodelay:false must be ignored. */
 	T_EXPECT(conf->mux.nodelay);
 	/* identity.claim must be "me", not "ignored". */
-	T_EXPECT(strcmp(conf->identity_claim, "me") == 0);
+	T_EXPECT(strcmp(conf->identity.claim, "me") == 0);
 	conf_free(conf);
 }
 
@@ -494,26 +517,26 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 	struct config *orig = conf_new();
 	T_CHECK(orig != NULL);
 	orig->mux_connect = strdup("127.0.0.1:7777");
-	orig->identity_claim = strdup("mynode");
+	orig->identity.claim = strdup("mynode");
 	T_CHECK(orig->mux_connect != NULL);
-	T_CHECK(orig->identity_claim != NULL);
-	orig->identity_connect = malloc(sizeof(char *));
-	T_CHECK(orig->identity_connect != NULL);
-	orig->identity_connect[0] = strdup("127.0.0.1:9001");
-	T_CHECK(orig->identity_connect[0] != NULL);
-	orig->identity_connect_count = 1;
+	T_CHECK(orig->identity.claim != NULL);
+	orig->identity.mux_connect = malloc(sizeof(char *));
+	T_CHECK(orig->identity.mux_connect != NULL);
+	orig->identity.mux_connect[0] = strdup("127.0.0.1:9001");
+	T_CHECK(orig->identity.mux_connect[0] != NULL);
+	orig->identity.mux_connect_count = 1;
 
 	char tmpl[] = "/tmp/conf_id_dump_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
-	T_CHECK(conf_dumpfile(orig, tmpl));
+	T_CHECK(write_conf_file(orig, tmpl));
 
 	struct config *reparsed = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
 	T_CHECK(reparsed != NULL);
-	T_EXPECT_STREQ(reparsed->identity_claim, "mynode");
-	T_EXPECT_EQ((int)reparsed->identity_connect_count, 1);
+	T_EXPECT_STREQ(reparsed->identity.claim, "mynode");
+	T_EXPECT_EQ((int)reparsed->identity.mux_connect_count, 1);
 
 	conf_free(reparsed);
 	conf_free(orig);

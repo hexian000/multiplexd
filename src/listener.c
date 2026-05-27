@@ -8,7 +8,6 @@
 
 #include "listener.h"
 
-#include "mux/mux.h"
 #include "util.h"
 
 #include "os/socket.h"

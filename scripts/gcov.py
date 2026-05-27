@@ -27,15 +27,6 @@ DEFAULT_COVERAGE_BUILD_DIR = DEFAULT_BUILD_DIR / "gcov"
 DEFAULT_MARKDOWN_OUTPUT = DEFAULT_BUILD_DIR / "gcov.md"
 DEFAULT_SOURCE_DIRS = ("src",)
 DEFAULT_EXCLUDE_SOURCE_SUFFIXES = ("_test.c",)
-KNOWN_BOOL_OPTIONS = {
-	"BUILD_STATIC": "OFF",
-	"BUILD_PIE": "OFF",
-	"FORCE_POSIX": "OFF",
-	"ENABLE_THREADS": "ON",
-	"LINK_STATIC_LIBS": "OFF",
-	"ENABLE_SYSTEMD": "OFF",
-	"USE_TLS_LIBRARY": "auto",
-}
 CACHE_LINE_RE = re.compile(r"^([A-Za-z0-9_]+):[^=]+=(.*)$")
 HIT_COUNT_RE = re.compile(r"^([0-9]+)")
 
@@ -208,8 +199,6 @@ def build_configure_command(
 	compiler = base_cache.get("CMAKE_C_COMPILER")
 	if compiler:
 		command.append("-DCMAKE_C_COMPILER=%s" % compiler)
-	for key, default in KNOWN_BOOL_OPTIONS.items():
-		command.append("-D%s=%s" % (key, base_cache.get(key, default)))
 	return command
 
 

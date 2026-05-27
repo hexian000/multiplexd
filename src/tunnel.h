@@ -124,8 +124,7 @@ struct tunnel_stats {
 	/* Windowed-minimum RTT from PING/PONG probes, in nanoseconds; 0 if
 	 * no measurement has been completed yet. */
 	intmax_t rtt_ns;
-	/* Raw physical BDP estimate in bytes, no headroom; 0 if not yet
-	 * estimated. */
+	/* Raw physical BDP estimate in bytes; 0 if not yet estimated. */
 	size_t bdp;
 	/* Stream lifecycle counters (per-tunnel snapshot; aggregated by
 	 * server_stats() across all active tunnels). */
@@ -142,8 +141,9 @@ struct tunnel_stats {
 	 * accumulator in srv->counters). */
 	uintmax_t byt_mux_recv;
 	uintmax_t byt_mux_sent;
-	uintmax_t byt_local_recv;
-	uintmax_t byt_local_sent;
+	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
+	uintmax_t byt_push_recv;
+	uintmax_t byt_push_sent;
 	/* SYN->SYN|ACK latency ring (ns).  stream_establish_count is the
 	 * monotonic write index; the ring holds the most recent
 	 * min(stream_establish_count, 256) samples.

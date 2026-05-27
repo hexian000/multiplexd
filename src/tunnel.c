@@ -15,6 +15,7 @@
 #include "sync/task.h"
 #include "util.h"
 #include "utils/arraysize.h"
+#include "utils/debug.h"
 #include "utils/minmax.h"
 #include "utils/slog.h"
 
@@ -53,8 +54,7 @@ static void tunnel_set_tag_part(
 	if (ret < 0) {
 		buf[0] = '\0';
 	}
-	/* Truncation (ret >= buflen) is benign: snprintf guarantees
-	 * null-termination in all non-error cases. */
+	/* Truncation benign: snprintf null-terminates. */
 }
 
 static void tunnel_set_tag(
@@ -143,13 +143,15 @@ struct tunnel {
 #if WITH_THREADS
 		atomic_uintmax_t byt_mux_recv;
 		atomic_uintmax_t byt_mux_sent;
-		atomic_uintmax_t byt_local_recv;
-		atomic_uintmax_t byt_local_sent;
+		/* PUSH-frame payload bytes only */
+		atomic_uintmax_t byt_push_recv;
+		atomic_uintmax_t byt_push_sent;
 #else
 		uintmax_t byt_mux_recv;
 		uintmax_t byt_mux_sent;
-		uintmax_t byt_local_recv;
-		uintmax_t byt_local_sent;
+		/* PUSH-frame payload bytes only */
+		uintmax_t byt_push_recv;
+		uintmax_t byt_push_sent;
 #endif
 	} traffic_cnt;
 	/* SYN->SYN|ACK latency ring; written on the server thread only. */
@@ -162,9 +164,7 @@ static bool stream_connect(
 	const char *target)
 {
 	union sockaddr_max connect_addr;
-	bool ok = true;
-	RESOLVE_ADDR(&connect_addr, target, tcp, ok = false);
-	if (!ok) {
+	if (!resolve_addr(&connect_addr, target, SA_RESOLVE_TCP)) {
 		TUNNEL_LOG_F(
 			WARNING, t,
 			"stream %" PRIu16 ": name resolution failed for \"%s\"",
@@ -250,30 +250,48 @@ static void relay_dispatch_on_event(void *p)
 struct relay_connected_arg {
 	struct tunnel *t;
 	intmax_t lat_ns;
+	void (*cb)(void *, struct tunnel *, intmax_t);
 };
 
-static void relay_dispatch_on_established(void *p)
+static void relay_dispatch_connected(void *p)
 {
 	struct relay_connected_arg *restrict arg = p;
 	struct tunnel *restrict t = arg->t;
 	const intmax_t lat_ns = arg->lat_ns;
+	void (*const cb)(void *, struct tunnel *, intmax_t) = arg->cb;
 	free(arg);
-	if (t->relay.cb.on_established != NULL) {
-		t->relay.cb.on_established(t->callback_data, t, lat_ns);
-	}
-}
-
-static void relay_dispatch_on_resumed(void *p)
-{
-	struct relay_connected_arg *restrict arg = p;
-	struct tunnel *restrict t = arg->t;
-	const intmax_t lat_ns = arg->lat_ns;
-	free(arg);
-	if (t->relay.cb.on_resumed != NULL) {
-		t->relay.cb.on_resumed(t->callback_data, t, lat_ns);
+	if (cb != NULL) {
+		cb(t->callback_data, t, lat_ns);
 	}
 }
 #endif /* WITH_THREADS */
+
+static void relay_connected(
+	struct tunnel *restrict t,
+	void (*cb)(void *, struct tunnel *, intmax_t), const intmax_t lat_ns)
+{
+	if (cb == NULL) {
+		return;
+	}
+#if WITH_THREADS
+	struct relay_connected_arg *restrict arg = malloc(sizeof(*arg));
+	if (arg == NULL) {
+		LOGOOM();
+		return;
+	}
+	*arg = (struct relay_connected_arg){
+		.t = t,
+		.lat_ns = lat_ns,
+		.cb = cb,
+	};
+	(void)dispatcher_invoke(
+		t->relay.srv->disp,
+		(struct task){ .func = relay_dispatch_connected, .data = arg });
+	ev_async_send(t->relay.srv->loop, &t->relay.srv->w_async);
+#else
+	cb(t->callback_data, t, lat_ns);
+#endif
+}
 
 static const double tunnel_reconnect_delays[] = {
 	0.2,  2.0,  2.0,  5.0,	 5.0,	15.0,  15.0,
@@ -310,9 +328,7 @@ static bool tunnel_do_connect(struct tunnel *restrict t)
 	const char *const addr_str = t->connect_addr;
 
 	union sockaddr_max addr;
-	bool ok = true;
-	RESOLVE_ADDR(&addr, addr_str, tcp, ok = false);
-	if (!ok) {
+	if (!resolve_addr(&addr, addr_str, SA_RESOLVE_TCP)) {
 		TUNNEL_LOG_F(ERROR, t, "failed to resolve: %s", addr_str);
 		return false;
 	}
@@ -517,63 +533,12 @@ static void tunnel_on_event(
 	/* MUX_EVENT_ESTABLISHED and MUX_EVENT_RESUMED bypass on_event and are
 	 * routed to their dedicated callbacks instead. */
 	if (event == MUX_EVENT_ESTABLISHED) {
-#if WITH_THREADS
-		if (t->relay.cb.on_established != NULL) {
-			struct relay_connected_arg *restrict arg =
-				malloc(sizeof(*arg));
-			if (arg == NULL) {
-				LOGOOM();
-				return;
-			}
-			*arg = (struct relay_connected_arg){
-				.t = t,
-				.lat_ns = edata.connected.ns,
-			};
-			(void)dispatcher_invoke(
-				t->relay.srv->disp,
-				(struct task){
-					.func = relay_dispatch_on_established,
-					.data = arg,
-				});
-			ev_async_send(
-				t->relay.srv->loop, &t->relay.srv->w_async);
-		}
-#else
-		if (t->relay.cb.on_established != NULL) {
-			t->relay.cb.on_established(
-				t->callback_data, t, edata.connected.ns);
-		}
-#endif
+		relay_connected(
+			t, t->relay.cb.on_established, edata.connected.ns);
 		return;
 	}
 	if (event == MUX_EVENT_RESUMED) {
-#if WITH_THREADS
-		if (t->relay.cb.on_resumed != NULL) {
-			struct relay_connected_arg *restrict arg =
-				malloc(sizeof(*arg));
-			if (arg == NULL) {
-				LOGOOM();
-				return;
-			}
-			*arg = (struct relay_connected_arg){
-				.t = t,
-				.lat_ns = edata.connected.ns,
-			};
-			(void)dispatcher_invoke(
-				t->relay.srv->disp,
-				(struct task){
-					.func = relay_dispatch_on_resumed,
-					.data = arg,
-				});
-			ev_async_send(
-				t->relay.srv->loop, &t->relay.srv->w_async);
-		}
-#else
-		if (t->relay.cb.on_resumed != NULL) {
-			t->relay.cb.on_resumed(
-				t->callback_data, t, edata.connected.ns);
-		}
-#endif
+		relay_connected(t, t->relay.cb.on_resumed, edata.connected.ns);
 		return;
 	}
 
@@ -797,10 +762,8 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 			.traffic = {
 				.byt_mux_recv = &t->traffic_cnt.byt_mux_recv,
 				.byt_mux_sent = &t->traffic_cnt.byt_mux_sent,
-				.byt_local_recv =
-					&t->traffic_cnt.byt_local_recv,
-				.byt_local_sent =
-					&t->traffic_cnt.byt_local_sent,
+				.byt_push_recv = &t->traffic_cnt.byt_push_recv,
+				.byt_push_sent = &t->traffic_cnt.byt_push_sent,
 			},
 		},
 #if WITH_TLS
@@ -1041,10 +1004,10 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 		&t->traffic_cnt.byt_mux_recv, memory_order_relaxed);
 	out->byt_mux_sent = atomic_load_explicit(
 		&t->traffic_cnt.byt_mux_sent, memory_order_relaxed);
-	out->byt_local_recv = atomic_load_explicit(
-		&t->traffic_cnt.byt_local_recv, memory_order_relaxed);
-	out->byt_local_sent = atomic_load_explicit(
-		&t->traffic_cnt.byt_local_sent, memory_order_relaxed);
+	out->byt_push_recv = atomic_load_explicit(
+		&t->traffic_cnt.byt_push_recv, memory_order_relaxed);
+	out->byt_push_sent = atomic_load_explicit(
+		&t->traffic_cnt.byt_push_sent, memory_order_relaxed);
 #else
 	out->num_streams = t->stream_cnt.num_streams;
 	out->num_stream_halfopen = t->stream_cnt.num_stream_halfopen;
@@ -1056,8 +1019,8 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	out->num_stream_failed = t->stream_cnt.num_stream_failed;
 	out->byt_mux_recv = t->traffic_cnt.byt_mux_recv;
 	out->byt_mux_sent = t->traffic_cnt.byt_mux_sent;
-	out->byt_local_recv = t->traffic_cnt.byt_local_recv;
-	out->byt_local_sent = t->traffic_cnt.byt_local_sent;
+	out->byt_push_recv = t->traffic_cnt.byt_push_recv;
+	out->byt_push_sent = t->traffic_cnt.byt_push_sent;
 #endif
 	out->stream_establish_count = t->stream_establish_count;
 	memcpy(out->stream_establish_ns, t->stream_establish_ns,

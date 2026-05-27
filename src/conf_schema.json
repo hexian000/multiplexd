@@ -1,5 +1,5 @@
 {
-    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "multiplexd configuration",
     "description": "Configuration file for multiplexd. At least one of 'mux_listen', 'mux_connect', or 'identity.mux_connect' must be present.",
     "type": "object",
@@ -143,30 +143,37 @@
                     "minimum": 0
                 },
                 "connect_timeout": {
-                    "description": "Maximum time in seconds for a single TCP-connect and mux-handshake attempt. Clamped to [10, mux.ping_timeout]. Default: 15.",
+                    "description": "Maximum time in seconds for a single TCP-connect and mux-handshake attempt. Clamped to [10, 86400]. Default: 15.",
                     "type": "integer",
                     "minimum": 10,
                     "maximum": 86400,
                     "default": 15
                 },
+                "timeout": {
+                    "description": "Session inactivity timeout in seconds. The session is considered dead when no data is received for this duration. Clamped to [10, 86400]. Default: 60.",
+                    "type": "integer",
+                    "minimum": 10,
+                    "maximum": 86400,
+                    "default": 60
+                },
                 "ping_timeout": {
-                    "description": "Timeout in seconds to wait for a PING response before the session is considered dead. Clamped to [10, 86400]. Default: 15.",
+                    "description": "Timeout in seconds to wait for a PING response in the BDP estimator before discarding the measurement cycle. Clamped to [10, 86400]. Default: 15.",
                     "type": "integer",
                     "minimum": 10,
                     "maximum": 86400,
                     "default": 15
                 },
                 "keepalive": {
-                    "description": "Keepalive PING probe interval in seconds. Clamped to [10, mux.ping_timeout]. Default: 300.",
+                    "description": "Keepalive PROBE interval in seconds. 0 disables periodic probes; when non-zero, clamped to [10, mux.timeout]. Default: 25.",
                     "type": "integer",
-                    "minimum": 10,
+                    "minimum": 0,
                     "maximum": 86400,
-                    "default": 300
+                    "default": 25
                 },
                 "send_timeout": {
-                    "description": "Send completion timeout in seconds. Clamped to [10, mux.ping_timeout]. Default: 15.",
+                    "description": "Send completion timeout in seconds. 0 disables the send timeout; when non-zero, clamped to [10, 86400]. Default: 15.",
                     "type": "integer",
-                    "minimum": 10,
+                    "minimum": 0,
                     "maximum": 86400,
                     "default": 15
                 },
@@ -178,7 +185,7 @@
                     "default": 0
                 },
                 "resume_timeout": {
-                    "description": "Maximum time in seconds a suspended server session waits for a client reconnect. Must be >= mux.ping_timeout; values below mux.ping_timeout are clamped up to mux.ping_timeout. Default: 600.",
+                    "description": "Maximum time in seconds a suspended server session waits for a client reconnect. Clamped to [10, 86400]. Default: 600.",
                     "type": "integer",
                     "minimum": 10,
                     "maximum": 86400,
