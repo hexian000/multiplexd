@@ -444,16 +444,7 @@ static bool conf_check(struct config *restrict conf)
 			      (int)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT),
 			      INT_MAX);
 	}
-	/* Automatic window mode requires both values to be 0; a mixed
-	 * configuration (exactly one is 0) is not supported. Warn and
-	 * normalize both to 0 so automatic BDP sizing is used. */
-	if ((conf->mux.stream_window <= 0) != (conf->mux.session_window <= 0)) {
-		LOGW("mux.stream_window and mux.session_window must both be 0 "
-		     "(automatic BDP sizing) or both be > 0 (manual); "
-		     "mixed configuration treated as automatic mode");
-		conf->mux.stream_window = 0;
-		conf->mux.session_window = 0;
-	}
+
 	conf->mux_tcp.backlog = CLAMP(conf->mux_tcp.backlog, 1, 4096);
 	conf->tcp.backlog = CLAMP(conf->tcp.backlog, 1, 4096);
 	/* Validate max_startups throttle parameters. */

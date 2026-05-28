@@ -3543,14 +3543,6 @@ struct bdp_ctx {
 	size_t expected_len;
 };
 
-static void bdp_enable_auto_window(struct mux_session *restrict ss)
-{
-	struct mux_config conf = *mux_conf(ss);
-	conf.stream_window = 0;
-	conf.session_window = 0;
-	mux_set_config(ss, &conf);
-}
-
 static void bdp_enable_auto_windows(struct mux_session *restrict ss)
 {
 	struct mux_config conf = *mux_conf(ss);
@@ -3595,12 +3587,13 @@ static int pred_echo_and_bdp_cycle(void *ptr)
 }
 
 /* -------------------------------------------------------------------------
- * test_bdp_auto_session_window_matches_stream_window: when both windows are
- * automatic, auto_window must be set; after a BDP update stream_window
- * carries headroom and must be >= session_window.
+ * test_bdp_auto_stream_window_updated_by_pong: when both windows are
+ * automatic, a PONG-driven BDP update must grow stream_window but leave
+ * session_window unchanged (session_window tracks peer_stream_window, not
+ * the local BDP estimate).
  * ---------------------------------------------------------------------- */
 
-T_DECLARE_CASE(test_bdp_auto_session_window_matches_stream_window)
+T_DECLARE_CASE(test_bdp_auto_stream_window_updated_by_pong)
 {
 	struct mux_test_fixture fx;
 	if (fixture_setup(&fx) != 0) {
@@ -3616,7 +3609,8 @@ T_DECLARE_CASE(test_bdp_auto_session_window_matches_stream_window)
 	}
 
 	bdp_enable_auto_windows(fx.cli);
-	T_EXPECT(fx.cli->auto_window);
+	T_EXPECT(fx.cli->auto_stream_window);
+	T_EXPECT(fx.cli->auto_session_window);
 	T_EXPECT_EQ(
 		fx.cli->session_window,
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
@@ -3659,10 +3653,13 @@ T_DECLARE_CASE(test_bdp_auto_session_window_matches_stream_window)
 	session_recv_pong(fx.cli, &hdr, frame_size);
 
 	T_EXPECT(
-		fx.cli->session_window >
+		fx.cli->session_window ==
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
-	/* Both windows derive from the same target; stream_window == session_window. */
-	T_EXPECT(fx.cli->stream_window >= fx.cli->session_window);
+	/* PONG updates only stream_window; session_window tracks
+	 * peer_stream_window and is unchanged (no SYN/SYN|ACK in auto mode). */
+	T_EXPECT(
+		fx.cli->stream_window >
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 
 cleanup:
@@ -3670,9 +3667,58 @@ cleanup:
 }
 
 /* -------------------------------------------------------------------------
- * test_bdp_auto_session_window_without_auto_stream_window: in manual window
- * mode (both stream_window and session_window > 0), BDP estimator updates
- * must not change either window.
+ * test_bdp_manual_window_mode_no_estimator_effect: in manual window mode
+ * (both stream_window and session_window > 0), BDP estimator updates must
+ * not change either window.
+ * ---------------------------------------------------------------------- */
+
+T_DECLARE_CASE(test_bdp_manual_window_mode_no_estimator_effect)
+{
+	struct mux_test_fixture fx;
+	if (fixture_setup(&fx) != 0) {
+		T_FATAL("fixture_setup failed");
+		return;
+	}
+
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
+		    &fx) != 0) {
+		T_FATAL("sessions did not establish");
+		goto cleanup;
+	}
+
+	/* Both windows non-zero → manual mode; auto_stream_window and
+	 * auto_session_window must be clear. */
+	const uint_least32_t fixed_session = 8;
+	const uint_least32_t fixed_stream = 4;
+	struct mux_config conf = *mux_conf(fx.cli);
+	conf.session_window = (int)fixed_session;
+	conf.stream_window = (int)fixed_stream;
+	mux_set_config(fx.cli, &conf);
+	T_EXPECT(!fx.cli->auto_stream_window);
+	T_EXPECT(!fx.cli->auto_session_window);
+	T_EXPECT_EQ(fx.cli->session_window, fixed_session);
+	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
+
+	/* estimator_add must return early because auto_stream_window is clear. */
+	estimator_add(
+		fx.cli,
+		(uintmax_t)fixed_session * (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
+	T_EXPECT(!fx.cli->estimator.ping_in_flight);
+
+	/* Windows must remain at their configured values. */
+	T_EXPECT_EQ(fx.cli->session_window, fixed_session);
+	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
+
+cleanup:
+	fixture_teardown(&fx);
+}
+
+/* -------------------------------------------------------------------------
+ * test_bdp_auto_session_window_without_auto_stream_window: session_window
+ * auto (= 0 in config) with stream_window manual (> 0).  session_window
+ * must track peer_stream_window; the BDP estimator must not start probes;
+ * stream_window must remain at its configured value.
  * ---------------------------------------------------------------------- */
 
 T_DECLARE_CASE(test_bdp_auto_session_window_without_auto_stream_window)
@@ -3690,25 +3736,33 @@ T_DECLARE_CASE(test_bdp_auto_session_window_without_auto_stream_window)
 		goto cleanup;
 	}
 
-	/* Both windows non-zero → manual mode; auto_window must be clear. */
-	const uint_least32_t fixed_session = 8;
+	/* session_window = 0 (auto), stream_window = 4 (manual). */
 	const uint_least32_t fixed_stream = 4;
 	struct mux_config conf = *mux_conf(fx.cli);
-	conf.session_window = (int)fixed_session;
+	conf.session_window = 0;
 	conf.stream_window = (int)fixed_stream;
 	mux_set_config(fx.cli, &conf);
-	T_EXPECT(!fx.cli->auto_window);
-	T_EXPECT_EQ(fx.cli->session_window, fixed_session);
+	T_EXPECT(!fx.cli->auto_stream_window);
+	T_EXPECT(fx.cli->auto_session_window);
 	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
 
-	/* estimator_add must return early because auto_window is clear. */
+	/* estimator_add must return early because auto_stream_window is false;
+	 * no PING should be queued and stream_window must remain fixed. */
 	estimator_add(
 		fx.cli,
-		(uintmax_t)fixed_session * (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
+		(uintmax_t)fixed_stream * (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
+	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
 
-	/* Windows must remain at their configured values. */
-	T_EXPECT_EQ(fx.cli->session_window, fixed_session);
+	/* session_update_session_window must still update session_window to
+	 * track peer_stream_window even when stream_window is manual. */
+	const uint_least32_t floor_frames =
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT);
+	const uint_least32_t new_peer_window = floor_frames * 4;
+	fx.cli->peer_stream_window = new_peer_window;
+	session_update_session_window(fx.cli);
+	T_EXPECT_EQ(fx.cli->session_window, new_peer_window);
+	/* stream_window must not have been modified. */
 	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
 
 cleanup:
@@ -3716,12 +3770,12 @@ cleanup:
 }
 
 /* -------------------------------------------------------------------------
- * test_bdp_auto_stream_window_tracks_session_window: in automatic window
- * mode, session_update_window sets both session_window and stream_window to
- * the same target (bdp + headroom), so stream_window == session_window.
+ * test_bdp_auto_session_window_tracks_peer_stream_window: in automatic
+ * window mode, session_update_session_window must update session_window to
+ * match peer_stream_window without touching stream_window.
  * ---------------------------------------------------------------------- */
 
-T_DECLARE_CASE(test_bdp_auto_stream_window_tracks_session_window)
+T_DECLARE_CASE(test_bdp_auto_session_window_tracks_peer_stream_window)
 {
 	struct mux_test_fixture fx;
 	if (fixture_setup(&fx) != 0) {
@@ -3737,43 +3791,24 @@ T_DECLARE_CASE(test_bdp_auto_stream_window_tracks_session_window)
 	}
 
 	bdp_enable_auto_windows(fx.cli);
-	T_EXPECT(fx.cli->auto_window);
+	T_EXPECT(fx.cli->auto_stream_window);
+	T_EXPECT(fx.cli->auto_session_window);
 
-	estimator_add(fx.cli, (uintmax_t)8u * (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
-	T_EXPECT(fx.cli->estimator.ping_in_flight);
-	if (!fx.cli->estimator.ping_in_flight) {
-		T_FATAL("estimator did not queue ping frame");
-		goto cleanup;
-	}
-	if (fx.cli->estimator.probe_sent_ns <= 1000000) {
-		T_FATAL("invalid estimator timestamp");
-		goto cleanup;
-	}
-	fx.cli->estimator.probe_sent_ns -= 1000000;
-	const intmax_t sent_ns = fx.cli->estimator.probe_sent_ns;
+	/* In auto mode, session_window tracks peer_stream_window via
+	 * session_update_session_window.  Set peer_stream_window to a value
+	 * above the floor and call the function directly. */
+	const uint_least32_t floor_frames =
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT);
+	const uint_least32_t new_peer_window = floor_frames * 4;
+	const uint_least32_t initial_stream_window = fx.cli->stream_window;
 
-	const struct mux_header hdr = {
-		.version = MUX_PROTOCOL_VERSION,
-		.flags = 0,
-		.length = MUX_PING_PAYLOAD_SIZE,
-		.stream_id = STREAMID_CTRL,
-		.extra = MUX_CTRL_PONG,
-	};
-	const size_t frame_size = MUX_FRAME_HEADER_SIZE + MUX_PING_PAYLOAD_SIZE;
-	ringbuf_reset(fx.cli->wire.recvbuf);
-	if (!ringbuf_reserve(&fx.cli->wire.recvbuf, frame_size, false)) {
-		T_FATAL("recvbuf has no space");
-		goto cleanup;
-	}
-	unsigned char *const pong = ringbuf_write_ptr(fx.cli->wire.recvbuf);
-	mux_write_header(pong, &hdr);
-	write_uint64(pong + MUX_FRAME_HEADER_SIZE, (uint_fast64_t)sent_ns);
-	ringbuf_produce(fx.cli->wire.recvbuf, frame_size);
-	session_recv_pong(fx.cli, &hdr, frame_size);
+	fx.cli->peer_stream_window = new_peer_window;
+	session_update_session_window(fx.cli);
 
-	/* Both windows derive from the same target; stream_window == session_window. */
-	T_EXPECT(fx.cli->stream_window >= fx.cli->session_window);
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
+	T_EXPECT_EQ(fx.cli->session_window, new_peer_window);
+	/* stream_window is driven by the BDP estimator, not peer_stream_window;
+	 * session_update_session_window must not change it. */
+	T_EXPECT_EQ(fx.cli->stream_window, initial_stream_window);
 
 cleanup:
 	fixture_teardown(&fx);
@@ -3799,7 +3834,7 @@ T_DECLARE_CASE(test_bdp_control_only_no_cycle)
 		goto cleanup;
 	}
 
-	bdp_enable_auto_window(fx.cli);
+	bdp_enable_auto_windows(fx.cli);
 
 	struct bdp_control_ctx ctx = {
 		.ss = fx.cli,
@@ -3839,7 +3874,7 @@ T_DECLARE_CASE(test_bdp_ping_queued_before_send_progress)
 		goto cleanup;
 	}
 
-	bdp_enable_auto_window(fx.cli);
+	bdp_enable_auto_windows(fx.cli);
 	estimator_add(fx.cli, (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
 
 	T_EXPECT_EQ(
@@ -3880,7 +3915,7 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 		goto cleanup;
 	}
 
-	bdp_enable_auto_window(fx.cli);
+	bdp_enable_auto_windows(fx.cli);
 
 	payload = malloc(PAYLOAD_SMALL);
 	if (payload == NULL) {
@@ -3948,7 +3983,7 @@ T_DECLARE_CASE(test_bdp_stop_resets_learned_state)
 		goto cleanup;
 	}
 
-	bdp_enable_auto_window(fx.cli);
+	bdp_enable_auto_windows(fx.cli);
 
 	payload = malloc(PAYLOAD_SMALL);
 	if (payload == NULL) {
@@ -4146,9 +4181,10 @@ int main(void)
 	T_RUN_CASE(t, test_resume_retransmit);
 	T_RUN_CASE(t, test_resume_handshake_transport_lost);
 	T_RUN_CASE(t, test_nodelay_reverse_large);
-	T_RUN_CASE(t, test_bdp_auto_session_window_matches_stream_window);
+	T_RUN_CASE(t, test_bdp_auto_stream_window_updated_by_pong);
+	T_RUN_CASE(t, test_bdp_manual_window_mode_no_estimator_effect);
 	T_RUN_CASE(t, test_bdp_auto_session_window_without_auto_stream_window);
-	T_RUN_CASE(t, test_bdp_auto_stream_window_tracks_session_window);
+	T_RUN_CASE(t, test_bdp_auto_session_window_tracks_peer_stream_window);
 	T_RUN_CASE(t, test_bdp_control_only_no_cycle);
 	T_RUN_CASE(t, test_bdp_ping_queued_before_send_progress);
 	T_RUN_CASE(t, test_bdp_ping_sent);

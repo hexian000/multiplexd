@@ -191,14 +191,14 @@
                     "default": 600
                 },
                 "session_window": {
-                    "description": "Maximum total in-flight frames per session. Both stream_window and session_window must be 0 for automatic BDP-driven sizing; a mixed configuration (exactly one set to 0) produces a warning and treats both as 0. Fixed range when non-zero: [65536, 268435456]. Default: 0.",
+                    "description": "Session-level TX cap: maximum number of unacknowledged non-stream-0 frames the local sender may have in flight. Set to 0 for automatic mode: session_window is updated on each inbound SYN or SYN|ACK to match the peer's advertised per-stream receive window, starting at MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT frames. Can be configured independently of stream_window. Fixed range when non-zero: [65536, 268435456]. Default: 0.",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 268435456,
                     "default": 0
                 },
                 "stream_window": {
-                    "description": "Per-stream receive buffer size in bytes. Both stream_window and session_window must be 0 for automatic BDP-driven sizing (starts at 65536, grows as bandwidth samples arrive); setting only one to 0 produces a warning and enables automatic mode for both. Fixed range when non-zero: [16384, 16777216]. Default: 0.",
+                    "description": "Per-stream RX receive-window grant in bytes advertised to the peer. Set to 0 for automatic mode: the BDP estimator drives stream_window bidirectionally from inbound payload probe cycles, starting at 65536 bytes and tracking path bandwidth-delay product. Can be configured independently of session_window. Fixed range when non-zero: [16384, 16777216]. Default: 0.",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 16777216,

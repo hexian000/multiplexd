@@ -1113,47 +1113,69 @@ static bool update_stream_window_cb(
 	return true;
 }
 
-/* Apply the current BDP estimate to the session and stream window floors.
- * bdp_bytes is the windowed maximum BDP maintained by the estimator; both
- * windows are derived from bdp_bytes + bdp_bytes/4 and are updated
- * bidirectionally.  On shrink, per-stream recv_window is left intact so the
- * peer can drain already-granted credit naturally.  On grow, live streams
- * receive the extra recv credit immediately. */
-static void
-session_update_window(struct mux_session *restrict ss, const size_t bdp_bytes)
+/* Update the TX unacked-frame cap from the peer's per-stream receive window.
+ * Called after peer_stream_window changes (SYN and SYN|ACK paths).  A floor
+ * of MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT prevents session_window from
+ * being zero before the first stream handshake.  On growth, a stall caused
+ * by the old (smaller) window cap is cleared immediately. */
+void session_update_session_window(struct mux_session *restrict ss)
 {
 	const uint_least32_t floor_frames =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
-	/* Add a fixed headroom fraction so neither window bottlenecks the other.
-	 * The same value is used for session and stream to avoid double-headroom. */
+	const uint_least32_t new_window =
+		(uint_least32_t)MAX(ss->peer_stream_window, floor_frames);
+	if (ss->session_window == new_window) {
+		return;
+	}
+	const bool grew = new_window > ss->session_window;
+	ss->session_window = new_window;
+	MUX_LOG_F(
+		INFO, ss, "session window updated from peer: session=%zu",
+		(size_t)ss->session_window * MUX_WINDOW_UNIT);
+	if (grew && ss->send_stalled &&
+	    ss->unacked_frames < (size_t)ss->session_window) {
+		MUX_LOG_F(
+			DEBUG, ss,
+			"send stall cleared by session window growth: unacked=%zu"
+			" limit=%" PRIuLEAST32,
+			ss->unacked_frames, ss->session_window);
+		ss->send_stalled = false;
+		mux_notify_write(ss);
+	}
+}
+
+/* Apply the current BDP estimate to the per-stream receive window floor.
+ * bdp_bytes is the windowed maximum BDP maintained by the estimator.
+ * On shrink, per-stream recv_window is left intact so the peer can drain
+ * already-granted credit naturally.  On grow, live streams receive the
+ * extra recv credit immediately. */
+static void session_update_stream_window(
+	struct mux_session *restrict ss, const size_t bdp_bytes)
+{
+	const uint_least32_t floor_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	/* Add a fixed headroom fraction so the receive window is never the
+	 * throughput bottleneck. */
 	const size_t window_bytes = bdp_bytes + bdp_bytes / 4;
 	const uint_least32_t frames = (uint_least32_t)MAX(
 		window_bytes / MUX_MAX_PAYLOAD_SIZE, floor_frames);
 
-	if (ss->session_window == frames && ss->stream_window == frames) {
+	if (ss->stream_window == frames) {
 		return;
 	}
-	ss->session_window = frames;
-
-	if (ss->stream_window != frames) {
-		const uint_least32_t old_stream = ss->stream_window;
-		ss->stream_window = frames;
-		if (frames > old_stream && ss->sched.streams != NULL) {
-			uint_fast32_t w =
-				(uint_fast32_t)frames * MUX_MAX_PAYLOAD_SIZE;
-			table_iterate(
-				ss->sched.streams, update_stream_window_cb, &w);
-		}
-		/* On shrink: leave per-stream recv_window intact now; each
-		 * stream lazily syncs its recv_window down inside
-		 * stream_check_ack once outstanding peer credit is consumed
-		 * and the safety constraint is satisfied. */
+	const uint_least32_t old_stream = ss->stream_window;
+	ss->stream_window = frames;
+	if (frames > old_stream && ss->sched.streams != NULL) {
+		uint_fast32_t w = (uint_fast32_t)frames * MUX_MAX_PAYLOAD_SIZE;
+		table_iterate(ss->sched.streams, update_stream_window_cb, &w);
 	}
+	/* On shrink: leave per-stream recv_window intact now; each
+	 * stream lazily syncs its recv_window down inside
+	 * stream_check_ack once outstanding peer credit is consumed
+	 * and the safety constraint is satisfied. */
 	MUX_LOG_F(
-		INFO, ss,
-		"estimator updated: max_bdp=%zu session=%zu stream=%zu",
-		bdp_bytes, (size_t)ss->session_window * MUX_WINDOW_UNIT,
-		(size_t)ss->stream_window * MUX_WINDOW_UNIT);
+		INFO, ss, "estimator updated: max_bdp=%zu stream=%zu",
+		bdp_bytes, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
 }
 
 /* Handle an inbound PONG (spec §5.3.3): feed the echoed timestamp into the
@@ -1171,7 +1193,9 @@ void session_recv_pong(
 		ringbuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE);
 	ringbuf_consume(ss->wire.recvbuf, frame_size);
 	estimator_calculate(ss, sent_ns);
-	session_update_window(ss, ss->estimator.effective_bdp);
+	if (ss->auto_stream_window) {
+		session_update_stream_window(ss, ss->estimator.effective_bdp);
+	}
 }
 
 static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
@@ -1380,34 +1404,44 @@ void session_close(struct mux_session *restrict ss)
 void session_set_config(
 	struct mux_session *restrict ss, const struct mux_config *restrict conf)
 {
-	const bool was_auto_window = ss->auto_window;
+	const bool was_auto_stream_window = ss->auto_stream_window;
+	const bool was_auto_session_window = ss->auto_session_window;
 	ss->conf = *conf;
-	/* Automatic mode requires both windows to be 0; any other combination
-	 * is manual mode and uses the configured frame counts directly. */
-	ss->auto_window =
-		(conf->stream_window <= 0 && conf->session_window <= 0);
-	if (ss->auto_window) {
-		const uint_least32_t floor_frames =
-			MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
-		if (!was_auto_window) {
+	ss->auto_stream_window = (conf->stream_window <= 0);
+	ss->auto_session_window = (conf->session_window <= 0);
+	const uint_least32_t floor_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	/* stream_window: auto (BDP-driven) or manual (fixed config). */
+	if (ss->auto_stream_window) {
+		if (!was_auto_stream_window) {
 			/* Switching from manual to auto: reset to the initial
 			 * floor so the estimator re-probes from a clean state
 			 * rather than inheriting an arbitrary manual value. */
-			ss->session_window = floor_frames;
 			ss->stream_window = floor_frames;
 		} else {
-			/* Already in auto mode: preserve the learned values,
+			/* Already in auto mode: preserve the learned value,
 			 * enforcing only the floor. */
-			if (ss->session_window < floor_frames) {
-				ss->session_window = floor_frames;
-			}
 			if (ss->stream_window < floor_frames) {
 				ss->stream_window = floor_frames;
 			}
 		}
 	} else {
-		ss->session_window = (uint_least32_t)conf->session_window;
 		ss->stream_window = (uint_least32_t)conf->stream_window;
+	}
+	/* session_window: auto (peer-driven) or manual (fixed config). */
+	if (ss->auto_session_window) {
+		if (!was_auto_session_window) {
+			/* Switching from manual to auto: reset to the floor. */
+			ss->session_window = floor_frames;
+		} else {
+			/* Already in auto mode: preserve the learned value,
+			 * enforcing only the floor. */
+			if (ss->session_window < floor_frames) {
+				ss->session_window = floor_frames;
+			}
+		}
+	} else {
+		ss->session_window = (uint_least32_t)conf->session_window;
 	}
 
 	const double timeout = (double)conf->timeout;
@@ -1459,9 +1493,8 @@ void session_set_config(
 	 * calling estimator_seed would wipe the learned RTT/BW windows and
 	 * re-seed bdp from a window value that includes the 25 % headroom,
 	 * compounding the overshoot on every config reload. */
-	if (ss->auto_window && !was_auto_window) {
-		estimator_seed(
-			ss, (size_t)ss->session_window * MUX_WINDOW_UNIT);
+	if (ss->auto_stream_window && !was_auto_stream_window) {
+		estimator_seed(ss, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
 	}
 }
 

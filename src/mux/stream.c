@@ -871,7 +871,7 @@ uint_fast32_t stream_grant_inc(const struct mux_stream *restrict s)
  * stream_check_ack so every grant evaluation sees the up-to-date window. */
 static void stream_try_shrink_recv_window(struct mux_stream *restrict s)
 {
-	if (!s->session->auto_window) {
+	if (!s->session->auto_stream_window) {
 		return;
 	}
 	const uint_fast32_t target =

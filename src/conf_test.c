@@ -274,15 +274,18 @@ T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 	conf_free(conf);
 }
 
-T_DECLARE_CASE(test_conf_parsefile_mixed_window_mode_normalized_to_auto)
+T_DECLARE_CASE(test_conf_parsefile_partial_window_config_accepted)
 {
+	/* stream_window set (manual), session_window absent (auto); each axis
+	 * is independent so the mixed configuration is accepted as-is.  The
+	 * stream_window value is clamped to [1, 1024] by conf_validate. */
 	struct config *conf =
 		parse_tmpconf("{"
 			      "\"mux_connect\":\"127.0.0.1:9000\","
 			      "\"mux\":{\"stream_window\":32768}"
 			      "}");
 	T_CHECK(conf != NULL);
-	T_EXPECT_EQ(conf->mux.stream_window, 0);
+	T_EXPECT_EQ(conf->mux.stream_window, 2);
 	T_EXPECT_EQ(conf->mux.session_window, 0);
 	conf_free(conf);
 }
@@ -466,15 +469,15 @@ T_DECLARE_CASE(test_conf_parsefile_mem_pressure_config)
 
 T_DECLARE_CASE(test_conf_parsefile_session_window_positive)
 {
-	/* Setting only session_window hits the positive-value clamping path
-	 * inside parse_mux_session_window; the post-parse normalisation then
-	 * resets both windows to auto (0) because stream_window is not set. */
+	/* Setting only session_window (auto stream_window) is now valid:
+	 * each axis is independent.  65536/16384=4 frames, clamped to
+	 * [MUX_INITIAL_SEND_WINDOW/MUX_WINDOW_UNIT, INT_MAX] = [4, INT_MAX]. */
 	struct config *conf =
 		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
 			      "\"mux\":{\"session_window\":65536}}");
 	T_CHECK(conf != NULL);
-	/* Both normalised to auto after mixed-mode detection. */
-	T_EXPECT_EQ(conf->mux.session_window, 0);
+	/* session_window stored as frames; stream_window not set (auto). */
+	T_EXPECT_EQ(conf->mux.session_window, 4);
 	T_EXPECT_EQ(conf->mux.stream_window, 0);
 	conf_free(conf);
 }
@@ -560,7 +563,7 @@ int main(void)
 	T_RUN_CASE(t, test_conf_parsefile_invalid_max_startups_rate);
 	T_RUN_CASE(t, test_conf_parsefile_invalid_max_startups_range);
 	T_RUN_CASE(t, test_conf_parsefile_clamps_timeout_fields);
-	T_RUN_CASE(t, test_conf_parsefile_mixed_window_mode_normalized_to_auto);
+	T_RUN_CASE(t, test_conf_parsefile_partial_window_config_accepted);
 #if WITH_TLS
 	T_RUN_CASE(t, test_conf_parsefile_rejects_partial_tls_config);
 	T_RUN_CASE(t, test_conf_parsefile_authcerts_array);

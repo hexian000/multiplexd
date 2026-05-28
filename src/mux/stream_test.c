@@ -397,10 +397,10 @@ T_DECLARE_CASE(test_stream_recv_fin_with_rx_eof_shuts_down_write)
 	teardown_fixture(&fx);
 }
 
-/* When auto_window is enabled and the session stream_window has been reduced
- * below a stream's recv_window, stream_check_ack must shrink recv_window as
- * soon as no outstanding peer credit remains and all buffered bytes fit within
- * the new target. */
+/* When auto_stream_window is enabled and the session stream_window has been
+ * reduced below a stream's recv_window, stream_check_ack must shrink
+ * recv_window as soon as no outstanding peer credit remains and all buffered
+ * bytes fit within the new target. */
 T_DECLARE_CASE(test_stream_check_ack_shrinks_recv_window_when_safe)
 {
 	struct stream_fixture fx;
@@ -408,7 +408,7 @@ T_DECLARE_CASE(test_stream_check_ack_shrinks_recv_window_when_safe)
 		T_FATAL("setup_fixture failed");
 		return;
 	}
-	fx.ss.auto_window = true;
+	fx.ss.auto_stream_window = true;
 	/* New BDP target: 2 frames. */
 	fx.ss.stream_window = 2;
 
@@ -442,7 +442,7 @@ T_DECLARE_CASE(test_stream_check_ack_does_not_shrink_while_outstanding)
 		T_FATAL("setup_fixture failed");
 		return;
 	}
-	fx.ss.auto_window = true;
+	fx.ss.auto_stream_window = true;
 	/* New BDP target: 2 frames. */
 	fx.ss.stream_window = 2;
 

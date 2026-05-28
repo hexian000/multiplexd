@@ -224,6 +224,9 @@ static void dispatch_by_stream(
 		 * unconditionally so a shrinking peer window is tracked. */
 		ss->peer_stream_window =
 			(uint_least32_t)(s->send_window / MUX_WINDOW_UNIT);
+		if (ss->auto_session_window) {
+			session_update_session_window(ss);
+		}
 		if (s->syn_sent_ns > 0) {
 			const intmax_t latency =
 				clock_monotonic_ns() - s->syn_sent_ns;
@@ -387,6 +390,9 @@ static void dispatch_no_stream(
 		 * Assigned unconditionally so a shrinking peer window is tracked.
 		 * The initial default send window contributes exactly one frame. */
 		ss->peer_stream_window = (uint_least32_t)hdr->extra + 1u;
+		if (ss->auto_session_window) {
+			session_update_session_window(ss);
+		}
 		if (LOGLEVEL(INFO)) {
 			char stream_tag_[256];
 			(void)stream_format_tag(

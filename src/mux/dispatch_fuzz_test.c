@@ -271,6 +271,11 @@ void session_recv_pong(
 	consume_frame(ss, frame_size);
 }
 
+void session_update_session_window(struct mux_session *restrict ss)
+{
+	(void)ss;
+}
+
 bool handshake_process_hello(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)

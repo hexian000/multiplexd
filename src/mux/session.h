@@ -181,21 +181,26 @@ struct mux_session {
 	/* true when the unacked list has reached the session window cap;
 	 * data frame sends are suspended until the peer acknowledges frames. */
 	bool send_stalled : 1;
-	/* true when both stream_window and session_window were configured as 0;
-	 * automatic BDP-driven sizing is active for both windows. */
-	bool auto_window : 1;
+	/* true when stream_window was configured as 0; the BDP estimator probes
+	 * bandwidth on each inbound PUSH cycle and stream_window tracks the
+	 * resulting effective_bdp with headroom. */
+	bool auto_stream_window : 1;
+	/* true when session_window was configured as 0; session_window tracks
+	 * peer_stream_window (updated on each SYN and SYN|ACK). */
+	bool auto_session_window : 1;
 	/* true when the session should shut down as soon as its last stream
 	 * closes; set by session_drain() and cleared on reconnect. */
 	bool draining : 1;
 
-	/* Effective unacked-frame cap for the session; updated from the learned
-	 * BDP whenever automatic window sizing is enabled.  Tracks the BDP
-	 * bidirectionally: grows and shrinks with the estimate. */
+	/* Effective unacked-frame cap for the session; in auto mode updated from
+	 * peer_stream_window (the peer's per-stream receive window) whenever a
+	 * SYN or SYN|ACK is received.  A floor of
+	 * MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT is always enforced. */
 	uint_least32_t session_window;
 	/* Effective per-stream receive window (frames); in auto mode tracks the
-	 * BDP with headroom so per-stream credit is never the bottleneck.
-	 * Tracks the BDP bidirectionally: grows and shrinks with the estimate;
-	 * already-granted per-stream recv_window is not clawed back on shrink. */
+	 * RX BDP with headroom so per-stream credit is never the bottleneck.
+	 * Grows and shrinks with the BDP estimate; already-granted per-stream
+	 * recv_window is not clawed back on shrink. */
 	uint_least32_t stream_window;
 	/* Peer's effective per-stream receive window (frames); updated
 	 * unconditionally on each SYN and SYN|ACK (supports shrinking);
@@ -374,5 +379,10 @@ void session_recv_ping(
 void session_recv_pong(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	size_t frame_size);
+
+/* Update session_window from the current peer_stream_window value.
+ * Must be called after each SYN and SYN|ACK that changes peer_stream_window.
+ * No-op when auto_session_window is false. */
+void session_update_session_window(struct mux_session *restrict ss);
 
 #endif /* MUX_SESSION_H */
