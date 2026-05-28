@@ -9,6 +9,7 @@
 #ifndef MUX_ESTIMATOR_H
 #define MUX_ESTIMATOR_H
 
+#include "algo/ewma.h"
 #include "algo/wndfilter.h"
 
 #include <inttypes.h>
@@ -46,6 +47,11 @@ struct estimator_ctx {
 	 * Not clamped; BDP_MIN/BDP_MAX are applied only when computing
 	 * effective_bdp. */
 	size_t bdp;
+	/* EWMA of the TRACK-phase BDP target; smooths cycle-to-cycle variation
+	 * before bdp feeds the bdp_wnd windowed maximum.  Snapped (reset to
+	 * ready=0) on RTT inflation force-age and on every STARTUP→TRACK
+	 * transition so the first TRACK cycle after growth sets bdp directly. */
+	struct ewma bdp_ewma;
 	/* Estimator phase: STARTUP grows the window aggressively; TRACK refines
 	 * the BDP estimate using windowed BW and sample statistics. */
 	enum estimator_phase phase;
@@ -55,6 +61,10 @@ struct estimator_ctx {
 	 * reset to 0 when ratio drops below 6/5 (INFLATE_LO) or rtt_min is not
 	 * yet aged past RTT_WND_NS/4. Triggers force-age at INFLATE_ROUNDS. */
 	uint_least8_t inflated_rounds;
+	/* Consecutive STARTUP window_limited cycles where bw_sample grew by less
+	 * than BW_FLAT_THRESHOLD of the prior maximum; triggers TRACK transition
+	 * to stop window growth once physical bandwidth has plateaued. */
+	uint_least8_t bw_flat_rounds;
 	bool ping_in_flight : 1;
 	/* true when the session was send-stalled (unacked >= session_window)
 	 * at the moment the probe PING was fired; used in STARTUP to detect

@@ -82,7 +82,7 @@ bool session_send_oob(
 
 static struct mux_session make_session(void)
 {
-	return (struct mux_session){
+	struct mux_session ss = {
 		.auto_window = true,
 		.session_window = 4,
 		.stream_window = 4,
@@ -90,6 +90,8 @@ static struct mux_session make_session(void)
 		.conf.timeout = 600,
 		.conf.ping_timeout = 4,
 	};
+	ewma_init_span(&ss.estimator.bdp_ewma, BDP_EWMA_SPAN);
+	return ss;
 }
 
 T_DECLARE_CASE(test_estimator_seed_clamps_effective_bdp_to_limit)
@@ -305,7 +307,10 @@ T_DECLARE_CASE(
 	estimator_calculate(&ss, 100);
 	T_EXPECT_EQ(ss.estimator.phase, (enum estimator_phase)EST_TRACK);
 	T_EXPECT(wndfilter_get(&ss.estimator.rtt_wnd) > 0);
-	T_EXPECT(wndfilter_get(&ss.estimator.bw_wnd) > 0);
+	/* The cycle was app-limited (sample fit inside the window): rtt_min
+	 * is recorded, but bw_wnd/sample_wnd are intentionally NOT updated so
+	 * a future idle stretch cannot age the high-water mark down. */
+	T_EXPECT_EQ(wndfilter_get(&ss.estimator.bw_wnd), (intmax_t)0);
 	T_EXPECT(!ss.estimator.ping_in_flight);
 }
 
@@ -348,9 +353,9 @@ T_DECLARE_CASE(test_estimator_track_bdp_shrinks_when_window_expires)
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent_ns;
 	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
-	/* Large window so the sample is not window-limited. */
-	ss.estimator.cycle_window_bytes =
-		(size_t)ss.session_window * MUX_WINDOW_UNIT;
+	/* Window-limited so the cycle counts as link-driving evidence; app-limited
+	 * cycles intentionally hold the prior bw/sample/bdp windowed maxes. */
+	ss.estimator.cycle_window_bytes = ss.estimator.sample;
 	ss.estimator.phase = EST_TRACK;
 	/* Seed a very large bdp; the fresh cycle should shrink it. */
 	ss.estimator.bdp = 4u * 1024u * 1024u;
@@ -399,8 +404,9 @@ T_DECLARE_CASE(test_estimator_track_force_age_collapses_bdp_after_inflate_rounds
 	ss.estimator.bdp = 4u * 1024u * 1024u; /* start large */
 	wndfilter_reset(
 		&ss.estimator.rtt_wnd, rtt_min_t, (intmax_t)(rtt_min * 1e9));
-	/* Large window so the sample is not window-limited. */
-	const size_t cycle_window = (size_t)ss.session_window * MUX_WINDOW_UNIT;
+	/* Window-limited cycles so inflation detection sees real link-driving
+	 * samples; without this the new app-limited gating skips inflation. */
+	const size_t cycle_window = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
 
 	for (int i = 0; i < INFLATE_ROUNDS; i++) {
 		const intmax_t now_ns = clocks[i];
@@ -409,6 +415,11 @@ T_DECLARE_CASE(test_estimator_track_force_age_collapses_bdp_after_inflate_rounds
 		ss.estimator.probe_sent_ns = sent;
 		ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
 		ss.estimator.cycle_window_bytes = cycle_window;
+		/* Isolate the inflation path from the TRACK→STARTUP re-probe
+		 * heuristic: window-limited cycles otherwise switch phase
+		 * after saturated_rounds reaches 2. */
+		ss.estimator.saturated_rounds = 0;
+		ss.estimator.phase = EST_TRACK;
 		estimator_calculate(&ss, sent);
 	}
 
@@ -447,14 +458,18 @@ T_DECLARE_CASE(test_estimator_track_inflate_counter_cleared_when_ratio_drops)
 	ss.estimator.bdp = 4u * 1024u * 1024u;
 	wndfilter_reset(
 		&ss.estimator.rtt_wnd, rtt_min_t, (intmax_t)(rtt_min * 1e9));
-	const size_t cycle_window = (size_t)ss.session_window * MUX_WINDOW_UNIT;
 
 	/* First two cycles: ratio ≥ INFLATE_HI → inflated_rounds increments. */
 	for (int i = 0; i < 2; i++) {
 		ss.estimator.ping_in_flight = true;
 		ss.estimator.probe_sent_ns = sent[i];
 		ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
-		ss.estimator.cycle_window_bytes = cycle_window;
+		/* Window-limited so inflation detection runs (app-limited cycles
+		 * intentionally skip it).  Isolate from the TRACK→STARTUP
+		 * re-probe path by resetting saturated_rounds each cycle. */
+		ss.estimator.cycle_window_bytes = ss.estimator.sample;
+		ss.estimator.saturated_rounds = 0;
+		ss.estimator.phase = EST_TRACK;
 		estimator_calculate(&ss, sent[i]);
 	}
 	T_EXPECT_EQ(ss.estimator.inflated_rounds, (uint_least8_t)2);
@@ -463,7 +478,9 @@ T_DECLARE_CASE(test_estimator_track_inflate_counter_cleared_when_ratio_drops)
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent[2];
 	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
-	ss.estimator.cycle_window_bytes = cycle_window;
+	ss.estimator.cycle_window_bytes = ss.estimator.sample;
+	ss.estimator.saturated_rounds = 0;
+	ss.estimator.phase = EST_TRACK;
 	estimator_calculate(&ss, sent[2]);
 
 	T_EXPECT_EQ(ss.estimator.inflated_rounds, (uint_least8_t)0);
@@ -495,8 +512,9 @@ T_DECLARE_CASE(test_estimator_track_inflate_skipped_when_rtt_min_uncalibrated)
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent_ns;
 	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
-	ss.estimator.cycle_window_bytes =
-		(size_t)ss.session_window * MUX_WINDOW_UNIT;
+	/* Window-limited so estimator_phase_track actually runs (app-limited
+	 * cycles short-circuit before reaching the inflation guard). */
+	ss.estimator.cycle_window_bytes = ss.estimator.sample;
 
 	estimator_calculate(&ss, sent_ns);
 
@@ -532,6 +550,145 @@ T_DECLARE_CASE(test_estimator_startup_ignores_rtt_inflation)
 	T_EXPECT_EQ(ss.estimator.inflated_rounds, (uint_least8_t)0);
 }
 
+/* STARTUP phase: after BW_FLAT_ROUNDS consecutive window-limited probes where
+ * bw_sample grows by less than 25 % relative to the prior windowed maximum,
+ * the phase transitions to EST_TRACK so window growth stops at the physical
+ * bandwidth ceiling. */
+T_DECLARE_CASE(test_estimator_startup_exits_to_track_after_bw_flat_rounds)
+{
+	struct mux_session ss = make_session();
+	/* rtt = 10 ms; 2 frames → bw_sample ≈ 3.2 MB/s. */
+	const intmax_t rtt_ns = INTMAX_C(10000000);
+	const intmax_t clocks[BW_FLAT_ROUNDS] = {
+		rtt_ns,
+		INTMAX_C(1000000000) + rtt_ns,
+		INTMAX_C(2000000000) + rtt_ns,
+	};
+	/* Seed bw_wnd higher than bw_sample so bw_prev_max > 0 and the flat
+	 * condition (< 25 % growth) is met from the very first probe. */
+	const intmax_t bw_seed = INTMAX_C(5000000); /* 5 MB/s */
+
+	estimator_test_reset();
+	set_clock_sequence(clocks, BW_FLAT_ROUNDS);
+
+	ss.estimator.phase = EST_STARTUP;
+	ss.estimator.bdp = 65536;
+	wndfilter_reset(&ss.estimator.bw_wnd, 0, bw_seed);
+
+	for (int i = 0; i < BW_FLAT_ROUNDS; i++) {
+		const intmax_t sent_ns = clocks[i] - rtt_ns;
+		ss.estimator.ping_in_flight = true;
+		ss.estimator.probe_sent_ns = sent_ns;
+		ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+		ss.estimator.cycle_window_bytes =
+			2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+		estimator_calculate(&ss, sent_ns);
+		if (i < BW_FLAT_ROUNDS - 1) {
+			T_EXPECT_EQ(
+				ss.estimator.phase,
+				(enum estimator_phase)EST_STARTUP);
+		}
+	}
+
+	T_EXPECT_EQ(ss.estimator.phase, (enum estimator_phase)EST_TRACK);
+	T_EXPECT_EQ(ss.estimator.bw_flat_rounds, (uint_least8_t)0);
+}
+
+/* STARTUP phase: when a probe's bw_sample grows by >= 25 % relative to the
+ * prior windowed maximum, bw_flat_rounds is reset so the phase stays in
+ * STARTUP and window growth continues. */
+T_DECLARE_CASE(test_estimator_startup_flat_counter_resets_on_bw_growth)
+{
+	struct mux_session ss = make_session();
+	const intmax_t rtt_ns = INTMAX_C(10000000); /* 10 ms */
+	const intmax_t clocks[2] = {
+		rtt_ns,
+		INTMAX_C(1000000000) + rtt_ns,
+	};
+	/* Seed bw_wnd to 5 MB/s; bw_sample_1 ≈ 3.2 MB/s is below the 25 %
+	 * growth threshold (5 MB/s × 5/4 = 6.25 MB/s), so the first probe
+	 * increments bw_flat_rounds to 1. */
+	const intmax_t bw_seed = INTMAX_C(5000000);
+
+	estimator_test_reset();
+	set_clock_sequence(clocks, 2);
+
+	ss.estimator.phase = EST_STARTUP;
+	ss.estimator.bdp = 65536;
+	wndfilter_reset(&ss.estimator.bw_wnd, 0, bw_seed);
+
+	/* Cycle 1: flat bandwidth → bw_flat_rounds increments to 1. */
+	const intmax_t sent1 = clocks[0] - rtt_ns;
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.probe_sent_ns = sent1;
+	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+	ss.estimator.cycle_window_bytes = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+	estimator_calculate(&ss, sent1);
+	T_EXPECT_EQ(ss.estimator.phase, (enum estimator_phase)EST_STARTUP);
+	T_EXPECT_EQ(ss.estimator.bw_flat_rounds, (uint_least8_t)1);
+
+	/* Cycle 2: 4 frames / 10 ms = 6.5 MB/s > 5 MB/s × 5/4 → growth
+	 * exceeds the 25 % threshold → bw_flat_rounds resets to 0. */
+	const intmax_t sent2 = clocks[1] - rtt_ns;
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.probe_sent_ns = sent2;
+	ss.estimator.sample = 4u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+	ss.estimator.cycle_window_bytes = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+	estimator_calculate(&ss, sent2);
+	T_EXPECT_EQ(ss.estimator.phase, (enum estimator_phase)EST_STARTUP);
+	T_EXPECT_EQ(ss.estimator.bw_flat_rounds, (uint_least8_t)0);
+}
+
+/* TRACK EWMA smoothing: when consecutive cycles produce different targets,
+ * bdp must be smoothed by the EWMA rather than jumping instantly to the new
+ * target.  After two cycles with increasing samples the result must lie
+ * strictly between the first and second cycle's target values. */
+T_DECLARE_CASE(test_estimator_track_bdp_smoothed_across_cycles)
+{
+	struct mux_session ss = make_session();
+	/* rtt_min = 1 ms seeded 1 ms before now_base; rtt samples = 10 ms.
+	 * Seeding rtt_wnd very close to now ensures that the inflation guard
+	 * (now - rtt_wnd[0].t < RTT_WND_NS/4 = 75 s) skips force-age, so
+	 * bdp_ewma.ready stays 1 between the two cycles. */
+	const intmax_t rtt_ns = INTMAX_C(10000000); /* 10 ms */
+	const intmax_t now_base = INTMAX_C(80) * INTMAX_C(1000000000);
+	const intmax_t clocks[2] = { now_base, now_base + rtt_ns };
+
+	estimator_test_reset();
+	set_clock_sequence(clocks, 2);
+
+	ss.estimator.phase = EST_TRACK;
+	wndfilter_reset(
+		&ss.estimator.rtt_wnd, now_base - INTMAX_C(1000000),
+		INTMAX_C(1000000));
+
+	/* Cycle 1: sample = 2 frames.  bdp_ewma.ready=0 so bdp is set directly
+	 * to target1 = sample_max = 2 * MUX_MAX_PAYLOAD_SIZE. */
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.probe_sent_ns = now_base - rtt_ns;
+	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+	/* Window-limited so estimator_phase_track runs (app-limited cycles
+	 * skip the EWMA update); reset saturated_rounds each cycle to keep
+	 * phase in TRACK across the two iterations. */
+	ss.estimator.cycle_window_bytes = ss.estimator.sample;
+	ss.estimator.saturated_rounds = 0;
+	estimator_calculate(&ss, now_base - rtt_ns);
+	const size_t bdp1 = ss.estimator.bdp;
+
+	/* Cycle 2: sample = 4 frames → target2 > target1.  EWMA must produce a
+	 * value strictly between the two targets (not yet fully converged). */
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.probe_sent_ns = now_base;
+	ss.estimator.sample = 4u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+	ss.estimator.cycle_window_bytes = ss.estimator.sample;
+	ss.estimator.saturated_rounds = 0;
+	estimator_calculate(&ss, now_base);
+
+	T_EXPECT_EQ(ss.estimator.phase, (enum estimator_phase)EST_TRACK);
+	T_EXPECT(ss.estimator.bdp > bdp1);
+	T_EXPECT(ss.estimator.bdp < 4u * (size_t)MUX_MAX_PAYLOAD_SIZE);
+}
+
 /* TRACK bidirectional: even when the derived target is very small,
  * effective_bdp is never allowed to fall below BDP_MIN. */
 T_DECLARE_CASE(test_estimator_track_effective_bdp_floored_at_min_bdp)
@@ -560,14 +717,64 @@ T_DECLARE_CASE(test_estimator_track_effective_bdp_floored_at_min_bdp)
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent_ns;
 	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
-	ss.estimator.cycle_window_bytes =
-		(size_t)ss.session_window * MUX_WINDOW_UNIT;
+	/* Window-limited so the TRACK bidirectional target actually runs and
+	 * pushes the small computed bdp into bdp_clamped → effective_bdp
+	 * floor; app-limited cycles intentionally hold the prior estimate. */
+	ss.estimator.cycle_window_bytes = ss.estimator.sample;
 
 	estimator_calculate(&ss, sent_ns);
 
 	/* target = MAX(32768, bw_sample * rtt_min) which is tiny; bdp is the raw
 	 * result while effective_bdp is floored at BDP_MIN. */
 	T_EXPECT_EQ(ss.estimator.effective_bdp, (size_t)BDP_MIN);
+}
+
+/* TRACK app-limited: a cycle that did not drive the link to capacity must
+ * leave bw_wnd, sample_wnd, bdp_wnd, and effective_bdp untouched.  This is
+ * the throughput-first guarantee for long idle stretches: an established
+ * high-water mark survives even when BW_WND_NS / BDP_WND_NS would otherwise
+ * age it out, so the window does not shrink and starve a future burst. */
+T_DECLARE_CASE(test_estimator_track_app_limited_preserves_windowed_max)
+{
+	struct mux_session ss = make_session();
+	/* now is well past BDP_WND_NS (7200 s) so any unfrozen wndfilter would
+	 * age the seeded peaks out and reset to the current (tiny) values. */
+	const intmax_t now_ns = INTMAX_C(8000) * INTMAX_C(1000000000);
+	const intmax_t sent_ns = now_ns - INTMAX_C(10000000); /* 10 ms RTT */
+	const intmax_t bw_peak = INTMAX_C(100000000); /* 100 MB/s */
+	const size_t bdp_peak = 4u * 1024u * 1024u; /* 4 MiB */
+
+	estimator_test_reset();
+	set_clock_sequence(&now_ns, 1);
+
+	ss.estimator.phase = EST_TRACK;
+	/* Seed historical peaks at t=0; they must survive the app-limited cycle. */
+	wndfilter_reset(&ss.estimator.bw_wnd, 0, bw_peak);
+	wndfilter_reset(&ss.estimator.sample_wnd, 0, (intmax_t)bdp_peak);
+	wndfilter_reset(&ss.estimator.bdp_wnd, 0, (intmax_t)bdp_peak);
+	ss.estimator.effective_bdp = bdp_peak;
+	/* rtt_min close to now so the inflation guard is skipped regardless. */
+	wndfilter_reset(
+		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000),
+		INTMAX_C(10000000));
+
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.probe_sent_ns = sent_ns;
+	ss.estimator.sample = 2u * (size_t)MUX_MAX_PAYLOAD_SIZE;
+	/* Large window: sample + payload < cycle_window → app-limited. */
+	ss.estimator.cycle_window_bytes =
+		(size_t)ss.session_window * MUX_WINDOW_UNIT;
+
+	estimator_calculate(&ss, sent_ns);
+
+	/* Peaks held; effective_bdp preserved.  RTT min still updates (it is
+	 * valid regardless of demand) so rtt_wnd may change. */
+	T_EXPECT_EQ(wndfilter_get(&ss.estimator.bw_wnd), bw_peak);
+	T_EXPECT_EQ(
+		wndfilter_get(&ss.estimator.sample_wnd), (intmax_t)bdp_peak);
+	T_EXPECT_EQ(wndfilter_get(&ss.estimator.bdp_wnd), (intmax_t)bdp_peak);
+	T_EXPECT_EQ(ss.estimator.effective_bdp, bdp_peak);
+	T_EXPECT_EQ(ss.estimator.phase, (enum estimator_phase)EST_TRACK);
 }
 
 int main(void)
@@ -603,6 +810,11 @@ int main(void)
 		t,
 		test_estimator_track_inflate_skipped_when_rtt_min_uncalibrated);
 	T_RUN_CASE(t, test_estimator_startup_ignores_rtt_inflation);
+	T_RUN_CASE(
+		t, test_estimator_startup_exits_to_track_after_bw_flat_rounds);
+	T_RUN_CASE(t, test_estimator_startup_flat_counter_resets_on_bw_growth);
+	T_RUN_CASE(t, test_estimator_track_bdp_smoothed_across_cycles);
+	T_RUN_CASE(t, test_estimator_track_app_limited_preserves_windowed_max);
 	T_RUN_CASE(t, test_estimator_track_effective_bdp_floored_at_min_bdp);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

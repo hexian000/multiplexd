@@ -12,6 +12,7 @@
 #include "mux/mux.h"
 #include "mux/session.h"
 
+#include "algo/ewma.h"
 #include "algo/wndfilter.h"
 #include "os/clock.h"
 #include "utils/debug.h"
@@ -37,10 +38,18 @@
 #define BDP_WND_NS (INTMAX_C(7200) * INTMAX_C(1000000000))
 /* RTT inflation thresholds: LO = 6/5 (1.20), HI = 3/2 (1.50). */
 #define INFLATE_ROUNDS 3
+/* STARTUP bandwidth convergence: exit to TRACK after this many consecutive
+ * window_limited valid cycles where bw_sample grew by less than 1/4 of the
+ * prior windowed maximum (BW_FLAT_THRESHOLD = 25%). */
+#define BW_FLAT_ROUNDS 3
+/* BDP EWMA span: alpha = 2 / (span + 1).  4 → α = 0.4; moderate smoothing
+ * without masking genuine capacity shifts. */
+#define BDP_EWMA_SPAN 4
 
 void estimator_init(struct mux_session *restrict ss)
 {
 	ss->estimator = (struct estimator_ctx){ 0 };
+	ewma_init_span(&ss->estimator.bdp_ewma, BDP_EWMA_SPAN);
 }
 
 void estimator_seed(struct mux_session *restrict ss, const size_t bdp)
@@ -126,25 +135,48 @@ void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
 
 static void estimator_phase_startup(
 	struct estimator_ctx *restrict est, const bool valid_cycle,
-	const bool window_limited)
+	const bool window_limited, const intmax_t bw_sample,
+	const intmax_t bw_prev_max)
 {
 	if (!valid_cycle && est->probe_was_stalled) {
 		/* A fully stalled window can still justify slow-start growth. */
+		est->bw_flat_rounds = 0;
 		est->bdp = est->bdp + est->cycle_window_bytes;
 	} else if (valid_cycle && window_limited) {
 		/* The window capped delivery, so grow aggressively. */
 		est->bdp = est->bdp + est->sample;
+		/* Bandwidth convergence: if bw_sample grew by less than
+		 * BW_FLAT_THRESHOLD (25%) of the prior maximum for
+		 * BW_FLAT_ROUNDS consecutive cycles, bandwidth has plateaued
+		 * and growing the window further will not improve throughput. */
+		if (bw_prev_max > 0 && bw_sample * 4 < bw_prev_max * 5) {
+			if (++est->bw_flat_rounds >= BW_FLAT_ROUNDS) {
+				est->phase = EST_TRACK;
+				est->saturated_rounds = 0;
+				est->bw_flat_rounds = 0;
+				est->bdp_ewma.ready = 0;
+			}
+		} else {
+			est->bw_flat_rounds = 0;
+		}
 	} else if (valid_cycle) {
 		/* The sample fit inside the window; switch to steady tracking. */
 		est->phase = EST_TRACK;
 		est->saturated_rounds = 0;
+		est->bw_flat_rounds = 0;
+		est->bdp_ewma.ready = 0;
+	} else {
+		/* Invalid non-stalled cycle: no bandwidth data; stale count
+		 * is not meaningful so reset to avoid a spurious transition. */
+		est->bw_flat_rounds = 0;
 	}
 }
 
 /* RTT inflation detection and force-age.  Only act when rtt_min is stable
  * (aged >= RTT_WND_NS/4 ≈ 75 s) to avoid acting on an uncalibrated baseline.
  * On triggered force-age, *bw_max and *sample_max are updated to the current
- * cycle's values so the BDP calculation immediately reflects fresh data. */
+ * cycle's values and bdp_ewma is snapped so the BDP calculation immediately
+ * reflects fresh data without smoothing the old (now-meaningless) state. */
 static bool estimator_handle_inflation(
 	struct estimator_ctx *restrict est, const intmax_t now_ns,
 	const intmax_t rtt_ns, const intmax_t rtt_min_ns,
@@ -176,43 +208,35 @@ static bool estimator_handle_inflation(
 	*sample_max = (intmax_t)est->sample;
 	est->inflated_rounds = 0;
 	est->saturated_rounds = 0;
+	/* Snap the EWMA so the corrected target lands without smoothing. */
+	est->bdp_ewma.ready = 0;
 	return true;
 }
 
+/* TRACK steady-state update.  Caller guarantees valid_cycle && window_limited
+ * (i.e., not idle and not app-limited).  Returns true on RTT-inflation force-
+ * age so the caller can refresh bdp_wnd similarly. */
 static bool estimator_phase_track(
-	struct estimator_ctx *restrict est, const bool valid_cycle,
-	const bool window_limited, const intmax_t now_ns, const intmax_t rtt_ns,
-	const intmax_t rtt_min_ns, const intmax_t bw_sample)
+	struct estimator_ctx *restrict est, const intmax_t now_ns,
+	const intmax_t rtt_ns, const intmax_t rtt_min_ns,
+	const intmax_t bw_sample)
 {
-	if (!valid_cycle) {
-		/* Idle: leave bdp unchanged; bw_wnd/sample_wnd age
-		 * naturally over BW_WND_NS; wnd_max_update resets to
-		 * the current sample when the window expires. */
-		return false;
-	}
 	intmax_t bw_max = wndfilter_get(&est->bw_wnd);
 	intmax_t sample_max = wndfilter_get(&est->sample_wnd);
 	const bool inflation = estimator_handle_inflation(
 		est, now_ns, rtt_ns, rtt_min_ns, bw_sample, &bw_max,
 		&sample_max);
-	/* Bidirectional target: pure physical BDP, no headroom.
-	 * Headroom is added by session_update_window. */
-	{
-		/* bw_max * rtt_min_ns may overflow intmax_t across BW/RTT window
-		 * boundaries; use double which is exact for results <= BDP_MAX. */
-		double target =
-			MAX((double)sample_max,
-			    (double)bw_max * (double)rtt_min_ns / 1e9);
-		est->bdp = (size_t)target;
-	}
-	/* STARTUP re-probe path: unchanged semantics. */
-	if (!window_limited) {
-		est->saturated_rounds = 0;
-	} else if (++est->saturated_rounds >= 2) {
-		/* BDP may have grown past the current estimate;
-		 * switch back to STARTUP after two saturated
-		 * rounds to avoid a premature re-probe. */
+	/* Bidirectional target: pure physical BDP, no headroom.  Headroom is
+	 * added by session_update_window.  bw_max * rtt_min_ns may overflow
+	 * intmax_t across BW/RTT window boundaries; double is exact for
+	 * results <= BDP_MAX. */
+	const double target = MAX(
+		(double)sample_max, (double)bw_max * (double)rtt_min_ns / 1e9);
+	est->bdp = (size_t)ewma_add(&est->bdp_ewma, target);
+	if (++est->saturated_rounds >= 2) {
+		/* BDP may have grown past the current estimate; re-probe. */
 		est->phase = EST_STARTUP;
+		est->bw_flat_rounds = 0;
 	}
 	return inflation;
 }
@@ -257,13 +281,20 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 	const bool window_limited =
 		est->sample + (size_t)MUX_MAX_PAYLOAD_SIZE >=
 		est->cycle_window_bytes;
+	/* app_limited: valid sample but the application did not drive the link
+	 * to capacity.  Throughput-first policy: skip all bandwidth/BDP filter
+	 * updates so long idle stretches cannot age out the high-water mark
+	 * and starve a future burst. */
+	const bool app_limited = valid_cycle && !window_limited;
 
 	intmax_t bw_sample = 0;
-	if (valid_cycle) {
+	intmax_t bw_prev_max = 0;
+	if (valid_cycle && window_limited) {
 		/* sample <= session_window * MUX_WINDOW_UNIT <= 5/4 * BDP_MAX;
 		 * numerator <= 5/4 * BDP_MAX * 1e9 ≈ 1.34e18 < INTMAX_MAX. */
 		bw_sample =
 			(intmax_t)est->sample * INTMAX_C(1000000000) / rtt_ns;
+		bw_prev_max = wndfilter_get(&est->bw_wnd);
 		(void)wndfilter_update_max(
 			&est->bw_wnd, BW_WND_NS, now_ns, bw_sample);
 		(void)wndfilter_update_max(
@@ -274,42 +305,67 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 	bool inflation = false;
 	switch (est->phase) {
 	case EST_STARTUP:
-		estimator_phase_startup(est, valid_cycle, window_limited);
+		estimator_phase_startup(
+			est, valid_cycle, window_limited, bw_sample,
+			bw_prev_max);
 		break;
 	case EST_TRACK:
-		inflation = estimator_phase_track(
-			est, valid_cycle, window_limited, now_ns, rtt_ns,
-			rtt_min_ns, bw_sample);
+		if (app_limited) {
+			/* Hold all windowed maxima; just reset the re-probe
+			 * counter (semantically a non-saturated cycle). */
+			est->saturated_rounds = 0;
+		} else if (valid_cycle) { /* implies window_limited */
+			inflation = estimator_phase_track(
+				est, now_ns, rtt_ns, rtt_min_ns, bw_sample);
+		}
+		/* !valid_cycle: leave bdp untouched and let bw_wnd/sample_wnd
+		 * age naturally over BW_WND_NS. */
 		break;
 	default:
 		FAILMSGF("invalid estimator phase: %d", est->phase);
 	}
 
-	/* Update the BDP_WND_NS windowed maximum BDP.  On RTT inflation the
-	 * window is force-aged to the corrected estimate to avoid letting an
-	 * inflated peak persist for up to 2 hours. */
+	/* Update the BDP_WND_NS windowed maximum BDP and read the held peak.
+	 *  - inflation: force-age to the corrected estimate so an inflated
+	 *    peak cannot persist for up to 2 hours.
+	 *  - app_limited: hold the prior peak without refreshing timestamps,
+	 *    preserving throughput across long idle stretches.
+	 *  - otherwise (including !valid_cycle and STARTUP): feed the current
+	 *    clamped bdp into the windowed-max filter. */
 	const size_t bdp_clamped = CLAMP(est->bdp, BDP_MIN, BDP_MAX);
 	if (inflation) {
 		wndfilter_reset(&est->bdp_wnd, now_ns, (intmax_t)bdp_clamped);
-		est->effective_bdp = bdp_clamped;
-	} else {
-		est->effective_bdp = (size_t)wndfilter_update_max(
+	} else if (!app_limited) {
+		(void)wndfilter_update_max(
 			&est->bdp_wnd, BDP_WND_NS, now_ns,
 			(intmax_t)bdp_clamped);
 	}
+	const intmax_t held = wndfilter_get(&est->bdp_wnd);
+	est->effective_bdp = held > 0 ? (size_t)held : bdp_clamped;
 
 	est->ping_in_flight = false;
 	est->sample = 0;
 	est->last_probe_ns = now_ns;
-	const intmax_t bw_max = wndfilter_get(&est->bw_wnd);
 
+	/* Cycle classification, in priority order.  inflation implies a valid
+	 * window-limited cycle; "app-limited" means the application capped the
+	 * sample below the window; "stalled" tags invalid cycles that were at
+	 * least pushing against the send window (STARTUP can still grow). */
+	const char *cycle_label =
+		inflation ? "inflation" :
+		!valid_cycle ?
+			    (est->probe_was_stalled ? "stalled" : "invalid") :
+		app_limited ? "app-limited" :
+			      "saturated";
 	MUX_LOG_F(
 		INFO, ss,
-		"PONG: rtt_min=%.1f ms bw=%" PRIdMAX " B/s (max=%" PRIdMAX
-		" B/s)"
-		" in %.1f ms bdp=%zu B phase=%s stalled=%d infl=%u",
-		(double)rtt_min_ns / 1e6, bw_sample, bw_max,
-		(double)rtt_ns / 1e6, est->bdp,
-		est->phase == EST_STARTUP ? "STARTUP" : "TRACK",
-		(int)est->probe_was_stalled, (unsigned)est->inflated_rounds);
+		"PONG: rtt=%.1f ms (min=%.1f ms) bw=%" PRIdMAX
+		" B/s (max=%" PRIdMAX " B/s)"
+		" bdp=%zu B (eff=%zu B) phase=%s cycle=%s"
+		" sat=%u infl=%u flat=%u",
+		(double)rtt_ns / 1e6, (double)rtt_min_ns / 1e6, bw_sample,
+		wndfilter_get(&est->bw_wnd), est->bdp, est->effective_bdp,
+		est->phase == EST_STARTUP ? "STARTUP" : "TRACK", cycle_label,
+		(unsigned)est->saturated_rounds, (unsigned)est->inflated_rounds,
+		(unsigned)est->bw_flat_rounds);
 }

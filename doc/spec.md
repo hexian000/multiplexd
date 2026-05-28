@@ -8,7 +8,7 @@ multiple independent bidirectional byte streams to share a single transport
 connection.  The underlying transport is either plain TCP or TLS 1.3.  The
 protocol employs a fixed-size frame header, per-stream credit-based flow
 control, and fairness requirements for outbound scheduling so that no single
-stream monopolises the transport connection.
+stream monopolizes the transport connection.
 
 ## 1.  Introduction
 
@@ -80,7 +80,7 @@ mux frames, it MUST equal the negotiated protocol version (currently 1).
 
 Value 0 is reserved for hello frames (Section 5.2.1) and MUST NOT appear in
 regular mux frames.  Receivers MUST close the connection if a regular mux
-frame carries Version 0, or if any frame carries an unrecognised version
+frame carries Version 0, or if any frame carries an unrecognized version
 value.
 
 ### 2.3.  Frame Payload
@@ -532,7 +532,7 @@ Failure of either condition MUST cause the receiver to close the connection.
 
 The `extensions` field is an object whose keys are extension names and whose
 values are extension-specific objects.  Receivers MUST ignore any extension
-entry they do not recognise and MUST NOT fail the handshake solely because this
+entry they do not recognize and MUST NOT fail the handshake solely because this
 field is present.
 
 -  Extension keys defined in this specification are listed without a namespace
@@ -699,7 +699,7 @@ receiving any frame, including during SESSION_HANDSHAKE.
 
 ### 5.5.  Reconnection (Client)
 
-Reconnection behaviour, including backoff strategy and timing, is
+Reconnection behavior, including backoff strategy and timing, is
 implementation-defined.  When session resumption is in effect (Section 5.8),
 reconnection attempts carry a resume ClientHello so that existing streams
 survive the transport failure.
@@ -738,7 +738,7 @@ unacked list.
 
 #### 5.7.1.  Per-Session Counters
 
-Each endpoint maintains four 32-bit unsigned counters, all initialised to zero
+Each endpoint maintains four 32-bit unsigned counters, all initialized to zero
 at session establishment:
 
 -  The *frame transmit count*: the number of non-stream-0 frames transmitted
@@ -752,11 +752,11 @@ at session establishment:
    processing.
 
 -  The *reported process count*: the frame process count most recently conveyed
-   to the peer in a session ACK.  Initialised to zero.
+   to the peer in a session ACK.  Initialized to zero.
 
 -  The *confirmed transmit count*: the number of this endpoint's transmitted
    frames that the peer has confirmed as processed.  Advanced by `extra` when
-   a session ACK is received.  Initialised to zero.
+   a session ACK is received.  Initialized to zero.
 
 #### 5.7.2.  Unacknowledged-Transmit List
 
@@ -921,13 +921,13 @@ Window Increment (Section 2.4.1).
 
 This protocol does not implement connection-level flow control.  The underlying
 TCP send and receive buffers serve as the connection-level backstop; per-stream
-flow control prevents any single stream from monopolising those buffers.
+flow control prevents any single stream from monopolizing those buffers.
 
 ### 6.1.  Credit Model
 
 Each stream direction maintains a credit balance at the sender.  The sender
 tracks two cumulative quantities, each represented as a 32-bit unsigned integer
-and initialised to 16384 octets (the implicit initial credit, Section 6.5) at
+and initialized to 16384 octets (the implicit initial credit, Section 6.5) at
 stream creation:
 
 -  The *accumulated send credit*: the total send credit received from the peer.
@@ -1002,7 +1002,7 @@ The receiver tracks the following per-stream quantities:
    stream.
 
 -  The *total credit granted*: cumulative send credit already granted to the
-   peer.  Initialised to 16384 octets (the implicit initial credit).
+   peer.  Initialized to 16384 octets (the implicit initial credit).
 
 The *outstanding credit* is the total credit granted minus the total payload
 received.  A receiver MUST NOT grant credit that would cause the sum of the
@@ -1025,7 +1025,7 @@ Window updates SHOULD be piggybacked on the next outbound data frame for the
 stream (PUSH|ACK).  A standalone ACK frame MAY be sent when no data frame is
 available for that stream.
 
-To amortise round-trips, a window update SHOULD be withheld until the available
+To amortize round-trips, a window update SHOULD be withheld until the available
 capacity reaches half the receive buffer capacity.
 
 When this threshold is reached but no outbound data frame is immediately
@@ -1039,13 +1039,13 @@ stream, including any frame transmitted when the coalescing deferral
 
 Each stream begins with an implicit send credit of 16384 octets in each
 direction.  This credit is not transmitted on the wire; both endpoints
-initialise the accumulated send credit and the total credit granted to this
+initialize the accumulated send credit and the total credit granted to this
 value at stream creation.
 
 The SYN and SYN|ACK frames MAY carry an additional credit grant via the Extra
 field to raise the effective initial credit to the full receive-buffer size
 without requiring a separate ACK round-trip.  This avoids the additional
-round-trip that would otherwise be required before a stream could fully utilise
+round-trip that would otherwise be required before a stream could fully utilize
 its receive window.
 
 ### 6.6.  Counter Representation and Arithmetic
@@ -1103,14 +1103,14 @@ than a stream sending small frames of equal aggregate volume.
 A stream is ready when it has pending outbound payload and the accumulated send
 credit exceeds the total payload transmitted.
 
-This requirement ensures that no single stream can monopolise the transport
+This requirement ensures that no single stream can monopolize the transport
 connection regardless of its data volume.
 
 ### 7.1.  Small-Frame Coalescing
 
 An implementation MAY delay transmission of a small outbound data frame
 to reduce frame overhead, analogous to the Nagle algorithm in TCP.  This
-optimisation is OPTIONAL and applies only when both of the following
+optimization is OPTIONAL and applies only when both of the following
 conditions hold:
 
 -  The payload of the queued frame is smaller than the maximum payload size
@@ -1135,10 +1135,10 @@ is met:
     stream at the time of transmission.
 
 Implementations SHOULD provide a per-session or per-stream configuration
-switch to disable this behaviour, equivalent to TCP_NODELAY.  When the
+switch to disable this behavior, equivalent to TCP_NODELAY.  When the
 switch is enabled, all outbound frames are transmitted immediately
 regardless of frame size or in-flight state.  This switch controls only
-the small-frame coalescing optimisation; the credit-grant mechanism
+the small-frame coalescing optimization; the credit-grant mechanism
 described in Section 6.4 operates independently and MUST NOT be
 suppressed when the switch is enabled.
 
@@ -1247,5 +1247,5 @@ implementations:
 | I-13 | Invalid opening SYN flags              | First frame for unknown non-zero stream uses SYN\|ACK                         | Receiver MUST close the connection and MUST NOT resume the session                                                   |
 
 For each test, endpoints MUST record wire-level evidence (sent and received
-frames, flags, stream IDs, and Extra values) sufficient to diagnose behavioural
+frames, flags, stream IDs, and Extra values) sufficient to diagnose behavioral
 mismatches.

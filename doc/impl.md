@@ -255,7 +255,7 @@ sequenceDiagram
 | Session              | `w_idle_timeout`        | client idle-close / lazy reconnect                   | feeds the upper-layer reconnect policy                                                                                                                                                                                   |
 | Stream (socket mode) | `socket.w_io`           | local fd recv/send pump                              | present only when a real local fd is attached                                                                                                                                                                            |
 | Stream (socket mode) | `socket.w_timeout`      | local send/connect stall detection                   | local-edge analogue of session send timeout                                                                                                                                                                              |
-| Stream (direct mode) | `direct.w_io`           | synthesised `EV_READ` / `EV_WRITE`                   | user-visible readiness is derived from stream state rather than kernel fd readiness                                                                                                                                      |
+| Stream (direct mode) | `direct.w_io`           | synthesized `EV_READ` / `EV_WRITE`                   | user-visible readiness is derived from stream state rather than kernel fd readiness                                                                                                                                      |
 | Server               | `w_sighup`              | config reload trigger                                | fires `server_reload()` synchronously on the server loop                                                                                                                                                                 |
 | Server               | `w_sigint`, `w_sigterm` | graceful shutdown trigger                            | stops listeners, dispatches `mux_shutdown()` to every tunnel, arms `shutting_down` flag for the `w_maintenance` deadline                                                                                                 |
 | Server               | `w_maintenance`         | shutdown deadline, sleep detection, frame-pool drain | fires every second; runs three tasks in priority order: (1) 2 s force-exit when `shutting_down`; (2) wall-clock jump ≥ `mux.timeout` calls `tunnel_drop_transport()` on every tunnel; (3) releases one frame-pool object |
@@ -397,7 +397,7 @@ flowchart LR
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
 | Socket-attached reads and `mux_stream_send()` feed the same per-stream send queue.                                                                                 | Local I/O mode does not change fairness or flow-control semantics.                                                     |
 | `sched_next_data()` applies state, send credit, and Nagle as one dequeue gate.                                                                                     | A stalled sender can be blocked by any of the three; there is no single “sendable” bit.                                |
-| The session sendbuf holds at most one frame at a time.                                                                                                             | Transport backpressure interleaves with scheduling decisions and prevents a hot stream from monopolising the socket.   |
+| The session sendbuf holds at most one frame at a time.                                                                                                             | Transport backpressure interleaves with scheduling decisions and prevents a hot stream from monopolizing the socket.   |
 | `w_send_timeout` matters only while that single frame remains pending.                                                                                             | Send-stall detection tracks transport progress, not queue depth.                                                       |
 | `session_eager_flush()` is called from socket-mode `recv_cb()` after reading local data; if no transport I/O is already in flight it inlines `send_cb()` directly. | Avoids one libev event loop iteration on the response path, halving round-trip latency for request/response workloads. |
 
@@ -630,42 +630,90 @@ completed by PONG or by timeout detection on the next payload.
 
 ### 12.3 Phase Update (`estimator_calculate`)
 
+```mermaid
+stateDiagram-v2
+  [*] --> STARTUP
+  STARTUP --> STARTUP : valid && window_limited (bw growing)
+  STARTUP --> TRACK : valid && !window_limited
+  STARTUP --> TRACK : valid && window_limited (bw flat × BW_FLAT_ROUNDS)
+  TRACK --> STARTUP : valid && window_limited (saturated_rounds ≥ 2)
+  TRACK --> TRACK : otherwise
+```
+
 **`STARTUP`**
 
-| Condition                           | Action                      | Next phase |
-| ----------------------------------- | --------------------------- | ---------- |
-| `!valid_cycle && probe_was_stalled` | `bdp += cycle_window_bytes` | `STARTUP`  |
-| `valid_cycle && window_limited`     | `bdp += sample`             | `STARTUP`  |
-| `valid_cycle && !window_limited`    | `saturated_rounds = 0`      | `TRACK`    |
+STARTUP is the initial window-growth phase. `bdp` grows additively in each
+window-limited probe cycle. The phase exits to TRACK when a cycle is not
+window-limited (the window has expanded past path capacity) or when the
+per-cycle bandwidth sample stagnates — growing less than 25 % of the prior
+`bw_wnd` maximum — for `BW_FLAT_ROUNDS` consecutive window-limited cycles,
+indicating the physical bandwidth ceiling has been reached. Stalled,
+invalid, and non-window-limited cycles all reset `bw_flat_rounds`.
+
+| Condition                                                                        | Action                                                   | Next phase |
+| -------------------------------------------------------------------------------- | -------------------------------------------------------- | ---------- |
+| `!valid_cycle && probe_was_stalled`                                              | `bdp += cycle_window_bytes`                              | `STARTUP`  |
+| `valid_cycle && window_limited`, bw growing (≥ 25 %) or first cycle              | `bdp += sample`; `bw_flat_rounds = 0`                    | `STARTUP`  |
+| `valid_cycle && window_limited`, bw flat for `BW_FLAT_ROUNDS` consecutive cycles | `bdp += sample`; `saturated_rounds = bw_flat_rounds = 0` | `TRACK`    |
+| `valid_cycle && !window_limited`                                                 | `saturated_rounds = bw_flat_rounds = 0`                  | `TRACK`    |
 
 **`TRACK`**
 
-| Condition                                                         | Action                                                                                     | Next phase           |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | -------------------- |
-| `!valid_cycle`                                                    | no change to `bdp`; `bw_wnd`/`sample_wnd` age naturally                                    | `TRACK`              |
-| `valid_cycle`, rtt_min aged, `rtt_sample >= INFLATE_HI * rtt_min` | increment `inflated_rounds`; when it reaches `INFLATE_ROUNDS`, force-age and reset `bdp`   | `TRACK`              |
-| `valid_cycle`, rtt_min aged, `rtt_sample <= INFLATE_LO * rtt_min` | clear `inflated_rounds`                                                                    | `TRACK`              |
-| `valid_cycle` (any ratio)                                         | `bdp = max(sample_max, bw_max * rtt_min)` (raw; `effective_bdp` gets clamped windowed max) | `TRACK`              |
-| `valid_cycle && window_limited`                                   | increment `saturated_rounds`; if it reaches 2, re-probe aggressively                       | `TRACK` or `STARTUP` |
-| `valid_cycle && !window_limited`                                  | `saturated_rounds = 0`                                                                     | `TRACK`              |
+TRACK is the steady-state phase. `bdp` is recalculated each non-app-limited
+valid cycle from the windowed maxima of sample and bandwidth, then smoothed
+by an EWMA (`BDP_EWMA_SPAN = 4`, α = 0.4) to suppress cycle-to-cycle jitter
+without masking genuine capacity changes. RTT inflation detection force-ages
+the BW and sample filters when persistent queue buildup is detected, and
+also snaps the EWMA (resets it to the corrected estimate directly) so
+inflation does not smooth over a sudden drop. The EWMA is also snapped on
+every STARTUP→TRACK transition so the first TRACK cycle sets `bdp` directly.
+When the window becomes saturated for two consecutive cycles, the phase
+re-enters STARTUP to probe for additional capacity; `bw_flat_rounds` is
+reset on re-entry so the convergence counter starts fresh.
+
+**App-limited cycles.** A valid cycle that did not drive the link to
+capacity (`valid_cycle && !window_limited`) carries no information about
+available bandwidth — the application simply had less to send than the
+window allowed. Per the throughput-first policy, such cycles **do not**
+update `bw_wnd`, `sample_wnd`, or `bdp_wnd`, and inflation detection is
+suppressed. `effective_bdp` is always derived from `wndfilter_get(&bdp_wnd)`
+(falling back to the current clamped `bdp` before any peak has been
+recorded), so holding `bdp_wnd` directly translates into a held
+`effective_bdp` — a long idle stretch (hours or more) cannot age the
+high-water mark out and shrink the window in front of a future burst.
+Memory savings only materialize when force-age (RTT inflation) lowers the
+estimate or when a subsequent non-app-limited cycle actually records a
+lower peak. RTT min still updates on every valid cycle because RTT is a
+property of the path, independent of demand.
+
+| Condition                                                           | Action                                                                                          | Next phase           |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | -------------------- |
+| `!valid_cycle`                                                      | no change to `bdp`; `bw_wnd`/`sample_wnd` ages only on the next non-app-limited update          | `TRACK`              |
+| `valid_cycle && !window_limited` (app-limited)                      | hold `bw_wnd`/`sample_wnd`/`bdp_wnd`/`effective_bdp`; `saturated_rounds = 0`; skip inflation    | `TRACK`              |
+| `valid_cycle && window_limited`, rtt_min aged, ratio ≥ `INFLATE_HI` | increment `inflated_rounds`; at `INFLATE_ROUNDS` force-age and snap `bdp_ewma`                  | `TRACK`              |
+| `valid_cycle && window_limited`, rtt_min aged, ratio ≤ `INFLATE_LO` | clear `inflated_rounds`                                                                         | `TRACK`              |
+| `valid_cycle && window_limited` (any ratio)                         | `bdp = EWMA(max(sample_max, bw_max * rtt_min))`; update `bdp_wnd`; increment `saturated_rounds` | `TRACK` or `STARTUP` |
 
 **RTT inflation force-age** collapses all three slots of `bw_wnd` and
 `sample_wnd` to the current cycle's values, then clears both `inflated_rounds`
-and `saturated_rounds`. The guard `now - rtt_wnd[0].t >= RTT_WND_NS / 4`
+and `saturated_rounds`, and snaps `bdp_ewma` so the corrected estimate is
+applied directly without smoothing. The guard `now - rtt_wnd[0].t >= RTT_WND_NS / 4`
 skips the inflation check until `rtt_min` has been calibrated for at least
 75 s, preventing false force-ages during warm-up.
 
 Constants: `BDP_MAX = UINT16_MAX * MUX_WINDOW_UNIT` (≈ 1 GiB; single
 WINDOW_UPDATE grant encoding limit), `BDP_MIN = MUX_INITIAL_SEND_WINDOW`,
 `RTT_WND_NS = 300 s`, `BW_WND_NS = 600 s`,
-`INFLATE_HI = 1.5`, `INFLATE_LO = 1.2`, `INFLATE_ROUNDS = 3`.
+`INFLATE_HI = 1.5`, `INFLATE_LO = 1.2`, `INFLATE_ROUNDS = 3`,
+`BW_FLAT_ROUNDS = 3` (flat-bandwidth cycles before STARTUP exits to TRACK),
+`BDP_EWMA_SPAN = 4` (TRACK BDP smoothing; α = 2/(span+1) = 0.4).
 
 ### 12.4 Window Update and Lifecycle
 
 | Event                     | Result                                                                                                                                                                                                                                                        |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Manual mode               | The estimator is inert; configured frame counts are used as-is.                                                                                                                                                                                               |
-| Automatic mode            | Mixed config is normalised away; effective windows start at `floor_frames` and track the BDP bidirectionally.                                                                                                                                                 |
+| Automatic mode            | Mixed config is normalized away; effective windows start at `floor_frames` and track the BDP bidirectionally.                                                                                                                                                 |
 | `session_update_window()` | Both `session_window` and `stream_window` are set to `window_frames`; live streams expand `recv_window` immediately on grow; on shrink, each stream's `recv_window` is lazily synced down by `stream_check_ack` once `buffered_bytes + outstanding ≤ target`. |
 | `estimator_stop()`        | Reset phase, RTT/BW filters, and probe state; bump `epoch_ns`; preserve `effective_bdp` and seed `bdp_wnd` with it so the window is maintained across reconnect until new measurements arrive.                                                                |
 
@@ -778,7 +826,7 @@ a retired stream is handled by the single-RST path in Section 14.3 instead.
 The mux listener applies a three-layer guard (`is_startup_limited()`) before
 creating an accepted tunnel:
 
-| Layer | Config field                                 | Behaviour                                                                                                                                                                                                            |
+| Layer | Config field                                 | Behavior                                                                                                                                                                                                             |
 | ----- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1     | `max_sessions`                               | Hard cap on fully established sessions; excess connections are rejected immediately.                                                                                                                                 |
 | 2     | `startup_limit_full`                         | Hard cap on half-open sessions; protects against SYN-flood-style connection floods.                                                                                                                                  |
