@@ -19,14 +19,22 @@
 struct mux_frame;
 struct mux_session;
 
+enum estimator_phase {
+	ESTIMATOR_STARTUP = 0,
+	ESTIMATOR_TRACK,
+};
+
 /* Estimator state, embedded by value in mux_session.
  * At most one PING is outstanding at any time. */
 struct estimator_ctx {
 	/* PING payload timestamp; valid when ping_in_flight is true. */
 	intmax_t probe_sent_ns;
-	/* Last probe completion time; 0 = none. */
+	/* last probe completion time; 0 = none. */
 	intmax_t last_probe_ns;
-	size_t sample; /* bytes in the current probe cycle */
+	/* bytes in the current probe cycle */
+	size_t sample;
+	/* bandwidth at the STARTUP→TRACK transition; 0 = none recorded. */
+	intmax_t bw_exit;
 
 	struct wndfilter rtt_wnd;
 	struct wndfilter bw_wnd;
@@ -35,6 +43,7 @@ struct estimator_ctx {
 	size_t bdp;
 	size_t effective_bdp;
 
+	enum estimator_phase phase;
 	bool ping_in_flight : 1;
 	bool inited : 1;
 };

@@ -587,16 +587,18 @@ flowchart LR
   C --> D[PONG]
   D --> E[estimator_calculate]
   E --> F["bdp = bw_max × rtt_min"]
-  F --> G["window_limited → ×3<br/>rtt_inflated → bdp × 1.25"]
-  G --> H[session_update_stream_window]
-  H --> I["stream_window = ceil(effective_bdp / MUX_WINDOW_UNIT)"]
-  I --> J[grow: expand live stream recv_window immediately;
+  F --> G{phase}
+  G -- STARTUP --> H1["rtt_inflated → bdp×1.25, phase=TRACK<br/>window_limited → ×3"]
+  G -- TRACK --> H2["bw > bw_exit×1.25 → ×3, phase=STARTUP<br/>else bdp×1.25"]
+  H1 & H2 --> I[session_update_stream_window]
+  I --> J["stream_window = ceil(effective_bdp / MUX_WINDOW_UNIT)"]
+  J --> K[grow: expand live stream recv_window immediately;
 shrink: lazily sync recv_window down in stream_check_ack
 once outstanding peer credit is consumed]
 
-  K["inbound SYN or SYN|ACK"] --> L[peer_stream_window updated]
-  L --> M[session_update_session_window]
-  M --> N[session_window = peer_stream_window frames]
+  L["inbound SYN or SYN|ACK"] --> M[peer_stream_window updated]
+  M --> N[session_update_session_window]
+  N --> O[session_window = peer_stream_window frames]
 ```
 
 ### 12.1 Core Equations
@@ -608,21 +610,28 @@ extra frame.
 ```text
 bw_sample      = sample × 1e9 / rtt_ns
 bw_max         = wndfilter_max(bw_wnd,  WND_BW_MAX_NS)    -- 86400 s window
-min_rtt        = wndfilter_min(rtt_wnd, WND_RTT_MIN_NS)   -- 60 s window
+min_rtt        = wndfilter_min(rtt_wnd, WND_RTT_MIN_NS)   -- 30 s window
 bdp            = bw_max × min_rtt / 1e9
 window_limited = sample + sample/2 > effective_bdp         -- sample > 2/3 target
 rtt_inflated   = rtt_ns > min_rtt + min_rtt/4              -- current RTT > 5/4 baseline
 
-if window_limited:   effective_bdp ×= 3
-elif rtt_inflated:   effective_bdp  = bdp + bdp/4          -- guard: bw_max > 0
+-- STARTUP phase
+if rtt_inflated:     phase = TRACK; bw_exit = bw_max
+                     if bw_max > 0: effective_bdp = bdp + bdp/4
+elif window_limited: effective_bdp ×= 3
+
+-- TRACK phase
+if bw_max > 0 and (bw_exit == 0 or bw_max > bw_exit + bw_exit/4):
+                     phase = STARTUP; bw_exit = 0; effective_bdp ×= 3
+elif bw_max > 0:     effective_bdp = bdp + bdp/4
 
 initial_frames = MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT
 stream_window  = max(ceil(effective_bdp / MUX_MAX_PAYLOAD_SIZE), initial_frames)
 ```
 
 The `bw_wnd` 86400 s window acts as a natural floor: a measured peak bandwidth
-persists for up to one day before the rtt-inflated path can drive `effective_bdp`
-below the level it once supported.
+persists for up to one day before `effective_bdp` can fall materially below the
+level it once supported.
 
 Constants: `WNDSIZE_MAX = UINT16_MAX × MUX_WINDOW_UNIT`, `WNDSIZE_MIN = 4 × MUX_WINDOW_UNIT`, `WND_RTT_MIN_NS = 30 s`, `WND_BW_MAX_NS = 86400 s`.
 
@@ -645,14 +654,37 @@ PUSH.
 ### 12.3 `effective_bdp` Update Rules
 
 Each valid PONG updates `min_rtt`.  When `sample > 0`, `bw_wnd` is updated and
-`bdp` is recomputed.  Two mutually exclusive branches then adjust `effective_bdp`:
+`bdp` is recomputed.  `effective_bdp` is then adjusted according to the current
+phase (`STARTUP` or `TRACK`), stored in `est->phase`.
 
-- **window_limited** (`sample > 2/3 × effective_bdp`): the receive window is
-  the throughput bottleneck; triple the target to probe for more capacity.
-- **rtt_inflated** (`rtt > 5/4 × min_rtt`, only when `bw_max > 0`): queue
-  building detected; reduce to `bdp × 1.25`.
+**STARTUP phase** — fast-start, searching for the bandwidth ceiling:
 
-`window_limited` takes priority.  When neither fires, `effective_bdp` is unchanged.
+- **rtt_inflated** (`rtt > 5/4 × min_rtt`): queue building detected; transition
+  to TRACK, record `bw_exit = bw_max`, and (when `bw_max > 0`) clamp
+  `effective_bdp` to `bdp × 1.25`.
+- **window_limited** (`sample > 2/3 × effective_bdp`, only when not
+  rtt_inflated): the receive window is the throughput bottleneck; triple the
+  target to probe for more capacity.
+- Neither fires: `effective_bdp` is unchanged.
+
+`rtt_inflated` takes priority over `window_limited`.  The old behavior of
+tripling a window-limited target even while the RTT was already inflating was
+the primary source of `effective_bdp` oscillation.
+
+**TRACK phase** — steady-state, maintaining the working point:
+
+- **Bandwidth headroom** (`bw_max > bw_exit + bw_exit/4`, or `bw_exit == 0`):
+  a new bandwidth peak has emerged; re-enter STARTUP, clear `bw_exit`, and
+  triple `effective_bdp` to resume probing.
+- **Steady state** (otherwise, when `bw_max > 0`): maintain `effective_bdp =
+  bdp + bdp/4`.
+- `bw_max == 0` (no sample this cycle): `effective_bdp` is unchanged.
+
+The `bw_exit` field records the bandwidth at the STARTUP→TRACK transition and
+acts as an asymmetric hysteresis gate: TRACK cannot re-enter STARTUP unless
+`bw_max` has grown at least 25% beyond the level that triggered the exit.  The
+`bw_wnd` 86400 s windowed maximum keeps `bw_max` stable between cycles, so
+this threshold cannot be met by a transient sampling artefact.
 
 ### 12.4 Window Update and Lifecycle
 

@@ -105,6 +105,53 @@ void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
 	est->sample = (size_t)bytes;
 }
 
+static void phase_startup(
+	struct mux_session *restrict ss, const bool window_limited,
+	const bool rtt_inflated, const intmax_t bw_max)
+{
+	struct estimator_ctx *restrict est = &ss->estimator;
+	if (rtt_inflated) {
+		/* Queue building: exit STARTUP, clamp to BDP × 1.25. */
+		est->phase = ESTIMATOR_TRACK;
+		est->bw_exit = bw_max;
+		if (bw_max > 0) {
+			est->effective_bdp = est->bdp + est->bdp / 4;
+		}
+		MUX_LOG_F(
+			INFO, ss,
+			"estimator: STARTUP→TRACK bw=%" PRIdMAX
+			" B/s bdp=%zu B",
+			bw_max, est->bdp);
+		return;
+	}
+	if (window_limited) {
+		/* Fast-start: triple the target to probe for more bandwidth. */
+		est->effective_bdp *= 3;
+	}
+}
+
+static void phase_track(struct mux_session *restrict ss, const intmax_t bw_max)
+{
+	if (bw_max <= 0) {
+		return;
+	}
+	struct estimator_ctx *restrict est = &ss->estimator;
+	if (est->bw_exit == 0 || bw_max > est->bw_exit + est->bw_exit / 4) {
+		/* Bandwidth headroom found: re-enter STARTUP. */
+		est->phase = ESTIMATOR_STARTUP;
+		est->bw_exit = 0;
+		est->effective_bdp *= 3;
+		MUX_LOG_F(
+			INFO, ss,
+			"estimator: TRACK→STARTUP bw=%" PRIdMAX
+			" B/s bdp=%zu B",
+			bw_max, est->bdp);
+		return;
+	}
+	/* Steady-state tracking: maintain BDP × 1.25. */
+	est->effective_bdp = est->bdp + est->bdp / 4;
+}
+
 void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns)
 {
 	struct estimator_ctx *restrict est = &ss->estimator;
@@ -153,12 +200,13 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 		(est->sample + est->sample / 2 > est->effective_bdp);
 	const bool rtt_inflated = (rtt_ns > rtt_min_ns + rtt_min_ns / 4);
 
-	if (window_limited) {
-		/* Fast-start: triple the target to probe for more bandwidth. */
-		est->effective_bdp *= 3;
-	} else if (rtt_inflated && bw_max > 0) {
-		/* Queue building: clamp to BDP estimate with 1.25× headroom. */
-		est->effective_bdp = est->bdp + est->bdp / 4;
+	switch (est->phase) {
+	case ESTIMATOR_STARTUP:
+		phase_startup(ss, window_limited, rtt_inflated, bw_max);
+		break;
+	case ESTIMATOR_TRACK:
+		phase_track(ss, bw_max);
+		break;
 	}
 	est->ping_in_flight = false;
 	est->sample = 0;
@@ -167,9 +215,10 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 	MUX_LOG_F(
 		INFO, ss,
 		"PONG: rtt=%.1f ms (min=%.1f ms) bw=%" PRIdMAX
-		" B/s bdp=%zu B (eff=%zu B)",
+		" B/s bdp=%zu B (eff=%zu B, phase=%s)",
 		(double)rtt_ns / 1e6, (double)rtt_min_ns / 1e6, bw_max,
-		est->bdp, est->effective_bdp);
+		est->bdp, est->effective_bdp,
+		est->phase == ESTIMATOR_STARTUP ? "startup" : "track");
 }
 
 size_t estimator_window_size(const struct estimator_ctx *restrict est)
