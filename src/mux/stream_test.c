@@ -471,6 +471,46 @@ T_DECLARE_CASE(test_stream_check_ack_does_not_shrink_while_outstanding)
 	teardown_fixture(&fx);
 }
 
+T_DECLARE_CASE(test_stream_format_tag_formats_id_string)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+
+	char buf[256];
+	const int ret = stream_format_tag(buf, sizeof(buf), s);
+	T_EXPECT(ret > 0);
+	T_EXPECT(buf[0] != '\0');
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+T_DECLARE_CASE(test_stream_mark_syn_sent_advances_state)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	/* stream_new with active_open=true starts in STREAM_INIT. */
+	struct mux_stream *const s = stream_new(&fx.ss, 1, true);
+	T_CHECK(s != NULL);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_INIT);
+
+	stream_mark_syn_sent(s);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_SYN_SENT);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -485,5 +525,7 @@ int main(void)
 	T_RUN_CASE(t, test_stream_recv_fin_with_rx_eof_shuts_down_write);
 	T_RUN_CASE(t, test_stream_check_ack_shrinks_recv_window_when_safe);
 	T_RUN_CASE(t, test_stream_check_ack_does_not_shrink_while_outstanding);
+	T_RUN_CASE(t, test_stream_format_tag_formats_id_string);
+	T_RUN_CASE(t, test_stream_mark_syn_sent_advances_state);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

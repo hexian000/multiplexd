@@ -31,11 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Format a stream log prefix into buf.
- * accepted stream (peer-initiated): "[N] me <- peer:"
- * connected stream (locally-initiated): "[N] me -> peer:"
- * me/peer use identity, fall back to IP, finally fall back to "[fd:N]".
- * Returns the snprintf byte count. */
+/* Format a stream log prefix into buf ("[N] me <- peer:" or "-> peer:").
+ * me/peer: identity, then IP, then "[fd:N]".  Returns snprintf byte count. */
 int stream_format_tag(
 	char *restrict buf, size_t buflen, const struct mux_stream *restrict s)
 {
@@ -386,10 +383,8 @@ void stream_on_send(struct mux_stream *restrict s)
 		update_watcher(s);
 		return;
 	}
-	/* Direct I/O: notify the user that send credit is available so it
-	 * can queue more data.  Without this the user would only learn
-	 * about available credit via stream_recv_window (peer ACK), which
-	 * may not arrive until the current send window is exhausted. */
+	/* Notify the user that send credit is available; otherwise credit
+	 * would only be visible after the peer sends a window update. */
 	if (stream_read_credit_avail(s) > 0) {
 		stream_feed_user(s, EV_WRITE);
 	}
@@ -707,10 +702,8 @@ void stream_mark_syn_sent(struct mux_stream *s)
 {
 	ASSERT(s->state == STREAM_INIT);
 	stream_set_state(s, STREAM_SYN_SENT);
-	/* If the local fd is already attached (fast-open path), stop the
-	 * watcher: no local I/O is permitted while the mux-level SYN is
-	 * in flight.  When the fd is not yet attached (fd == -1) the watcher
-	 * has never been started, so there is nothing to do here. */
+	/* Fast-open path: fd is attached; stop watcher while SYN is in flight.
+	 * If fd == -1, the watcher was never started. */
 	if (s->socket.w_io.fd != -1) {
 		update_watcher(s);
 	}
@@ -754,13 +747,11 @@ struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 		return NULL;
 	}
 
-	/* Calculate how much we can send */
 	const uint_fast32_t credit = stream_credit_avail(s);
 	if (credit == 0) {
 		STREAM_LOG(VERBOSE, s, "send credit exhausted");
 		return NULL;
 	}
-	/* credit > 0 implies available > 0; this invariant is checked above. */
 	STREAM_LOG_F(
 		VERYVERBOSE, s, "dequeue_send credit=%" PRIuFAST32, credit);
 	const size_t payload = frame->len - MUX_FRAME_HEADER_SIZE;
@@ -769,7 +760,6 @@ struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 		"dequeue_send payload=%zu frame_len=%zu frame_pos=%zu", payload,
 		frame->len, frame->pos);
 
-	/* Only dequeue if payload fits in window */
 	if (payload == 0 || payload > credit) {
 		STREAM_LOG_F(
 			VERYVERBOSE, s,
@@ -791,7 +781,6 @@ struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 		return NULL;
 	}
 
-	/* Dequeue and return the complete frame */
 	frame = mux_frame_list_pop(&s->send_queue);
 	s->queued_send_bytes -=
 		(uint_least32_t)(frame->len - MUX_FRAME_HEADER_SIZE);
@@ -800,13 +789,10 @@ struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 	return frame;
 }
 
-/* Compute the fraction [1/8, 1.0] by which to scale per-stream window grants
- * based on session-level receive-buffer pressure.
- * Disabled (returns 1.0 always) when mem_pressure_hi <= 0.
- * Fast path: returns 1.0 immediately when there is nothing buffered.
- * Pressure range [s_lo, s_hi]: linear decay from 1.0 to 1/8.
- * s_hi = mem_pressure_hi; s_lo = mem_pressure_lo > 0 ? mem_pressure_lo : s_hi / 2.
- * Beyond s_hi: clamp at 1/8. */
+/* Scale per-stream window grants by session receive-buffer pressure.
+ * Disabled when mem_pressure_hi <= 0; fast path returns 1.0 when
+ * nothing is buffered.  Linear decay from 1.0 to a minimum scale
+ * in [s_lo, s_hi]; clamped at the minimum beyond s_hi. */
 static double session_pressure_scale(const struct mux_session *restrict ss)
 {
 	if (ss->conf.mem_pressure_hi <= 0) {
@@ -829,12 +815,8 @@ static double session_pressure_scale(const struct mux_session *restrict ss)
 	return 1.0 - (buffered - s_low) / (s_high - s_low) * (1.0 - 0.125);
 }
 
-/* Compute the window increment (in MUX_WINDOW_UNIT units) to grant the peer.
- * Uses the actual available receive window to avoid over-granting when the
- * local receive buffer already holds undelivered data.  Scales the grant
- * down by session_pressure_scale() when session-level pressure is active;
- * always grants at least one MUX_WINDOW_UNIT while grantable allows, so
- * no stream can be permanently starved. */
+/* Compute the window increment to grant the peer (in MUX_WINDOW_UNIT units).
+ * Scales by session_pressure_scale(); floors at one unit to avoid starvation. */
 uint_fast32_t stream_grant_inc(const struct mux_stream *restrict s)
 {
 	const uint_fast32_t grantable = stream_grantable_bytes(s);
@@ -956,12 +938,8 @@ void stream_recv_copy(
 	struct mux_stream *restrict s, const unsigned char *restrict payload,
 	size_t payload_len)
 {
-	/*
-	 * Window updates are quantized to MUX_WINDOW_UNIT on wire.
-	 * For simplicity we intentionally tolerate at most one full payload of
-	 * over-window data relative to the peer's last quantized advertisement.
-	 * The hard safety cap is still recv_window.
-	 */
+	/* Window updates are quantized to MUX_WINDOW_UNIT; up to one full
+	 * payload of over-window data is tolerated.  Hard cap: recv_window. */
 	if (s->state == STREAM_CLOSED) {
 		STREAM_LOG_F(
 			VERBOSE, s,
@@ -973,7 +951,6 @@ void stream_recv_copy(
 	STREAM_LOG_F(
 		VERYVERBOSE, s, "receiving PUSH frame with %zu bytes",
 		payload_len);
-	/* Check window violation */
 	if (s->buffered_bytes + payload_len > s->recv_window) {
 		STREAM_LOG_F(
 			WARNING, s,
@@ -1005,7 +982,6 @@ void stream_recv_copy(
 		" buffered=%" PRIuLEAST32,
 		payload_len, s->bytes_received, s->buffered_bytes);
 
-	/* Try to flush to local socket or wake the direct I/O user. */
 	stream_notify_readable(s);
 }
 
@@ -1013,12 +989,9 @@ void stream_recv_window(struct mux_stream *s, const uint_fast32_t window_inc)
 {
 	const uint_fast32_t inc_bytes = window_inc * MUX_WINDOW_UNIT;
 
-	/* spec §6.6: check before applying the increment so the test uses the
-	 * true post-increment value without relying on wrapping to catch the
-	 * error.  Use 64-bit arithmetic so the sum cannot itself wrap.
-	 * recv_window is a local configuration parameter not advertised on the
-	 * wire, so the only bound applicable here is the 2^31 - 1 limit within
-	 * which the wrapping arithmetic of §6.6 is guaranteed correct. */
+	/* spec §6.6: pre-check with 64-bit arithmetic avoids wrapping.
+	 * The applicable bound is INT32_MAX (the range within which §6.6
+	 * wrapping arithmetic is correct); recv_window is not on the wire. */
 	const uint_fast32_t outstanding = stream_credit_avail(s);
 	if ((uintmax_t)outstanding + inc_bytes > (uintmax_t)INT32_MAX) {
 		STREAM_LOG_F(
@@ -1051,7 +1024,6 @@ void stream_recv_window(struct mux_stream *s, const uint_fast32_t window_inc)
 		return;
 	}
 
-	/* Resume local read if credit opened */
 	stream_notify_writable(s);
 
 	if (s->send_queue.head != NULL) {
@@ -1150,13 +1122,9 @@ void stream_recv_rst(struct mux_stream *s)
 	if (!s->is_direct) {
 		stream_rst_notify_socket(s);
 	} else {
-		/* Invoke EV_READ directly so the callback fires synchronously
-		 * before the watcher is detached.  The callback calls
-		 * mux_stream_recv(), which returns -1 / ECONNRESET because
-		 * rst_received is already set.  The callback may call
-		 * mux_stream_close(), which transitions the stream to
-		 * STREAM_CLOSED.  Guard the remaining teardown steps against
-		 * that. */
+		/* Fire EV_READ synchronously before watcher detach so the
+		 * user callback sees rst_received; it may call mux_stream_close(),
+		 * transitioning to STREAM_CLOSED — guard teardown against that. */
 		stream_rst_notify_direct(s);
 	}
 	if (s->state == STREAM_CLOSED) {

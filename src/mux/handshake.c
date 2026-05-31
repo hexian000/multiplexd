@@ -44,7 +44,6 @@ static int proto_hello_build(
 	unsigned char *const buf, const size_t buf_size,
 	const struct proto_hello *const msg)
 {
-	/* JSON carries session_id in base64. */
 	char id_b64[SESSION_ID_B64 + 1];
 	if (msg->has_session_id) {
 		size_t len = SESSION_ID_B64;

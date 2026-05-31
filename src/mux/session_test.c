@@ -390,7 +390,7 @@ T_DECLARE_CASE(test_session_recv_ping_copies_payload_into_pong)
 	teardown_fixture(&fx);
 }
 
-T_DECLARE_CASE(test_session_recv_ping_drops_when_pong_already_queued)
+T_DECLARE_CASE(test_session_recv_ping_queues_pong_per_ping_outside_rate_limit)
 {
 	struct session_fixture fx;
 	static const unsigned char payload1[] = { 1, 2, 3, 4 };
@@ -422,8 +422,9 @@ T_DECLARE_CASE(test_session_recv_ping_drops_when_pong_already_queued)
 	ringbuf_produce(fx.ss.wire.recvbuf, frame1->len);
 	session_recv_ping(&fx.ss, &hdr, frame1->len);
 	T_CHECK(fx.ss.wire.oobbuf.head != NULL);
-	const struct mux_frame *const queued = fx.ss.wire.oobbuf.head;
+	const struct mux_frame *const first_pong = fx.ss.wire.oobbuf.head;
 
+	/* Reset the rate-limit clock so the second PING is not dropped. */
 	fx.ss.ping_recv_last_ns = -(intmax_t)MUX_PING_RATE_LIMIT_NS;
 	hdr.length = (uint_least16_t)sizeof(payload2);
 	ringbuf_reset(fx.ss.wire.recvbuf);
@@ -432,12 +433,16 @@ T_DECLARE_CASE(test_session_recv_ping_drops_when_pong_already_queued)
 	ringbuf_produce(fx.ss.wire.recvbuf, frame2->len);
 	session_recv_ping(&fx.ss, &hdr, frame2->len);
 
-	T_EXPECT(fx.ss.wire.oobbuf.head == queued);
-	T_EXPECT(fx.ss.wire.oobbuf.tail == queued);
-	T_EXPECT(fx.ss.wire.oobbuf.head->next == NULL);
+	/* Each PING outside the rate-limit window queues its own PONG. */
+	T_EXPECT(fx.ss.wire.oobbuf.head == first_pong);
+	T_EXPECT(fx.ss.wire.oobbuf.tail != first_pong);
+	T_EXPECT(fx.ss.wire.oobbuf.head->next != NULL);
 	T_EXPECT(
-		memcmp(fx.ss.wire.oobbuf.head->data + MUX_FRAME_HEADER_SIZE,
-		       payload1, sizeof(payload1)) == 0);
+		memcmp(first_pong->data + MUX_FRAME_HEADER_SIZE, payload1,
+		       sizeof(payload1)) == 0);
+	T_EXPECT(
+		memcmp(fx.ss.wire.oobbuf.tail->data + MUX_FRAME_HEADER_SIZE,
+		       payload2, sizeof(payload2)) == 0);
 
 	mux_frame_put(&fx.ss.pool, frame1);
 	mux_frame_put(&fx.ss.pool, frame2);
@@ -467,6 +472,96 @@ static int setup_handshake_fixture(struct session_fixture *restrict fx)
 	ev_timer_init(&fx->ss.w_send_timeout, session_test_timer_cb, 0.0, 5.0);
 	fx->ss.w_send_timeout.data = &fx->ss;
 	return 0;
+}
+
+/* Regression: a received PONG must clear the estimator's ping_in_flight token
+ * and reset w_keepalive.repeat to the full keepalive interval so the next
+ * keepalive_cb fires a fresh PING rather than treating the unanswered PING as
+ * a liveness failure. */
+T_DECLARE_CASE(test_session_recv_pong_clears_ping_in_flight)
+{
+	struct session_fixture fx;
+	static const unsigned char payload[MUX_PING_PAYLOAD_SIZE] = { 0 };
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	/* Simulate a probe in flight (sent by keepalive or data path):
+	 * payload is all-zero so sent_ns == 0, which matches probe_sent_ns. */
+	fx.ss.conf.keepalive = 60;
+	fx.ss.conf.ping_timeout = 15;
+	ev_timer_init(&fx.ss.w_keepalive, session_test_timer_cb, 0.0, 15.0);
+	fx.ss.w_keepalive.data = &fx.ss;
+	fx.ss.estimator.ping_in_flight = true;
+	fx.ss.estimator.probe_sent_ns = 0;
+
+	/* Build a minimal PONG frame in recvbuf. */
+	struct mux_frame *const frame = make_frame(
+		&fx.ss.pool, STREAMID_CTRL, 0, MUX_CTRL_PONG, payload,
+		sizeof(payload));
+	T_CHECK(frame != NULL);
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = 0,
+		.length = (uint_least16_t)sizeof(payload),
+		.stream_id = STREAMID_CTRL,
+		.extra = MUX_CTRL_PONG,
+	};
+	ringbuf_reset(fx.ss.wire.recvbuf);
+	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
+	ringbuf_produce(fx.ss.wire.recvbuf, frame->len);
+
+	session_recv_pong(&fx.ss, &hdr, frame->len);
+
+	T_EXPECT(!fx.ss.estimator.ping_in_flight);
+	/* Timer repeat must be restored to the full keepalive interval. */
+	T_EXPECT_EQ(fx.ss.w_keepalive.repeat, 60.0);
+
+	mux_frame_put(&fx.ss.pool, frame);
+	teardown_fixture(&fx);
+}
+
+/* Any received PONG resets w_keepalive.repeat to the full keepalive interval,
+ * regardless of whether a probe was in flight.  This defers the next probe
+ * correctly even for unsolicited PONGs. */
+T_DECLARE_CASE(test_session_recv_pong_resets_keepalive_interval)
+{
+	struct session_fixture fx;
+	static const unsigned char payload[MUX_PING_PAYLOAD_SIZE] = { 0 };
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	fx.ss.conf.keepalive = 60;
+	ev_timer_init(&fx.ss.w_keepalive, session_test_timer_cb, 0.0, 60.0);
+	fx.ss.w_keepalive.data = &fx.ss;
+	fx.ss.estimator.ping_in_flight = false;
+
+	struct mux_frame *const frame = make_frame(
+		&fx.ss.pool, STREAMID_CTRL, 0, MUX_CTRL_PONG, payload,
+		sizeof(payload));
+	T_CHECK(frame != NULL);
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = 0,
+		.length = (uint_least16_t)sizeof(payload),
+		.stream_id = STREAMID_CTRL,
+		.extra = MUX_CTRL_PONG,
+	};
+	ringbuf_reset(fx.ss.wire.recvbuf);
+	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
+	ringbuf_produce(fx.ss.wire.recvbuf, frame->len);
+
+	session_recv_pong(&fx.ss, &hdr, frame->len);
+
+	T_EXPECT(!fx.ss.estimator.ping_in_flight);
+	/* Timer repeat must be set to the keepalive interval. */
+	T_EXPECT_EQ(fx.ss.w_keepalive.repeat, 60.0);
+
+	mux_frame_put(&fx.ss.pool, frame);
+	teardown_fixture(&fx);
 }
 
 /* Regression: after session_handshake_done, w_coalesce must be re-armed when
@@ -542,6 +637,65 @@ T_DECLARE_CASE(test_session_handshake_done_no_coalesce_without_backlog)
 	teardown_fixture(&fx);
 }
 
+T_DECLARE_CASE(test_session_initiate_shutdown_transitions_to_closed)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	/* Using SESSION_INIT takes the force-close path in
+	 * session_initiate_shutdown, which requires no timer initialisation
+	 * and leaves the session in SESSION_CLOSED.  session_cleanup closes
+	 * and clears w_socket.fd (== fds[0]); update the fixture to prevent
+	 * double-close in teardown_fixture. */
+	fx.ss.state = SESSION_INIT;
+	session_initiate_shutdown(&fx.ss);
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+
+	fx.fds[0] = -1;
+	teardown_fixture(&fx);
+}
+
+T_DECLARE_CASE(test_session_drain_sets_draining_flag)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	/* Use SESSION_INIT so that session_drain does not trigger an
+	 * immediate session_initiate_shutdown (which would require timer
+	 * initialisation and leave the session CLOSED). */
+	fx.ss.state = SESSION_INIT;
+	session_drain(&fx.ss);
+	T_EXPECT(fx.ss.draining);
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_INIT);
+
+	teardown_fixture(&fx);
+}
+
+T_DECLARE_CASE(test_session_discard_stream_frames_clears_queued_data)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	/* Enqueue two non-RST frames for stream 5. */
+	T_CHECK(session_send_ctrl(&fx.ss, 5, MUX_FLAG_ACK, 0));
+	T_CHECK(session_send_ctrl(&fx.ss, 5, MUX_FLAG_ACK, 0));
+	T_CHECK(fx.ss.wire.sendbuf.head != NULL);
+
+	session_discard_stream_frames(&fx.ss, 5);
+	T_EXPECT(fx.ss.wire.sendbuf.head == NULL);
+
+	teardown_fixture(&fx);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -554,11 +708,18 @@ int main(void)
 	T_RUN_CASE(
 		t, test_session_open_stream_success_sets_default_send_window);
 	T_RUN_CASE(t, test_session_recv_ping_copies_payload_into_pong);
-	T_RUN_CASE(t, test_session_recv_ping_drops_when_pong_already_queued);
+	T_RUN_CASE(
+		t,
+		test_session_recv_ping_queues_pong_per_ping_outside_rate_limit);
+	T_RUN_CASE(t, test_session_recv_pong_clears_ping_in_flight);
+	T_RUN_CASE(t, test_session_recv_pong_resets_keepalive_interval);
 	T_RUN_CASE(
 		t, test_session_handshake_done_rearms_coalesce_for_delay_list);
 	T_RUN_CASE(
 		t, test_session_handshake_done_rearms_coalesce_for_ack_backlog);
 	T_RUN_CASE(t, test_session_handshake_done_no_coalesce_without_backlog);
+	T_RUN_CASE(t, test_session_initiate_shutdown_transitions_to_closed);
+	T_RUN_CASE(t, test_session_drain_sets_draining_flag);
+	T_RUN_CASE(t, test_session_discard_stream_frames_clears_queued_data);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

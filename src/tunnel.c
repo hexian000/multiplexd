@@ -479,12 +479,8 @@ static bool handle_closed(struct tunnel *restrict t)
 		ev_timer_stop(t->loop, &t->w_reconnect);
 		return true;
 	}
-	/* Both clean and dirty closes use the backoff timer.  An immediate
-	 * reconnect attempt is not made here to avoid a busy loop: if the
-	 * attempt were to fail asynchronously it would fire another CLOSED
-	 * event and start the cycle again.  Clean closes use a normal delay
-	 * so we do not hammer a server that exited intentionally; dirty closes
-	 * (timeout, resume expiry, etc.) use the same backoff ladder. */
+	/* Both clean and dirty closes schedule a backoff reconnect; no
+	 * immediate attempt to avoid CLOSED-event busy loops. */
 	tunnel_schedule_reconnect(t);
 	return false;
 }
@@ -593,12 +589,8 @@ static int tunnel_thread(void *arg)
 {
 	struct tunnel *restrict t = arg;
 	ev_run(t->loop, 0);
-	/* ev_run may exit naturally when the session closes all its watchers
-	 * before tunnel_close() has had a chance to dispatch task_tunnel_teardown.
-	 * In that case the teardown task sits unconsumed in the dispatcher queue.
-	 * Drain it here on the tunnel thread so that mux_close() (and thus
-	 * free(ss)) always runs on the thread that allocated the session,
-	 * preventing a cross-thread free that corrupts glibc's per-thread tcache. */
+	/* If ev_run exits before task_tunnel_teardown is dispatched, drain it
+	 * here so mux_close/free(ss) always run on the allocating thread. */
 	dispatcher_tick(t->disp);
 	return 0;
 }
@@ -824,12 +816,8 @@ void tunnel_start(struct tunnel *t)
 }
 
 #if WITH_THREADS
-/* Suppress mux callbacks, close the session, and stop the event loop.
- * Runs on the tunnel thread as the final dispatched task; suppressing
- * callbacks first guarantees no new tasks are enqueued into relay_disp
- * after this point, so the tunnel's dispatcher is empty when ev_run()
- * returns and thrd_join() completes.  Clears t->ss after freeing it so
- * that tunnel_close can detect whether the task actually ran. */
+/* Final dispatched task on the tunnel thread: suppress callbacks, close
+ * session, stop event loop.  Clears t->ss so tunnel_close knows it ran. */
 static void task_tunnel_teardown(void *p)
 {
 	struct tunnel *restrict t = p;
@@ -844,24 +832,17 @@ static void task_tunnel_teardown(void *p)
 void tunnel_close(struct tunnel *t)
 {
 #if WITH_THREADS
-	/* Disconnect relay callbacks first.  Any relay_dispatch_on_event or
-	 * relay_dispatch_on_closed task already queued in the server
-	 * dispatcher will see NULL callbacks and become no-ops (freeing
-	 * any arg allocation without invoking the callback).  This must
-	 * happen before dispatching the teardown task to the tunnel thread
-	 * so that no new relay tasks can be enqueued after this point. */
+	/* Null relay callbacks so any queued relay tasks become no-ops.
+	 * Must precede the teardown dispatch to prevent new relay tasks. */
 	t->relay.cb = (struct tunnel_callbacks){ 0 };
 
 	if (t->started) {
 		/* Suppress mux callbacks, close session, stop event loop. */
 		tunnel_dispatch(t, (struct task){ task_tunnel_teardown, t });
 		THRD_ASSERT(thrd_join(t->thread, NULL));
-		/* If task_tunnel_teardown did not run (graceful close: the tunnel
-		 * thread stopped itself in tunnel_on_closed before processing the
-		 * task, or a race where tunnel_on_closed fired concurrently), the
-		 * session is still allocated.  Free it here on the relay thread;
-		 * this is safe because thrd_join guarantees the tunnel thread is
-		 * fully done with t->ss. */
+		/* If task_tunnel_teardown did not run (tunnel closed itself before
+		 * processing it), t->ss is still alive; free it here — safe after
+		 * thrd_join guarantees the tunnel thread is done. */
 		if (t->ss != NULL) {
 			mux_close(t->ss);
 		}
@@ -914,10 +895,8 @@ static void task_drop_transport(void *p)
 	if (fd < 0) {
 		return;
 	}
-	/* Close the transport socket so the mux layer detects transport
-	 * loss (MUX_EVENT_LOST / MUX_EVENT_SUSPENDED) and w_reconnect
-	 * re-establishes the connection.  The mux session itself is kept
-	 * alive in SUSPENDED state; its session ID is preserved for resumption. */
+	/* Close the transport socket so the mux layer triggers
+	 * MUX_EVENT_SUSPENDED and w_reconnect re-establishes the connection. */
 	if (close(fd) != 0) {
 		const int err = errno;
 		TUNNEL_LOG_F(
@@ -980,7 +959,7 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	mux_session_stats(t->ss, &snap);
 	out->rx_window = snap.rx_window;
 	out->tx_window = snap.tx_window;
-	out->rtt_ns = snap.rtt_ns;
+	out->rtt_ns = snap.rtt;
 	out->bdp = snap.bdp;
 	out->last_changed = t->last_changed;
 #if WITH_THREADS

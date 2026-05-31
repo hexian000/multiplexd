@@ -19,7 +19,6 @@
 #include "util.h"
 
 #include "algo/hashtable.h"
-#include "algo/wndfilter.h"
 
 #include "os/clock.h"
 #include "os/socket.h"
@@ -74,7 +73,11 @@ session_set_state(struct mux_session *ss, enum session_state newstate)
 		ev_timer_stop(ss->loop, &ss->w_timeout);
 		ev_timer_stop(ss->loop, &ss->w_keepalive);
 		ev_timer_stop(ss->loop, &ss->w_send_timeout);
-		estimator_stop(ss);
+		ss->estimator.ping_in_flight = false;
+		ss->stream_window = (uint_least32_t)MAX(
+			estimator_window_size(&ss->estimator) / 2 /
+				MUX_WINDOW_UNIT,
+			(size_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
 		COUNTER_ADD(ss->cnt.num_session_disconnected, 1);
 		COUNTER_SUB(ss->cnt.num_sessions, 1);
 		if (ss->callbacks.on_event != NULL) {
@@ -151,7 +154,9 @@ static void session_stop(struct mux_session *ss)
 	ev_timer_stop(loop, &ss->w_connect_timeout);
 	ev_timer_stop(loop, &ss->sched.w_coalesce);
 	ev_timer_stop(loop, &ss->w_idle_timeout);
-	estimator_stop(ss);
+	ss->stream_window = (uint_least32_t)MAX(
+		estimator_window_size(&ss->estimator) / 2 / MUX_WINDOW_UNIT,
+		(size_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
 }
 
 static void session_cleanup(struct mux_session *restrict ss)
@@ -377,20 +382,6 @@ update_send_timeout(struct mux_session *restrict ss, const bool progress)
 	}
 }
 
-static bool oobbuf_has_pong(const struct mux_session *ss)
-{
-	for (const struct mux_frame *frame = ss->wire.oobbuf.head;
-	     frame != NULL; frame = frame->next) {
-		struct mux_header hdr;
-		mux_read_header(frame->data, &hdr);
-		if (hdr.stream_id == STREAMID_CTRL &&
-		    hdr.extra == MUX_CTRL_PONG) {
-			return true;
-		}
-	}
-	return false;
-}
-
 /* Add one unacked-list entry worth @p count logical seqnums.  Hitting the
  * session cap only stalls new data dequeues; ACK/oob paths still run until
  * session_ack_trim drops the list below session_window. */
@@ -578,7 +569,6 @@ bool session_send_push(
 		.extra = extra,
 	};
 
-	/* Fill header at the beginning of frame buffer */
 	unsigned char *p = frame->data;
 	mux_write_header(p, &hdr);
 
@@ -654,7 +644,6 @@ static void send_cb(struct mux_session *restrict ss)
 	bool retransmitting = false;
 
 	for (;;) {
-		/* 1. Flush the current sendbuf head frame. */
 		if (ss->wire.sendbuf.head != NULL) {
 			const bool blocked = flush_sendbuf(ss, &made_progress);
 			if (blocked) {
@@ -755,7 +744,6 @@ static void send_cb(struct mux_session *restrict ss)
 			}
 			break; /* nothing to send */
 		}
-		/* sendbuf now holds the data frame; loop to write it. */
 	}
 
 	update_send_timeout(ss, made_progress);
@@ -853,9 +841,7 @@ void session_flush(struct mux_session *restrict ss)
 		}
 		ss->wire.tx_pending = true;
 	}
-	/* Re-arm EV_IDLE if the lp queue has work and sendbuf is now clear.
-	 * This handles the case where sched_cb paused because sendbuf was
-	 * occupied; once it drains, lifecycle events can proceed. */
+	/* Re-arm EV_IDLE when sendbuf drains and lp queue has pending work. */
 	if (ss->sched.lp_head != NULL && ss->wire.sendbuf.head == NULL) {
 		ev_idle_start(ss->loop, &ss->sched.w_sched);
 	}
@@ -1055,25 +1041,29 @@ static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	CHECKMSGF(
 		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
 		ss->state);
+	/* When the session has a shared session_id, suspend rather than close
+	 * so that streams survive short blackhole periods: the client will
+	 * resume the session as soon as the network recovers.  Only sessions
+	 * without a session_id (fresh connections that never completed a resume
+	 * handshake) are torn down immediately. */
+	if (ss->handshake.has_session_id) {
+		MUX_LOG(WARNING, ss, "session timeout; suspending for resume");
+		session_suspend(ss);
+		return;
+	}
 	MUX_LOG(WARNING, ss, "session timeout");
 	session_fire_closed(ss, false);
 }
 
 /* Handle an inbound PING (spec §5.3.2): immediately queue a PONG whose
  * payload is a byte-for-byte copy of the PING payload.  Silently discards
- * the PING when rate limit is exceeded or a PONG is already queued. */
+ * the PING when the rate limit is exceeded. */
 void session_recv_ping(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
 	const intmax_t now = clock_monotonic_ns();
-	/* Rate limit: at most one PONG per MUX_PING_RATE_LIMIT_NS. */
 	if (now - ss->ping_recv_last_ns < MUX_PING_RATE_LIMIT_NS) {
-		ringbuf_consume(ss->wire.recvbuf, frame_size);
-		return;
-	}
-	/* Drop if a PONG is already waiting to be sent. */
-	if (oobbuf_has_pong(ss)) {
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
 		return;
 	}
@@ -1113,17 +1103,12 @@ static bool update_stream_window_cb(
 	return true;
 }
 
-/* Update the TX unacked-frame cap from the peer's per-stream receive window.
- * Called after peer_stream_window changes (SYN and SYN|ACK paths).  A floor
- * of MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT prevents session_window from
- * being zero before the first stream handshake.  On growth, a stall caused
- * by the old (smaller) window cap is cleared immediately. */
 void session_update_session_window(struct mux_session *restrict ss)
 {
-	const uint_least32_t floor_frames =
+	const uint_least32_t initial_frames =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
 	const uint_least32_t new_window =
-		(uint_least32_t)MAX(ss->peer_stream_window, floor_frames);
+		(uint_least32_t)MAX(ss->peer_stream_window, initial_frames);
 	if (ss->session_window == new_window) {
 		return;
 	}
@@ -1144,21 +1129,13 @@ void session_update_session_window(struct mux_session *restrict ss)
 	}
 }
 
-/* Apply the current BDP estimate to the per-stream receive window floor.
- * bdp_bytes is the windowed maximum BDP maintained by the estimator.
- * On shrink, per-stream recv_window is left intact so the peer can drain
- * already-granted credit naturally.  On grow, live streams receive the
- * extra recv credit immediately. */
 static void session_update_stream_window(
-	struct mux_session *restrict ss, const size_t bdp_bytes)
+	struct mux_session *restrict ss, const size_t window_bytes)
 {
-	const uint_least32_t floor_frames =
-		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
-	/* Add a fixed headroom fraction so the receive window is never the
-	 * throughput bottleneck. */
-	const size_t window_bytes = bdp_bytes + bdp_bytes / 4;
-	const uint_least32_t frames = (uint_least32_t)MAX(
-		window_bytes / MUX_MAX_PAYLOAD_SIZE, floor_frames);
+	const size_t target_frames = (window_bytes + MUX_MAX_PAYLOAD_SIZE - 1) /
+				     MUX_MAX_PAYLOAD_SIZE;
+	const uint_least32_t frames =
+		(uint_least32_t)MAX(target_frames, (size_t)1u);
 
 	if (ss->stream_window == frames) {
 		return;
@@ -1174,12 +1151,14 @@ static void session_update_stream_window(
 	 * stream_check_ack once outstanding peer credit is consumed
 	 * and the safety constraint is satisfied. */
 	MUX_LOG_F(
-		INFO, ss, "estimator updated: max_bdp=%zu stream=%zu",
-		bdp_bytes, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
+		INFO, ss, "estimator updated: window=%zu stream=%zu",
+		window_bytes, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
 }
 
 /* Handle an inbound PONG (spec §5.3.3): feed the echoed timestamp into the
- * estimator, then apply its current BDP to the live window floors. */
+ * estimator, then apply its current BDP to the live window floors.  Also
+ * clears the keepalive in-flight flag and resets the timer to the normal
+ * keepalive interval so a successful PONG always defers the next probe. */
 void session_recv_pong(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
@@ -1192,9 +1171,19 @@ void session_recv_pong(
 	const intmax_t sent_ns = (intmax_t)read_uint64(
 		ringbuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE);
 	ringbuf_consume(ss->wire.recvbuf, frame_size);
+
 	estimator_calculate(ss, sent_ns);
 	if (ss->auto_stream_window) {
-		session_update_stream_window(ss, ss->estimator.effective_bdp);
+		session_update_stream_window(
+			ss, estimator_window_size(&ss->estimator));
+	}
+
+	/* Any PONG confirms the link is alive: reset the keepalive deadline
+	 * to the full idle interval regardless of which path sent the PING. */
+	const double keepalive = (double)ss->conf.keepalive;
+	ev_timer_set(&ss->w_keepalive, 0.0, keepalive);
+	if (ev_is_active(&ss->w_keepalive)) {
+		ev_timer_again(ss->loop, &ss->w_keepalive);
 	}
 }
 
@@ -1207,10 +1196,40 @@ static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	CHECKMSGF(
 		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
 		ss->state);
-	MUX_LOG(VERBOSE, ss, "connection inactive, sending PROBE");
-	if (!session_send_oob(ss, MUX_CTRL_PROBE, NULL, 0)) {
+
+	if (ss->estimator.ping_in_flight) {
+		const intmax_t age_ns =
+			clock_monotonic_ns() - ss->estimator.probe_sent_ns;
+		const intmax_t timeout_ns =
+			(intmax_t)ss->conf.ping_timeout * INTMAX_C(1000000000);
+		if (age_ns >= timeout_ns) {
+			/* The probe has not been answered within ping_timeout. */
+			if (ss->handshake.has_session_id) {
+				MUX_LOG(WARNING, ss,
+					"keepalive PING timeout; suspending for resume");
+				session_suspend(ss);
+			} else {
+				MUX_LOG(WARNING, ss, "keepalive PING timeout");
+				session_fire_closed(ss, false);
+			}
+			return;
+		}
+		/* Probe is still fresh (e.g. sent by the data path just before
+		 * the keepalive interval expired); re-arm for remaining time. */
+		const double remaining = (double)(timeout_ns - age_ns) / 1e9;
+		ev_timer_set(&ss->w_keepalive, 0.0, remaining);
+		ev_timer_again(ss->loop, &ss->w_keepalive);
 		return;
 	}
+
+	if (!estimator_ping(ss)) {
+		/* OOM: skip this cycle; the timer will fire again normally. */
+		return;
+	}
+	const double ping_timeout = (double)ss->conf.ping_timeout;
+	ev_timer_set(&ss->w_keepalive, 0.0, ping_timeout);
+	ev_timer_again(ss->loop, &ss->w_keepalive);
+	MUX_LOG(VERBOSE, ss, "keepalive PING sent");
 	session_flush(ss);
 }
 
@@ -1322,10 +1341,8 @@ session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
 	const double idle_timeout = (double)conf->idle_timeout;
 	ev_timer_init(&ss->w_idle_timeout, idle_cb, 0.0, idle_timeout);
 	ss->w_idle_timeout.data = ss;
-	/* Resolve 0-sentinels (auto stream/session window) and record auto-mode
-	 * flags.  Must be called after all ev_timer_init calls so that the
-	 * subsequent ev_timer_set calls inside session_set_config are safe. */
-	estimator_init(ss);
+	/* Must follow all ev_timer_init calls (session_set_config uses ev_timer_set). */
+	estimator_init(ss, MUX_INITIAL_SEND_WINDOW);
 	session_set_config(ss, conf);
 	COUNTER_ADD(ss->cnt.num_session_created, 1);
 	return ss;
@@ -1369,7 +1386,9 @@ void session_initiate_shutdown(struct mux_session *restrict ss)
 	ev_timer_stop(loop, &ss->w_connect_timeout);
 	ev_timer_stop(loop, &ss->sched.w_coalesce);
 	ev_timer_stop(loop, &ss->w_idle_timeout);
-	estimator_stop(ss);
+	ss->stream_window = (uint_least32_t)MAX(
+		estimator_window_size(&ss->estimator) / 2 / MUX_WINDOW_UNIT,
+		(size_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
 
 	/* Free all streams: closes local fds, drains queues; no protocol
 	 * frames are sent (per spec §5.6: streams are implicitly aborted). */
@@ -1409,21 +1428,15 @@ void session_set_config(
 	ss->conf = *conf;
 	ss->auto_stream_window = (conf->stream_window <= 0);
 	ss->auto_session_window = (conf->session_window <= 0);
-	const uint_least32_t floor_frames =
+	const uint_least32_t initial_frames =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
 	/* stream_window: auto (BDP-driven) or manual (fixed config). */
 	if (ss->auto_stream_window) {
 		if (!was_auto_stream_window) {
-			/* Switching from manual to auto: reset to the initial
-			 * floor so the estimator re-probes from a clean state
-			 * rather than inheriting an arbitrary manual value. */
-			ss->stream_window = floor_frames;
+			/* Manual-to-auto: reset to the floor for a clean probe. */
+			ss->stream_window = initial_frames;
 		} else {
-			/* Already in auto mode: preserve the learned value,
-			 * enforcing only the floor. */
-			if (ss->stream_window < floor_frames) {
-				ss->stream_window = floor_frames;
-			}
+			/* Already auto: preserve the learned value (no floor). */
 		}
 	} else {
 		ss->stream_window = (uint_least32_t)conf->stream_window;
@@ -1432,12 +1445,12 @@ void session_set_config(
 	if (ss->auto_session_window) {
 		if (!was_auto_session_window) {
 			/* Switching from manual to auto: reset to the floor. */
-			ss->session_window = floor_frames;
+			ss->session_window = initial_frames;
 		} else {
 			/* Already in auto mode: preserve the learned value,
 			 * enforcing only the floor. */
-			if (ss->session_window < floor_frames) {
-				ss->session_window = floor_frames;
+			if (ss->session_window < initial_frames) {
+				ss->session_window = initial_frames;
 			}
 		}
 	} else {
@@ -1490,11 +1503,9 @@ void session_set_config(
 
 	/* Seed the estimator only when first entering auto mode.  In the
 	 * already-auto path the window and probe state have already converged;
-	 * calling estimator_seed would wipe the learned RTT/BW windows and
-	 * re-seed bdp from a window value that includes the 25 % headroom,
-	 * compounding the overshoot on every config reload. */
+	 * re-seeding would wipe the learned RTT/BW windows. */
 	if (ss->auto_stream_window && !was_auto_stream_window) {
-		estimator_seed(ss, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
+		estimator_init(ss, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
 	}
 }
 
@@ -1619,7 +1630,7 @@ struct mux_stream *session_open_stream(struct mux_session *restrict ss)
 	}
 	const uint_fast16_t id = sched_alloc_stream_id(ss);
 	if (id == STREAMID_CTRL) {
-		/* All stream IDs in this parity class are active (spec §5.1);
+		/* All stream IDs in this parity class are active (spec §4.1);
 		 * reject the request and wait for existing streams to close. */
 		MUX_LOG(VERBOSE, ss, "open_stream: stream IDs exhausted");
 		return NULL;
@@ -1787,21 +1798,16 @@ void session_handshake_done(struct mux_session *ss)
 		}
 	}
 
-	/* Re-activate any streams queued while the session was suspended.
-	 * INIT/CLOSED streams placed in the data queue before establishment are
-	 * redirected to the lp queue by sched_next_data on first encounter.
-	 * Data-ready streams need EV_WRITE; lp queue streams need EV_IDLE. */
+	/* Re-activate streams queued during suspension: data-ready via EV_WRITE,
+	 * INIT/CLOSED lifecycle via EV_IDLE. */
 	if (ss->sched.sched_head != NULL) {
 		ss->wire.tx_pending = true;
 	}
 	if (ss->sched.lp_head != NULL && ss->wire.sendbuf.head == NULL) {
 		ev_idle_start(ss->loop, &ss->sched.w_sched);
 	}
-	/* Re-arm w_coalesce if the session resumes with a preserved backlog:
-	 * delay list entries (Nagle / ACK coalescing held before suspension) or
-	 * a session-level ACK backlog (recv_seq != ack_seq carried across the
-	 * transport break).  sched_coalesce_arm is idempotent, so calling it
-	 * here is also safe on a fresh establish with no backlog. */
+	/* Re-arm w_coalesce on resume with preserved Nagle/ACK backlog or
+	 * session ACK delta.  sched_coalesce_arm is idempotent. */
 	if (ss->sched.delay_head != NULL || ss->recv_seq != ss->ack_seq) {
 		sched_coalesce_arm(ss);
 	}
@@ -1814,12 +1820,8 @@ void session_handshake_done(struct mux_session *ss)
 	}
 }
 
-/* Trim @p count frames from the unacked list (session-ACK increment path).
- * Advances last_ack_recv by count.  Returns false and logs an error if
- * count exceeds the current unacked list length, indicating a protocol
- * violation (peer acknowledged more frames than were sent).
- * Clears send_stalled and wakes the scheduler when the unacked count
- * drops back below session_window. */
+/* Trim @p count frames from the unacked list.  Returns false on protocol
+ * violation (acked > unacked).  Clears send_stalled on underflow. */
 bool session_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
 {
 	if (count > ss->unacked_frames) {
@@ -1929,14 +1931,9 @@ void session_suspend(struct mux_session *restrict ss)
 	ss->wire.tls_want = 0;
 #endif
 
-	/* Wait for peer to reconnect.  Reuse w_connect_timeout as a one-shot
-	 * deadline: client waits send_timeout; server waits resume_timeout. */
-	double wait;
-	if (!ss->accepted && ss->conf.send_timeout > 0) {
-		wait = (double)ss->conf.send_timeout;
-	} else {
-		wait = (double)ss->conf.resume_timeout;
-	}
+	/* Reuse w_connect_timeout as a one-shot resume deadline.  send_timeout
+	 * is not used in SESSION_SUSPENDED; it gates live sends only. */
+	const double wait = (double)ss->conf.resume_timeout;
 	ev_timer_set(&ss->w_connect_timeout, wait, 0.0);
 	ev_timer_start(ss->loop, &ss->w_connect_timeout);
 
@@ -1950,11 +1947,8 @@ void session_suspend(struct mux_session *restrict ss)
 	}
 }
 
-/* Called on the suspended (or still-established) session when a client
- * reconnects with a matching session_id.  Migrates the new fd from the
- * transient session @p new_ss, sends ServerHello, starts retransmission,
- * and destroys @p new_ss.
- * Returns false if session_suspend or client_resume_seq fails. */
+/* Resume: migrate fd from @p new_ss, send ServerHello, retransmit, destroy @p new_ss.
+ * Returns false on session_suspend or resume_ack_recv failure. */
 bool session_resume_transport(
 	struct mux_session *restrict ss, struct mux_session *restrict new_ss,
 	const uint_least32_t client_resume_seq)
@@ -2028,9 +2022,7 @@ bool session_resume_transport(
 	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
 	ss->w_connect_timeout.repeat = (double)ss->conf.connect_timeout;
 
-	/* Destroy the transient session.  Its fd is already stolen above.
-	 * The caller's socket_cb post-dispatch will finish the transient
-	 * session teardown after we return. */
+	/* Destroy the transient session (fd already stolen above). */
 	/* Transfer the attach timestamp so setup time covers from session_new()
 	 * to SESSION_ESTABLISHED on the resumed session too. */
 	ss->connect_started = new_ss->connect_started;
@@ -2064,11 +2056,8 @@ bool session_resume_transport(
 	return true;
 }
 
-/* After receiving a resume_seq in a hello, advance the unacked list to
- * reflect frames the peer has already processed.  @p peer_ack is the
- * peer's cumulative last_ack_recv; the delta from ss->last_ack_recv is
- * the trim count.  Sets the retransmit cursor to the new list head.
- * Returns false on protocol violation; caller must call session_reset. */
+/* Apply peer_ack from a resume hello: trim the unacked list and set the
+ * retransmit cursor.  Returns false on protocol violation. */
 bool session_resume_ack_recv(
 	struct mux_session *restrict ss, const uint_least32_t peer_ack)
 {

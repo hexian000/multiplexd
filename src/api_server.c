@@ -544,12 +544,11 @@ static struct vbuffer *append_tunnel_metrics(
 		"Per-stream window size per identity session", "%zu",
 		t->rx_window, t->tx_window);
 	APPEND_TUNNEL_METRIC(
-		"session_rtt_seconds",
-		"Windowed-minimum round-trip time per identity session",
+		"session_rtt_seconds", "Round-trip time per identity session",
 		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9);
 	APPEND_TUNNEL_METRIC(
 		"session_bdp_bytes",
-		"Raw bandwidth-delay product estimate per identity session",
+		"Instantaneous bandwidth-delay product (bw_wnd x rtt_wnd) per identity session",
 		t->bdp == 0, "%zu", t->bdp);
 
 #undef APPEND_TUNNEL_METRIC_DIR
@@ -885,10 +884,7 @@ recv_error(struct ev_loop *loop, struct api_ctx *restrict ctx, const int code)
 	ev_io_start(loop, &ctx->w_send);
 }
 
-/*
- * Reads incoming HTTP request data and parses it incrementally.
- * When headers are complete, dispatches to api_handle() and begins sending.
- */
+/* Read and parse the request incrementally; dispatch to api_handle() when headers are complete. */
 static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ);
@@ -918,11 +914,9 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		return;
 	}
 	ctx->rbuf.len += n;
-	/*
-	 * Maintain NUL termination so http_parse/http_parsehdr can use strstr.
-	 * When the buffer is full (len == cap) the next iteration detects
-	 * cap == 0 and responds 413 before any parsing, so no NUL is needed.
-	 */
+	/* NUL-terminate so http_parse/http_parsehdr can use strstr.  When
+	 * len == cap the next iteration responds HTTP_ENTITY_TOO_LARGE before
+	 * parsing, so no NUL is needed. */
 	if (ctx->rbuf.len < ctx->rbuf.cap) {
 		ctx->rbuf.data[ctx->rbuf.len] = '\0';
 	}

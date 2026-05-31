@@ -162,6 +162,33 @@ T_DECLARE_CASE(test_listener_serve_fn_called)
 	ev_loop_destroy(loop);
 }
 
+T_DECLARE_CASE(test_listener_stop_and_restart_binds_again)
+{
+	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+
+	struct listener l;
+	listener_init(&l, &g_socket_opts, test_serve, NULL, NULL);
+
+	const struct sockaddr_in sa = make_loopback_any();
+	T_CHECK(listener_start(&l, loop, (const struct sockaddr *)&sa));
+
+	const int port1 = get_bound_port(&l);
+	T_EXPECT(port1 > 0);
+
+	listener_stop(&l, loop);
+	T_EXPECT_EQ(l.w_accept.fd, -1);
+
+	/* Start again; must successfully bind a new port. */
+	T_CHECK(listener_start(&l, loop, (const struct sockaddr *)&sa));
+
+	const int port2 = get_bound_port(&l);
+	T_EXPECT(port2 > 0);
+
+	listener_stop(&l, loop);
+	ev_loop_destroy(loop);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -169,5 +196,6 @@ int main(void)
 	T_RUN_CASE(t, test_listener_stop_after_start);
 	T_RUN_CASE(t, test_listener_start_bad_addr_fails);
 	T_RUN_CASE(t, test_listener_serve_fn_called);
+	T_RUN_CASE(t, test_listener_stop_and_restart_binds_again);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

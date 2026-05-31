@@ -260,9 +260,10 @@ struct mux_session_stats {
 	size_t tx_window;
 	/* Windowed-minimum RTT from PING/PONG probes, in nanoseconds;
 	 * 0 when no measurement has been completed yet. */
-	intmax_t rtt_ns;
-	/* Raw physical BDP estimate in bytes;
-	 * 0 when the estimator has not yet produced a value. */
+	intmax_t rtt;
+	/* Instantaneous BDP = bw_wnd × rtt_wnd; 0 if not yet estimated.
+	 * The effective (windowed, clamped) BDP is reflected by rx_window
+	 * and tx_window. */
 	size_t bdp;
 };
 

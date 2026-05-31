@@ -411,6 +411,88 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 #endif
 }
 
+T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
+{
+	/*
+	 * Verify that a freshly created outbound tunnel (fd = -1, not yet
+	 * started) reports MUX_STATE_CONNECT, confirming that the session is
+	 * in its initial state rather than already established or closed.
+	 */
+	struct server srv;
+	memset(&srv, 0, sizeof(srv));
+
+#if !WITH_THREADS
+	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	srv.loop = loop;
+#endif
+
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.data = NULL,
+		.mux_conf = &g_conf,
+		.pool = g_pool,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+	};
+
+	struct tunnel *t = tunnel_new(&srv, &opts);
+	T_CHECK(t != NULL);
+
+	T_EXPECT_EQ(tunnel_state(t), (enum mux_state)MUX_STATE_CONNECT);
+
+	tunnel_close(t);
+
+#if !WITH_THREADS
+	ev_loop_destroy(loop);
+#endif
+}
+
+T_DECLARE_CASE(test_tunnel_stats_initial_zero)
+{
+	/*
+	 * Verify that all stream and traffic counters are zero immediately
+	 * after tunnel_new() and before tunnel_start().
+	 */
+	struct server srv;
+	memset(&srv, 0, sizeof(srv));
+
+#if !WITH_THREADS
+	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	srv.loop = loop;
+#endif
+
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.data = NULL,
+		.mux_conf = &g_conf,
+		.pool = g_pool,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+	};
+
+	struct tunnel *t = tunnel_new(&srv, &opts);
+	T_CHECK(t != NULL);
+
+	struct tunnel_stats stats;
+	tunnel_stats(t, &stats);
+	T_EXPECT_EQ(stats.num_streams, (size_t)0);
+	T_EXPECT_EQ(stats.num_stream_opened, (uintmax_t)0);
+	T_EXPECT_EQ(stats.byt_mux_recv, (uintmax_t)0);
+	T_EXPECT_EQ(stats.byt_mux_sent, (uintmax_t)0);
+
+	tunnel_close(t);
+
+#if !WITH_THREADS
+	ev_loop_destroy(loop);
+#endif
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -419,5 +501,7 @@ int main(void)
 	T_RUN_CASE(t, test_tunnel_reconnect_rearms_after_failed_retry);
 	T_RUN_CASE(t, test_tunnel_reconnect_on_transport_lost);
 	T_RUN_CASE(t, test_tunnel_reconnect_after_connect_timeout);
+	T_RUN_CASE(t, test_tunnel_state_returns_connecting_after_new);
+	T_RUN_CASE(t, test_tunnel_stats_initial_zero);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

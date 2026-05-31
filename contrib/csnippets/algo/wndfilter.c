@@ -5,13 +5,11 @@
 
 #include <stdint.h>
 
-intmax_t wndfilter_reset(
+void wndfilter_reset(
 	struct wndfilter *restrict w, const intmax_t t, const intmax_t v)
 {
 	const struct wndfilter_sample val = { .t = t, .v = v };
-
 	w->s[2] = w->s[1] = w->s[0] = val;
-	return w->s[0].v;
 }
 
 /* As time advances, update the 1st, 2nd, and 3rd best slots. */
@@ -58,7 +56,8 @@ intmax_t wndfilter_update_min(
 	const struct wndfilter_sample val = { .t = t, .v = v };
 
 	if (val.v <= w->s[0].v || val.t - w->s[2].t > wnd) {
-		return wndfilter_reset(w, t, v);
+		wndfilter_reset(w, t, v);
+		return w->s[0].v;
 	}
 	if (val.v <= w->s[1].v) {
 		w->s[2] = w->s[1] = val;
@@ -75,7 +74,8 @@ intmax_t wndfilter_update_max(
 	const struct wndfilter_sample val = { .t = t, .v = v };
 
 	if (val.v >= w->s[0].v || val.t - w->s[2].t > wnd) {
-		return wndfilter_reset(w, t, v);
+		wndfilter_reset(w, t, v);
+		return w->s[0].v;
 	}
 	if (val.v >= w->s[1].v) {
 		w->s[2] = w->s[1] = val;

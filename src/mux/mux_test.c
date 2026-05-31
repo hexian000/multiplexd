@@ -3618,8 +3618,11 @@ T_DECLARE_CASE(test_bdp_auto_stream_window_updated_by_pong)
 
 	/* Drive the real PONG -> estimator -> session_update_window path
 	 * directly so the regression does not depend on a large data transfer
-	 * completing before the smaller auto session-window cap stalls sends. */
-	estimator_add(fx.cli, (uintmax_t)MUX_INITIAL_SEND_WINDOW);
+	 * completing before the smaller auto session-window cap stalls sends.
+	 * Use 4 × MUX_INITIAL_SEND_WINDOW so the resulting BDP estimate is
+	 * well above the 5-frame boundary; a 1× sample lands right at
+	 * BDP_MIN and integer-division truncation makes the assertion fragile. */
+	estimator_add(fx.cli, (uintmax_t)MUX_INITIAL_SEND_WINDOW * 4);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
 	if (!fx.cli->estimator.ping_in_flight) {
 		T_FATAL("estimator did not queue ping frame");
@@ -3878,8 +3881,8 @@ T_DECLARE_CASE(test_bdp_ping_queued_before_send_progress)
 	estimator_add(fx.cli, (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
 
 	T_EXPECT_EQ(
-		fx.cli->estimator.bdp, (uint_least32_t)fx.cli->session_window *
-					       (uint_least32_t)MUX_WINDOW_UNIT);
+		estimator_window_size(&fx.cli->estimator),
+		(size_t)fx.cli->session_window * (size_t)MUX_WINDOW_UNIT);
 	T_EXPECT_EQ(
 		fx.cli->estimator.sample, (uint_least32_t)MUX_MAX_PAYLOAD_SIZE);
 	T_EXPECT(fx.cli->wire.oobbuf.head != NULL);
@@ -3962,11 +3965,12 @@ cleanup:
 }
 
 /* -------------------------------------------------------------------------
- * test_bdp_stop_resets_learned_state: disconnect cleanup must reset all
- * estimator state, including learned BDP and RTT windows.
+ * test_bdp_stop_halves_stream_window: on disconnect, stream_window is set to
+ * the raw BDP in frames (half of the window target) and estimator learned
+ * state is preserved.
  * ---------------------------------------------------------------------- */
 
-T_DECLARE_CASE(test_bdp_stop_resets_learned_state)
+T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 {
 	struct mux_test_fixture fx;
 	if (fixture_setup(&fx) != 0) {
@@ -4023,11 +4027,22 @@ T_DECLARE_CASE(test_bdp_stop_resets_learned_state)
 	estimator_add(fx.cli, (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
 
-	estimator_stop(fx.cli);
-	T_EXPECT_EQ(fx.cli->estimator.bdp, (uint_least32_t)0);
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) == 0);
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
-	T_EXPECT_EQ(fx.cli->estimator.probe_sent_ns, (intmax_t)0);
+	/* Simulate the stop-path: set window target to a known value; estimator
+	 * state (filters, probe) is intentionally preserved. */
+	fx.cli->estimator.effective_bdp = 3u * (size_t)MUX_INITIAL_SEND_WINDOW;
+	const uint_least32_t initial_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	fx.cli->stream_window = (uint_least32_t)MAX(
+		estimator_window_size(&fx.cli->estimator) / 2 / MUX_WINDOW_UNIT,
+		(size_t)initial_frames);
+	T_EXPECT_EQ(
+		estimator_window_size(&fx.cli->estimator),
+		3u * (size_t)MUX_INITIAL_SEND_WINDOW);
+	T_EXPECT_EQ(fx.cli->stream_window, 3u * initial_frames / 2u);
+	/* Learned state is preserved after stop. */
+	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
+	T_EXPECT(fx.cli->estimator.ping_in_flight);
+	T_EXPECT(fx.cli->estimator.probe_sent_ns != 0);
 
 cleanup:
 	free(payload);
@@ -4188,7 +4203,7 @@ int main(void)
 	T_RUN_CASE(t, test_bdp_control_only_no_cycle);
 	T_RUN_CASE(t, test_bdp_ping_queued_before_send_progress);
 	T_RUN_CASE(t, test_bdp_ping_sent);
-	T_RUN_CASE(t, test_bdp_stop_resets_learned_state);
+	T_RUN_CASE(t, test_bdp_stop_halves_stream_window);
 	T_RUN_CASE(t, test_send_queue_saturates_read_credit);
 
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;

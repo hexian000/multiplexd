@@ -48,9 +48,8 @@ static inline intmax_t wndfilter_get(const struct wndfilter *w)
  * @param m Pointer to the tracker state.
  * @param t Timestamp of the measurement.
  * @param v The measured value.
- * @return v.
  */
-intmax_t wndfilter_reset(struct wndfilter *restrict w, intmax_t t, intmax_t v);
+void wndfilter_reset(struct wndfilter *restrict w, intmax_t t, intmax_t v);
 
 /**
  * @brief Update the tracker and return the running minimum.

@@ -62,7 +62,6 @@ struct json_conf_mux {
     unsigned send_timeout;
     unsigned session_window;
     unsigned stream_window;
-    unsigned timeout;
 
     bool nodelay;
 };

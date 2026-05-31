@@ -15,6 +15,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Maximum configuration file size in bytes. */
+#define CONF_MAXSIZE 65535
+
 /* Per-peer listen entry inside the identity block. */
 struct identity_peer {
 	/* Peer-side identity used as routing key. */

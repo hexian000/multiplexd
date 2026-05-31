@@ -290,11 +290,9 @@ static void tls_ctx_impl_free(struct tls_ctx_impl *restrict c)
 	free(c);
 }
 
-/* Verify callback: accept any certificate trusted by the configured CA chain,
- * regardless of hostname. Our private-CA security model uses the CA itself
- * to control access; hostname matching is not applicable. Clears the
- * CN-mismatch flag that arises from the empty hostname set in tls_connect
- * (see comment there). All other verification failures are preserved. */
+/* Verify callback: accept any CA-trusted certificate regardless of hostname.
+ * Clears the CN-mismatch flag from the empty hostname passed to tls_connect;
+ * all other verification failures are preserved. */
 static int tls_ca_verify(
 	void *data, mbedtls_x509_crt *crt, int depth, uint32_t *restrict flags)
 {

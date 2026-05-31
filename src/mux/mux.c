@@ -100,8 +100,7 @@ void mux_session_stats(
 {
 	out->rx_window = (size_t)ss->stream_window * MUX_WINDOW_UNIT;
 	out->tx_window = (size_t)ss->peer_stream_window * MUX_WINDOW_UNIT;
-	const intmax_t rtt_ns = wndfilter_get(&ss->estimator.rtt_wnd);
-	out->rtt_ns = rtt_ns;
+	out->rtt = ss->estimator.rtt;
 	out->bdp = ss->estimator.bdp;
 }
 

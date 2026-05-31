@@ -117,7 +117,6 @@ static void process_syn_payload(
 	ringbuf_consume(ss->wire.recvbuf, frame_size);
 }
 
-/* Process frame for a known stream (found in stream table) */
 static void dispatch_by_stream(
 	struct mux_session *ss, struct mux_stream *restrict s,
 	const struct mux_header *restrict hdr)
@@ -128,7 +127,7 @@ static void dispatch_by_stream(
 	/* CLOSED streams linger briefly so late frames can be handled without a
 	 * second lookup structure. */
 	if (s->state == STREAM_CLOSED) {
-		/* RST on closed stream: SHOULD be ignored (spec §4.8 table). */
+		/* RST on closed stream: SHOULD be ignored (spec §4.2.1 table). */
 		if (hdr->flags & MUX_FLAG_RST) {
 			MUX_LOG_F(
 				VERBOSE, ss,
@@ -219,9 +218,8 @@ static void dispatch_by_stream(
 		 * unlocked state and re-enable EV_READ / dequeue correctly. */
 		s->unacked_bytes = 0;
 		stream_recv_window(s, hdr->extra);
-		/* send_window = MUX_DEFAULT_SEND_WINDOW + extra * MUX_WINDOW_UNIT;
-		 * dividing back gives the exact peer stream_window.  Assigned
-		 * unconditionally so a shrinking peer window is tracked. */
+		/* Dividing send_window by MUX_WINDOW_UNIT recovers the peer
+		 * stream_window; assigned unconditionally to track shrinks. */
 		ss->peer_stream_window =
 			(uint_least32_t)(s->send_window / MUX_WINDOW_UNIT);
 		if (ss->auto_session_window) {
@@ -300,7 +298,6 @@ static void dispatch_by_stream(
 	ringbuf_consume(ss->wire.recvbuf, frame_size);
 }
 
-/* Process frame for an unknown stream (not found in stream table) */
 static void dispatch_no_stream(
 	struct mux_session *ss, const struct mux_header *restrict hdr)
 {
@@ -310,7 +307,6 @@ static void dispatch_no_stream(
 	const uint_fast8_t unknown_flags =
 		flags & (uint_fast8_t)(~MUX_FLAG_MASK);
 
-	/* RST for unknown stream - ignore */
 	if (flags & MUX_FLAG_RST) {
 		MUX_LOG_F(
 			VERBOSE, ss, "RST for unknown stream %" PRIuFAST16,
@@ -319,7 +315,6 @@ static void dispatch_no_stream(
 		return;
 	}
 
-	/* SYN - new incoming stream */
 	if (flags & MUX_FLAG_SYN) {
 		const uint_fast8_t allowed = MUX_FLAG_SYN | MUX_FLAG_PUSH;
 		if (unknown_flags != 0 || (flags & ~allowed) != 0) {
@@ -554,7 +549,7 @@ void dispatch_frame(struct mux_session *ss)
 					session_recv_pong(ss, &hdr, frame_size);
 					break;
 				default:
-					/* PROBE (0x0000) and reserved: discard */
+					/* MUX_CTRL_PROBE and reserved: discard */
 					ringbuf_consume(
 						ss->wire.recvbuf, frame_size);
 					break;
@@ -567,11 +562,9 @@ void dispatch_frame(struct mux_session *ss)
 
 		/* Count received non-stream-0 frames for session ACK. */
 		ss->recv_seq++;
-		/* Force-send session ACK immediately when the unacknowledged
-		 * delta hits the threshold (spec §5.7.3 MUST), without
-		 * waiting for the coalesce timer.  Use clamp(session_window/4,
-		 * 2, 8) so the threshold stays small regardless of window size,
-		 * avoiding the half-window starvation of the old formula. */
+		/* Force-send session ACK immediately when the delta hits a
+		 * fraction of session_window (spec §5.7.3 MUST), without
+		 * waiting for the coalesce timer. */
 		const uint_fast32_t ack_thresh =
 			(uint_fast32_t)CLAMP(ss->session_window / 4u, 2u, 8u);
 		if (ss->recv_seq - ss->ack_seq >= ack_thresh) {

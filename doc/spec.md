@@ -647,7 +647,8 @@ version=0x01, flags=0x00, length=0, stream_id=0, extra=0x0000
 
 Receipt of any frame (including keepalive probes and RTT probes) resets the
 activity timer.  An endpoint that does not receive any frame within the
-activity timeout interval MUST close the connection.
+activity timeout interval SHOULD suspend or close the connection
+(see Section 5.4).
 
 #### 5.3.2.  RTT Probe Request (PING)
 
@@ -688,14 +689,21 @@ or token embedded in the payload.  PONG frames MUST NOT be gated by the
 send-stall gate (Section 6.2).
 
 A sender MAY apply an implementation-defined timeout while awaiting a PONG.
-If this timeout expires before the PONG arrives, the sender MAY abandon the
-in-flight probe.
+If this timeout expires before the PONG arrives, the sender SHOULD treat the
+transport as unresponsive.  When session resumption is supported
+(Section 5.8) the sender SHOULD prefer suspending the session over closing it
+so that streams can survive transient blackhole periods.
 
 ### 5.4.  Timeouts
 
 Timeout values and keepalive intervals are implementation-defined.  An
-endpoint MUST close the connection if the activity timeout expires without
-receiving any frame, including during SESSION_HANDSHAKE.
+endpoint MAY suspend or close the connection if a configurable inactivity
+timeout expires without receiving any frame, including during
+SESSION_HANDSHAKE.  Implementations that support session resumption
+(Section 5.8) SHOULD prefer suspending the session on inactivity timeout
+rather than closing it, allowing streams to survive short blackhole periods.
+Only sessions that cannot be resumed (e.g., no shared session_id has been
+negotiated) MUST be closed.
 
 ### 5.5.  Reconnection (Client)
 

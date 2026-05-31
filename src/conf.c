@@ -215,7 +215,6 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	cfg->mux.max_halfopen = (int)obj->mux.max_halfopen;
 	cfg->mux.max_streams = (int)obj->mux.max_streams;
 	cfg->mux.connect_timeout = (int)obj->mux.connect_timeout;
-	cfg->mux.timeout = (int)obj->mux.timeout;
 	cfg->mux.ping_timeout = (int)obj->mux.ping_timeout;
 	cfg->mux.keepalive = (int)obj->mux.keepalive;
 	cfg->mux.send_timeout = (int)obj->mux.send_timeout;
@@ -227,9 +226,7 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 			cfg->mux.session_window = 0;
 		} else {
 			cfg->mux.session_window = (int)CLAMP(
-				v / MUX_MAX_PAYLOAD_SIZE,
-				MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT,
-				16384);
+				v / MUX_MAX_PAYLOAD_SIZE, 4, UINT16_MAX);
 		}
 	}
 	{
@@ -237,8 +234,8 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		if (v == 0) {
 			cfg->mux.stream_window = 0;
 		} else {
-			cfg->mux.stream_window =
-				(int)CLAMP(v / MUX_MAX_PAYLOAD_SIZE, 1, 1024);
+			cfg->mux.stream_window = (int)CLAMP(
+				v / MUX_MAX_PAYLOAD_SIZE, 4, UINT16_MAX);
 		}
 	}
 	cfg->mux.mem_pressure_hi = (int)obj->mux.mem_pressure.hi;
@@ -406,16 +403,9 @@ static bool conf_check(struct config *restrict conf)
 		return false;
 	}
 #endif
-	conf->mux.timeout = CLAMP(conf->mux.timeout, 10, 86400);
 	conf->mux.ping_timeout = CLAMP(conf->mux.ping_timeout, 10, 86400);
 	if (conf->mux.keepalive > 0) {
-		if (conf->mux.keepalive > conf->mux.timeout) {
-			LOGW_F("mux.keepalive (%d) > mux.timeout (%d): "
-			       "mux.keepalive will be clamped to mux.timeout",
-			       conf->mux.keepalive, conf->mux.timeout);
-		}
-		conf->mux.keepalive =
-			CLAMP(conf->mux.keepalive, 10, conf->mux.timeout);
+		conf->mux.keepalive = CLAMP(conf->mux.keepalive, 10, 86400);
 	}
 	if (conf->mux.send_timeout > 0) {
 		conf->mux.send_timeout =
@@ -431,22 +421,6 @@ static bool conf_check(struct config *restrict conf)
 	}
 	conf->loglevel =
 		CLAMP(conf->loglevel, LOG_LEVEL_SILENCE, LOG_LEVEL_VERYVERBOSE);
-	if (conf->mux.max_halfopen > 0) {
-		conf->mux.max_halfopen = CLAMP(conf->mux.max_halfopen, 1, 4096);
-	}
-	if (conf->mux.stream_window > 0) {
-		conf->mux.stream_window =
-			CLAMP(conf->mux.stream_window, 1, 1024);
-	}
-	if (conf->mux.session_window > 0) {
-		conf->mux.session_window =
-			CLAMP(conf->mux.session_window,
-			      (int)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT),
-			      INT_MAX);
-	}
-
-	conf->mux_tcp.backlog = CLAMP(conf->mux_tcp.backlog, 1, 4096);
-	conf->tcp.backlog = CLAMP(conf->tcp.backlog, 1, 4096);
 	/* Validate max_startups throttle parameters. */
 	if (conf->startup_limit_rate > 100) {
 		LOGE_F("max_startups rate (%d) exceeds 100:"
@@ -485,35 +459,53 @@ static bool conf_check(struct config *restrict conf)
 
 static char *read_file(const char *restrict path, size_t *restrict lenp)
 {
-	FILE *fp = fopen(path, "r");
-	if (fp == NULL) {
-		LOGE_F("failed to open file: %s", path);
-		return NULL;
+	FILE *fp;
+	if (strcmp(path, "-") == 0) {
+		fp = stdin;
+	} else {
+		fp = fopen(path, "r");
+		if (fp == NULL) {
+			LOGE_F("failed to open config file: %s", path);
+			return NULL;
+		}
 	}
-	if (fseek(fp, 0, SEEK_END) != 0) {
-		LOGE_F("failed to seek file: %s", path);
-		(void)fclose(fp);
-		return NULL;
-	}
-	const long size = ftell(fp);
-	if (size < 0) {
-		LOGE_F("failed to get size of file: %s", path);
-		(void)fclose(fp);
-		return NULL;
-	}
-	if (fseek(fp, 0, SEEK_SET) != 0) {
-		LOGE_F("failed to seek file: %s", path);
-		(void)fclose(fp);
-		return NULL;
-	}
-	char *buf = malloc((size_t)size + 1);
+	/* The +1 allocation serves double duty: oversize detection and NUL
+	 * termination. Both regular files and stdin are read the same way. */
+	char *buf = malloc(CONF_MAXSIZE + 1);
 	if (buf == NULL) {
 		LOGOOM();
-		(void)fclose(fp);
+		if (fp != stdin) {
+			(void)fclose(fp);
+		}
 		return NULL;
 	}
-	const size_t n = fread(buf, 1, (size_t)size, fp);
-	(void)fclose(fp);
+	size_t n = 0;
+	size_t rem = CONF_MAXSIZE + 1;
+	while (rem > 0) {
+		const size_t rd = fread(buf + n, 1, rem, fp);
+		if (rd == 0) {
+			if (ferror(fp)) {
+				LOGE_F("failed to read config: %s", path);
+				free(buf);
+				if (fp != stdin) {
+					(void)fclose(fp);
+				}
+				return NULL;
+			}
+			break;
+		}
+		n += rd;
+		rem -= rd;
+	}
+	if (fp != stdin) {
+		(void)fclose(fp);
+	}
+	if (n > CONF_MAXSIZE) {
+		LOGE_F("config exceeds maximum size of %d bytes: %s",
+		       CONF_MAXSIZE, path);
+		free(buf);
+		return NULL;
+	}
 	buf[n] = '\0';
 	if (lenp != NULL) {
 		*lenp = n;
@@ -794,7 +786,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 			.max_halfopen = (unsigned)conf->mux.max_halfopen,
 			.max_streams = (uintmax_t)conf->mux.max_streams,
 			.connect_timeout = (unsigned)conf->mux.connect_timeout,
-			.timeout = (unsigned)conf->mux.timeout,
+
 			.ping_timeout = (unsigned)conf->mux.ping_timeout,
 			.keepalive = (unsigned)conf->mux.keepalive,
 			.send_timeout = (unsigned)conf->mux.send_timeout,

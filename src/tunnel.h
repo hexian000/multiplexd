@@ -124,7 +124,8 @@ struct tunnel_stats {
 	/* Windowed-minimum RTT from PING/PONG probes, in nanoseconds; 0 if
 	 * no measurement has been completed yet. */
 	intmax_t rtt_ns;
-	/* Raw physical BDP estimate in bytes; 0 if not yet estimated. */
+	/* Instantaneous BDP (bw_wnd × rtt_wnd); 0 if not yet estimated.
+	 * The effective BDP is reflected by rx_window and tx_window. */
 	size_t bdp;
 	/* Stream lifecycle counters (per-tunnel snapshot; aggregated by
 	 * server_stats() across all active tunnels). */

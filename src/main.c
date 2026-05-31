@@ -47,7 +47,7 @@ static void print_usage(const char *argv0)
 	(void)fprintf(
 		stderr, "%s",
 		"  -h, --help                 show usage and exit\n"
-		"  -c, --config <file>        specify json config\n"
+		"  -c, --config <file>        specify json config (use - to read from stdin)\n"
 		"  -C, --color                colorized log output using ANSI escape sequences\n"
 		"  -d, --daemonize            run in background and write logs to syslog\n"
 		"  -u, --user [user][:[group]]\n"
@@ -286,11 +286,9 @@ int main(int argc, char **argv)
 
 	const char *user_name = args.user_name;
 
-	/* Daemonize before starting any threads: fork() in a multithreaded
-	 * process leaves only the calling thread alive in the child, so any
-	 * mutexes held by other threads remain permanently locked.  Privilege
-	 * drop is deferred until after server_start so that sockets can be
-	 * bound with root privileges first. */
+	/* Daemonize before any threads start: held mutexes survive into the
+	 * child, causing deadlock.  Privilege drop follows server_start so
+	 * root can bind privileged ports first. */
 	if (args.daemonize) {
 		daemonize(NULL, false, false);
 		slog_setoutput(SLOG_OUTPUT_SYSLOG, PROJECT_NAME);

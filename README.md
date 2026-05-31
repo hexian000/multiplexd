@@ -5,7 +5,7 @@
 [![Downloads](https://img.shields.io/github/downloads/hexian000/multiplexd/total.svg)](https://github.com/hexian000/multiplexd/releases)
 [![Release](https://img.shields.io/github/release/hexian000/multiplexd.svg?style=flat)](https://github.com/hexian000/multiplexd/releases)
 
-multiplexd is a TCP stream multiplexer with zero-RTT stream open, deficit round-robin scheduling, two-phase BDP flow-control estimation, transparent session resumption with unacknowledged-frame replay, and TLS 1.3 mutual authentication against a private trust store.
+multiplexd is a TCP stream multiplexer with zero-RTT stream open, deficit round-robin scheduling, flow-control with adaptive BDP estimation, transparent session resumption with unacknowledged-frame replay, and TLS 1.3 mutual authentication against a private trust store.
 
 **Table of Contents**
 - [Features](#features)
@@ -67,7 +67,7 @@ multiplexd is a TCP stream multiplexer with zero-RTT stream open, deficit round-
 ### Performance and Fairness
 
 - **Deficit round-robin (DRR) scheduler**: Outbound bandwidth is distributed fairly across active streams at byte granularity, preventing any single stream from starving others regardless of message size.
-- **Two-phase BDP estimator**: `STARTUP` grows the flow-control window aggressively until it is no longer the bottleneck; `TRACK` maintains it and re-enters `STARTUP` only when path capacity appears to have increased. Windows grow monotonically — granted credit is never clawed back.
+- **BDP estimator**: Measures RTT and bandwidth from inbound PING/PONG cycles and sets the per-stream receive window according to estimated BDP (windowed max-bandwidth × windowed min-RTT).
 - **Two-level flow control**: A per-stream sliding receive window bounds per-stream in-flight data; a session-wide unacknowledged-frame cap blocks new payload scheduling while retransmits and control frames pass through unaffected, preventing a slow peer from deadlocking the session.
 - **Memory back-pressure**: Receive-window grants are linearly throttled as aggregate buffer occupancy rises between `mem_pressure.lo` and `mem_pressure.hi`, bounding memory growth under sustained load.
 - **Thread offloading**: With `ENABLE_THREADS=ON`, each session runs on a dedicated thread. Parallel tunnels to the same peer distribute load across CPU cores.
@@ -116,7 +116,7 @@ multiplexd streams are ordered byte sequences with no framing, methods, or heade
 | **Session resumption**     | Transparent; unacknowledged frames replayed                                      | None                                                                           | None                                                                       |
 | **Inter-stream fairness**  | Deficit round-robin scheduler; byte-granularity fairness                         | Round-robin scheduler; frame-granularity fairness                              | No inter-stream scheduling; systematically skewed under load               |
 | **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)        | Per-channel byte window only                                               |
-| **Adaptive window tuning** | Two-phase BDP estimator (`STARTUP` / `TRACK`)                                    | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
+| **Adaptive window tuning** | Adaptive BDP estimator                                                           | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
 | **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                           | None                                                                       |
 | **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                  | Re-execs master; existing child processes drains naturally                 |
 | **Observability**          | Health check, plain-text stats, Prometheus metrics                               | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors | None                                                                       |

@@ -67,7 +67,6 @@ typedef struct { const char *name; size_t len; int idx; } json_conf_mux_entry_;
 static const json_conf_mux_entry_ json_conf_mux_keys_[] = {
     {"tcp", 3, 12},
     {"nodelay", 7, 6},
-    {"timeout", 7, 13},
     {"keepalive", 9, 2},
     {"max_streams", 11, 4},
     {"idle_timeout", 12, 1},
@@ -93,7 +92,7 @@ json_conf_mux_lookup(const char *str, size_t len)
 {
     const json_conf_mux_entry_ key_ = {str, len, 0};
     const json_conf_mux_entry_ *e_ =
-        bsearch(&key_, json_conf_mux_keys_, 14, sizeof(*json_conf_mux_keys_), json_conf_mux_cmp_);
+        bsearch(&key_, json_conf_mux_keys_, 13, sizeof(*json_conf_mux_keys_), json_conf_mux_cmp_);
     return e_ ? e_->idx : -1;
 }
 
@@ -226,7 +225,6 @@ enum json_conf_mux_key {
     JSON_CONF_MUX_SESSION_WINDOW = 10,
     JSON_CONF_MUX_STREAM_WINDOW = 11,
     JSON_CONF_MUX_TCP = 12,
-    JSON_CONF_MUX_TIMEOUT = 13,
 };
 
 enum json_conf_mux_mem_pressure_key {
@@ -537,7 +535,7 @@ static bool json_conf_mux_unmarshal(
     *obj = (struct json_conf_mux){
         .connect_timeout = 15u,
         .idle_timeout = 0u,
-        .keepalive = 25u,
+        .keepalive = 300u,
         .max_halfopen = 256u,
         .mem_pressure = {
             .hi = UINTMAX_C(0),
@@ -556,7 +554,6 @@ static bool json_conf_mux_unmarshal(
             .notsent_lowat = UINTMAX_C(131072),
             .reuseport = false,
         },
-        .timeout = 60u,
     };
 
     while (json_obj_next(json, length, &iter_,
@@ -614,23 +611,18 @@ static bool json_conf_mux_unmarshal(
         }
         case JSON_CONF_MUX_SESSION_WINDOW: {
             if (!json_parse_uint(val_, val_len_, &obj->session_window)) { return false; }
-            if (obj->session_window > 268435456u) { return false; }
+            if (obj->session_window > 1073725440u) { return false; }
             break;
         }
         case JSON_CONF_MUX_STREAM_WINDOW: {
             if (!json_parse_uint(val_, val_len_, &obj->stream_window)) { return false; }
-            if (obj->stream_window > 16777216u) { return false; }
+            if (obj->stream_window > 1073725440u) { return false; }
             break;
         }
         case JSON_CONF_MUX_TCP: {
             if (!json_conf_mux_tcp_unmarshal(&obj->tcp, val_, val_len_)) {
                 return false;
             }
-            break;
-        }
-        case JSON_CONF_MUX_TIMEOUT: {
-            if (!json_parse_uint(val_, val_len_, &obj->timeout)) { return false; }
-            if (obj->timeout > 86400u) { return false; }
             break;
         }
         default:
@@ -722,7 +714,7 @@ bool json_conf_unmarshal(
         .mux = {
             .connect_timeout = 15u,
             .idle_timeout = 0u,
-            .keepalive = 25u,
+            .keepalive = 300u,
             .max_halfopen = 256u,
             .mem_pressure = {
                 .hi = UINTMAX_C(0),
@@ -741,7 +733,6 @@ bool json_conf_unmarshal(
                 .notsent_lowat = UINTMAX_C(131072),
                 .reuseport = false,
             },
-            .timeout = 60u,
         },
         .tcp = {
             .backlog = 16u,
@@ -1004,8 +995,6 @@ static int json_conf_mux_marshal(
     EMIT("\"%s\":", "tcp");
     EMIT_SUB(json_conf_mux_tcp_marshal, &obj->tcp);
     EMIT("%s", ",");
-    EMIT("\"%s\":%ju,", "timeout",
-        (uintmax_t)obj->timeout);
 
     if (n_ > n_start_) { n_--; }
     EMIT("%s", "}");

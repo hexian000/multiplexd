@@ -851,8 +851,8 @@ T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 		make_established_tunnel(&fx, "peer-rtt", 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
-	/* 20 ms RTT — stored in nanoseconds in the estimator window */
-	wndfilter_reset(&ss->estimator.rtt_wnd, 0, INTMAX_C(20000000));
+	/* 20 ms RTT */
+	ss->estimator.rtt = INTMAX_C(20000000);
 	sl_rtt->tunnels = malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_rtt->tunnels != NULL);
 	sl_rtt->tunnels[0] = t1;

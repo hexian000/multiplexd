@@ -70,10 +70,8 @@ static const struct table_opts SESSION_TABLE_OPTS = {
 };
 
 /* Iterator over all tunnel objects owned by a server.
- * Yields mux_tunnel first, then each identities[k].tunnels[j] in order,
- * then each identity_tunnels[i] (skipping NULLs), then all
- * accepted_sessions in table order.
- * Zero-initialize before first call; returns NULL when done. */
+ * Yields: mux_tunnel, identities[k].tunnels[j], identity_tunnels[i] (skip NULLs),
+ * accepted_sessions.  Zero-initialize before first call; returns NULL when done. */
 struct tunnel_iter {
 	/* 0 = mux_tunnel, 1 = identities, 2 = identity_tunnels, 3 = accepted */
 	size_t phase;
@@ -269,9 +267,8 @@ server_on_established(void *data, struct tunnel *restrict t, intmax_t lat_ns)
 			}
 		}
 		/* Wire the dialed session into the matching identity pool.
-		 * Guard against duplicate wiring: if the server rejected a
-		 * resume attempt the mux layer fires ESTABLISHED again on the
-		 * same tunnel object, but the tunnel is already in the pool. */
+		 * Guard against duplicate wiring on re-ESTABLISHED after a
+		 * rejected resume. */
 		const char *const peer_id = tunnel_peer_identity(t);
 		if (peer_id != NULL) {
 			void *elem = NULL;
@@ -368,9 +365,7 @@ static void handle_closed(
 	}
 	tunnel_close(t);
 
-	/* During graceful shutdown, exit the event loop once all sessions
-	 * have finished their close handshake.
-	 * All accepted sessions gone and no dialed sessions remaining. */
+	/* During graceful shutdown, exit when no accepted or dialed sessions remain. */
 	if (srv->shutting_down && table_size(srv->accepted_tunnels) == 0 &&
 	    srv->mux_tunnel == NULL) {
 		bool any_peer = false;
@@ -421,7 +416,7 @@ static void tunnel_on_event(
 }
 
 /* Locate a suspended (or still-established) session matching the client's
- * session_id.  Called during session resumption handshake (spec §6.8).
+ * session_id.  Called during session resumption handshake (spec §5.8).
  * Acquires accepted_mu for the duration of the table lookup. */
 static struct mux_session *tunnel_on_resume(
 	void *data, struct tunnel *new_t, const unsigned char *session_id)
@@ -751,9 +746,8 @@ static void server_cleanse_tls_config(const struct config *restrict conf)
 }
 
 /* Build fresh server and client TLS contexts from new_conf.
- * On success, zeroes the sensitive credential strings and returns true.
- * On failure, frees any partially-created context and returns false;
- * the caller is responsible for freeing new_conf. */
+ * Returns true on success (zeroes credential strings); false on failure
+ * (partial context freed; caller frees new_conf). */
 static bool server_reload_make_tls(
 	const struct config *restrict new_conf,
 	struct tls_context **restrict out_server,
@@ -1253,6 +1247,10 @@ bool server_apply_config(struct server *restrict s, struct config *new_conf)
 static void server_reload(struct server *restrict s)
 {
 	const char *const conf_path = s->conf_path;
+	if (conf_path == NULL || strcmp(conf_path, "-") == 0) {
+		LOGW("config reload is not supported when reading from stdin");
+		return;
+	}
 	LOGI_F("reloading config: %s", conf_path);
 	(void)systemd_notify(SYSTEMD_STATE_RELOADING);
 
@@ -1272,8 +1270,7 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	struct server *restrict srv = w->data;
 
 	/* Task 1 (highest priority): shutdown deadline polling.
-	 * When shutting_down, check the 2 s force-exit deadline and skip the
-	 * non-shutdown tasks below. */
+	 * When shutting_down, check the force-exit deadline and return. */
 	if (srv->shutting_down) {
 		const intmax_t elapsed_ns =
 			clock_monotonic_ns() - srv->shutdown_start_ns;
@@ -1284,17 +1281,15 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		return;
 	}
 
-	/* Task 2: system suspend/resume detection via wall-clock jump.
-	 * CLOCK_MONOTONIC does not advance during system suspend; clock_unix()
-	 * (CLOCK_REALTIME) does.  A gap larger than mux.ping_timeout seconds means
-	 * the system resumed from suspend; drop all transports so the mux
-	 * sessions re-establish their TCP connections via w_reconnect. */
+	/* Task 2: detect system suspend via wall-clock jump (CLOCK_REALTIME
+	 * advances; CLOCK_MONOTONIC does not).  A gap > mux.ping_timeout means
+	 * resume from suspend; drop all transports so sessions reconnect. */
 	struct timespec now_ts;
 	if (clock_unix(&now_ts)) {
 		const time_t now_wall = now_ts.tv_sec;
 		const time_t delta = now_wall - srv->last_maintenance_wall;
 		srv->last_maintenance_wall = now_wall;
-		if (delta > (time_t)srv->conf->mux.timeout) {
+		if (delta > (time_t)srv->conf->mux.ping_timeout) {
 			LOGW_F("wall-clock jump of %lds detected, dropping all transports",
 			       (long)delta);
 			const size_t n =
@@ -1700,9 +1695,7 @@ static bool server_start_identity_listeners(struct server *restrict s)
 }
 
 /* Create one dedicated mux session per identity.mux_connect address.
- * The session announces identity_claim in the hello; the peer's identity
- * is discovered after the handshake and used to wire the session to the
- * matching identity listener in server_on_established. */
+ * Sessions are wired to the matching identity listener in server_on_established. */
 static bool server_start_identity_tunnels(struct server *restrict s)
 {
 	const struct config *restrict conf = s->conf;
@@ -1819,11 +1812,8 @@ void server_stop(struct server *srv)
 		}
 	}
 
-	/* Drain any close notifications that arrived just before the relay was
-	 * stopped.  Sessions that closed gracefully during the shutdown window
-	 * will have their cleanup tasks here; processing them now avoids the
-	 * race where server_stop tries to force-close a session whose tunnel
-	 * thread has already exited. */
+	/* Drain close notifications queued before relay stopped; avoids
+	 * force-closing a session whose tunnel thread has already exited. */
 #if WITH_THREADS
 	dispatcher_tick(srv->disp);
 #endif
