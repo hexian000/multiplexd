@@ -111,7 +111,7 @@ T_DECLARE_CASE(test_estimator_init_resets_all_state)
 	/* Seed every field to confirm estimator_init zeros them all. */
 	ss.estimator.effective_bdp = 65536;
 	wndfilter_reset(&ss.estimator.bw_wnd, 0, INTMAX_C(50000000));
-	wndfilter_reset(&ss.estimator.rtt_wnd, 0, INTMAX_C(250000000));
+	ewma_add(&ss.estimator.rtt_ewma, (double)INTMAX_C(250000000));
 	ss.estimator.probe_sent_ns = 10;
 	ss.estimator.sample = 30;
 	ss.estimator.ping_in_flight = true;
@@ -126,7 +126,7 @@ T_DECLARE_CASE(test_estimator_init_resets_all_state)
 	T_EXPECT(!ss.estimator.ping_in_flight);
 	T_EXPECT_EQ(ss.estimator.effective_bdp, (size_t)12345);
 	T_EXPECT(wndfilter_get(&ss.estimator.bw_wnd) == 0);
-	T_EXPECT(wndfilter_get(&ss.estimator.rtt_wnd) == 0);
+	T_EXPECT(!ss.estimator.rtt_ewma.ready);
 	T_EXPECT_EQ(ss.estimator.phase, ESTIMATOR_STARTUP);
 	T_EXPECT_EQ(ss.estimator.bw_exit, (intmax_t)0);
 }
@@ -255,18 +255,18 @@ T_DECLARE_CASE(test_estimator_calculate_updates_effective_bdp)
 	T_EXPECT_EQ(ss.estimator.bw_exit, (intmax_t)0);
 }
 
-/* RTT inflation cycle: current RTT exceeds rtt_min × 5/4 while the sample is
- * too small to be window-limited.  effective_bdp is reduced to bdp × 1.25
- * to drain the growing queue. */
-T_DECLARE_CASE(test_estimator_calculate_app_limited_adopts_bdp_peak)
+/* RTT inflation cycle: current RTT exceeds srtt × 5/4 while the sample is
+ * too small to be window-limited.  STARTUP exits to TRACK; effective_bdp is
+ * preserved and bw_exit is set to bw_max. */
+T_DECLARE_CASE(test_estimator_calculate_rtt_inflated_exits_startup)
 {
 	struct mux_session ss = make_session();
-	const intmax_t rtt_min_ns = INTMAX_C(10000000); /* 10 ms */
-	/* 15 ms > rtt_min × 5/4 = 12.5 ms → RTT inflated. */
+	const intmax_t rtt_base_ns = INTMAX_C(10000000); /* 10 ms EWMA seed */
+	/* srtt ≈ 11.1 ms after ewma_add(15 ms); 15 ms > srtt × 5/4 ≈ 13.9 ms → RTT inflated. */
 	const intmax_t rtt_ns = INTMAX_C(15000000);
 	const intmax_t now_ns = INTMAX_C(100) * INTMAX_C(1000000000) + rtt_ns;
 	const intmax_t sent_ns = now_ns - rtt_ns;
-	/* bw_high = 500 MB/s → bdp = 500e6 × 10e-3 = 5 MB. */
+	/* bw_high = 500 MB/s; bdp uses srtt computed after ewma_add. */
 	const intmax_t bw_high = INTMAX_C(500000000);
 
 	estimator_test_reset();
@@ -274,10 +274,9 @@ T_DECLARE_CASE(test_estimator_calculate_app_limited_adopts_bdp_peak)
 
 	wndfilter_reset(
 		&ss.estimator.bw_wnd, now_ns - INTMAX_C(1000000), bw_high);
-	wndfilter_reset(
-		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000), rtt_min_ns);
-	ss.estimator.inited =
-		true; /* rtt_wnd already seeded with 10 ms minimum */
+	ewma_add(
+		&ss.estimator.rtt_ewma,
+		(double)rtt_base_ns); /* seed EWMA at 10 ms */
 
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent_ns;
@@ -285,15 +284,16 @@ T_DECLARE_CASE(test_estimator_calculate_app_limited_adopts_bdp_peak)
 	/* effective_bdp large enough that sample is not window-limited:
 	 * 16384 ≤ 10 MB × 2/3 = 6 666 666 → window_limited = false. */
 	const size_t bdp_bytes =
-		(size_t)((double)bw_high * (double)rtt_min_ns / 1e9);
+		(size_t)((double)bw_high * (double)rtt_base_ns / 1e9);
 	ss.estimator.effective_bdp = bdp_bytes * 2;
 
 	estimator_calculate(&ss, sent_ns);
 
 	/* bw_wnd reflects its seeded peak (app-limited bw_sample is below it). */
 	T_EXPECT_EQ(wndfilter_get(&ss.estimator.bw_wnd), bw_high);
-	/* STARTUP + rtt_inflated → exits to TRACK; effective_bdp = bdp + bdp/4. */
-	T_EXPECT_EQ(ss.estimator.effective_bdp, bdp_bytes + bdp_bytes / 4);
+	/* STARTUP + rtt_inflated → exits to TRACK; effective_bdp preserved,
+	 * bw_exit = bw_max. */
+	T_EXPECT_EQ(ss.estimator.effective_bdp, bdp_bytes * 2);
 	T_EXPECT_EQ(ss.estimator.phase, ESTIMATOR_TRACK);
 	T_EXPECT_EQ(ss.estimator.bw_exit, bw_high);
 }
@@ -360,8 +360,8 @@ T_DECLARE_CASE(test_estimator_calculate_invalid_cycle_preserves_effective_bdp)
 }
 
 /* App-limited and no RTT inflation: effective_bdp is preserved unchanged.
- * current RTT equals the windowed minimum (rtt = rtt_min), so rtt_inflated
- * is false; sample < 2/3 of effective_bdp, so window_limited is false. */
+ * current RTT equals the EWMA seed (rtt = srtt), so rtt_inflated is false;
+ * sample < 2/3 of effective_bdp, so window_limited is false. */
 T_DECLARE_CASE(test_estimator_calculate_peak_guard_trims_to_peak_ceiling)
 {
 	struct mux_session ss = make_session();
@@ -372,11 +372,11 @@ T_DECLARE_CASE(test_estimator_calculate_peak_guard_trims_to_peak_ceiling)
 
 	estimator_test_reset();
 	set_clock_sequence(&now_ns, 1);
-	wndfilter_reset(
-		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000), rtt_ns);
+	ewma_add(
+		&ss.estimator.rtt_ewma,
+		(double)rtt_ns); /* seed EWMA at 10 ms */
 	wndfilter_reset(
 		&ss.estimator.bw_wnd, now_ns - INTMAX_C(1000000), bw_val);
-	ss.estimator.inited = true;
 
 	/* bdp = 100e6 × 10e-3 = 1 MB.  effective_bdp at 5 MB so that
 	 * sample = 16384 ≤ 5 MB × 2/3 = 3 333 333 → window_limited = false. */
@@ -397,13 +397,13 @@ T_DECLARE_CASE(test_estimator_calculate_peak_guard_trims_to_peak_ceiling)
 
 /* STARTUP: RTT inflation takes priority over a window-limited sample.
  * Even when sample > 2/3 of effective_bdp, an inflated RTT triggers the
- * STARTUP→TRACK transition with effective_bdp clamped to bdp × 1.25
- * rather than tripled. */
-T_DECLARE_CASE(test_estimator_calculate_peak_floor_prevents_decrease)
+ * STARTUP→TRACK transition; effective_bdp is preserved (the window_limited
+ * tripling is skipped) and bw_exit = bw_max. */
+T_DECLARE_CASE(test_estimator_calculate_rtt_inflated_overrides_window_limited)
 {
 	struct mux_session ss = make_session();
-	const intmax_t rtt_min_ns = INTMAX_C(10000000); /* 10 ms */
-	/* 15 ms > rtt_min × 5/4 = 12.5 ms → RTT inflated. */
+	const intmax_t rtt_base_ns = INTMAX_C(10000000); /* 10 ms EWMA seed */
+	/* srtt ≈ 11.1 ms after ewma_add(15 ms); 15 ms > srtt × 5/4 ≈ 13.9 ms → RTT inflated. */
 	const intmax_t rtt_ns = INTMAX_C(15000000);
 	const intmax_t now_ns = INTMAX_C(200) * INTMAX_C(1000000000) + rtt_ns;
 	const intmax_t sent_ns = now_ns - rtt_ns;
@@ -411,17 +411,14 @@ T_DECLARE_CASE(test_estimator_calculate_peak_floor_prevents_decrease)
 
 	estimator_test_reset();
 	set_clock_sequence(&now_ns, 1);
-	wndfilter_reset(
-		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000), rtt_min_ns);
+	ewma_add(
+		&ss.estimator.rtt_ewma,
+		(double)rtt_base_ns); /* seed EWMA at 10 ms */
 	wndfilter_reset(
 		&ss.estimator.bw_wnd, now_ns - INTMAX_C(1000000), bw_val);
-	ss.estimator.inited = true;
 
-	/* window_limited: 32768 > 30000 × 2/3 = 20000 → true, despite RTT inflation.
-	 * bdp = bw_val × rtt_min_ns / 1e9 = 100e6 × 10e-3 = 1 MB. */
+	/* window_limited: 32768 > 30000 × 2/3 = 20000 → true, despite RTT inflation. */
 	ss.estimator.effective_bdp = 30000;
-	const size_t bdp_bytes =
-		(size_t)((double)bw_val * (double)rtt_min_ns / 1e9);
 
 	ss.estimator.ping_in_flight = true;
 	ss.estimator.probe_sent_ns = sent_ns;
@@ -429,15 +426,16 @@ T_DECLARE_CASE(test_estimator_calculate_peak_floor_prevents_decrease)
 
 	estimator_calculate(&ss, sent_ns);
 
-	/* rtt_inflated takes priority → STARTUP→TRACK, effective_bdp = bdp × 1.25. */
-	T_EXPECT_EQ(ss.estimator.effective_bdp, bdp_bytes + bdp_bytes / 4);
+	/* rtt_inflated takes priority → STARTUP→TRACK; effective_bdp preserved,
+	 * window_limited tripling skipped; bw_exit = bw_max. */
+	T_EXPECT_EQ(ss.estimator.effective_bdp, (size_t)30000);
 	T_EXPECT_EQ(ss.estimator.phase, ESTIMATOR_TRACK);
 	T_EXPECT_EQ(ss.estimator.bw_exit, bw_val);
 	T_EXPECT(!ss.estimator.ping_in_flight);
 }
 
-/* TRACK: bandwidth within bw_exit × 1.25 ceiling → stays in TRACK,
- * effective_bdp converges to bdp × 1.25. */
+/* TRACK: bw_max ≤ bw_exit → stays in TRACK,
+ * effective_bdp converges to bdp × 1.5. */
 T_DECLARE_CASE(test_estimator_track_stable_bw_stays_track)
 {
 	struct mux_session ss = make_session();
@@ -449,11 +447,11 @@ T_DECLARE_CASE(test_estimator_track_stable_bw_stays_track)
 
 	estimator_test_reset();
 	set_clock_sequence(&now_ns, 1);
-	wndfilter_reset(
-		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000), rtt_ns);
+	ewma_add(
+		&ss.estimator.rtt_ewma,
+		(double)rtt_ns); /* seed EWMA at 10 ms */
 	wndfilter_reset(
 		&ss.estimator.bw_wnd, now_ns - INTMAX_C(1000000), bw_val);
-	ss.estimator.inited = true;
 	ss.estimator.phase = ESTIMATOR_TRACK;
 	ss.estimator.bw_exit = bw_val;
 	/* bdp = 100e6 × 10e-3 = 1 MB. */
@@ -467,14 +465,14 @@ T_DECLARE_CASE(test_estimator_track_stable_bw_stays_track)
 
 	estimator_calculate(&ss, sent_ns);
 
-	/* bw_max = bw_val = bw_exit → not > bw_exit × 1.25 → stays TRACK. */
+	/* bw_max = bw_val = bw_exit → not > bw_exit → stays TRACK. */
 	T_EXPECT_EQ(ss.estimator.phase, ESTIMATOR_TRACK);
-	T_EXPECT_EQ(ss.estimator.effective_bdp, bdp_bytes + bdp_bytes / 4);
+	T_EXPECT_EQ(ss.estimator.effective_bdp, bdp_bytes + bdp_bytes / 2);
 	T_EXPECT_EQ(ss.estimator.bw_exit, bw_val);
 	T_EXPECT(!ss.estimator.ping_in_flight);
 }
 
-/* TRACK: bandwidth exceeds bw_exit × 1.25 → transitions back to STARTUP
+/* TRACK: bw_max > bw_exit → transitions back to STARTUP
  * and triples effective_bdp to resume probing. */
 T_DECLARE_CASE(test_estimator_track_bw_peak_returns_to_startup)
 {
@@ -482,17 +480,17 @@ T_DECLARE_CASE(test_estimator_track_bw_peak_returns_to_startup)
 	const intmax_t rtt_ns = INTMAX_C(10000000); /* 10 ms */
 	const intmax_t now_ns = INTMAX_C(400) * INTMAX_C(1000000000) + rtt_ns;
 	const intmax_t sent_ns = now_ns - rtt_ns;
-	/* bw_exit = 100 MB/s; bw_val = 200 MB/s > bw_exit × 1.25 = 125 MB/s. */
+	/* bw_exit = 100 MB/s; bw_val = 200 MB/s > bw_exit = 100 MB/s. */
 	const intmax_t bw_exit = INTMAX_C(100000000);
 	const intmax_t bw_val = INTMAX_C(200000000);
 
 	estimator_test_reset();
 	set_clock_sequence(&now_ns, 1);
-	wndfilter_reset(
-		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000), rtt_ns);
+	ewma_add(
+		&ss.estimator.rtt_ewma,
+		(double)rtt_ns); /* seed EWMA at 10 ms */
 	wndfilter_reset(
 		&ss.estimator.bw_wnd, now_ns - INTMAX_C(1000000), bw_val);
-	ss.estimator.inited = true;
 	ss.estimator.phase = ESTIMATOR_TRACK;
 	ss.estimator.bw_exit = bw_exit;
 	ss.estimator.effective_bdp = 1500000;
@@ -503,7 +501,7 @@ T_DECLARE_CASE(test_estimator_track_bw_peak_returns_to_startup)
 
 	estimator_calculate(&ss, sent_ns);
 
-	/* bw_max = 200e6 > bw_exit + bw_exit/4 = 125e6 → back to STARTUP. */
+	/* bw_max = 200e6 > bw_exit = 100e6 → back to STARTUP. */
 	T_EXPECT_EQ(ss.estimator.phase, ESTIMATOR_STARTUP);
 	T_EXPECT_EQ(ss.estimator.bw_exit, (intmax_t)0);
 	T_EXPECT_EQ(ss.estimator.effective_bdp, (size_t)4500000);
@@ -522,11 +520,11 @@ T_DECLARE_CASE(test_estimator_track_zero_bw_exit_returns_to_startup)
 
 	estimator_test_reset();
 	set_clock_sequence(&now_ns, 1);
-	wndfilter_reset(
-		&ss.estimator.rtt_wnd, now_ns - INTMAX_C(1000000), rtt_ns);
+	ewma_add(
+		&ss.estimator.rtt_ewma,
+		(double)rtt_ns); /* seed EWMA at 10 ms */
 	wndfilter_reset(
 		&ss.estimator.bw_wnd, now_ns - INTMAX_C(1000000), bw_val);
-	ss.estimator.inited = true;
 	ss.estimator.phase = ESTIMATOR_TRACK;
 	ss.estimator.bw_exit = 0;
 	ss.estimator.effective_bdp = 2000000;
@@ -558,7 +556,7 @@ int main(void)
 	T_RUN_CASE(t, test_estimator_calculate_discards_stale_timestamp);
 	T_RUN_CASE(t, test_estimator_calculate_invalid_rtt_clears_cycle);
 	T_RUN_CASE(t, test_estimator_calculate_updates_effective_bdp);
-	T_RUN_CASE(t, test_estimator_calculate_app_limited_adopts_bdp_peak);
+	T_RUN_CASE(t, test_estimator_calculate_rtt_inflated_exits_startup);
 	T_RUN_CASE(t, test_estimator_effective_bdp_stores_value);
 	T_RUN_CASE(t, test_estimator_calculate_effective_bdp_floored_at_min);
 	T_RUN_CASE(
@@ -566,7 +564,9 @@ int main(void)
 		test_estimator_calculate_invalid_cycle_preserves_effective_bdp);
 	T_RUN_CASE(
 		t, test_estimator_calculate_peak_guard_trims_to_peak_ceiling);
-	T_RUN_CASE(t, test_estimator_calculate_peak_floor_prevents_decrease);
+	T_RUN_CASE(
+		t,
+		test_estimator_calculate_rtt_inflated_overrides_window_limited);
 	T_RUN_CASE(t, test_estimator_track_stable_bw_stays_track);
 	T_RUN_CASE(t, test_estimator_track_bw_peak_returns_to_startup);
 	T_RUN_CASE(t, test_estimator_track_zero_bw_exit_returns_to_startup);

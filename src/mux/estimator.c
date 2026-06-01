@@ -7,6 +7,7 @@
 #include "mux/mux.h"
 #include "mux/session.h"
 
+#include "algo/ewma.h"
 #include "algo/wndfilter.h"
 #include "os/clock.h"
 #include "utils/minmax.h"
@@ -24,13 +25,14 @@
 #define WNDSIZE_MAX ((size_t)UINT16_MAX * MUX_WINDOW_UNIT)
 #define WNDSIZE_MIN ((size_t)4 * MUX_WINDOW_UNIT)
 
-#define WND_RTT_MIN_NS (INTMAX_C(30) * INTMAX_C(1000000000))
+#define RTT_EWMA_SPAN 8
 #define WND_BW_MAX_NS (INTMAX_C(86400) * INTMAX_C(1000000000))
 
 void estimator_init(struct mux_session *restrict ss, const size_t bdp)
 {
 	ss->estimator = (struct estimator_ctx){ 0 };
 	ss->estimator.effective_bdp = bdp;
+	ewma_init_span(&ss->estimator.rtt_ewma, RTT_EWMA_SPAN);
 }
 
 static bool send_ping(struct mux_session *restrict ss, const intmax_t now_ns)
@@ -106,17 +108,20 @@ void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
 }
 
 static void phase_startup(
-	struct mux_session *restrict ss, const bool window_limited,
-	const bool rtt_inflated, const intmax_t bw_max)
+	struct mux_session *restrict ss, const intmax_t rtt_ns,
+	const intmax_t rtt_smooth_ns)
 {
 	struct estimator_ctx *restrict est = &ss->estimator;
+	const intmax_t bw_max = wndfilter_get(&est->bw_wnd);
+
+	const bool window_limited = /* sample > 2/3 of the window target */
+		(est->sample + est->sample / 2 > est->effective_bdp);
+	const bool rtt_inflated = (rtt_ns > rtt_smooth_ns + rtt_smooth_ns / 4);
+
 	if (rtt_inflated) {
-		/* Queue building: exit STARTUP, clamp to BDP × 1.25. */
+		/* Queue building: exit STARTUP, set bw_exit. */
 		est->phase = ESTIMATOR_TRACK;
 		est->bw_exit = bw_max;
-		if (bw_max > 0) {
-			est->effective_bdp = est->bdp + est->bdp / 4;
-		}
 		MUX_LOG_F(
 			INFO, ss,
 			"estimator: STARTUP→TRACK bw=%" PRIdMAX
@@ -130,13 +135,14 @@ static void phase_startup(
 	}
 }
 
-static void phase_track(struct mux_session *restrict ss, const intmax_t bw_max)
+static void phase_track(struct mux_session *restrict ss)
 {
+	struct estimator_ctx *restrict est = &ss->estimator;
+	const intmax_t bw_max = wndfilter_get(&est->bw_wnd);
 	if (bw_max <= 0) {
 		return;
 	}
-	struct estimator_ctx *restrict est = &ss->estimator;
-	if (est->bw_exit == 0 || bw_max > est->bw_exit + est->bw_exit / 4) {
+	if (est->bw_exit == 0 || bw_max > est->bw_exit) {
 		/* Bandwidth headroom found: re-enter STARTUP. */
 		est->phase = ESTIMATOR_STARTUP;
 		est->bw_exit = 0;
@@ -148,8 +154,8 @@ static void phase_track(struct mux_session *restrict ss, const intmax_t bw_max)
 			bw_max, est->bdp);
 		return;
 	}
-	/* Steady-state tracking: maintain BDP × 1.25. */
-	est->effective_bdp = est->bdp + est->bdp / 4;
+	/* Steady-state tracking: maintain BDP × 1.5. */
+	est->effective_bdp = est->bdp + est->bdp / 2;
 }
 
 void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns)
@@ -174,13 +180,8 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 	}
 
 	est->rtt = rtt_ns;
-	if (!est->inited) {
-		wndfilter_reset(&est->rtt_wnd, now_ns, rtt_ns);
-		est->inited = true;
-	}
-
-	const intmax_t rtt_min_ns = wndfilter_update_min(
-		&est->rtt_wnd, WND_RTT_MIN_NS, now_ns, rtt_ns);
+	const intmax_t rtt_smooth_ns =
+		(intmax_t)ewma_add(&est->rtt_ewma, (double)rtt_ns);
 
 	intmax_t bw_max = 0;
 	if (est->sample > 0) {
@@ -194,18 +195,14 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 		bw_max = wndfilter_get(&est->bw_wnd);
 	}
 
-	est->bdp = (size_t)((double)bw_max * (double)rtt_min_ns / 1e9);
-
-	const bool window_limited = /* sample > 2/3 of the window target */
-		(est->sample + est->sample / 2 > est->effective_bdp);
-	const bool rtt_inflated = (rtt_ns > rtt_min_ns + rtt_min_ns / 4);
+	est->bdp = (size_t)((double)bw_max * (double)rtt_smooth_ns / 1e9);
 
 	switch (est->phase) {
 	case ESTIMATOR_STARTUP:
-		phase_startup(ss, window_limited, rtt_inflated, bw_max);
+		phase_startup(ss, rtt_ns, rtt_smooth_ns);
 		break;
 	case ESTIMATOR_TRACK:
-		phase_track(ss, bw_max);
+		phase_track(ss);
 		break;
 	}
 	est->ping_in_flight = false;
@@ -214,9 +211,9 @@ void estimator_calculate(struct mux_session *restrict ss, const intmax_t sent_ns
 
 	MUX_LOG_F(
 		INFO, ss,
-		"PONG: rtt=%.1f ms (min=%.1f ms) bw=%" PRIdMAX
+		"PONG: rtt=%.1f ms (srtt=%.1f ms) bw=%" PRIdMAX
 		" B/s bdp=%zu B (eff=%zu B, phase=%s)",
-		(double)rtt_ns / 1e6, (double)rtt_min_ns / 1e6, bw_max,
+		(double)rtt_ns / 1e6, (double)rtt_smooth_ns / 1e6, bw_max,
 		est->bdp, est->effective_bdp,
 		est->phase == ESTIMATOR_STARTUP ? "startup" : "track");
 }

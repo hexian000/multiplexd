@@ -3579,7 +3579,7 @@ static int pred_echo_and_bdp_cycle(void *ptr)
 	if (ctx->ts->recv_len < ctx->expected_len) {
 		return 0;
 	}
-	if (wndfilter_get(&ctx->ss->estimator.rtt_wnd) <= 0 ||
+	if (!ctx->ss->estimator.rtt_ewma.ready ||
 	    ctx->ss->estimator.ping_in_flight) {
 		return 0;
 	}
@@ -3952,7 +3952,7 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
 	T_EXPECT(ret == 0);
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
+	T_EXPECT(fx.cli->estimator.rtt_ewma.ready);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_SMALL);
 	if (ts->recv_len == PAYLOAD_SMALL) {
@@ -4019,7 +4019,7 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 	const int cycle_ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
 	T_EXPECT(cycle_ret == 0);
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
+	T_EXPECT(fx.cli->estimator.rtt_ewma.ready);
 
 	/* Clear last_probe_ns to bypass the send-side rate limit so that the
 	 * second estimator_add immediately queues a PING for the stop test. */
@@ -4040,7 +4040,7 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 		3u * (size_t)MUX_INITIAL_SEND_WINDOW);
 	T_EXPECT_EQ(fx.cli->stream_window, 3u * initial_frames / 2u);
 	/* Learned state is preserved after stop. */
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
+	T_EXPECT(fx.cli->estimator.rtt_ewma.ready);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
 	T_EXPECT(fx.cli->estimator.probe_sent_ns != 0);
 

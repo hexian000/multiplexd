@@ -610,14 +610,13 @@ extra frame.
 ```text
 bw_sample      = sample × 1e9 / rtt_ns
 bw_max         = wndfilter_max(bw_wnd,  WND_BW_MAX_NS)    -- 86400 s window
-min_rtt        = wndfilter_min(rtt_wnd, WND_RTT_MIN_NS)   -- 30 s window
-bdp            = bw_max × min_rtt / 1e9
+srtt           = ewma(rtt_ns, span=8)                      -- α ≈ 0.22
+bdp            = bw_max × srtt / 1e9
 window_limited = sample + sample/2 > effective_bdp         -- sample > 2/3 target
-rtt_inflated   = rtt_ns > min_rtt + min_rtt/4              -- current RTT > 5/4 baseline
+rtt_inflated   = rtt_ns > srtt + srtt/4                    -- current RTT > 5/4 smoothed
 
 -- STARTUP phase
 if rtt_inflated:     phase = TRACK; bw_exit = bw_max
-                     if bw_max > 0: effective_bdp = bdp + bdp/4
 elif window_limited: effective_bdp ×= 3
 
 -- TRACK phase
@@ -633,7 +632,7 @@ The `bw_wnd` 86400 s window acts as a natural floor: a measured peak bandwidth
 persists for up to one day before `effective_bdp` can fall materially below the
 level it once supported.
 
-Constants: `WNDSIZE_MAX = UINT16_MAX × MUX_WINDOW_UNIT`, `WNDSIZE_MIN = 4 × MUX_WINDOW_UNIT`, `WND_RTT_MIN_NS = 30 s`, `WND_BW_MAX_NS = 86400 s`.
+Constants: `WNDSIZE_MAX = UINT16_MAX × MUX_WINDOW_UNIT`, `WNDSIZE_MIN = 4 × MUX_WINDOW_UNIT`, `RTT_EWMA_SPAN = 8` (α = 2/9 ≈ 0.22), `WND_BW_MAX_NS = 86400 s`.
 
 ### 12.2 Probe Lifecycle
 
@@ -645,7 +644,7 @@ Constants: `WNDSIZE_MAX = UINT16_MAX × MUX_WINDOW_UNIT`, `WNDSIZE_MIN = 4 × MU
 | PING timeout (≥ `conf.ping_timeout` since `probe_sent_ns`) | Discard the cycle in place inside the next `estimator_add()` call without advancing `last_probe_ns`, then fall through to start a fresh probe immediately on the same call. |
 | Matching PONG (`sent_ns == probe_sent_ns`)                 | `estimator_calculate` updates RTT/BW filters and `effective_bdp` per §12.3; advances `last_probe_ns` to gate the next probe.                                                |
 | Stale PONG (`sent_ns != probe_sent_ns`)                    | Discarded without updating any filter.                                                                                                                                      |
-| First successful `estimator_calculate`                     | `est->inited` latches; `rtt_wnd` is reset to the first RTT sample so subsequent `wndfilter_update_min` calls have a sane starting point.                                    |
+| First successful `estimator_calculate`                     | `rtt_ewma.ready` latches on the first RTT sample; subsequent `ewma_add` calls use the standard recurrence.                                                                  |
 
 The estimator has no dedicated timer; probes are driven by payload arrival and
 are completed either by a matching PONG or by timeout detection on the next
@@ -653,15 +652,14 @@ PUSH.
 
 ### 12.3 `effective_bdp` Update Rules
 
-Each valid PONG updates `min_rtt`.  When `sample > 0`, `bw_wnd` is updated and
+Each valid PONG updates `srtt` via EWMA.  When `sample > 0`, `bw_wnd` is updated and
 `bdp` is recomputed.  `effective_bdp` is then adjusted according to the current
 phase (`STARTUP` or `TRACK`), stored in `est->phase`.
 
 **STARTUP phase** — fast-start, searching for the bandwidth ceiling:
 
-- **rtt_inflated** (`rtt > 5/4 × min_rtt`): queue building detected; transition
-  to TRACK, record `bw_exit = bw_max`, and (when `bw_max > 0`) clamp
-  `effective_bdp` to `bdp × 1.25`.
+- **rtt_inflated** (`rtt > 5/4 × srtt`): queue building detected; transition
+  to TRACK and record `bw_exit = bw_max`.
 - **window_limited** (`sample > 2/3 × effective_bdp`, only when not
   rtt_inflated): the receive window is the throughput bottleneck; triple the
   target to probe for more capacity.

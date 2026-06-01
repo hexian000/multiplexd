@@ -548,7 +548,7 @@ static struct vbuffer *append_tunnel_metrics(
 		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9);
 	APPEND_TUNNEL_METRIC(
 		"session_bdp_bytes",
-		"Instantaneous bandwidth-delay product (bw_wnd x rtt_wnd) per identity session",
+		"Instantaneous bandwidth-delay product (bw_wnd x rtt_ewma) per identity session",
 		t->bdp == 0, "%zu", t->bdp);
 
 #undef APPEND_TUNNEL_METRIC_DIR

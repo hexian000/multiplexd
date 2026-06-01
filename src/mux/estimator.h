@@ -9,6 +9,7 @@
 #ifndef MUX_ESTIMATOR_H
 #define MUX_ESTIMATOR_H
 
+#include "algo/ewma.h"
 #include "algo/wndfilter.h"
 
 #include <inttypes.h>
@@ -36,7 +37,7 @@ struct estimator_ctx {
 	/* bandwidth at the STARTUP→TRACK transition; 0 = none recorded. */
 	intmax_t bw_exit;
 
-	struct wndfilter rtt_wnd;
+	struct ewma rtt_ewma;
 	struct wndfilter bw_wnd;
 
 	intmax_t rtt;
@@ -45,7 +46,6 @@ struct estimator_ctx {
 
 	enum estimator_phase phase;
 	bool ping_in_flight : 1;
-	bool inited : 1;
 };
 
 /* Reset all estimator state; effective_bdp is seeded from bdp. */
