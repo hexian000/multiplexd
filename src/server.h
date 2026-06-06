@@ -13,6 +13,7 @@
 #include "listener.h"
 #include "mux/mux.h"
 #include "tunnel.h"
+
 #if WITH_THREADS
 #include "sync/dispatcher.h"
 #include "sync/shared_mutex.h"
@@ -37,7 +38,7 @@ struct mcache;
 struct tls_context;
 
 /* Single event log entry for the session event ring buffer. */
-struct evlog_entry {
+struct server_evlog_entry {
 	/* wall-clock time of the most recent occurrence */
 	time_t timestamp;
 	/* consecutive occurrence count */
@@ -47,8 +48,8 @@ struct evlog_entry {
 };
 
 /* Session event ring buffer; owned by the server thread. */
-struct evlog {
-	struct evlog_entry entries[16];
+struct server_evlog {
+	struct server_evlog_entry entries[16];
 	size_t len; /* valid entries */
 	size_t pos; /* next write position */
 };
@@ -66,7 +67,7 @@ struct evlog {
  */
 
 /* Live cumulative counters and aggregated gauges embedded in struct server
- * (counters route).  All uintmax_t fields follow Prometheus counter
+ * (counters route).  All uint_least64_t fields follow Prometheus counter
  * semantics: they increase monotonically and wrap to 0 on overflow;
  * consumers computing rates must handle a decrease in value as a counter
  * reset. */
@@ -74,69 +75,69 @@ struct server_counters {
 	/* listener counters — updated on the server thread only */
 	struct {
 		/* accepted connections from mux_listener */
-		uintmax_t num_accepted;
+		uint_least64_t num_accepted;
 		/* served connections from mux_listener (reached num_halfopen++) */
-		uintmax_t num_served;
+		uint_least64_t num_served;
 		/* accepted/served connections from tcp_listener */
-		uintmax_t num_accepted_tcp;
-		uintmax_t num_served_tcp;
+		uint_least64_t num_accepted_tcp;
+		uint_least64_t num_served_tcp;
 		/* accepted/served connections from api_listener */
-		uintmax_t num_accepted_api;
-		uintmax_t num_served_api;
+		uint_least64_t num_accepted_api;
+		uint_least64_t num_served_api;
 		/* mux connections dropped by startup_limit */
-		uintmax_t num_rejected;
+		uint_least64_t num_rejected;
 #if WITH_TLS
 		/* TLS accept failures (server mode) */
-		uintmax_t num_tls_failures;
+		uint_least64_t num_tls_failures;
 #endif
 	};
 
 	/* session lifecycle counters (monotonic) and gauges */
 	struct {
 #if WITH_THREADS
-		atomic_uintmax_t num_session_created;
-		atomic_uintmax_t num_session_connect;
-		atomic_uintmax_t num_session_connected;
-		atomic_uintmax_t num_session_disconnected;
-		atomic_uintmax_t num_session_finalized;
+		atomic_uint_least64_t num_session_created;
+		atomic_uint_least64_t num_session_connect;
+		atomic_uint_least64_t num_session_connected;
+		atomic_uint_least64_t num_session_disconnected;
+		atomic_uint_least64_t num_session_finalized;
 		/* sessions currently in ESTABLISHED state */
 		atomic_size_t num_sessions;
 		/* sessions currently in CONNECT or HANDSHAKE state */
 		atomic_size_t num_session_halfopen;
 #else
-		uintmax_t num_session_created;
-		uintmax_t num_session_connect;
-		uintmax_t num_session_connected;
-		uintmax_t num_session_disconnected;
-		uintmax_t num_session_finalized;
+		uint_least64_t num_session_created;
+		uint_least64_t num_session_connect;
+		uint_least64_t num_session_connected;
+		uint_least64_t num_session_disconnected;
+		uint_least64_t num_session_finalized;
 		/* sessions currently in ESTABLISHED state */
 		size_t num_sessions;
 		/* sessions currently in CONNECT or HANDSHAKE state */
 		size_t num_session_halfopen;
-#endif
+#endif /* WITH_THREADS */
 	};
 
 	/* error and control counters */
 	struct {
 #if WITH_THREADS
 		/* client-mode reconnect attempts */
-		atomic_uintmax_t num_reconnects;
+		atomic_uint_least64_t num_reconnects;
 		/* RST frames sent (aggregated) */
-		atomic_uintmax_t num_rst_sent;
+		atomic_uint_least64_t num_rst_sent;
 		/* RST frames received (aggregated) */
-		atomic_uintmax_t num_rst_recv;
+		atomic_uint_least64_t num_rst_recv;
 		/* stream_abort() calls (aggregated) */
-		atomic_uintmax_t num_stream_errors;
+		atomic_uint_least64_t num_stream_errors;
 #else
 		/* client-mode reconnect attempts */
-		uintmax_t num_reconnects;
+		uint_least64_t num_reconnects;
 		/* RST frames sent (aggregated) */
-		uintmax_t num_rst_sent;
+		uint_least64_t num_rst_sent;
 		/* RST frames received (aggregated) */
-		uintmax_t num_rst_recv;
+		uint_least64_t num_rst_recv;
 		/* stream_abort() calls (aggregated) */
-		uintmax_t num_stream_errors;
-#endif
+		uint_least64_t num_stream_errors;
+#endif /* WITH_THREADS */
 	};
 
 	/* per-stream buffer gauges (aggregated) */
@@ -155,17 +156,17 @@ struct server_counters {
 		size_t send_buffered_frames;
 		/* frames held in the session unacked list (spec §6.7.2) */
 		size_t unacked_frames;
-#endif
+#endif /* WITH_THREADS */
 	};
 
 	/* Traffic byte counters for closed tunnels; accumulated on the server
 	 * thread in handle_closed().  Active tunnel traffic is summed at
 	 * snapshot time in server_stats() via tunnel_stats(). */
 	struct {
-		uintmax_t traffic_byt_mux_recv;
-		uintmax_t traffic_byt_mux_sent;
-		uintmax_t traffic_byt_push_recv;
-		uintmax_t traffic_byt_push_sent;
+		uint_least64_t traffic_byt_mux_recv;
+		uint_least64_t traffic_byt_mux_sent;
+		uint_least64_t traffic_byt_push_recv;
+		uint_least64_t traffic_byt_push_sent;
 	};
 };
 
@@ -174,56 +175,56 @@ struct server_counters {
  * Organized into two groups matching the two monitoring routes. */
 struct server_stats {
 	/* --- counters route snapshot (mirrors struct server_counters) --- */
-	uintmax_t num_accepted;
-	uintmax_t num_served;
-	uintmax_t num_accepted_tcp;
-	uintmax_t num_served_tcp;
-	uintmax_t num_accepted_api;
-	uintmax_t num_served_api;
-	uintmax_t num_session_created;
-	uintmax_t num_session_connect;
-	uintmax_t num_session_connected;
-	uintmax_t num_session_disconnected;
-	uintmax_t num_session_finalized;
+	uint_least64_t num_accepted;
+	uint_least64_t num_served;
+	uint_least64_t num_accepted_tcp;
+	uint_least64_t num_served_tcp;
+	uint_least64_t num_accepted_api;
+	uint_least64_t num_served_api;
+	uint_least64_t num_session_created;
+	uint_least64_t num_session_connect;
+	uint_least64_t num_session_connected;
+	uint_least64_t num_session_disconnected;
+	uint_least64_t num_session_finalized;
 	size_t num_sessions;
 	size_t num_session_halfopen;
 	/* --- stream counters (aggregated from tunnel_stats[] at snapshot time) --- */
 	size_t num_streams;
 	size_t num_stream_halfopen;
-	uintmax_t num_stream_opened;
-	uintmax_t num_stream_accepted;
-	uintmax_t num_stream_fastopen;
-	uintmax_t num_stream_established;
-	uintmax_t num_stream_succeeded;
-	uintmax_t num_stream_failed;
-	uintmax_t num_rejected;
+	uint_least64_t num_stream_opened;
+	uint_least64_t num_stream_accepted;
+	uint_least64_t num_stream_fastopen;
+	uint_least64_t num_stream_established;
+	uint_least64_t num_stream_succeeded;
+	uint_least64_t num_stream_failed;
+	uint_least64_t num_rejected;
 #if WITH_TLS
-	uintmax_t num_tls_failures;
+	uint_least64_t num_tls_failures;
 #endif
-	uintmax_t num_reconnects;
-	uintmax_t num_rst_sent;
-	uintmax_t num_rst_recv;
-	uintmax_t num_stream_errors;
+	uint_least64_t num_reconnects;
+	uint_least64_t num_rst_sent;
+	uint_least64_t num_rst_recv;
+	uint_least64_t num_stream_errors;
 	size_t recv_buffered_bytes;
 	size_t send_buffered_frames;
 	size_t unacked_frames;
-	uintmax_t traffic_byt_mux_recv;
-	uintmax_t traffic_byt_mux_sent;
-	uintmax_t traffic_byt_push_recv;
-	uintmax_t traffic_byt_push_sent;
+	uint_least64_t traffic_byt_mux_recv;
+	uint_least64_t traffic_byt_mux_sent;
+	uint_least64_t traffic_byt_push_recv;
+	uint_least64_t traffic_byt_push_sent;
 
 	/* --- stats route snapshot (mirrors the runtime diagnostic fields
 	 * and per-identity tunnel_stats) --- */
 	/* number of latency samples in the ring (capped at 256); 0 = no data */
 	size_t stream_establish_count;
 	/* SYN->SYN|ACK latency percentiles (ns); valid when count > 0 */
-	intmax_t stream_establish_p50;
-	intmax_t stream_establish_p90;
-	intmax_t stream_establish_p99;
-	intmax_t stream_establish_pmax;
+	int_least64_t stream_establish_p50;
+	int_least64_t stream_establish_p90;
+	int_least64_t stream_establish_p99;
+	int_least64_t stream_establish_pmax;
 
 	/* borrowed pointer into struct server; valid until free(server_stats(s)) */
-	const struct evlog *evlog;
+	const struct server_evlog *evlog;
 
 	/* number of entries in tunnels[] (mux_tunnel + identity pool members
 	 * + accepted tunnels not wired into any identity pool) */
@@ -242,6 +243,8 @@ struct identity_listener {
 	 * Owned array; all elements are non-NULL. */
 	struct tunnel **tunnels;
 	size_t num_tunnels;
+	/* Allocated capacity of tunnels[]; always a power of two. */
+	size_t cap_tunnels;
 	/* Round-robin dispatch cursor into tunnels[]. */
 	size_t rr_next;
 };
@@ -288,7 +291,7 @@ struct server {
 	struct tunnel **identity_tunnels;
 	size_t num_identity_tunnels;
 
-	intmax_t started;
+	int_least64_t started;
 
 	ev_signal w_sighup;
 	ev_signal w_sigint;
@@ -301,7 +304,7 @@ struct server {
 	bool shutting_down;
 	/* Monotonic timestamp (ns) when shutdown was initiated; used by
 	 * maintenance_cb to enforce the 2 s force-exit deadline. */
-	intmax_t shutdown_start_ns;
+	int_least64_t shutdown_start_ns;
 	/* Wall-clock timestamp of the previous maintenance tick; used to detect
 	 * large time jumps (system suspend/resume) for transport reconnection. */
 	time_t last_maintenance_wall;
@@ -318,13 +321,13 @@ struct server {
 	struct server_counters counters;
 
 	/* stats route: server-thread-only diagnostics; read via server_stats() */
-	struct evlog evlog; /* session event ring buffer */
+	struct server_evlog evlog; /* session event ring buffer */
 
 	/* Rate tracking state for POST /stats bandwidth display */
 	struct {
-		uintmax_t byt_mux_recv, byt_mux_sent;
-		uintmax_t byt_push_recv, byt_push_sent;
-		intmax_t timestamp;
+		uint_least64_t byt_mux_recv, byt_mux_sent;
+		uint_least64_t byt_push_recv, byt_push_sent;
+		int_least64_t timestamp;
 		bool is_set;
 	} rate_tracker;
 };

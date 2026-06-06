@@ -4,6 +4,7 @@
 #ifndef ALGO_WNDFILTER_H
 #define ALGO_WNDFILTER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /** @defgroup wndfilter
@@ -19,9 +20,9 @@
  */
 struct wndfilter_sample {
 	/* timestamp of the measurement */
-	intmax_t t;
+	int_fast64_t t;
 	/* value measured */
-	intmax_t v;
+	int_fast64_t v;
 };
 
 /**
@@ -31,6 +32,7 @@ struct wndfilter_sample {
  */
 struct wndfilter {
 	struct wndfilter_sample s[3];
+	bool ready;
 };
 
 /**
@@ -38,7 +40,7 @@ struct wndfilter {
  * @param m Pointer to the tracker state.
  * @return The best value in the current window.
  */
-static inline intmax_t wndfilter_get(const struct wndfilter *w)
+static inline int_fast64_t wndfilter_get(const struct wndfilter *w)
 {
 	return w->s[0].v;
 }
@@ -49,7 +51,8 @@ static inline intmax_t wndfilter_get(const struct wndfilter *w)
  * @param t Timestamp of the measurement.
  * @param v The measured value.
  */
-void wndfilter_reset(struct wndfilter *restrict w, intmax_t t, intmax_t v);
+void wndfilter_reset(
+	struct wndfilter *restrict w, int_fast64_t t, int_fast64_t v);
 
 /**
  * @brief Update the tracker and return the running minimum.
@@ -59,8 +62,9 @@ void wndfilter_reset(struct wndfilter *restrict w, intmax_t t, intmax_t v);
  * @param v The new measured value.
  * @return The minimum value in the current window.
  */
-intmax_t wndfilter_update_min(
-	struct wndfilter *restrict w, intmax_t wnd, intmax_t t, intmax_t v);
+int_fast64_t wndfilter_update_min(
+	struct wndfilter *restrict w, int_fast64_t wnd, int_fast64_t t,
+	int_fast64_t v);
 
 /**
  * @brief Update the tracker and return the running maximum.
@@ -70,8 +74,9 @@ intmax_t wndfilter_update_min(
  * @param v The new measured value.
  * @return The maximum value in the current window.
  */
-intmax_t wndfilter_update_max(
-	struct wndfilter *restrict w, intmax_t wnd, intmax_t t, intmax_t v);
+int_fast64_t wndfilter_update_max(
+	struct wndfilter *restrict w, int_fast64_t wnd, int_fast64_t t,
+	int_fast64_t v);
 
 /** @} */
 

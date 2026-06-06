@@ -241,8 +241,8 @@ static void teardown_session(struct mux_session *restrict ss)
 	/* Free frames queued by handshake_enqueue_hello (server fresh path). */
 	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
 	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
-	/* Free unacked list (empty in fuzz sessions). */
-	mux_frame_list_clear(&ss->unacked, &ss->pool);
+	/* Free unacked ring (empty in fuzz sessions). */
+	unacked_ring_free_all(ss);
 	/* Free peer identity string (strdup'd by handshake_process_hello). */
 	free(ss->handshake.peer_identity);
 	ss->handshake.peer_identity = NULL;

@@ -1,4 +1,4 @@
-#include "queue.h"
+#include "sync/queue.h"
 #include "utils/likely.h"
 
 #include <assert.h>

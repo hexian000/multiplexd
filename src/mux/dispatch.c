@@ -45,7 +45,8 @@ is_valid_peer_stream_id(struct mux_session *ss, const uint_fast16_t stream_id)
 static bool
 validate_flags_by_stream(const struct mux_stream *s, const uint_fast8_t flags)
 {
-	const uint_fast8_t non_rst_flags = flags & ~MUX_FLAG_RST;
+	const uint_fast8_t non_rst_flags =
+		flags & (uint_fast8_t)(~MUX_FLAG_RST);
 
 	switch (s->state) {
 	case STREAM_SYN_SENT:
@@ -53,8 +54,9 @@ validate_flags_by_stream(const struct mux_stream *s, const uint_fast8_t flags)
 		    (MUX_FLAG_SYN | MUX_FLAG_ACK)) {
 			return false;
 		}
-		return (non_rst_flags &
-			~(MUX_FLAG_SYN | MUX_FLAG_ACK | MUX_FLAG_PUSH)) == 0;
+		return (non_rst_flags & (uint_fast8_t) ~(
+						MUX_FLAG_SYN | MUX_FLAG_ACK |
+						MUX_FLAG_PUSH)) == 0;
 	case STREAM_SYN_RECEIVED:
 		break;
 	case STREAM_ESTABLISHED:
@@ -73,7 +75,8 @@ validate_flags_by_stream(const struct mux_stream *s, const uint_fast8_t flags)
 		if (non_rst_flags == 0) {
 			return false;
 		}
-		return (non_rst_flags & ~(MUX_FLAG_ACK | MUX_FLAG_FIN)) == 0;
+		return (non_rst_flags &
+			(uint_fast8_t) ~(MUX_FLAG_ACK | MUX_FLAG_FIN)) == 0;
 	case STREAM_INIT:
 	case STREAM_CLOSED:
 		break;
@@ -94,7 +97,7 @@ is_ignorable_unknown_terminal_frame(const struct mux_header *restrict hdr)
 	if ((flags & (MUX_FLAG_ACK | MUX_FLAG_FIN)) == 0) {
 		return false;
 	}
-	return (flags & ~(MUX_FLAG_ACK | MUX_FLAG_FIN)) == 0;
+	return (flags & (uint_fast8_t) ~(MUX_FLAG_ACK | MUX_FLAG_FIN)) == 0;
 }
 
 static void process_syn_payload(
@@ -105,13 +108,16 @@ static void process_syn_payload(
 	if ((hdr->flags & MUX_FLAG_PUSH) && hdr->length > 0 &&
 	    (s->state == STREAM_ESTABLISHED ||
 	     s->state == STREAM_SYN_RECEIVED)) {
-		estimator_add(ss, hdr->length);
 		stream_recv_copy(
 			s,
 			ringbuf_read_ptr(ss->wire.recvbuf) +
 				MUX_FRAME_HEADER_SIZE,
 			hdr->length);
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
+		if (ss->auto_stream_window) {
+			estimator_add(ss, hdr->length);
+			session_flush_oob(ss);
+		}
 		return;
 	}
 	ringbuf_consume(ss->wire.recvbuf, frame_size);
@@ -275,16 +281,19 @@ static void dispatch_by_stream(
 	}
 
 	if ((flags & MUX_FLAG_PUSH) && hdr->length > 0) {
-		estimator_add(ss, hdr->length);
 		COUNTER_ADD(
-			ss->cnt.traffic.byt_push_recv, (uintmax_t)hdr->length);
+			ss->cnt.traffic.byt_push_recv,
+			(uint_least64_t)hdr->length);
 		stream_recv_copy(
 			s,
 			ringbuf_read_ptr(ss->wire.recvbuf) +
 				MUX_FRAME_HEADER_SIZE,
 			hdr->length);
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
-
+		if (ss->auto_stream_window) {
+			estimator_add(ss, hdr->length);
+			session_flush_oob(ss);
+		}
 		if (flags & MUX_FLAG_FIN) {
 			stream_recv_fin(s);
 		}

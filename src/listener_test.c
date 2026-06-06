@@ -2,24 +2,23 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 #include "listener.h"
-#include "util.h"
-
 #include "mux/mux.h"
+#include "util.h"
 
 #include "utils/testing.h"
 
 #include <ev.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-static const struct socket_opts g_socket_opts = {
+static const struct util_socket_opts g_socket_opts = {
 	.backlog = 4,
 };
 
@@ -130,7 +129,7 @@ T_DECLARE_CASE(test_listener_serve_fn_called)
 	g_serve_calls = 0;
 
 	struct listener l;
-	uintmax_t accepted = 0;
+	uint_least64_t accepted = 0;
 	listener_init(&l, &g_socket_opts, test_serve, NULL, &accepted);
 
 	const struct sockaddr_in sa = make_loopback_any();
@@ -155,7 +154,7 @@ T_DECLARE_CASE(test_listener_serve_fn_called)
 	ev_run(loop, EVRUN_ONCE);
 
 	T_EXPECT_EQ(g_serve_calls, 1);
-	T_EXPECT((uintmax_t)accepted >= 1u);
+	T_EXPECT((uint_least64_t)accepted >= 1u);
 
 	(void)close(cfd);
 	listener_stop(&l, loop);

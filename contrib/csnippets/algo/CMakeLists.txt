@@ -5,7 +5,6 @@ target_sources(csnippets
     "${CMAKE_CURRENT_SOURCE_DIR}/wndfilter.c"
     PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/cityhash.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/ewma.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/hashtable.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/luahash.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/wndfilter.h"

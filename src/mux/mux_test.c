@@ -6,11 +6,12 @@
  * single ev_loop, exercising the full protocol: handshake, data transfer,
  * flow-control, half-close, RST, and concurrent streams. */
 
-#include "mux/mux.h"
 #include "mux/frame.h"
-#include "mux/handshake.c"
+#include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/stream.h"
+
+#include "mux/handshake.c"
 
 #include "math/rand.h"
 #include "utils/minmax.h"
@@ -18,16 +19,13 @@
 #include "utils/slog.h"
 #include "utils/testing.h"
 
-#include <arpa/inet.h>
 #include <ev.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -35,6 +33,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #ifndef UNUSED
 #define UNUSED(x) ((void)(x))
@@ -126,6 +127,7 @@ struct mux_test_fixture {
 	bool cli_suspended;
 	bool srv_resumed;
 	bool cli_resumed;
+	bool cli_connect_failed;
 
 	enum accept_mode accept_mode;
 
@@ -365,7 +367,7 @@ stream_io_cb(struct ev_loop *loop, mux_stream_io *w, const int revents)
  * ---------------------------------------------------------------------- */
 
 static bool
-on_accept_cb(void *data, struct mux_session *ss, struct mux_stream *s)
+on_accept_cb(void *data, const struct mux_session *ss, struct mux_stream *s)
 {
 	UNUSED(ss);
 	struct mux_test_fixture *restrict fx = data;
@@ -2219,7 +2221,7 @@ struct raw_stream_fixture {
 };
 
 static bool raw_stream_on_accept_cb(
-	void *data, struct mux_session *ss, struct mux_stream *s)
+	void *data, const struct mux_session *ss, struct mux_stream *s)
 {
 	UNUSED(ss);
 	struct raw_stream_fixture *sfx = data;
@@ -3062,7 +3064,7 @@ static void fx_break_transport(struct mux_test_fixture *restrict fx)
 	/* Atomically close srv_fd (sends RST to the client) and replace it
 	 * with sp[0] so the slot remains occupied.  session_resume_transport
 	 * will later call session_suspend(fx->srv), which calls ev_io_stop and
-	 * CLOSE_FD on srv_fd (now sp[0]) cleanly — no EBADF. */
+	 * SOCKET_CLOSE_FD on srv_fd (now sp[0]) cleanly — no EBADF. */
 	(void)dup2(sp[0], srv_fd);
 	close(sp[0]);
 
@@ -3249,11 +3251,11 @@ T_DECLARE_CASE(test_resume_retransmit)
 	 * the preserved frames over a fresh transport. */
 	session_suspend(fx.cli);
 	session_suspend(fx.srv);
-	T_EXPECT(fx.cli->retransmit_cursor != NULL);
-	T_EXPECT(fx.srv->retransmit_cursor != NULL);
+	T_EXPECT(fx.cli->retransmit_off != SIZE_MAX);
+	T_EXPECT(fx.srv->retransmit_off != SIZE_MAX);
 	T_LOGF("retransmit armed: cli=%d srv=%d",
-	       fx.cli->retransmit_cursor != NULL,
-	       fx.srv->retransmit_cursor != NULL);
+	       fx.cli->retransmit_off != SIZE_MAX,
+	       fx.srv->retransmit_off != SIZE_MAX);
 
 	/* Wait for both sessions to resume. */
 	const int resume_ret =
@@ -3266,10 +3268,10 @@ T_DECLARE_CASE(test_resume_retransmit)
 		       " ack_seq=%" PRIuLEAST32 " tx_pending=%d retrans=%d)",
 		       fx.cli->state, fx.cli->unacked_frames, fx.cli->recv_seq,
 		       fx.cli->ack_seq, fx.cli->wire.tx_pending,
-		       fx.cli->retransmit_cursor != NULL, fx.srv->state,
+		       fx.cli->retransmit_off != SIZE_MAX, fx.srv->state,
 		       fx.srv->unacked_frames, fx.srv->recv_seq,
 		       fx.srv->ack_seq, fx.srv->wire.tx_pending,
-		       fx.srv->retransmit_cursor != NULL);
+		       fx.srv->retransmit_off != SIZE_MAX);
 	}
 	T_EXPECT(resume_ret == 0);
 	T_EXPECT(fx.cli_suspended);
@@ -3300,12 +3302,12 @@ T_DECLARE_CASE(test_resume_retransmit)
 			       fx.cli->state, fx.cli->unacked_frames,
 			       fx.cli->recv_seq, fx.cli->ack_seq,
 			       fx.cli->wire.tx_pending,
-			       fx.cli->retransmit_cursor != NULL,
+			       fx.cli->retransmit_off != SIZE_MAX,
 			       cli_ts->recv_len, cli_sent, cli_ts->got_error,
 			       cli_ts->got_eof, fx.srv->state,
 			       fx.srv->unacked_frames, fx.srv->recv_seq,
 			       fx.srv->ack_seq, fx.srv->wire.tx_pending,
-			       fx.srv->retransmit_cursor != NULL,
+			       fx.srv->retransmit_off != SIZE_MAX,
 			       srv_ts->recv_len, srv_sent, srv_ts->got_error,
 			       srv_ts->got_eof);
 		}
@@ -3333,12 +3335,12 @@ T_DECLARE_CASE(test_resume_retransmit)
 			       fx.cli->state, fx.cli->unacked_frames,
 			       fx.cli->recv_seq, fx.cli->ack_seq,
 			       fx.cli->wire.tx_pending,
-			       fx.cli->retransmit_cursor != NULL,
+			       fx.cli->retransmit_off != SIZE_MAX,
 			       cli_ts->recv_len, cli_sent, cli_ts->got_error,
 			       cli_ts->got_eof, fx.srv->state,
 			       fx.srv->unacked_frames, fx.srv->recv_seq,
 			       fx.srv->ack_seq, fx.srv->wire.tx_pending,
-			       fx.srv->retransmit_cursor != NULL,
+			       fx.srv->retransmit_off != SIZE_MAX,
 			       srv_ts->recv_len, srv_sent, srv_ts->got_error,
 			       srv_ts->got_eof);
 		}
@@ -3452,6 +3454,7 @@ T_DECLARE_CASE(test_resume_handshake_transport_lost)
 	T_EXPECT(ret == 0);
 	T_EXPECT(fx.cli_resumed);
 	T_EXPECT(fx.srv_resumed);
+	T_EXPECT(!fx.cli_connect_failed);
 
 cleanup:
 	fixture_teardown(&fx);
@@ -3553,7 +3556,7 @@ static void bdp_enable_auto_windows(struct mux_session *restrict ss)
 
 struct bdp_control_ctx {
 	const struct mux_session *ss;
-	uintmax_t before_bytes_recv;
+	uint_least64_t before_bytes_recv;
 };
 
 static int pred_control_only_no_bdp(void *ptr)
@@ -3579,7 +3582,7 @@ static int pred_echo_and_bdp_cycle(void *ptr)
 	if (ctx->ts->recv_len < ctx->expected_len) {
 		return 0;
 	}
-	if (!ctx->ss->estimator.rtt_ewma.ready ||
+	if (wndfilter_get(&ctx->ss->estimator.rtt_wnd) == 0 ||
 	    ctx->ss->estimator.ping_in_flight) {
 		return 0;
 	}
@@ -3622,19 +3625,19 @@ T_DECLARE_CASE(test_bdp_auto_stream_window_updated_by_pong)
 	 * Use 4 × MUX_INITIAL_SEND_WINDOW so the resulting BDP estimate is
 	 * well above the 5-frame boundary; a 1× sample lands right at
 	 * BDP_MIN and integer-division truncation makes the assertion fragile. */
-	estimator_add(fx.cli, (uintmax_t)MUX_INITIAL_SEND_WINDOW * 4);
+	estimator_add(fx.cli, (uint_least64_t)MUX_INITIAL_SEND_WINDOW * 4);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
 	if (!fx.cli->estimator.ping_in_flight) {
 		T_FATAL("estimator did not queue ping frame");
 		goto cleanup;
 	}
 	/* Back-date the timestamp by 1 ms so the measured RTT is positive. */
-	if (fx.cli->estimator.probe_sent_ns <= 1000000) {
+	if (fx.cli->estimator.last_probe_ns <= 1000000) {
 		T_FATAL("invalid estimator timestamp");
 		goto cleanup;
 	}
-	fx.cli->estimator.probe_sent_ns -= 1000000;
-	const intmax_t sent_ns = fx.cli->estimator.probe_sent_ns;
+	fx.cli->estimator.last_probe_ns -= 1000000;
+	const intmax_t sent_ns = fx.cli->estimator.last_probe_ns;
 
 	const struct mux_header hdr = {
 		.version = MUX_PROTOCOL_VERSION,
@@ -3703,13 +3706,8 @@ T_DECLARE_CASE(test_bdp_manual_window_mode_no_estimator_effect)
 	T_EXPECT_EQ(fx.cli->session_window, fixed_session);
 	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
 
-	/* estimator_add must return early because auto_stream_window is clear. */
-	estimator_add(
-		fx.cli,
-		(uintmax_t)fixed_session * (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
-
-	/* Windows must remain at their configured values. */
+	/* dispatch.c guards estimator_add with auto_stream_window; session and
+	 * stream windows must remain at their configured values. */
 	T_EXPECT_EQ(fx.cli->session_window, fixed_session);
 	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
 
@@ -3749,12 +3747,8 @@ T_DECLARE_CASE(test_bdp_auto_session_window_without_auto_stream_window)
 	T_EXPECT(fx.cli->auto_session_window);
 	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
 
-	/* estimator_add must return early because auto_stream_window is false;
-	 * no PING should be queued and stream_window must remain fixed. */
-	estimator_add(
-		fx.cli,
-		(uintmax_t)fixed_stream * (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
+	/* dispatch.c guards estimator_add with auto_stream_window; stream_window
+	 * must remain at its configured value. */
 	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
 
 	/* session_update_session_window must still update session_window to
@@ -3878,7 +3872,7 @@ T_DECLARE_CASE(test_bdp_ping_queued_before_send_progress)
 	}
 
 	bdp_enable_auto_windows(fx.cli);
-	estimator_add(fx.cli, (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
+	estimator_add(fx.cli, (uint_least64_t)MUX_MAX_PAYLOAD_SIZE);
 
 	T_EXPECT_EQ(
 		estimator_window_size(&fx.cli->estimator),
@@ -3887,7 +3881,7 @@ T_DECLARE_CASE(test_bdp_ping_queued_before_send_progress)
 		fx.cli->estimator.sample, (uint_least32_t)MUX_MAX_PAYLOAD_SIZE);
 	T_EXPECT(fx.cli->wire.oobbuf.head != NULL);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
-	T_EXPECT(fx.cli->estimator.probe_sent_ns > 0);
+	T_EXPECT(fx.cli->estimator.last_probe_ns > 0);
 
 cleanup:
 	fixture_teardown(&fx);
@@ -3952,7 +3946,7 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
 	T_EXPECT(ret == 0);
-	T_EXPECT(fx.cli->estimator.rtt_ewma.ready);
+	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_SMALL);
 	if (ts->recv_len == PAYLOAD_SMALL) {
@@ -4019,12 +4013,12 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 	const int cycle_ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
 	T_EXPECT(cycle_ret == 0);
-	T_EXPECT(fx.cli->estimator.rtt_ewma.ready);
+	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
 
 	/* Clear last_probe_ns to bypass the send-side rate limit so that the
 	 * second estimator_add immediately queues a PING for the stop test. */
 	fx.cli->estimator.last_probe_ns = 0;
-	estimator_add(fx.cli, (uintmax_t)MUX_MAX_PAYLOAD_SIZE);
+	estimator_add(fx.cli, (uint_least64_t)MUX_MAX_PAYLOAD_SIZE);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
 
 	/* Simulate the stop-path: set window target to a known value; estimator
@@ -4040,9 +4034,9 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 		3u * (size_t)MUX_INITIAL_SEND_WINDOW);
 	T_EXPECT_EQ(fx.cli->stream_window, 3u * initial_frames / 2u);
 	/* Learned state is preserved after stop. */
-	T_EXPECT(fx.cli->estimator.rtt_ewma.ready);
+	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
-	T_EXPECT(fx.cli->estimator.probe_sent_ns != 0);
+	T_EXPECT(fx.cli->estimator.last_probe_ns != 0);
 
 cleanup:
 	free(payload);
@@ -4154,6 +4148,49 @@ cleanup:
 }
 
 /* -------------------------------------------------------------------------
+ * test_drain_rejects_new_streams: mux_open_stream must return NULL after
+ * mux_drain is called while a stream is open (so state stays ESTABLISHED
+ * and the draining flag is what gates the rejection).
+ * ---------------------------------------------------------------------- */
+T_DECLARE_CASE(test_drain_rejects_new_streams)
+{
+	struct mux_test_fixture fx;
+	if (fixture_setup(&fx) != 0) {
+		T_FATAL("fixture_setup failed");
+		return;
+	}
+
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
+		    &fx) != 0) {
+		T_FATAL("sessions did not establish");
+		goto cleanup;
+	}
+
+	/* Open a stream to hold the session in ESTABLISHED during drain,
+	 * ensuring the draining check in session_open_stream is exercised. */
+	struct mux_stream *s = mux_open_stream(fx.cli);
+	if (s == NULL) {
+		T_FATAL("mux_open_stream returned NULL");
+		goto cleanup;
+	}
+	struct test_stream *ts = test_stream_new(&fx, s);
+	if (ts == NULL) {
+		T_FATAL("test_stream_new failed");
+		goto cleanup;
+	}
+	fx.cli_streams[fx.n_cli_streams++] = ts;
+	mux_stream_io_start(fx.loop, &ts->w_io);
+
+	mux_drain(fx.cli);
+
+	T_EXPECT(mux_open_stream(fx.cli) == NULL);
+
+cleanup:
+	fixture_teardown(&fx);
+}
+
+/* -------------------------------------------------------------------------
  * main
  * ---------------------------------------------------------------------- */
 
@@ -4205,6 +4242,7 @@ int main(void)
 	T_RUN_CASE(t, test_bdp_ping_sent);
 	T_RUN_CASE(t, test_bdp_stop_halves_stream_window);
 	T_RUN_CASE(t, test_send_queue_saturates_read_credit);
+	T_RUN_CASE(t, test_drain_rejects_new_streams);
 
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -69,7 +69,7 @@ static void print_usage(const char *argv0)
 		"                             (default: rsa)\n"
 		"  --keysize <bits>           key size (RSA: 4096, ECDSA: 256/384/521)\n"
 		"\n"
-#endif
+#endif /* WITH_OPENSSL */
 	);
 	(void)fflush(stderr);
 }
@@ -170,7 +170,7 @@ static void parse_args(const int argc, char *const *argv)
 			args.keysize = (int)val;
 			continue;
 		}
-#endif
+#endif /* WITH_OPENSSL */
 		if (strcmp(argv[i], "--") == 0) {
 			break;
 		}
@@ -185,10 +185,10 @@ static void parse_args(const int argc, char *const *argv)
 
 int main(int argc, char **argv)
 {
-	init(argc, argv);
+	util_init(argc, argv);
 	parse_args(argc, argv);
 	slog_setlevel(args.loglevel);
-	loadlibs();
+	util_loadlibs();
 
 #if WITH_OPENSSL
 	if (args.gencerts != NULL) {
@@ -201,7 +201,7 @@ int main(int argc, char **argv)
 		}
 		return EXIT_SUCCESS;
 	}
-#endif
+#endif /* WITH_OPENSSL */
 
 	if (args.conf_path == NULL && !args.dump_config) {
 		LOGF("config file must be specified");
@@ -306,18 +306,16 @@ int main(int argc, char **argv)
 		drop_privileges(user_name);
 	}
 
-	/* Run event loop */
 	LOGI("entering event loop");
-	(void)systemd_notify(SYSTEMD_STATE_READY);
+	(void)systemd_notify(DAEMON_SYSTEMD_STATE_READY);
 	ev_run(loop, 0);
 
-	/* Cleanup */
 	LOGI("shutting down");
 
 	server_stop(server);
 	server_free(server);
 
-	unloadlibs();
+	util_unloadlibs();
 	conf_free(conf);
 
 	LOGD("program terminated normally");

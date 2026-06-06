@@ -81,13 +81,6 @@ static struct tls_conn_impl *tls_conn_raw(struct tls_connection *restrict conn)
 		}                                                              \
 	} while (0)
 
-void tls_secure_erase(void *ptr, size_t len)
-{
-	if (ptr != NULL && len > 0) {
-		mbedtls_platform_zeroize(ptr, len);
-	}
-}
-
 const char *tls_version(void)
 {
 	return "mbedTLS " MBEDTLS_VERSION_STRING;
@@ -399,6 +392,13 @@ static struct tls_context *tls_ctx_init(
 	}
 
 	return ctx;
+}
+
+void tls_secure_erase(void *ptr, size_t len)
+{
+	if (ptr != NULL && len > 0) {
+		mbedtls_platform_zeroize(ptr, len);
+	}
 }
 
 struct tls_context *tls_ctx_server(

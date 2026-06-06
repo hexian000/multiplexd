@@ -63,13 +63,6 @@ static struct tls_context *tls_ctx_new(const SSL_METHOD *method)
 		}                                                              \
 	} while (0)
 
-void tls_secure_erase(void *ptr, size_t len)
-{
-	if (ptr != NULL && len > 0) {
-		OPENSSL_cleanse(ptr, len);
-	}
-}
-
 const char *tls_version(void)
 {
 	return "OpenSSL " OPENSSL_VERSION_STR;
@@ -280,6 +273,13 @@ bool tls_load_authcerts(
 		}
 	}
 	return true;
+}
+
+void tls_secure_erase(void *ptr, size_t len)
+{
+	if (ptr != NULL && len > 0) {
+		OPENSSL_cleanse(ptr, len);
+	}
 }
 
 struct tls_context *tls_ctx_server(

@@ -10,16 +10,15 @@
 #include "utils/minmax.h"
 
 #include <assert.h>
+#if HASHTABLE_LOG
+#include <inttypes.h>
+#include <stdio.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if HASHTABLE_LOG
-#include <inttypes.h>
-#include <stdio.h>
-#endif
 
 /* start from 2^4 */
 static const size_t capacity_list[] = {
@@ -83,7 +82,7 @@ static uint_fast32_t default_hash(const void *key, const uint_fast32_t seed)
 	return cityhash64low_32(k->data, k->len, seed);
 }
 
-static bool default_eq(const void *a, const void *b)
+static bool default_eq(const void *restrict a, const void *restrict b)
 {
 	const struct hashkey *ka = a;
 	const struct hashkey *kb = b;
@@ -96,7 +95,7 @@ static uint_fast32_t str_hash(const void *key, const uint_fast32_t seed)
 	return luahash(s, strlen(s), seed);
 }
 
-static bool str_eq(const void *a, const void *b)
+static bool str_eq(const void *restrict a, const void *restrict b)
 {
 	return strcmp((const char *)a, (const char *)b) == 0;
 }
@@ -108,7 +107,7 @@ static uint_fast32_t ptr_hash(const void *key, const uint_fast32_t seed)
 	return cityhash64low_32(buf, sizeof(buf), seed);
 }
 
-static bool ptr_eq(const void *a, const void *b)
+static bool ptr_eq(const void *restrict a, const void *restrict b)
 {
 	return a == b;
 }
@@ -182,7 +181,7 @@ static inline void table_rehash(struct hashtable *restrict table)
 		const uint_fast32_t hash =
 			table->hash_fn(p->key, seed) & UINT32_MAX;
 		const size_t bucket = hash % capacity;
-		p->hash = (uint_least32_t)hash;
+		p->hash = hash;
 		p->next = table->p[bucket].bucket;
 		table->p[bucket].bucket = i;
 	}
@@ -243,7 +242,7 @@ static inline void table_reseed(struct hashtable *restrict table)
 	table->seed = (uint_least32_t)rand64n(UINT32_MAX);
 #if HASHTABLE_LOG
 	(void)fprintf(
-		stderr, "table reseed: size=%zu new_seed=%" PRIX32 "\n",
+		stderr, "table reseed: size=%zu new_seed=%" PRIXLEAST32 "\n",
 		table->size, table->seed);
 #endif
 	table_compact(table);
@@ -366,7 +365,7 @@ table_set(struct hashtable *restrict table, const void *key, void **element)
 
 	struct hash_element *restrict p = &table->p[index];
 	p->valid = true;
-	p->hash = (uint_least32_t)hash;
+	p->hash = hash;
 	p->key = key;
 	p->element = *element;
 	elemid_type *old_bucket = &table->p[bucket].bucket;

@@ -6,7 +6,6 @@
 #include "mux/stream.h"
 
 #include "algo/hashtable.h"
-
 #include "utils/testing.h"
 
 #include <stdbool.h>
@@ -38,7 +37,9 @@ static uint_fast32_t g_last_window_inc;
 static int g_stream_start_calls;
 static int g_stream_recv_fin_calls;
 static int g_estimator_add_calls;
-static uintmax_t g_last_estimator_bytes;
+static uint_least64_t g_last_estimator_bytes;
+static bool g_estimator_add_resets_recvbuf;
+static int g_flush_oob_calls;
 static struct mux_stream *g_sched_find_stream;
 
 static void dispatch_test_reset(void)
@@ -65,6 +66,8 @@ static void dispatch_test_reset(void)
 	g_stream_recv_fin_calls = 0;
 	g_estimator_add_calls = 0;
 	g_last_estimator_bytes = 0;
+	g_estimator_add_resets_recvbuf = false;
+	g_flush_oob_calls = 0;
 	g_sched_find_stream = NULL;
 }
 
@@ -155,6 +158,17 @@ void session_recv_pong(
 void session_update_session_window(struct mux_session *restrict ss)
 {
 	(void)ss;
+}
+
+void session_flush(struct mux_session *restrict ss)
+{
+	(void)ss;
+}
+
+void session_flush_oob(struct mux_session *restrict ss)
+{
+	(void)ss;
+	g_flush_oob_calls++;
 }
 
 bool handshake_process_hello(
@@ -257,11 +271,14 @@ void stream_recv_fin(struct mux_stream *s)
 	g_stream_recv_fin_calls++;
 }
 
-void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
+void estimator_add(struct mux_session *restrict ss, const uint_least64_t bytes)
 {
-	(void)ss;
 	g_estimator_add_calls++;
 	g_last_estimator_bytes = bytes;
+	if (g_estimator_add_resets_recvbuf) {
+		ringbuf_reset(ss->wire.recvbuf);
+		ss->state = SESSION_CLOSED;
+	}
 }
 
 static struct mux_session make_session(const bool accepted)
@@ -804,6 +821,88 @@ T_DECLARE_CASE(test_dispatch_by_stream_syn_ack_retransmit_on_established)
 	ringbuf_free(ss.wire.recvbuf);
 }
 
+T_DECLARE_CASE(test_dispatch_by_stream_push_calls_estimator_when_auto)
+{
+	struct mux_session ss = make_session(false);
+	ss.auto_stream_window = true;
+	struct mux_frame frame = { 0 };
+	struct mux_stream s = {
+		.id = 2,
+		.state = STREAM_ESTABLISHED,
+		.send_window = MUX_DEFAULT_SEND_WINDOW,
+	};
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_PUSH,
+		.length = 100,
+		.stream_id = 2,
+		.extra = 0,
+	};
+
+	dispatch_test_reset();
+	fill_frame(&frame, &ss, &hdr);
+	dispatch_by_stream(&ss, &s, &hdr);
+	T_EXPECT_EQ(g_estimator_add_calls, 1);
+	T_EXPECT_EQ(g_last_estimator_bytes, (uint_least64_t)100);
+	ringbuf_free(ss.wire.recvbuf);
+}
+
+T_DECLARE_CASE(test_dispatch_by_stream_push_skips_estimator_without_auto)
+{
+	struct mux_session ss = make_session(false);
+	ss.auto_stream_window = false;
+	struct mux_frame frame = { 0 };
+	struct mux_stream s = {
+		.id = 2,
+		.state = STREAM_ESTABLISHED,
+		.send_window = MUX_DEFAULT_SEND_WINDOW,
+	};
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_PUSH,
+		.length = 100,
+		.stream_id = 2,
+		.extra = 0,
+	};
+
+	dispatch_test_reset();
+	fill_frame(&frame, &ss, &hdr);
+	dispatch_by_stream(&ss, &s, &hdr);
+	T_EXPECT_EQ(g_estimator_add_calls, 0);
+	ringbuf_free(ss.wire.recvbuf);
+}
+
+T_DECLARE_CASE(test_dispatch_by_stream_push_estimator_suspend_safe)
+{
+	/* Regression: estimator_add called before ringbuf_consume caused a crash
+	 * when a PING timeout inside estimator_add synchronously called
+	 * session_suspend, which resets wire.recvbuf.  The fix is to consume the
+	 * frame first; estimator_add runs after the frame is retired. */
+	struct mux_session ss = make_session(false);
+	ss.auto_stream_window = true;
+	struct mux_frame frame = { 0 };
+	struct mux_stream s = {
+		.id = 2,
+		.state = STREAM_ESTABLISHED,
+		.send_window = MUX_DEFAULT_SEND_WINDOW,
+	};
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_PUSH,
+		.length = 100,
+		.stream_id = 2,
+		.extra = 0,
+	};
+
+	dispatch_test_reset();
+	g_estimator_add_resets_recvbuf = true;
+	fill_frame(&frame, &ss, &hdr);
+	dispatch_by_stream(&ss, &s, &hdr);
+	T_EXPECT_EQ(g_estimator_add_calls, 1);
+	T_EXPECT_EQ(ringbuf_readable(ss.wire.recvbuf), (size_t)0);
+	ringbuf_free(ss.wire.recvbuf);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -830,5 +929,9 @@ int main(void)
 	T_RUN_CASE(t, test_dispatch_by_stream_syn_ack_starts_stream);
 	T_RUN_CASE(
 		t, test_dispatch_by_stream_syn_ack_retransmit_on_established);
+	T_RUN_CASE(t, test_dispatch_by_stream_push_calls_estimator_when_auto);
+	T_RUN_CASE(
+		t, test_dispatch_by_stream_push_skips_estimator_without_auto);
+	T_RUN_CASE(t, test_dispatch_by_stream_push_estimator_suspend_safe);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

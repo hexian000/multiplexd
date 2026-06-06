@@ -10,7 +10,6 @@
 #define MUX_H
 
 #include <ev.h>
-#include <sys/socket.h>
 
 #if WITH_THREADS
 #include <stdatomic.h>
@@ -18,6 +17,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 struct mux_callbacks;
 struct mux_frame;
@@ -60,17 +60,17 @@ size_t mux_frame_object_size(void);
 /* Traffic byte counters; embedded in mux_session_counters. */
 struct mux_traffic_counters {
 #if WITH_THREADS
-	atomic_uintmax_t *byt_mux_recv;
-	atomic_uintmax_t *byt_mux_sent;
+	atomic_uint_least64_t *byt_mux_recv;
+	atomic_uint_least64_t *byt_mux_sent;
 	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
-	atomic_uintmax_t *byt_push_recv;
-	atomic_uintmax_t *byt_push_sent;
+	atomic_uint_least64_t *byt_push_recv;
+	atomic_uint_least64_t *byt_push_sent;
 #else
-	uintmax_t *byt_mux_recv;
-	uintmax_t *byt_mux_sent;
+	uint_least64_t *byt_mux_recv;
+	uint_least64_t *byt_mux_sent;
 	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
-	uintmax_t *byt_push_recv;
-	uintmax_t *byt_push_sent;
+	uint_least64_t *byt_push_recv;
+	uint_least64_t *byt_push_sent;
 #endif
 };
 
@@ -80,46 +80,46 @@ struct mux_traffic_counters {
  * NULL pointers are silently skipped by COUNTER_*. */
 struct mux_session_counters {
 #if WITH_THREADS
-	atomic_uintmax_t *num_session_created;
-	atomic_uintmax_t *num_session_connect;
-	atomic_uintmax_t *num_session_connected;
-	atomic_uintmax_t *num_session_disconnected;
-	atomic_uintmax_t *num_session_finalized;
+	atomic_uint_least64_t *num_session_created;
+	atomic_uint_least64_t *num_session_connect;
+	atomic_uint_least64_t *num_session_connected;
+	atomic_uint_least64_t *num_session_disconnected;
+	atomic_uint_least64_t *num_session_finalized;
 	atomic_size_t *num_sessions;
 	atomic_size_t *num_session_halfopen;
 	atomic_size_t *num_streams;
 	atomic_size_t *num_stream_halfopen;
-	atomic_uintmax_t *num_stream_opened;
-	atomic_uintmax_t *num_stream_accepted;
-	atomic_uintmax_t *num_stream_fastopen;
-	atomic_uintmax_t *num_stream_established;
-	atomic_uintmax_t *num_stream_succeeded;
-	atomic_uintmax_t *num_stream_failed;
-	atomic_uintmax_t *num_rst_sent;
-	atomic_uintmax_t *num_rst_recv;
-	atomic_uintmax_t *num_stream_errors;
+	atomic_uint_least64_t *num_stream_opened;
+	atomic_uint_least64_t *num_stream_accepted;
+	atomic_uint_least64_t *num_stream_fastopen;
+	atomic_uint_least64_t *num_stream_established;
+	atomic_uint_least64_t *num_stream_succeeded;
+	atomic_uint_least64_t *num_stream_failed;
+	atomic_uint_least64_t *num_rst_sent;
+	atomic_uint_least64_t *num_rst_recv;
+	atomic_uint_least64_t *num_stream_errors;
 	atomic_size_t *recv_buffered_bytes;
 	atomic_size_t *send_buffered_frames;
 	atomic_size_t *unacked_frames;
 #else
-	uintmax_t *num_session_created;
-	uintmax_t *num_session_connect;
-	uintmax_t *num_session_connected;
-	uintmax_t *num_session_disconnected;
-	uintmax_t *num_session_finalized;
+	uint_least64_t *num_session_created;
+	uint_least64_t *num_session_connect;
+	uint_least64_t *num_session_connected;
+	uint_least64_t *num_session_disconnected;
+	uint_least64_t *num_session_finalized;
 	size_t *num_sessions;
 	size_t *num_session_halfopen;
 	size_t *num_streams;
 	size_t *num_stream_halfopen;
-	uintmax_t *num_stream_opened;
-	uintmax_t *num_stream_accepted;
-	uintmax_t *num_stream_fastopen;
-	uintmax_t *num_stream_established;
-	uintmax_t *num_stream_succeeded;
-	uintmax_t *num_stream_failed;
-	uintmax_t *num_rst_sent;
-	uintmax_t *num_rst_recv;
-	uintmax_t *num_stream_errors;
+	uint_least64_t *num_stream_opened;
+	uint_least64_t *num_stream_accepted;
+	uint_least64_t *num_stream_fastopen;
+	uint_least64_t *num_stream_established;
+	uint_least64_t *num_stream_succeeded;
+	uint_least64_t *num_stream_failed;
+	uint_least64_t *num_rst_sent;
+	uint_least64_t *num_rst_recv;
+	uint_least64_t *num_stream_errors;
 	size_t *recv_buffered_bytes;
 	size_t *send_buffered_frames;
 	size_t *unacked_frames;
@@ -258,12 +258,10 @@ struct mux_session_stats {
 	size_t rx_window;
 	/* Per-stream send window limited by the peer, in bytes. */
 	size_t tx_window;
-	/* Windowed-minimum RTT from PING/PONG probes, in nanoseconds;
-	 * 0 when no measurement has been completed yet. */
-	intmax_t rtt;
-	/* Instantaneous BDP = bw_wnd × rtt_ewma; 0 if not yet estimated.
-	 * The effective (windowed, clamped) BDP is reflected by rx_window
-	 * and tx_window. */
+	/* Round-trip time in nanoseconds; 0 when no measurement has been
+	 * completed yet. */
+	int_least64_t rtt;
+	/* Bandwidth-delay product in bytes; 0 if not yet estimated. */
 	size_t bdp;
 };
 
@@ -349,7 +347,8 @@ union mux_event_data {
  *             return the matching mux_session, or NULL for a fresh session.
  */
 struct mux_callbacks {
-	bool (*on_accept)(void *data, struct mux_session *, struct mux_stream *);
+	bool (*on_accept)(
+		void *data, const struct mux_session *, struct mux_stream *);
 	void (*on_event)(
 		void *data, struct mux_session *, enum mux_event,
 		union mux_event_data);
@@ -411,7 +410,8 @@ uint_least16_t mux_stream_id(const struct mux_stream *s);
 
 /* Queue up to *len bytes for sending.  On return *len holds bytes queued
  * (may be less if the window is partially full, or zero when exhausted —
- * retry after EV_WRITE).  Returns -1/EINVAL when not in a writable state. */
+ * retry after EV_WRITE).  Returns -1/EINVAL when not in a writable state,
+ * -1/EAGAIN when the frame pool is exhausted before any data is queued. */
 int mux_stream_send(
 	struct mux_stream *s, const void *restrict buf, size_t *restrict len);
 

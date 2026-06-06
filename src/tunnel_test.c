@@ -1,28 +1,27 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-#include "tunnel.h"
-#include "server.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
+#include "server.h"
+#include "tunnel.h"
 
 #include "utils/testing.h"
 
-#include <arpa/inet.h>
 #include <ev.h>
+
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 static struct mux_frame *test_pool_alloc(void *data)
 {
@@ -53,14 +52,14 @@ static const struct mux_config g_conf = {
 	.session_window = 2,
 };
 
-static const struct socket_opts g_mux_socket = { .backlog = 1 };
-static const struct socket_opts g_local_socket = { .backlog = 1 };
+static const struct util_socket_opts g_mux_socket = { .backlog = 1 };
+static const struct util_socket_opts g_local_socket = { .backlog = 1 };
 
 static const struct tunnel_callbacks g_empty_cbs = { 0 };
 
 static const unsigned char g_zero_id[MUX_SESSION_ID_LEN];
 
-static uintmax_t test_num_reconnects(const struct server *srv)
+static uint_least64_t test_num_reconnects(const struct server *srv)
 {
 #if WITH_THREADS
 	return atomic_load_explicit(
@@ -71,7 +70,7 @@ static uintmax_t test_num_reconnects(const struct server *srv)
 }
 
 static bool wait_for_reconnects(
-	struct ev_loop *loop, const struct server *srv, uintmax_t minimum)
+	struct ev_loop *loop, const struct server *srv, uint_least64_t minimum)
 {
 	for (int i = 0; i < 100; i++) {
 		if (loop != NULL) {
@@ -482,9 +481,9 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 	struct tunnel_stats stats;
 	tunnel_stats(t, &stats);
 	T_EXPECT_EQ(stats.num_streams, (size_t)0);
-	T_EXPECT_EQ(stats.num_stream_opened, (uintmax_t)0);
-	T_EXPECT_EQ(stats.byt_mux_recv, (uintmax_t)0);
-	T_EXPECT_EQ(stats.byt_mux_sent, (uintmax_t)0);
+	T_EXPECT_EQ(stats.num_stream_opened, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.byt_mux_recv, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.byt_mux_sent, (uint_least64_t)0);
 
 	tunnel_close(t);
 
@@ -492,6 +491,285 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 	ev_loop_destroy(loop);
 #endif
 }
+
+/* -------------------------------------------------------------------------
+ * Multi-threaded concurrency tests (WITH_THREADS only)
+ * ---------------------------------------------------------------------- */
+
+#if WITH_THREADS
+
+#include <stdatomic.h>
+#include <threads.h>
+
+#include "sync/dispatcher.h"
+#include "sync/queue.h"
+#include "sync/shared_mutex.h"
+#include "sync/task.h"
+
+/* Inline concurrency helpers */
+
+struct test_barrier {
+	mtx_t mu;
+	cnd_t cv;
+	atomic_uint count;
+	unsigned int total;
+};
+
+static void test_barrier_init(struct test_barrier *b, unsigned int n)
+{
+	mtx_init(&b->mu, mtx_plain);
+	cnd_init(&b->cv);
+	atomic_init(&b->count, 0);
+	b->total = n;
+}
+
+static void test_barrier_destroy(struct test_barrier *b)
+{
+	mtx_destroy(&b->mu);
+	cnd_destroy(&b->cv);
+}
+
+static void test_barrier_wait(struct test_barrier *b)
+{
+	mtx_lock(&b->mu);
+	const unsigned int n = atomic_fetch_add(&b->count, 1u) + 1u;
+	if (n == b->total) {
+		atomic_store(&b->count, 0u);
+		cnd_broadcast(&b->cv);
+	} else {
+		cnd_wait(&b->cv, &b->mu);
+	}
+	mtx_unlock(&b->mu);
+}
+
+typedef int (*test_thread_fn)(void *);
+
+static int test_spawn_thread(thrd_t *thr, test_thread_fn fn, void *arg)
+{
+	return thrd_create(thr, fn, arg);
+}
+
+static int test_thread_join(thrd_t thr)
+{
+	int ret = 0;
+	(void)thrd_join(thr, &ret);
+	return ret;
+}
+
+/* Test: dispatcher roundtrip */
+
+struct dispatcher_ctx {
+	struct test_barrier *barrier;
+	struct dispatcher *disp;
+	int *result;
+};
+
+static void dispatcher_task_cb(void *p)
+{
+	int *result = p;
+	*result = 42;
+}
+
+static int dispatcher_worker(void *arg)
+{
+	struct dispatcher_ctx *const ctx = arg;
+	test_barrier_wait(ctx->barrier);
+	struct task t = { .func = dispatcher_task_cb, .data = ctx->result };
+	if (!dispatcher_invoke(ctx->disp, t)) {
+		return 1;
+	}
+	return 0;
+}
+
+T_DECLARE_CASE(test_dispatcher_roundtrip)
+{
+	struct test_barrier barrier;
+	test_barrier_init(&barrier, 2);
+	struct dispatcher *disp = dispatcher_create(4);
+	T_CHECK(disp != NULL);
+	int result = 0;
+	struct dispatcher_ctx ctx = { .barrier = &barrier,
+				      .disp = disp,
+				      .result = &result };
+	thrd_t thr;
+	T_EXPECT_EQ(
+		test_spawn_thread(&thr, dispatcher_worker, &ctx), thrd_success);
+	test_barrier_wait(&barrier);
+	thrd_yield();
+	dispatcher_tick(disp);
+	T_EXPECT_EQ(test_thread_join(thr), 0);
+	T_EXPECT_EQ(result, 42);
+	dispatcher_join(disp);
+	test_barrier_destroy(&barrier);
+}
+
+/* Test: shared_mutex multiple readers */
+
+struct smtx_ctx {
+	smtx_t *mu;
+	struct test_barrier *start_barrier;
+	struct test_barrier *done_barrier;
+	atomic_int *counter;
+};
+
+static int smtx_reader(void *arg)
+{
+	struct smtx_ctx *const ctx = arg;
+	test_barrier_wait(ctx->start_barrier);
+	if (smtx_sharedlock(ctx->mu) != thrd_success) {
+		return 1;
+	}
+	atomic_fetch_add(ctx->counter, 1);
+	test_barrier_wait(ctx->done_barrier);
+	smtx_sharedunlock(ctx->mu);
+	return 0;
+}
+
+T_DECLARE_CASE(test_shared_mutex_multiple_readers)
+{
+	smtx_t mu;
+	T_EXPECT_EQ(smtx_init(&mu), 0);
+	struct test_barrier start_barrier, done_barrier;
+	test_barrier_init(&start_barrier, 3);
+	test_barrier_init(&done_barrier, 3);
+	atomic_int counter;
+	atomic_init(&counter, 0);
+	struct smtx_ctx ctx = { .mu = &mu,
+				.start_barrier = &start_barrier,
+				.done_barrier = &done_barrier,
+				.counter = &counter };
+	thrd_t r1, r2;
+	T_EXPECT_EQ(test_spawn_thread(&r1, smtx_reader, &ctx), thrd_success);
+	T_EXPECT_EQ(test_spawn_thread(&r2, smtx_reader, &ctx), thrd_success);
+	test_barrier_wait(&start_barrier);
+	test_barrier_wait(&done_barrier);
+	T_EXPECT_EQ(atomic_load(&counter), 2);
+	T_EXPECT_EQ(test_thread_join(r1), 0);
+	T_EXPECT_EQ(test_thread_join(r2), 0);
+	smtx_destroy(&mu);
+	test_barrier_destroy(&start_barrier);
+	test_barrier_destroy(&done_barrier);
+}
+
+T_DECLARE_CASE(test_shared_mutex_exclusive_blocks_readers)
+{
+	smtx_t mu;
+	T_EXPECT_EQ(smtx_init(&mu), 0);
+	T_EXPECT_EQ(smtx_lock(&mu), thrd_success);
+	T_EXPECT(smtx_trysharedlock(&mu) != thrd_success);
+	smtx_unlock(&mu);
+	T_EXPECT_EQ(smtx_sharedlock(&mu), thrd_success);
+	smtx_sharedunlock(&mu);
+	smtx_destroy(&mu);
+}
+
+/* Test: mpmc_queue concurrent push/pop */
+
+struct mqueue_ctx {
+	struct mpmc_queue *q;
+	struct test_barrier *barrier;
+	atomic_bool *done; /* shared: producer sets true when finished */
+	int *items;
+	int count;
+};
+
+static int mqueue_producer(void *arg)
+{
+	struct mqueue_ctx *const ctx = arg;
+	test_barrier_wait(ctx->barrier);
+	for (int i = 0; i < ctx->count; i++) {
+		if (!mqueue_push(ctx->q, &ctx->items[i])) {
+			return 1;
+		}
+	}
+	atomic_store(ctx->done, true);
+	return 0;
+}
+
+static int mqueue_consumer(void *arg)
+{
+	struct mqueue_ctx *const ctx = arg;
+	test_barrier_wait(ctx->barrier);
+	int received = 0;
+	while (received < ctx->count) {
+		void *p = mqueue_pop(ctx->q);
+		if (p != NULL) {
+			received++;
+			continue;
+		}
+		if (atomic_load(ctx->done)) {
+			break; /* producer finished, queue drained */
+		}
+	}
+	return (received == ctx->count) ? 0 : 2;
+}
+
+T_DECLARE_CASE(test_mpmc_queue_concurrent_push_pop)
+{
+	enum { item_count = 100 };
+	struct mpmc_queue *q = mqueue_new(256);
+	T_CHECK(q != NULL);
+	struct test_barrier barrier;
+	test_barrier_init(&barrier, 3);
+	atomic_bool done;
+	atomic_init(&done, false);
+	int items[item_count];
+	for (int i = 0; i < item_count; i++) {
+		items[i] = i + 1;
+	}
+	struct mqueue_ctx pctx = { .q = q,
+				   .barrier = &barrier,
+				   .done = &done,
+				   .items = items,
+				   .count = item_count };
+	struct mqueue_ctx cctx = { .q = q,
+				   .barrier = &barrier,
+				   .done = &done,
+				   .items = items,
+				   .count = item_count };
+	thrd_t producer, consumer;
+	T_EXPECT_EQ(
+		test_spawn_thread(&producer, mqueue_producer, &pctx),
+		thrd_success);
+	T_EXPECT_EQ(
+		test_spawn_thread(&consumer, mqueue_consumer, &cctx),
+		thrd_success);
+	test_barrier_wait(&barrier);
+	T_EXPECT_EQ(test_thread_join(producer), 0);
+	T_EXPECT_EQ(test_thread_join(consumer), 0);
+	mqueue_free(q);
+	test_barrier_destroy(&barrier);
+}
+
+/* Test: atomic counters cross-thread */
+
+static int atomic_worker(void *arg)
+{
+	atomic_uint_least64_t *const cnt = arg;
+	for (int i = 0; i < 10000; i++) {
+		atomic_fetch_add_explicit(cnt, 1, memory_order_relaxed);
+	}
+	return 0;
+}
+
+T_DECLARE_CASE(test_atomic_counters_cross_thread)
+{
+	atomic_uint_least64_t counter;
+	atomic_init(&counter, 0);
+	thrd_t t1, t2, t3;
+	T_EXPECT_EQ(
+		test_spawn_thread(&t1, atomic_worker, &counter), thrd_success);
+	T_EXPECT_EQ(
+		test_spawn_thread(&t2, atomic_worker, &counter), thrd_success);
+	T_EXPECT_EQ(
+		test_spawn_thread(&t3, atomic_worker, &counter), thrd_success);
+	T_EXPECT_EQ(test_thread_join(t1), 0);
+	T_EXPECT_EQ(test_thread_join(t2), 0);
+	T_EXPECT_EQ(test_thread_join(t3), 0);
+	T_EXPECT_EQ(atomic_load(&counter), (uint_least64_t)30000);
+}
+
+#endif /* WITH_THREADS */
 
 int main(void)
 {
@@ -503,5 +781,12 @@ int main(void)
 	T_RUN_CASE(t, test_tunnel_reconnect_after_connect_timeout);
 	T_RUN_CASE(t, test_tunnel_state_returns_connecting_after_new);
 	T_RUN_CASE(t, test_tunnel_stats_initial_zero);
+#if WITH_THREADS
+	T_RUN_CASE(t, test_dispatcher_roundtrip);
+	T_RUN_CASE(t, test_shared_mutex_multiple_readers);
+	T_RUN_CASE(t, test_shared_mutex_exclusive_blocks_readers);
+	T_RUN_CASE(t, test_mpmc_queue_concurrent_push_pop);
+	T_RUN_CASE(t, test_atomic_counters_cross_thread);
+#endif
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

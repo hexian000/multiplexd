@@ -18,14 +18,12 @@
 #include "algo/hashtable.h"
 #include "codec/base64.h"
 #include "net/mime.h"
-
 #include "utils/debug.h"
 #include "utils/serialize.h"
 #include "utils/slog.h"
 
 #include <errno.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -52,7 +50,7 @@ static int proto_hello_build(
 			MUX_SESSION_ID_LEN);
 		id_b64[SESSION_ID_B64] = '\0';
 	}
-	/* Strings in raw are borrowed; do not call json_proto_free(). */
+	/* Strings in raw are borrowed; do not call json_free_proto(). */
 	const struct json_proto raw = {
 		.type = { .str = (char *)PROTO_TYPE, .len = sizeof(PROTO_TYPE) - 1 },
 		.msgid = msg->msgid,
@@ -73,7 +71,7 @@ static int proto_hello_build(
 			},
 		},
 	};
-	const int json_sz = json_proto_marshal(NULL, 0, &raw);
+	const int json_sz = json_marshal_proto(NULL, 0, &raw);
 	if (json_sz <= 0 || (size_t)json_sz > MUX_MAX_PAYLOAD_SIZE) {
 		return -1;
 	}
@@ -81,7 +79,7 @@ static int proto_hello_build(
 	if (total <= buf_size) {
 		ASSERT((size_t)json_sz <= MUX_MAX_PAYLOAD_SIZE);
 		char json_buf[(size_t)json_sz + 1];
-		(void)json_proto_marshal(json_buf, (size_t)json_sz + 1, &raw);
+		(void)json_marshal_proto(json_buf, (size_t)json_sz + 1, &raw);
 		const struct mux_header hdr = {
 			.version = 0,
 			.flags = 0,
@@ -162,19 +160,19 @@ static bool proto_hello_parse(
 	char json_buf[json_len + 1];
 	memcpy(json_buf, json, json_len);
 	struct json_proto obj = { 0 };
-	if (!json_proto_unmarshal(&obj, json_buf, json_len)) {
+	if (!json_unmarshal_proto(&obj, json_buf, json_len)) {
 		LOGE("malformed protocol hello");
-		json_proto_free(&obj);
+		json_free_proto(&obj);
 		return false;
 	}
 
 	if (obj.type.str == NULL) {
 		LOGE("protocol hello: missing type");
-		json_proto_free(&obj);
+		json_free_proto(&obj);
 		return false;
 	}
 	if (!proto_parse_type(obj.type.str, &out->version)) {
-		json_proto_free(&obj);
+		json_free_proto(&obj);
 		return false;
 	}
 	out->msgid = (int)obj.msgid;
@@ -183,7 +181,7 @@ static bool proto_hello_parse(
 	if (obj.session_id.str != NULL &&
 	    !proto_parse_session_id(obj.session_id.str, out->session_id)) {
 		LOGE("protocol hello: invalid session_id");
-		json_proto_free(&obj);
+		json_free_proto(&obj);
 		return false;
 	}
 	out->has_session_id = obj.session_id.str != NULL;
@@ -196,13 +194,13 @@ static bool proto_hello_parse(
 		const size_t id_len = obj.extensions.identity.len;
 		if (id_len >= sizeof(out->identity)) {
 			LOGE("protocol hello: identity too long");
-			json_proto_free(&obj);
+			json_free_proto(&obj);
 			return false;
 		}
 		out->has_identity = true;
 		memcpy(out->identity, obj.extensions.identity.str, id_len + 1);
 	}
-	json_proto_free(&obj);
+	json_free_proto(&obj);
 	return true;
 }
 
@@ -269,6 +267,9 @@ bool handshake_enqueue_hello(
 	ASSERT(ss->wire.sendbuf.head == NULL);
 	mux_frame_list_push(&ss->wire.sendbuf, frame);
 	ss->wire.tx_pending = true;
+	if (include_resume_seq) {
+		ss->ack_seq = ss->recv_seq;
+	}
 	return true;
 }
 
@@ -332,10 +333,8 @@ static bool handshake_client_fresh(
 		session_reset(ss);
 		return false;
 	}
-	mux_frame_list_clear(&ss->unacked, &ss->pool);
-	COUNTER_SUB(ss->cnt.unacked_frames, ss->unacked_frames);
-	ss->unacked_frames = 0;
-	ss->retransmit_cursor = NULL;
+	unacked_ring_free_all(ss);
+	ss->retransmit_copy = NULL;
 	ss->send_seq = 0;
 	ss->recv_seq = 0;
 	ss->ack_seq = 0;
@@ -460,8 +459,9 @@ bool handshake_process_hello(
 		return false;
 	}
 	session_handshake_done(ss);
-	/* If resuming, start retransmitting from the cursor after handshake. */
-	if (ss->retransmit_cursor != NULL) {
+	/* If resuming, start retransmitting from the head after handshake. */
+	if (ss->unacked != NULL && ss->unacked->count > 0) {
+		ss->retransmit_off = 0;
 		ss->wire.tx_pending = true;
 		session_update_watcher(ss);
 	}

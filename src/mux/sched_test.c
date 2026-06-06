@@ -296,7 +296,7 @@ T_DECLARE_CASE(test_sched_wake_enqueues_only_once)
 	sched_wake(&ss, &stream);
 	T_EXPECT(ss.sched.sched_head == &stream);
 	T_EXPECT(ss.sched.sched_tail == &stream);
-	T_EXPECT(stream.is_ready);
+	T_EXPECT(stream.sched_queue == SCHED_QUEUE_DRR);
 	T_EXPECT(ss.wire.tx_pending);
 	T_EXPECT_EQ(g_update_watcher_calls, 2);
 
@@ -444,10 +444,156 @@ T_DECLARE_CASE(test_sched_coalesce_forces_session_ack_after_tick_budget)
 	cleanup_session(&ss);
 }
 
+/* -------------------------------------------------------------------------
+ * Stream ID boundary tests
+ * ---------------------------------------------------------------------- */
+
+T_DECLARE_CASE(test_stream_id_exhaustion)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+	ss.accepted = false;
+	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
+	cleanup_session(&ss);
+}
+
+T_DECLARE_CASE(test_stream_id_wraparound_client)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+	ss.accepted = false;
+	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
+	/* Free slot for ID 65535: index = 65535 >> 1 = 32767. */
+	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] &=
+		~((uint_fast32_t)1u << (32767 % BITMAP_WORD_BITS));
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)65535);
+	/* Manually occupy the slot (sched_alloc_stream_id does not set bit). */
+	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] |=
+		(uint_fast32_t)1u << (32767 % BITMAP_WORD_BITS);
+	/* Now full. */
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
+	/* Free ID 1 (index 0). */
+	ss.sched.id_bitmap[0] &= ~(uint_fast32_t)1u;
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)1);
+	cleanup_session(&ss);
+}
+
+T_DECLARE_CASE(test_stream_id_wraparound_server)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+	ss.accepted = true;
+	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
+	/* Free slot for ID 65534: index = 32767. */
+	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] &=
+		~((uint_fast32_t)1u << (32767 % BITMAP_WORD_BITS));
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)65534);
+	/* Manually occupy the slot. */
+	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] |=
+		(uint_fast32_t)1u << (32767 % BITMAP_WORD_BITS);
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
+	/* Free ID 2 (index 1). */
+	ss.sched.id_bitmap[1 / BITMAP_WORD_BITS] &=
+		~((uint_fast32_t)1u << (1 % BITMAP_WORD_BITS));
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)2);
+	cleanup_session(&ss);
+}
+
+T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+	ss.accepted = false;
+	ss.conf.max_streams = 4;
+	sched_test_reset();
+
+	for (int i = 0; i < 4; i++) {
+		struct mux_stream *s = calloc(1, sizeof(*s));
+		T_CHECK(s != NULL);
+		s->id = (uint_least16_t)(i * 2 + 1);
+		s->state = STREAM_ESTABLISHED;
+		T_EXPECT(sched_add_stream(&ss, s));
+	}
+	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)4);
+	ss.sched.num_tombstones = 2;
+	/* Live count = 4 - 2 = 2 < max_streams(4), so admission OK. */
+	{
+		struct mux_stream *s = calloc(1, sizeof(*s));
+		T_CHECK(s != NULL);
+		s->id = 9;
+		s->state = STREAM_INIT;
+		T_EXPECT(sched_add_stream(&ss, s));
+	}
+	sched_free_streams(&ss);
+	cleanup_session(&ss);
+}
+
+T_DECLARE_CASE(test_stream_id_search_wraps_past_bitmap_end)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+	ss.accepted = true;
+	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
+	/* Free ID 10: index = 5. */
+	ss.sched.id_bitmap[5 / BITMAP_WORD_BITS] &=
+		~((uint_fast32_t)1u << (5 % BITMAP_WORD_BITS));
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)10);
+	cleanup_session(&ss);
+}
+
+/* -------------------------------------------------------------------------
+ * Scheduler race condition tests
+ * ---------------------------------------------------------------------- */
+
+T_DECLARE_CASE(test_sched_wake_double_enqueue_idempotent)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+	sched_test_reset();
+
+	struct mux_stream *s = calloc(1, sizeof(*s));
+	T_CHECK(s != NULL);
+	s->id = 1;
+	s->state = STREAM_ESTABLISHED;
+	T_EXPECT(sched_add_stream(&ss, s));
+	sched_wake(&ss, s);
+	T_EXPECT(s->sched_queue == SCHED_QUEUE_DRR);
+	T_EXPECT(ss.sched.sched_head == s);
+	T_EXPECT(ss.sched.sched_tail == s);
+	sched_wake(&ss, s);
+	T_EXPECT(ss.sched.sched_head == s);
+	T_EXPECT(ss.sched.sched_tail == s);
+	T_EXPECT(s->next == NULL);
+	sched_free_streams(&ss);
+	cleanup_session(&ss);
+}
+
+T_DECLARE_CASE(test_lp_queue_double_enqueue_prevented)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+	sched_test_reset();
+
+	struct mux_stream *s = calloc(1, sizeof(*s));
+	T_CHECK(s != NULL);
+	s->id = 1;
+	s->state = STREAM_INIT;
+	T_EXPECT(sched_add_stream(&ss, s));
+	sched_wake(&ss, s);
+	T_EXPECT(ss.sched.lp_head == s);
+	T_EXPECT(ss.sched.lp_tail == s);
+	sched_wake(&ss, s);
+	T_EXPECT(ss.sched.lp_head == s);
+	T_EXPECT(ss.sched.lp_tail == s);
+	T_EXPECT(s->next == NULL);
+	sched_free_streams(&ss);
+	cleanup_session(&ss);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_sched_alloc_stream_id_bitmap_nearly_full);
 	T_RUN_CASE(t, test_sched_alloc_stream_id_bitmap_nearly_full);
 	T_RUN_CASE(t, test_sched_alloc_stream_id_starts_at_minimum);
 	T_RUN_CASE(t, test_sched_add_remove_updates_table_and_idle_timeout);
@@ -461,5 +607,12 @@ int main(void)
 		test_sched_next_data_sends_frame_and_resets_deficit_on_drain);
 	T_RUN_CASE(t, test_sched_cb_sends_syn_for_init_stream);
 	T_RUN_CASE(t, test_sched_coalesce_forces_session_ack_after_tick_budget);
+	T_RUN_CASE(t, test_stream_id_exhaustion);
+	T_RUN_CASE(t, test_stream_id_wraparound_client);
+	T_RUN_CASE(t, test_stream_id_wraparound_server);
+	T_RUN_CASE(t, test_tombstone_excluded_from_max_streams);
+	T_RUN_CASE(t, test_stream_id_search_wraps_past_bitmap_end);
+	T_RUN_CASE(t, test_sched_wake_double_enqueue_idempotent);
+	T_RUN_CASE(t, test_lp_queue_double_enqueue_prevented);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

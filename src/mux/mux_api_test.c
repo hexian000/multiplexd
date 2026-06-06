@@ -1,16 +1,16 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-#include "mux/mux.h"
-
 #include "mux/frame.h"
+#include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/stream.h"
 
 #include "utils/testing.h"
 
-#include <errno.h>
 #include <ev.h>
+
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>

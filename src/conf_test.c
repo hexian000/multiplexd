@@ -6,9 +6,9 @@
 #include "utils/slog.h"
 #include "utils/testing.h"
 
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -199,17 +199,17 @@ T_DECLARE_CASE(test_conf_parsefile_requires_claim_for_identity)
 
 T_DECLARE_CASE(test_conf_parsefile_parses_identity_listen)
 {
-	struct config *conf =
-		parse_tmpconf("{"
-			      "\"identity\":{"
-			      "\"claim\":\"mynode\","
-			      "\"mux_connect\":[\"127.0.0.1:9001\"],"
-			      "\"listen\":{"
-			      "\"peer1\":\"127.0.0.1:9002\","
-			      "\"peer2\":\"127.0.0.1:9003\""
-			      "}"
-			      "}"
-			      "}");
+	struct config *conf = parse_tmpconf(
+		"{"
+		"\"identity\":{"
+		"\"claim\":\"mynode\","
+		"\"mux_connect\":[\"127.0.0.1:9001\"],"
+		"\"listen\":{"
+		"\"peer1\":\"127.0.0.1:9002\","
+		"\"peer2\":\"127.0.0.1:9003\""
+		"}"
+		"}"
+		"}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ((int)conf->identity.mux_connect_count, 1);
 	T_EXPECT_EQ((int)conf->identity.peers_count, 2);
@@ -222,43 +222,43 @@ T_DECLARE_CASE(test_conf_parsefile_parses_identity_listen)
 
 T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_format)
 {
-	struct config *conf =
-		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\","
-			      "\"max_startups\":\"10:20\"}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\","
+		"\"max_startups\":\"10:20\"}");
 	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_rate)
 {
-	struct config *conf =
-		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\","
-			      "\"max_startups\":\"10:101:20\"}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\","
+		"\"max_startups\":\"10:101:20\"}");
 	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_range)
 {
-	struct config *conf =
-		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\","
-			      "\"max_startups\":\"10:20:10\"}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\","
+		"\"max_startups\":\"10:20:10\"}");
 	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 {
-	struct config *conf =
-		parse_tmpconf("{"
-			      "\"mux_connect\":\"127.0.0.1:9000\","
-			      "\"mux\":{"
-			      "\"ping_timeout\":10,"
-			      "\"keepalive\":5,"
-			      "\"send_timeout\":30,"
-			      "\"connect_timeout\":40,"
-			      "\"resume_timeout\":1,"
-			      "\"idle_timeout\":2"
-			      "},"
-			      "\"loglevel\":999"
-			      "}");
+	struct config *conf = parse_tmpconf(
+		"{"
+		"\"mux_connect\":\"127.0.0.1:9000\","
+		"\"mux\":{"
+		"\"ping_timeout\":10,"
+		"\"keepalive\":5,"
+		"\"send_timeout\":30,"
+		"\"connect_timeout\":40,"
+		"\"resume_timeout\":1,"
+		"\"idle_timeout\":2"
+		"},"
+		"\"loglevel\":999"
+		"}");
 	T_CHECK(conf != NULL);
 
 	T_EXPECT_EQ(conf->mux.ping_timeout, 10);
@@ -278,11 +278,11 @@ T_DECLARE_CASE(test_conf_parsefile_partial_window_config_accepted)
 	/* stream_window set (manual), session_window absent (auto); each axis
 	 * is independent so the mixed configuration is accepted as-is.
 	 * 32768/16384=2 frames, clamped to the minimum of 4. */
-	struct config *conf =
-		parse_tmpconf("{"
-			      "\"mux_connect\":\"127.0.0.1:9000\","
-			      "\"mux\":{\"stream_window\":32768}"
-			      "}");
+	struct config *conf = parse_tmpconf(
+		"{"
+		"\"mux_connect\":\"127.0.0.1:9000\","
+		"\"mux\":{\"stream_window\":32768}"
+		"}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->mux.stream_window, 4);
 	T_EXPECT_EQ(conf->mux.session_window, 0);
@@ -292,24 +292,25 @@ T_DECLARE_CASE(test_conf_parsefile_partial_window_config_accepted)
 #if WITH_TLS
 T_DECLARE_CASE(test_conf_parsefile_rejects_partial_tls_config)
 {
-	struct config *conf = parse_tmpconf("{"
-					    "\"mux_listen\":\"127.0.0.1:9000\","
-					    "\"tls\":{\"cert\":\"dummy\"}"
-					    "}");
+	struct config *conf = parse_tmpconf(
+		"{"
+		"\"mux_listen\":\"127.0.0.1:9000\","
+		"\"tls\":{\"cert\":\"dummy\"}"
+		"}");
 	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_authcerts_array)
 {
 	/* Verify that the authcerts array is parsed and stored correctly. */
-	struct config *conf =
-		parse_tmpconf("{"
-			      "\"mux_listen\":\"127.0.0.1:9000\","
-			      "\"tls\":{"
-			      "\"cert\":\"certdata\","
-			      "\"key\":\"keydata\","
-			      "\"authcerts\":[\"ca1.pem\",\"ca2.pem\"]"
-			      "}}");
+	struct config *conf = parse_tmpconf(
+		"{"
+		"\"mux_listen\":\"127.0.0.1:9000\","
+		"\"tls\":{"
+		"\"cert\":\"certdata\","
+		"\"key\":\"keydata\","
+		"\"authcerts\":[\"ca1.pem\",\"ca2.pem\"]"
+		"}}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ((int)conf->tls_authcerts_count, 2);
 	T_EXPECT_STREQ(conf->tls_authcerts[0], "ca1.pem");
@@ -401,22 +402,22 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 	/* Keys prefixed with '-' are a comment-out convention: they must be
 	 * silently skipped at any nesting level without causing a parse error
 	 * or overwriting the default field values. */
-	struct config *conf =
-		parse_tmpconf("{"
-			      "\"mux_connect\":\"127.0.0.1:9000\","
-			      "\"-mux_connect\":\"should-be-ignored\","
-			      "\"-loglevel\":0,"
-			      "\"mux\":{"
-			      "\"ping_timeout\":30,"
-			      "\"-ping_timeout\":999,"
-			      "\"-nodelay\":false"
-			      "},"
-			      "\"-tcp\":{\"nodelay\":false},"
-			      "\"identity\":{"
-			      "\"claim\":\"me\","
-			      "\"-claim\":\"ignored\""
-			      "}"
-			      "}");
+	struct config *conf = parse_tmpconf(
+		"{"
+		"\"mux_connect\":\"127.0.0.1:9000\","
+		"\"-mux_connect\":\"should-be-ignored\","
+		"\"-loglevel\":0,"
+		"\"mux\":{"
+		"\"ping_timeout\":30,"
+		"\"-ping_timeout\":999,"
+		"\"-nodelay\":false"
+		"},"
+		"\"-tcp\":{\"nodelay\":false},"
+		"\"identity\":{"
+		"\"claim\":\"me\","
+		"\"-claim\":\"ignored\""
+		"}"
+		"}");
 	T_CHECK(conf != NULL);
 	/* mux_connect must reflect the real key, not the commented-out one. */
 	T_EXPECT(strcmp(conf->mux_connect, "127.0.0.1:9000") == 0);
@@ -434,9 +435,9 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 T_DECLARE_CASE(test_conf_parsefile_unknown_root_key)
 {
 	/* Unknown keys at the root level must be warned about but not fail. */
-	struct config *conf =
-		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\","
-			      "\"nosuchkey\":\"value\"}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\","
+		"\"nosuchkey\":\"value\"}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_STREQ(conf->mux_listen, "127.0.0.1:9000");
 	conf_free(conf);
@@ -445,9 +446,9 @@ T_DECLARE_CASE(test_conf_parsefile_unknown_root_key)
 T_DECLARE_CASE(test_conf_parsefile_unknown_mux_key)
 {
 	/* Unknown keys inside a scope must be warned about but not fail. */
-	struct config *conf =
-		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
-			      "\"mux\":{\"nosuchfield\":1}}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\","
+		"\"mux\":{\"nosuchfield\":1}}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_STREQ(conf->mux_connect, "127.0.0.1:9000");
 	conf_free(conf);
@@ -456,10 +457,10 @@ T_DECLARE_CASE(test_conf_parsefile_unknown_mux_key)
 T_DECLARE_CASE(test_conf_parsefile_mem_pressure_config)
 {
 	/* Verify that the mux.mem_pressure sub-object is parsed correctly. */
-	struct config *conf =
-		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
-			      "\"mux\":{\"mem_pressure\":"
-			      "{\"hi\":1000,\"lo\":500}}}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\","
+		"\"mux\":{\"mem_pressure\":"
+		"{\"hi\":1000,\"lo\":500}}}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->mux.mem_pressure_hi, 1000);
 	T_EXPECT_EQ(conf->mux.mem_pressure_lo, 500);
@@ -470,9 +471,9 @@ T_DECLARE_CASE(test_conf_parsefile_session_window_positive)
 {
 	/* Setting only session_window (auto stream_window) is now valid:
 	 * each axis is independent.  65536/16384=4 frames. */
-	struct config *conf =
-		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
-			      "\"mux\":{\"session_window\":65536}}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\","
+		"\"mux\":{\"session_window\":65536}}");
 	T_CHECK(conf != NULL);
 	/* session_window stored as frames; stream_window not set (auto). */
 	T_EXPECT_EQ(conf->mux.session_window, 4);
@@ -486,11 +487,11 @@ T_DECLARE_CASE(test_conf_parsefile_both_windows_positive)
 	 * the parser stores them in units (divided by MUX_MAX_PAYLOAD_SIZE),
 	 * clamped to [4, max].  32768/16384=2 → clamped to 4;
 	 * 131072/16384=8, within range. */
-	struct config *conf =
-		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\","
-			      "\"mux\":{"
-			      "\"stream_window\":32768,"
-			      "\"session_window\":131072}}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\","
+		"\"mux\":{"
+		"\"stream_window\":32768,"
+		"\"session_window\":131072}}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->mux.stream_window, 4);
 	T_EXPECT_EQ(conf->mux.session_window, 8);
@@ -501,9 +502,9 @@ T_DECLARE_CASE(test_conf_parsefile_max_startups_valid)
 {
 	/* A well-formed max_startups string must be parsed into the three
 	 * throttle fields. */
-	struct config *conf =
-		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\","
-			      "\"max_startups\":\"10:50:200\"}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\","
+		"\"max_startups\":\"10:50:200\"}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->startup_limit_start, 10);
 	T_EXPECT_EQ(conf->startup_limit_rate, 50);

@@ -3,11 +3,10 @@
 
 #include "mux/handshake.c"
 
-#include "algo/hashtable.h"
-
 #include "mux/frame.h"
 #include "mux/session.h"
 
+#include "algo/hashtable.h"
 #include "utils/testing.h"
 
 #include <stdbool.h>
@@ -269,6 +268,7 @@ T_DECLARE_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume
 	T_EXPECT(parsed.has_session_id);
 	T_EXPECT(parsed.has_resume_seq);
 	T_EXPECT_EQ(parsed.resume_seq, (uint_least32_t)41);
+	T_EXPECT_EQ(ss.ack_seq, (uint_least32_t)41);
 	T_EXPECT(parsed.has_identity);
 	T_EXPECT_STREQ(parsed.identity, "cli-service");
 
@@ -409,7 +409,13 @@ T_DECLARE_CASE(test_handshake_process_confirmed_resume_rearms_write_watcher)
 	memset(ss.handshake.session_id, 0x31, sizeof(ss.handshake.session_id));
 	memcpy(hello.session_id, ss.handshake.session_id,
 	       sizeof(hello.session_id));
-	ss.retransmit_cursor = &retransmit;
+	/* Set up retransmit state: ring with one frame, offset at head. */
+	ss.unacked = mux_frame_ring_grow(ss.unacked);
+	T_CHECK(ss.unacked != NULL);
+	retransmit.unacked_count = 1;
+	T_CHECK(mux_frame_ring_push(&ss.unacked, &retransmit));
+	ss.unacked_frames = 1;
+	ss.retransmit_off = 0;
 	T_CHECK(build_hello_frame(&frame, &hdr, &hello) > 0);
 	ringbuf_free(ss.wire.recvbuf);
 	ss.wire.recvbuf = ringbuf_new(frame.len);
@@ -423,6 +429,9 @@ T_DECLARE_CASE(test_handshake_process_confirmed_resume_rearms_write_watcher)
 	T_EXPECT_EQ(g_update_watcher_calls, 1);
 	T_EXPECT(ss.wire.tx_pending);
 	T_EXPECT_EQ(g_reset_calls, 0);
+	/* Ring owns &retransmit (stack var); clear ring only, don't mux_frame_put. */
+	free(ss.unacked);
+	ss.unacked = NULL;
 	ringbuf_free(ss.wire.recvbuf);
 }
 

@@ -8,48 +8,85 @@
 
 #include "mux/frame.h"
 
-#include "mux/mux.h"
-
-#include "utils/serialize.h"
-
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
-struct mux_frame *
-mux_frame_get(const struct mux_frame_allocator *restrict allocator)
+bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 {
-	struct mux_frame *frame = allocator->alloc(allocator->data);
-	if (frame != NULL) {
-		frame->pos = 0;
-		frame->len = 0;
-		frame->next = NULL;
+	struct ringbuf *rb = *rbp;
+	if (need == 0 || ringbuf_write_space(rb) >= need) {
+		return true;
 	}
-	return frame;
+
+	ringbuf_compact(rb);
+	if (ringbuf_write_space(rb) >= need) {
+		return true;
+	}
+	if (!can_grow) {
+		return false;
+	}
+
+	if (need > SIZE_MAX - rb->len) {
+		return false;
+	}
+	const size_t min_cap = rb->len + need;
+	size_t new_cap = rb->cap > 0 ? rb->cap : 1;
+	for (; new_cap < min_cap; new_cap *= 2) {
+		if (new_cap > SIZE_MAX / 2) {
+			new_cap = min_cap;
+			break;
+		}
+	}
+
+	struct ringbuf *const new_rb =
+		realloc(rb, sizeof(struct ringbuf) + new_cap);
+	if (new_rb == NULL) {
+		return false;
+	}
+	new_rb->cap = new_cap;
+	*rbp = new_rb;
+	return true;
 }
 
-void mux_frame_put(
-	const struct mux_frame_allocator *restrict allocator,
-	struct mux_frame *frame)
+/* --- Frame pointer ring --- */
+
+struct mux_frame_ring *mux_frame_ring_new(const size_t cap)
 {
-	allocator->free(allocator->data, frame);
+	struct mux_frame_ring *r =
+		malloc(sizeof(*r) + cap * sizeof(r->entries[0]));
+	if (r == NULL) {
+		return NULL;
+	}
+	r->capacity = cap;
+	r->head = 0;
+	r->count = 0;
+	for (size_t i = 0; i < cap; i++) {
+		r->entries[i] = NULL;
+	}
+	return r;
 }
 
-void mux_write_header(
-	unsigned char *restrict buf, const struct mux_header *restrict header)
+struct mux_frame_ring *mux_frame_ring_grow(struct mux_frame_ring *r)
 {
-	write_uint8(buf + 0, header->version);
-	write_uint8(buf + 1, header->flags);
-	write_uint16(buf + 2, header->length);
-	write_uint16(buf + 4, header->stream_id);
-	write_uint16(buf + 6, (uint16_t)header->extra);
-}
+	const size_t old_cap = r != NULL ? r->capacity : 0;
+	const size_t old_count = r != NULL ? r->count : 0;
+	const size_t new_cap =
+		old_cap > 0 ? old_cap * 2 : (size_t)MUX_FRAME_RING_MIN;
 
-void mux_read_header(
-	const unsigned char *restrict buf, struct mux_header *restrict header)
-{
-	header->version = read_uint8(buf + 0);
-	header->flags = read_uint8(buf + 1);
-	header->length = read_uint16(buf + 2);
-	header->stream_id = read_uint16(buf + 4);
-	header->extra = read_uint16(buf + 6);
+	struct mux_frame_ring *nr =
+		malloc(sizeof(*nr) + new_cap * sizeof(nr->entries[0]));
+	if (nr == NULL) {
+		return NULL;
+	}
+	nr->capacity = new_cap;
+	nr->head = 0;
+	nr->count = old_count;
+	for (size_t i = 0; i < old_count; i++) {
+		nr->entries[i] = r->entries[(r->head + i) & (old_cap - 1)];
+	}
+	free(r);
+	return nr;
 }

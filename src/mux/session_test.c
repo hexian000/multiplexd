@@ -5,7 +5,6 @@
 #include "mux/stream.h"
 
 #include "algo/hashtable.h"
-
 #include "utils/testing.h"
 
 #include <ev.h>
@@ -119,6 +118,17 @@ static int setup_fixture(struct session_fixture *restrict fx)
 		fx->loop = NULL;
 		return -1;
 	}
+	fx->ss.unacked = mux_frame_ring_new(MUX_FRAME_RING_MIN);
+	if (fx->ss.unacked == NULL) {
+		ringbuf_free(fx->ss.wire.recvbuf);
+		fx->ss.wire.recvbuf = NULL;
+		table_free(fx->ss.sched.streams);
+		close(fx->fds[0]);
+		close(fx->fds[1]);
+		ev_loop_destroy(fx->loop);
+		fx->loop = NULL;
+		return -1;
+	}
 	return 0;
 }
 
@@ -134,7 +144,9 @@ static void teardown_fixture(struct session_fixture *restrict fx)
 	}
 	ringbuf_free(fx->ss.wire.recvbuf);
 	fx->ss.wire.recvbuf = NULL;
-	mux_frame_list_clear(&fx->ss.unacked, &fx->ss.pool);
+	mux_frame_ring_free(&fx->ss.unacked, &fx->ss.pool);
+	fx->ss.unacked_frames = 0;
+	fx->ss.retransmit_off = SIZE_MAX;
 	if (fx->fds[0] >= 0) {
 		close(fx->fds[0]);
 		fx->fds[0] = -1;
@@ -242,7 +254,7 @@ T_DECLARE_CASE(test_session_ack_trim_releases_frames_and_clears_stall)
 			NULL, 0);
 		T_CHECK(frame != NULL);
 		frame->unacked_count = 1;
-		mux_frame_list_push(&fx.ss.unacked, frame);
+		T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
 	}
 	fx.ss.unacked_frames = 3;
 	fx.ss.last_ack_recv = 1;
@@ -270,15 +282,15 @@ T_DECLARE_CASE(test_session_ack_trim_overflow_returns_false)
 		make_frame(&fx.ss.pool, 1, MUX_FLAG_PUSH, 0, NULL, 0);
 	T_CHECK(frame != NULL);
 	frame->unacked_count = 1;
-	mux_frame_list_push(&fx.ss.unacked, frame);
+	T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
 	fx.ss.unacked_frames = 1;
 	fx.ss.last_ack_recv = 5;
 
-	/* count=2 > unacked_frames=1: must return false, list unchanged. */
+	/* count=2 > unacked_frames=1: must return false, ring unchanged. */
 	T_EXPECT(!session_ack_trim(&fx.ss, 2));
 	T_EXPECT_EQ(fx.ss.unacked_frames, (size_t)1);
 	T_EXPECT_EQ(fx.ss.last_ack_recv, (uint_least32_t)5);
-	T_EXPECT(fx.ss.unacked.head == frame);
+	T_EXPECT(mux_frame_ring_peek(fx.ss.unacked, 0) == frame);
 
 	teardown_fixture(&fx);
 }
@@ -297,7 +309,7 @@ T_DECLARE_CASE(test_session_resume_ack_recv_advances_cursor)
 			NULL, 0);
 		T_CHECK(frame != NULL);
 		frame->unacked_count = 1;
-		mux_frame_list_push(&fx.ss.unacked, frame);
+		T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
 	}
 	fx.ss.unacked_frames = 2;
 	fx.ss.last_ack_recv = 1;
@@ -305,7 +317,7 @@ T_DECLARE_CASE(test_session_resume_ack_recv_advances_cursor)
 	T_EXPECT(session_resume_ack_recv(&fx.ss, 2));
 	T_EXPECT_EQ(fx.ss.last_ack_recv, (uint_least32_t)2);
 	T_EXPECT_EQ(fx.ss.unacked_frames, (size_t)1);
-	T_EXPECT(fx.ss.retransmit_cursor == fx.ss.unacked.head);
+	T_EXPECT(fx.ss.retransmit_off == 0 && fx.ss.unacked->count > 0);
 
 	teardown_fixture(&fx);
 }
@@ -488,13 +500,13 @@ T_DECLARE_CASE(test_session_recv_pong_clears_ping_in_flight)
 	}
 
 	/* Simulate a probe in flight (sent by keepalive or data path):
-	 * payload is all-zero so sent_ns == 0, which matches probe_sent_ns. */
+	 * payload is all-zero so sent_ns == 0, which matches last_probe_ns. */
 	fx.ss.conf.keepalive = 60;
 	fx.ss.conf.ping_timeout = 15;
 	ev_timer_init(&fx.ss.w_keepalive, session_test_timer_cb, 0.0, 15.0);
 	fx.ss.w_keepalive.data = &fx.ss;
 	fx.ss.estimator.ping_in_flight = true;
-	fx.ss.estimator.probe_sent_ns = 0;
+	fx.ss.estimator.last_probe_ns = 0;
 
 	/* Build a minimal PONG frame in recvbuf. */
 	struct mux_frame *const frame = make_frame(
@@ -696,6 +708,30 @@ T_DECLARE_CASE(test_session_discard_stream_frames_clears_queued_data)
 	teardown_fixture(&fx);
 }
 
+/* -------------------------------------------------------------------------
+ * Flow-control boundary tests
+ * ---------------------------------------------------------------------- */
+
+T_DECLARE_CASE(test_session_ack_extra_clamped_at_uint16_max)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	T_EXPECT(session_send_ctrl(
+		&fx.ss, STREAMID_CTRL, MUX_FLAG_ACK, UINT32_MAX));
+	T_CHECK(fx.ss.wire.sendbuf.head != NULL);
+	{
+		struct mux_header hdr = { 0 };
+		mux_read_header(fx.ss.wire.sendbuf.head->data, &hdr);
+		T_EXPECT_EQ(hdr.stream_id, (uint_least16_t)STREAMID_CTRL);
+		T_EXPECT(hdr.flags & MUX_FLAG_ACK);
+		T_EXPECT_EQ(hdr.extra, (uint_least16_t)UINT16_MAX);
+	}
+	teardown_fixture(&fx);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -721,5 +757,6 @@ int main(void)
 	T_RUN_CASE(t, test_session_initiate_shutdown_transitions_to_closed);
 	T_RUN_CASE(t, test_session_drain_sets_draining_flag);
 	T_RUN_CASE(t, test_session_discard_stream_frames_clears_queued_data);
+	T_RUN_CASE(t, test_session_ack_extra_clamped_at_uint16_max);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

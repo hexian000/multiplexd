@@ -11,6 +11,7 @@
 #if WITH_OPENSSL
 
 #include "os/clock.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
 #include <openssl/err.h>
@@ -346,6 +347,7 @@ static bool create_certificate(
 
 	{
 		const size_t server_name_len = strlen(server_name);
+		ASSERT(server_name_len < 256);
 		char san_value[server_name_len + 5];
 		if (!format_subject_alt_name(
 			    san_value, sizeof(san_value), server_name)) {

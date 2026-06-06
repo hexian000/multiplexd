@@ -20,16 +20,16 @@
 #include "utils/slog.h"
 
 #include <ev.h>
-#include <sys/socket.h>
 
+#include <errno.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 
 /* Format a stream log prefix into buf ("[N] me <- peer:" or "-> peer:").
  * me/peer: identity, then IP, then "[fd:N]".  Returns snprintf byte count. */
@@ -143,7 +143,7 @@ static inline void stream_mark_closed(struct mux_stream *restrict s)
 	stream_stop(s);
 	/* The tombstone only needs the stream ID for late-frame suppression. */
 	if (!s->is_direct && s->socket.w_io.fd != -1) {
-		CLOSE_FD(s->socket.w_io.fd);
+		SOCKET_CLOSE_FD(s->socket.w_io.fd);
 		s->socket.w_io.fd = -1;
 	}
 	/* From the caller's perspective the stream is already dead. */
@@ -176,7 +176,7 @@ static void stream_shutdown_local_write(struct mux_stream *restrict s)
 		return;
 	}
 	if (!s->is_direct) {
-		SHUTDOWN_FD(s->socket.w_io.fd, WR);
+		SOCKET_SHUTDOWN_FD(s->socket.w_io.fd, WR);
 	}
 	s->tx_shutdown = true;
 }
@@ -187,7 +187,8 @@ static void update_watcher(struct mux_stream *restrict s)
 		return;
 	}
 	if (!s->socket.connected) {
-		modify_io_events(s->session->loop, &s->socket.w_io, EV_WRITE);
+		util_modify_io_events(
+			s->session->loop, &s->socket.w_io, EV_WRITE);
 		return;
 	}
 
@@ -224,7 +225,7 @@ static void update_watcher(struct mux_stream *restrict s)
 			stream_state_str[s->state], stream_read_credit_avail(s),
 			s->queued_send_bytes);
 	}
-	modify_io_events(s->session->loop, &s->socket.w_io, events);
+	util_modify_io_events(s->session->loop, &s->socket.w_io, events);
 }
 
 static void stream_stop(struct mux_stream *s)
@@ -619,7 +620,7 @@ void stream_free(struct mux_stream *s)
 	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, s->recvbuf->len);
 	ringbuf_free(s->recvbuf);
 	if (!s->is_direct && s->socket.w_io.fd != -1) {
-		CLOSE_FD(s->socket.w_io.fd);
+		SOCKET_CLOSE_FD(s->socket.w_io.fd);
 	}
 	free(s);
 }
@@ -916,7 +917,14 @@ void stream_check_ack(struct mux_stream *restrict s)
 		" quickack_remaining=%u",
 		grantable, (unsigned)s->quickack_budget);
 	s->ack_pending = true;
-	if (!s->is_ready) {
+	if (s->send_queue.head == NULL && s->sched_queue != SCHED_QUEUE_DRR &&
+	    s != s->session->sched.drr_active) {
+		/* No data to piggyback on and not already in DRR: queue
+		 * for pure control-frame emission via ctrl_pending list. */
+		sched_ctrl_enqueue(s->session, s);
+		s->session->wire.tx_pending = true;
+		session_update_watcher(s->session);
+	} else if (s->sched_queue != SCHED_QUEUE_DRR) {
 		sched_wake(s->session, s);
 	}
 }

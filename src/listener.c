@@ -14,22 +14,22 @@
 #include "utils/slog.h"
 
 #include <ev.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-static void accept_cb(struct ev_loop *loop, ev_io *w, int revents)
+static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ);
 
 	struct listener *restrict l = w->data;
-	const struct socket_opts *restrict socket_opts = l->socket_opts;
-	uintmax_t *restrict num_accepted = l->num_accepted;
+	const struct util_socket_opts *restrict socket_opts = l->socket_opts;
+	uint_least64_t *restrict num_accepted = l->num_accepted;
 
 	/* Accept connections in a loop until no more are available */
 	for (;;) {
@@ -68,7 +68,7 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents)
 		/* Configure the accepted socket */
 		if (socket_set_cloexec(fd) != 0 ||
 		    socket_set_nonblock(fd) != 0) {
-			CLOSE_FD(fd);
+			SOCKET_CLOSE_FD(fd);
 			continue;
 		}
 		socket_set_buffer(
@@ -98,8 +98,9 @@ timer_cb(struct ev_loop *restrict loop, ev_timer *watcher, const int revents)
 }
 
 void listener_init(
-	struct listener *l, const struct socket_opts *socket_opts,
-	serve_fn serve, struct server *server, uintmax_t *restrict num_accepted)
+	struct listener *l, const struct util_socket_opts *socket_opts,
+	listener_serve_fn serve, struct server *server,
+	uint_least64_t *restrict num_accepted)
 {
 	l->serve = serve;
 	l->srv = server;
@@ -123,11 +124,11 @@ bool listener_start(
 	}
 
 	if (socket_set_cloexec(fd) != 0 || socket_set_nonblock(fd) != 0) {
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return false;
 	}
 
-	const struct socket_opts *restrict socket_opts = l->socket_opts;
+	const struct util_socket_opts *restrict socket_opts = l->socket_opts;
 	socket_set_buffer(fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf);
 	socket_set_tcp(
 		fd, socket_opts->tcp_nodelay, socket_opts->tcp_keepalive);
@@ -136,14 +137,14 @@ bool listener_start(
 	if (bind(fd, sa, sa_len(sa)) != 0) {
 		const int err = errno;
 		LOGE_F("bind: (%d) %s", err, strerror(err));
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return false;
 	}
 
 	if (listen(fd, socket_opts->backlog) != 0) {
 		const int err = errno;
 		LOGE_F("listen: (%d) %s", err, strerror(err));
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return false;
 	}
 
@@ -161,7 +162,7 @@ void listener_stop(struct listener *l, struct ev_loop *loop)
 	ev_timer_stop(loop, &l->w_timer);
 	ev_io_stop(loop, &l->w_accept);
 	if (l->w_accept.fd != -1) {
-		CLOSE_FD(l->w_accept.fd);
+		SOCKET_CLOSE_FD(l->w_accept.fd);
 		l->w_accept.fd = -1;
 	}
 }

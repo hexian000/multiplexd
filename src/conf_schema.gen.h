@@ -3,94 +3,94 @@
 #ifndef CONF_SCHEMA_GEN_H
 #define CONF_SCHEMA_GEN_H
 
+#include "codec/json.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-
-#include "codec/json.h"
 
 /** @name Struct types
  *  @{ */
 
 struct json_conf_tls {
-    struct json_string cert;
-    struct json_string ciphersuites;
-    struct json_string key;
+	struct json_string cert;
+	struct json_string ciphersuites;
+	struct json_string key;
 
-    struct json_string *authcerts;
-    size_t authcerts_count;
+	struct json_string *authcerts;
+	size_t authcerts_count;
 };
 
 struct json_conf_tcp {
-    unsigned backlog;
-    uintmax_t notsent_lowat;
-    uintmax_t rcvbuf;
-    uintmax_t sndbuf;
+	unsigned backlog;
+	uintmax_t notsent_lowat;
+	uintmax_t rcvbuf;
+	uintmax_t sndbuf;
 
-    bool keepalive;
-    bool nodelay;
-    bool reuseport;
+	bool keepalive;
+	bool nodelay;
+	bool reuseport;
 };
 
 struct json_conf_mux_tcp {
-    unsigned backlog;
-    uintmax_t notsent_lowat;
-    uintmax_t rcvbuf;
-    uintmax_t sndbuf;
+	unsigned backlog;
+	uintmax_t notsent_lowat;
+	uintmax_t rcvbuf;
+	uintmax_t sndbuf;
 
-    bool keepalive;
-    bool nodelay;
-    bool reuseport;
+	bool keepalive;
+	bool nodelay;
+	bool reuseport;
 };
 
 struct json_conf_mux_mem_pressure {
-    uintmax_t hi;
-    uintmax_t lo;
+	uintmax_t hi;
+	uintmax_t lo;
 };
 
 struct json_conf_mux {
-    struct json_conf_mux_mem_pressure mem_pressure;
-    struct json_conf_mux_tcp tcp;
+	struct json_conf_mux_mem_pressure mem_pressure;
+	struct json_conf_mux_tcp tcp;
 
-    unsigned connect_timeout;
-    unsigned idle_timeout;
-    unsigned keepalive;
-    unsigned max_halfopen;
-    uintmax_t max_streams;
-    unsigned ping_timeout;
-    unsigned resume_timeout;
-    unsigned send_timeout;
-    unsigned session_window;
-    unsigned stream_window;
+	unsigned connect_timeout;
+	unsigned idle_timeout;
+	unsigned keepalive;
+	unsigned max_halfopen;
+	uintmax_t max_streams;
+	unsigned ping_timeout;
+	unsigned resume_timeout;
+	unsigned send_timeout;
+	unsigned session_window;
+	unsigned stream_window;
 
-    bool nodelay;
+	bool nodelay;
 };
 
 struct json_conf_identity {
-    struct json_string claim;
+	struct json_string claim;
 
-    struct json_string *mux_connect;
-    size_t mux_connect_count;
+	struct json_string *mux_connect;
+	size_t mux_connect_count;
 
-    struct json_string listen_json;
+	struct json_string listen_json;
 };
 
 struct json_conf {
-    struct json_conf_identity identity;
-    struct json_conf_mux mux;
-    struct json_conf_tcp tcp;
-    struct json_conf_tls tls;
+	struct json_conf_identity identity;
+	struct json_conf_mux mux;
+	struct json_conf_tcp tcp;
+	struct json_conf_tls tls;
 
-    struct json_string api_listen;
-    struct json_string connect;
-    struct json_string listen;
-    struct json_string max_startups;
-    struct json_string mux_connect;
-    struct json_string mux_listen;
-    struct json_string type;
+	struct json_string api_listen;
+	struct json_string connect;
+	struct json_string listen;
+	struct json_string max_startups;
+	struct json_string mux_connect;
+	struct json_string mux_listen;
+	struct json_string type;
 
-    uintmax_t loglevel;
-    uintmax_t max_sessions;
+	uintmax_t loglevel;
+	uintmax_t max_sessions;
 };
 
 /** @} */
@@ -100,8 +100,8 @@ struct json_conf {
 
 /* Unmarshal json (length bytes) into *obj; the buffer is modified in-place. */
 /* The function zero-initializes *obj and applies schema defaults before parsing; pointer fields of set keys then point into the json buffer (keep it valid). Returns true on success. */
-bool json_conf_unmarshal(
-    struct json_conf *obj, char *json, size_t length);
+bool json_unmarshal_conf(
+	struct json_conf *obj, char *json, size_t length);
 
 /** @} */
 
@@ -110,7 +110,7 @@ bool json_conf_unmarshal(
 
 /* Marshal *obj into buf as JSON text (snprintf semantics: returns chars written
    excluding NUL, or required size including NUL when buf is NULL or bufsz is 0). */
-int json_conf_marshal(char *buf, size_t bufsz, const struct json_conf *obj);
+int json_marshal_conf(char *buf, size_t bufsz, const struct json_conf *obj);
 
 /** @} */
 
@@ -118,7 +118,7 @@ int json_conf_marshal(char *buf, size_t bufsz, const struct json_conf *obj);
  *  @{ */
 
 /* Free heap-allocated fields inside *obj (arrays). */
-void json_conf_free(struct json_conf *obj);
+void json_free_conf(struct json_conf *obj);
 
 /** @} */
 

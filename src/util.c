@@ -8,23 +8,23 @@
 
 #include "util.h"
 
+#if WITH_TLS
+#include "tlsutil.h"
+#endif
+
 #include "math/rand.h"
 #include "net/addr.h"
 #include "os/signal.h"
 #include "os/socket.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
 #include <ev.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#if WITH_TLS
-#include "tlsutil.h"
-#endif
-#include <sys/socket.h>
 
 #include <errno.h>
 #include <inttypes.h>
 #include <locale.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 
 void socket_notsent_lowat(const int fd, const int bytes)
@@ -74,7 +75,7 @@ int socket_user_timeout(const int fd, const int ms)
 #define PATH_SEPARATOR '/'
 #endif
 
-void init(int argc, char *const *argv)
+void util_init(int argc, char *const *argv)
 {
 	UNUSED(argc);
 	UNUSED(argv);
@@ -100,7 +101,7 @@ void init(int argc, char *const *argv)
 	crashhandler_install();
 }
 
-void loadlibs(void)
+void util_loadlibs(void)
 {
 	srand64((uint_fast64_t)time(NULL));
 
@@ -111,7 +112,7 @@ void loadlibs(void)
 #endif
 }
 
-void unloadlibs(void)
+void util_unloadlibs(void)
 {
 	LOGD("library cleanup complete");
 }
@@ -129,7 +130,7 @@ bool resolve_addr(
 	memcpy(buf, addrstr, addrlen);
 	buf[addrlen] = '\0';
 	char *hoststr, *portstr;
-	if (!splithostport(buf, &hoststr, &portstr)) {
+	if (!addr_splithostport(buf, &hoststr, &portstr)) {
 		return false;
 	}
 	return sa_resolve(addr, hoststr, portstr, type, PF_UNSPEC);
@@ -145,7 +146,7 @@ bool resolve_bindaddr(
 	memcpy(buf, addrstr, addrlen);
 	buf[addrlen] = '\0';
 	char *hoststr, *portstr;
-	if (!splithostport(buf, &hoststr, &portstr)) {
+	if (!addr_splithostport(buf, &hoststr, &portstr)) {
 		return false;
 	}
 	return sa_resolve_bind(addr, hoststr, portstr, type);

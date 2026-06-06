@@ -2,13 +2,13 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 #include "http.h"
-
 #include "utils/testing.h"
 
-#include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+
 T_DECLARE_CASE(test_http_parse_request)
 {
 	char buf[] = "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";

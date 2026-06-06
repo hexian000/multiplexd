@@ -168,7 +168,7 @@ static inline int log2u(unsigned int x)
 #else
 	return log2u64((uint_fast64_t)x);
 #endif
-#endif
+#endif /* __has_builtin */
 }
 
 static inline int log2ul(unsigned long x)
@@ -182,7 +182,7 @@ static inline int log2ul(unsigned long x)
 #else
 	return log2u64((uint_fast64_t)x);
 #endif
-#endif
+#endif /* __has_builtin */
 }
 
 static inline int log2ull(unsigned long long x)
@@ -196,7 +196,7 @@ static inline int log2ull(unsigned long long x)
 		ULLONG_MAX <= UINT_FAST64_MAX,
 		"unsigned long long exceeds uint_fast64_t range: fallback cast would truncate");
 	return log2u64((uint_fast64_t)x);
-#endif
+#endif /* __has_builtin */
 }
 
 static inline int countr_zerou(unsigned int x)
@@ -210,7 +210,7 @@ static inline int countr_zerou(unsigned int x)
 #else
 	return countr_zerou64((uint_fast64_t)x);
 #endif
-#endif
+#endif /* __has_builtin */
 }
 
 static inline int countr_zeroul(unsigned long x)
@@ -224,7 +224,7 @@ static inline int countr_zeroul(unsigned long x)
 #else
 	return countr_zerou64((uint_fast64_t)x);
 #endif
-#endif
+#endif /* __has_builtin */
 }
 
 static inline int countr_zeroull(unsigned long long x)
@@ -238,7 +238,7 @@ static inline int countr_zeroull(unsigned long long x)
 		ULLONG_MAX <= UINT_FAST64_MAX,
 		"unsigned long long exceeds uint_fast64_t range: fallback cast would truncate");
 	return countr_zerou64((uint_fast64_t)x);
-#endif
+#endif /* __has_builtin */
 }
 
 /* countl_zero: x=0 is valid and returns the full bit-width. */
@@ -252,7 +252,7 @@ static inline int countl_zerou(unsigned int x)
 #else
 	return countl_zerou64((uint_fast64_t)x);
 #endif
-#endif
+#endif /* __has_builtin */
 }
 
 static inline int countl_zeroul(unsigned long x)
@@ -265,7 +265,7 @@ static inline int countl_zeroul(unsigned long x)
 #else
 	return countl_zerou64((uint_fast64_t)x);
 #endif
-#endif
+#endif /* __has_builtin */
 }
 
 static inline int countl_zeroull(unsigned long long x)
@@ -278,7 +278,7 @@ static inline int countl_zeroull(unsigned long long x)
 		ULLONG_MAX <= UINT_FAST64_MAX,
 		"unsigned long long exceeds uint_fast64_t range: fallback cast would truncate");
 	return countl_zerou64((uint_fast64_t)x);
-#endif
+#endif /* __has_builtin */
 }
 
 #endif /* __STDC_VERSION_STDBIT_H__ >= 202311L */
@@ -335,7 +335,7 @@ static_assert(
 		unsigned int: log2u,                                           \
 		unsigned long: log2ul,                                         \
 		unsigned long long: log2ull)(x)
-#endif
+#endif /* UINTMAX_MAX > ULLONG_MAX */
 
 /**
  * @brief Returns the number of consecutive 0 bits starting from the least
@@ -356,7 +356,7 @@ static_assert(
 		unsigned int: countr_zerou,                                    \
 		unsigned long: countr_zeroul,                                  \
 		unsigned long long: countr_zeroull)(x)
-#endif
+#endif /* UINTMAX_MAX > ULLONG_MAX */
 
 /**
  * @brief Returns the number of consecutive 0 bits starting from the most
@@ -377,7 +377,13 @@ static_assert(
 		unsigned int: countl_zerou,                                    \
 		unsigned long: countl_zeroul,                                  \
 		unsigned long long: countl_zeroull)(x)
-#endif
+#endif /* UINTMAX_MAX > ULLONG_MAX */
+
+/* size_t must alias unsigned int, long, or long long for the
+ * _Generic dispatch in intlog2() and countr_zero() to cover it. */
+static_assert(
+	sizeof(size_t) <= sizeof(unsigned long long),
+	"size_t wider than unsigned long long: intlog2/countr_zero dispatch incomplete");
 
 /** @} */
 

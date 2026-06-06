@@ -46,7 +46,7 @@ bool wire_send(struct mux_session *restrict ss, unsigned char *buf, size_t *len)
 		}
 		return true;
 	}
-#endif
+#endif /* WITH_TLS */
 
 	{
 		const size_t total = *len;
@@ -115,7 +115,7 @@ bool wire_recv(
 		}
 		return true;
 	}
-#endif
+#endif /* WITH_TLS */
 
 	{
 		const int err = socket_recv(ss->w_socket.fd, buf, len);
@@ -151,18 +151,6 @@ void wire_discard_buffers(struct mux_session *restrict ss)
 	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
 	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
 	ringbuf_reset(ss->wire.recvbuf);
-}
-
-void wire_conn_free(struct mux_session *restrict ss)
-{
-#if WITH_TLS
-	if (ss->wire.tlsconn != NULL) {
-		tls_conn_free(ss->wire.tlsconn);
-		ss->wire.tlsconn = NULL;
-	}
-#else
-	(void)ss;
-#endif
 }
 
 #if WITH_TLS
@@ -219,6 +207,18 @@ void wire_migrate_tlsconn(
 }
 #endif /* WITH_TLS */
 
+void wire_conn_free(struct mux_session *restrict ss)
+{
+#if WITH_TLS
+	if (ss->wire.tlsconn != NULL) {
+		tls_conn_free(ss->wire.tlsconn);
+		ss->wire.tlsconn = NULL;
+	}
+#else
+	(void)ss;
+#endif
+}
+
 enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
 {
 #if WITH_TLS
@@ -246,9 +246,9 @@ enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
 		}
 		/* ret == 0: TLS close_notify complete; fall through to TCP half-close. */
 	}
-#endif
+#endif /* WITH_TLS */
 	LOGV_F("[fd:%d] shutdown: tcp", ss->w_socket.fd);
-	SHUTDOWN_FD(ss->w_socket.fd, WR);
+	SOCKET_SHUTDOWN_FD(ss->w_socket.fd, WR);
 	return WIRE_SHUTDOWN_DONE;
 }
 
@@ -267,7 +267,7 @@ bool wire_wait_eof(struct mux_session *restrict ss)
 		}
 		return true;
 	}
-#endif
+#endif /* WITH_TLS */
 	size_t len = sizeof(buf);
 	{
 		const int err = socket_recv(ss->w_socket.fd, buf, &len);

@@ -64,6 +64,7 @@ void sched_free_streams(struct mux_session *restrict ss)
 	ss->sched.drr_active = NULL;
 	ss->sched.lp_head = NULL;
 	ss->sched.lp_tail = NULL;
+	ss->sched.ctrl_head = NULL;
 	/* Clear delay_pending to prevent use-after-free in stream_stop
 	 * during bulk teardown. */
 	for (struct mux_stream *d = ss->sched.delay_head; d != NULL;
@@ -197,7 +198,7 @@ static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
 			ss->sched.sched_tail = NULL;
 		}
 		s->next = NULL;
-		s->is_ready = false;
+		s->sched_queue = SCHED_QUEUE_NONE;
 	}
 	return s;
 }
@@ -222,10 +223,14 @@ void sched_delay_remove(
 static void
 sched_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
-	/* Avoid double-enqueue: skip if owned by drr_active, lp_ready, or tombstone timer. */
-	if (!s->is_ready && s != ss->sched.drr_active && !s->lp_ready &&
+	/* Transition from CTRL to DRR: remove from control list. */
+	if (s->sched_queue == SCHED_QUEUE_CTRL) {
+		sched_ctrl_dequeue(ss, s);
+	}
+	/* Avoid double-enqueue: skip if owned by drr_active, LP, or tombstone timer. */
+	if (s->sched_queue == SCHED_QUEUE_NONE && s != ss->sched.drr_active &&
 	    !ev_is_active(&s->w_tombstone)) {
-		s->is_ready = true;
+		s->sched_queue = SCHED_QUEUE_DRR;
 		s->next = NULL;
 		if (ss->sched.sched_tail != NULL) {
 			ss->sched.sched_tail->next = s;
@@ -242,14 +247,17 @@ sched_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 static void
 sched_lp_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
-	if (s->is_ready || s == ss->sched.drr_active) {
+	if (s->sched_queue == SCHED_QUEUE_CTRL) {
+		sched_ctrl_dequeue(ss, s);
+	}
+	if (s->sched_queue == SCHED_QUEUE_DRR || s == ss->sched.drr_active) {
 		return;
 	}
 	if (ev_is_active(&s->w_tombstone)) {
 		return;
 	}
-	if (!s->lp_ready) {
-		s->lp_ready = true;
+	if (s->sched_queue == SCHED_QUEUE_NONE) {
+		s->sched_queue = SCHED_QUEUE_LP;
 		s->next = NULL;
 		if (ss->sched.lp_tail != NULL) {
 			ss->sched.lp_tail->next = s;
@@ -359,34 +367,13 @@ static void sched_send_ctrl_flags(
 	if (flags & MUX_FLAG_FIN) {
 		stream_mark_fin_sent(s);
 	}
-}
-
-static bool flush_ctrl_cb(
-	const struct hashtable *table, const void *key, void *element,
-	void *data)
-{
-	UNUSED(table);
-	UNUSED(key);
-	struct mux_session *restrict ss = data;
-	struct mux_stream *restrict s = element;
-	/* Skip tombstone streams to avoid spurious sched_wake calls. */
-	if (s->state == STREAM_CLOSED) {
-		return true;
+	/* Remove from ctrl_pending list now that all queued control frames
+	 * for this round have been emitted.  has_fin_pending was computed
+	 * before stream_mark_fin_sent; when FIN was just sent the flag is
+	 * still true but the frame is no longer pending. */
+	if (!s->ack_pending && (!has_fin_pending || (flags & MUX_FLAG_FIN))) {
+		sched_ctrl_dequeue(ss, s);
 	}
-	/* Re-check for accumulated credit (covers drain without inbound data). */
-	stream_check_ack(s);
-	sched_send_ctrl_flags(ss, s);
-	return true;
-}
-
-/* Emit pending ACK/FIN control headers without touching the DRR data queue.
- * This keeps credit-grant traffic moving while payload sends are stalled. */
-void sched_flush_ctrl(struct mux_session *restrict ss)
-{
-	if (ss->sched.streams == NULL) {
-		return;
-	}
-	table_iterate(ss->sched.streams, flush_ctrl_cb, ss);
 }
 
 static inline bool
@@ -542,6 +529,90 @@ bool sched_next_data(struct mux_session *restrict ss)
 	}
 }
 
+/* Emit pending ACK/FIN control headers without touching the DRR data queue.
+ * Walks the ctrl_pending list — O(k) where k = streams with no data to
+ * piggyback on.  When send_stalled, also walks the DRR ready queue as a
+ * fallback: streams that entered DRR because they had data at the time
+ * stream_check_ack fired would otherwise be invisible and their window
+ * grants would never reach the peer, causing a bidirectional stall. */
+void sched_flush_ctrl(struct mux_session *restrict ss)
+{
+	struct mux_stream **indirect = &ss->sched.ctrl_head;
+	while (*indirect != NULL) {
+		struct mux_stream *s = *indirect;
+		if (s->sched_queue != SCHED_QUEUE_CTRL ||
+		    s->state == STREAM_CLOSED) {
+			/* Lazy cleanup of stale or tombstone entries. */
+			*indirect = s->next;
+			s->next = NULL;
+			s->sched_queue = SCHED_QUEUE_NONE;
+			continue;
+		}
+		stream_check_ack(s);
+		sched_send_ctrl_flags(ss, s);
+		if (s->sched_queue != SCHED_QUEUE_CTRL) {
+			/* Control frame was sent; remove from list. */
+			*indirect = s->next;
+			s->next = NULL;
+		} else {
+			indirect = &s->next;
+		}
+	}
+
+	/* Fallback: during send_stalled, streams stuck in the DRR ready
+	 * queue cannot send data, but their pending ACK/FIN must still
+	 * flow so the peer can drain its window and return session ACKs.
+	 * Without this, a bidirectional transfer deadlocks: our ACKs are
+	 * held in DRR, the peer never sees them, its window fills up,
+	 * and it stops sending — so we never receive fresh data that
+	 * would trigger new ACK grants. */
+	if (ss->send_stalled) {
+		struct mux_stream *s = ss->sched.sched_head;
+		while (s != NULL) {
+			if (s->state != STREAM_CLOSED) {
+				stream_check_ack(s);
+				sched_send_ctrl_flags(ss, s);
+			}
+			s = s->next;
+		}
+	}
+}
+
+/* --- Control-pending list ---
+ * Singly-linked via mux_stream::next (reuses DRR/lp queue pointer; mutually
+ * exclusive — a stream is on at most one of {DRR, lp, ctrl} at a time). */
+
+void sched_ctrl_enqueue(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
+{
+	if (s->sched_queue == SCHED_QUEUE_CTRL) {
+		return;
+	}
+	s->sched_queue = SCHED_QUEUE_CTRL;
+	s->next = ss->sched.ctrl_head;
+	ss->sched.ctrl_head = s;
+}
+
+void sched_ctrl_dequeue(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
+{
+	if (s->sched_queue != SCHED_QUEUE_CTRL) {
+		return;
+	}
+	struct mux_stream **indirect = &ss->sched.ctrl_head;
+	while (*indirect != NULL) {
+		if (*indirect == s) {
+			*indirect = s->next;
+			s->next = NULL;
+			s->sched_queue = SCHED_QUEUE_NONE;
+			return;
+		}
+		indirect = &(*indirect)->next;
+	}
+	/* Not found in list: flag may have been cleared elsewhere; still sync. */
+	s->sched_queue = SCHED_QUEUE_NONE;
+}
+
 static void
 sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
@@ -554,7 +625,7 @@ sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 		session_send_push(ss, s, frame);
 		COUNTER_ADD(ss->cnt.num_stream_fastopen, 1);
 		stream_mark_syn_sent(s);
-		s->syn_sent_ns = clock_monotonic_ns();
+		s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
 		return;
 	}
 	const uint_fast32_t inc = stream_grant_inc(s);
@@ -565,7 +636,7 @@ sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 		s->id);
 	s->grant_sent += inc * MUX_WINDOW_UNIT;
 	stream_mark_syn_sent(s);
-	s->syn_sent_ns = clock_monotonic_ns();
+	s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
 }
 
 /* EV_IDLE callback: drain the low-priority lifecycle queue
@@ -592,7 +663,7 @@ static void sched_cb(struct ev_loop *loop, ev_idle *w, const int revents)
 		if (ss->sched.lp_head == NULL) {
 			ss->sched.lp_tail = NULL;
 		}
-		s->lp_ready = false;
+		s->sched_queue = SCHED_QUEUE_NONE;
 		s->next = NULL;
 
 		if (s->state == STREAM_CLOSED) {

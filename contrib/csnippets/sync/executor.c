@@ -57,26 +57,6 @@ static bool dequeue(struct executor *e, struct task *task)
 	}
 }
 
-static bool enqueue(struct executor *e, const struct task *task)
-{
-	struct task_item *new_item = malloc(sizeof(struct task_item));
-	if (new_item == NULL) {
-		return false;
-	}
-	*new_item = (struct task_item){ *task, NULL };
-	THRD_ASSERT(mtx_lock(&e->mu));
-	struct task_item *restrict item = e->queue.tail;
-	if (item != NULL) {
-		item->next = new_item;
-	} else {
-		e->queue.head = new_item;
-	}
-	e->queue.tail = new_item;
-	THRD_ASSERT(mtx_unlock(&e->mu));
-	THRD_ASSERT(cnd_signal(&e->cond));
-	return true;
-}
-
 static int worker_main(void *p)
 {
 	struct task task;
@@ -109,12 +89,37 @@ struct executor *executor_create(const size_t nworkers)
 	for (size_t i = 0; i < nworkers; i++) {
 		if (thrd_create(&e->workers[i], worker_main, e) !=
 		    thrd_success) {
-			executor_join(e);
+			executor_detach(e);
 			return NULL;
 		}
 		e->nthreads++;
 	}
 	return e;
+}
+
+static bool enqueue(struct executor *e, const struct task *task)
+{
+	struct task_item *new_item = malloc(sizeof(struct task_item));
+	if (new_item == NULL) {
+		return false;
+	}
+	*new_item = (struct task_item){ *task, NULL };
+	THRD_ASSERT(mtx_lock(&e->mu));
+	struct task_item *restrict item = e->queue.tail;
+	if (item != NULL) {
+		item->next = new_item;
+	} else {
+		e->queue.head = new_item;
+	}
+	e->queue.tail = new_item;
+	THRD_ASSERT(mtx_unlock(&e->mu));
+	THRD_ASSERT(cnd_signal(&e->cond));
+	return true;
+}
+
+bool executor_submit(struct executor *e, const struct task task)
+{
+	return enqueue(e, &task);
 }
 
 void executor_join(struct executor *e)
@@ -132,7 +137,17 @@ void executor_join(struct executor *e)
 	free(e);
 }
 
-bool executor_submit(struct executor *e, const struct task task)
+void executor_detach(struct executor *e)
 {
-	return enqueue(e, &task);
+	THRD_ASSERT(mtx_lock(&e->mu));
+	e->exit_flag = true;
+	THRD_ASSERT(mtx_unlock(&e->mu));
+	THRD_ASSERT(cnd_broadcast(&e->cond));
+	const size_t nthreads = e->nthreads;
+	for (size_t i = 0; i < nthreads; i++) {
+		THRD_ASSERT(thrd_detach(e->workers[i]));
+	}
+	mtx_destroy(&e->mu);
+	cnd_destroy(&e->cond);
+	free(e);
 }

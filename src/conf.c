@@ -9,12 +9,12 @@
 #include "conf.h"
 
 #include "conf_schema.gen.h"
+#include "mux/mux.h"
 
 #include "codec/json.h"
-
-#include "mux/mux.h"
 #include "net/mime.h"
 #include "utils/buffer.h"
+#include "utils/minmax.h"
 #include "utils/slog.h"
 
 #include <inttypes.h>
@@ -104,9 +104,21 @@ static bool identity_listen_cb(
 	if (key[0] == '-') {
 		return true;
 	}
-	struct json_val v = json_parse(val, val_len);
+	size_t consumed = val_len;
+	struct json_val v = json_parse(val, &consumed);
 	if (v.type != JSON_STRING) {
 		LOGE_F("identity.listen.%s: must be a string", key);
+		return false;
+	}
+	/* Reject trailing non-whitespace content after the parsed value */
+	while (consumed < val_len) {
+		if (!json_iswhitespace((unsigned char)val[consumed])) {
+			break;
+		}
+		consumed++;
+	}
+	if (consumed != val_len) {
+		LOGE_F("identity.listen.%s: unexpected trailing content", key);
 		return false;
 	}
 	struct identity_peer *restrict p =
@@ -285,11 +297,11 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		}
 	}
 	/* identity.listen: raw JSON fragment pointing into the json buffer.
-	 * Walk it now and strdup each peer address before json_conf_free. */
+	 * Walk it now and strdup each peer address before json_free_conf. */
 	if (obj->identity.listen_json.str != NULL) {
 		struct json_val parsed = json_parse(
 			obj->identity.listen_json.str,
-			obj->identity.listen_json.len);
+			&(size_t){ obj->identity.listen_json.len });
 		if (parsed.type != JSON_OBJECT) {
 			LOGE("identity.listen: must be an object");
 			return false;
@@ -301,12 +313,18 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		size_t val_len;
 		while (json_obj_next(
 			obj->identity.listen_json.str,
-			obj->identity.listen_json.len, &it, &key, &key_len,
+			&obj->identity.listen_json.len, &it, &key, &key_len,
 			&val, &val_len)) {
 			if (!identity_listen_cb(
 				    cfg, key, key_len, val, val_len)) {
 				return false;
 			}
+		}
+		/* Reject trailing content after the closing '}' */
+		if (it != obj->identity.listen_json.len) {
+			LOGE("identity.listen: unexpected trailing content"
+			     " after object");
+			return false;
 		}
 	}
 
@@ -377,7 +395,6 @@ static bool conf_check(struct config *restrict conf)
 		LOGW("ignoring mux_connect: not used in server mode");
 	}
 #if WITH_TLS
-	/* Check TLS configuration */
 	const bool has_cert = (conf->tls_cert != NULL);
 	const bool has_key = (conf->tls_key != NULL);
 	const bool has_authcerts = (conf->tls_authcerts_count > 0);
@@ -523,14 +540,14 @@ struct config *conf_new(void)
 	*conf = (struct config){ 0 };
 	char empty[] = "{}";
 	struct json_conf obj = { 0 };
-	if (!json_conf_unmarshal(&obj, empty, sizeof(empty) - 1)) {
+	if (!json_unmarshal_conf(&obj, empty, sizeof(empty) - 1)) {
 		/* Cannot fail on a well-formed empty object; treat as OOM. */
 		LOGOOM();
 		free(conf);
 		return NULL;
 	}
 	const bool ok = conf_load(conf, &obj);
-	json_conf_free(&obj);
+	json_free_conf(&obj);
 	if (!ok) {
 		conf_free(conf);
 		return NULL;
@@ -547,14 +564,14 @@ struct config *conf_parse(char *json, const size_t len)
 	}
 	*conf = (struct config){ 0 };
 	struct json_conf obj = { 0 };
-	if (!json_conf_unmarshal(&obj, json, len)) {
+	if (!json_unmarshal_conf(&obj, json, len)) {
 		LOGE("failed to process configuration");
-		json_conf_free(&obj);
+		json_free_conf(&obj);
 		conf_free(conf);
 		return NULL;
 	}
 	const bool ok = conf_load(conf, &obj);
-	json_conf_free(&obj);
+	json_free_conf(&obj);
 	if (!ok) {
 		LOGE("failed to process configuration");
 		conf_free(conf);
@@ -641,13 +658,11 @@ static struct vbuffer *build_listen_json(const struct config *restrict conf)
 
 char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 {
-	/* Build identity.listen JSON fragment if peers exist. */
 	struct vbuffer *listen_vbuf = build_listen_json(conf);
 	char *listen_json =
 		listen_vbuf != NULL ? (char *)listen_vbuf->data : NULL;
 	const size_t listen_len = listen_vbuf != NULL ? listen_vbuf->len : 0;
 
-	/* Build json_string arrays for identity.mux_connect. */
 	struct json_string *id_mc_arr = NULL;
 	if (conf->identity.mux_connect_count > 0) {
 		id_mc_arr = malloc(
@@ -665,7 +680,6 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 	}
 
 #if WITH_TLS
-	/* Build json_string arrays for tls.authcerts. */
 	struct json_string *authcerts_arr = NULL;
 	if (conf->tls_authcerts_count > 0) {
 		authcerts_arr = malloc(
@@ -827,7 +841,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 	};
 
 	/* Two-pass marshal: measure then fill. */
-	const int json_sz = json_conf_marshal(NULL, 0, &raw);
+	const int json_sz = json_marshal_conf(NULL, 0, &raw);
 	if (json_sz <= 0) {
 		VBUF_FREE(listen_vbuf);
 		free(id_mc_arr);
@@ -847,7 +861,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		LOGOOM();
 		return NULL;
 	}
-	(void)json_conf_marshal(out, (size_t)json_sz + 1, &raw);
+	(void)json_marshal_conf(out, (size_t)json_sz + 1, &raw);
 	out[json_sz] = '\0';
 
 	VBUF_FREE(listen_vbuf);

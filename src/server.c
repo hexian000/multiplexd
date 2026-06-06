@@ -37,8 +37,6 @@
 
 #include <ev.h>
 
-#include <sys/socket.h>
-
 #include <inttypes.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -51,6 +49,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 
 static uint_fast32_t sid_hash(const void *key, const uint_fast32_t seed)
@@ -88,15 +87,19 @@ struct tunnel_iter {
 static bool identity_listener_add(
 	struct identity_listener *restrict sl, struct tunnel *restrict t)
 {
-	struct tunnel **arr = (struct tunnel **)realloc(
-		(void *)sl->tunnels,
-		(sl->num_tunnels + 1) * sizeof(struct tunnel *));
-	if (arr == NULL) {
-		LOGOOM();
-		return false;
+	if (sl->num_tunnels >= sl->cap_tunnels) {
+		const size_t new_cap =
+			sl->cap_tunnels > 0 ? sl->cap_tunnels * 2 : 4;
+		struct tunnel **arr =
+			realloc(sl->tunnels, new_cap * sizeof(*arr));
+		if (arr == NULL) {
+			LOGOOM();
+			return false;
+		}
+		sl->tunnels = arr;
+		sl->cap_tunnels = new_cap;
 	}
-	arr[sl->num_tunnels++] = t;
-	sl->tunnels = arr;
+	sl->tunnels[sl->num_tunnels++] = t;
 	return true;
 }
 
@@ -206,11 +209,10 @@ static struct tunnel *tunnel_iter_next(
 static void
 server_evlogf(struct server *restrict srv, const char *restrict fmt, ...)
 {
-	struct evlog *restrict evlog = &srv->evlog;
+	struct server_evlog *restrict evlog = &srv->evlog;
 	const size_t evlog_size = ARRAY_SIZE(evlog->entries);
 	const time_t now = time(NULL);
-	/* Format directly into the candidate slot. */
-	struct evlog_entry *restrict entry = &evlog->entries[evlog->pos];
+	struct server_evlog_entry *restrict entry = &evlog->entries[evlog->pos];
 	va_list ap;
 	va_start(ap, fmt);
 	const int fmtlen =
@@ -222,7 +224,8 @@ server_evlogf(struct server *restrict srv, const char *restrict fmt, ...)
 	/* Merge into the previous entry if the message is identical. */
 	if (evlog->len > 0) {
 		const size_t prev = (evlog->pos + evlog_size - 1) % evlog_size;
-		struct evlog_entry *restrict last = &evlog->entries[prev];
+		struct server_evlog_entry *restrict last =
+			&evlog->entries[prev];
 		if (strncmp(last->message, entry->message,
 			    sizeof(last->message)) == 0) {
 			last->timestamp = now;
@@ -248,8 +251,8 @@ static void session_on_connected(
 	SESSION_EVLOGF(srv, t, "session %s (setup: %s)", verb, lat_str);
 }
 
-static void
-server_on_established(void *data, struct tunnel *restrict t, intmax_t lat_ns)
+static void server_on_established(
+	void *data, struct tunnel *restrict t, const intmax_t lat_ns)
 {
 	struct server *restrict srv = data;
 	const bool is_server = tunnel_is_accepted(t);
@@ -298,7 +301,7 @@ server_on_established(void *data, struct tunnel *restrict t, intmax_t lat_ns)
 }
 
 static void
-server_on_resumed(void *data, struct tunnel *restrict t, intmax_t lat_ns)
+server_on_resumed(void *data, struct tunnel *restrict t, const intmax_t lat_ns)
 {
 	struct server *restrict srv = data;
 	const bool is_server = tunnel_is_accepted(t);
@@ -389,8 +392,8 @@ static void handle_closed(
 }
 
 static void tunnel_on_event(
-	void *data, struct tunnel *t, enum mux_event event,
-	union mux_event_data edata)
+	void *data, struct tunnel *t, const enum mux_event event,
+	const union mux_event_data edata)
 {
 	struct server *restrict srv = data;
 	switch (event) {
@@ -463,7 +466,7 @@ static void identity_tcp_serve(
 		LOGD_F("[fd:%d] no session for identity \"%s\","
 		       " closing",
 		       fd, sl->peer_identity);
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return;
 	}
 	/* Dispatch mux_open_stream to the session's tunnel thread. */
@@ -488,7 +491,7 @@ static void tcp_serve(
 	}
 	if (t == NULL) {
 		LOGD_F("[fd:%d] no active session, closing", fd);
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return;
 	}
 
@@ -511,20 +514,17 @@ static bool is_startup_limited(const struct server *restrict srv)
 	const size_t n_halfopen = stats->num_session_halfopen;
 #endif
 
-	/* Check maximum session limit */
 	if (conf->max_sessions > 0 && n_sessions > (size_t)conf->max_sessions) {
 		LOGVV("session limit exceeded, rejecting new connection");
 		return true;
 	}
 
-	/* Check full startup limit */
 	if (conf->startup_limit_full > 0 &&
 	    n_halfopen > (size_t)conf->startup_limit_full) {
 		LOGVV("full startup limit exceeded, rejecting new connection");
 		return true;
 	}
 
-	/* Check probabilistic startup limit */
 	if (conf->startup_limit_start > 0 &&
 	    n_halfopen > (size_t)conf->startup_limit_start) {
 		if (frand() * 100.0 < conf->startup_limit_rate) {
@@ -635,7 +635,7 @@ static void mux_serve(
 
 	if (is_startup_limited(srv)) {
 		srv->counters.num_rejected++;
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return;
 	}
 
@@ -646,7 +646,7 @@ static void mux_serve(
 		if (conn == NULL) {
 			LOGE_F("[fd:%d] TLS accept failed", fd);
 			srv->counters.num_tls_failures++;
-			CLOSE_FD(fd);
+			SOCKET_CLOSE_FD(fd);
 			return;
 		}
 	}
@@ -693,7 +693,7 @@ static void mux_serve(
 			tls_conn_free(conn);
 		}
 #endif
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return;
 	}
 
@@ -913,6 +913,123 @@ static void server_reload_listeners(
 	}
 }
 
+/* Build a fresh identity listener hashtable when the peer table has changed.
+ * Stops old listeners, migrates live tunnel pools where peer identities
+ * match, starts new listeners, and replaces s->identities. */
+static void server_reload_identities_changed(
+	struct server *restrict s, const struct config *restrict new_conf,
+	const size_t new_np)
+{
+	/* Stop old identity listeners. */
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(s->identities, &cursor, NULL, &elem)) {
+			struct identity_listener *restrict sl = elem;
+			if (sl->listener.w_accept.fd != -1) {
+				listener_stop(&sl->listener, s->loop);
+			}
+		}
+	}
+
+	struct hashtable *new_tbl = NULL;
+	if (new_np > 0) {
+		new_tbl = table_new(&(struct table_opts){
+			.hash = TABLE_OPTS_STR.hash,
+			.eq = TABLE_OPTS_STR.eq,
+			.flags = TABLE_FAST,
+		});
+		if (new_tbl == NULL) {
+			LOGOOM();
+		}
+	}
+
+	if (new_tbl != NULL) {
+		for (size_t i = 0; i < new_np; i++) {
+			const struct identity_peer *restrict p =
+				&new_conf->identity.peers[i];
+			struct identity_listener *restrict sl =
+				malloc(sizeof(*sl));
+			if (sl == NULL) {
+				LOGOOM();
+				break;
+			}
+			sl->peer_identity = p->id;
+			sl->tunnels = NULL;
+			sl->num_tunnels = 0;
+			sl->rr_next = 0;
+			/* Migrate live tunnel pool if peer_identity matches. */
+			if (p->id != NULL) {
+				void *old_elem = NULL;
+				if (table_find(
+					    s->identities, p->id, &old_elem)) {
+					struct identity_listener
+						*restrict old_sl = old_elem;
+					sl->tunnels = old_sl->tunnels;
+					sl->num_tunnels = old_sl->num_tunnels;
+					sl->rr_next = old_sl->rr_next;
+					old_sl->tunnels = NULL;
+					old_sl->num_tunnels = 0;
+				}
+			}
+			listener_init(
+				&sl->listener, &new_conf->tcp,
+				identity_tcp_serve, s,
+				&s->counters.num_accepted_tcp);
+			sl->listener.data = sl;
+			if (p->listen != NULL) {
+				union sockaddr_max addr;
+				if (!resolve_bindaddr(
+					    &addr, p->listen, SA_RESOLVE_TCP)) {
+					LOGE_F("failed to parse identity"
+					       " listen address on reload:"
+					       " %s",
+					       p->listen);
+				} else if (!listener_start(
+						   &sl->listener, s->loop,
+						   &addr.sa)) {
+					LOGE_F("failed to restart identity"
+					       " listener for \"%s\" on"
+					       " reload",
+					       p->id);
+				} else if (LOGLEVEL(NOTICE)) {
+					char str[64];
+					sa_format(str, sizeof(str), &addr.sa);
+					LOGN_F("identity \"%s\" listening on"
+					       " %s (TCP)",
+					       p->id, str);
+				}
+			}
+			void *slot = sl;
+			new_tbl = table_set(new_tbl, sl->peer_identity, &slot);
+			if (slot == sl) {
+				/* OOM: sl not inserted; release it. */
+				if (sl->listener.w_accept.fd != -1) {
+					listener_stop(&sl->listener, s->loop);
+				}
+				free((void *)sl->tunnels);
+				free(sl);
+				LOGOOM();
+			} else {
+				ASSERT(slot == NULL);
+			}
+		}
+	}
+
+	/* Free orphaned old entries (tunnel arrays not migrated). */
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(s->identities, &cursor, NULL, &elem)) {
+			struct identity_listener *sl = elem;
+			free((void *)sl->tunnels);
+			free(sl);
+		}
+	}
+	table_free(s->identities);
+	s->identities = new_tbl;
+}
+
 /* Rebuild the identity_peers identity listener hashtable if the peer table
  * changed; otherwise fix peer_identity and socket_opts pointers into the
  * new config. */
@@ -966,103 +1083,7 @@ static void server_reload_identities(
 		s->identities = new_tbl;
 		return;
 	}
-	/* Stop old identity listeners. */
-	{
-		size_t cursor = 0;
-		void *elem;
-		while (table_next(s->identities, &cursor, NULL, &elem)) {
-			struct identity_listener *restrict sl = elem;
-			if (sl->listener.w_accept.fd != -1) {
-				listener_stop(&sl->listener, s->loop);
-			}
-		}
-	}
-	struct hashtable *new_tbl = new_np > 0 ?
-					    table_new(&(struct table_opts){
-						    .hash = TABLE_OPTS_STR.hash,
-						    .eq = TABLE_OPTS_STR.eq,
-						    .flags = TABLE_FAST,
-					    }) :
-					    NULL;
-	if (new_np > 0 && new_tbl == NULL) {
-		LOGOOM();
-		goto free_old;
-	}
-	for (size_t i = 0; i < new_np; i++) {
-		const struct identity_peer *restrict p =
-			&new_conf->identity.peers[i];
-		struct identity_listener *restrict sl = malloc(sizeof(*sl));
-		if (sl == NULL) {
-			LOGOOM();
-			break;
-		}
-		sl->peer_identity = p->id;
-		sl->tunnels = NULL;
-		sl->num_tunnels = 0;
-		sl->rr_next = 0;
-		/* Migrate live tunnel pool if peer_identity matches. */
-		if (p->id != NULL) {
-			void *old_elem = NULL;
-			if (table_find(s->identities, p->id, &old_elem)) {
-				struct identity_listener *restrict old_sl =
-					old_elem;
-				sl->tunnels = old_sl->tunnels;
-				sl->num_tunnels = old_sl->num_tunnels;
-				sl->rr_next = old_sl->rr_next;
-				old_sl->tunnels = NULL;
-				old_sl->num_tunnels = 0;
-			}
-		}
-		listener_init(
-			&sl->listener, &new_conf->tcp, identity_tcp_serve, s,
-			&s->counters.num_accepted_tcp);
-		sl->listener.data = sl;
-		if (p->listen != NULL) {
-			union sockaddr_max addr;
-			if (!resolve_bindaddr(
-				    &addr, p->listen, SA_RESOLVE_TCP)) {
-				LOGE_F("failed to parse identity listen"
-				       " address on reload: %s",
-				       p->listen);
-			} else if (!listener_start(
-					   &sl->listener, s->loop, &addr.sa)) {
-				LOGE_F("failed to restart identity listener for"
-				       " \"%s\" on reload",
-				       p->id);
-			} else if (LOGLEVEL(NOTICE)) {
-				char str[64];
-				sa_format(str, sizeof(str), &addr.sa);
-				LOGN_F("identity \"%s\" listening on %s (TCP)",
-				       p->id, str);
-			}
-		}
-		void *slot = sl;
-		new_tbl = table_set(new_tbl, sl->peer_identity, &slot);
-		if (slot == sl) {
-			/* OOM: sl not inserted; release it. */
-			if (sl->listener.w_accept.fd != -1) {
-				listener_stop(&sl->listener, s->loop);
-			}
-			free((void *)sl->tunnels);
-			free(sl);
-			LOGOOM();
-		} else {
-			ASSERT(slot == NULL);
-		}
-	}
-free_old:
-	/* Free orphaned old entries (tunnel arrays not migrated). */
-	{
-		size_t cursor = 0;
-		void *elem;
-		while (table_next(s->identities, &cursor, NULL, &elem)) {
-			struct identity_listener *sl = elem;
-			free((void *)sl->tunnels);
-			free(sl);
-		}
-	}
-	table_free(s->identities);
-	s->identities = new_tbl;
+	server_reload_identities_changed(s, new_conf, new_np);
 }
 
 /* Create a new outbound (client-mode) tunnel with the given connect address.
@@ -1252,7 +1273,7 @@ static void server_reload(struct server *restrict s)
 		return;
 	}
 	LOGI_F("reloading config: %s", conf_path);
-	(void)systemd_notify(SYSTEMD_STATE_RELOADING);
+	(void)systemd_notify(DAEMON_SYSTEMD_STATE_RELOADING);
 
 	struct config *const new_conf = conf_parsefile(conf_path);
 	if (new_conf == NULL) {
@@ -1261,7 +1282,7 @@ static void server_reload(struct server *restrict s)
 	}
 
 	(void)server_apply_config(s, new_conf);
-	(void)systemd_notify(SYSTEMD_STATE_READY);
+	(void)systemd_notify(DAEMON_SYSTEMD_STATE_READY);
 }
 
 static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
@@ -1290,8 +1311,9 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		const time_t delta = now_wall - srv->last_maintenance_wall;
 		srv->last_maintenance_wall = now_wall;
 		if (delta > (time_t)srv->conf->mux.ping_timeout) {
-			LOGW_F("wall-clock jump of %lds detected, dropping all transports",
-			       (long)delta);
+			LOGW_F("wall-clock jump of %" PRIdMAX
+			       "s detected, dropping all transports",
+			       (intmax_t)delta);
 			const size_t n =
 				(srv->accepted_tunnels != NULL ?
 					 table_size(srv->accepted_tunnels) :
@@ -1353,7 +1375,7 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 	case SIGTERM:
 		LOGI_F("received (%d) %s, initiating shutdown", signo,
 		       os_strsignal(signo));
-		(void)systemd_notify(SYSTEMD_STATE_STOPPING);
+		(void)systemd_notify(DAEMON_SYSTEMD_STATE_STOPPING);
 
 		/* Stop accepting new connections and incoming signals. */
 		ev_signal_stop(loop, &s->w_sighup);
@@ -1433,7 +1455,7 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		 * (handled in handle_closed) or the 2-second deadline fires
 		 * (handled in maintenance_cb). */
 		s->shutting_down = true;
-		s->shutdown_start_ns = clock_monotonic_ns();
+		s->shutdown_start_ns = (int_least64_t)clock_monotonic_ns();
 		break;
 	default:
 		break;
@@ -1457,7 +1479,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 	listener_init(
 		&srv->mux_listener, &conf->mux_tcp, mux_serve, srv,
 		&srv->counters.num_accepted);
-	static const struct socket_opts api_socket_opts = {
+	static const struct util_socket_opts api_socket_opts = {
 		.tcp_nodelay = true,
 		.tcp_keepalive = false,
 		.backlog = 16,
@@ -1465,7 +1487,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 	listener_init(
 		&srv->api_listener, &api_socket_opts, api_serve, srv,
 		&srv->counters.num_accepted_api);
-	srv->started = clock_monotonic_ns();
+	srv->started = (int_least64_t)clock_monotonic_ns();
 
 #if WITH_ALLOC_CACHE
 #if WITH_THREADS
@@ -1660,6 +1682,7 @@ static bool server_start_identity_listeners(struct server *restrict s)
 		sl->peer_identity = p->id;
 		sl->tunnels = NULL;
 		sl->num_tunnels = 0;
+		sl->cap_tunnels = 0;
 		sl->rr_next = 0;
 		listener_init(
 			&sl->listener, &conf->tcp, identity_tcp_serve, s,
@@ -1836,6 +1859,7 @@ void server_stop(struct server *srv)
 			free((void *)sl->tunnels);
 			sl->tunnels = NULL;
 			sl->num_tunnels = 0;
+			sl->cap_tunnels = 0;
 		}
 	}
 	free((void *)srv->identity_tunnels);
@@ -2045,38 +2069,38 @@ struct server_stats *server_stats(const struct server *restrict s)
 #endif
 
 #if WITH_THREADS
-	out->num_session_created = atomic_load_explicit(
+	out->num_session_created = (uint_least64_t)atomic_load_explicit(
 		&c->num_session_created, memory_order_relaxed);
-	out->num_session_connect = atomic_load_explicit(
+	out->num_session_connect = (uint_least64_t)atomic_load_explicit(
 		&c->num_session_connect, memory_order_relaxed);
-	out->num_session_connected = atomic_load_explicit(
+	out->num_session_connected = (uint_least64_t)atomic_load_explicit(
 		&c->num_session_connected, memory_order_relaxed);
-	out->num_session_disconnected = atomic_load_explicit(
+	out->num_session_disconnected = (uint_least64_t)atomic_load_explicit(
 		&c->num_session_disconnected, memory_order_relaxed);
-	out->num_session_finalized = atomic_load_explicit(
+	out->num_session_finalized = (uint_least64_t)atomic_load_explicit(
 		&c->num_session_finalized, memory_order_relaxed);
-	out->num_sessions =
-		atomic_load_explicit(&c->num_sessions, memory_order_relaxed);
-	out->num_session_halfopen = atomic_load_explicit(
+	out->num_sessions = (size_t)atomic_load_explicit(
+		&c->num_sessions, memory_order_relaxed);
+	out->num_session_halfopen = (size_t)atomic_load_explicit(
 		&c->num_session_halfopen, memory_order_relaxed);
-	out->num_rst_sent =
-		atomic_load_explicit(&c->num_rst_sent, memory_order_relaxed);
-	out->num_rst_recv =
-		atomic_load_explicit(&c->num_rst_recv, memory_order_relaxed);
-	out->num_stream_errors = atomic_load_explicit(
+	out->num_rst_sent = (uint_least64_t)atomic_load_explicit(
+		&c->num_rst_sent, memory_order_relaxed);
+	out->num_rst_recv = (uint_least64_t)atomic_load_explicit(
+		&c->num_rst_recv, memory_order_relaxed);
+	out->num_stream_errors = (uint_least64_t)atomic_load_explicit(
 		&c->num_stream_errors, memory_order_relaxed);
-	out->num_reconnects =
-		atomic_load_explicit(&c->num_reconnects, memory_order_relaxed);
+	out->num_reconnects = (uint_least64_t)atomic_load_explicit(
+		&c->num_reconnects, memory_order_relaxed);
 	out->traffic_byt_mux_recv = c->traffic_byt_mux_recv;
 	out->traffic_byt_mux_sent = c->traffic_byt_mux_sent;
 	out->traffic_byt_push_recv = c->traffic_byt_push_recv;
 	out->traffic_byt_push_sent = c->traffic_byt_push_sent;
-	out->recv_buffered_bytes = atomic_load_explicit(
+	out->recv_buffered_bytes = (size_t)atomic_load_explicit(
 		&c->recv_buffered_bytes, memory_order_relaxed);
-	out->send_buffered_frames = atomic_load_explicit(
+	out->send_buffered_frames = (size_t)atomic_load_explicit(
 		&c->send_buffered_frames, memory_order_relaxed);
-	out->unacked_frames =
-		atomic_load_explicit(&c->unacked_frames, memory_order_relaxed);
+	out->unacked_frames = (size_t)atomic_load_explicit(
+		&c->unacked_frames, memory_order_relaxed);
 #else
 	out->num_session_created = c->num_session_created;
 	out->num_session_connect = c->num_session_connect;

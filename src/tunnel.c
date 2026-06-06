@@ -3,17 +3,18 @@
 
 #include "tunnel.h"
 
+#include "mux/mux.h"
+#include "server.h"
+#include "util.h"
+
 #include "algo/hashtable.h"
 #include "math/rand.h"
-#include "mux/mux.h"
 #include "os/clock.h"
 #include "os/socket.h"
-#include "server.h"
 #if WITH_THREADS
 #include "sync/dispatcher.h"
 #endif
 #include "sync/task.h"
-#include "util.h"
 #include "utils/arraysize.h"
 #include "utils/debug.h"
 #include "utils/minmax.h"
@@ -28,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #if WITH_THREADS
 #include <threads.h>
 #endif
@@ -112,46 +114,46 @@ struct tunnel {
 	/* Session log tag: "my <= peer" or "my => peer". Owned buffer. */
 	char tag[256];
 	/* Socket options cached at creation; updated on reload. */
-	struct socket_opts mux_socket;
-	struct socket_opts local_socket;
+	struct util_socket_opts mux_socket;
+	struct util_socket_opts local_socket;
 	/* Per-tunnel stream lifecycle counters; updated by the session thread
 	 * via mux_session_counters pointer-block. */
 	struct {
 #if WITH_THREADS
 		atomic_size_t num_streams;
 		atomic_size_t num_stream_halfopen;
-		atomic_uintmax_t num_stream_opened;
-		atomic_uintmax_t num_stream_accepted;
-		atomic_uintmax_t num_stream_fastopen;
-		atomic_uintmax_t num_stream_established;
-		atomic_uintmax_t num_stream_succeeded;
-		atomic_uintmax_t num_stream_failed;
+		atomic_uint_least64_t num_stream_opened;
+		atomic_uint_least64_t num_stream_accepted;
+		atomic_uint_least64_t num_stream_fastopen;
+		atomic_uint_least64_t num_stream_established;
+		atomic_uint_least64_t num_stream_succeeded;
+		atomic_uint_least64_t num_stream_failed;
 #else
 		size_t num_streams;
 		size_t num_stream_halfopen;
-		uintmax_t num_stream_opened;
-		uintmax_t num_stream_accepted;
-		uintmax_t num_stream_fastopen;
-		uintmax_t num_stream_established;
-		uintmax_t num_stream_succeeded;
-		uintmax_t num_stream_failed;
+		uint_least64_t num_stream_opened;
+		uint_least64_t num_stream_accepted;
+		uint_least64_t num_stream_fastopen;
+		uint_least64_t num_stream_established;
+		uint_least64_t num_stream_succeeded;
+		uint_least64_t num_stream_failed;
 #endif
 	} stream_cnt;
 	/* Per-tunnel traffic byte counters; updated by the session thread
 	 * via mux_session_counters pointer-block. */
 	struct {
 #if WITH_THREADS
-		atomic_uintmax_t byt_mux_recv;
-		atomic_uintmax_t byt_mux_sent;
+		atomic_uint_least64_t byt_mux_recv;
+		atomic_uint_least64_t byt_mux_sent;
 		/* PUSH-frame payload bytes only */
-		atomic_uintmax_t byt_push_recv;
-		atomic_uintmax_t byt_push_sent;
+		atomic_uint_least64_t byt_push_recv;
+		atomic_uint_least64_t byt_push_sent;
 #else
-		uintmax_t byt_mux_recv;
-		uintmax_t byt_mux_sent;
+		uint_least64_t byt_mux_recv;
+		uint_least64_t byt_mux_sent;
 		/* PUSH-frame payload bytes only */
-		uintmax_t byt_push_recv;
-		uintmax_t byt_push_sent;
+		uint_least64_t byt_push_recv;
+		uint_least64_t byt_push_sent;
 #endif
 	} traffic_cnt;
 	/* SYN->SYN|ACK latency ring; written on the server thread only. */
@@ -167,7 +169,8 @@ static bool stream_connect(
 	if (!resolve_addr(&connect_addr, target, SA_RESOLVE_TCP)) {
 		TUNNEL_LOG_F(
 			WARNING, t,
-			"stream %" PRIu16 ": name resolution failed for \"%s\"",
+			"stream %" PRIuLEAST16
+			": name resolution failed for \"%s\"",
 			mux_stream_id(stream), target);
 		return false;
 	}
@@ -181,7 +184,7 @@ static bool stream_connect(
 	}
 
 	if (socket_set_cloexec(fd) != 0 || socket_set_nonblock(fd) != 0) {
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return false;
 	}
 	socket_set_buffer(
@@ -194,7 +197,7 @@ static bool stream_connect(
 		const int err = errno;
 		if (err != EINPROGRESS) {
 			LOGE_F("connect: (%d) %s", err, strerror(err));
-			CLOSE_FD(fd);
+			SOCKET_CLOSE_FD(fd);
 			return false;
 		}
 	}
@@ -204,22 +207,22 @@ static bool stream_connect(
 		sa_format(addr_str, sizeof(addr_str), &connect_addr.sa);
 		TUNNEL_LOG_F(
 			DEBUG, t,
-			"stream %" PRIu16 ": connecting [fd:%d] to %s",
+			"stream %" PRIuLEAST16 ": connecting [fd:%d] to %s",
 			mux_stream_id(stream), fd, addr_str);
 	}
 	mux_stream_attach(stream, fd);
 	return true;
 }
 
-static bool
-tunnel_on_accept(void *data, struct mux_session *ss, struct mux_stream *stream)
+static bool tunnel_on_accept(
+	void *data, const struct mux_session *ss, struct mux_stream *stream)
 {
 	UNUSED(ss);
 	const struct tunnel *restrict t = data;
 	if (t->forward_addr == NULL) {
 		TUNNEL_LOG_F(
 			WARNING, t,
-			"stream %" PRIu16 ": no connect target configured",
+			"stream %" PRIuLEAST16 ": no connect target configured",
 			mux_stream_id(stream));
 		return false;
 	}
@@ -311,7 +314,7 @@ static void tunnel_schedule_reconnect(struct tunnel *restrict t)
 	t->reconnect_count++;
 #if WITH_THREADS
 	(void)atomic_fetch_add_explicit(
-		&t->relay.srv->counters.num_reconnects, (uintmax_t)1,
+		&t->relay.srv->counters.num_reconnects, (uint_least64_t)1,
 		memory_order_relaxed);
 #else
 	t->relay.srv->counters.num_reconnects++;
@@ -340,7 +343,7 @@ static bool tunnel_do_connect(struct tunnel *restrict t)
 		return false;
 	}
 	if (socket_set_cloexec(fd) != 0 || socket_set_nonblock(fd) != 0) {
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return false;
 	}
 	socket_set_buffer(
@@ -366,7 +369,7 @@ static bool tunnel_do_connect(struct tunnel *restrict t)
 		const int err = errno;
 		if (err != EINPROGRESS) {
 			LOGE_F("connect: (%d) %s", err, strerror(err));
-			CLOSE_FD(fd);
+			SOCKET_CLOSE_FD(fd);
 			return false;
 		}
 	}
@@ -414,7 +417,7 @@ static void handle_transport_lost(struct tunnel *restrict t)
 	ev_timer_stop(t->loop, &t->w_reconnect);
 #if WITH_THREADS
 	(void)atomic_fetch_add_explicit(
-		&t->relay.srv->counters.num_reconnects, (uintmax_t)1,
+		&t->relay.srv->counters.num_reconnects, (uint_least64_t)1,
 		memory_order_relaxed);
 #else
 	t->relay.srv->counters.num_reconnects++;
@@ -668,7 +671,6 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 		tunnel_reconnect_delays[0]);
 	t->w_reconnect.data = t;
 	const struct mux_frame_allocator pool = opts->pool;
-	/* Compute the initial session tag. */
 	{
 		char my[64];
 		char peer[64];
@@ -963,29 +965,29 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	out->bdp = snap.bdp;
 	out->last_changed = t->last_changed;
 #if WITH_THREADS
-	out->num_streams = atomic_load_explicit(
+	out->num_streams = (size_t)atomic_load_explicit(
 		&t->stream_cnt.num_streams, memory_order_relaxed);
-	out->num_stream_halfopen = atomic_load_explicit(
+	out->num_stream_halfopen = (size_t)atomic_load_explicit(
 		&t->stream_cnt.num_stream_halfopen, memory_order_relaxed);
-	out->num_stream_opened = atomic_load_explicit(
+	out->num_stream_opened = (uint_least64_t)atomic_load_explicit(
 		&t->stream_cnt.num_stream_opened, memory_order_relaxed);
-	out->num_stream_accepted = atomic_load_explicit(
+	out->num_stream_accepted = (uint_least64_t)atomic_load_explicit(
 		&t->stream_cnt.num_stream_accepted, memory_order_relaxed);
-	out->num_stream_fastopen = atomic_load_explicit(
+	out->num_stream_fastopen = (uint_least64_t)atomic_load_explicit(
 		&t->stream_cnt.num_stream_fastopen, memory_order_relaxed);
-	out->num_stream_established = atomic_load_explicit(
+	out->num_stream_established = (uint_least64_t)atomic_load_explicit(
 		&t->stream_cnt.num_stream_established, memory_order_relaxed);
-	out->num_stream_succeeded = atomic_load_explicit(
+	out->num_stream_succeeded = (uint_least64_t)atomic_load_explicit(
 		&t->stream_cnt.num_stream_succeeded, memory_order_relaxed);
-	out->num_stream_failed = atomic_load_explicit(
+	out->num_stream_failed = (uint_least64_t)atomic_load_explicit(
 		&t->stream_cnt.num_stream_failed, memory_order_relaxed);
-	out->byt_mux_recv = atomic_load_explicit(
+	out->byt_mux_recv = (uint_least64_t)atomic_load_explicit(
 		&t->traffic_cnt.byt_mux_recv, memory_order_relaxed);
-	out->byt_mux_sent = atomic_load_explicit(
+	out->byt_mux_sent = (uint_least64_t)atomic_load_explicit(
 		&t->traffic_cnt.byt_mux_sent, memory_order_relaxed);
-	out->byt_push_recv = atomic_load_explicit(
+	out->byt_push_recv = (uint_least64_t)atomic_load_explicit(
 		&t->traffic_cnt.byt_push_recv, memory_order_relaxed);
-	out->byt_push_sent = atomic_load_explicit(
+	out->byt_push_sent = (uint_least64_t)atomic_load_explicit(
 		&t->traffic_cnt.byt_push_sent, memory_order_relaxed);
 #else
 	out->num_streams = t->stream_cnt.num_streams;
@@ -1033,7 +1035,7 @@ static void open_stream_task(void *p)
 		}
 		TUNNEL_LOG_F(
 			DEBUG, t, "[fd:%d] session not ready, closing", fd);
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		free(arg);
 		return;
 	}
@@ -1041,7 +1043,7 @@ static void open_stream_task(void *p)
 	 * before the SYN is sent and piggybacked as SYN|PUSH (fast open). */
 	mux_stream_attach(stream, fd);
 	TUNNEL_LOG_F(
-		DEBUG, t, "[fd:%d] new stream %" PRIu16, fd,
+		DEBUG, t, "[fd:%d] new stream %" PRIuLEAST16, fd,
 		mux_stream_id(stream));
 	free(arg);
 }
@@ -1051,7 +1053,7 @@ void tunnel_open_stream(struct tunnel *t, const int fd)
 	struct open_stream_arg *restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return;
 	}
 	*arg = (struct open_stream_arg){ .t = t, .ss = t->ss, .fd = fd };
@@ -1062,8 +1064,8 @@ struct reload_arg {
 	struct tunnel *t;
 	struct mux_session *ss;
 	struct mux_config conf;
-	struct socket_opts mux_socket;
-	struct socket_opts local_socket;
+	struct util_socket_opts mux_socket;
+	struct util_socket_opts local_socket;
 	bool drain;
 	bool update_connect_addr;
 	/* Owned; NULL is valid. */

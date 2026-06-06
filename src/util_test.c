@@ -8,11 +8,10 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 T_DECLARE_CASE(test_socket_notsent_lowat_sets_option)
 {
@@ -78,7 +77,7 @@ T_DECLARE_CASE(test_resolve_addr_ipv6_parses_correctly)
 T_DECLARE_CASE(test_resolve_addr_invalid_returns_false)
 {
 	union sockaddr_max addr;
-	/* No colon: splithostport returns false, so resolve_addr returns false. */
+	/* No colon: addr_splithostport returns false, so resolve_addr returns false. */
 	T_EXPECT(!resolve_addr(&addr, "127.0.0.1", SA_RESOLVE_TCP));
 }
 

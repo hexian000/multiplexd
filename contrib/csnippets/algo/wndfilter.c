@@ -3,21 +3,21 @@
 
 #include "wndfilter.h"
 
-#include <stdint.h>
-
 void wndfilter_reset(
-	struct wndfilter *restrict w, const intmax_t t, const intmax_t v)
+	struct wndfilter *restrict w, const int_fast64_t t,
+	const int_fast64_t v)
 {
 	const struct wndfilter_sample val = { .t = t, .v = v };
 	w->s[2] = w->s[1] = w->s[0] = val;
+	w->ready = true;
 }
 
 /* As time advances, update the 1st, 2nd, and 3rd best slots. */
-static intmax_t subwin_update(
-	struct wndfilter *restrict w, const intmax_t wnd,
+static int_fast64_t subwin_update(
+	struct wndfilter *restrict w, const int_fast64_t wnd,
 	const struct wndfilter_sample *restrict val)
 {
-	const intmax_t dt = val->t - w->s[0].t;
+	const int_fast64_t dt = val->t - w->s[0].t;
 
 	if (dt > wnd) {
 		/*
@@ -49,10 +49,14 @@ static intmax_t subwin_update(
 	return w->s[0].v;
 }
 
-intmax_t wndfilter_update_min(
-	struct wndfilter *restrict w, const intmax_t wnd, const intmax_t t,
-	const intmax_t v)
+int_fast64_t wndfilter_update_min(
+	struct wndfilter *restrict w, const int_fast64_t wnd,
+	const int_fast64_t t, const int_fast64_t v)
 {
+	if (!w->ready) {
+		wndfilter_reset(w, t, v);
+		return w->s[0].v;
+	}
 	const struct wndfilter_sample val = { .t = t, .v = v };
 
 	if (val.v <= w->s[0].v || val.t - w->s[2].t > wnd) {
@@ -67,10 +71,14 @@ intmax_t wndfilter_update_min(
 	return subwin_update(w, wnd, &val);
 }
 
-intmax_t wndfilter_update_max(
-	struct wndfilter *restrict w, const intmax_t wnd, const intmax_t t,
-	const intmax_t v)
+int_fast64_t wndfilter_update_max(
+	struct wndfilter *restrict w, const int_fast64_t wnd,
+	const int_fast64_t t, const int_fast64_t v)
 {
+	if (!w->ready) {
+		wndfilter_reset(w, t, v);
+		return w->s[0].v;
+	}
 	const struct wndfilter_sample val = { .t = t, .v = v };
 
 	if (val.v >= w->s[0].v || val.t - w->s[2].t > wnd) {

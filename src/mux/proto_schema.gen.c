@@ -14,36 +14,36 @@
 
 /* --- json_proto --- */
 static int
-json_proto_lookup(const char *str, size_t len)
+json_lookup_proto(const char *str, size_t len)
 {
-    if (len < 1) { return -1; }
-    switch ((unsigned char)str[0]) {
-    case 'e':
-        return len == 10 && memcmp(str, "extensions", 10) == 0 ? 0 : -1;
-    case 'm':
-        return len == 5 && memcmp(str, "msgid", 5) == 0 ? 1 : -1;
-    case 'r':
-        return len == 10 && memcmp(str, "resume_seq", 10) == 0 ? 2 : -1;
-    case 's':
-        return len == 10 && memcmp(str, "session_id", 10) == 0 ? 3 : -1;
-    case 't':
-        return len == 4 && memcmp(str, "type", 4) == 0 ? 4 : -1;
-    default: return -1;
-    }
+	if (len < 1) { return -1; }
+	switch ((unsigned char)str[0]) {
+	case 'e':
+		return len == 10 && memcmp(str, "extensions", 10) == 0 ? 0 : -1;
+	case 'm':
+		return len == 5 && memcmp(str, "msgid", 5) == 0 ? 1 : -1;
+	case 'r':
+		return len == 10 && memcmp(str, "resume_seq", 10) == 0 ? 2 : -1;
+	case 's':
+		return len == 10 && memcmp(str, "session_id", 10) == 0 ? 3 : -1;
+	case 't':
+		return len == 4 && memcmp(str, "type", 4) == 0 ? 4 : -1;
+	default: return -1;
+	}
 }
 
 /* --- json_proto_extensions --- */
 static int
-json_proto_extensions_lookup(const char *str, size_t len)
+json_lookup_proto_extensions(const char *str, size_t len)
 {
-    if (len < 1) { return -1; }
-    switch ((unsigned char)str[0]) {
-    case 'i':
-        return len == 8 && memcmp(str, "identity", 8) == 0 ? 0 : -1;
-    case 'r':
-        return len == 14 && memcmp(str, "reject_inbound", 14) == 0 ? 1 : -1;
-    default: return -1;
-    }
+	if (len < 1) { return -1; }
+	switch ((unsigned char)str[0]) {
+	case 'i':
+		return len == 8 && memcmp(str, "identity", 8) == 0 ? 0 : -1;
+	case 'r':
+		return len == 14 && memcmp(str, "reject_inbound", 14) == 0 ? 1 : -1;
+	default: return -1;
+	}
 }
 
 /** @} */
@@ -52,16 +52,16 @@ json_proto_extensions_lookup(const char *str, size_t len)
  *  @{ */
 
 enum json_proto_key {
-    JSON_PROTO_EXTENSIONS = 0,
-    JSON_PROTO_MSGID = 1,
-    JSON_PROTO_RESUME_SEQ = 2,
-    JSON_PROTO_SESSION_ID = 3,
-    JSON_PROTO_TYPE = 4,
+	JSON_PROTO_EXTENSIONS = 0,
+	JSON_PROTO_MSGID = 1,
+	JSON_PROTO_RESUME_SEQ = 2,
+	JSON_PROTO_SESSION_ID = 3,
+	JSON_PROTO_TYPE = 4,
 };
 
 enum json_proto_extensions_key {
-    JSON_PROTO_EXTENSIONS_IDENTITY = 0,
-    JSON_PROTO_EXTENSIONS_REJECT_INBOUND = 1,
+	JSON_PROTO_EXTENSIONS_IDENTITY = 0,
+	JSON_PROTO_EXTENSIONS_REJECT_INBOUND = 1,
 };
 
 /** @} */
@@ -69,14 +69,14 @@ enum json_proto_extensions_key {
 /** @name Free
  *  @{ */
 
-static void json_proto_extensions_free(struct json_proto_extensions *obj)
+static void json_free_proto_extensions(struct json_proto_extensions *obj)
 {
-    (void)obj;
+	(void)obj;
 }
 
-void json_proto_free(struct json_proto *obj)
+void json_free_proto(struct json_proto *obj)
 {
-    json_proto_extensions_free(&obj->extensions);
+	json_free_proto_extensions(&obj->extensions);
 }
 
 /** @} */
@@ -84,89 +84,95 @@ void json_proto_free(struct json_proto *obj)
 /** @name Unmarshal
  *  @{ */
 
-static bool json_proto_extensions_unmarshal(
-    struct json_proto_extensions *obj, char *json, size_t length)
+static bool json_unmarshal_proto_extensions(
+	struct json_proto_extensions *obj, char *json, size_t length)
 {
-    const struct json_val root_ = json_parse(json, length);
-    if (root_.type != JSON_OBJECT) { return false; }
-    json_iter iter_ = root_.iter;
-    char *key_; size_t key_len_; char *val_; size_t val_len_;
-    *obj = (struct json_proto_extensions){
-        .reject_inbound = false,
-    };
+	const struct json_val root_ = json_parse(json, &(size_t){ length });
+	if (root_.type != JSON_OBJECT) { return false; }
+	json_iter iter_ = root_.iter;
+	char *key_; size_t key_len_; char *val_; size_t val_len_;
+	*obj = (struct json_proto_extensions){
+		.reject_inbound = false,
+	};
 
-    while (json_obj_next(json, length, &iter_,
-            &key_, &key_len_, &val_, &val_len_)) {
-        const int k_ = json_proto_extensions_lookup(key_, key_len_);
-        switch (k_) {
-        case JSON_PROTO_EXTENSIONS_IDENTITY: {
-            if (!json_parse_string(val_, val_len_, &obj->identity.str, &obj->identity.len)) { return false; }
-            if (obj->identity.len > 255u) { return false; }
-            break;
-        }
-        case JSON_PROTO_EXTENSIONS_REJECT_INBOUND: {
-            if (!json_parse_bool(val_, val_len_, &obj->reject_inbound)) { return false; }
-            break;
-        }
-        default:
-            break;
-        }
-    }
-    return true;
+	while (json_obj_next(json, &length, &iter_,
+			&key_, &key_len_, &val_, &val_len_)) {
+		const int k_ = json_lookup_proto_extensions(key_, key_len_);
+		switch (k_) {
+		case JSON_PROTO_EXTENSIONS_IDENTITY: {
+			if (!json_parse_string(val_, val_len_, &obj->identity.str, &obj->identity.len)) { return false; }
+			if (obj->identity.len > 255u) { return false; }
+			break;
+		}
+		case JSON_PROTO_EXTENSIONS_REJECT_INBOUND: {
+			if (!json_parse_bool(val_, val_len_, &obj->reject_inbound)) { return false; }
+			break;
+		}
+		default:
+			break;
+		}
+	}
+	for (; iter_ < length; iter_++) {
+		if (!json_iswhitespace(json[iter_])) { return false; }
+	}
+	return true;
 }
 
-bool json_proto_unmarshal(
-    struct json_proto *obj, char *json, size_t length)
+bool json_unmarshal_proto(
+	struct json_proto *obj, char *json, size_t length)
 {
-    const struct json_val root_ = json_parse(json, length);
-    if (root_.type != JSON_OBJECT) { return false; }
-    json_iter iter_ = root_.iter;
-    char *key_; size_t key_len_; char *val_; size_t val_len_;
-    *obj = (struct json_proto){
-        .extensions = {
-            .reject_inbound = false,
-        },
-    };
-    int required_ = 2;
+	const struct json_val root_ = json_parse(json, &(size_t){ length });
+	if (root_.type != JSON_OBJECT) { return false; }
+	json_iter iter_ = root_.iter;
+	char *key_; size_t key_len_; char *val_; size_t val_len_;
+	*obj = (struct json_proto){
+		.extensions = {
+			.reject_inbound = false,
+		},
+	};
+	int required_ = 2;
 
-    while (json_obj_next(json, length, &iter_,
-            &key_, &key_len_, &val_, &val_len_)) {
-        const int k_ = json_proto_lookup(key_, key_len_);
-        switch (k_) {
-        case JSON_PROTO_EXTENSIONS: {
-            if (!json_proto_extensions_unmarshal(&obj->extensions, val_, val_len_)) {
-                return false;
-            }
-            break;
-        }
-        case JSON_PROTO_MSGID: {
-            if (!json_parse_imax(val_, val_len_, &obj->msgid)) { return false; }
-            if (obj->msgid != INTMAX_C(0) && obj->msgid != INTMAX_C(1)) { return false; }
-            required_--;
-            break;
-        }
-        case JSON_PROTO_RESUME_SEQ: {
-            if (!json_parse_uint(val_, val_len_, &obj->resume_seq)) { return false; }
-            if (obj->resume_seq > 4294967295u) { return false; }
-            break;
-        }
-        case JSON_PROTO_SESSION_ID: {
-            if (!json_parse_string(val_, val_len_, &obj->session_id.str, &obj->session_id.len)) { return false; }
-            if (obj->session_id.len < 24u) { return false; }
-            if (obj->session_id.len > 24u) { return false; }
-            break;
-        }
-        case JSON_PROTO_TYPE: {
-            if (!json_parse_string(val_, val_len_, &obj->type.str, &obj->type.len)) { return false; }
-            required_--;
-            break;
-        }
-        default:
-            break;
-        }
-    }
-    if (required_) { return false; }
-    return true;
+	while (json_obj_next(json, &length, &iter_,
+			&key_, &key_len_, &val_, &val_len_)) {
+		const int k_ = json_lookup_proto(key_, key_len_);
+		switch (k_) {
+		case JSON_PROTO_EXTENSIONS: {
+			if (!json_unmarshal_proto_extensions(&obj->extensions, val_, val_len_)) {
+				return false;
+			}
+			break;
+		}
+		case JSON_PROTO_MSGID: {
+			if (!json_parse_imax(val_, val_len_, &obj->msgid)) { return false; }
+			if (obj->msgid != INTMAX_C(0) && obj->msgid != INTMAX_C(1)) { return false; }
+			required_--;
+			break;
+		}
+		case JSON_PROTO_RESUME_SEQ: {
+			if (!json_parse_uint(val_, val_len_, &obj->resume_seq)) { return false; }
+			if (obj->resume_seq > 4294967295u) { return false; }
+			break;
+		}
+		case JSON_PROTO_SESSION_ID: {
+			if (!json_parse_string(val_, val_len_, &obj->session_id.str, &obj->session_id.len)) { return false; }
+			if (obj->session_id.len < 24u) { return false; }
+			if (obj->session_id.len > 24u) { return false; }
+			break;
+		}
+		case JSON_PROTO_TYPE: {
+			if (!json_parse_string(val_, val_len_, &obj->type.str, &obj->type.len)) { return false; }
+			required_--;
+			break;
+		}
+		default:
+			break;
+		}
+	}
+	if (required_) { return false; }
+	for (; iter_ < length; iter_++) {
+		if (!json_iswhitespace(json[iter_])) { return false; }
+	}
+	return true;
 }
 
 /** @} */
@@ -175,83 +181,95 @@ bool json_proto_unmarshal(
  *  @{ */
 
 #define EMIT(fmt, ...) do { \
-    r_ = snprintf(buf ? buf + n_ : NULL, \
-        bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, fmt, __VA_ARGS__); \
-    if (r_ < 0) { return -1; } \
-    n_ += r_; \
+	r_ = snprintf(buf ? buf + n_ : NULL, \
+		bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, fmt, __VA_ARGS__); \
+	if (r_ < 0) { return -1; } \
+	n_ += r_; \
 } while (0)
 #define EMIT_STR(s, len) do { \
-    r_ = json_marshal_string(buf ? buf + n_ : NULL, \
-        bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, (s), (len)); \
-    if (r_ < 0) { return -1; } \
-    n_ += r_; \
+	r_ = json_marshal_string(buf ? buf + n_ : NULL, \
+		bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, (s), (len)); \
+	if (r_ < 0) { return -1; } \
+	n_ += r_; \
 } while (0)
 #define EMIT_SUB(fn, arg) do { \
-    r_ = (fn)(buf ? buf + n_ : NULL, \
-        bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, (arg)); \
-    if (r_ < 0) { return -1; } \
-    n_ += r_; \
+	r_ = (fn)(buf ? buf + n_ : NULL, \
+		bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, (arg)); \
+	if (r_ < 0) { return -1; } \
+	n_ += r_; \
+} while (0)
+#define EMIT_LIT(s) do { \
+	static const char lit_[] = s; \
+	const int l_ = (int)(sizeof(lit_) - 1); \
+	if (buf && bufsz > (size_t)n_ + (size_t)l_) \
+		memcpy(buf + n_, lit_, (size_t)l_); \
+	n_ += l_; \
 } while (0)
 
-static int json_proto_extensions_marshal(
-    char *buf, size_t bufsz, const struct json_proto_extensions *obj)
+static int json_marshal_proto_extensions(
+	char *buf, size_t bufsz, const struct json_proto_extensions *obj)
 {
-    int n_ = 0;
-    int r_;
+	int n_ = 0;
+	int r_;
 
-    EMIT("%s", "{");
-    const int n_start_ = n_;
+	EMIT_LIT("{");
+	const int n_start_ = n_;
 
-    if (obj->identity.str != NULL) {
-        EMIT("\"%s\":", "identity");
-        EMIT_STR(obj->identity.str, obj->identity.len);
-        EMIT("%s", ",");
-    }
-    EMIT("\"%s\":%s,", "reject_inbound",
-        obj->reject_inbound ? "true" : "false");
+	if (obj->identity.str != NULL) {
+		EMIT_LIT("\"identity\":");
+		EMIT_STR(obj->identity.str, obj->identity.len);
+		EMIT_LIT(",");
+	}
+	EMIT_LIT("\"reject_inbound\":");
+	if (obj->reject_inbound) {
+		EMIT_LIT("true,");
+	} else {
+		EMIT_LIT("false,");
+	}
 
-    if (n_ > n_start_) { n_--; }
-    EMIT("%s", "}");
+	if (n_ > n_start_) { n_--; }
+	EMIT_LIT("}");
 
-    return n_;
+	return n_;
 }
 
-int json_proto_marshal(
-    char *buf, size_t bufsz, const struct json_proto *obj)
+int json_marshal_proto(
+	char *buf, size_t bufsz, const struct json_proto *obj)
 {
-    int n_ = 0;
-    int r_;
+	int n_ = 0;
+	int r_;
 
-    EMIT("%s", "{");
-    const int n_start_ = n_;
+	EMIT_LIT("{");
+	const int n_start_ = n_;
 
-    EMIT("\"%s\":", "extensions");
-    EMIT_SUB(json_proto_extensions_marshal, &obj->extensions);
-    EMIT("%s", ",");
-    EMIT("\"%s\":%jd,", "msgid",
-        (intmax_t)obj->msgid);
-    EMIT("\"%s\":%ju,", "resume_seq",
-        (uintmax_t)obj->resume_seq);
-    if (obj->session_id.str != NULL) {
-        EMIT("\"%s\":", "session_id");
-        EMIT_STR(obj->session_id.str, obj->session_id.len);
-        EMIT("%s", ",");
-    }
-    if (obj->type.str != NULL) {
-        EMIT("\"%s\":", "type");
-        EMIT_STR(obj->type.str, obj->type.len);
-        EMIT("%s", ",");
-    }
+	EMIT_LIT("\"extensions\":");
+	EMIT_SUB(json_marshal_proto_extensions, &obj->extensions);
+	EMIT_LIT(",");
+	EMIT("\"%s\":%jd,", "msgid",
+		(intmax_t)obj->msgid);
+	EMIT("\"%s\":%ju,", "resume_seq",
+		(uintmax_t)obj->resume_seq);
+	if (obj->session_id.str != NULL) {
+		EMIT_LIT("\"session_id\":");
+		EMIT_STR(obj->session_id.str, obj->session_id.len);
+		EMIT_LIT(",");
+	}
+	if (obj->type.str != NULL) {
+		EMIT_LIT("\"type\":");
+		EMIT_STR(obj->type.str, obj->type.len);
+		EMIT_LIT(",");
+	}
 
-    if (n_ > n_start_) { n_--; }
-    EMIT("%s", "}");
+	if (n_ > n_start_) { n_--; }
+	EMIT_LIT("}");
 
-    return n_;
+	return n_;
 }
 
 
 #undef EMIT
 #undef EMIT_STR
 #undef EMIT_SUB
+#undef EMIT_LIT
 
 /** @} */

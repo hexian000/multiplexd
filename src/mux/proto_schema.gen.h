@@ -3,30 +3,30 @@
 #ifndef PROTO_SCHEMA_GEN_H
 #define PROTO_SCHEMA_GEN_H
 
+#include "codec/json.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-
-#include "codec/json.h"
 
 /** @name Struct types
  *  @{ */
 
 struct json_proto_extensions {
-    struct json_string identity;
+	struct json_string identity;
 
-    bool reject_inbound;
+	bool reject_inbound;
 };
 
 struct json_proto {
-    struct json_proto_extensions extensions;
+	struct json_proto_extensions extensions;
 
-    struct json_string session_id;
-    struct json_string type;
+	struct json_string session_id;
+	struct json_string type;
 
-    unsigned resume_seq;
+	unsigned resume_seq;
 
-    intmax_t msgid;
+	intmax_t msgid;
 };
 
 /** @} */
@@ -36,8 +36,8 @@ struct json_proto {
 
 /* Unmarshal json (length bytes) into *obj; the buffer is modified in-place. */
 /* The function zero-initializes *obj and applies schema defaults before parsing; pointer fields of set keys then point into the json buffer (keep it valid). Returns true on success. */
-bool json_proto_unmarshal(
-    struct json_proto *obj, char *json, size_t length);
+bool json_unmarshal_proto(
+	struct json_proto *obj, char *json, size_t length);
 
 /** @} */
 
@@ -46,7 +46,7 @@ bool json_proto_unmarshal(
 
 /* Marshal *obj into buf as JSON text (snprintf semantics: returns chars written
    excluding NUL, or required size including NUL when buf is NULL or bufsz is 0). */
-int json_proto_marshal(char *buf, size_t bufsz, const struct json_proto *obj);
+int json_marshal_proto(char *buf, size_t bufsz, const struct json_proto *obj);
 
 /** @} */
 
@@ -54,7 +54,7 @@ int json_proto_marshal(char *buf, size_t bufsz, const struct json_proto *obj);
  *  @{ */
 
 /* Free heap-allocated fields inside *obj (arrays). */
-void json_proto_free(struct json_proto *obj);
+void json_free_proto(struct json_proto *obj);
 
 /** @} */
 

@@ -176,8 +176,11 @@ def build_server_config(*, use_tls: bool) -> Dict[str, object]:
     config: Dict[str, object] = {
         "api_listen": "127.0.0.1:9081",
         "mux_listen": "127.0.0.1:8443",
-        "listen": "127.0.0.1:5203",
         "connect": "127.0.0.1:5201",
+        "identity": {
+            "claim": "server",
+            "listen": {"client": "127.0.0.1:5203"},
+        },
         "mux": {
             "stream_window": 16777216,
             "session_window": 16777216,
@@ -192,15 +195,19 @@ def build_server_config(*, use_tls: bool) -> Dict[str, object]:
             "cert": "@server-cert.pem",
             "key": "@server-key.pem",
             "authcerts": ["@client-cert.pem"],
+            "ciphersuites": "TLS_CHACHA20_POLY1305_SHA256",
         }
     return config
 
 
-def build_client_config(*, use_tls: bool) -> Dict[str, object]:
+def build_client_config(*, use_tls: bool, tunnels: int = 2) -> Dict[str, object]:
     config: Dict[str, object] = {
-        "mux_connect": "127.0.0.1:8443",
-        "listen": "127.0.0.1:5202",
         "connect": "127.0.0.1:5201",
+        "identity": {
+            "claim": "client",
+            "mux_connect": ["127.0.0.1:8443"] * tunnels,
+            "listen": {"server": "127.0.0.1:5202"},
+        },
         "mux": {
             "stream_window": 16777216,
             "session_window": 16777216,
@@ -215,6 +222,7 @@ def build_client_config(*, use_tls: bool) -> Dict[str, object]:
             "cert": "@client-cert.pem",
             "key": "@client-key.pem",
             "authcerts": ["@server-cert.pem"],
+            "ciphersuites": "TLS_CHACHA20_POLY1305_SHA256",
         }
     return config
 
@@ -240,6 +248,7 @@ def prepare_runtime_assets(
         runtime_dir: Path,
         *,
         use_tls: bool,
+        tunnels: int = 2,
 ) -> tuple[Path, Path]:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if use_tls:
@@ -247,7 +256,7 @@ def prepare_runtime_assets(
     server_config_path = runtime_dir / "server.json"
     client_config_path = runtime_dir / "client.json"
     write_config(server_config_path, build_server_config(use_tls=use_tls))
-    write_config(client_config_path, build_client_config(use_tls=use_tls))
+    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels))
     return server_config_path, client_config_path
 
 
@@ -586,6 +595,7 @@ def render_markdown_report(
         parallel: int,
         netem_delay: Optional[str],
     use_tls: bool,
+    tunnels: int,
     command_timeout_seconds: float,
     shutdown_budget: ProcessShutdownBudget,
 ) -> str:
@@ -600,6 +610,7 @@ def render_markdown_report(
         "| Duration per run | %d s |" % duration,
         "| Parallel streams | %d |" % parallel,
         "| TLS | %s |" % ("on" if use_tls else "off"),
+        "| Tunnels | %d |" % tunnels,
         "| Netem delay | %s |" % (netem_delay or "off"),
         "| Benchmark timeout | %.1f s per scenario |" % command_timeout_seconds,
         "| Shutdown grace | SIGINT %.1f s, terminate %.1f s |"
@@ -692,6 +703,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="enable TLS for the mux transport (default: off)",
     )
     parser.add_argument(
+        "--tunnels",
+        type=int,
+        default=2,
+        help="number of parallel mux tunnels (default: 2)",
+    )
+    parser.add_argument(
         "--netem-delay",
         help="optional tc netem delay applied to the mux transport, for example 100ms",
     )
@@ -720,6 +737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         binary_path,
         build_dir,
         use_tls=args.tls,
+        tunnels=args.tunnels,
     )
     configure_netem(args.netem_delay)
     command_timeout_seconds = compute_command_timeout_seconds(
@@ -859,6 +877,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parallel=args.parallel,
         netem_delay=args.netem_delay,
         use_tls=args.tls,
+        tunnels=args.tunnels,
         command_timeout_seconds=command_timeout_seconds,
         shutdown_budget=shutdown_budget,
     )

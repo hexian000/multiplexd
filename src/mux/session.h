@@ -47,7 +47,7 @@ enum session_state {
 	SESSION_HANDSHAKE,
 	/* Session ready; stream operations allowed */
 	SESSION_ESTABLISHED,
-	/* Transport lost; streams and unacked list preserved; awaiting reconnect */
+	/* Transport lost; streams and unacked ring preserved; awaiting reconnect */
 	SESSION_SUSPENDED,
 	/* Graceful shutdown of the transport layer initiated */
 	SESSION_CLOSING,
@@ -88,6 +88,10 @@ struct sched_ctx {
 	 * data path never skips over INIT/CLOSED streams. */
 	struct mux_stream *lp_head;
 	struct mux_stream *lp_tail;
+	/* Control-pending list: streams with queued ACK or FIN that have no
+	 * data to piggyback on.  Drained by sched_flush_ctrl during send-stall
+	 * and opportunistically by sched_next_data during normal operation. */
+	struct mux_stream *ctrl_head;
 	ev_idle w_sched;
 	/* Fixed-period coalescing timer: flushes Nagle-held frames and
 	 * sub-threshold window updates every MUX_COALESCING_INTERVAL seconds. */
@@ -129,8 +133,8 @@ struct handshake_ctx {
 #define COUNTER_STORE(p, v)                                                    \
 	((p) ? atomic_store_explicit((p), (v), memory_order_relaxed) : (void)0)
 #else
-#define COUNTER_ADD(p, v) ((p) ? (*(p) += (uintmax_t)(v)) : 0)
-#define COUNTER_SUB(p, v) ((p) ? (*(p) -= (uintmax_t)(v)) : 0)
+#define COUNTER_ADD(p, v) ((p) ? (*(p) += (uint_least64_t)(v)) : 0)
+#define COUNTER_SUB(p, v) ((p) ? (*(p) -= (uint_least64_t)(v)) : 0)
 #define COUNTER_LOAD(p) ((p) ? *(p) : 0)
 #define COUNTER_STORE(p, v) ((p) ? (void)(*(p) = (v)) : (void)0)
 #endif
@@ -154,13 +158,13 @@ struct mux_session {
 	size_t send_buffered_frames;
 	size_t unacked_frames;
 	/* Local per-session diagnostics. */
-	intmax_t last_connect_latency_ns;
+	int_least64_t last_connect_latency_ns;
 	/* Total mux bytes received from the transport for diagnostics. */
-	uintmax_t bytes_recv;
+	uint_least64_t bytes_recv;
 	/* Monotonic ns of the last outgoing PONG; used for inbound PING rate limiting. */
-	intmax_t ping_recv_last_ns;
+	int_least64_t ping_recv_last_ns;
 	enum session_state state;
-	intmax_t last_modified;
+	int_least64_t last_modified;
 	/* Peer address captured when session reaches SESSION_ESTABLISHED. */
 	union sockaddr_max peer_addr;
 	struct mux_callbacks callbacks;
@@ -178,7 +182,7 @@ struct mux_session {
 
 	/* true for accepted (server-role) sessions */
 	bool accepted : 1;
-	/* true when the unacked list has reached the session window cap;
+	/* true when the unacked ring has reached the session window cap;
 	 * data frame sends are suspended until the peer acknowledges frames. */
 	bool send_stalled : 1;
 	/* true when stream_window was configured as 0; the BDP estimator probes
@@ -229,10 +233,13 @@ struct mux_session {
 		/* true when a stream ACK has been sent since the last session ACK,
 		 * meaning a session-level ACK piggyback should be scheduled */
 		bool ack_pending : 1;
-		/* non-stream-0 frames fully flushed but not yet acked */
-		struct mux_frame_list unacked;
-		/* cursor into unacked list during retransmission; NULL when idle */
-		struct mux_frame *retransmit_cursor;
+		/* non-stream-0 frames fully flushed but not yet acked.
+		 * Frame pointer ring; O(1) trim by advancing head. */
+		struct mux_frame_ring *unacked;
+		/* Offset from unacked->entries[unacked->head] to the first
+		 * un-retransmitted frame when replaying after a resume;
+		 * SIZE_MAX when no retransmit is in progress. */
+		size_t retransmit_off;
 		/* transient copy currently queued/flushing for retransmission;
 		 * NULL when no retransmit copy is in flight */
 		struct mux_frame *retransmit_copy;
@@ -324,6 +331,13 @@ bool session_send_oob(
 /* Flush the send buffer once; call after enqueuing control frames outside the I/O callback. */
 void session_flush(struct mux_session *restrict ss);
 
+/* Flush OOB control frames (PING/PONG/PROBE) to the wire immediately, bypassing
+ * EV_WRITE and the scheduler queue.  Drives send_cb inline when not already
+ * pending; no-op when state != SESSION_ESTABLISHED.  Call after ringbuf_consume
+ * to guarantee the receive frame has been retired before any teardown that
+ * send_cb may trigger. */
+void session_flush_oob(struct mux_session *restrict ss);
+
 /* Wake the scheduler for stream s and, if EV_WRITE was not already pending,
  * flush the send pipeline inline to avoid an extra libev iteration.
  * Must only be called from stream.c:recv_cb(); do not call from any path
@@ -349,6 +363,10 @@ void session_log_frame_header(
  * instead; session_reset() discards all stream and unacked state. */
 void session_reset(struct mux_session *ss);
 
+/* Call session_reset then fire MUX_EVENT_CLOSED if the session closed.
+ * expired is set when the event is triggered by a resume-timeout. */
+void session_notify_closed(struct mux_session *restrict ss, bool expired);
+
 /* Suspend the transport on error, preserving stream and unacked state for resume. */
 void session_suspend(struct mux_session *ss);
 
@@ -360,10 +378,20 @@ bool session_resume_transport(
 	struct mux_session *restrict ss, struct mux_session *restrict new_ss,
 	uint_least32_t client_resume_seq);
 
-/* Trim count frames from the unacked list after a session-level ACK from the peer. */
+/* Trim count frames from the unacked ring after a session-level ACK from the peer. */
 bool session_ack_trim(struct mux_session *restrict ss, uint_fast32_t count);
 
-/* Apply the peer's resume_seq to trim our unacked list on session resume. */
+/* Discard all frames in the unacked ring, free the ring array, and reset
+ * counters.  Defined inline so handshake tests can use it without linking
+ * the full session TU. */
+static inline void unacked_ring_free_all(struct mux_session *restrict ss)
+{
+	mux_frame_ring_free(&ss->unacked, &ss->pool);
+	ss->unacked_frames = 0;
+	ss->retransmit_off = SIZE_MAX;
+}
+
+/* Apply the peer's resume_seq to trim our unacked ring on session resume. */
 bool session_resume_ack_recv(
 	struct mux_session *restrict ss, uint_least32_t peer_ack);
 

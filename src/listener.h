@@ -18,7 +18,7 @@ struct config;
 struct ev_loop;
 struct listener;
 struct server;
-struct socket_opts;
+struct util_socket_opts;
 struct sockaddr;
 
 /**
@@ -28,19 +28,19 @@ struct sockaddr;
  * @param accepted_fd The accepted socket; ownership transfers to the callback.
  * @param accepted_sa The peer socket address captured at accept time.
  */
-typedef void (*serve_fn)(
+typedef void (*listener_serve_fn)(
 	struct listener *l, struct ev_loop *loop, int accepted_fd,
 	const struct sockaddr *accepted_sa);
 
 struct listener {
 	ev_io w_accept;
 	ev_timer w_timer;
-	const struct socket_opts *socket_opts;
-	serve_fn serve;
+	const struct util_socket_opts *socket_opts;
+	listener_serve_fn serve;
 	struct server *srv;
 	/* Optional per-listener context; unused by built-in listeners. */
 	void *data;
-	uintmax_t *num_accepted;
+	uint_least64_t *num_accepted;
 };
 
 /**
@@ -52,9 +52,9 @@ struct listener {
  * @param num_accepted Optional counter incremented on each successful accept.
  */
 void listener_init(
-	struct listener *l, const struct socket_opts *socket_opts,
-	serve_fn serve, struct server *server,
-	uintmax_t *restrict num_accepted);
+	struct listener *l, const struct util_socket_opts *socket_opts,
+	listener_serve_fn serve, struct server *server,
+	uint_least64_t *restrict num_accepted);
 
 /**
  * @brief Bind and start accepting connections.

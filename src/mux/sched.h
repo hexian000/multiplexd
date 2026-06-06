@@ -57,6 +57,12 @@ bool sched_next_data(struct mux_session *restrict ss);
  * peer (and unblock the session stall). */
 void sched_flush_ctrl(struct mux_session *restrict ss);
 
+/* Add/remove a stream from the control-pending list (ACK/FIN queued, no data). */
+void sched_ctrl_enqueue(
+	struct mux_session *restrict ss, struct mux_stream *restrict s);
+void sched_ctrl_dequeue(
+	struct mux_session *restrict ss, struct mux_stream *restrict s);
+
 /* Arm the coalescing timer if it is not already active.  Called when a
  * stream enters the delay list or when a deferred session ACK is pending. */
 void sched_coalesce_arm(struct mux_session *ss);

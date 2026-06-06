@@ -22,32 +22,31 @@
  */
 
 #include "api_server.h"
-#include "algo/hashtable.h"
 #include "conf.h"
 #include "mux/sched.h"
 #include "mux/session.h"
 #include "mux/stream.h"
-#include "os/clock.h"
-#include "os/socket.h"
 #include "server.h"
 #include "util.h"
 
+#include "algo/hashtable.h"
+#include "os/clock.h"
+#include "os/socket.h"
 #include "utils/testing.h"
 
 #include <ev.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <errno.h>
+#if WITH_THREADS
+#include <stdatomic.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if WITH_THREADS
-#include <stdatomic.h>
-#endif
+#include <sys/socket.h>
+#include <unistd.h>
 
 #if WITH_THREADS
 #define STORE_STAT(field, value)                                               \
@@ -939,8 +938,8 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	T_EXPECT(resp_contains(rctx1.buf, "Mux Throughput"));
 	T_EXPECT(resp_contains(rctx1.buf, "Server Load"));
 	T_EXPECT(fx.srv.rate_tracker.is_set);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uintmax_t)2048);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uintmax_t)4096);
+	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uint_least64_t)2048);
+	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uint_least64_t)4096);
 
 	fx.srv.counters.traffic_byt_mux_recv = 3072;
 	fx.srv.counters.traffic_byt_mux_sent = 6144;
@@ -952,8 +951,8 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
 	T_EXPECT(resp_contains(rctx2.buf, "Mux Throughput"));
 	T_EXPECT(resp_contains(rctx2.buf, "Server Load"));
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uintmax_t)3072);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uintmax_t)6144);
+	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uint_least64_t)3072);
+	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uint_least64_t)6144);
 
 	apifx_teardown(&fx);
 }
@@ -1032,7 +1031,7 @@ T_DECLARE_CASE(test_connection_close_on_non_keepalive_request)
 
 int main(void)
 {
-	loadlibs();
+	util_loadlibs();
 
 	T_DECLARE_CTX(t);
 	T_RUN_CASE(t, test_healthy_get);
@@ -1053,6 +1052,6 @@ int main(void)
 	T_RUN_CASE(t, test_not_found_keepalive_followed_by_success);
 	T_RUN_CASE(t, test_connection_close_on_non_keepalive_request);
 
-	unloadlibs();
+	util_unloadlibs();
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -58,9 +58,9 @@ struct config {
 	/* Mux session parameters; window fields in frame units. */
 	struct mux_config mux;
 	/* TCP socket options for the mux transport socket. */
-	struct socket_opts mux_tcp;
+	struct util_socket_opts mux_tcp;
 	/* TCP socket options for the local application socket. */
-	struct socket_opts tcp;
+	struct util_socket_opts tcp;
 
 	struct conf_identity identity;
 
@@ -79,19 +79,19 @@ struct config {
 struct config *conf_new(void);
 
 /**
- * @brief Parse, validate, and normalize a configuration file.
- * @param path Path to the JSON configuration file.
- * @return A heap-allocated configuration on success, or NULL on failure.
- */
-struct config *conf_parsefile(const char *path);
-
-/**
  * @brief Parse, validate, and normalize a configuration from a JSON buffer.
  * @param json The JSON input buffer (modified in-place; need not be NUL-terminated).
  * @param len The input length in bytes.
  * @return A heap-allocated configuration on success, or NULL on failure.
  */
 struct config *conf_parse(char *json, size_t len);
+
+/**
+ * @brief Parse, validate, and normalize a configuration file.
+ * @param path Path to the JSON configuration file.
+ * @return A heap-allocated configuration on success, or NULL on failure.
+ */
+struct config *conf_parsefile(const char *path);
 
 /**
  * @brief Serialize a configuration to a heap-allocated JSON string.

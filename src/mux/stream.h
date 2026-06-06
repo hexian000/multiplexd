@@ -12,8 +12,6 @@
 #include "mux/frame.h"
 #include "mux/mux.h"
 
-#include "utils/minmax.h"
-
 #include <ev.h>
 
 #include <stdbool.h>
@@ -21,6 +19,16 @@
 #include <stdint.h>
 
 struct mux_session;
+
+/* Scheduling queue membership for a stream.  At most one queue owns a
+ * stream at any time; the DRR data queue, low-priority lifecycle queue,
+ * and control-pending list are all mutually exclusive. */
+enum sched_queue {
+	SCHED_QUEUE_NONE,
+	SCHED_QUEUE_CTRL,
+	SCHED_QUEUE_DRR,
+	SCHED_QUEUE_LP,
+};
 
 enum stream_state {
 	/* Active: stream created locally; initial SYN flight not queued yet */
@@ -45,9 +53,8 @@ struct mux_stream {
 	uint_least16_t id;
 
 	/* State flags (shared by both modes) */
-	bool is_ready : 1;
-	/* true when this stream is in the low-priority (EV_IDLE) queue for SYN/cleanup. */
-	bool lp_ready : 1;
+	/* Which scheduling queue this stream belongs to; mutually exclusive. */
+	uint_least8_t sched_queue : 2;
 	/* true = direct I/O mode; false = socket mode */
 	bool is_direct : 1;
 	/* Receive window update pending; a credit-bearing ACK must be sent to the peer. */
@@ -111,8 +118,8 @@ struct mux_stream {
 	/* Cumulative credit granted to the peer so far, in bytes (wrapping). */
 	uint_least32_t grant_sent;
 	/* Remaining budget for immediate-ACK cycles (TCP-style quickack). */
-	uint8_t quickack_budget;
-	intmax_t syn_sent_ns;
+	uint_least8_t quickack_budget;
+	int_least64_t syn_sent_ns;
 	/* One-shot linger before CLOSED cleanup re-enters EV_IDLE. */
 	ev_timer w_tombstone;
 };

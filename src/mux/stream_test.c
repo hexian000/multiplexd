@@ -6,7 +6,6 @@
 #include "mux/stream.h"
 
 #include "algo/hashtable.h"
-
 #include "utils/testing.h"
 
 #include <ev.h>
@@ -511,6 +510,51 @@ T_DECLARE_CASE(test_stream_mark_syn_sent_advances_state)
 	teardown_fixture(&fx);
 }
 
+/* -------------------------------------------------------------------------
+ * Race condition tests
+ * ---------------------------------------------------------------------- */
+
+T_DECLARE_CASE(test_syn_received_rst_before_attach)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = stream_new(&fx.ss, 2, false);
+	T_CHECK(s != NULL);
+	T_CHECK(sched_add_stream(&fx.ss, s));
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_SYN_RECEIVED);
+	T_EXPECT(s->halfopen_counted);
+	stream_recv_rst(s);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(s->rst_received);
+	T_EXPECT(!s->halfopen_counted);
+	/* stream is now owned by sched LP queue; teardown_fixture frees it. */
+	teardown_fixture(&fx);
+}
+
+T_DECLARE_CASE(test_halfopen_release_before_free)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	s->halfopen_counted = true;
+	fx.ss.num_halfopen = 1;
+	T_EXPECT(s->halfopen_counted);
+	T_CHECK(fx.ss.num_halfopen > 0);
+	fx.ss.num_halfopen--;
+	s->halfopen_counted = false;
+	T_EXPECT_EQ(fx.ss.num_halfopen, (size_t)0);
+	T_EXPECT(!s->halfopen_counted);
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -527,5 +571,7 @@ int main(void)
 	T_RUN_CASE(t, test_stream_check_ack_does_not_shrink_while_outstanding);
 	T_RUN_CASE(t, test_stream_format_tag_formats_id_string);
 	T_RUN_CASE(t, test_stream_mark_syn_sent_advances_state);
+	T_RUN_CASE(t, test_syn_received_rst_before_attach);
+	T_RUN_CASE(t, test_halfopen_release_before_free);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

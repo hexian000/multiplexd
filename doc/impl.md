@@ -588,8 +588,8 @@ flowchart LR
   D --> E[estimator_calculate]
   E --> F["bdp = bw_max × rtt_min"]
   F --> G{phase}
-  G -- STARTUP --> H1["rtt_inflated → bdp×1.25, phase=TRACK<br/>window_limited → ×3"]
-  G -- TRACK --> H2["bw > bw_exit×1.25 → ×3, phase=STARTUP<br/>else bdp×1.25"]
+  G -- STARTUP --> H1["window_limited → ×3<br/>16 stable rounds → phase=TRACK"]
+  G -- TRACK --> H2["effective_bdp = bdp × 1.25<br/>sample > effective_bdp → phase=STARTUP"]
   H1 & H2 --> I[session_update_stream_window]
   I --> J["stream_window = ceil(effective_bdp / MUX_WINDOW_UNIT)"]
   J --> K[grow: expand live stream recv_window immediately;
@@ -609,42 +609,45 @@ extra frame.
 
 ```text
 bw_sample      = sample × 1e9 / rtt_ns
-bw_max         = wndfilter_max(bw_wnd,  WND_BW_MAX_NS)    -- 86400 s window
-srtt           = ewma(rtt_ns, span=8)                      -- α ≈ 0.22
-bdp            = bw_max × srtt / 1e9
-window_limited = sample + sample/2 > effective_bdp         -- sample > 2/3 target
-rtt_inflated   = rtt_ns > srtt + srtt/4                    -- current RTT > 5/4 smoothed
+bw_max         = wndfilter_max(bw_wnd, WND_BW_MAX_NS)     -- 86400 s window
+rtt_min_ns     = wndfilter_min(rtt_wnd, WND_RTT_MIN_NS)   -- 600 s window
+bdp            = bw_max × rtt_min_ns / 1e9
+window_limited = sample + sample/2 > effective_bdp        -- sample > 2/3 target
 
--- STARTUP phase
-if rtt_inflated:     phase = TRACK; bw_exit = bw_max
-elif window_limited: effective_bdp ×= 3
+-- STARTUP phase (bw_max == 0 → no-op)
+if window_limited:
+    effective_bdp ×= 3 (capped at WNDSIZE_MAX); stable_rounds = 0
+else:
+    stable_rounds++
+    if stable_rounds >= STARTUP_STABLE_ROUNDS:
+        phase = TRACK
 
 -- TRACK phase
-if bw_max > 0 and (bw_exit == 0 or bw_max > bw_exit + bw_exit/4):
-                     phase = STARTUP; bw_exit = 0; effective_bdp ×= 3
-elif bw_max > 0:     effective_bdp = bdp + bdp/4
+effective_bdp  = bdp + bdp / 4
+if sample > effective_bdp:  phase = STARTUP; stable_rounds = 0
 
 initial_frames = MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT
-stream_window  = max(ceil(effective_bdp / MUX_MAX_PAYLOAD_SIZE), initial_frames)
+stream_window  = max(ceil(effective_bdp / MUX_WINDOW_UNIT), initial_frames)
 ```
 
-The `bw_wnd` 86400 s window acts as a natural floor: a measured peak bandwidth
-persists for up to one day before `effective_bdp` can fall materially below the
-level it once supported.
+The `bw_wnd` 86400 s window and `rtt_wnd` 600 s window together act as a
+natural floor: a measured peak bandwidth and minimum RTT persist for up to
+their respective window sizes before `effective_bdp` can fall materially
+below the level it once supported.
 
-Constants: `WNDSIZE_MAX = UINT16_MAX × MUX_WINDOW_UNIT`, `WNDSIZE_MIN = 4 × MUX_WINDOW_UNIT`, `RTT_EWMA_SPAN = 8` (α = 2/9 ≈ 0.22), `WND_BW_MAX_NS = 86400 s`.
+Constants: `WNDSIZE_MAX = UINT16_MAX × MUX_WINDOW_UNIT`, `WNDSIZE_MIN = 4 × MUX_WINDOW_UNIT`, `STARTUP_STABLE_ROUNDS = 16`, `WND_BW_MAX_NS = 86400 s`, `WND_RTT_MIN_NS = 600 s`, `MUX_PING_RATE_LIMIT_NS = 1 s`.
 
 ### 12.2 Probe Lifecycle
 
-| Event                                                      | Effect                                                                                                                                                                      |
-| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| First eligible inbound PUSH after the rate-limit window    | Start `sample = bytes`, queue PING with `probe_sent_ns` payload, set `ping_in_flight`.                                                                                      |
-| More eligible PUSH while PING is in flight                 | Accumulate payload into `sample`.                                                                                                                                           |
-| `now − last_probe_ns < MUX_PING_RATE_LIMIT_NS`             | Skip without starting a probe; at most one cycle per `MUX_PING_RATE_LIMIT_NS` (1 s).                                                                                        |
-| PING timeout (≥ `conf.ping_timeout` since `probe_sent_ns`) | Discard the cycle in place inside the next `estimator_add()` call without advancing `last_probe_ns`, then fall through to start a fresh probe immediately on the same call. |
-| Matching PONG (`sent_ns == probe_sent_ns`)                 | `estimator_calculate` updates RTT/BW filters and `effective_bdp` per §12.3; advances `last_probe_ns` to gate the next probe.                                                |
-| Stale PONG (`sent_ns != probe_sent_ns`)                    | Discarded without updating any filter.                                                                                                                                      |
-| First successful `estimator_calculate`                     | `rtt_ewma.ready` latches on the first RTT sample; subsequent `ewma_add` calls use the standard recurrence.                                                                  |
+| Event                                                      | Effect                                                                                                                                                                                           |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| First inbound PUSH with no probe in flight                 | Start `sample = bytes`, queue PING with `last_probe_ns` payload, set `ping_in_flight`.                                                                                                           |
+| More eligible PUSH while PING is in flight                 | Accumulate payload into `sample`; no static clamp — overflow guard applied during `bw_sample` calculation.                                                                                      |
+| `now − last_probe_ns < MUX_PING_RATE_LIMIT_NS`             | Rate limit applies in every phase: skip without starting a probe; at most one cycle per `MUX_PING_RATE_LIMIT_NS` (1 s).                                                                          |
+| PING timeout (≥ `conf.ping_timeout` since `last_probe_ns`) | Discard the cycle; suspend the session for resume if `has_session_id`, otherwise close it via `session_notify_closed`; `last_probe_ns` is not updated; no new probe is started on the same call. |
+| Matching PONG (`sent_ns == last_probe_ns`)                 | `estimator_calculate` updates RTT/BW filters and `effective_bdp` per §12.3; advances `last_probe_ns` to gate the next probe.                                                                     |
+| Stale PONG (`sent_ns != last_probe_ns`)                    | Discarded without updating any filter.                                                                                                                                                           |
+| Liveness PING via `estimator_ping`                         | Bypasses the data-driven trigger; queues a PING with `last_probe_ns` current time and sets `ping_in_flight` (no-op when a probe is already in flight).                                           |
 
 The estimator has no dedicated timer; probes are driven by payload arrival and
 are completed either by a matching PONG or by timeout detection on the next
@@ -652,50 +655,43 @@ PUSH.
 
 ### 12.3 `effective_bdp` Update Rules
 
-Each valid PONG updates `srtt` via EWMA.  When `sample > 0`, `bw_wnd` is updated and
-`bdp` is recomputed.  `effective_bdp` is then adjusted according to the current
-phase (`STARTUP` or `TRACK`), stored in `est->phase`.
+Each valid PONG updates `rtt_wnd` (windowed-minimum RTT) and `bw_wnd` (windowed-maximum
+bandwidth); a zero sample cannot raise the bandwidth peak.  `bdp` is computed
+directly as `bw_max × rtt_min_ns / 1e9` without a separate BDP filter.
+`effective_bdp` is then adjusted according to the current phase (`STARTUP` or
+`TRACK`), stored in `est->phase`.
 
 **STARTUP phase** — fast-start, searching for the bandwidth ceiling:
 
-- **rtt_inflated** (`rtt > 5/4 × srtt`): queue building detected; transition
-  to TRACK and record `bw_exit = bw_max`.
-- **window_limited** (`sample > 2/3 × effective_bdp`, only when not
-  rtt_inflated): the receive window is the throughput bottleneck; triple the
-  target to probe for more capacity.
-- Neither fires: `effective_bdp` is unchanged.
+- **window_limited** (`sample > 2/3 × effective_bdp`): the receive window is the
+  throughput bottleneck; triple `effective_bdp` (capped at `WNDSIZE_MAX`) and
+  reset `stable_rounds` to 0.
+- **otherwise**: increment `stable_rounds`; once it reaches
+  `STARTUP_STABLE_ROUNDS` (16) consecutive non-window-limited cycles, the window
+  is confirmed to have headroom — transition to TRACK.
+- `bw_max == 0` (no bandwidth sample yet): `effective_bdp` is unchanged and
+  `stable_rounds` is not advanced.
 
-`rtt_inflated` takes priority over `window_limited`.  The old behavior of
-tripling a window-limited target even while the RTT was already inflating was
-the primary source of `effective_bdp` oscillation.
+**TRACK phase** — steady-state, tracking the current BDP:
 
-**TRACK phase** — steady-state, maintaining the working point:
-
-- **Bandwidth headroom** (`bw_max > bw_exit + bw_exit/4`, or `bw_exit == 0`):
-  a new bandwidth peak has emerged; re-enter STARTUP, clear `bw_exit`, and
-  triple `effective_bdp` to resume probing.
-- **Steady state** (otherwise, when `bw_max > 0`): maintain `effective_bdp =
-  bdp + bdp/4`.
-- `bw_max == 0` (no sample this cycle): `effective_bdp` is unchanged.
-
-The `bw_exit` field records the bandwidth at the STARTUP→TRACK transition and
-acts as an asymmetric hysteresis gate: TRACK cannot re-enter STARTUP unless
-`bw_max` has grown at least 25% beyond the level that triggered the exit.  The
-`bw_wnd` 86400 s windowed maximum keeps `bw_max` stable between cycles, so
-this threshold cannot be met by a transient sampling artefact.
+- **Always**: `effective_bdp = bdp + bdp / 4`, where `bdp = bw_max × rtt_min_ns / 1e9`.
+- **Sample exceeds target** (`sample > effective_bdp`): link bandwidth has
+  improved — re-enter STARTUP and reset `stable_rounds` to 0.  `effective_bdp`
+  is not reset; STARTUP resumes growing from the current TRACK value if the
+  window is still the bottleneck.
 
 ### 12.4 Window Update and Lifecycle
 
-| Event                            | Result                                                                                                                                                                                                                                                                                                                                           |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Manual mode                      | The estimator is inert; configured frame counts are used as-is.                                                                                                                                                                                                                                                                                  |
-| Automatic `stream_window`        | `auto_stream_window = true`; effective `stream_window` starts at `initial_frames` and grows with `effective_bdp`; the `bw_wnd` 86400 s window buffers shrinks—`effective_bdp` cannot fall below the level it once supported until the old peak ages out.                                                                                         |
-| Automatic `session_window`       | `auto_session_window = true`; `session_window` starts at `initial_frames` and is updated from `peer_stream_window` on each SYN/SYN\|ACK.                                                                                                                                                                                                         |
-| `session_update_stream_window()` | `stream_window` is set to `max(ceil(effective_bdp / MUX_WINDOW_UNIT), initial_frames)`; live streams expand `recv_window` immediately on grow; on shrink, each stream's `recv_window` is lazily synced down by `stream_check_ack` once `buffered_bytes + outstanding ≤ target`.                                                                  |
-| Disconnect / stop                | `stream_window` is set to `max(effective_bdp / 2 / MUX_WINDOW_UNIT, initial_frames)` without modifying the estimator struct. The learned RTT and bandwidth filters are preserved across reconnects; any stale in-flight probe is discarded by the timeout path in the next `estimator_add()` call, after which a fresh cycle starts immediately. |
-| First enter auto mode on reload  | `estimator_init()` seeds `effective_bdp` from the current `stream_window * MUX_WINDOW_UNIT` and zeroes the rest of the estimator state.  Subsequent reloads that stay in auto mode preserve the learned state.                                                                                                                                   |
+| Event                            | Result                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Manual mode                      | The estimator is inert; configured frame counts are used as-is.                                                                                                                                                                                                                                                                             |
+| Automatic `stream_window`        | `auto_stream_window = true`; effective `stream_window` starts at `initial_frames` and grows with `effective_bdp`; the `bw_wnd` 86400 s window buffers shrinks—`effective_bdp` cannot fall below the level it once supported until the old peak ages out.                                                                                    |
+| Automatic `session_window`       | `auto_session_window = true`; `session_window` starts at `initial_frames` and is updated from `peer_stream_window` on each SYN/SYN\|ACK.                                                                                                                                                                                                    |
+| `session_update_stream_window()` | `stream_window` is set to `max(ceil(effective_bdp / MUX_WINDOW_UNIT), initial_frames)`; live streams expand `recv_window` immediately on grow; on shrink, each stream's `recv_window` is lazily synced down by `stream_check_ack` once `buffered_bytes + outstanding ≤ target`.                                                             |
+| Disconnect / stop                | `stream_window` is set to `max(effective_bdp / 2 / MUX_WINDOW_UNIT, initial_frames)` without modifying the estimator struct. The learned RTT and bandwidth filters are preserved across reconnects; any stale in-flight probe is detected by the timeout path on the next inbound PUSH, which closes or suspends the session at that point. |
+| First enter auto mode on reload  | `estimator_init()` seeds `effective_bdp` from the current `stream_window * MUX_WINDOW_UNIT` and zeroes the rest of the estimator state.  Subsequent reloads that stay in auto mode preserve the learned state.                                                                                                                              |
 
-When `stream_window` decreases (rtt_inflated path, or manual reload), each
+When `stream_window` decreases (TRACK trim to `bdp + bdp/4`, or manual reload), each
 stream's `recv_window` is lazily synced to the new target inside
 `stream_check_ack`: the shrink is applied as soon as
 `buffered_bytes + outstanding ≤ target` (`outstanding = grant_sent − bytes_received`),

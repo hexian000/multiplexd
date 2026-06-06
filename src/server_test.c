@@ -2,16 +2,17 @@
 
 #include "conf.h"
 #include "listener.h"
-#include "os/socket.h"
 #include "server.h"
 #include "util.h"
 
+#include "os/socket.h"
 #include "utils/minmax.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
-#include <errno.h>
 #include <ev.h>
+
+#include <errno.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -400,7 +401,7 @@ static int bind_listen_localhost(void)
 
 	int on = 1;
 	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return -1;
 	}
 
@@ -410,11 +411,11 @@ static int bind_listen_localhost(void)
 	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	sa.sin_port = 0;
 	if (bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0) {
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return -1;
 	}
 	if (listen(fd, 8) != 0) {
-		CLOSE_FD(fd);
+		SOCKET_CLOSE_FD(fd);
 		return -1;
 	}
 	return fd;
@@ -440,7 +441,7 @@ static void mock_conn_free(struct mock_conn *restrict conn)
 		ev_io_stop(conn->mock->loop, &conn->w_io);
 	}
 	if (conn->fd >= 0) {
-		CLOSE_FD(conn->fd);
+		SOCKET_CLOSE_FD(conn->fd);
 		conn->fd = -1;
 	}
 	free(conn->out_buf);
@@ -503,7 +504,7 @@ static int mock_conn_flush(struct mock_conn *restrict conn)
 	conn->out_buf = NULL;
 
 	if (conn->half_close_armed && !conn->write_shutdown) {
-		SHUTDOWN_FD(conn->fd, WR);
+		SOCKET_SHUTDOWN_FD(conn->fd, WR);
 		conn->write_shutdown = true;
 	}
 	return 0;
@@ -515,7 +516,7 @@ static void mock_conn_update_events(struct mock_conn *restrict conn)
 	if (conn->out_off < conn->out_len) {
 		events |= EV_WRITE;
 	}
-	modify_io_events(conn->mock->loop, &conn->w_io, events);
+	util_modify_io_events(conn->mock->loop, &conn->w_io, events);
 }
 
 static void mock_conn_io_cb(struct ev_loop *loop, ev_io *w, const int revents)
@@ -594,13 +595,13 @@ mock_server_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 			return;
 		}
 		if (socket_set_nonblock(fd) != 0) {
-			CLOSE_FD(fd);
+			SOCKET_CLOSE_FD(fd);
 			continue;
 		}
 
 		struct mock_conn *conn = calloc(1, sizeof(*conn));
 		if (conn == NULL) {
-			CLOSE_FD(fd);
+			SOCKET_CLOSE_FD(fd);
 			continue;
 		}
 		conn->mock = mock;
@@ -661,8 +662,8 @@ static void mock_server_stop(struct mock_server *restrict mock)
 		ev_io_stop(mock->loop, &mock->w_accept);
 	}
 	if (mock->listen_fd >= 0) {
-		SHUTDOWN_FD(mock->listen_fd, RDWR);
-		CLOSE_FD(mock->listen_fd);
+		SOCKET_SHUTDOWN_FD(mock->listen_fd, RDWR);
+		SOCKET_CLOSE_FD(mock->listen_fd);
 		mock->listen_fd = -1;
 	}
 	while (mock->conns != NULL) {
@@ -763,16 +764,17 @@ static struct wait_stats wait_stats_snapshot(const struct server *restrict s)
 {
 	struct wait_stats st = { 0 };
 #if WITH_THREADS
-	const uintmax_t session_connect = atomic_load_explicit(
+	const uint_least64_t session_connect = atomic_load_explicit(
 		&s->counters.num_session_connect, memory_order_relaxed);
-	const uintmax_t session_connected = atomic_load_explicit(
+	const uint_least64_t session_connected = atomic_load_explicit(
 		&s->counters.num_session_connected, memory_order_relaxed);
-	const uintmax_t session_disconnected = atomic_load_explicit(
+	const uint_least64_t session_disconnected = atomic_load_explicit(
 		&s->counters.num_session_disconnected, memory_order_relaxed);
 #else
-	const uintmax_t session_connect = s->counters.num_session_connect;
-	const uintmax_t session_connected = s->counters.num_session_connected;
-	const uintmax_t session_disconnected =
+	const uint_least64_t session_connect = s->counters.num_session_connect;
+	const uint_least64_t session_connected =
+		s->counters.num_session_connected;
+	const uint_least64_t session_disconnected =
 		s->counters.num_session_disconnected;
 #endif
 	st.num_established_sessions =
@@ -1332,7 +1334,7 @@ T_DECLARE_CASE(test_multi_stream_churn_and_workload)
 
 		for (uint_fast32_t i = 0; i < STREAM_CHURN_CONCURRENCY; i++) {
 			if (clients[i] >= 0) {
-				CLOSE_FD(clients[i]);
+				SOCKET_CLOSE_FD(clients[i]);
 				clients[i] = -1;
 			}
 		}
@@ -1348,7 +1350,7 @@ T_DECLARE_CASE(test_multi_stream_churn_and_workload)
 cleanup:
 	for (uint_fast32_t i = 0; i < STREAM_CHURN_CONCURRENCY; i++) {
 		if (clients[i] >= 0) {
-			CLOSE_FD(clients[i]);
+			SOCKET_CLOSE_FD(clients[i]);
 			clients[i] = -1;
 		}
 	}
@@ -1389,7 +1391,7 @@ T_DECLARE_CASE(test_backend_close_after_echo)
 		T_FAIL();
 		goto cleanup;
 	}
-	CLOSE_FD(cl);
+	SOCKET_CLOSE_FD(cl);
 	cl = -1;
 	if (wait_for_streams_exact(&fx, 0) != 0) {
 		T_LOG("wait_for_streams_exact(0) failed");
@@ -1399,7 +1401,7 @@ T_DECLARE_CASE(test_backend_close_after_echo)
 
 cleanup:
 	if (cl >= 0) {
-		CLOSE_FD(cl);
+		SOCKET_CLOSE_FD(cl);
 	}
 	fixture_teardown(&fx);
 }
@@ -1441,7 +1443,7 @@ T_DECLARE_CASE(test_client_abort_mid_payload)
 		T_FAIL();
 		goto cleanup;
 	}
-	CLOSE_FD(cl);
+	SOCKET_CLOSE_FD(cl);
 	cl = -1;
 	if (wait_for_streams_exact(&fx, 0) != 0) {
 		T_LOG("wait_for_streams_exact(0) failed");
@@ -1451,7 +1453,7 @@ T_DECLARE_CASE(test_client_abort_mid_payload)
 
 cleanup:
 	if (cl >= 0) {
-		CLOSE_FD(cl);
+		SOCKET_CLOSE_FD(cl);
 	}
 	free(payload);
 	fixture_teardown(&fx);
@@ -1504,7 +1506,7 @@ T_DECLARE_CASE(test_listener_reuse_after_stream_churn)
 		}
 		for (uint_fast32_t i = 0; i < STREAM_CHURN_CONCURRENCY; i++) {
 			if (clients[i] >= 0) {
-				CLOSE_FD(clients[i]);
+				SOCKET_CLOSE_FD(clients[i]);
 				clients[i] = -1;
 			}
 		}
@@ -1524,7 +1526,7 @@ T_DECLARE_CASE(test_listener_reuse_after_stream_churn)
 			T_FAIL();
 			goto cleanup;
 		}
-		CLOSE_FD(cl);
+		SOCKET_CLOSE_FD(cl);
 		if (wait_for_streams_exact(&fx, 0) != 0) {
 			T_LOG("wait_for_streams_exact(0) failed after reuse");
 			T_FAIL();
@@ -1535,7 +1537,7 @@ T_DECLARE_CASE(test_listener_reuse_after_stream_churn)
 cleanup:
 	for (uint_fast32_t i = 0; i < STREAM_CHURN_CONCURRENCY; i++) {
 		if (clients[i] >= 0) {
-			CLOSE_FD(clients[i]);
+			SOCKET_CLOSE_FD(clients[i]);
 			clients[i] = -1;
 		}
 	}
@@ -1589,10 +1591,10 @@ T_DECLARE_CASE(test_cross_direction_overlap)
 
 cleanup:
 	if (cl_b >= 0) {
-		CLOSE_FD(cl_b);
+		SOCKET_CLOSE_FD(cl_b);
 	}
 	if (cl_a >= 0) {
-		CLOSE_FD(cl_a);
+		SOCKET_CLOSE_FD(cl_a);
 	}
 	fixture_teardown(&fx);
 }
@@ -1648,7 +1650,7 @@ T_DECLARE_CASE(test_large_payload_then_half_close)
 
 cleanup:
 	if (cl >= 0) {
-		CLOSE_FD(cl);
+		SOCKET_CLOSE_FD(cl);
 	}
 	free(payload);
 	fixture_teardown(&fx);
@@ -1770,22 +1772,16 @@ T_DECLARE_CASE(test_server_config_reload)
 		T_FATAL("session not re-established after reload");
 	}
 
-	/* Post-reload echo – the server must still forward traffic. */
-	const int fd_after = connect_local(&fx, fx.tcp_port_a);
-	if (fd_after < 0) {
+	/* Post-reload echo – the server must still forward traffic.
+	 * Use connect_and_wait_echo which retries if the session is not
+	 * yet ready to accept streams (e.g. accepted_tunnels not yet
+	 * populated). */
+	int fd_after;
+	if (connect_and_wait_echo(&fx, fx.tcp_port_a, "post", &fd_after) != 0) {
 		(void)unlink(tmp_path);
 		fixture_teardown(&fx);
-		T_FATAL("connect_local failed after reload");
+		T_FATAL("connect_and_wait_echo failed after reload");
 	}
-	if (wait_for_streams_ready(&fx, 1) != 0) {
-		close(fd_after);
-		(void)unlink(tmp_path);
-		fixture_teardown(&fx);
-		T_FATAL("streams not ready after reload");
-	}
-	T_CHECK(send_and_expect_echo(
-			&fx, fd_after, "post", 4,
-			(double)ECHO_WAIT_TIMEOUT_MS / 1000.0) == 0);
 	close(fd_after);
 
 	(void)unlink(tmp_path);
@@ -1902,8 +1898,8 @@ T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
 
 int main(void)
 {
-	init(0, NULL);
-	loadlibs();
+	util_init(0, NULL);
+	util_loadlibs();
 
 	T_DECLARE_CTX(t);
 	T_RUN_CASE(t, test_bidirectional_stream_and_forward);
@@ -1919,6 +1915,6 @@ int main(void)
 	T_RUN_CASE(t, test_server_max_sessions_rejects);
 	T_RUN_CASE(t, test_server_graceful_shutdown_via_signal);
 
-	unloadlibs();
+	util_unloadlibs();
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

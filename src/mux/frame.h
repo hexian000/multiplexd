@@ -11,6 +11,8 @@
 
 #include "mux/mux.h"
 
+#include "utils/serialize.h"
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -120,12 +122,24 @@ enum mux_status {
 	MUX_STATUS_CANCEL = 0x0005,
 };
 
-struct mux_frame *
-mux_frame_get(const struct mux_frame_allocator *restrict pool);
+static inline struct mux_frame *
+mux_frame_get(const struct mux_frame_allocator *restrict pool)
+{
+	struct mux_frame *frame = pool->alloc(pool->data);
+	if (frame != NULL) {
+		frame->pos = 0;
+		frame->len = 0;
+		frame->next = NULL;
+	}
+	return frame;
+}
 
-void mux_frame_put(
+static inline void mux_frame_put(
 	const struct mux_frame_allocator *restrict pool,
-	struct mux_frame *frame);
+	struct mux_frame *frame)
+{
+	pool->free(pool->data, frame);
+}
 
 struct mux_frame_list {
 	struct mux_frame *head;
@@ -219,11 +233,25 @@ struct mux_header {
 	uint_least16_t extra;
 };
 
-void mux_write_header(
-	unsigned char *restrict buf, const struct mux_header *restrict header);
+static inline void mux_write_header(
+	unsigned char *restrict buf, const struct mux_header *restrict header)
+{
+	write_uint8(buf + 0, header->version);
+	write_uint8(buf + 1, header->flags);
+	write_uint16(buf + 2, header->length);
+	write_uint16(buf + 4, header->stream_id);
+	write_uint16(buf + 6, (uint16_t)header->extra);
+}
 
-void mux_read_header(
-	const unsigned char *restrict buf, struct mux_header *restrict header);
+static inline void mux_read_header(
+	const unsigned char *restrict buf, struct mux_header *restrict header)
+{
+	header->version = read_uint8(buf + 0);
+	header->flags = read_uint8(buf + 1);
+	header->length = read_uint16(buf + 2);
+	header->stream_id = read_uint16(buf + 4);
+	header->extra = read_uint16(buf + 6);
+}
 
 /* --- Ring buffer --- */
 
@@ -231,6 +259,8 @@ struct ringbuf {
 	size_t off, len, cap;
 	unsigned char data[];
 };
+
+bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow);
 
 static inline struct ringbuf *ringbuf_new(const size_t cap)
 {
@@ -304,43 +334,103 @@ static inline void ringbuf_compact(struct ringbuf *restrict rb)
 	rb->off = 0;
 }
 
-static inline bool
-ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
+/* --- Frame pointer ring ---
+ * Dynamic circular array of struct mux_frame * pointers.
+ * O(1) tail push, O(k) head trim, contiguous memory for cache-friendly scans.
+ * The ring struct is heap-allocated as a single block (entries[] is a FAM);
+ * use mux_frame_ring_new() to create and mux_frame_ring_free() to destroy. */
+
+#define MUX_FRAME_RING_MIN 16
+
+struct mux_frame_ring {
+	size_t capacity;
+	size_t head; /* index of oldest entry */
+	size_t count; /* number of entries stored */
+	struct mux_frame *entries[];
+};
+
+/* Allocate a new ring with initial @p cap (may be 0; grows on first push).
+ * Returns NULL on OOM. */
+struct mux_frame_ring *mux_frame_ring_new(size_t cap);
+
+/* Grow capacity 2× (or to MUX_FRAME_RING_MIN on first alloc) and linearise.
+ * Returns new ring pointer on success; returns NULL on OOM (old ring intact). */
+struct mux_frame_ring *mux_frame_ring_grow(struct mux_frame_ring *r);
+
+static inline size_t
+mux_frame_ring_size(const struct mux_frame_ring *restrict r)
 {
-	struct ringbuf *rb = *rbp;
-	if (need == 0 || ringbuf_write_space(rb) >= need) {
-		return true;
-	}
+	return r != NULL ? r->count : 0;
+}
 
-	ringbuf_compact(rb);
-	if (ringbuf_write_space(rb) >= need) {
-		return true;
+/* O(1) peek at the frame at @p offset from head (0 = oldest).
+ * Returns NULL when the ring is empty. */
+static inline struct mux_frame *
+mux_frame_ring_peek(const struct mux_frame_ring *restrict r, size_t offset)
+{
+	if (r == NULL || r->count == 0 || r->capacity == 0) {
+		return NULL;
 	}
-	if (!can_grow) {
-		return false;
-	}
+	return r->entries[(r->head + offset) & (r->capacity - 1)];
+}
 
-	if (need > SIZE_MAX - rb->len) {
-		return false;
-	}
-	const size_t min_cap = rb->len + need;
-	size_t new_cap = rb->cap > 0 ? rb->cap : 1;
-	while (new_cap < min_cap) {
-		if (new_cap > SIZE_MAX / 2) {
-			new_cap = min_cap;
-			break;
+/* O(1) append; returns false only on OOM (after failed grow attempt).
+ * May update *rp if the ring is reallocated by grow. */
+static inline bool mux_frame_ring_push(
+	struct mux_frame_ring **restrict rp, struct mux_frame *restrict frame)
+{
+	struct mux_frame_ring *r = *rp;
+	if (r == NULL) {
+		r = mux_frame_ring_new(MUX_FRAME_RING_MIN);
+		if (r == NULL) {
+			return false;
 		}
-		new_cap *= 2;
+		*rp = r;
 	}
-
-	struct ringbuf *const new_rb =
-		realloc(rb, sizeof(struct ringbuf) + new_cap);
-	if (new_rb == NULL) {
-		return false;
+	if (r->count >= r->capacity) {
+		r = mux_frame_ring_grow(r);
+		if (r == NULL) {
+			return false;
+		}
+		*rp = r;
 	}
-	new_rb->cap = new_cap;
-	*rbp = new_rb;
+	const size_t tail = (r->head + r->count) & (r->capacity - 1);
+	r->entries[tail] = frame;
+	r->count++;
 	return true;
+}
+
+/* O(1) pop and return the oldest frame; NULL if ring is empty. */
+static inline struct mux_frame *
+mux_frame_ring_pop(struct mux_frame_ring *restrict r)
+{
+	if (r == NULL || r->count == 0) {
+		return NULL;
+	}
+	struct mux_frame *f = r->entries[r->head];
+	r->entries[r->head] = NULL;
+	r->head = (r->head + 1) & (r->capacity - 1);
+	r->count--;
+	return f;
+}
+
+/* Free all mux_frame entries via @p pool, free the ring, and set *rp = NULL.
+ * Safe to call when *rp is NULL. */
+static inline void mux_frame_ring_free(
+	struct mux_frame_ring **restrict rp,
+	const struct mux_frame_allocator *restrict pool)
+{
+	struct mux_frame_ring *r = *rp;
+	if (r == NULL) {
+		return;
+	}
+	for (size_t i = 0; i < r->count; i++) {
+		struct mux_frame *f =
+			r->entries[(r->head + i) & (r->capacity - 1)];
+		mux_frame_put(pool, f);
+	}
+	free(r);
+	*rp = NULL;
 }
 
 #endif /* MUX_FRAME_H */

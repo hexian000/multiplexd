@@ -190,6 +190,173 @@ T_DECLARE_CASE(test_frame_list_drain_clears_head_tail_and_count)
 	T_EXPECT(list.tail == NULL);
 }
 
+T_DECLARE_CASE(test_frame_ring_null_and_empty_ops)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+
+	/* NULL ring: size/peek/pop must not crash or lie. */
+	T_EXPECT_EQ(mux_frame_ring_size(NULL), (size_t)0);
+	T_EXPECT(mux_frame_ring_peek(NULL, 0) == NULL);
+	T_EXPECT(mux_frame_ring_pop(NULL) == NULL);
+
+	/* Empty ring: same expectations after allocation. */
+	struct mux_frame_ring *r = mux_frame_ring_new(MUX_FRAME_RING_MIN);
+	T_CHECK(r != NULL);
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
+	T_EXPECT(mux_frame_ring_peek(r, 0) == NULL);
+	T_EXPECT(mux_frame_ring_pop(r) == NULL);
+
+	mux_frame_ring_free(&r, &pool);
+	T_EXPECT(r == NULL);
+	T_EXPECT_EQ(ctx.free_calls, 0);
+}
+
+T_DECLARE_CASE(test_frame_ring_push_pop_fifo)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+
+	struct mux_frame_ring *r = NULL;
+	const int n = 8;
+	struct mux_frame *pushed[8];
+
+	for (int i = 0; i < n; i++) {
+		pushed[i] = mux_frame_get(&pool);
+		T_CHECK(pushed[i] != NULL);
+		T_CHECK(mux_frame_ring_push(&r, pushed[i]));
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)n);
+
+	/* peek should return items in push order */
+	for (int i = 0; i < n; i++) {
+		T_EXPECT(mux_frame_ring_peek(r, (size_t)i) == pushed[i]);
+	}
+
+	/* pop should return items in FIFO order */
+	for (int i = 0; i < n; i++) {
+		T_EXPECT(mux_frame_ring_pop(r) == pushed[i]);
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
+
+	mux_frame_ring_free(&r, &pool);
+	/* All frames were already popped; ring_free frees 0 more. */
+	T_EXPECT_EQ(ctx.free_calls, 0);
+
+	/* Free the popped frames manually. */
+	for (int i = 0; i < n; i++) {
+		mux_frame_put(&pool, pushed[i]);
+	}
+	T_EXPECT_EQ(ctx.free_calls, n);
+}
+
+T_DECLARE_CASE(test_frame_ring_grow_contiguous)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+
+	struct mux_frame_ring *r = NULL;
+	/* Fill exactly MUX_FRAME_RING_MIN slots (head stays 0 — contiguous). */
+	const int cap0 = MUX_FRAME_RING_MIN;
+	struct mux_frame *frames[MUX_FRAME_RING_MIN + 1];
+
+	for (int i = 0; i < cap0; i++) {
+		frames[i] = mux_frame_get(&pool);
+		T_CHECK(frames[i] != NULL);
+		T_CHECK(mux_frame_ring_push(&r, frames[i]));
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)cap0);
+
+	/* One more push must trigger grow to 2×MIN capacity. */
+	frames[cap0] = mux_frame_get(&pool);
+	T_CHECK(frames[cap0] != NULL);
+	T_CHECK(mux_frame_ring_push(&r, frames[cap0]));
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)(cap0 + 1));
+	T_EXPECT_EQ(r->capacity, (size_t)(cap0 * 2));
+
+	/* FIFO order must be preserved across the grow. */
+	for (int i = 0; i <= cap0; i++) {
+		T_EXPECT(mux_frame_ring_pop(r) == frames[i]);
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
+
+	mux_frame_ring_free(&r, &pool);
+	for (int i = 0; i <= cap0; i++) {
+		mux_frame_put(&pool, frames[i]);
+	}
+	T_EXPECT_EQ(ctx.free_calls, cap0 + 1);
+}
+
+T_DECLARE_CASE(test_frame_ring_grow_wrapped)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+
+	struct mux_frame_ring *r = NULL;
+	const int cap0 = MUX_FRAME_RING_MIN; /* 16 */
+	const int pop_n = 10;
+	const int push2 = 14; /* total after pop: 6 + 14 = 20 > 16 → grow */
+	const int total = cap0 + push2;
+	struct mux_frame *frames[MUX_FRAME_RING_MIN + 14]; /* 30 */
+
+	/* Round 1: fill to capacity. */
+	for (int i = 0; i < cap0; i++) {
+		frames[i] = mux_frame_get(&pool);
+		T_CHECK(frames[i] != NULL);
+		T_CHECK(mux_frame_ring_push(&r, frames[i]));
+	}
+	/* Pop 10: head advances into the ring (head = 10). */
+	for (int i = 0; i < pop_n; i++) {
+		T_EXPECT(mux_frame_ring_pop(r) == frames[i]);
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)(cap0 - pop_n));
+
+	/* Round 2: push 14 more; slots wrap around, then grow fires. */
+	for (int i = cap0; i < total; i++) {
+		frames[i] = mux_frame_get(&pool);
+		T_CHECK(frames[i] != NULL);
+		T_CHECK(mux_frame_ring_push(&r, frames[i]));
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)(total - pop_n));
+
+	/* FIFO order must be fully intact after the wrapped grow. */
+	for (int i = pop_n; i < total; i++) {
+		T_EXPECT(mux_frame_ring_pop(r) == frames[i]);
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
+
+	mux_frame_ring_free(&r, &pool);
+	/* Free frames[0..pop_n-1] that were already popped above. */
+	for (int i = 0; i < pop_n; i++) {
+		mux_frame_put(&pool, frames[i]);
+	}
+	for (int i = pop_n; i < total; i++) {
+		mux_frame_put(&pool, frames[i]);
+	}
+}
+
+T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+
+	struct mux_frame_ring *r = NULL;
+	const int n = 6;
+
+	for (int i = 0; i < n; i++) {
+		struct mux_frame *f = mux_frame_get(&pool);
+		T_CHECK(f != NULL);
+		T_CHECK(mux_frame_ring_push(&r, f));
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)n);
+	T_EXPECT_EQ(ctx.alloc_calls, n);
+
+	mux_frame_ring_free(&r, &pool);
+
+	T_EXPECT(r == NULL);
+	T_EXPECT_EQ(ctx.free_calls, n);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -199,5 +366,10 @@ int main(void)
 	T_RUN_CASE(t, test_header_roundtrip_with_flag_combinations);
 	T_RUN_CASE(t, test_frame_list_push_pop_fifo);
 	T_RUN_CASE(t, test_frame_list_drain_clears_head_tail_and_count);
+	T_RUN_CASE(t, test_frame_ring_null_and_empty_ops);
+	T_RUN_CASE(t, test_frame_ring_push_pop_fifo);
+	T_RUN_CASE(t, test_frame_ring_grow_contiguous);
+	T_RUN_CASE(t, test_frame_ring_grow_wrapped);
+	T_RUN_CASE(t, test_frame_ring_free_releases_all_frames);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

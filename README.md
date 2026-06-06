@@ -35,6 +35,9 @@ multiplexd is a TCP stream multiplexer with zero-RTT stream open, deficit round-
     - [`GET /config`](#get-config)
     - [`PUT /config`](#put-config)
 - [Usage](#usage)
+- [Pre-built Binaries](#pre-built-binaries)
+  - [Binary Variants](#binary-variants)
+  - [Runtime Dependencies](#runtime-dependencies)
 - [Building](#building)
   - [Dependencies](#dependencies)
   - [Build Instructions](#build-instructions)
@@ -352,6 +355,29 @@ Replaces the active configuration with the JSON body of the request and performs
 # Dump resolved config with inlined PEM certificates to stdout
 ./multiplexd -c config.json --dump-config
 ```
+
+## Pre-built Binaries
+
+Pre-built binaries are available on the [Releases](https://github.com/hexian000/multiplexd/releases) page. The naming convention is `multiplexd[-static].<arch>-<platform>`.
+
+### Binary Variants
+
+| Suffix / Platform    | Linkage | Runtime Dependencies           |
+| -------------------- | ------- | ------------------------------ |
+| `-static`            | Static  | None — self-contained          |
+| `-android`, `-win32` | Dynamic | System-provided libraries only |
+| All others           | Dynamic | See table below                |
+
+### Runtime Dependencies
+
+Non-static builds require the following runtime libraries.
+
+| Platform        | TLS Library | Install Command                 |
+| --------------- | ----------- | ------------------------------- |
+| Debian / Ubuntu | OpenSSL     | `apt install libev4 libssl3`    |
+| Alpine Linux    | OpenSSL     | `apk add libev libssl3`         |
+| OpenWrt         | mbedTLS     | `apk add libev libmbedtls`      |
+| OpenWrt (opkg)  | mbedTLS     | `opkg install libev libmbedtls` |
 
 ## Building
 

@@ -104,7 +104,7 @@ static uint_fast32_t g_last_window_inc;
 static int g_stream_start_calls;
 static int g_stream_recv_fin_calls;
 static int g_estimator_add_calls;
-static uintmax_t g_last_estimator_bytes;
+static uint_least64_t g_last_estimator_bytes;
 static struct mux_stream *g_sched_find_stream;
 
 /* on_accept mock control */
@@ -276,6 +276,16 @@ void session_update_session_window(struct mux_session *restrict ss)
 	(void)ss;
 }
 
+void session_flush(struct mux_session *restrict ss)
+{
+	(void)ss;
+}
+
+void session_flush_oob(struct mux_session *restrict ss)
+{
+	(void)ss;
+}
+
 bool handshake_process_hello(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
@@ -319,7 +329,7 @@ bool sched_add_stream(
 
 /* on_accept callback: controls stream acceptance per iteration. */
 static bool
-fuzz_on_accept(void *ud, struct mux_session *ss, struct mux_stream *s)
+fuzz_on_accept(void *ud, const struct mux_session *ss, struct mux_stream *s)
 {
 	(void)ud;
 	(void)ss;
@@ -391,7 +401,7 @@ void stream_recv_fin(struct mux_stream *s)
 	g_stream_recv_fin_calls++;
 }
 
-void estimator_add(struct mux_session *restrict ss, const uintmax_t bytes)
+void estimator_add(struct mux_session *restrict ss, const uint_least64_t bytes)
 {
 	(void)ss;
 	g_estimator_add_calls++;

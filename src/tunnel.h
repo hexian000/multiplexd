@@ -31,10 +31,11 @@ struct tunnel_callbacks {
 	 * than once on the same tunnel when the server rejects a resume
 	 * attempt and the client falls back to a new session; implementations
 	 * must be idempotent with respect to any session pool they maintain. */
-	void (*on_established)(void *data, struct tunnel *t, intmax_t lat_ns);
+	void (*on_established)(
+		void *data, struct tunnel *t, const intmax_t lat_ns);
 	/* Fired when the peer confirmed that the suspended session has been
 	 * successfully resumed on the new transport. */
-	void (*on_resumed)(void *data, struct tunnel *t, intmax_t lat_ns);
+	void (*on_resumed)(void *data, struct tunnel *t, const intmax_t lat_ns);
 	struct mux_session *(*on_resume)(
 		void *data, struct tunnel *new_t,
 		const unsigned char *session_id);
@@ -48,9 +49,9 @@ struct tunnel_opts {
 	 * by tunnel_new() with the per-tunnel mcache. */
 	struct mux_frame_allocator pool;
 	/* Socket options applied to outbound mux connections. */
-	struct socket_opts mux_socket;
+	struct util_socket_opts mux_socket;
 	/* Socket options applied to inbound forwarded-stream connections. */
-	struct socket_opts local_socket;
+	struct util_socket_opts local_socket;
 	int fd;
 	const unsigned char *id;
 	const char *connect_addr;
@@ -121,30 +122,29 @@ struct tunnel_stats {
 	size_t rx_window;
 	size_t tx_window;
 	intmax_t last_changed;
-	/* Windowed-minimum RTT from PING/PONG probes, in nanoseconds; 0 if
-	 * no measurement has been completed yet. */
+	/* Round-trip time in nanoseconds; 0 if no measurement has been
+	 * completed yet. */
 	intmax_t rtt_ns;
-	/* Instantaneous BDP (bw_wnd × rtt_ewma); 0 if not yet estimated.
-	 * The effective BDP is reflected by rx_window and tx_window. */
+	/* Bandwidth-delay product in bytes; 0 if not yet estimated. */
 	size_t bdp;
 	/* Stream lifecycle counters (per-tunnel snapshot; aggregated by
 	 * server_stats() across all active tunnels). */
 	size_t num_streams;
 	size_t num_stream_halfopen;
-	uintmax_t num_stream_opened;
-	uintmax_t num_stream_accepted;
-	uintmax_t num_stream_fastopen;
-	uintmax_t num_stream_established;
-	uintmax_t num_stream_succeeded;
-	uintmax_t num_stream_failed;
+	uint_least64_t num_stream_opened;
+	uint_least64_t num_stream_accepted;
+	uint_least64_t num_stream_fastopen;
+	uint_least64_t num_stream_established;
+	uint_least64_t num_stream_succeeded;
+	uint_least64_t num_stream_failed;
 	/* Traffic byte counters (per-tunnel snapshot; aggregated by
 	 * server_stats() across all active tunnels plus closed-tunnel
 	 * accumulator in srv->counters). */
-	uintmax_t byt_mux_recv;
-	uintmax_t byt_mux_sent;
+	uint_least64_t byt_mux_recv;
+	uint_least64_t byt_mux_sent;
 	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
-	uintmax_t byt_push_recv;
-	uintmax_t byt_push_sent;
+	uint_least64_t byt_push_recv;
+	uint_least64_t byt_push_sent;
 	/* SYN->SYN|ACK latency ring (ns).  stream_establish_count is the
 	 * monotonic write index; the ring holds the most recent
 	 * min(stream_establish_count, 256) samples.
@@ -165,8 +165,8 @@ void tunnel_open_stream(struct tunnel *t, int fd);
  * reconnect triggered by the drain uses the updated addresses. */
 struct tunnel_reload_opts {
 	struct mux_config conf;
-	struct socket_opts mux_socket;
-	struct socket_opts local_socket;
+	struct util_socket_opts mux_socket;
+	struct util_socket_opts local_socket;
 	/* When true, the session drains: it rejects new inbound streams and
 	 * initiates graceful shutdown when its last active stream closes. */
 	bool drain;

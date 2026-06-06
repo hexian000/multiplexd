@@ -21,15 +21,15 @@
 
 #include <ev.h>
 
-#include <strings.h>
-#include <sys/socket.h>
-
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
 #include <time.h>
 
 enum { HTTP_MAX_ENTITY = 8192 };
@@ -76,7 +76,7 @@ static void api_ctx_free(struct ev_loop *loop, struct api_ctx *restrict ctx)
 	ev_io_stop(loop, &ctx->w_send);
 	ev_timer_stop(loop, &ctx->w_timeout);
 	if (ctx->fd != -1) {
-		CLOSE_FD(ctx->fd);
+		SOCKET_CLOSE_FD(ctx->fd);
 	}
 	VBUF_FREE(ctx->cbuf);
 	free(ctx);
@@ -218,26 +218,30 @@ static void append_stateful_stats(
 
 	/* Rate tracking state stored per-server to avoid static shared state. */
 	if (!s->rate_tracker.is_set) {
-		s->rate_tracker.timestamp = started;
+		s->rate_tracker.timestamp = (int_least64_t)started;
 		s->rate_tracker.is_set = true;
 	}
 
 	const double dt = (double)(now - s->rate_tracker.timestamp) / 1e9;
 	if (dt > 0.0) {
-		const uintmax_t byt_mux_recv = stats->traffic_byt_mux_recv -
-					       s->rate_tracker.byt_mux_recv;
+		const uint_least64_t byt_mux_recv =
+			stats->traffic_byt_mux_recv -
+			s->rate_tracker.byt_mux_recv;
 		FORMAT_BYTES(rx_mux, (double)byt_mux_recv / dt);
-		const uintmax_t byt_mux_sent = stats->traffic_byt_mux_sent -
-					       s->rate_tracker.byt_mux_sent;
+		const uint_least64_t byt_mux_sent =
+			stats->traffic_byt_mux_sent -
+			s->rate_tracker.byt_mux_sent;
 		FORMAT_BYTES(tx_mux, (double)byt_mux_sent / dt);
 		VBUF_APPENDF(
 			ctx->cbuf, "%-20s: Rx %s/s, Tx %s/s\n",
 			"Mux Throughput", rx_mux, tx_mux);
-		const uintmax_t byt_push_recv = stats->traffic_byt_push_recv -
-						s->rate_tracker.byt_push_recv;
+		const uint_least64_t byt_push_recv =
+			stats->traffic_byt_push_recv -
+			s->rate_tracker.byt_push_recv;
 		FORMAT_BYTES(rx_push, (double)byt_push_recv / dt);
-		const uintmax_t byt_push_sent = stats->traffic_byt_push_sent -
-						s->rate_tracker.byt_push_sent;
+		const uint_least64_t byt_push_sent =
+			stats->traffic_byt_push_sent -
+			s->rate_tracker.byt_push_sent;
 		FORMAT_BYTES(tx_push, (double)byt_push_sent / dt);
 		VBUF_APPENDF(
 			ctx->cbuf, "%-20s: Rx %s/s, Tx %s/s\n",
@@ -261,7 +265,7 @@ static void append_stateful_stats(
 	s->rate_tracker.byt_mux_sent = stats->traffic_byt_mux_sent;
 	s->rate_tracker.byt_push_recv = stats->traffic_byt_push_recv;
 	s->rate_tracker.byt_push_sent = stats->traffic_byt_push_sent;
-	s->rate_tracker.timestamp = now;
+	s->rate_tracker.timestamp = (int_least64_t)now;
 }
 
 /* Appends the per-tunnel session status section to the response body. */
@@ -303,13 +307,14 @@ static void append_eventlog(
 	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
 {
 	VBUF_APPENDSTR(ctx->cbuf, "\n> Recent Events\n");
-	const struct evlog *restrict evlog = stats->evlog;
+	const struct server_evlog *restrict evlog = stats->evlog;
 	const size_t evlog_size = ARRAY_SIZE(evlog->entries);
 	const size_t n = MIN(evlog->len, 10);
 	for (size_t i = 0; i < n; i++) {
 		const size_t idx =
 			(evlog->pos + evlog_size - 1 - i) % evlog_size;
-		const struct evlog_entry *restrict e = &evlog->entries[idx];
+		const struct server_evlog_entry *restrict e =
+			&evlog->entries[idx];
 		char ts[32] = "(unknown)";
 		if (e->timestamp != (time_t)-1) {
 			(void)format_rfc3339(
@@ -478,13 +483,13 @@ static struct vbuffer *append_tunnel_metrics(
 	struct vbuffer *restrict cbuf,
 	const struct server_stats *restrict stats)
 {
-#define APPEND_TUNNEL_METRIC_DIR(name, help, fmt, rx_val, tx_val)                      \
+#define APPEND_TUNNEL_METRIC_DIR(name, help, fmt, rx_val, tx_val, keep_cond)           \
 	do {                                                                           \
 		bool hdr = false;                                                      \
 		for (size_t i = 0; i < stats->num_tunnels; i++) {                      \
 			const struct tunnel_stats *restrict t =                        \
 				&stats->tunnels[i];                                    \
-			if (!t->established || t->peer_identity == NULL) {             \
+			if (!(keep_cond) || t->peer_identity == NULL) {                \
 				continue;                                              \
 			}                                                              \
 			if (!hdr) {                                                    \
@@ -506,13 +511,13 @@ static struct vbuffer *append_tunnel_metrics(
 		}                                                                      \
 	} while (0)
 
-#define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val)                 \
+#define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val, keep_cond)      \
 	do {                                                                   \
 		bool hdr = false;                                              \
 		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
 			const struct tunnel_stats *restrict t =                \
 				&stats->tunnels[i];                            \
-			if (!t->established || t->peer_identity == NULL ||     \
+			if (!(keep_cond) || t->peer_identity == NULL ||        \
 			    (extra_skip)) {                                    \
 				continue;                                      \
 			}                                                      \
@@ -534,22 +539,22 @@ static struct vbuffer *append_tunnel_metrics(
 	APPEND_TUNNEL_METRIC_DIR(
 		"session_bytes_total",
 		"Wire bytes on the mux link per identity session", "%ju",
-		t->byt_mux_recv, t->byt_mux_sent);
+		t->byt_mux_recv, t->byt_mux_sent, true);
 	APPEND_TUNNEL_METRIC_DIR(
 		"session_payload_bytes_total",
 		"PUSH-frame payload bytes on the mux link per identity session",
-		"%ju", t->byt_push_recv, t->byt_push_sent);
+		"%ju", t->byt_push_recv, t->byt_push_sent, true);
 	APPEND_TUNNEL_METRIC_DIR(
 		"session_window_bytes",
 		"Per-stream window size per identity session", "%zu",
-		t->rx_window, t->tx_window);
+		t->rx_window, t->tx_window, t->established);
 	APPEND_TUNNEL_METRIC(
 		"session_rtt_seconds", "Round-trip time per identity session",
-		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9);
+		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9, t->established);
 	APPEND_TUNNEL_METRIC(
 		"session_bdp_bytes",
-		"Instantaneous bandwidth-delay product (bw_wnd x rtt_ewma) per identity session",
-		t->bdp == 0, "%zu", t->bdp);
+		"Bandwidth-delay product per identity session", t->bdp == 0,
+		"%zu", t->bdp, t->established);
 
 #undef APPEND_TUNNEL_METRIC_DIR
 #undef APPEND_TUNNEL_METRIC
@@ -934,7 +939,6 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		ctx->next = parsed;
 	}
 
-	/* Parse and discard remaining header lines */
 	while (!ctx->hdr_done) {
 		char *key, *value;
 		char *const parsed = http_parsehdr(ctx->next, &key, &value);
@@ -1039,7 +1043,7 @@ void api_serve(
 	struct server *restrict s = l->srv;
 	struct api_ctx *restrict ctx = api_ctx_new(s, accepted_fd);
 	if (ctx == NULL) {
-		CLOSE_FD(accepted_fd);
+		SOCKET_CLOSE_FD(accepted_fd);
 		return;
 	}
 	s->counters.num_served_api++;

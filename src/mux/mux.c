@@ -14,8 +14,8 @@
 #include "mux/stream.h"
 #include "mux/wire.h"
 
-#include "algo/wndfilter.h"
 #include "utils/minmax.h"
+#include "utils/slog.h"
 
 #include <ev.h>
 
@@ -25,6 +25,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
+
+size_t mux_frame_object_size(void)
+{
+	return sizeof(struct mux_frame);
+}
 
 struct mux_session *
 mux_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
@@ -50,6 +55,11 @@ void mux_shutdown(struct mux_session *ss)
 void mux_start(struct mux_session *ss)
 {
 	session_start(ss);
+}
+
+void mux_attach_fd(struct mux_session *ss, const int fd)
+{
+	session_attach_fd(ss, fd);
 }
 
 /* --- Session accessors --- */
@@ -85,9 +95,9 @@ enum mux_state mux_state(const struct mux_session *ss)
 	}
 }
 
-void mux_attach_fd(struct mux_session *ss, const int fd)
+const unsigned char *mux_session_id(const struct mux_session *ss)
 {
-	session_attach_fd(ss, fd);
+	return ss->handshake.session_id;
 }
 
 const struct mux_config *mux_conf(const struct mux_session *ss)
@@ -102,11 +112,6 @@ void mux_session_stats(
 	out->tx_window = (size_t)ss->peer_stream_window * MUX_WINDOW_UNIT;
 	out->rtt = ss->estimator.rtt;
 	out->bdp = ss->estimator.bdp;
-}
-
-size_t mux_frame_object_size(void)
-{
-	return sizeof(struct mux_frame);
 }
 
 /* --- Session mutators --- */
@@ -216,7 +221,13 @@ int mux_stream_send(
 	while (remaining > 0) {
 		struct mux_frame *frame = mux_frame_get(&s->session->pool);
 		if (frame == NULL) {
-			break; /* out of frames; return what was queued */
+			if (to_send == remaining) {
+				/* OOM before any frame was queued. */
+				LOGOOM();
+				errno = EAGAIN;
+				return -1;
+			}
+			break; /* partial success: frames already queued */
 		}
 		const size_t chunk = MIN(remaining, MUX_MAX_PAYLOAD_SIZE);
 		frame->len = MUX_FRAME_HEADER_SIZE + chunk;
@@ -252,10 +263,10 @@ int mux_stream_recv(
 			errno = EAGAIN;
 			return -1;
 		}
-		/* Both FINs exchanged and recv drained: close now.
-		 * EOF (*len=0) is returned below before the caller unwinds,
-		 * so the close does not suppress EOF delivery.
-		 * stream_close is idempotent on STREAM_CLOSED. */
+		/* Peer FIN received (CLOSE_WAIT) or both FINs exchanged (CLOSING):
+		 * return EOF.  For CLOSING, close the stream now that the receive
+		 * buffer is fully drained; stream_close is idempotent on
+		 * STREAM_CLOSED.  EOF (*len=0) is returned below. */
 		if (s->state == STREAM_CLOSING) {
 			stream_close(s);
 		}
@@ -278,7 +289,6 @@ int mux_stream_recv(
 	s->session->recv_buffered_bytes -= copied;
 	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, copied);
 
-	/* Check if we should send a window update. */
 	stream_check_ack(s);
 
 	*len = copied;
@@ -311,9 +321,4 @@ void mux_stream_close(struct mux_stream *s)
 	}
 	/* Unread data present: send RST (close(fd) semantics). */
 	stream_close(s);
-}
-
-const unsigned char *mux_session_id(const struct mux_session *ss)
-{
-	return ss->handshake.session_id;
 }

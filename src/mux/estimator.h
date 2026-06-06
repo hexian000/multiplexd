@@ -9,7 +9,6 @@
 #ifndef MUX_ESTIMATOR_H
 #define MUX_ESTIMATOR_H
 
-#include "algo/ewma.h"
 #include "algo/wndfilter.h"
 
 #include <inttypes.h>
@@ -28,23 +27,18 @@ enum estimator_phase {
 /* Estimator state, embedded by value in mux_session.
  * At most one PING is outstanding at any time. */
 struct estimator_ctx {
-	/* PING payload timestamp; valid when ping_in_flight is true. */
-	intmax_t probe_sent_ns;
-	/* last probe completion time; 0 = none. */
-	intmax_t last_probe_ns;
-	/* bytes in the current probe cycle */
+	int_least64_t last_probe_ns;
 	size_t sample;
-	/* bandwidth at the STARTUP→TRACK transition; 0 = none recorded. */
-	intmax_t bw_exit;
 
-	struct ewma rtt_ewma;
+	struct wndfilter rtt_wnd;
 	struct wndfilter bw_wnd;
 
-	intmax_t rtt;
+	int_least64_t rtt;
 	size_t bdp;
 	size_t effective_bdp;
 
 	enum estimator_phase phase;
+	uint_least32_t stable_rounds;
 	bool ping_in_flight : 1;
 };
 
@@ -55,7 +49,7 @@ void estimator_init(struct mux_session *restrict ss, size_t bdp);
  * No-op when a probe is already in flight.  Returns false on send failure. */
 bool estimator_ping(struct mux_session *restrict ss);
 
-void estimator_add(struct mux_session *restrict ss, uintmax_t bytes);
+void estimator_add(struct mux_session *restrict ss, uint_least64_t bytes);
 void estimator_calculate(struct mux_session *restrict ss, intmax_t sent_ns);
 
 size_t estimator_window_size(const struct estimator_ctx *restrict est);
