@@ -294,7 +294,7 @@ static bool process_hello_server(
 				    suspended, ss, peer_hello->resume_seq)) {
 				session_reset(ss);
 			}
-			return false; /* this session is destroyed */
+			return false;
 		}
 		MUX_LOG(WARNING, ss,
 			"resume requested but no matching session found;"

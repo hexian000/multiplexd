@@ -293,7 +293,6 @@ struct tls_context *tls_ctx_server(
 	}
 	SSL_CTX *const ssl_ctx = tls_ctx_raw(ctx);
 
-	/* Require TLS 1.3 */
 	if (!SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_3_VERSION)) {
 		LOG_SSLERROR(ERROR, "SSL_CTX_set_min_proto_version");
 		tls_ctx_free(ctx);
@@ -357,7 +356,6 @@ struct tls_context *tls_ctx_client(
 	}
 	SSL_CTX *const ssl_ctx = tls_ctx_raw(ctx);
 
-	/* Require TLS 1.3 */
 	if (!SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_3_VERSION)) {
 		LOG_SSLERROR(ERROR, "SSL_CTX_set_min_proto_version");
 		tls_ctx_free(ctx);
@@ -368,7 +366,6 @@ struct tls_context *tls_ctx_client(
 		tls_ctx_free(ctx);
 		return NULL;
 	}
-
 	(void)SSL_CTX_set_mode(
 		ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
 				 SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |

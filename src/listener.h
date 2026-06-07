@@ -38,7 +38,9 @@ struct listener {
 	const struct util_socket_opts *socket_opts;
 	listener_serve_fn serve;
 	struct server *srv;
-	/* Optional per-listener context; unused by built-in listeners. */
+	/* Optional per-listener context.  identity_listener stores a
+	 * back-pointer to the enclosing struct here, recovered via DOWNCAST
+	 * inside identity_tcp_serve. */
 	void *data;
 	uint_least64_t *num_accepted;
 };

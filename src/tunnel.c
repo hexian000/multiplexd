@@ -49,6 +49,9 @@ static void task_mux_start(void *p)
 
 #define TUNNEL_LOG(level, t, message) TUNNEL_LOG_F(level, t, "%s", message)
 
+/* Both snprintf calls below tolerate truncation: snprintf null-terminates
+ * the destination buffer even when the formatted output is longer than
+ * the available capacity, so the result is always a valid C string. */
 static void tunnel_set_tag_part(
 	char *restrict buf, const size_t buflen, const char *restrict text)
 {
@@ -56,7 +59,6 @@ static void tunnel_set_tag_part(
 	if (ret < 0) {
 		buf[0] = '\0';
 	}
-	/* Truncation benign: snprintf null-terminates. */
 }
 
 static void tunnel_set_tag(
@@ -67,7 +69,6 @@ static void tunnel_set_tag(
 	if (ret < 0) {
 		tag[0] = '\0';
 	}
-	/* Truncation benign: snprintf null-terminates. */
 }
 
 struct tunnel {
@@ -86,7 +87,6 @@ struct tunnel {
 	/* Relay: re-dispatch or pass-through mux callbacks. */
 	struct {
 		struct server *srv;
-		/* Callbacks to invoke. */
 		struct tunnel_callbacks cb;
 	} relay;
 
@@ -107,6 +107,10 @@ struct tunnel {
 	bool shutting_down;
 	/* true for passively-accepted (server-role) sessions; set at creation. */
 	bool accepted;
+	/* Server-wide monotonically-increasing identifier assigned at creation;
+	 * never reused within the process lifetime.  Exposed as a Prometheus
+	 * label to disambiguate tunnels that share the same peer identity. */
+	uint_least64_t tunnel_index;
 	/* Owned copies of session metadata strings. */
 	char *identity;
 	char *peer_id;
@@ -529,8 +533,6 @@ static void tunnel_on_event(
 		break;
 	}
 
-	/* MUX_EVENT_ESTABLISHED and MUX_EVENT_RESUMED bypass on_event and are
-	 * routed to their dedicated callbacks instead. */
 	if (event == MUX_EVENT_ESTABLISHED) {
 		relay_connected(
 			t, t->relay.cb.on_established, edata.connected.ns);
@@ -632,6 +634,7 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 	t->identity = identity != NULL ? strdup(identity) : NULL;
 	t->peer_id = peer_id != NULL ? strdup(peer_id) : NULL;
 	t->peer_identity = NULL;
+	t->tunnel_index = ++srv->next_tunnel_index;
 	t->mux_socket = opts->mux_socket;
 	t->local_socket = opts->local_socket;
 	t->cb = (struct mux_callbacks){
@@ -856,7 +859,6 @@ void tunnel_close(struct tunnel *t)
 		ev_timer_stop(t->loop, &t->w_reconnect);
 		mux_close(t->ss);
 	}
-	/* Common cleanup. */
 	ev_async_stop(t->loop, &t->w_async);
 	dispatcher_destroy(t->disp);
 	ev_loop_destroy(t->loop);
@@ -952,11 +954,17 @@ const unsigned char *tunnel_session_id(const struct tunnel *t)
 	return mux_session_id(t->ss);
 }
 
+uint_least64_t tunnel_index(const struct tunnel *t)
+{
+	return t->tunnel_index;
+}
+
 void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 {
 	out->established = mux_state(t->ss) == MUX_STATE_ESTABLISHED;
 	out->tag = t->tag;
 	out->accepted = t->accepted;
+	out->tunnel_index = t->tunnel_index;
 	struct mux_session_stats snap;
 	mux_session_stats(t->ss, &snap);
 	out->rx_window = snap.rx_window;

@@ -127,9 +127,10 @@ values:
 
 For frames with neither SYN, ACK, nor RST set, receivers MUST ignore Extra,
 except for stream-0 frames with Flags = 0x00, whose Extra field is interpreted
-as a keepalive subtype per Section 2.4.4.
+as a keepalive subtype per Section 2.4.4. (This is a compound adjective; the
+numeric ID is referred to as "stream 0" in prose.)
 
-#### 2.4.3.  Session-Level Acknowledgement Encoding (Stream 0 + ACK)
+#### 2.4.3.  Session Acknowledgement Encoding (Stream 0 + ACK)
 
 When Stream ID is 0 and ACK is set, Extra carries a session-level frame
 increment: the number of non-stream-0 frames the sender has processed since
@@ -231,10 +232,10 @@ Flag bits 0x20, 0x40, and 0x80 are reserved for future extensions.
 Stream IDs are 16-bit unsigned integers subject to the following rules:
 
 -  Stream 0 is reserved for session-level control.  Frames addressed to stream 0
-   with the ACK flag set carry session-level acknowledgements (Section 5.7).
-   Stream-0 frames with Flags = 0x00 serve as keepalive probes or RTT probes
-   (Section 5.3).  All stream-0 frames with any other flag combination MUST be
-   silently discarded.
+   with the ACK flag set carry session acknowledgements (Section 5.7).
+   stream-0 frames with Flags = 0x00 serve as keepalive probes or RTT probes
+   (Section 5.3).  All stream-0 frames with any flag combination other than
+   `0x00` or ACK set MUST be silently discarded.
 
 -  Odd IDs (1, 3, 5, ...) are allocated exclusively by the client.
 
@@ -287,8 +288,8 @@ any state; this table is not exhaustive when extensions are in use.
 
 | State               | Defined non-RST flag combinations                              | Notes                                                                                                |
 | ------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| STREAM_INIT         | None                                                           | Pre-SYN active-open state.  Receipt of any non-RST frame is undefined.                               |
-| STREAM_SYN_SENT     | SYN\|ACK, SYN\|ACK\|PUSH                                       | Completes stream establishment; PUSH delivers an optional fast-open payload from the passive side.   |
+| STREAM_INIT         | None                                                           | Pre-SYN active-open state.  Receipt of any non-RST frame is not defined by this document.        |
+| STREAM_SYN_SENT     | SYN\|ACK, SYN\|ACK\|PUSH                                       | Completes stream establishment; PUSH delivers an optional fast-open payload from the passive opener. |
 | STREAM_SYN_RECEIVED | None                                                           | While local stream setup is pending, no additional non-RST frame from the peer is defined.           |
 | STREAM_ESTABLISHED  | ACK, PUSH, ACK\|PUSH, FIN, ACK\|FIN, PUSH\|FIN, ACK\|PUSH\|FIN | Full-duplex transfer.                                                                                |
 | STREAM_FIN_WAIT     | ACK, PUSH, ACK\|PUSH, FIN, ACK\|FIN, PUSH\|FIN, ACK\|PUSH\|FIN | The peer MAY continue sending until it sends FIN.                                                    |
@@ -304,7 +305,7 @@ send RST.
 
 #### 4.3.1.  Stream Initiation
 
-Active side (the endpoint that opens the stream):
+Active opener (the endpoint that opens the stream):
 
 1.  Allocate a stream ID from the appropriate parity class.
 
@@ -314,11 +315,12 @@ Active side (the endpoint that opens the stream):
 
     *  flags = SYN
     *  extra = initial send-credit grant to peer above the implicit 16384-octet
-       default; see Section 6 for the grant computation.
+       default; see Section 6.5 for the initial-credit semantics (the grant
+       formula is in Section 6.4).
     *  The SYN MAY carry an initial payload (Length > 0, PUSH set),
        constituting a fast-open.  This is valid only before the stream leaves
        STREAM_INIT.  The payload length MUST NOT exceed 16384 octets (the
-       active side's initial send credit toward the passive side, Section 6.5).
+       active opener's initial send credit toward the passive opener, Section 6.5).
 
 4.  Upon receiving SYN|ACK, add extra * 16384 to the local accumulated send
     credit.  If PUSH is set, copy exactly Length octets from the frame payload
@@ -327,7 +329,7 @@ Active side (the endpoint that opens the stream):
     already conveyed in the SYN Extra field; a subsequent ACK is sent only if
     additional credit becomes available after establishment.
 
-Passive side (the endpoint that receives the SYN):
+Passive opener (the endpoint that receives the SYN):
 
 1.  Receive SYN.  Under the base protocol, a stream-opening SYN frame carries
     only SYN or SYN|PUSH; active extensions MAY define additional flags on the
@@ -345,9 +347,9 @@ Passive side (the endpoint that receives the SYN):
        default; see Section 6.
     *  The SYN|ACK MAY carry an initial payload (Length > 0, PUSH set),
        constituting a fast-open response.  The payload length MUST NOT exceed
-       the passive side's initial send credit toward the active side: the
+       the passive opener's initial send credit toward the active opener: the
        implicit initial credit (16384 octets) plus the additional credit
-       granted by the active side's SYN Extra field (Section 6.5).
+       granted by the active opener's SYN Extra field (Section 6.5).
 
 3.  Transition to STREAM_ESTABLISHED.
 
@@ -475,7 +477,7 @@ following field values, followed immediately by a UTF-8-encoded JSON body:
 
 | Field      | Type    | Required    | Description                                                                                                |
 | ---------- | ------- | ----------- | ---------------------------------------------------------------------------------------------------------- |
-| type       | string  | Yes         | "application/x-multiplexd-proto; version=1"                                                                |
+| type       | string  | Yes         | MIME media type string; see Section 5.2 for the required value (`application/x-multiplexd-proto; version=1`) |
 | msgid      | integer | Yes         | 0 = ClientHello; 1 = ServerHello                                                                           |
 | session_id | string  | Conditional | 24-character Base64-encoded string (RFC 4648) encoding the server-assigned 16-byte shared session identity |
 | resume_seq | integer | No          | Number of the peer's non-stream-0 frames actually processed by this endpoint; see Section 5.7              |
@@ -724,15 +726,17 @@ To initiate a graceful shutdown, the local endpoint:
 2.  Initiates a transport-level shutdown: a TLS `close_notify` alert when TLS is
     in use, followed by a TCP half-close.
 
-3.  Enters SESSION_CLOSE_WAIT and waits for the peer's corresponding
-    shutdown notification before closing the transport connection.
+3.  Enters SESSION_CLOSING while the local transport teardown is in progress,
+    then transitions to SESSION_CLOSE_WAIT and waits for the peer's
+    corresponding shutdown notification before closing the transport
+    connection.
 
 Upon receiving an unexpected transport EOF before shutdown is negotiated, the
 session is torn down immediately.
 
 Any streams that are still open when the session closes are abruptly terminated.
 
-### 5.7.  Session-Level Acknowledgement
+### 5.7.  Session Acknowledgement
 
 To enable session resumption (Section 5.8), each endpoint retains every
 non-stream-0 frame it sends in an ordered unacknowledged-transmit list
@@ -981,7 +985,7 @@ regardless of gate state:
 -  ACK frames (credit grants) and FIN frames (stream half-close) for any
    non-stream-0 stream.
 
-Stream-0 frames are exempt because they carry the session ACKs that unblock the
+stream-0 frames are exempt because they carry the session ACKs that unblock the
 stalled sender and the RTT probes that maintain session liveness.  RST frames
 are exempt because streams must always be abortable regardless of gate state.
 ACK and FIN frames are exempt so that the peer can continue delivering data to
@@ -992,7 +996,7 @@ stall independently of the session window condition.
 The send-stall gate operates at the session level and is independent of the
 per-stream credit model (Section 6.1).  Transmitting a PUSH frame for a
 non-stream-0 stream requires both conditions to hold: the stream MUST have
-available per-stream credit AND the gate MUST be open.  A stream with available
+available per-stream credit and the gate MUST be open.  A stream with available
 credit may still be blocked at the session level; conversely, opening the gate
 does not grant per-stream credit.
 
@@ -1001,7 +1005,8 @@ does not grant per-stream credit.
 The receiver tracks the following per-stream quantities:
 
 -  The *receive buffer capacity*: the maximum number of octets that may be
-   concurrently buffered; configurable in the range 16384 to 16,777,216 octets.
+   concurrently buffered; configurable in the range 0 to 1,073,725,440 octets
+   (0 selects automatic, BDP-driven sizing).
 
 -  The *buffered data*: octets received but not yet delivered to the local
    stream consumer.
@@ -1067,9 +1072,9 @@ minus total payload transmitted.
 
 Wrapping arithmetic yields the correct result as long as the true value of any
 such difference does not exceed 2^31 octets.  Because the receive buffer
-capacity is at most 16 MiB (16,777,216 octets, Section 6.3) and the
-flow-control protocol ensures that outstanding credit and buffered data each
-stay within that bound, no counter pair diverges by more than 16 MiB under a
+capacity is at most 1,073,725,440 octets (Section 6.3) and the flow-control
+protocol ensures that outstanding credit and buffered data each stay within
+that bound, no counter pair diverges by more than that bound under a
 well-behaved peer.  Wrapping arithmetic therefore always yields the correct
 result in conformant sessions.
 
@@ -1104,7 +1109,7 @@ the peer.
 Outbound data-frame scheduling is implementation-defined.  When multiple
 streams are ready concurrently, the sender SHOULD use a fair scheduling policy
 that does not indefinitely starve any ready stream while continuing to transmit
-data for other ready streams, and SHOULD prefer a byte-fair policy so that a
+data for other ready streams, and SHOULD prefer a byte-granularity policy so that a
 stream sending large frames does not receive disproportionately more bandwidth
 than a stream sending small frames of equal aggregate volume.
 

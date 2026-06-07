@@ -28,9 +28,7 @@ struct identity_peer {
 
 /* Mirrors the JSON "identity" object. */
 struct conf_identity {
-	/* identity.claim */
 	char *claim;
-	/* identity.mux_connect array. */
 	char **mux_connect;
 	size_t mux_connect_count;
 	/* identity.listen entries, keyed by peer id. */

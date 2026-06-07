@@ -349,11 +349,11 @@ static const int k_msgids[] = {
 
 /*
  * Append formatted text to json[0..JBUF_SIZE-1], tracking the number of
- * bytes actually written in the variable `off` (declared in the enclosing
+ * bytes actually written in the variable off (declared in the enclosing
  * scope).  When the buffer is full, further calls are silently dropped.
  *
  * Uses _space to hold the remaining capacity, then caps the increment at
- * _space so `off` never exceeds JBUF_SIZE-1.
+ * _space so off never exceeds JBUF_SIZE-1.
  */
 #define JAPP(fmt, ...)                                                         \
 	do {                                                                   \

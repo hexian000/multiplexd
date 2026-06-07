@@ -83,7 +83,6 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		}
 #endif
 
-		/* Delegate to user-defined serve function */
 		l->serve(l, loop, fd, &addr.sa);
 	}
 }

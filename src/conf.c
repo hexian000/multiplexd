@@ -400,13 +400,11 @@ static bool conf_check(struct config *restrict conf)
 	const bool has_authcerts = (conf->tls_authcerts_count > 0);
 
 	if (has_cert && has_key && has_authcerts) {
-		/* Complete TLS configuration - run in secure mode */
+		/* all three set: secure mode */
 	} else if (!has_cert && !has_key && !has_authcerts) {
-		/* No TLS configuration - run in plaintext mode */
 		LOGW("running in plaintext mode: connection is NOT encrypted\n"
 		     "  configure tls.cert, tls.key, and tls.authcerts for secure communication");
 	} else {
-		/* Partial TLS configuration is an error */
 		LOGE("incomplete TLS configuration:");
 		if (!has_cert) {
 			LOGE("  missing: tls.cert");

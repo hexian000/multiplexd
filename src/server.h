@@ -290,6 +290,11 @@ struct server {
 	 * the handshake has not completed yet. */
 	struct tunnel **identity_tunnels;
 	size_t num_identity_tunnels;
+	/* Monotonically-increasing identifier assigned to every tunnel at
+	 * creation; never reused within the process lifetime.  Used as a
+	 * Prometheus label to disambiguate multiple tunnels sharing the same
+	 * peer identity. */
+	uint_least64_t next_tunnel_index;
 
 	int_least64_t started;
 

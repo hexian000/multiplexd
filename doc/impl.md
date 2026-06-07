@@ -99,10 +99,10 @@ threading rules live in §20.
 
 ## 3. Runtime State Carriers
 
-| Object  | Owns                                                                                                                                                              | Implicit Consequence                                                                                                                          |
-| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Session | transport fd/TLS state, session sendbuf, fixed receive ring, ctrlbuf, unacked list, retransmit cursor, stream table, ready queue, timers, optional stats pointers | It is the only place where dispatch, sched, handshake, estimator, and wire meet; none of those submodules owns transport state independently. |
-| Stream  | send queue, receive ring sized by `recv_window`, flow-control counters, half-close/reset flags, local I/O mode, coalescing membership                             | A stream can be logically closed before it disappears from the table; tombstone retention keeps late traffic deterministic.                   |
+| Object  | Owns                                                                                                                                                                | Implicit Consequence                                                                                                                          |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session | transport fd/TLS state, session sendbuf and oobbuf, fixed receive ring, unacked list, retransmit cursor, stream table, ready queue, timers, optional stats pointers | It is the only place where dispatch, sched, handshake, estimator, and wire meet; none of those submodules owns transport state independently. |
+| Stream  | send queue, receive ring sized by `recv_window`, flow-control counters, half-close/reset flags, local I/O mode, coalescing membership                               | A stream can be logically closed before it disappears from the table; tombstone retention keeps late traffic deterministic.                   |
 
 State enums are defined in `session.h` and `stream.h`; the diagrams below retain
 only the transitions whose runtime coupling is referenced elsewhere in this document.
@@ -158,8 +158,8 @@ if the session was never fully established.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> INIT: active open
-  [*] --> SYN_RECEIVED: passive open
+  [*] --> INIT: active opener
+  [*] --> SYN_RECEIVED: passive opener
 
   INIT --> SYN_SENT: SYN or SYN|PUSH sent
   INIT --> CLOSED: close before SYN leaves host
@@ -189,7 +189,7 @@ than immediate removal. The delayed-cleanup policy allows dispatch to suppress
 duplicate late traffic without maintaining a separate retired-stream map.
 
 The following two sequence diagrams document the scheduler and callback handoffs
-at the key state transitions: active open and graceful close.
+at the key state transitions: active opener and graceful close.
 
 ```mermaid
 sequenceDiagram
@@ -243,23 +243,23 @@ sequenceDiagram
 
 ## 5. libev Watcher Topology
 
-| Owner                | Watcher                 | Drives                                               | Runtime Coupling                                                                                                                                                                                                         |
-| -------------------- | ----------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Session              | `w_socket`              | transport read/write                                 | gated by `rx_open` and `tx_pending` rather than watcher churn                                                                                                                                                            |
-| Session              | `w_timeout`             | activity timeout                                     | participates in hard teardown paths                                                                                                                                                                                      |
-| Session              | `w_keepalive`           | periodic keepalive scheduling                        | armed only on the steady-state path                                                                                                                                                                                      |
-| Session              | `w_send_timeout`        | pending-send stall detection                         | meaningful only while the one-frame sendbuf is pending                                                                                                                                                                   |
-| Session              | `w_connect_timeout`     | outbound connection / TLS timeout                    | stops at connect or TLS setup completion; triggers close on expiry                                                                                                                                                       |
-| Session              | `w_sched`               | scheduler trigger                                    | bridges lifecycle work into the DRR/send path                                                                                                                                                                            |
-| Session              | `w_coalesce`            | delayed ACK / grant / Nagle expiry                   | owns the shared per-stream delay list and deferred session ACK budget                                                                                                                                                    |
-| Session              | `w_idle_timeout`        | client idle-close / lazy reconnect                   | feeds the upper-layer reconnect policy                                                                                                                                                                                   |
-| Stream (socket mode) | `socket.w_io`           | local fd recv/send pump                              | present only when a real local fd is attached                                                                                                                                                                            |
-| Stream (socket mode) | `socket.w_timeout`      | local send/connect stall detection                   | local-edge analogue of session send timeout                                                                                                                                                                              |
-| Stream (direct mode) | `direct.w_io`           | synthesized `EV_READ` / `EV_WRITE`                   | user-visible readiness is derived from stream state rather than kernel fd readiness                                                                                                                                      |
-| Server               | `w_sighup`              | config reload trigger                                | fires `server_reload()` synchronously on the server loop                                                                                                                                                                 |
-| Server               | `w_sigint`, `w_sigterm` | graceful shutdown trigger                            | stops listeners, dispatches `mux_shutdown()` to every tunnel, arms `shutting_down` flag for the `w_maintenance` deadline                                                                                                 |
-| Server               | `w_maintenance`         | shutdown deadline, sleep detection, frame-pool drain | fires every second; runs three tasks in priority order: (1) 2 s force-exit when `shutting_down`; (2) wall-clock jump ≥ `mux.timeout` calls `tunnel_drop_transport()` on every tunnel; (3) releases one frame-pool object |
-| Server               | `w_async` (threads)     | cross-thread event relay                             | drains the server-side dispatcher queue after tunnel-to-server async relay                                                                                                                                               |
+| Owner                | Watcher                   | Drives                                               | Runtime Coupling                                                                                                                                                                                                                        |
+| -------------------- | ------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session              | `w_socket`                | transport read/write                                 | gated by `rx_open` and `tx_pending` rather than watcher churn                                                                                                                                                                           |
+| Session              | `w_timeout`               | activity timeout                                     | participates in hard teardown paths                                                                                                                                                                                                     |
+| Session              | `w_keepalive`             | periodic keepalive scheduling                        | armed only on the steady-state path                                                                                                                                                                                                     |
+| Session              | `w_send_timeout`          | pending-send stall detection                         | meaningful only while the one-frame sendbuf is pending                                                                                                                                                                                  |
+| Session              | `w_connect_timeout`       | outbound connection / TLS timeout                    | stops at connect or TLS setup completion; triggers close on expiry                                                                                                                                                                      |
+| Session              | `w_sched`                 | scheduler trigger                                    | bridges lifecycle work into the DRR/send path                                                                                                                                                                                           |
+| Session              | `w_coalesce`              | delayed ACK / grant / Nagle expiry                   | owns the shared per-stream delay list and deferred session ACK budget                                                                                                                                                                   |
+| Session              | `w_idle_timeout`          | client idle-close / lazy reconnect                   | feeds the upper-layer reconnect policy                                                                                                                                                                                                  |
+| Stream (socket mode) | `socket.w_io`             | local fd recv/send pump                              | present only when a real local fd is attached                                                                                                                                                                                           |
+| Stream (socket mode) | `socket.w_timeout`        | local send/connect stall detection                   | local-edge analogue of session send timeout                                                                                                                                                                                             |
+| Stream (direct mode) | `direct.w_io`             | synthesized `EV_READ` / `EV_WRITE`                   | user-visible readiness is derived from stream state rather than kernel fd readiness                                                                                                                                                     |
+| Server               | `w_sighup`                | config reload trigger                                | fires `server_reload()` synchronously on the server loop                                                                                                                                                                                |
+| Server               | `w_sigint`, `w_sigterm`   | graceful shutdown trigger                            | stops listeners, dispatches `mux_shutdown()` to every tunnel, arms `shutting_down` flag for the `w_maintenance` deadline                                                                                                                |
+| Server               | `w_maintenance`           | shutdown deadline, sleep detection, frame-pool drain | fires every second; runs three tasks in priority order: (1) force-exit after 2 s when `shutting_down`; (2) on a wall-clock jump ≥ `mux.ping_timeout`, call `tunnel_drop_transport()` on every tunnel; (3) release one frame-pool object |
+| Server               | `w_relay_async` (threads) | cross-thread event relay                             | drains the server-side dispatcher queue after tunnel-to-server async relay                                                                                                                                                              |
 
 Per-stream coalescing uses `delay_ticks` and `delay_pending` flags instead of
 per-stream timers, keeping all delayed-grant state under the single
@@ -271,8 +271,7 @@ session-level `w_coalesce` clock.
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `rx_open`       | gates `EV_READ` on `w_socket`; cleared on transport EOF or error                                                                                                                 |
 | `tx_pending`    | gates `EV_WRITE` on `w_socket`; set when sendbuf or oobbuf has frames to flush; also set by TCP FIN or TLS `close_notify` receipt to wake `send_cb` into the graceful-close path |
-| `is_ready`      | marks DRR ready-queue membership                                                                                                                                                 |
-| `lp_ready`      | marks low-priority (EV_IDLE lifecycle) queue membership for INIT/CLOSED processing                                                                                               |
+| `sched_queue`   | `enum` (NONE/CTRL/DRR/LP) on each stream; `DRR` is the data ready queue, `LP` is the low-priority `EV_IDLE` lifecycle queue, `CTRL` is the per-stream pending-control list       |
 | `delay_pending` | marks membership in the shared coalescing delay list                                                                                                                             |
 | `nagle_flush`   | one-shot small-frame bypass after a delay-list expiry                                                                                                                            |
 
@@ -284,7 +283,7 @@ part is what the hello changes in runtime state.
 | Decision point                        | Implementation consequence                                                                                                                                                                                                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Stream 0 route                        | Hello, keepalive, and session ACK processing bypass the normal stream table.                                                                                                                                                                                              |
-| `extensions.reject_inbound`           | Latches `peer_rejects_inbound_streams`, which blocks future active opens.                                                                                                                                                                                                 |
+| `extensions.reject_inbound`           | Latches `peer_rejects_inbound_streams`, which blocks future active opener attempts.                                                                                                                                                                                       |
 | Initial ClientHello                   | Server assigns the shared `session_id` and completes first-establishment handshake.                                                                                                                                                                                       |
 | Resume ClientHello                    | `on_resume` may swap the transient accepted session for a suspended one that steals the new transport and replays unacked frames.                                                                                                                                         |
 | ServerHello on the client             | Matching `session_id` + `resume_seq` confirms resume; otherwise the client drops old streams and adopts the new session identity.                                                                                                                                         |
@@ -441,11 +440,12 @@ with fresh session state would be a protocol error.
 
 ### 9.3 Control Packing and Tombstones
 
-| Mechanism        | Rule                                                                                            | Rationale                                                                                                          |
-| ---------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `ctrlbuf`        | Pack control-only headers in 8-byte units; flush to sendbuf when full.                          | Standalone ACK, FIN, RST, and keepalive traffic share one batching path.                                           |
-| Tombstone linger | Non-INIT streams remain in the table for `MUX_TOMBSTONE_PERIOD_S` after `stream_mark_closed()`. | Dispatch can suppress duplicate late traffic and answer at most one final RST without a second retired-stream map. |
-| INIT fast close  | Streams closed before a SYN leaves skip tombstone retention.                                    | The peer never observed the stream id, so there is no late-traffic state to preserve.                              |
+| Mechanism               | Rule                                                                                                                                                                      | Rationale                                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `sendbuf` / `oobbuf`    | stream-0 control frames (PROBE/PING/PONG) are queued in `oobbuf` and flushed alongside `sendbuf`; in-place compaction strips stream-0 frames from a packed sendbuf entry. | Standalone ACK, FIN, RST, and keepalive traffic share one batching path through the transport write.               |
+| Per-stream control list | Per-stream ACK/FIN piggybacks are tracked in the session's `ctrl_head` list and folded into the next outbound data frame.                                                 | Streams that owe a credit grant or FIN emit one piggybacked header rather than a standalone frame.                 |
+| Tombstone linger        | Non-INIT streams remain in the table for `MUX_TOMBSTONE_PERIOD_S` after `stream_mark_closed()`.                                                                           | Dispatch can suppress duplicate late traffic and answer at most one final RST without a second retired-stream map. |
+| INIT fast close         | Streams closed before a SYN leaves skip tombstone retention.                                                                                                              | The peer never observed the stream id, so there is no late-traffic state to preserve.                              |
 
 ## 10. Flow-Control Bookkeeping and Backpressure
 
@@ -493,7 +493,7 @@ of triggering a spurious `FLOW_CONTROL_ERROR`.
 | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Read credit           | `queued_send_bytes + bytes_sent >= send_window`                                                                                           | Local socket reads stop before the peer grant is exhausted.                                                                        |
 | Session send stall    | unacked list reaches `session_window` frames                                                                                              | `EV_WRITE` stops scheduling fresh payload but still flushes sendbuf, retransmit traffic, stream-0 control, and per-stream ACK/FIN. |
-| Expressible grant     | newly grantable credit is at least one `MUX_WINDOW_UNIT`                                                                                  | `ack_pending` becomes meaningful only once the wire can represent the increment.                                                   |
+| Expressible grant     | newly grantable credit is at least one `MUX_WINDOW_UNIT`                                                                                  | The `ack_pending` flag becomes meaningful only once the wire can represent the increment.                                          |
 | Immediate ACK / grant | `quickack_budget > 0`, or grantable credit reaches `2 * MUX_MAX_PAYLOAD_SIZE`, or `recv_seq - ack_seq >= clamp(session_window / 4, 2, 8)` | The implementation bypasses delayed ACK so both peers do not wait on each other's timers.                                          |
 
 `session_ack_trim()` clears `send_stalled` and nudges the scheduler only after a
@@ -511,7 +511,8 @@ Grants follow three paths:
 
 ### 10.4 Receive-Buffer Pressure and Auto Window
 
-For `x = recv_buffered_bytes`, the receive-pressure scale is:
+For `x = recv_buffered_bytes`, the receive-pressure scale is (with
+`s_lo = conf.mux.mem_pressure.lo` and `s_hi = conf.mux.mem_pressure.hi`):
 
 - `scale(x) = 1` for `x < s_lo`;
 - `scale(x)` falls linearly from `1` to `1/8` for `s_lo <= x < s_hi`;
@@ -572,7 +573,7 @@ session leaves the steady-state path.
 ## 12. BDP Estimator
 
 The estimator is active when `stream_window = 0` in config (`auto_stream_window`
-mode). It learns a byte-domain BDP from inbound payload-driven probe cycles and
+mode). It learns a byte-granularity BDP from inbound payload-driven probe cycles and
 sets `stream_window` so the mux credit window is never the throughput
 bottleneck.  TCP handles congestion control; the estimator only ensures the
 per-stream receive window stays ahead of the BDP.  `session_window` is driven
@@ -642,7 +643,7 @@ Constants: `WNDSIZE_MAX = UINT16_MAX × MUX_WINDOW_UNIT`, `WNDSIZE_MIN = 4 × MU
 | Event                                                      | Effect                                                                                                                                                                                           |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | First inbound PUSH with no probe in flight                 | Start `sample = bytes`, queue PING with `last_probe_ns` payload, set `ping_in_flight`.                                                                                                           |
-| More eligible PUSH while PING is in flight                 | Accumulate payload into `sample`; no static clamp — overflow guard applied during `bw_sample` calculation.                                                                                      |
+| More eligible PUSH while PING is in flight                 | Accumulate payload into `sample`; no static clamp — overflow guard applied during `bw_sample` calculation.                                                                                       |
 | `now − last_probe_ns < MUX_PING_RATE_LIMIT_NS`             | Rate limit applies in every phase: skip without starting a probe; at most one cycle per `MUX_PING_RATE_LIMIT_NS` (1 s).                                                                          |
 | PING timeout (≥ `conf.ping_timeout` since `last_probe_ns`) | Discard the cycle; suspend the session for resume if `has_session_id`, otherwise close it via `session_notify_closed`; `last_probe_ns` is not updated; no new probe is started on the same call. |
 | Matching PONG (`sent_ns == last_probe_ns`)                 | `estimator_calculate` updates RTT/BW filters and `effective_bdp` per §12.3; advances `last_probe_ns` to gate the next probe.                                                                     |
@@ -703,7 +704,7 @@ granted.
 | Mode            | Local readiness source                                           | Outbound producer                             | Inbound consumer                        | Watchers                          |
 | --------------- | ---------------------------------------------------------------- | --------------------------------------------- | --------------------------------------- | --------------------------------- |
 | Socket-attached | kernel fd readiness                                              | attached-fd `EV_READ` pumps into `send_queue` | attached-fd `EV_WRITE` drains `recvbuf` | `socket.w_io`, `socket.w_timeout` |
-| Direct          | `mux_stream_io_modify()` synthesises readiness from stream state | `mux_stream_send()`                           | `mux_stream_recv()`                     | `direct.w_io`                     |
+| Direct          | `mux_stream_io_modify()` synthesizes readiness from stream state | `mux_stream_send()`                           | `mux_stream_recv()`                     | `direct.w_io`                     |
 
 Both modes share the same queues, counters, ACK logic, and close semantics; the
 only difference is how the local application edge is driven.
@@ -786,7 +787,7 @@ a retired stream is handled by the single-RST path in Section 14.3 instead.
 | ----------------------------------------------------------------------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Session teardown                                                                    | session layer | stop watchers first, then deep cleanup, then close transport, then hand control back to reconnect policy if applicable                                                                                                 |
 | Resumable transport loss                                                            | session layer | enter `SESSION_SUSPENDED`, arm the resume timer, and emit `MUX_EVENT_SUSPENDED` on both dialed and accepted sessions                                                                                                   |
-| Wall-clock jump ≥ `mux.timeout` detected by `maintenance_cb`                        | server layer  | `tunnel_drop_transport()` shuts down the transport fd for every active tunnel; each session detects the loss via `MUX_EVENT_LOST` and `MUX_EVENT_SUSPENDED`; client tunnels re-dial via the normal transport-loss path |
+| Wall-clock jump ≥ `mux.ping_timeout` detected by `maintenance_cb`                   | server layer  | `tunnel_drop_transport()` shuts down the transport fd for every active tunnel; each session detects the loss via `MUX_EVENT_LOST` and `MUX_EVENT_SUSPENDED`; client tunnels re-dial via the normal transport-loss path |
 | Dirty transport loss on a dialed tunnel with `idle_timeout == 0`                    | tunnel layer  | take immediate reconnect attempt 0 via `handle_transport_lost()` / `tunnel_do_connect()`                                                                                                                               |
 | Dirty transport loss on an accepted tunnel                                          | tunnel layer  | observe `MUX_EVENT_SUSPENDED`, but do not start an outbound reconnect; wait for peer resume or timeout                                                                                                                 |
 | Attempt 0 failed, or reconnect triggered from `MUX_EVENT_CLOSED` on a dialed tunnel | tunnel layer  | fall back to `tunnel_schedule_reconnect()` starting at 0.2 s and increment `reconnect_count`                                                                                                                           |
@@ -823,6 +824,12 @@ creating an accepted tunnel:
 
 | Concern                                                                            | Files                                                                                        |
 | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| **Top-level orchestrators**                                                        |                                                                                              |
+| Process supervisor, signal handling, config reload, statistics, API endpoints      | [src/server.c](../src/server.c), [src/server.h](../src/server.h)                             |
+| Mux-listener accept loop and bidirectional forwarding                              | [src/listener.c](../src/listener.c), [src/listener.h](../src/listener.h)                     |
+| Session-per-thread tunnel, reconnect policy, cross-thread relay                    | [src/tunnel.c](../src/tunnel.c), [src/tunnel.h](../src/tunnel.h)                             |
+| Built-in observability HTTP endpoints                                              | [src/api_server.c](../src/api_server.c), [src/api_server.h](../src/api_server.h)             |
+| **Mux core (`src/mux/`)**                                                          |                                                                                              |
 | API wrappers and public entry points                                               | [src/mux/mux.c](../src/mux/mux.c), [src/mux/mux.h](../src/mux/mux.h)                         |
 | Session state machine, transport lifecycle, suspend/resume                         | [src/mux/session.c](../src/mux/session.c), [src/mux/session.h](../src/mux/session.h)         |
 | BDP/RTT estimator                                                                  | [src/mux/estimator.c](../src/mux/estimator.c), [src/mux/estimator.h](../src/mux/estimator.h) |

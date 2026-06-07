@@ -1646,7 +1646,6 @@ static bool server_start_mux_tunnel(struct server *restrict s)
 		return false;
 	}
 	s->mux_tunnel = t;
-	/* mux_start() starts watchers on the tunnel's loop; dispatch. */
 	tunnel_start(t);
 	return true;
 }
@@ -1748,7 +1747,6 @@ static bool server_start_identity_tunnels(struct server *restrict s)
 			       i);
 			return false;
 		}
-		/* mux_start() starts watchers on the tunnel's loop; dispatch. */
 		tunnel_start(t);
 		s->identity_tunnels[i] = t;
 	}
@@ -2129,7 +2127,6 @@ struct server_stats *server_stats(const struct server *restrict s)
 		ts->peer_identity = NULL;
 		ts->num_tunnels = 1;
 		tunnel_stats(s->mux_tunnel, ts);
-		/* session already populated by tunnel_stats() */
 		idx++;
 	}
 	{

@@ -291,7 +291,6 @@ static void format_frame_flags(
 		if (ret < 0 && buflen > 0) {
 			buf[0] = '\0';
 		}
-		/* Truncation benign: snprintf null-terminates. */
 		return;
 	}
 	if (!wrote) {
@@ -299,7 +298,6 @@ static void format_frame_flags(
 		if (ret < 0 && buflen > 0) {
 			buf[0] = '\0';
 		}
-		/* Truncation benign: snprintf null-terminates. */
 	} else if (p < end) {
 		*p = '\0';
 	}
@@ -969,8 +967,8 @@ static void socket_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		session_state_str[ss->state], revents);
 
 #if WITH_TLS
-	/* Consume the pending TLS I/O request.  Retry via session_on_recv,
-	 * which drives TLS handshake progress regardless of direction. */
+	/* Consume the pending TLS I/O request.  Fall through to recv_cb
+	 * below to drive TLS handshake progress regardless of direction. */
 	const bool tls_poll = (ss->wire.tls_want != 0);
 	ss->wire.tls_want = 0;
 #endif

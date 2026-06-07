@@ -910,13 +910,70 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
-	/* rx_window = 2 * 16384 = 32768, tx_window = 4 * 16384 = 65536 */
+	/* rx_window = 2 * 16384 = 32768, tx_window = 4 * 16384 = 65536.
+	 * tunnel label is the server-wide monotonic index assigned at
+	 * tunnel_new(); 1 for the first tunnel created in a fresh fixture. */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_window_bytes{identity=\"peer-win\",direction=\"rx\"} 32768"));
+		"multiplexd_session_window_bytes{identity=\"peer-win\",tunnel=\"1\",direction=\"rx\"} 32768"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_window_bytes{identity=\"peer-win\",direction=\"tx\"} 65536"));
+		"multiplexd_session_window_bytes{identity=\"peer-win\",tunnel=\"1\",direction=\"tx\"} 65536"));
+
+	apifx_teardown(&fx);
+}
+
+T_DECLARE_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	/* Two tunnels sharing the same peer identity "peer-dup" — the
+	 * situation that previously caused duplicate Prometheus label sets. */
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
+	T_CHECK(fx.srv.identities != NULL);
+	struct identity_listener *sl = calloc(1, sizeof(*sl));
+	T_CHECK(sl != NULL);
+	sl->peer_identity = "peer-dup";
+	struct tunnel *const t1 = make_established_tunnel(&fx, "peer-dup", 0);
+	T_CHECK(t1 != NULL);
+	struct tunnel *const t2 = make_established_tunnel(&fx, "peer-dup", 0);
+	T_CHECK(t2 != NULL);
+	sl->tunnels = malloc(2 * sizeof(struct tunnel *));
+	T_CHECK(sl->tunnels != NULL);
+	sl->tunnels[0] = t1;
+	sl->tunnels[1] = t2;
+	sl->num_tunnels = 2;
+	{
+		void *slot = sl;
+		fx.srv.identities =
+			table_set(fx.srv.identities, sl->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	/* The two tunnel_indexes are 1 and 2 (first two tunnels in a fresh
+	 * fixture).  Each label set must appear exactly once. */
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"1\",direction=\"rx\"}"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"2\",direction=\"rx\"}"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"1\",direction=\"tx\"}"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"2\",direction=\"tx\"}"));
 
 	apifx_teardown(&fx);
 }
@@ -1047,6 +1104,8 @@ int main(void)
 	T_RUN_CASE(t, test_stats_get_includes_identity_rows);
 	T_RUN_CASE(t, test_stats_identity_shows_window_when_rtt_known);
 	T_RUN_CASE(t, test_metrics_reports_identity_window_bytes);
+	T_RUN_CASE(
+		t, test_metrics_unique_tunnel_label_for_repeated_peer_identity);
 	T_RUN_CASE(t, test_stats_post_tracks_rate_deltas);
 	T_RUN_CASE(t, test_metrics_reports_non_zero_mux_counters);
 	T_RUN_CASE(t, test_not_found_keepalive_followed_by_success);

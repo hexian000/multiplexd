@@ -105,12 +105,19 @@ const char *tunnel_peer_identity(const struct tunnel *t);
 const struct sockaddr *tunnel_peer_addr(const struct tunnel *t);
 bool tunnel_is_accepted(const struct tunnel *t);
 const unsigned char *tunnel_session_id(const struct tunnel *t);
+/* Server-wide monotonic identifier assigned at creation; never reused
+ * within the process lifetime.  Use as a stable per-tunnel handle. */
+uint_least64_t tunnel_index(const struct tunnel *t);
 
 /* Snapshot of per-tunnel statistics. */
 struct tunnel_stats {
 	/* borrowed pointer to the identity string for this tunnel's pool;
 	 * NULL for the top-level mux_tunnel (no identity pool) */
 	const char *peer_identity;
+	/* Server-wide monotonic identifier assigned at creation; never
+	 * reused.  Exposed as a Prometheus label to disambiguate tunnels
+	 * that share the same peer identity. */
+	uint_least64_t tunnel_index;
 	/* borrowed pointer to the tunnel's diagnostic tag ("my <= peer") */
 	const char *tag;
 	/* true for passively-accepted (server-role) tunnels; used by

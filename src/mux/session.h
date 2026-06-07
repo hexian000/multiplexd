@@ -161,7 +161,7 @@ struct mux_session {
 	int_least64_t last_connect_latency_ns;
 	/* Total mux bytes received from the transport for diagnostics. */
 	uint_least64_t bytes_recv;
-	/* Monotonic ns of the last outgoing PONG; used for inbound PING rate limiting. */
+	/* Monotonic ns of the last inbound PING; used for inbound PING rate limiting. */
 	int_least64_t ping_recv_last_ns;
 	enum session_state state;
 	int_least64_t last_modified;

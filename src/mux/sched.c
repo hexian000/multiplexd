@@ -745,7 +745,7 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	}
 
 	/* Emit deferred session-level ACK for non-stream-0 frames (spec §5.7.3).
-	 * The force path (delta >= MUX_SESSION_MAX_UNACKED_FRAMES) is handled
+	 * The force path (delta >= CLAMP(session_window / 4, 2, 8)) is handled
 	 * immediately in process_frame upon receipt; this timer covers the
 	 * normal deferred case and serves as a fallback on allocation failure. */
 	if (ss->state == SESSION_ESTABLISHED && ss->recv_seq != ss->ack_seq) {

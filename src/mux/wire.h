@@ -27,16 +27,15 @@ struct wire_ctx {
 	bool tx_pending : 1;
 	/* true when the peer closed the transport cleanly (TCP FIN or TLS
 	 * close_notify); false on connection errors or timeouts.  Set by
-	 * wire_recv; cleared by session_attach_transport on reconnect. */
+	 * wire_recv; cleared by session_attach_fd on reconnect. */
 	bool rx_eof : 1;
-	/* Single frame being transmitted to the transport.
-	 * Head of the outbound frame queue; the head frame is the current
-	 * transport write target and may be partially flushed.
-	 * Empty when the transport is idle. */
+	/* Outbound frame list: the head is the current transport write
+	 * target and may be partially flushed.  Empty when the transport
+	 * is idle. */
 	struct mux_frame_list sendbuf;
-	/* Out-of-band control queue (PROBE/PING/PONG), drained ahead of the
-	 * regular queue (except retransmit copies).  Bypasses the send-stall
-	 * gate (spec §6.2). */
+	/* Out-of-band control queue (PROBE/PING/PONG), drained ahead of
+	 * any non-retransmit regular frame.  Bypasses the send-stall gate
+	 * (spec §6.2). */
 	struct mux_frame_list oobbuf;
 	/* Receive byte ring for parsing inbound frames. */
 	struct ringbuf *recvbuf;

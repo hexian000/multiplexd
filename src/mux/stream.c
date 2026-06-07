@@ -37,7 +37,10 @@ int stream_format_tag(
 	char *restrict buf, size_t buflen, const struct mux_stream *restrict s)
 {
 	const struct mux_session *const ss = s->session;
-	/* Peer-initiated: server session with odd ID, or client session with even ID. */
+	/* Peer-initiated streams are received on a server session with an
+	 * odd stream ID (server-side streams are even by parity).  The
+	 * arithmetic also holds for client sessions with even IDs, but
+	 * those never occur in practice. */
 	const bool peer_initiated = (bool)(s->id & 1u) == ss->accepted;
 	const char *const arrow = peer_initiated ? " <- " : " -> ";
 
@@ -54,7 +57,6 @@ int stream_format_tag(
 			if (ret < 0) {
 				me[0] = '\0';
 			}
-			/* Truncation benign: snprintf null-terminates. */
 		}
 	}
 
@@ -72,7 +74,6 @@ int stream_format_tag(
 		if (ret < 0) {
 			peer[0] = '\0';
 		}
-		/* Truncation benign: snprintf null-terminates. */
 	}
 
 	return snprintf(

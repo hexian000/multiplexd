@@ -22,6 +22,7 @@
 #include <ev.h>
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -34,7 +35,6 @@
 
 enum { HTTP_MAX_ENTITY = 8192 };
 
-/* Inactivity timeout in seconds */
 #define API_TIMEOUT 30.0
 
 enum api_state {
@@ -49,13 +49,11 @@ struct api_ctx {
 	ev_io w_recv, w_send;
 	ev_timer w_timeout;
 	struct http_message msg;
-	/* current parse position in rbuf */
 	char *next;
 	bool hdr_done : 1;
 	bool keepalive : 1;
 	/* copy of Connection: request header value */
 	char connection[32];
-	/* bytes of wbuf already sent */
 	size_t wpos;
 	/* parsed Content-Length from the request; 0 when absent */
 	size_t content_length;
@@ -365,9 +363,6 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 	}
 	FORMAT_DURATION(str_uptime, make_duration_nanos(now - s->started));
 
-	/*
-	 * Build the response body in cbuf.
-	 */
 	VBUF_RESET(ctx->cbuf);
 
 	if (!opt.nobanner) {
@@ -474,7 +469,6 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		return;
 	}
 	respond_ok(ctx, "text/plain; charset=utf-8", ctx->cbuf->len);
-	/* body is in cbuf; send_cb will follow up with cbuf after wbuf */
 	free(stats);
 }
 
@@ -502,38 +496,41 @@ static struct vbuffer *append_tunnel_metrics(
 			}                                                              \
 			VBUF_APPENDF(                                                  \
 				cbuf,                                                  \
-				"multiplexd_%s{identity=\"%s\",direction=\"rx\"} " fmt \
-				"\n"                                                   \
-				"multiplexd_%s{identity=\"%s\",direction=\"tx\"} " fmt \
-				"\n",                                                  \
-				(name), t->peer_identity, (rx_val), (name),            \
-				t->peer_identity, (tx_val));                           \
+				"multiplexd_%s{identity=\"%s\",tunnel=\"%" PRIuLEAST64 \
+				"\",direction=\"rx\"} " fmt "\n"                       \
+				"multiplexd_%s{identity=\"%s\",tunnel=\"%" PRIuLEAST64 \
+				"\",direction=\"tx\"} " fmt "\n",                      \
+				(name), t->peer_identity, t->tunnel_index,             \
+				(rx_val), (name), t->peer_identity,                    \
+				t->tunnel_index, (tx_val));                            \
 		}                                                                      \
 	} while (0)
 
-#define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val, keep_cond)      \
-	do {                                                                   \
-		bool hdr = false;                                              \
-		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
-			const struct tunnel_stats *restrict t =                \
-				&stats->tunnels[i];                            \
-			if (!(keep_cond) || t->peer_identity == NULL ||        \
-			    (extra_skip)) {                                    \
-				continue;                                      \
-			}                                                      \
-			if (!hdr) {                                            \
-				VBUF_APPENDF(                                  \
-					cbuf,                                  \
-					"# HELP multiplexd_%s %s\n"            \
-					"# TYPE multiplexd_%s gauge\n",        \
-					(name), (help), (name));               \
-				hdr = true;                                    \
-			}                                                      \
-			VBUF_APPENDF(                                          \
-				cbuf,                                          \
-				"multiplexd_%s{identity=\"%s\"} " fmt "\n",    \
-				(name), t->peer_identity, (val));              \
-		}                                                              \
+#define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val, keep_cond)              \
+	do {                                                                           \
+		bool hdr = false;                                                      \
+		for (size_t i = 0; i < stats->num_tunnels; i++) {                      \
+			const struct tunnel_stats *restrict t =                        \
+				&stats->tunnels[i];                                    \
+			if (!(keep_cond) || t->peer_identity == NULL ||                \
+			    (extra_skip)) {                                            \
+				continue;                                              \
+			}                                                              \
+			if (!hdr) {                                                    \
+				VBUF_APPENDF(                                          \
+					cbuf,                                          \
+					"# HELP multiplexd_%s %s\n"                    \
+					"# TYPE multiplexd_%s gauge\n",                \
+					(name), (help), (name));                       \
+				hdr = true;                                            \
+			}                                                              \
+			VBUF_APPENDF(                                                  \
+				cbuf,                                                  \
+				"multiplexd_%s{identity=\"%s\",tunnel=\"%" PRIuLEAST64 \
+				"\"} " fmt "\n",                                       \
+				(name), t->peer_identity, t->tunnel_index,             \
+				(val));                                                \
+		}                                                                      \
 	} while (0)
 
 	APPEND_TUNNEL_METRIC_DIR(
@@ -752,7 +749,6 @@ static void handle_config_get(struct api_ctx *restrict ctx)
 		return;
 	}
 	respond_ok(ctx, "application/json; charset=utf-8", ctx->cbuf->len);
-	/* body is in cbuf; send_cb will follow up with cbuf after wbuf */
 }
 
 /* Handles PUT /config — parse the request body as a new config and hot-reload. */
@@ -926,7 +922,6 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		ctx->rbuf.data[ctx->rbuf.len] = '\0';
 	}
 
-	/* Parse request line on first attempt or if previously incomplete */
 	if (ctx->msg.req.method == NULL) {
 		char *const parsed = http_parse(ctx->next, &ctx->msg);
 		if (parsed == NULL) {
