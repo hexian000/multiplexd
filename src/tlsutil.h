@@ -254,6 +254,20 @@ int tls_shutdown(struct tls_connection *conn, bool *want_read, bool *want_write)
 void tls_conn_free(struct tls_connection *conn);
 
 /**
+ * @brief Get the peer's X.509 certificate in DER format.
+ *
+ * The peer certificate is only available after a successful TLS handshake.
+ * Calling this function before the handshake completes returns false.
+ *
+ * @param conn  TLS connection that completed handshake. MUST NOT be NULL.
+ * @param out   Set to malloc'd DER buffer on success; caller must free().
+ * @param len   Set to DER length in bytes on success.
+ * @return true on success, false if no peer certificate is available.
+ */
+bool tls_peer_cert_der(
+	struct tls_connection *conn, unsigned char **out, size_t *len);
+
+/**
  * @brief Log pending TLS errors for @p s.
  *
  * This is a thin wrapper around the internal logging used by the project and

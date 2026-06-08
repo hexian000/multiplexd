@@ -16,6 +16,7 @@
 #include "mux/sched.h"
 #include "mux/wire.h"
 
+#include "algo/hashtable.h"
 #include "os/socket.h"
 #include "utils/slog.h"
 
@@ -311,6 +312,10 @@ void session_discard_stream_frames(
 
 /* Recompute and apply the correct EV_READ/EV_WRITE mask for the mux socket watcher. */
 void session_update_watcher(struct mux_session *restrict ss);
+
+/** Prebuilt table_opts for the per-session stream table, keyed by stream ID.
+ * Uses a 16-bit integer hash suitable for the stream-ID key space. */
+extern const struct table_opts mux_stream_table_opts;
 
 /* Enqueue a PUSH data frame for stream s into the send buffer; takes ownership of frame. */
 bool session_send_push(

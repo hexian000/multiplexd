@@ -290,36 +290,43 @@ update_send_timeout(struct mux_stream *restrict s, const bool progress)
 	}
 }
 
+/* Write data to the local socket fd, handling partial writes and EAGAIN.
+ * Returns bytes written (may be 0 on EAGAIN).  On hard error calls
+ * stream_abort and returns 0; caller must check s->state afterwards. */
+static size_t stream_local_write(
+	struct mux_stream *restrict s, const unsigned char *restrict data,
+	const size_t len)
+{
+	const int sfd = s->socket.w_io.fd;
+	size_t nwrite = 0;
+	while (nwrite < len) {
+		size_t nbytes = len - nwrite;
+		const int err = socket_send(sfd, data + nwrite, &nbytes);
+		if (err != 0) {
+			if (err == EAGAIN || err == EWOULDBLOCK ||
+			    err == ENOBUFS || err == ENOMEM) {
+				break;
+			}
+			LOGE_F("send [fd:%d]: (%d) %s", sfd, err,
+			       strerror(err));
+			stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
+			return 0;
+		}
+		if (nbytes == 0) {
+			break;
+		}
+		nwrite += nbytes;
+	}
+	return nwrite;
+}
+
 static void stream_flush_local(struct mux_stream *s)
 {
 	bool made_progress = false;
 	while (ringbuf_readable(s->recvbuf) > 0) {
 		const size_t len = ringbuf_readable(s->recvbuf);
 		const unsigned char *const data = ringbuf_read_ptr(s->recvbuf);
-		const int sfd = s->socket.w_io.fd;
-		size_t nwrite = 0;
-		for (;;) {
-			size_t nbytes = len - nwrite;
-			const int err =
-				socket_send(sfd, data + nwrite, &nbytes);
-			if (err != 0) {
-				if (err == EAGAIN || err == EWOULDBLOCK ||
-				    err == ENOBUFS || err == ENOMEM) {
-					break; /* wait for EV_WRITE */
-				}
-				LOGE_F("send [fd:%d]: (%d) %s", sfd, err,
-				       strerror(err));
-				stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
-				return;
-			}
-			if (nbytes == 0) {
-				break;
-			}
-			nwrite += nbytes;
-			if (nwrite >= len) {
-				break;
-			}
-		}
+		const size_t nwrite = stream_local_write(s, data, len);
 		if (nwrite == 0) {
 			update_send_timeout(s, made_progress);
 			return;
@@ -967,6 +974,39 @@ void stream_recv_copy(
 			" window=%" PRIuLEAST32,
 			payload_len, s->buffered_bytes, s->recv_window);
 		stream_abort(s, MUX_STATUS_FLOW_CONTROL_ERROR);
+		return;
+	}
+
+	/* Fast path: when the receive buffer is empty and the local socket
+	 * is connected and writable, write the payload directly to the local
+	 * fd, bypassing the intermediate recvbuf memcpy and the flush round-
+	 * trip through the event loop.  Only the unwritten remainder falls
+	 * through to the normal ringbuf path. */
+	if (payload_len > 0 && ringbuf_readable(s->recvbuf) == 0 &&
+	    s->socket.connected && !s->is_direct &&
+	    (s->state == STREAM_ESTABLISHED || s->state == STREAM_CLOSE_WAIT)) {
+		const size_t nwrite =
+			stream_local_write(s, payload, payload_len);
+		if (s->state == STREAM_CLOSED) {
+			return;
+		}
+		if (nwrite > 0) {
+			s->bytes_received += nwrite;
+			payload += nwrite;
+			payload_len -= nwrite;
+			stream_check_ack(s);
+			if (payload_len == 0) {
+				STREAM_LOG_F(
+					VERYVERBOSE, s,
+					"direct write: %zu bytes, "
+					"received=%" PRIuLEAST32,
+					nwrite, s->bytes_received);
+				return;
+			}
+		}
+	}
+
+	if (payload_len == 0) {
 		return;
 	}
 

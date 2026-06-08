@@ -632,4 +632,34 @@ void tls_perror(const char *s)
 	LOG_SSLERROR(ERROR, s);
 }
 
+bool tls_peer_cert_der(
+	struct tls_connection *conn, unsigned char **out, size_t *len)
+{
+	if (conn == NULL || out == NULL || len == NULL) {
+		return false;
+	}
+	SSL *ssl = (SSL *)conn;
+	ERR_clear_error();
+	X509 *cert = SSL_get_peer_certificate(ssl);
+	if (cert == NULL) {
+		return false;
+	}
+	const int der_len = i2d_X509(cert, NULL);
+	if (der_len <= 0) {
+		X509_free(cert);
+		return false;
+	}
+	unsigned char *der = malloc((size_t)der_len);
+	if (der == NULL) {
+		X509_free(cert);
+		return false;
+	}
+	unsigned char *p = der;
+	i2d_X509(cert, &p);
+	X509_free(cert);
+	*out = der;
+	*len = (size_t)der_len;
+	return true;
+}
+
 #endif /* WITH_TLS */

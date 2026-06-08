@@ -97,14 +97,20 @@ add_mux_test(frame_test
 add_mux_test(handshake_test
     frame.c frame.h
     proto_schema.gen.c proto_schema.gen.h
+    session.c
     handshake_test.c
 )
+
+target_compile_definitions(handshake_test PRIVATE MUX_SESSION_TABLE_OPTS_ONLY)
 
 add_mux_test(handshake_fuzz_test
     frame.c frame.h
     proto_schema.gen.c proto_schema.gen.h
+    session.c
     handshake_fuzz_test.c
 )
+
+target_compile_definitions(handshake_fuzz_test PRIVATE MUX_SESSION_TABLE_OPTS_ONLY)
 
 add_mux_test(estimator_test
     estimator_test.c
@@ -112,8 +118,11 @@ add_mux_test(estimator_test
 
 add_mux_test(dispatch_test
     frame.c frame.h
+    session.c
     dispatch_test.c
 )
+
+target_compile_definitions(dispatch_test PRIVATE MUX_SESSION_TABLE_OPTS_ONLY)
 
 add_mux_test(dispatch_fuzz_test
     frame.c frame.h

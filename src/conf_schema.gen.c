@@ -13,37 +13,185 @@
  *  @{ */
 
 /* --- json_conf --- */
-typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_entry_;
-static const json_lookup_conf_entry_ json_lookup_conf_keys_[] = {
-	{"mux", 3, 7},
-	{"tcp", 3, 10},
-	{"tls", 3, 11},
-	{"type", 4, 12},
-	{"listen", 6, 3},
-	{"connect", 7, 1},
-	{"identity", 8, 2},
-	{"loglevel", 8, 4},
-	{"api_listen", 10, 0},
-	{"mux_listen", 10, 9},
-	{"mux_connect", 11, 8},
-	{"max_sessions", 12, 5},
-	{"max_startups", 12, 6},
-};
-static int json_lookup_conf_cmp_(const void *key_, const void *entry_)
+/* ANSI-C code produced by gperf version 3.1 */
+/* Command-line: gperf -l -c -E -P -Qjson_lookup_conf_stringpool --null-strings --initializer-suffix=,0  */
+/* Computed positions: -k'2,6' */
+
+
+
+/* json_lookup_conf: 13 keys  (auto-generated -- do not edit) */
+struct json_lookup_conf_kv { int name; int idx; };
+/* maximum key range = 21, duplicates = 0 */
+
+#ifdef __GNUC__
+__inline
+#else
+#ifdef __cplusplus
+inline
+#endif
+#endif
+static unsigned int
+json_lookup_conf_hash (register const char *str, register size_t len)
 {
-	const json_lookup_conf_entry_ *k_ = (const json_lookup_conf_entry_ *)key_;
-	const json_lookup_conf_entry_ *e_ = (const json_lookup_conf_entry_ *)entry_;
-	if (k_->len < e_->len) { return -1; }
-	if (k_->len > e_->len) { return  1; }
-	return memcmp(k_->name, e_->name, k_->len);
+	(void)(str);
+  static const unsigned char asso_values[] =
+    {
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24,  5, 24,  5,
+      15,  5, 24, 24, 24,  0, 24, 24, 15, 24,
+       0,  0,  5, 24, 24, 24,  0,  0,  5, 24,
+      24,  0, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+      24, 24, 24, 24, 24, 24
+    };
+  register unsigned int hval = len;
+
+  switch (hval)
+    {
+      default:
+        hval += asso_values[(unsigned char)str[5]];
+      /*FALLTHROUGH*/
+      case 5:
+      case 4:
+      case 3:
+      case 2:
+        hval += asso_values[(unsigned char)str[1]];
+        break;
+    }
+  return hval;
 }
+
+struct json_lookup_conf_stringpool_t
+  {
+    char json_lookup_conf_stringpool_str3[sizeof("mux")];
+    char json_lookup_conf_stringpool_str4[sizeof("type")];
+    char json_lookup_conf_stringpool_str6[sizeof("listen")];
+    char json_lookup_conf_stringpool_str8[sizeof("tcp")];
+    char json_lookup_conf_stringpool_str10[sizeof("mux_listen")];
+    char json_lookup_conf_stringpool_str11[sizeof("mux_connect")];
+    char json_lookup_conf_stringpool_str12[sizeof("connect")];
+    char json_lookup_conf_stringpool_str13[sizeof("loglevel")];
+    char json_lookup_conf_stringpool_str15[sizeof("api_listen")];
+    char json_lookup_conf_stringpool_str17[sizeof("max_startups")];
+    char json_lookup_conf_stringpool_str18[sizeof("tls")];
+    char json_lookup_conf_stringpool_str22[sizeof("max_sessions")];
+    char json_lookup_conf_stringpool_str23[sizeof("identity")];
+  };
+static const struct json_lookup_conf_stringpool_t json_lookup_conf_stringpool_contents =
+  {
+    "mux",
+    "type",
+    "listen",
+    "tcp",
+    "mux_listen",
+    "mux_connect",
+    "connect",
+    "loglevel",
+    "api_listen",
+    "max_startups",
+    "tls",
+    "max_sessions",
+    "identity"
+  };
+#define json_lookup_conf_stringpool ((const char *) &json_lookup_conf_stringpool_contents)
+static const struct json_lookup_conf_kv *
+json_lookup_conf_kv_lookup_ (register const char *str, register size_t len)
+{
+  enum
+    {
+      TOTAL_KEYWORDS = 13,
+      MIN_WORD_LENGTH = 3,
+      MAX_WORD_LENGTH = 12,
+      MIN_HASH_VALUE = 3,
+      MAX_HASH_VALUE = 23
+    };
+
+  static const unsigned char lengthtable[] =
+    {
+       0,  0,  0,  3,  4,  0,  6,  0,  3,  0, 10, 11,  7,  8,
+       0, 10,  0, 12,  3,  0,  0,  0, 12,  8
+    };
+  static const struct json_lookup_conf_kv wordlist[] =
+    {
+      {-1,0}, {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str3, 7},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str4, 12},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str6, 3},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str8, 10},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str10, 9},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str11, 8},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str12, 1},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str13, 4},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str15, 0},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str17, 6},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str18, 11},
+      {-1,0}, {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str22, 5},
+      {(int)(size_t)&((struct json_lookup_conf_stringpool_t *)0)->json_lookup_conf_stringpool_str23, 2}
+    };
+
+  if (len <= MAX_WORD_LENGTH && len >= MIN_WORD_LENGTH)
+    {
+      register unsigned int key = json_lookup_conf_hash (str, len);
+
+      if (key <= MAX_HASH_VALUE)
+        if (len == lengthtable[key])
+          {
+            register const char *s = wordlist[key].name + json_lookup_conf_stringpool;
+
+            if (*str == *s && !memcmp (str + 1, s + 1, len - 1))
+              return &wordlist[key];
+          }
+    }
+  return 0;
+}
+
+
+#ifdef TOTAL_KEYWORDS
+#undef TOTAL_KEYWORDS
+#endif
+#ifdef MIN_WORD_LENGTH
+#undef MIN_WORD_LENGTH
+#endif
+#ifdef MAX_WORD_LENGTH
+#undef MAX_WORD_LENGTH
+#endif
+#ifdef MIN_HASH_VALUE
+#undef MIN_HASH_VALUE
+#endif
+#ifdef MAX_HASH_VALUE
+#undef MAX_HASH_VALUE
+#endif
+
 static int
 json_lookup_conf(const char *str, size_t len)
 {
-	const json_lookup_conf_entry_ key_ = {str, len, 0};
-	const json_lookup_conf_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_keys_, 13, sizeof(*json_lookup_conf_keys_), json_lookup_conf_cmp_);
-	return e_ ? e_->idx : -1;
+	const struct json_lookup_conf_kv *kv_ = json_lookup_conf_kv_lookup_(str, len);
+	return kv_ ? kv_->idx : -1;
 }
 
 /* --- json_conf_identity --- */
@@ -52,48 +200,187 @@ json_lookup_conf_identity(const char *str, size_t len)
 {
 	if (len < 1) { return -1; }
 	switch ((unsigned char)str[0]) {
+	case 'a':
+		return len == 9 && memcmp(str, "authcerts", 9) == 0 ? 0 : -1;
 	case 'c':
-		return len == 5 && memcmp(str, "claim", 5) == 0 ? 0 : -1;
+		return len == 5 && memcmp(str, "claim", 5) == 0 ? 1 : -1;
 	case 'l':
-		return len == 6 && memcmp(str, "listen", 6) == 0 ? 1 : -1;
+		return len == 6 && memcmp(str, "listen", 6) == 0 ? 2 : -1;
 	case 'm':
-		return len == 11 && memcmp(str, "mux_connect", 11) == 0 ? 2 : -1;
+		return len == 11 && memcmp(str, "mux_connect", 11) == 0 ? 3 : -1;
 	default: return -1;
 	}
 }
 
 /* --- json_conf_mux --- */
-typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_mux_entry_;
-static const json_lookup_conf_mux_entry_ json_lookup_conf_mux_keys_[] = {
-	{"tcp", 3, 12},
-	{"nodelay", 7, 6},
-	{"keepalive", 9, 2},
-	{"max_streams", 11, 4},
-	{"idle_timeout", 12, 1},
-	{"max_halfopen", 12, 3},
-	{"mem_pressure", 12, 5},
-	{"ping_timeout", 12, 7},
-	{"send_timeout", 12, 9},
-	{"stream_window", 13, 11},
-	{"resume_timeout", 14, 8},
-	{"session_window", 14, 10},
-	{"connect_timeout", 15, 0},
-};
-static int json_lookup_conf_mux_cmp_(const void *key_, const void *entry_)
+/* ANSI-C code produced by gperf version 3.1 */
+/* Command-line: gperf -l -c -E -P -Qjson_lookup_conf_mux_stringpool --null-strings --initializer-suffix=,0  */
+/* Computed positions: -k'1-2' */
+
+
+
+/* json_lookup_conf_mux: 13 keys  (auto-generated -- do not edit) */
+struct json_lookup_conf_mux_kv { int name; int idx; };
+/* maximum key range = 30, duplicates = 0 */
+
+#ifdef __GNUC__
+__inline
+#else
+#ifdef __cplusplus
+inline
+#endif
+#endif
+static unsigned int
+json_lookup_conf_mux_hash (register const char *str, register size_t len)
 {
-	const json_lookup_conf_mux_entry_ *k_ = (const json_lookup_conf_mux_entry_ *)key_;
-	const json_lookup_conf_mux_entry_ *e_ = (const json_lookup_conf_mux_entry_ *)entry_;
-	if (k_->len < e_->len) { return -1; }
-	if (k_->len > e_->len) { return  1; }
-	return memcmp(k_->name, e_->name, k_->len);
+	(void)(str);
+  static const unsigned char asso_values[] =
+    {
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33,  5, 33,  0,
+      10,  0, 33, 33, 33, 10, 33,  0, 33,  5,
+       0,  0,  5, 33,  5,  0,  0, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+      33, 33, 33, 33, 33, 33
+    };
+  return len + asso_values[(unsigned char)str[1]] + asso_values[(unsigned char)str[0]];
 }
+
+struct json_lookup_conf_mux_stringpool_t
+  {
+    char json_lookup_conf_mux_stringpool_str3[sizeof("tcp")];
+    char json_lookup_conf_mux_stringpool_str7[sizeof("nodelay")];
+    char json_lookup_conf_mux_stringpool_str9[sizeof("keepalive")];
+    char json_lookup_conf_mux_stringpool_str12[sizeof("send_timeout")];
+    char json_lookup_conf_mux_stringpool_str13[sizeof("stream_window")];
+    char json_lookup_conf_mux_stringpool_str14[sizeof("session_window")];
+    char json_lookup_conf_mux_stringpool_str15[sizeof("connect_timeout")];
+    char json_lookup_conf_mux_stringpool_str17[sizeof("mem_pressure")];
+    char json_lookup_conf_mux_stringpool_str19[sizeof("resume_timeout")];
+    char json_lookup_conf_mux_stringpool_str21[sizeof("max_streams")];
+    char json_lookup_conf_mux_stringpool_str22[sizeof("max_halfopen")];
+    char json_lookup_conf_mux_stringpool_str27[sizeof("ping_timeout")];
+    char json_lookup_conf_mux_stringpool_str32[sizeof("idle_timeout")];
+  };
+static const struct json_lookup_conf_mux_stringpool_t json_lookup_conf_mux_stringpool_contents =
+  {
+    "tcp",
+    "nodelay",
+    "keepalive",
+    "send_timeout",
+    "stream_window",
+    "session_window",
+    "connect_timeout",
+    "mem_pressure",
+    "resume_timeout",
+    "max_streams",
+    "max_halfopen",
+    "ping_timeout",
+    "idle_timeout"
+  };
+#define json_lookup_conf_mux_stringpool ((const char *) &json_lookup_conf_mux_stringpool_contents)
+static const struct json_lookup_conf_mux_kv *
+json_lookup_conf_mux_kv_lookup_ (register const char *str, register size_t len)
+{
+  enum
+    {
+      TOTAL_KEYWORDS = 13,
+      MIN_WORD_LENGTH = 3,
+      MAX_WORD_LENGTH = 15,
+      MIN_HASH_VALUE = 3,
+      MAX_HASH_VALUE = 32
+    };
+
+  static const unsigned char lengthtable[] =
+    {
+       0,  0,  0,  3,  0,  0,  0,  7,  0,  9,  0,  0, 12, 13,
+      14, 15,  0, 12,  0, 14,  0, 11, 12,  0,  0,  0,  0, 12,
+       0,  0,  0,  0, 12
+    };
+  static const struct json_lookup_conf_mux_kv wordlist[] =
+    {
+      {-1,0}, {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str3, 12},
+      {-1,0}, {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str7, 6},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str9, 2},
+      {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str12, 9},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str13, 11},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str14, 10},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str15, 0},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str17, 5},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str19, 8},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str21, 4},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str22, 3},
+      {-1,0}, {-1,0}, {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str27, 7},
+      {-1,0}, {-1,0}, {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_stringpool_t *)0)->json_lookup_conf_mux_stringpool_str32, 1}
+    };
+
+  if (len <= MAX_WORD_LENGTH && len >= MIN_WORD_LENGTH)
+    {
+      register unsigned int key = json_lookup_conf_mux_hash (str, len);
+
+      if (key <= MAX_HASH_VALUE)
+        if (len == lengthtable[key])
+          {
+            register const char *s = wordlist[key].name + json_lookup_conf_mux_stringpool;
+
+            if (*str == *s && !memcmp (str + 1, s + 1, len - 1))
+              return &wordlist[key];
+          }
+    }
+  return 0;
+}
+
+
+#ifdef TOTAL_KEYWORDS
+#undef TOTAL_KEYWORDS
+#endif
+#ifdef MIN_WORD_LENGTH
+#undef MIN_WORD_LENGTH
+#endif
+#ifdef MAX_WORD_LENGTH
+#undef MAX_WORD_LENGTH
+#endif
+#ifdef MIN_HASH_VALUE
+#undef MIN_HASH_VALUE
+#endif
+#ifdef MAX_HASH_VALUE
+#undef MAX_HASH_VALUE
+#endif
+
 static int
 json_lookup_conf_mux(const char *str, size_t len)
 {
-	const json_lookup_conf_mux_entry_ key_ = {str, len, 0};
-	const json_lookup_conf_mux_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_mux_keys_, 13, sizeof(*json_lookup_conf_mux_keys_), json_lookup_conf_mux_cmp_);
-	return e_ ? e_->idx : -1;
+	const struct json_lookup_conf_mux_kv *kv_ = json_lookup_conf_mux_kv_lookup_(str, len);
+	return kv_ ? kv_->idx : -1;
 }
 
 /* --- json_conf_mux_mem_pressure --- */
@@ -111,59 +398,295 @@ json_lookup_conf_mux_mem_pressure(const char *str, size_t len)
 }
 
 /* --- json_conf_mux_tcp --- */
-typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_mux_tcp_entry_;
-static const json_lookup_conf_mux_tcp_entry_ json_lookup_conf_mux_tcp_keys_[] = {
-	{"rcvbuf", 6, 4},
-	{"sndbuf", 6, 6},
-	{"backlog", 7, 0},
-	{"nodelay", 7, 2},
-	{"keepalive", 9, 1},
-	{"reuseport", 9, 5},
-	{"notsent_lowat", 13, 3},
-};
-static int json_lookup_conf_mux_tcp_cmp_(const void *key_, const void *entry_)
+/* ANSI-C code produced by gperf version 3.1 */
+/* Command-line: gperf -l -c -E -P -Qjson_lookup_conf_mux_tcp_stringpool --null-strings --initializer-suffix=,0  */
+/* Computed positions: -k'1' */
+
+
+
+/* json_lookup_conf_mux_tcp: 7 keys  (auto-generated -- do not edit) */
+struct json_lookup_conf_mux_tcp_kv { int name; int idx; };
+/* maximum key range = 9, duplicates = 0 */
+
+#ifdef __GNUC__
+__inline
+#else
+#ifdef __cplusplus
+inline
+#endif
+#endif
+static unsigned int
+json_lookup_conf_mux_tcp_hash (register const char *str, register size_t len)
 {
-	const json_lookup_conf_mux_tcp_entry_ *k_ = (const json_lookup_conf_mux_tcp_entry_ *)key_;
-	const json_lookup_conf_mux_tcp_entry_ *e_ = (const json_lookup_conf_mux_tcp_entry_ *)entry_;
-	if (k_->len < e_->len) { return -1; }
-	if (k_->len > e_->len) { return  1; }
-	return memcmp(k_->name, e_->name, k_->len);
+	(void)(str);
+  static const unsigned char asso_values[] =
+    {
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15,  5, 15,
+      15, 15, 15, 15, 15, 15, 15,  5, 15, 15,
+       0, 15, 15, 15,  0,  5, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15
+    };
+  return len + asso_values[(unsigned char)str[0]];
 }
+
+struct json_lookup_conf_mux_tcp_stringpool_t
+  {
+    char json_lookup_conf_mux_tcp_stringpool_str6[sizeof("rcvbuf")];
+    char json_lookup_conf_mux_tcp_stringpool_str7[sizeof("nodelay")];
+    char json_lookup_conf_mux_tcp_stringpool_str9[sizeof("reuseport")];
+    char json_lookup_conf_mux_tcp_stringpool_str11[sizeof("sndbuf")];
+    char json_lookup_conf_mux_tcp_stringpool_str12[sizeof("backlog")];
+    char json_lookup_conf_mux_tcp_stringpool_str13[sizeof("notsent_lowat")];
+    char json_lookup_conf_mux_tcp_stringpool_str14[sizeof("keepalive")];
+  };
+static const struct json_lookup_conf_mux_tcp_stringpool_t json_lookup_conf_mux_tcp_stringpool_contents =
+  {
+    "rcvbuf",
+    "nodelay",
+    "reuseport",
+    "sndbuf",
+    "backlog",
+    "notsent_lowat",
+    "keepalive"
+  };
+#define json_lookup_conf_mux_tcp_stringpool ((const char *) &json_lookup_conf_mux_tcp_stringpool_contents)
+static const struct json_lookup_conf_mux_tcp_kv *
+json_lookup_conf_mux_tcp_kv_lookup_ (register const char *str, register size_t len)
+{
+  enum
+    {
+      TOTAL_KEYWORDS = 7,
+      MIN_WORD_LENGTH = 6,
+      MAX_WORD_LENGTH = 13,
+      MIN_HASH_VALUE = 6,
+      MAX_HASH_VALUE = 14
+    };
+
+  static const unsigned char lengthtable[] =
+    {
+       0,  0,  0,  0,  0,  0,  6,  7,  0,  9,  0,  6,  7, 13,
+       9
+    };
+  static const struct json_lookup_conf_mux_tcp_kv wordlist[] =
+    {
+      {-1,0}, {-1,0}, {-1,0}, {-1,0}, {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_tcp_stringpool_t *)0)->json_lookup_conf_mux_tcp_stringpool_str6, 4},
+      {(int)(size_t)&((struct json_lookup_conf_mux_tcp_stringpool_t *)0)->json_lookup_conf_mux_tcp_stringpool_str7, 2},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_tcp_stringpool_t *)0)->json_lookup_conf_mux_tcp_stringpool_str9, 5},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_tcp_stringpool_t *)0)->json_lookup_conf_mux_tcp_stringpool_str11, 6},
+      {(int)(size_t)&((struct json_lookup_conf_mux_tcp_stringpool_t *)0)->json_lookup_conf_mux_tcp_stringpool_str12, 0},
+      {(int)(size_t)&((struct json_lookup_conf_mux_tcp_stringpool_t *)0)->json_lookup_conf_mux_tcp_stringpool_str13, 3},
+      {(int)(size_t)&((struct json_lookup_conf_mux_tcp_stringpool_t *)0)->json_lookup_conf_mux_tcp_stringpool_str14, 1}
+    };
+
+  if (len <= MAX_WORD_LENGTH && len >= MIN_WORD_LENGTH)
+    {
+      register unsigned int key = json_lookup_conf_mux_tcp_hash (str, len);
+
+      if (key <= MAX_HASH_VALUE)
+        if (len == lengthtable[key])
+          {
+            register const char *s = wordlist[key].name + json_lookup_conf_mux_tcp_stringpool;
+
+            if (*str == *s && !memcmp (str + 1, s + 1, len - 1))
+              return &wordlist[key];
+          }
+    }
+  return 0;
+}
+
+
+#ifdef TOTAL_KEYWORDS
+#undef TOTAL_KEYWORDS
+#endif
+#ifdef MIN_WORD_LENGTH
+#undef MIN_WORD_LENGTH
+#endif
+#ifdef MAX_WORD_LENGTH
+#undef MAX_WORD_LENGTH
+#endif
+#ifdef MIN_HASH_VALUE
+#undef MIN_HASH_VALUE
+#endif
+#ifdef MAX_HASH_VALUE
+#undef MAX_HASH_VALUE
+#endif
+
 static int
 json_lookup_conf_mux_tcp(const char *str, size_t len)
 {
-	const json_lookup_conf_mux_tcp_entry_ key_ = {str, len, 0};
-	const json_lookup_conf_mux_tcp_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_mux_tcp_keys_, 7, sizeof(*json_lookup_conf_mux_tcp_keys_), json_lookup_conf_mux_tcp_cmp_);
-	return e_ ? e_->idx : -1;
+	const struct json_lookup_conf_mux_tcp_kv *kv_ = json_lookup_conf_mux_tcp_kv_lookup_(str, len);
+	return kv_ ? kv_->idx : -1;
 }
 
 /* --- json_conf_tcp --- */
-typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_tcp_entry_;
-static const json_lookup_conf_tcp_entry_ json_lookup_conf_tcp_keys_[] = {
-	{"rcvbuf", 6, 4},
-	{"sndbuf", 6, 6},
-	{"backlog", 7, 0},
-	{"nodelay", 7, 2},
-	{"keepalive", 9, 1},
-	{"reuseport", 9, 5},
-	{"notsent_lowat", 13, 3},
-};
-static int json_lookup_conf_tcp_cmp_(const void *key_, const void *entry_)
+/* ANSI-C code produced by gperf version 3.1 */
+/* Command-line: gperf -l -c -E -P -Qjson_lookup_conf_tcp_stringpool --null-strings --initializer-suffix=,0  */
+/* Computed positions: -k'1' */
+
+
+
+/* json_lookup_conf_tcp: 7 keys  (auto-generated -- do not edit) */
+struct json_lookup_conf_tcp_kv { int name; int idx; };
+/* maximum key range = 9, duplicates = 0 */
+
+#ifdef __GNUC__
+__inline
+#else
+#ifdef __cplusplus
+inline
+#endif
+#endif
+static unsigned int
+json_lookup_conf_tcp_hash (register const char *str, register size_t len)
 {
-	const json_lookup_conf_tcp_entry_ *k_ = (const json_lookup_conf_tcp_entry_ *)key_;
-	const json_lookup_conf_tcp_entry_ *e_ = (const json_lookup_conf_tcp_entry_ *)entry_;
-	if (k_->len < e_->len) { return -1; }
-	if (k_->len > e_->len) { return  1; }
-	return memcmp(k_->name, e_->name, k_->len);
+	(void)(str);
+  static const unsigned char asso_values[] =
+    {
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15,  5, 15,
+      15, 15, 15, 15, 15, 15, 15,  5, 15, 15,
+       0, 15, 15, 15,  0,  5, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+      15, 15, 15, 15, 15, 15
+    };
+  return len + asso_values[(unsigned char)str[0]];
 }
+
+struct json_lookup_conf_tcp_stringpool_t
+  {
+    char json_lookup_conf_tcp_stringpool_str6[sizeof("rcvbuf")];
+    char json_lookup_conf_tcp_stringpool_str7[sizeof("nodelay")];
+    char json_lookup_conf_tcp_stringpool_str9[sizeof("reuseport")];
+    char json_lookup_conf_tcp_stringpool_str11[sizeof("sndbuf")];
+    char json_lookup_conf_tcp_stringpool_str12[sizeof("backlog")];
+    char json_lookup_conf_tcp_stringpool_str13[sizeof("notsent_lowat")];
+    char json_lookup_conf_tcp_stringpool_str14[sizeof("keepalive")];
+  };
+static const struct json_lookup_conf_tcp_stringpool_t json_lookup_conf_tcp_stringpool_contents =
+  {
+    "rcvbuf",
+    "nodelay",
+    "reuseport",
+    "sndbuf",
+    "backlog",
+    "notsent_lowat",
+    "keepalive"
+  };
+#define json_lookup_conf_tcp_stringpool ((const char *) &json_lookup_conf_tcp_stringpool_contents)
+static const struct json_lookup_conf_tcp_kv *
+json_lookup_conf_tcp_kv_lookup_ (register const char *str, register size_t len)
+{
+  enum
+    {
+      TOTAL_KEYWORDS = 7,
+      MIN_WORD_LENGTH = 6,
+      MAX_WORD_LENGTH = 13,
+      MIN_HASH_VALUE = 6,
+      MAX_HASH_VALUE = 14
+    };
+
+  static const unsigned char lengthtable[] =
+    {
+       0,  0,  0,  0,  0,  0,  6,  7,  0,  9,  0,  6,  7, 13,
+       9
+    };
+  static const struct json_lookup_conf_tcp_kv wordlist[] =
+    {
+      {-1,0}, {-1,0}, {-1,0}, {-1,0}, {-1,0}, {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_tcp_stringpool_t *)0)->json_lookup_conf_tcp_stringpool_str6, 4},
+      {(int)(size_t)&((struct json_lookup_conf_tcp_stringpool_t *)0)->json_lookup_conf_tcp_stringpool_str7, 2},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_tcp_stringpool_t *)0)->json_lookup_conf_tcp_stringpool_str9, 5},
+      {-1,0},
+      {(int)(size_t)&((struct json_lookup_conf_tcp_stringpool_t *)0)->json_lookup_conf_tcp_stringpool_str11, 6},
+      {(int)(size_t)&((struct json_lookup_conf_tcp_stringpool_t *)0)->json_lookup_conf_tcp_stringpool_str12, 0},
+      {(int)(size_t)&((struct json_lookup_conf_tcp_stringpool_t *)0)->json_lookup_conf_tcp_stringpool_str13, 3},
+      {(int)(size_t)&((struct json_lookup_conf_tcp_stringpool_t *)0)->json_lookup_conf_tcp_stringpool_str14, 1}
+    };
+
+  if (len <= MAX_WORD_LENGTH && len >= MIN_WORD_LENGTH)
+    {
+      register unsigned int key = json_lookup_conf_tcp_hash (str, len);
+
+      if (key <= MAX_HASH_VALUE)
+        if (len == lengthtable[key])
+          {
+            register const char *s = wordlist[key].name + json_lookup_conf_tcp_stringpool;
+
+            if (*str == *s && !memcmp (str + 1, s + 1, len - 1))
+              return &wordlist[key];
+          }
+    }
+  return 0;
+}
+
+
+#ifdef TOTAL_KEYWORDS
+#undef TOTAL_KEYWORDS
+#endif
+#ifdef MIN_WORD_LENGTH
+#undef MIN_WORD_LENGTH
+#endif
+#ifdef MAX_WORD_LENGTH
+#undef MAX_WORD_LENGTH
+#endif
+#ifdef MIN_HASH_VALUE
+#undef MIN_HASH_VALUE
+#endif
+#ifdef MAX_HASH_VALUE
+#undef MAX_HASH_VALUE
+#endif
+
 static int
 json_lookup_conf_tcp(const char *str, size_t len)
 {
-	const json_lookup_conf_tcp_entry_ key_ = {str, len, 0};
-	const json_lookup_conf_tcp_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_tcp_keys_, 7, sizeof(*json_lookup_conf_tcp_keys_), json_lookup_conf_tcp_cmp_);
-	return e_ ? e_->idx : -1;
+	const struct json_lookup_conf_tcp_kv *kv_ = json_lookup_conf_tcp_kv_lookup_(str, len);
+	return kv_ ? kv_->idx : -1;
 }
 
 /* --- json_conf_tls --- */
@@ -206,9 +729,10 @@ enum json_conf_key {
 };
 
 enum json_conf_identity_key {
-	JSON_CONF_IDENTITY_CLAIM = 0,
-	JSON_CONF_IDENTITY_LISTEN = 1,
-	JSON_CONF_IDENTITY_MUX_CONNECT = 2,
+	JSON_CONF_IDENTITY_AUTHCERTS = 0,
+	JSON_CONF_IDENTITY_CLAIM = 1,
+	JSON_CONF_IDENTITY_LISTEN = 2,
+	JSON_CONF_IDENTITY_MUX_CONNECT = 3,
 };
 
 enum json_conf_mux_key {
@@ -689,6 +1213,11 @@ static bool json_unmarshal_conf_identity(
 			&key_, &key_len_, &val_, &val_len_)) {
 		const int k_ = json_lookup_conf_identity(key_, key_len_);
 		switch (k_) {
+		case JSON_CONF_IDENTITY_AUTHCERTS: {
+			obj->authcerts_json.str = val_;
+			obj->authcerts_json.len = val_len_;
+			break;
+		}
 		case JSON_CONF_IDENTITY_CLAIM: {
 			if (!json_parse_string(val_, val_len_, &obj->claim.str, &obj->claim.len)) { return false; }
 			break;
@@ -1059,6 +1588,10 @@ static int json_marshal_conf_identity(
 	EMIT_LIT("{");
 	const int n_start_ = n_;
 
+	if (obj->authcerts_json.str != NULL) {
+		EMIT("\"%s\":%.*s,", "authcerts",
+			(int)obj->authcerts_json.len, obj->authcerts_json.str);
+	}
 	if (obj->claim.str != NULL) {
 		EMIT_LIT("\"claim\":");
 		EMIT_STR(obj->claim.str, obj->claim.len);

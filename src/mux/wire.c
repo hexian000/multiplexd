@@ -13,6 +13,7 @@
 #include "tlsutil.h"
 
 #include "os/socket.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
 #include <ev.h>
@@ -150,7 +151,48 @@ void wire_discard_buffers(struct mux_session *restrict ss)
 {
 	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
 	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
+	ss->wire.sendbuf_staging = false;
 	ringbuf_reset(ss->wire.recvbuf);
+}
+
+void wire_sendbuf_push(
+	struct mux_session *restrict ss, struct mux_frame *restrict frame)
+{
+	ASSERT(frame->len > 0);
+	/* Retransmit copies must stay as a separate reference entry so that
+	 * session_track_sent can match them by pointer identity. */
+	const bool force_ref = (frame == ss->retransmit_copy) ||
+			       (frame->len > MUX_CORK_APPEND_MAX);
+	if (!force_ref) {
+		/* Small frame: pack into the tail staging entry if there is room. */
+		struct mux_frame *const staging =
+			ss->wire.sendbuf_staging ? ss->wire.sendbuf.tail : NULL;
+		if (staging != NULL &&
+		    staging->len + frame->len <= MUX_FRAME_SIZE) {
+			memcpy(staging->data + staging->len, frame->data,
+			       frame->len);
+			staging->len += frame->len;
+			mux_frame_put(&ss->pool, frame);
+			return;
+		}
+		/* No suitable staging tail: allocate a fresh staging entry. */
+		struct mux_frame *const new_staging = mux_frame_get(&ss->pool);
+		if (new_staging != NULL) {
+			memcpy(new_staging->data, frame->data, frame->len);
+			new_staging->pos = 0;
+			new_staging->len = frame->len;
+			mux_frame_list_push(&ss->wire.sendbuf, new_staging);
+			ss->wire.sendbuf_staging = true;
+			mux_frame_put(&ss->pool, frame);
+			return;
+		}
+		/* Pool exhausted: fall through and append the original by reference. */
+		LOGOOM();
+	}
+	/* Large, retransmit, or OOM fallback: append by reference. */
+	frame->pos = 0;
+	mux_frame_list_push(&ss->wire.sendbuf, frame);
+	ss->wire.sendbuf_staging = false;
 }
 
 #if WITH_TLS

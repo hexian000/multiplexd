@@ -673,9 +673,10 @@ static void sched_cb(struct ev_loop *loop, ev_idle *w, const int revents)
 		}
 
 		if (s->state == STREAM_INIT) {
-			/* session_send_push must not run with a partial sendbuf;
-			 * re-queue and stop until the buffer drains. */
-			if (ss->wire.sendbuf.head != NULL) {
+			/* Defer SYN when a partially-written frame occupies
+			 * sendbuf head; staging entries (pos==0) are safe. */
+			if (ss->wire.sendbuf.head != NULL &&
+			    ss->wire.sendbuf.head->pos > 0) {
 				MUX_LOG_F(
 					DEBUG, ss,
 					"idle scheduler waiting for sendbuf drain before SYN"

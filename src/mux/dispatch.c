@@ -21,6 +21,7 @@
 #include "os/clock.h"
 #include "utils/debug.h"
 #include "utils/formats.h"
+#include "utils/likely.h"
 #include "utils/minmax.h"
 #include "utils/slog.h"
 
@@ -132,7 +133,7 @@ static void dispatch_by_stream(
 
 	/* CLOSED streams linger briefly so late frames can be handled without a
 	 * second lookup structure. */
-	if (s->state == STREAM_CLOSED) {
+	if (UNLIKELY(s->state == STREAM_CLOSED)) {
 		/* RST on closed stream: SHOULD be ignored (spec §4.2.1 table). */
 		if (hdr->flags & MUX_FLAG_RST) {
 			MUX_LOG_F(
@@ -179,14 +180,14 @@ static void dispatch_by_stream(
 		return;
 	}
 
-	if (hdr->flags & MUX_FLAG_RST) {
+	if (UNLIKELY(hdr->flags & MUX_FLAG_RST)) {
 		stream_recv_rst(s);
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
 		return;
 	}
 
 	const uint_fast8_t flags = hdr->flags & MUX_FLAG_MASK;
-	if (!validate_flags_by_stream(s, flags)) {
+	if (UNLIKELY(!validate_flags_by_stream(s, flags))) {
 		MUX_LOG_F(
 			DEBUG, ss,
 			"invalid flags 0x%02x for stream %" PRIuFAST16
@@ -201,6 +202,22 @@ static void dispatch_by_stream(
 		stream_recv_rst(s);
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
 		return;
+	}
+
+	/* ACK credit logging: snapshot before the window update.
+	 * Only relevant for ACK-only frames; SYN|ACK is handled inside
+	 * the SYN branch after the retransmit guard below. */
+	const uint_fast32_t credit_before =
+		((flags & MUX_FLAG_ACK) && !(flags & MUX_FLAG_SYN)) ?
+			stream_credit_avail(s) :
+			0;
+
+	/* ACK-only: clear Nagle unacked bytes and grant receive-window
+	 * credit.  SYN|ACK carries its own window update inside the SYN
+	 * branch after the idempotent-retransmit guard. */
+	if ((flags & MUX_FLAG_ACK) && !(flags & MUX_FLAG_SYN)) {
+		s->unacked_bytes = 0;
+		stream_recv_window(s, hdr->extra);
 	}
 
 	/* SYN|ACK: completes stream establishment (guaranteed by validate_flags_by_stream).
@@ -262,12 +279,9 @@ static void dispatch_by_stream(
 	}
 
 	/* ACK: grant credit whenever RST is clear and ACK is set.
-	 * This includes ACK|FIN: Extra carries a credit grant, not a status code. */
+	 * This includes ACK|FIN: Extra carries a credit grant, not a status code.
+	 * stream_recv_window already called in the ACK-only block above. */
 	if (flags & MUX_FLAG_ACK) {
-		const uint_fast32_t credit_before = stream_credit_avail(s);
-		/* Nagle: clear before stream_recv_window; see SYN|ACK above. */
-		s->unacked_bytes = 0;
-		stream_recv_window(s, hdr->extra);
 		if (credit_before == 0 && hdr->extra > 0) {
 			MUX_LOG_F(
 				DEBUG, ss,
@@ -280,7 +294,7 @@ static void dispatch_by_stream(
 		 * setting; do not derive peer_stream_window from ACK increments. */
 	}
 
-	if ((flags & MUX_FLAG_PUSH) && hdr->length > 0) {
+	if (LIKELY((flags & MUX_FLAG_PUSH) && hdr->length > 0)) {
 		COUNTER_ADD(
 			ss->cnt.traffic.byt_push_recv,
 			(uint_least64_t)hdr->length);

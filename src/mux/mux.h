@@ -231,6 +231,12 @@ void mux_attach_fd(struct mux_session *ss, int fd);
 
 int mux_fd(const struct mux_session *ss);
 
+#if WITH_TLS
+/* Returns the TLS connection object, or NULL when TLS is not in use.
+ * The returned pointer is owned by the session and must not be freed. */
+struct tls_connection *mux_tls_conn(const struct mux_session *ss);
+#endif
+
 /* Returns NULL before SESSION_ESTABLISHED. */
 const struct sockaddr *mux_peer_addr(const struct mux_session *ss);
 

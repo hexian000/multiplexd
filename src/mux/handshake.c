@@ -323,11 +323,7 @@ static bool handshake_client_fresh(
 				0);
 	}
 	sched_free_streams(ss);
-	ss->sched.streams = table_new(&(struct table_opts){
-		.hash = TABLE_OPTS_PTR.hash,
-		.eq = TABLE_OPTS_PTR.eq,
-		.flags = TABLE_FAST,
-	});
+	ss->sched.streams = table_new(&mux_stream_table_opts);
 	if (ss->sched.streams == NULL) {
 		LOGOOM();
 		session_reset(ss);

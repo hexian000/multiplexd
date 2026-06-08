@@ -530,6 +530,65 @@ T_DECLARE_CASE(test_tls_full_handshake_and_io)
 	rm_tmpdir(tmpl);
 }
 
+T_DECLARE_CASE(test_tls_peer_cert_der_after_handshake)
+{
+	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	struct tls_context *srv_ctx =
+		tls_ctx_server(cert_path, key_path, authcerts, 1, NULL);
+	struct tls_context *cli_ctx =
+		tls_ctx_client(cert_path, key_path, authcerts, 1, NULL);
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	struct tls_connection *srv_conn = tls_accept(srv_ctx, fds[0]);
+	struct tls_connection *cli_conn = tls_connect(cli_ctx, fds[1]);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+	T_CHECK(drive_handshake(srv_conn, cli_conn, 20));
+
+	/* Both sides should be able to retrieve the peer's certificate. */
+	unsigned char *srv_der = NULL;
+	size_t srv_der_len = 0;
+	T_EXPECT(tls_peer_cert_der(srv_conn, &srv_der, &srv_der_len));
+	T_EXPECT(srv_der != NULL);
+	T_EXPECT(srv_der_len > 0);
+
+	unsigned char *cli_der = NULL;
+	size_t cli_der_len = 0;
+	T_EXPECT(tls_peer_cert_der(cli_conn, &cli_der, &cli_der_len));
+	T_EXPECT(cli_der != NULL);
+	T_EXPECT(cli_der_len > 0);
+
+	/* Same certificate on both sides (self-signed test cert). */
+	T_EXPECT(srv_der_len == cli_der_len);
+	T_EXPECT(memcmp(srv_der, cli_der, srv_der_len) == 0);
+
+	free(srv_der);
+	free(cli_der);
+
+	T_EXPECT(drive_shutdown(cli_conn, srv_conn, 10));
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	tls_ctx_free(cli_ctx);
+	tls_ctx_free(srv_ctx);
+	close(fds[0]);
+	close(fds[1]);
+	rm_tmpdir(tmpl);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -545,6 +604,7 @@ int main(void)
 	T_RUN_CASE(t, test_tls_load_cert_from_memory_succeeds);
 	T_RUN_CASE(t, test_tls_load_key_from_memory_succeeds);
 	T_RUN_CASE(t, test_tls_full_handshake_and_io);
+	T_RUN_CASE(t, test_tls_peer_cert_der_after_handshake);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 

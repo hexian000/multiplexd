@@ -69,6 +69,13 @@ int mux_fd(const struct mux_session *ss)
 	return ss->w_socket.fd;
 }
 
+#if WITH_TLS
+struct tls_connection *mux_tls_conn(const struct mux_session *ss)
+{
+	return ss->wire.tlsconn;
+}
+#endif
+
 const struct sockaddr *mux_peer_addr(const struct mux_session *ss)
 {
 	if (ss->peer_addr.sa.sa_family == AF_UNSPEC) {

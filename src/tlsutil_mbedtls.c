@@ -659,4 +659,25 @@ void tls_perror(const char *s)
 	LOGE_F("%s", s);
 }
 
+bool tls_peer_cert_der(
+	struct tls_connection *conn, unsigned char **out, size_t *len)
+{
+	if (conn == NULL || out == NULL || len == NULL) {
+		return false;
+	}
+	struct tls_conn_impl *const c = tls_conn_raw(conn);
+	const mbedtls_x509_crt *cert = mbedtls_ssl_get_peer_cert(&c->ssl);
+	if (cert == NULL || cert->raw.len == 0) {
+		return false;
+	}
+	unsigned char *der = malloc(cert->raw.len);
+	if (der == NULL) {
+		return false;
+	}
+	memcpy(der, cert->raw.p, cert->raw.len);
+	*out = der;
+	*len = cert->raw.len;
+	return true;
+}
+
 #endif /* WITH_TLS */

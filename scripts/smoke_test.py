@@ -264,7 +264,16 @@ def build_server_config(
     mux_port: int,
     echo_port: int,
     api_port: int,
+    window: Optional[int] = None,
 ) -> Dict[str, object]:
+    mux: Dict[str, object] = {
+        "ping_timeout": 15,
+        "keepalive": 30,
+        "max_streams": 200,
+    }
+    if window is not None:
+        mux["stream_window"] = window
+        mux["session_window"] = window
     return {
         "mux_listen": "127.0.0.1:%d" % mux_port,
         "connect": "127.0.0.1:%d" % echo_port,
@@ -274,11 +283,7 @@ def build_server_config(
             "key": "@server-key.pem",
             "authcerts": ["@client-cert.pem"],
         },
-        "mux": {
-            "ping_timeout": 15,
-            "keepalive": 30,
-            "max_streams": 200,
-        },
+        "mux": mux,
         "loglevel": 8,
     }
 
@@ -288,7 +293,15 @@ def build_client_config(
     mux_port: int,
     listen_port: int,
     api_port: int,
+    window: Optional[int] = None,
 ) -> Dict[str, object]:
+    mux: Dict[str, object] = {
+        "ping_timeout": 15,
+        "keepalive": 30,
+    }
+    if window is not None:
+        mux["stream_window"] = window
+        mux["session_window"] = window
     return {
         "mux_connect": "127.0.0.1:%d" % mux_port,
         "listen": "127.0.0.1:%d" % listen_port,
@@ -298,10 +311,7 @@ def build_client_config(
             "key": "@client-key.pem",
             "authcerts": ["@server-cert.pem"],
         },
-        "mux": {
-            "ping_timeout": 15,
-            "keepalive": 30,
-        },
+        "mux": mux,
         "loglevel": 8,
     }
 
@@ -451,6 +461,7 @@ def smoke_test(
     rng: random.Random,
     duration: float,
     seed: Optional[int],
+    window: Optional[int] = None,
 ) -> bool:
     """Orchestrate the full smoke test.  Returns True on pass."""
     # Port allocation: keep all sockets open at once to guarantee uniqueness.
@@ -504,7 +515,8 @@ def smoke_test(
         write_config(
             server_cfg,
             build_server_config(
-                mux_port=mux_port, echo_port=echo_port, api_port=server_api_port
+                mux_port=mux_port, echo_port=echo_port, api_port=server_api_port,
+                window=window,
             ),
         )
         write_config(
@@ -513,6 +525,7 @@ def smoke_test(
                 mux_port=mux_port,
                 listen_port=client_listen_port,
                 api_port=client_api_port,
+                window=window,
             ),
         )
 
@@ -685,6 +698,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=10.0,
         help="random test duration in seconds (default: 10)",
     )
+    parser.add_argument(
+        "--window",
+        type=int,
+        help="set both stream_window and session_window (default: omit from config)",
+    )
     return parser.parse_args(argv)
 
 
@@ -723,6 +741,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rng=rng,
         duration=args.duration,
         seed=args.seed,
+        window=args.window,
     )
 
     log("")

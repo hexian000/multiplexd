@@ -287,6 +287,19 @@
                         "description": "Local TCP address to accept traffic for this peer.",
                         "type": "string"
                     }
+                },
+                "authcerts": {
+                    "description": "Per-identity authorized certificates. TLS handshake accepts the union of all certificates in this map (and global tls.authcerts, if any). After the protocol hello exchange, if the peer's claimed identity is not present as a key in this map, the connection is closed. Each value is an array of certificate entries following the same format as tls.authcerts: each entry is '@/path/to/cert.pem' or an inline PEM string.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "description": "Allowed certificates for this peer identity.",
+                        "type": "array",
+                        "items": {
+                            "description": "PEM certificate or file reference '@'.",
+                            "type": "string"
+                        },
+                        "minItems": 1
+                    }
                 }
             },
             "additionalProperties": false

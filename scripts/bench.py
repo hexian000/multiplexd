@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import shutil
@@ -40,6 +41,8 @@ class ScenarioResult:
     total_bits_per_second: float
     sent_bits_per_second: float
     received_bits_per_second: float
+    stddev_bits_per_second: float
+    interval_throughputs: List[float]
     duration_seconds: float
 
 
@@ -172,7 +175,15 @@ def compute_process_shutdown_budget(
     )
 
 
-def build_server_config(*, use_tls: bool) -> Dict[str, object]:
+def build_server_config(*, use_tls: bool, window: Optional[int] = None) -> Dict[str, object]:
+    mux: Dict[str, object] = {
+        "tcp": {
+            "notsent_lowat": 0,
+        }
+    }
+    if window is not None:
+        mux["stream_window"] = window
+        mux["session_window"] = window
     config: Dict[str, object] = {
         "api_listen": "127.0.0.1:9081",
         "mux_listen": "127.0.0.1:8443",
@@ -181,26 +192,27 @@ def build_server_config(*, use_tls: bool) -> Dict[str, object]:
             "claim": "server",
             "listen": {"client": "127.0.0.1:5203"},
         },
-        "mux": {
-            "stream_window": 16777216,
-            "session_window": 16777216,
-            "tcp": {
-                "notsent_lowat": 0,
-            }
-        },
-        "loglevel": 5,
+        "mux": mux,
+        "loglevel": 4,
     }
     if use_tls:
         config["tls"] = {
             "cert": "@server-cert.pem",
             "key": "@server-key.pem",
             "authcerts": ["@client-cert.pem"],
-            "ciphersuites": "TLS_CHACHA20_POLY1305_SHA256",
         }
     return config
 
 
-def build_client_config(*, use_tls: bool, tunnels: int = 2) -> Dict[str, object]:
+def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int] = None) -> Dict[str, object]:
+    mux: Dict[str, object] = {
+        "tcp": {
+            "notsent_lowat": 0,
+        }
+    }
+    if window is not None:
+        mux["stream_window"] = window
+        mux["session_window"] = window
     config: Dict[str, object] = {
         "connect": "127.0.0.1:5201",
         "identity": {
@@ -208,21 +220,14 @@ def build_client_config(*, use_tls: bool, tunnels: int = 2) -> Dict[str, object]
             "mux_connect": ["127.0.0.1:8443"] * tunnels,
             "listen": {"server": "127.0.0.1:5202"},
         },
-        "mux": {
-            "stream_window": 16777216,
-            "session_window": 16777216,
-            "tcp": {
-                "notsent_lowat": 0,
-            }
-        },
-        "loglevel": 5,
+        "mux": mux,
+        "loglevel": 4,
     }
     if use_tls:
         config["tls"] = {
             "cert": "@client-cert.pem",
             "key": "@client-key.pem",
             "authcerts": ["@server-cert.pem"],
-            "ciphersuites": "TLS_CHACHA20_POLY1305_SHA256",
         }
     return config
 
@@ -248,15 +253,16 @@ def prepare_runtime_assets(
         runtime_dir: Path,
         *,
         use_tls: bool,
-        tunnels: int = 2,
+        tunnels: int = 1,
+        window: Optional[int] = None,
 ) -> tuple[Path, Path]:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if use_tls:
         ensure_certificates(binary_path, runtime_dir)
     server_config_path = runtime_dir / "server.json"
     client_config_path = runtime_dir / "client.json"
-    write_config(server_config_path, build_server_config(use_tls=use_tls))
-    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels))
+    write_config(server_config_path, build_server_config(use_tls=use_tls, window=window))
+    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels, window=window))
     return server_config_path, client_config_path
 
 
@@ -470,6 +476,60 @@ def combine_throughput(
     return total, sent, received, seconds
 
 
+def extract_interval_throughputs(report: Dict[str, object]) -> List[float]:
+    """Return per-interval total bits_per_second values from an iperf3 JSON report."""
+    intervals = report.get("intervals", [])
+    if not isinstance(intervals, list):
+        return []
+    values: List[float] = []
+    for interval in intervals:
+        if not isinstance(interval, dict):
+            continue
+        total = 0.0
+        sum_obj = interval.get("sum")
+        if isinstance(sum_obj, dict):
+            bps = sum_obj.get("bits_per_second")
+            if isinstance(bps, (int, float)):
+                total = float(bps)
+        if total == 0.0:
+            streams = interval.get("streams")
+            if isinstance(streams, list):
+                for stream in streams:
+                    if isinstance(stream, dict):
+                        bps = stream.get("bits_per_second")
+                        if isinstance(bps, (int, float)):
+                            total += float(bps)
+        values.append(total)
+    return values
+
+
+def compute_stddev(values: Sequence[float]) -> float:
+    """Return sample standard deviation of the given values."""
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+    return math.sqrt(variance)
+
+
+def compute_combined_stddev(
+        reports: Sequence[Dict[str, object]],
+) -> float:
+    """Compute stddev of per-interval throughput across all reports."""
+    all_intervals = collect_interval_throughputs(reports)
+    return compute_stddev(all_intervals)
+
+
+def collect_interval_throughputs(
+        reports: Sequence[Dict[str, object]],
+) -> List[float]:
+    """Gather per-interval throughput values across all reports."""
+    all_intervals: List[float] = []
+    for report in reports:
+        all_intervals.extend(extract_interval_throughputs(report))
+    return all_intervals
+
+
 def format_bits_per_second(bits_per_second: float) -> str:
     units = (
             ("bit/s", 1.0),
@@ -596,6 +656,7 @@ def render_markdown_report(
         netem_delay: Optional[str],
     use_tls: bool,
     tunnels: int,
+    window: Optional[int],
     command_timeout_seconds: float,
     shutdown_budget: ProcessShutdownBudget,
 ) -> str:
@@ -611,6 +672,7 @@ def render_markdown_report(
         "| Parallel streams | %d |" % parallel,
         "| TLS | %s |" % ("on" if use_tls else "off"),
         "| Tunnels | %d |" % tunnels,
+        "| Stream/session window | %s |" % (str(window) if window is not None else "default"),
         "| Netem delay | %s |" % (netem_delay or "off"),
         "| Benchmark timeout | %.1f s per scenario |" % command_timeout_seconds,
         "| Shutdown grace | SIGINT %.1f s, terminate %.1f s |"
@@ -622,8 +684,8 @@ def render_markdown_report(
         "",
         "## Throughput",
         "",
-        "| Scenario | Total Throughput | Sent | Received | Duration | Logs |",
-        "| --- | ---: | ---: | ---: | ---: | --- |",
+        "| Scenario | Total Throughput | Sent | Received | StdDev | Duration | Logs |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for result in results:
         log_parts: List[str] = []
@@ -649,12 +711,13 @@ def render_markdown_report(
             )
         log_text = ", ".join(log_parts)
         lines.append(
-            "| %s | %s | %s | %s | %.2f s | %s |"
+            "| %s | %s | %s | %s | %s | %.2f s | %s |"
             % (
                 result.scenario.label,
                 format_bits_per_second(result.total_bits_per_second),
                 format_bits_per_second(result.sent_bits_per_second),
                 format_bits_per_second(result.received_bits_per_second),
+                format_bits_per_second(result.stddev_bits_per_second),
                 result.duration_seconds,
                 log_text,
             )
@@ -663,6 +726,19 @@ def render_markdown_report(
     for result in results:
         lines.append("- %s: `%s`" %
                      (result.scenario.label, " ; ".join(result.command_texts)))
+
+    lines.extend(["", "## Per-Second Throughput", ""])
+    for result in results:
+        lines.append("### %s" % result.scenario.label)
+        lines.append("")
+        if not result.interval_throughputs:
+            lines.append("*(no interval data)*")
+        else:
+            lines.append("| Second | Throughput |")
+            lines.append("| ---: | ---: |")
+            for index, bps in enumerate(result.interval_throughputs, start=1):
+                lines.append("| %d | %s |" % (index, format_bits_per_second(bps)))
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -680,10 +756,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Markdown output path (default: build/bench.md)",
     )
     parser.add_argument(
+        "-t",
         "--duration",
         type=int,
-        default=30,
-        help="iperf3 test duration in seconds (default: 30)",
+        default=10,
+        help="iperf3 test duration in seconds (default: 10)",
     )
     parser.add_argument(
         "--parallel",
@@ -698,15 +775,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="seconds to wait after starting services before running iperf3",
     )
     parser.add_argument(
-        "--tls",
-        action="store_true",
-        help="enable TLS for the mux transport (default: off)",
+        "--no-tls",
+        action="store_false",
+        default=True,
+        dest="tls",
+        help="disable TLS for the mux transport (default: on)",
     )
     parser.add_argument(
         "--tunnels",
         type=int,
-        default=2,
-        help="number of parallel mux tunnels (default: 2)",
+        default=1,
+        help="number of parallel mux tunnels (default: 1)",
+    )
+    parser.add_argument(
+        "-w",
+        "--window",
+        type=int,
+        help="set both stream_window and session_window (default: omit from config)",
     )
     parser.add_argument(
         "--netem-delay",
@@ -738,6 +823,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         build_dir,
         use_tls=args.tls,
         tunnels=args.tunnels,
+        window=args.window,
     )
     configure_netem(args.netem_delay)
     command_timeout_seconds = compute_command_timeout_seconds(
@@ -833,6 +919,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ]
             total, sent, received, seconds = combine_throughput(
                 reports, scenario)
+            stddev = compute_combined_stddev(reports)
+            intervals = collect_interval_throughputs(reports)
             results.append(
                 ScenarioResult(
                     scenario=scenario,
@@ -843,6 +931,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     total_bits_per_second=total,
                     sent_bits_per_second=sent,
                     received_bits_per_second=received,
+                    stddev_bits_per_second=stddev,
+                    interval_throughputs=intervals,
                     duration_seconds=seconds,
                 )
             )
@@ -878,6 +968,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         netem_delay=args.netem_delay,
         use_tls=args.tls,
         tunnels=args.tunnels,
+        window=args.window,
         command_timeout_seconds=command_timeout_seconds,
         shutdown_budget=shutdown_budget,
     )

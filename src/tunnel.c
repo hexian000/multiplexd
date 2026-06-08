@@ -5,6 +5,9 @@
 
 #include "mux/mux.h"
 #include "server.h"
+#if WITH_TLS
+#include "tlsutil.h"
+#endif
 #include "util.h"
 
 #include "algo/hashtable.h"
@@ -115,6 +118,12 @@ struct tunnel {
 	char *identity;
 	char *peer_id;
 	char *peer_identity;
+#if WITH_TLS
+	/* Peer's X.509 certificate in DER format, extracted after TLS
+	 * handshake completes.  Owned; NULL when TLS is not in use. */
+	unsigned char *peer_cert_der;
+	size_t peer_cert_der_len;
+#endif
 	/* Session log tag: "my <= peer" or "my => peer". Owned buffer. */
 	char tag[256];
 	/* Socket options cached at creation; updated on reload. */
@@ -444,6 +453,24 @@ static void handle_connected(
 	if (peer_id != NULL && t->peer_identity == NULL) {
 		LOGOOM();
 	}
+
+#if WITH_TLS
+	/* Extract the peer's certificate DER for post-handshake identity
+	 * validation.  The TLS connection is accessed on the tunnel thread
+	 * where it is safe to read. */
+	free(t->peer_cert_der);
+	t->peer_cert_der = NULL;
+	t->peer_cert_der_len = 0;
+	{
+		struct tls_connection *const tlsconn = mux_tls_conn(ss);
+		if (tlsconn != NULL) {
+			(void)tls_peer_cert_der(
+				tlsconn, &t->peer_cert_der,
+				&t->peer_cert_der_len);
+		}
+	}
+#endif
+
 	if (t->accepted) {
 		if (peer_id == NULL) {
 			return;
@@ -871,6 +898,9 @@ void tunnel_close(struct tunnel *t)
 	free(t->identity);
 	free(t->peer_id);
 	free(t->peer_identity);
+#if WITH_TLS
+	free(t->peer_cert_der);
+#endif
 	free(t);
 }
 
@@ -938,6 +968,16 @@ const char *tunnel_peer_identity(const struct tunnel *t)
 {
 	return t->peer_identity;
 }
+
+#if WITH_TLS
+const unsigned char *tunnel_peer_cert_der(const struct tunnel *t, size_t *len)
+{
+	if (len != NULL) {
+		*len = t->peer_cert_der_len;
+	}
+	return t->peer_cert_der;
+}
+#endif
 
 const struct sockaddr *tunnel_peer_addr(const struct tunnel *t)
 {

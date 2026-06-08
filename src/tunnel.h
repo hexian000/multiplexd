@@ -11,6 +11,9 @@
 
 #include "mux/mux.h"
 #include "util.h"
+#if WITH_TLS
+#include "tlsutil.h"
+#endif
 
 #include <ev.h>
 #include <stdbool.h>
@@ -102,6 +105,9 @@ enum mux_state tunnel_state(const struct tunnel *t);
 struct mux_session *tunnel_session(const struct tunnel *t);
 const char *tunnel_peer_id(const struct tunnel *t);
 const char *tunnel_peer_identity(const struct tunnel *t);
+#if WITH_TLS
+const unsigned char *tunnel_peer_cert_der(const struct tunnel *t, size_t *len);
+#endif
 const struct sockaddr *tunnel_peer_addr(const struct tunnel *t);
 bool tunnel_is_accepted(const struct tunnel *t);
 const unsigned char *tunnel_session_id(const struct tunnel *t);

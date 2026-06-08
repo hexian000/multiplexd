@@ -69,6 +69,40 @@ make_session(struct frame_pool_ctx *restrict pool_ctx, const int fd)
 	return ss;
 }
 
+/* Build a minimal 8-byte control frame header in frame->data so tests can
+ * pass a complete, well-formed frame to wire_sendbuf_push. */
+static void make_ctrl_frame(
+	struct mux_frame *restrict frame, const uint_least16_t stream_id)
+{
+	frame->pos = 0;
+	frame->len = MUX_FRAME_HEADER_SIZE;
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_ACK,
+		.length = 0,
+		.stream_id = stream_id,
+		.extra = 0,
+	};
+	mux_write_header(frame->data, &hdr);
+}
+
+/* Build a PUSH frame with a given payload length (payload bytes are zeroed). */
+static void
+make_push_frame(struct mux_frame *restrict frame, const size_t payload_len)
+{
+	frame->pos = 0;
+	frame->len = MUX_FRAME_HEADER_SIZE + payload_len;
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_PUSH,
+		.length = (uint_least16_t)payload_len,
+		.stream_id = 2,
+		.extra = 0,
+	};
+	mux_write_header(frame->data, &hdr);
+	memset(frame->data + MUX_FRAME_HEADER_SIZE, 0, payload_len);
+}
+
 T_DECLARE_CASE(test_wire_send_plain_tcp_writes_bytes)
 {
 	int fds[2];
@@ -625,6 +659,193 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 
 #endif /* WITH_TLS */
 
+/* Small control frame (8 B) is memcpy-packed into a new staging entry;
+ * the original frame is returned to the pool. */
+T_DECLARE_CASE(test_sendbuf_push_small_frame_packs_into_staging)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+
+	struct mux_frame *f = mux_frame_get(&ss.pool);
+	T_CHECK(f != NULL);
+	make_ctrl_frame(f, 1);
+
+	wire_sendbuf_push(&ss, f);
+
+	/* One staging entry was created; original frame freed. */
+	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
+	T_EXPECT(ss.wire.sendbuf_staging);
+	T_EXPECT_EQ(ss.wire.sendbuf.tail->len, (size_t)MUX_FRAME_HEADER_SIZE);
+	/* pool: 2 allocs (f + staging), 1 free (original f) */
+	T_EXPECT_EQ(pool_ctx.alloc_calls, 2);
+	T_EXPECT_EQ(pool_ctx.free_calls, 1);
+
+	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+}
+
+/* A second small frame is memcpy-appended to the existing staging entry
+ * without allocating a new frame. */
+T_DECLARE_CASE(test_sendbuf_push_second_small_frame_packs_into_existing_staging)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+
+	struct mux_frame *f1 = mux_frame_get(&ss.pool);
+	struct mux_frame *f2 = mux_frame_get(&ss.pool);
+	T_CHECK(f1 != NULL && f2 != NULL);
+	make_ctrl_frame(f1, 1);
+	make_ctrl_frame(f2, 2);
+
+	wire_sendbuf_push(&ss, f1);
+	wire_sendbuf_push(&ss, f2);
+
+	/* Still one sendbuf entry (both headers packed into the staging frame). */
+	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
+	T_EXPECT(ss.wire.sendbuf_staging);
+	T_EXPECT_EQ(
+		ss.wire.sendbuf.tail->len, (size_t)(2 * MUX_FRAME_HEADER_SIZE));
+	/* pool: 3 allocs (f1 + f2 + staging), 2 frees (f1 + f2) */
+	T_EXPECT_EQ(pool_ctx.alloc_calls, 3);
+	T_EXPECT_EQ(pool_ctx.free_calls, 2);
+
+	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+}
+
+/* A large frame (> MUX_CORK_APPEND_MAX) is appended by reference;
+ * the frame pointer is preserved and no staging entry is created. */
+T_DECLARE_CASE(test_sendbuf_push_large_frame_goes_by_reference)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+
+	struct mux_frame *f = mux_frame_get(&ss.pool);
+	T_CHECK(f != NULL);
+	/* payload = MUX_CORK_APPEND_MAX bytes, so total = header + threshold */
+	make_push_frame(f, MUX_CORK_APPEND_MAX);
+
+	wire_sendbuf_push(&ss, f);
+
+	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
+	T_EXPECT(!ss.wire.sendbuf_staging);
+	/* Frame is in sendbuf by reference — no alloc, no free beyond original f. */
+	T_EXPECT(ss.wire.sendbuf.head == f);
+	T_EXPECT_EQ(pool_ctx.free_calls, 0);
+
+	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+}
+
+/* A large frame following a staging entry produces a second sendbuf entry
+ * (count == 2) and sendbuf_staging is cleared. */
+T_DECLARE_CASE(test_sendbuf_push_large_after_staging_adds_second_entry)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+
+	struct mux_frame *small = mux_frame_get(&ss.pool);
+	struct mux_frame *large = mux_frame_get(&ss.pool);
+	T_CHECK(small != NULL && large != NULL);
+	make_ctrl_frame(small, 1);
+	make_push_frame(large, MUX_CORK_APPEND_MAX);
+
+	wire_sendbuf_push(&ss, small); /* creates staging entry */
+	wire_sendbuf_push(&ss, large); /* by-reference; count -> 2 */
+
+	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)2);
+	/* sendbuf_staging is cleared because the tail is now a large ref entry. */
+	T_EXPECT(!ss.wire.sendbuf_staging);
+	T_EXPECT(ss.wire.sendbuf.tail == large);
+
+	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+}
+
+/* A retransmit copy is always appended by reference even when it fits within
+ * MUX_CORK_APPEND_MAX, so session_track_sent can match it by pointer. */
+T_DECLARE_CASE(test_sendbuf_push_retransmit_copy_goes_by_reference)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+
+	struct mux_frame *f = mux_frame_get(&ss.pool);
+	T_CHECK(f != NULL);
+	make_ctrl_frame(f, 1); /* 8 bytes — fits in staging threshold */
+	ss.retransmit_copy = f; /* mark as retransmit copy */
+
+	wire_sendbuf_push(&ss, f);
+
+	/* Retransmit copy must be by-reference. */
+	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
+	T_EXPECT(!ss.wire.sendbuf_staging);
+	T_EXPECT(ss.wire.sendbuf.head == f);
+	T_EXPECT_EQ(pool_ctx.free_calls, 0);
+
+	ss.retransmit_copy = NULL;
+	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+}
+
+/* wire_discard_buffers frees sendbuf frames (including staging) and resets
+ * sendbuf_staging. */
+T_DECLARE_CASE(test_sendbuf_discard_clears_staging)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+	ss.wire.recvbuf = ringbuf_new(32);
+	T_CHECK(ss.wire.recvbuf != NULL);
+
+	/* Put one staging entry (contains two packed small frames). */
+	struct mux_frame *f1 = mux_frame_get(&ss.pool);
+	struct mux_frame *f2 = mux_frame_get(&ss.pool);
+	T_CHECK(f1 != NULL && f2 != NULL);
+	make_ctrl_frame(f1, 1);
+	make_ctrl_frame(f2, 2);
+	wire_sendbuf_push(&ss, f1);
+	wire_sendbuf_push(&ss, f2);
+	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
+
+	wire_discard_buffers(&ss);
+
+	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)0);
+	T_EXPECT(ss.wire.sendbuf.head == NULL);
+	T_EXPECT(!ss.wire.sendbuf_staging);
+	/* pool: 3 allocs (f1 + f2 + staging), 3 frees (f1 + f2 freed at push, staging freed at discard) */
+	T_EXPECT_EQ(pool_ctx.free_calls, 3);
+
+	ringbuf_free(ss.wire.recvbuf);
+}
+
+/* wire_sendbuf_push on a small frame that exactly fills a staging entry up to
+ * MUX_FRAME_SIZE leaves room == 0, so the next small frame starts a new entry. */
+T_DECLARE_CASE(test_sendbuf_push_staging_full_starts_new_entry)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+
+	/* Create a staging entry and fill it artificially. */
+	struct mux_frame *seed = mux_frame_get(&ss.pool);
+	T_CHECK(seed != NULL);
+	make_ctrl_frame(seed, 1);
+	wire_sendbuf_push(&ss, seed); /* staging created; seed freed */
+	ss.wire.sendbuf.tail->len = MUX_FRAME_SIZE; /* fill it to capacity */
+
+	pool_ctx.alloc_calls = 0;
+	pool_ctx.free_calls = 0;
+
+	/* Now append a small frame — staging is full, so a new entry must be created. */
+	struct mux_frame *f2 = mux_frame_get(&ss.pool);
+	T_CHECK(f2 != NULL);
+	make_ctrl_frame(f2, 2);
+	wire_sendbuf_push(&ss, f2);
+
+	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)2);
+	/* A new staging entry was created for f2. */
+	T_EXPECT(ss.wire.sendbuf_staging);
+	T_EXPECT_EQ(ss.wire.sendbuf.tail->len, (size_t)MUX_FRAME_HEADER_SIZE);
+	/* pool: 2 allocs (f2 + new staging), 1 free (f2) */
+	T_EXPECT_EQ(pool_ctx.alloc_calls, 2);
+	T_EXPECT_EQ(pool_ctx.free_calls, 1);
+
+	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -636,6 +857,15 @@ int main(void)
 	T_RUN_CASE(t, test_wire_discard_buffers_frees_all_pending_frames);
 	T_RUN_CASE(t, test_wire_shutdown_plain_tcp_returns_done);
 	T_RUN_CASE(t, test_wire_wait_eof_returns_true_on_clean_peer_close);
+	T_RUN_CASE(t, test_sendbuf_push_small_frame_packs_into_staging);
+	T_RUN_CASE(
+		t,
+		test_sendbuf_push_second_small_frame_packs_into_existing_staging);
+	T_RUN_CASE(t, test_sendbuf_push_large_frame_goes_by_reference);
+	T_RUN_CASE(t, test_sendbuf_push_large_after_staging_adds_second_entry);
+	T_RUN_CASE(t, test_sendbuf_push_retransmit_copy_goes_by_reference);
+	T_RUN_CASE(t, test_sendbuf_discard_clears_staging);
+	T_RUN_CASE(t, test_sendbuf_push_staging_full_starts_new_entry);
 #if WITH_TLS
 	T_RUN_CASE(t, test_wire_set_tlsctx_updates_and_noop);
 	T_RUN_CASE(t, test_wire_tls_start_noop_when_no_context);

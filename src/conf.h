@@ -26,6 +26,24 @@ struct identity_peer {
 	char *listen;
 };
 
+/* Per-identity authorized certificate entry.
+ *
+ * PEM strings in certs[] are staging fields populated by conf_load and
+ * consumed/discarded by conf_inline_pem.  After conf_inline_pem, only
+ * certs_der[] / certs_der_len[] contain the final DER data. */
+struct conf_identity_authcert {
+	/* Peer identity string (owned). */
+	char *peer;
+	/* Staging: PEM certificate strings (owned; NULLed by conf_inline_pem). */
+	char **certs;
+	/* DER-encoded certificates (owned; populated by conf_inline_pem). */
+	unsigned char **certs_der;
+	/* Length of each DER entry in certs_der[]. */
+	size_t *certs_der_len;
+	/* Number of entries (same for certs[] and certs_der[]). */
+	size_t certs_count;
+};
+
 /* Mirrors the JSON "identity" object. */
 struct conf_identity {
 	char *claim;
@@ -34,6 +52,9 @@ struct conf_identity {
 	/* identity.listen entries, keyed by peer id. */
 	struct identity_peer *peers;
 	size_t peers_count;
+	/* identity.authcerts entries, keyed by peer identity. */
+	struct conf_identity_authcert *authcerts;
+	size_t authcerts_count;
 };
 
 struct config {
@@ -49,8 +70,13 @@ struct config {
 	char *tls_cert;
 	char *tls_key;
 	char *tls_ciphersuites;
+	/* Staging: per-entry PEM strings (owned; NULLed by conf_inline_pem). */
 	char **tls_authcerts;
 	size_t tls_authcerts_count;
+	/* Final concatenated PEM bundle of all trusted certificates (owned).
+	 * Built by conf_inline_pem from tls_authcerts[] + identity.authcerts.
+	 * NULL when no certificates are configured. */
+	char *tls_authcerts_bundle;
 #endif
 
 	/* Mux session parameters; window fields in frame units. */

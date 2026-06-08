@@ -251,6 +251,49 @@ static void session_on_connected(
 	SESSION_EVLOGF(srv, t, "session %s (setup: %s)", verb, lat_str);
 }
 
+#if WITH_TLS
+/**
+ * @brief Check whether the peer's TLS certificate matches the configured
+ * certificate set for the claimed identity.
+ *
+ * Uses pre-computed DER from conf_identity_authcert.certs_der.
+ */
+static bool server_check_identity_authcerts(
+	const struct config *restrict conf, const char *restrict peer_identity,
+	const unsigned char *restrict peer_cert_der, size_t peer_cert_der_len)
+{
+	/* No per-identity restriction configured. */
+	if (conf->identity.authcerts_count == 0) {
+		return true;
+	}
+	if (peer_identity == NULL || peer_cert_der == NULL ||
+	    peer_cert_der_len == 0) {
+		return false;
+	}
+	/* Find the authcert entry for the claimed identity. */
+	const struct conf_identity_authcert *ac = NULL;
+	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
+		if (strcmp(conf->identity.authcerts[i].peer, peer_identity) ==
+		    0) {
+			ac = &conf->identity.authcerts[i];
+			break;
+		}
+	}
+	if (ac == NULL) {
+		return false;
+	}
+	/* Compare peer's DER cert against pre-computed DER. */
+	for (size_t i = 0; i < ac->certs_count; i++) {
+		if (ac->certs_der_len[i] == peer_cert_der_len &&
+		    memcmp(ac->certs_der[i], peer_cert_der,
+			   peer_cert_der_len) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+#endif /* WITH_TLS */
+
 static void server_on_established(
 	void *data, struct tunnel *restrict t, const intmax_t lat_ns)
 {
@@ -259,6 +302,29 @@ static void server_on_established(
 	LOGN_F("[fd:%d] %s session established", tunnel_fd(t),
 	       is_server ? "server" : "client");
 	session_on_connected(srv, t, "established", lat_ns);
+
+#if WITH_TLS
+	/* Identity-specific certificate enforcement.
+	 * The TLS handshake accepted the peer's certificate from the union
+	 * of all trusted certs.  Now verify that the presented certificate
+	 * matches the certificate set configured for the claimed identity. */
+	{
+		size_t cert_der_len = 0;
+		const unsigned char *cert_der =
+			tunnel_peer_cert_der(t, &cert_der_len);
+		if (!server_check_identity_authcerts(
+			    srv->conf, tunnel_peer_identity(t), cert_der,
+			    cert_der_len)) {
+			SESSION_EVLOG(
+				srv, t,
+				"identity not authorized by"
+				" identity.authcerts, closing");
+			tunnel_close(t);
+			return;
+		}
+	}
+#endif /* WITH_TLS */
+
 	if (!is_server) {
 		/* Clear the identity_tunnels staging slot (set during server_start
 		 * before the handshake completed) so tunnel_iter does not count
@@ -758,11 +824,18 @@ static bool server_reload_make_tls(
 	if (new_conf->tls_cert == NULL || new_conf->tls_key == NULL) {
 		return true;
 	}
+#if WITH_TLS
+	char *authcerts_arr[1] = { new_conf->tls_authcerts_bundle };
+	const size_t authcerts_count =
+		new_conf->tls_authcerts_bundle != NULL ? 1 : 0;
+#else
+	char **authcerts_arr = NULL;
+	const size_t authcerts_count = 0;
+#endif
 	if (new_conf->mux_listen != NULL) {
 		*out_server = tls_ctx_server(
-			new_conf->tls_cert, new_conf->tls_key,
-			new_conf->tls_authcerts, new_conf->tls_authcerts_count,
-			new_conf->tls_ciphersuites);
+			new_conf->tls_cert, new_conf->tls_key, authcerts_arr,
+			authcerts_count, new_conf->tls_ciphersuites);
 		if (*out_server == NULL) {
 			LOGE("failed to create server TLS context"
 			     " during reload");
@@ -772,9 +845,8 @@ static bool server_reload_make_tls(
 	if (new_conf->mux_connect != NULL ||
 	    new_conf->identity.mux_connect_count > 0) {
 		*out_client = tls_ctx_client(
-			new_conf->tls_cert, new_conf->tls_key,
-			new_conf->tls_authcerts, new_conf->tls_authcerts_count,
-			new_conf->tls_ciphersuites);
+			new_conf->tls_cert, new_conf->tls_key, authcerts_arr,
+			authcerts_count, new_conf->tls_ciphersuites);
 		if (*out_client == NULL) {
 			LOGE("failed to create client TLS context"
 			     " during reload");
@@ -1521,11 +1593,13 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 
 #if WITH_TLS
 	if (conf->tls_cert != NULL && conf->tls_key != NULL) {
+		char *authcerts_arr[1] = { conf->tls_authcerts_bundle };
+		const size_t authcerts_count =
+			conf->tls_authcerts_bundle != NULL ? 1 : 0;
 		if (conf->mux_listen != NULL) {
 			srv->server_tlsctx = tls_ctx_server(
-				conf->tls_cert, conf->tls_key,
-				conf->tls_authcerts, conf->tls_authcerts_count,
-				conf->tls_ciphersuites);
+				conf->tls_cert, conf->tls_key, authcerts_arr,
+				authcerts_count, conf->tls_ciphersuites);
 			if (srv->server_tlsctx == NULL) {
 				LOGE("failed to create server TLS context");
 				server_free(srv);
@@ -1536,9 +1610,8 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 			(conf->identity.mux_connect_count > 0);
 		if (conf->mux_connect != NULL || has_identity_connect) {
 			srv->client_tlsctx = tls_ctx_client(
-				conf->tls_cert, conf->tls_key,
-				conf->tls_authcerts, conf->tls_authcerts_count,
-				conf->tls_ciphersuites);
+				conf->tls_cert, conf->tls_key, authcerts_arr,
+				authcerts_count, conf->tls_ciphersuites);
 			if (srv->client_tlsctx == NULL) {
 				LOGE("failed to create client TLS context");
 				server_free(srv);
@@ -1547,7 +1620,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 		}
 		server_cleanse_tls_config(conf);
 	}
-#endif
+#endif /* WITH_TLS */
 
 	ev_signal_init(&srv->w_sighup, signal_cb, SIGHUP);
 	srv->w_sighup.data = srv;

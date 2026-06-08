@@ -11,6 +11,7 @@
 #include "conf_schema.gen.h"
 #include "mux/mux.h"
 
+#include "codec/base64.h"
 #include "codec/json.h"
 #include "net/mime.h"
 #include "utils/buffer.h"
@@ -132,6 +133,113 @@ static bool identity_listen_cb(
 		LOGOOM();
 		return false;
 	}
+	return true;
+}
+
+static struct conf_identity_authcert *identity_authcert_upsert(
+	struct config *restrict conf, const char *restrict id, size_t id_len)
+{
+	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
+		if (strcmp(conf->identity.authcerts[i].peer, id) == 0) {
+			return &conf->identity.authcerts[i];
+		}
+	}
+	const size_t n = conf->identity.authcerts_count;
+	if (n >= SIZE_MAX / sizeof(*conf->identity.authcerts)) {
+		LOGOOM();
+		return NULL;
+	}
+	struct conf_identity_authcert *restrict entries =
+		realloc(conf->identity.authcerts,
+			(n + 1) * sizeof(*conf->identity.authcerts));
+	if (entries == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	conf->identity.authcerts = entries;
+	entries[n] = (struct conf_identity_authcert){
+		.peer = strndup(id, id_len),
+		.certs = NULL,
+		.certs_count = 0,
+	};
+	if (entries[n].peer == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	conf->identity.authcerts_count = n + 1;
+	return &entries[n];
+}
+
+/* Callback for parsing a single identity.authcerts entry value (JSON array of
+ * certificate strings).  val points to the raw JSON text of the array. */
+static bool identity_authcert_cb(
+	struct config *restrict conf, const char *restrict key, size_t key_len,
+	char *restrict val, size_t val_len)
+{
+	if (key[0] == '-') {
+		return true;
+	}
+	size_t consumed = val_len;
+	struct json_val v = json_parse(val, &consumed);
+	if (v.type != JSON_ARRAY) {
+		LOGE_F("identity.authcerts.%s: must be an array", key);
+		return false;
+	}
+	while (consumed < val_len) {
+		if (!json_iswhitespace((unsigned char)val[consumed])) {
+			break;
+		}
+		consumed++;
+	}
+	if (consumed != val_len) {
+		LOGE_F("identity.authcerts.%s: unexpected trailing content",
+		       key);
+		return false;
+	}
+
+	struct conf_identity_authcert *restrict ac =
+		identity_authcert_upsert(conf, key, key_len);
+	if (ac == NULL) {
+		return false;
+	}
+
+	/* Free any previously-parsed certs (upsert may replace existing). */
+	for (size_t i = 0; i < ac->certs_count; i++) {
+		free(ac->certs[i]);
+	}
+	free(ac->certs);
+	ac->certs = NULL;
+	ac->certs_count = 0;
+
+	/* Parse each string element in the array. */
+	json_iter it = v.iter;
+	char *elem;
+	size_t elem_len;
+	size_t count = 0;
+	while (json_arr_next(val, &val_len, &it, &elem, &elem_len)) {
+		char *cert_str;
+		size_t cert_len;
+		if (!json_parse_string(elem, elem_len, &cert_str, &cert_len)) {
+			LOGE_F("identity.authcerts.%s[%zu]:"
+			       " must be a string",
+			       key, count);
+			return false;
+		}
+		char **new_certs =
+			realloc(ac->certs, (count + 1) * sizeof(*ac->certs));
+		if (new_certs == NULL) {
+			LOGOOM();
+			return false;
+		}
+		ac->certs = new_certs;
+		ac->certs[count] = strndup(cert_str, cert_len);
+		if (ac->certs[count] == NULL) {
+			LOGOOM();
+			return false;
+		}
+		count++;
+	}
+	ac->certs_count = count;
 	return true;
 }
 
@@ -328,6 +436,36 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		}
 	}
 
+	/* identity.authcerts: raw JSON fragment → conf_identity_authcert[] */
+	if (obj->identity.authcerts_json.str != NULL) {
+		struct json_val parsed = json_parse(
+			obj->identity.authcerts_json.str,
+			&(size_t){ obj->identity.authcerts_json.len });
+		if (parsed.type != JSON_OBJECT) {
+			LOGE("identity.authcerts: must be an object");
+			return false;
+		}
+		json_iter it = parsed.iter;
+		char *key;
+		size_t key_len;
+		char *val;
+		size_t val_len;
+		while (json_obj_next(
+			obj->identity.authcerts_json.str,
+			&obj->identity.authcerts_json.len, &it, &key, &key_len,
+			&val, &val_len)) {
+			if (!identity_authcert_cb(
+				    cfg, key, key_len, val, val_len)) {
+				return false;
+			}
+		}
+		if (it != obj->identity.authcerts_json.len) {
+			LOGE("identity.authcerts: unexpected trailing content"
+			     " after object");
+			return false;
+		}
+	}
+
 	return true;
 }
 
@@ -397,24 +535,16 @@ static bool conf_check(struct config *restrict conf)
 #if WITH_TLS
 	const bool has_cert = (conf->tls_cert != NULL);
 	const bool has_key = (conf->tls_key != NULL);
-	const bool has_authcerts = (conf->tls_authcerts_count > 0);
+	const bool has_authcerts =
+		(conf->tls_authcerts_count > 0 ||
+		 conf->identity.authcerts_count > 0);
 
 	if (has_cert && has_key && has_authcerts) {
 		/* all three set: secure mode */
 	} else if (!has_cert && !has_key && !has_authcerts) {
-		LOGW("running in plaintext mode: connection is NOT encrypted\n"
-		     "  configure tls.cert, tls.key, and tls.authcerts for secure communication");
+		LOGW("running in plaintext mode: connection is NOT encrypted");
 	} else {
-		LOGE("incomplete TLS configuration:");
-		if (!has_cert) {
-			LOGE("  missing: tls.cert");
-		}
-		if (!has_key) {
-			LOGE("  missing: tls.key");
-		}
-		if (!has_authcerts) {
-			LOGE("  missing: tls.authcerts");
-		}
+		LOGE("incomplete TLS configuration");
 		return false;
 	}
 #endif
@@ -461,6 +591,19 @@ static bool conf_check(struct config *restrict conf)
 			}
 		}
 	}
+	/* Validate identity authcerts: no duplicate peer identities. */
+	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
+		for (size_t j = i + 1; j < conf->identity.authcerts_count;
+		     j++) {
+			if (strcmp(conf->identity.authcerts[i].peer,
+				   conf->identity.authcerts[j].peer) == 0) {
+				LOGE_F("duplicate identity.authcerts"
+				       " peer: \"%s\"",
+				       conf->identity.authcerts[i].peer);
+				return false;
+			}
+		}
+	}
 	/* Require identity.claim when identity entries are configured. */
 	if ((conf->identity.mux_connect_count > 0 ||
 	     conf->identity.peers_count > 0) &&
@@ -468,6 +611,11 @@ static bool conf_check(struct config *restrict conf)
 		LOGE("identity.claim is required when identity.mux_connect or"
 		     " identity.listen are configured");
 		return false;
+	}
+	if (conf->identity.authcerts_count > 0 &&
+	    conf->identity.claim == NULL) {
+		LOGW("identity.claim is recommended when"
+		     " identity.authcerts is configured");
 	}
 	return true;
 }
@@ -654,6 +802,91 @@ static struct vbuffer *build_listen_json(const struct config *restrict conf)
 	return vbuf;
 }
 
+/* Build a vbuffer containing the JSON object for identity.authcerts.
+ * Returns NULL when no per-identity authcerts are configured or on OOM. */
+static struct vbuffer *build_authcerts_json(const struct config *restrict conf)
+{
+	struct vbuffer *vbuf = VBUF_NEW(64);
+	if (vbuf == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	VBUF_APPEND(vbuf, "{", 1);
+	bool first = true;
+	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
+		const struct conf_identity_authcert *restrict ac =
+			&conf->identity.authcerts[i];
+		if (ac->certs_count == 0) {
+			continue;
+		}
+		if (!first) {
+			VBUF_APPEND(vbuf, ",", 1);
+		}
+		/* Marshal the key (peer identity string). */
+		const size_t id_len = strlen(ac->peer);
+		const int r_id = json_marshal_string(NULL, 0, ac->peer, id_len);
+		if (r_id < 0) {
+			VBUF_FREE(vbuf);
+			return NULL;
+		}
+		/* Compute the total size needed for the array of cert
+		 * strings: "[" + marshalled_certs + "]". */
+		size_t arr_len = 1; /* '[' */
+		for (size_t j = 0; j < ac->certs_count; j++) {
+			if (j > 0) {
+				arr_len++; /* ',' */
+			}
+			const int r_cert = json_marshal_string(
+				NULL, 0, ac->certs[j], strlen(ac->certs[j]));
+			if (r_cert < 0) {
+				VBUF_FREE(vbuf);
+				return NULL;
+			}
+			arr_len += (size_t)r_cert;
+		}
+		arr_len++; /* ']' */
+
+		const size_t need = (size_t)r_id + 1u + arr_len;
+		vbuf = vbuf_grow(vbuf, vbuf->len + need);
+		if (vbuf->cap < vbuf->len + need) {
+			VBUF_FREE(vbuf);
+			LOGOOM();
+			return NULL;
+		}
+		char *wp = (char *)vbuf->data + vbuf->len;
+		wp += json_marshal_string(
+			wp, (size_t)r_id + 1, ac->peer, id_len);
+		*wp++ = ':';
+		*wp++ = '[';
+		for (size_t j = 0; j < ac->certs_count; j++) {
+			if (j > 0) {
+				*wp++ = ',';
+			}
+			const size_t cert_len = strlen(ac->certs[j]);
+			const int r_cert = json_marshal_string(
+				NULL, 0, ac->certs[j], cert_len);
+			(void)json_marshal_string(
+				wp, (size_t)r_cert + 1, ac->certs[j], cert_len);
+			wp += r_cert;
+		}
+		*wp++ = ']';
+		vbuf->len += need;
+		first = false;
+	}
+	if (first) {
+		VBUF_FREE(vbuf);
+		return NULL;
+	}
+	VBUF_APPEND(vbuf, "}", 1);
+	if (VBUF_HAS_OOM(vbuf)) {
+		VBUF_FREE(vbuf);
+		LOGOOM();
+		return NULL;
+	}
+	vbuf->data[vbuf->len] = '\0';
+	return vbuf;
+}
+
 char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 {
 	struct vbuffer *listen_vbuf = build_listen_json(conf);
@@ -661,12 +894,19 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		listen_vbuf != NULL ? (char *)listen_vbuf->data : NULL;
 	const size_t listen_len = listen_vbuf != NULL ? listen_vbuf->len : 0;
 
+	struct vbuffer *authcerts_vbuf = build_authcerts_json(conf);
+	char *authcerts_json =
+		authcerts_vbuf != NULL ? (char *)authcerts_vbuf->data : NULL;
+	const size_t authcerts_json_len =
+		authcerts_vbuf != NULL ? authcerts_vbuf->len : 0;
+
 	struct json_string *id_mc_arr = NULL;
 	if (conf->identity.mux_connect_count > 0) {
 		id_mc_arr = malloc(
 			conf->identity.mux_connect_count * sizeof(*id_mc_arr));
 		if (id_mc_arr == NULL) {
 			VBUF_FREE(listen_vbuf);
+			VBUF_FREE(authcerts_vbuf);
 			LOGOOM();
 			return NULL;
 		}
@@ -685,6 +925,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		if (authcerts_arr == NULL) {
 			free(id_mc_arr);
 			VBUF_FREE(listen_vbuf);
+			VBUF_FREE(authcerts_vbuf);
 			LOGOOM();
 			return NULL;
 		}
@@ -835,6 +1076,10 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 				.str = listen_json,
 				.len = listen_len,
 			},
+			.authcerts_json = {
+				.str = authcerts_json,
+				.len = authcerts_json_len,
+			},
 		},
 	};
 
@@ -842,6 +1087,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 	const int json_sz = json_marshal_conf(NULL, 0, &raw);
 	if (json_sz <= 0) {
 		VBUF_FREE(listen_vbuf);
+		VBUF_FREE(authcerts_vbuf);
 		free(id_mc_arr);
 #if WITH_TLS
 		free(authcerts_arr);
@@ -852,6 +1098,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 	char *out = malloc((size_t)json_sz + 1);
 	if (out == NULL) {
 		VBUF_FREE(listen_vbuf);
+		VBUF_FREE(authcerts_vbuf);
 		free(id_mc_arr);
 #if WITH_TLS
 		free(authcerts_arr);
@@ -863,6 +1110,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 	out[json_sz] = '\0';
 
 	VBUF_FREE(listen_vbuf);
+	VBUF_FREE(authcerts_vbuf);
 	free(id_mc_arr);
 #if WITH_TLS
 	free(authcerts_arr);
@@ -890,17 +1138,152 @@ static bool inline_field(char **restrict sp, const char *restrict name)
 	return true;
 }
 
+/**
+ * @brief Decode a PEM certificate to DER format.
+ * @param pem  NUL-terminated PEM certificate string.
+ * @param der_len  Output: DER length in bytes.
+ * @return malloc'd DER buffer, or NULL on failure.
+ */
+static unsigned char *pem_cert_to_der(const char *pem, size_t *der_len)
+{
+	if (pem == NULL || der_len == NULL) {
+		return NULL;
+	}
+	const char *begin = strstr(pem, "-----BEGIN CERTIFICATE-----");
+	const char *end = strstr(pem, "-----END CERTIFICATE-----");
+	if (begin == NULL || end == NULL || end <= begin) {
+		return NULL;
+	}
+	begin = strchr(begin, '\n');
+	if (begin == NULL) {
+		return NULL;
+	}
+	begin++; /* skip newline after header */
+	const char *body_end = end;
+	while (body_end > begin &&
+	       (body_end[-1] == '\n' || body_end[-1] == '\r' ||
+		body_end[-1] == ' ' || body_end[-1] == '\t')) {
+		body_end--;
+	}
+	const size_t b64_len = (size_t)(body_end - begin);
+	if (b64_len == 0) {
+		return NULL;
+	}
+	size_t dlen = (b64_len * 3) / 4 + 4;
+	unsigned char *der = malloc(dlen);
+	if (der == NULL) {
+		return NULL;
+	}
+	if (!base64_decode(der, &dlen, (const unsigned char *)begin, b64_len)) {
+		free(der);
+		return NULL;
+	}
+	*der_len = dlen;
+	return der;
+}
+
 bool conf_inline_pem(struct config *conf)
 {
 	if (!inline_field(&conf->tls_cert, "tls.cert") ||
 	    !inline_field(&conf->tls_key, "tls.key")) {
 		return false;
 	}
+
+	/* Inline @path references in both global and per-identity certs. */
 	for (size_t i = 0; i < conf->tls_authcerts_count; i++) {
 		if (!inline_field(&conf->tls_authcerts[i], "tls.authcerts")) {
 			return false;
 		}
 	}
+	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
+		for (size_t j = 0; j < conf->identity.authcerts[i].certs_count;
+		     j++) {
+			if (!inline_field(
+				    &conf->identity.authcerts[i].certs[j],
+				    "identity.authcerts")) {
+				return false;
+			}
+		}
+	}
+
+	/* Build the concatenated PEM bundle from all certs. */
+	{
+		size_t total = 0;
+		for (size_t i = 0; i < conf->tls_authcerts_count; i++) {
+			total += strlen(conf->tls_authcerts[i]) + 1;
+		}
+		for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
+			for (size_t j = 0;
+			     j < conf->identity.authcerts[i].certs_count; j++) {
+				total += strlen(conf->identity.authcerts[i]
+							.certs[j]) +
+					 1;
+			}
+		}
+		char *bundle = NULL;
+		if (total > 0) {
+			bundle = malloc(total + 1);
+			if (bundle == NULL) {
+				LOGOOM();
+				return false;
+			}
+			size_t pos = 0;
+			for (size_t i = 0; i < conf->tls_authcerts_count; i++) {
+				const size_t len =
+					strlen(conf->tls_authcerts[i]);
+				memcpy(bundle + pos, conf->tls_authcerts[i],
+				       len);
+				pos += len;
+				bundle[pos++] = '\n';
+			}
+			for (size_t i = 0; i < conf->identity.authcerts_count;
+			     i++) {
+				for (size_t j = 0;
+				     j <
+				     conf->identity.authcerts[i].certs_count;
+				     j++) {
+					const size_t len = strlen(
+						conf->identity.authcerts[i]
+							.certs[j]);
+					memcpy(bundle + pos,
+					       conf->identity.authcerts[i]
+						       .certs[j],
+					       len);
+					pos += len;
+					bundle[pos++] = '\n';
+				}
+			}
+			bundle[pos] = '\0';
+		}
+		conf->tls_authcerts_bundle = bundle;
+	}
+
+	/* Convert per-identity PEM certs to DER. */
+	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
+		struct conf_identity_authcert *restrict ac =
+			&conf->identity.authcerts[i];
+		const size_t n = ac->certs_count;
+		if (n == 0) {
+			continue;
+		}
+		ac->certs_der = calloc(n, sizeof(*ac->certs_der));
+		ac->certs_der_len = calloc(n, sizeof(*ac->certs_der_len));
+		if (ac->certs_der == NULL || ac->certs_der_len == NULL) {
+			LOGOOM();
+			return false;
+		}
+		for (size_t j = 0; j < n; j++) {
+			ac->certs_der[j] = pem_cert_to_der(
+				ac->certs[j], &ac->certs_der_len[j]);
+			if (ac->certs_der[j] == NULL) {
+				LOGE_F("identity.authcerts.%s[%zu]:"
+				       " invalid PEM certificate",
+				       ac->peer, j);
+				return false;
+			}
+		}
+	}
+
 	return true;
 }
 #endif /* WITH_TLS */
@@ -924,6 +1307,7 @@ void conf_free(struct config *restrict conf)
 		free(conf->tls_authcerts[i]);
 	}
 	free((void *)conf->tls_authcerts);
+	free(conf->tls_authcerts_bundle);
 #endif
 	free(conf->identity.claim);
 	for (size_t i = 0; i < conf->identity.mux_connect_count; i++) {
@@ -935,6 +1319,18 @@ void conf_free(struct config *restrict conf)
 		free(conf->identity.peers[i].listen);
 	}
 	free(conf->identity.peers);
+	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
+		free(conf->identity.authcerts[i].peer);
+		for (size_t j = 0; j < conf->identity.authcerts[i].certs_count;
+		     j++) {
+			free(conf->identity.authcerts[i].certs[j]);
+			free(conf->identity.authcerts[i].certs_der[j]);
+		}
+		free(conf->identity.authcerts[i].certs);
+		free(conf->identity.authcerts[i].certs_der);
+		free(conf->identity.authcerts[i].certs_der_len);
+	}
+	free(conf->identity.authcerts);
 	free(conf);
 }
 

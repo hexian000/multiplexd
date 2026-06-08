@@ -288,7 +288,7 @@ any state; this table is not exhaustive when extensions are in use.
 
 | State               | Defined non-RST flag combinations                              | Notes                                                                                                |
 | ------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| STREAM_INIT         | None                                                           | Pre-SYN active-open state.  Receipt of any non-RST frame is not defined by this document.        |
+| STREAM_INIT         | None                                                           | Pre-SYN active-open state.  Receipt of any non-RST frame is not defined by this document.            |
 | STREAM_SYN_SENT     | SYN\|ACK, SYN\|ACK\|PUSH                                       | Completes stream establishment; PUSH delivers an optional fast-open payload from the passive opener. |
 | STREAM_SYN_RECEIVED | None                                                           | While local stream setup is pending, no additional non-RST frame from the peer is defined.           |
 | STREAM_ESTABLISHED  | ACK, PUSH, ACK\|PUSH, FIN, ACK\|FIN, PUSH\|FIN, ACK\|PUSH\|FIN | Full-duplex transfer.                                                                                |
@@ -475,13 +475,13 @@ following field values, followed immediately by a UTF-8-encoded JSON body:
 
 #### 5.2.2.  Message Fields
 
-| Field      | Type    | Required    | Description                                                                                                |
-| ---------- | ------- | ----------- | ---------------------------------------------------------------------------------------------------------- |
+| Field      | Type    | Required    | Description                                                                                                  |
+| ---------- | ------- | ----------- | ------------------------------------------------------------------------------------------------------------ |
 | type       | string  | Yes         | MIME media type string; see Section 5.2 for the required value (`application/x-multiplexd-proto; version=1`) |
-| msgid      | integer | Yes         | 0 = ClientHello; 1 = ServerHello                                                                           |
-| session_id | string  | Conditional | 24-character Base64-encoded string (RFC 4648) encoding the server-assigned 16-byte shared session identity |
-| resume_seq | integer | No          | Number of the peer's non-stream-0 frames actually processed by this endpoint; see Section 5.7              |
-| extensions | object  | No          | Extension negotiation; values are extension-specific objects; absent means {}                              |
+| msgid      | integer | Yes         | 0 = ClientHello; 1 = ServerHello                                                                             |
+| session_id | string  | Conditional | 24-character Base64-encoded string (RFC 4648) encoding the server-assigned 16-byte shared session identity   |
+| resume_seq | integer | No          | Number of the peer's non-stream-0 frames actually processed by this endpoint; see Section 5.7                |
+| extensions | object  | No          | Extension negotiation; values are extension-specific objects; absent means {}                                |
 
 Additional hello object members are extension points.  Receivers MUST ignore
 unknown members and MUST NOT fail the handshake solely because such members are
@@ -1203,6 +1203,36 @@ TLS 1.3 transport encryption is OPTIONAL.  When enabled:
 When TLS is not in use, the protocol provides no confidentiality,
 authentication, or integrity protection beyond what the underlying network
 provides.
+
+### 10.1.  Identity-Specific Certificate Pinning
+
+Implementations MAY support per-identity certificate sets as a local policy
+enforcement mechanism not visible on the wire.  When enabled:
+
+-  The administrator configures a mapping from peer identity strings to
+   per-identity trusted certificate lists.  Each entry specifies the set of
+   certificates that a peer claiming that identity is permitted to present.
+
+-  At the TLS layer, the TLS context is built from the union of all
+   certificates in the map (together with any global `tls.authcerts` entries,
+   if configured).  This allows any peer whose certificate is in the union to
+   pass the TLS handshake, regardless of which identity it will later claim.
+
+-  After the protocol hello exchange completes and the peer's claimed identity
+   (the `identity` extension, Section 5.2.3.2) is known, the implementation
+   verifies that the claimed identity appears as a key in the per-identity
+   certificate map.  If it does not, the implementation MUST close the
+   connection before any stream operations are permitted.
+
+This mechanism ensures that a compromise of one peer's private key does not
+grant the attacker the ability to impersonate a different peer, because even
+though the attacker's certificate would pass the TLS handshake (it is in the
+union set), the post-handshake identity check would fail — the attacker's
+claimed identity does not correspond to the certificate they presented.
+
+When per-identity certificate sets are configured, implementations SHOULD
+still include a global `tls.authcerts` list for peers that are not listed in
+the identity map, or for sessions where the peer does not claim an identity.
 
 Regardless of transport, implementations MUST enforce:
 

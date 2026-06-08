@@ -8,6 +8,33 @@
 
 #include "mux/session.h"
 
+/* Prebuilt stream-table configuration — always compiled so that
+ * translation units built with MUX_SESSION_TABLE_OPTS_ONLY only need
+ * session.h and these three definitions. */
+static uint_fast32_t stream_id_hash(const void *key, const uint_fast32_t seed)
+{
+	const uint_least16_t id = (uint_least16_t)(uintptr_t)key;
+	uint_fast32_t hash = seed;
+	hash ^= (uint_fast32_t)(id & 0xffu);
+	hash *= (uint_fast32_t)0x01000193u;
+	hash ^= (uint_fast32_t)((id >> 8) & 0xffu);
+	hash *= (uint_fast32_t)0x01000193u;
+	return hash;
+}
+
+static bool stream_id_eq(const void *a, const void *b)
+{
+	return a == b;
+}
+
+const struct table_opts mux_stream_table_opts = {
+	.hash = stream_id_hash,
+	.eq = stream_id_eq,
+	.flags = TABLE_FAST,
+};
+
+#ifndef MUX_SESSION_TABLE_OPTS_ONLY
+
 #include "mux/dispatch.h"
 #include "mux/estimator.h"
 #include "mux/frame.h"
@@ -426,7 +453,12 @@ static bool push_unacked(
 
 /* Keep flushed frames only when resume replay may need them.  Hello frames
  * and stream-0 controls are one-shot, retransmit copies only advance the
- * cursor, and bundled control frames are compacted before tracking. */
+ * cursor, and bundled control frames are compacted before tracking.
+ * This function handles both single-header frames and multi-header staging
+ * frames produced by wire_sendbuf_push: it always walks the full header list
+ * rather than short-circuiting on the first PUSH flag, so that a staging
+ * frame containing a mix of PUSH and non-PUSH sub-frames is counted and
+ * compacted correctly. */
 static void session_track_sent(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
@@ -450,13 +482,10 @@ static void session_track_sent(
 		return;
 	}
 
-	if (hdr.flags & MUX_FLAG_PUSH) {
-		/* One PUSH frame advances one logical session sequence number. */
-		push_unacked(ss, frame, 1);
-		return;
-	}
-
-	/* Strip stream-0 controls and compact the remaining headers in-place. */
+	/* Walk all concatenated headers, strip stream-0 controls, and count
+	 * the remaining entries.  For single-header frames (the common case)
+	 * this loop runs exactly once and produces the same result as before;
+	 * for multi-header staging frames every sub-frame is counted. */
 	unsigned char *dst = frame->data;
 	const unsigned char *src = frame->data;
 	const unsigned char *const end = frame->data + frame->len;
@@ -491,63 +520,10 @@ static void session_track_sent(
 	push_unacked(ss, frame, n);
 }
 
-/* Flush one write attempt for the current sendbuf head frame.
- * Returns true when the transport is still blocked on the current head.
- * On error, session_reset or session_suspend has already been called. */
-static bool
-flush_sendbuf(struct mux_session *restrict ss, bool *restrict made_progress)
-{
-	struct mux_frame *frame = ss->wire.sendbuf.head;
-	if (frame == NULL) {
-		return false;
-	}
-	const size_t remaining = frame->len - frame->pos;
-	ASSERT(remaining > 0);
-
-	size_t nsend = remaining;
-	if (!wire_send(ss, frame->data + frame->pos, &nsend)) {
-		if (ss->handshake.has_session_id &&
-		    (ss->state == SESSION_ESTABLISHED ||
-		     (ss->state == SESSION_HANDSHAKE && !ss->accepted))) {
-			session_suspend(ss);
-		} else {
-			session_reset(ss);
-		}
-		return true;
-	}
-	if (nsend == 0) {
-		return true; /* EAGAIN — transport buffer full */
-	}
-	*made_progress = true;
-
-	/* Only reset the keepalive deadline while the timer is active (i.e.
-	 * state == SESSION_ESTABLISHED).  In other states—HANDSHAKE, CONNECT,
-	 * SUSPENDED—the timer is stopped and must not be restarted here. */
-	if (ev_is_active(&ss->w_keepalive)) {
-		ev_timer_again(ss->loop, &ss->w_keepalive);
-	}
-	COUNTER_ADD(ss->cnt.traffic.byt_mux_sent, (uint_least64_t)nsend);
-	frame->pos += nsend;
-	MUX_LOG_F(
-		VERBOSE, ss, "mux sent %zu bytes (buf: %zu/%zu)", nsend,
-		frame->pos, frame->len);
-
-	if (frame->pos >= frame->len) {
-		struct mux_frame *const popped =
-			mux_frame_list_pop(&ss->wire.sendbuf);
-		ASSERT(popped == frame);
-		(void)popped;
-		session_track_sent(ss, frame);
-		return false;
-	}
-	return true;
-}
-
 bool session_send_push(
 	struct mux_session *ss, struct mux_stream *s, struct mux_frame *frame)
 {
 	ASSERT(frame->len > MUX_FRAME_HEADER_SIZE);
-	ASSERT(ss->wire.sendbuf.head == NULL);
 	const size_t payload_len = frame->len - MUX_FRAME_HEADER_SIZE;
 	const bool send_syn = s->state == STREAM_INIT;
 
@@ -590,7 +566,7 @@ bool session_send_push(
 	frame->pos = 0;
 	frame->len = MUX_FRAME_HEADER_SIZE + payload_len;
 
-	mux_frame_list_push(&ss->wire.sendbuf, frame);
+	wire_sendbuf_push(ss, frame);
 
 	if (payload_len > 0) {
 		s->bytes_sent += payload_len;
@@ -616,20 +592,69 @@ bool session_send_push(
 	return true;
 }
 
-static unsigned char *sendbuf_reserve_ctrl(struct mux_session *restrict ss)
+/* Flush one send attempt for the current sendbuf head entry.
+ * Returns true when the transport is still blocked (EAGAIN, partial write,
+ * or TLS cross-direction stall); false when the head entry was fully sent
+ * and removed from the queue (sendbuf may still have a following entry).
+ * On fatal error session_reset or session_suspend has already been called. */
+static bool flush_sendbuf_head(
+	struct mux_session *restrict ss, bool *restrict made_progress)
 {
-	struct mux_frame *frame = mux_frame_get(&ss->pool);
+	struct mux_frame *frame = ss->wire.sendbuf.head;
 	if (frame == NULL) {
-		return NULL;
+		return false;
 	}
-	frame->pos = 0;
-	frame->len = MUX_FRAME_HEADER_SIZE;
-	mux_frame_list_push(&ss->wire.sendbuf, frame);
-	return frame->data;
+	ASSERT(frame->len > frame->pos);
+	const size_t remaining = frame->len - frame->pos;
+
+	size_t nsend = remaining;
+	if (!wire_send(ss, frame->data + frame->pos, &nsend)) {
+		if (ss->handshake.has_session_id &&
+		    (ss->state == SESSION_ESTABLISHED ||
+		     (ss->state == SESSION_HANDSHAKE && !ss->accepted))) {
+			session_suspend(ss);
+		} else {
+			session_reset(ss);
+		}
+		return true;
+	}
+	if (nsend == 0) {
+		return true; /* EAGAIN — transport buffer full */
+	}
+	*made_progress = true;
+
+	if (ev_is_active(&ss->w_keepalive)) {
+		ev_timer_again(ss->loop, &ss->w_keepalive);
+	}
+	COUNTER_ADD(ss->cnt.traffic.byt_mux_sent, (uint_least64_t)nsend);
+	frame->pos += nsend;
+	MUX_LOG_F(
+		VERBOSE, ss, "mux sent %zu bytes (buf: %zu/%zu)", nsend,
+		frame->pos, frame->len);
+
+	if (frame->pos < frame->len) {
+		return true; /* partial write */
+	}
+
+	/* Entry fully sent: pop from sendbuf head and hand off to the unacked ring.
+	 * Capture the staging identity before the pop because sendbuf.tail changes. */
+	struct mux_frame *const was_staging_tail =
+		ss->wire.sendbuf_staging ? ss->wire.sendbuf.tail : NULL;
+	struct mux_frame *const popped = mux_frame_list_pop(&ss->wire.sendbuf);
+	ASSERT(popped == frame);
+	(void)popped;
+	if (frame == was_staging_tail) {
+		ss->wire.sendbuf_staging = false;
+	}
+	session_track_sent(ss, frame);
+	return false;
 }
 
 /* EV_WRITE interleaves transport flushes with the next highest-priority work:
- * retransmit copy, oob control, queued frame, then freshly scheduled data. */
+ * retransmit copy, oob control, queued frame, then freshly scheduled data.
+ * Small frames are packed into staging entries at sendbuf tail via
+ * wire_sendbuf_push; staging entries accumulate across loop iterations
+ * and are flushed when full or at loop exit. */
 static void send_cb(struct mux_session *restrict ss)
 {
 	ss->wire.tx_pending = false;
@@ -660,45 +685,86 @@ static void send_cb(struct mux_session *restrict ss)
 	bool made_progress = false;
 	bool retransmitting = false;
 
+	/* Flush partially-written EAGAIN residue from the previous call before
+	 * producing more frames.  Without this, a TLS WANT_READ during HANDSHAKE
+	 * would leave tls_want=EV_READ but tx_pending=false, so the sendbuf
+	 * would stall until connect_timeout fires. */
+	if (ss->wire.sendbuf.head != NULL && ss->wire.sendbuf.head->pos > 0) {
+		if (flush_sendbuf_head(ss, &made_progress)) {
+			if (ss->wire.sendbuf.head == NULL) {
+				/* session_suspend/reset cleared the queue. */
+				return;
+			}
+			MUX_LOG_F(
+				DEBUG, ss,
+				"send loop blocked on transport: sendbuf=%zu/%zu"
+				" oobbuf=%d ready=%d",
+				ss->wire.sendbuf.head->pos,
+				ss->wire.sendbuf.head->len,
+				ss->wire.oobbuf.head != NULL,
+				ss->sched.sched_head != NULL);
+			ss->wire.tx_pending = true;
+			update_send_timeout(ss, made_progress);
+			return;
+		}
+	}
+
 	for (;;) {
-		if (ss->wire.sendbuf.head != NULL) {
-			const bool blocked = flush_sendbuf(ss, &made_progress);
-			if (blocked) {
-				/* Transport blocked (EAGAIN or TLS cross-direction
-				 * WANT_READ/WANT_WRITE).  Set tx_pending so the
-				 * watcher is re-armed once the unblocking event
-				 * fires, regardless of the current session state.
-				 * Without this, a TLS WANT_READ during HANDSHAKE
-				 * would leave tls_want=EV_READ but tx_pending=false,
-				 * so after the next EV_READ the watcher would never
-				 * request EV_WRITE again and the sendbuf would stall
-				 * until connect_timeout fires. */
-				const struct mux_frame *const frame =
-					ss->wire.sendbuf.head;
-				if (frame == NULL) {
+		/* Flush reference entries from sendbuf head.  Reference entries
+		 * (large frames, retransmit copies, OOB) cannot accumulate further
+		 * and must be sent before producing more.  Staging entries with
+		 * pos==0 are left in place to allow further packing.
+		 * Staging entry = the sole entry in sendbuf with flag set. */
+		if (ss->wire.sendbuf.head != NULL &&
+		    !(ss->wire.sendbuf_staging &&
+		      ss->wire.sendbuf.head == ss->wire.sendbuf.tail)) {
+			if (flush_sendbuf_head(ss, &made_progress)) {
+				if (ss->wire.sendbuf.head == NULL) {
 					return;
 				}
 				MUX_LOG_F(
 					DEBUG, ss,
-					"send loop blocked on transport: frame=%zu/%zu"
+					"send loop blocked on transport: sendbuf=%zu/%zu"
 					" oobbuf=%d ready=%d",
-					frame->pos, frame->len,
+					ss->wire.sendbuf.head->pos,
+					ss->wire.sendbuf.head->len,
 					ss->wire.oobbuf.head != NULL,
 					ss->sched.sched_head != NULL);
 				ss->wire.tx_pending = true;
 				break;
 			}
-			if (ss->state != SESSION_ESTABLISHED) {
-				return;
-			}
+			continue;
 		}
 
 		if (ss->state != SESSION_ESTABLISHED) {
+			/* Non-data state (HANDSHAKE, CLOSING): flush any
+			 * accumulated staging entry and stop the produce loop. */
+			if (ss->wire.sendbuf.head != NULL) {
+				flush_sendbuf_head(ss, &made_progress);
+				if (ss->wire.sendbuf.head != NULL) {
+					ss->wire.tx_pending = true;
+				}
+			}
 			break;
 		}
 
 		/* 2a. Resume replay takes precedence over new traffic. */
 		if (ss->retransmit_off != SIZE_MAX) {
+			/* Flush any frame in sendbuf before creating the next
+			 * retransmit copy.  Without this, a copy of frame N
+			 * could be in sendbuf while ss->retransmit_copy is
+			 * overwritten with copy N+1; session_track_sent would
+			 * then misidentify copy N as a new non-retransmit frame,
+			 * double-counting its sequence number. */
+			if (ss->wire.sendbuf.head != NULL) {
+				if (flush_sendbuf_head(ss, &made_progress)) {
+					if (ss->wire.sendbuf.head == NULL) {
+						return;
+					}
+					ss->wire.tx_pending = true;
+					break;
+				}
+			}
 			if (ss->unacked != NULL &&
 			    ss->retransmit_off >= ss->unacked->count) {
 				ss->retransmit_off = SIZE_MAX;
@@ -725,7 +791,7 @@ static void send_cb(struct mux_session *restrict ss)
 				ss->retransmit_copy = copy;
 				mux_frame_list_push_front(
 					&ss->wire.sendbuf, copy);
-				continue; /* write the retransmit copy */
+				continue;
 			}
 		}
 
@@ -737,9 +803,17 @@ static void send_cb(struct mux_session *restrict ss)
 			continue;
 		}
 
-		/* 2c. Drain any frame already queued ahead of the scheduler. */
+		/* Flush accumulated staging entries before checking send_stalled
+		 * so that unacked_frames / send_seq reflect the full set of frames
+		 * already produced this round. */
 		if (ss->wire.sendbuf.head != NULL) {
-			continue;
+			if (flush_sendbuf_head(ss, &made_progress)) {
+				if (ss->wire.sendbuf.head == NULL) {
+					return;
+				}
+				ss->wire.tx_pending = true;
+				break;
+			}
 		}
 
 		/* 3. send_stalled blocks new payload only; per-stream ACK/FIN must still
@@ -774,6 +848,14 @@ static void send_cb(struct mux_session *restrict ss)
 					ss->unacked_frames);
 			}
 			break; /* nothing to send */
+		}
+	}
+
+	/* Flush any frames left in sendbuf after the produce loop exits. */
+	if (ss->wire.sendbuf.head != NULL) {
+		flush_sendbuf_head(ss, &made_progress);
+		if (ss->wire.sendbuf.head != NULL) {
+			ss->wire.tx_pending = true;
 		}
 	}
 
@@ -1331,11 +1413,7 @@ session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
 	};
 	ss->retransmit_off = SIZE_MAX;
 
-	ss->sched.streams = table_new(&(struct table_opts){
-		.hash = TABLE_OPTS_PTR.hash,
-		.eq = TABLE_OPTS_PTR.eq,
-		.flags = TABLE_FAST,
-	});
+	ss->sched.streams = table_new(&mux_stream_table_opts);
 	if (ss->sched.streams == NULL) {
 		mux_frame_ring_free(&ss->unacked, &ss->pool);
 		free(ss);
@@ -1605,11 +1683,7 @@ void session_attach_fd(struct mux_session *restrict ss, const int fd)
 	}
 
 	if (ss->sched.streams == NULL) {
-		ss->sched.streams = table_new(&(struct table_opts){
-			.hash = TABLE_OPTS_PTR.hash,
-			.eq = TABLE_OPTS_PTR.eq,
-			.flags = TABLE_FAST,
-		});
+		ss->sched.streams = table_new(&mux_stream_table_opts);
 		if (ss->sched.streams == NULL) {
 			LOGOOM();
 			SOCKET_CLOSE_FD(fd);
@@ -1739,6 +1813,10 @@ void session_discard_stream_frames(
 		if (ss->retransmit_copy == frame) {
 			ss->retransmit_copy = NULL;
 		}
+		if (ss->wire.sendbuf_staging &&
+		    ss->wire.sendbuf.tail == frame) {
+			ss->wire.sendbuf_staging = false;
+		}
 		mux_frame_put(&ss->pool, frame);
 		frame = next;
 	}
@@ -1751,11 +1829,13 @@ bool session_send_ctrl(
 	if (flags & MUX_FLAG_RST) {
 		COUNTER_ADD(ss->cnt.num_rst_sent, 1);
 	}
-	unsigned char *p = sendbuf_reserve_ctrl(ss);
-	if (p == NULL) {
+	struct mux_frame *frame = mux_frame_get(&ss->pool);
+	if (frame == NULL) {
 		LOGOOM();
 		return false;
 	}
+	frame->pos = 0;
+	frame->len = MUX_FRAME_HEADER_SIZE;
 
 	const uint_fast32_t clamped = MIN(extra, (uint_fast32_t)UINT16_MAX);
 	const struct mux_header hdr = {
@@ -1766,9 +1846,10 @@ bool session_send_ctrl(
 		.extra = clamped,
 	};
 
-	mux_write_header(p, &hdr);
+	mux_write_header(frame->data, &hdr);
 
-	session_log_frame_header(ss, "frame out", p, &hdr);
+	session_log_frame_header(ss, "frame out", frame->data, &hdr);
+	wire_sendbuf_push(ss, frame);
 	mux_notify_write(ss);
 	return true;
 }
@@ -1982,6 +2063,11 @@ void session_suspend(struct mux_session *restrict ss)
 			}
 		}
 	}
+
+	/* Frames in sendbuf (including staging entries) were already captured
+	 * above.  Staging entries go through session_track_sent which walks
+	 * all concatenated headers — the same path as single-header frames. */
+	ss->wire.sendbuf_staging = false;
 	ss->retransmit_copy = NULL;
 
 	/* OOB controls never replay across resume; drop the stale transport state. */
@@ -2180,3 +2266,5 @@ bool session_resume_ack_recv(
 		(ss->unacked != NULL && ss->unacked->count > 0) ? 0 : SIZE_MAX;
 	return true;
 }
+
+#endif /* MUX_SESSION_TABLE_OPTS_ONLY */

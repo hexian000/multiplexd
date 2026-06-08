@@ -224,14 +224,15 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (args.dump_config) {
-#if WITH_OPENSSL
-		if (!conf_inline_pem(conf)) {
-			LOGF("failed to inline PEM references");
-			conf_free(conf);
-			return EXIT_FAILURE;
-		}
+#if WITH_TLS
+	if (!conf_inline_pem(conf)) {
+		LOGF("failed to load PEM references");
+		conf_free(conf);
+		return EXIT_FAILURE;
+	}
 #endif
+
+	if (args.dump_config) {
 		size_t dump_len;
 		char *dump_json = conf_dump(conf, &dump_len);
 		if (dump_json == NULL) {

@@ -29,9 +29,17 @@ struct wire_ctx {
 	 * close_notify); false on connection errors or timeouts.  Set by
 	 * wire_recv; cleared by session_attach_fd on reconnect. */
 	bool rx_eof : 1;
+	/* true when sendbuf.tail is a staging entry that can accept
+	 * further small-frame packing via wire_sendbuf_push; false when
+	 * the tail is a by-reference frame or the queue is empty. */
+	bool sendbuf_staging : 1;
 	/* Outbound frame list: the head is the current transport write
-	 * target and may be partially flushed.  Empty when the transport
-	 * is idle. */
+	 * target and may be partially flushed.  Small frames (<=256 B)
+	 * are packed into a staging entry at the tail via wire_sendbuf_push;
+	 * large frames, retransmit copies, and OOB frames are appended by
+	 * reference.  When the head is not the staging entry it is flushed
+	 * to the transport immediately; staging entries accumulate until full
+	 * or until a reference entry follows. */
 	struct mux_frame_list sendbuf;
 	/* Out-of-band control queue (PROBE/PING/PONG), drained ahead of
 	 * any non-retransmit regular frame.  Bypasses the send-stall gate
@@ -73,6 +81,23 @@ bool wire_recv(struct mux_session *ss, unsigned char *restrict buf, size_t *len)
 
 /* Free all pending send buffers and reset the receive ring. */
 void wire_discard_buffers(struct mux_session *ss);
+
+/* Maximum total frame length (header + payload) that may be packed into a
+ * sendbuf staging entry.  Frames at or below this threshold are memcpy'd
+ * into the staging buffer and their originals returned to the pool; frames
+ * above this threshold are appended by reference (zero-copy).
+ * Value chosen to cover all pure control frames (8 B) and PING/PONG (16 B)
+ * while keeping a clear boundary well below the 16 KB data frame size. */
+#define MUX_CORK_APPEND_MAX 256u
+
+/* Append @p frame to the sendbuf outbound queue.
+ *   - Small frames (frame->len <= MUX_CORK_APPEND_MAX): memcpy'd into the
+ *     tail staging entry if there is room, otherwise a new staging entry is
+ *     allocated; the original frame is returned to the pool in both cases.
+ *   - Large frames (frame->len > MUX_CORK_APPEND_MAX) and retransmit copies:
+ *     appended by reference; the frame pointer is preserved for
+ *     session_track_sent's retransmit_copy identity check. */
+void wire_sendbuf_push(struct mux_session *ss, struct mux_frame *frame);
 
 #if WITH_TLS
 /* Update the TLS context used for future outbound reconnects.

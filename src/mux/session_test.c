@@ -92,11 +92,7 @@ static int setup_fixture(struct session_fixture *restrict fx)
 			.rx_open = true,
 		},
 	};
-	fx->ss.sched.streams = table_new(&(struct table_opts){
-		.hash = TABLE_OPTS_PTR.hash,
-		.eq = TABLE_OPTS_PTR.eq,
-		.flags = TABLE_FAST,
-	});
+	fx->ss.sched.streams = table_new(&mux_stream_table_opts);
 	if (fx->ss.sched.streams == NULL) {
 		close(fx->fds[0]);
 		close(fx->fds[1]);

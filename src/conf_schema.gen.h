@@ -72,6 +72,7 @@ struct json_conf_identity {
 	struct json_string *mux_connect;
 	size_t mux_connect_count;
 
+	struct json_string authcerts_json;
 	struct json_string listen_json;
 };
 
