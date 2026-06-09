@@ -227,6 +227,20 @@ enum tls_error tls_recv(
 	size_t *restrict len);
 
 /**
+ * @brief Check whether the TLS layer has buffered data ready to be read
+ *        without a further I/O operation.
+ *
+ * Returns true when the TLS implementation has already decrypted data (or
+ * buffered TLS record bytes) that can be returned by the next tls_recv call
+ * without going back to the OS socket.  Used to drive the recv batch loop in
+ * the session layer.
+ *
+ * @param conn TLS connection. MUST NOT be NULL.
+ * @return true if data is available without I/O, false otherwise.
+ */
+bool tls_has_pending(const struct tls_connection *conn);
+
+/**
  * @brief Perform non-blocking TLS shutdown.
  *
  * Performs an orderly TLS shutdown using non-blocking semantics. Returns:

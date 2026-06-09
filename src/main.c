@@ -185,10 +185,10 @@ static void parse_args(const int argc, char *const *argv)
 
 int main(int argc, char **argv)
 {
-	util_init(argc, argv);
+	init(argc, argv);
 	parse_args(argc, argv);
 	slog_setlevel(args.loglevel);
-	util_loadlibs();
+	loadlibs();
 
 #if WITH_OPENSSL
 	if (args.gencerts != NULL) {
@@ -316,7 +316,7 @@ int main(int argc, char **argv)
 	server_stop(server);
 	server_free(server);
 
-	util_unloadlibs();
+	unloadlibs();
 	conf_free(conf);
 
 	LOGD("program terminated normally");

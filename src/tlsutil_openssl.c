@@ -308,6 +308,7 @@ struct tls_context *tls_ctx_server(
 		ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
 				 SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
 				 SSL_MODE_AUTO_RETRY);
+	(void)SSL_CTX_set_read_ahead(ssl_ctx, 1);
 
 	if (!tls_load_cert(ctx, tls_cert)) {
 		LOGE("failed to load TLS certificate");
@@ -370,6 +371,7 @@ struct tls_context *tls_ctx_client(
 		ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
 				 SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
 				 SSL_MODE_AUTO_RETRY);
+	(void)SSL_CTX_set_read_ahead(ssl_ctx, 1);
 
 	/* Client certificate is mandatory for mutual authentication */
 	if (!tls_load_cert(ctx, tls_cert)) {
@@ -572,6 +574,11 @@ enum tls_error tls_recv(
 	}
 	LOG_SSLERROR(ERROR, "SSL_read");
 	return TLS_ERROR_UNKNOWN;
+}
+
+bool tls_has_pending(const struct tls_connection *const conn)
+{
+	return SSL_has_pending((const SSL *)conn) != 0;
 }
 
 int tls_shutdown(

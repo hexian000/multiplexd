@@ -8,33 +8,6 @@
 
 #include "mux/session.h"
 
-/* Prebuilt stream-table configuration — always compiled so that
- * translation units built with MUX_SESSION_TABLE_OPTS_ONLY only need
- * session.h and these three definitions. */
-static uint_fast32_t stream_id_hash(const void *key, const uint_fast32_t seed)
-{
-	const uint_least16_t id = (uint_least16_t)(uintptr_t)key;
-	uint_fast32_t hash = seed;
-	hash ^= (uint_fast32_t)(id & 0xffu);
-	hash *= (uint_fast32_t)0x01000193u;
-	hash ^= (uint_fast32_t)((id >> 8) & 0xffu);
-	hash *= (uint_fast32_t)0x01000193u;
-	return hash;
-}
-
-static bool stream_id_eq(const void *a, const void *b)
-{
-	return a == b;
-}
-
-const struct table_opts mux_stream_table_opts = {
-	.hash = stream_id_hash,
-	.eq = stream_id_eq,
-	.flags = TABLE_FAST,
-};
-
-#ifndef MUX_SESSION_TABLE_OPTS_ONLY
-
 #include "mux/dispatch.h"
 #include "mux/estimator.h"
 #include "mux/frame.h"
@@ -197,6 +170,10 @@ static void session_cleanup(struct mux_session *restrict ss)
 	wire_discard_buffers(ss);
 	unacked_ring_free_all(ss);
 	ss->retransmit_copy = NULL;
+	if (ss->frame_spare != NULL) {
+		mux_frame_put(&ss->pool, ss->frame_spare);
+		ss->frame_spare = NULL;
+	}
 }
 
 static void handshake_cleanup(struct mux_session *restrict ss)
@@ -224,13 +201,12 @@ void session_reset(struct mux_session *ss)
 	ss->num_halfopen = 0;
 }
 
-void session_update_watcher(struct mux_session *restrict ss)
+static void update_watcher(struct mux_session *restrict ss)
 {
 	int events = 0;
 #if WITH_TLS
 	if (ss->wire.tls_want != 0) {
-		util_modify_io_events(
-			ss->loop, &ss->w_socket, ss->wire.tls_want);
+		modify_io_events(ss->loop, &ss->w_socket, ss->wire.tls_want);
 		return;
 	}
 #endif
@@ -258,7 +234,12 @@ void session_update_watcher(struct mux_session *restrict ss)
 	default:
 		return;
 	}
-	util_modify_io_events(ss->loop, &ss->w_socket, events);
+	modify_io_events(ss->loop, &ss->w_socket, events);
+}
+
+void session_notify(struct mux_session *restrict ss)
+{
+	update_watcher(ss);
 }
 
 /* -------------------------------------------------------------------------
@@ -365,7 +346,7 @@ static void mux_notify_write(struct mux_session *ss)
 			ss->sched.sched_head != NULL, ss->send_stalled);
 	}
 	ss->wire.tx_pending = true;
-	session_update_watcher(ss);
+	update_watcher(ss);
 }
 
 /* Emit a session-level ACK for all unacknowledged non-stream-0 frames.
@@ -432,7 +413,7 @@ static bool push_unacked(
 	const size_t count)
 {
 	if (!unacked_ring_push(ss, frame, count)) {
-		mux_frame_put(&ss->pool, frame);
+		session_frame_free(ss, frame);
 		return false;
 	}
 	if (!ss->send_stalled &&
@@ -468,7 +449,7 @@ static void session_track_sent(
 
 	/* Hello frames are handshake-only and never enter the resume log. */
 	if (hdr.version == 0) {
-		mux_frame_put(&ss->pool, frame);
+		session_frame_free(ss, frame);
 		return;
 	}
 
@@ -478,14 +459,25 @@ static void session_track_sent(
 		ASSERT(ss->unacked != NULL &&
 		       ss->retransmit_off < ss->unacked->count);
 		ss->retransmit_off++;
-		mux_frame_put(&ss->pool, frame);
+		session_frame_free(ss, frame);
+		return;
+	}
+
+	/* Fast path: single-header frame (the common case).  The header walk
+	 * below is only required for multi-header staging frames; a lone entry
+	 * needs neither compaction nor a second header parse. */
+	if (MUX_FRAME_HEADER_SIZE + (size_t)hdr.length == frame->len) {
+		if (hdr.stream_id == STREAMID_CTRL) {
+			session_frame_free(ss, frame);
+			return;
+		}
+		push_unacked(ss, frame, 1);
 		return;
 	}
 
 	/* Walk all concatenated headers, strip stream-0 controls, and count
-	 * the remaining entries.  For single-header frames (the common case)
-	 * this loop runs exactly once and produces the same result as before;
-	 * for multi-header staging frames every sub-frame is counted. */
+	 * the remaining entries.  For multi-header staging frames every
+	 * sub-frame is counted. */
 	unsigned char *dst = frame->data;
 	const unsigned char *src = frame->data;
 	const unsigned char *const end = frame->data + frame->len;
@@ -493,14 +485,14 @@ static void session_track_sent(
 	while (src < end) {
 		if ((size_t)(end - src) < MUX_FRAME_HEADER_SIZE) {
 			MUX_LOG(ERROR, ss, "invalid internal frame layout");
-			mux_frame_put(&ss->pool, frame);
+			session_frame_free(ss, frame);
 			return;
 		}
 		mux_read_header(src, &hdr);
 		const size_t entry_len = MUX_FRAME_HEADER_SIZE + hdr.length;
 		if ((size_t)(end - src) < entry_len) {
 			MUX_LOG(ERROR, ss, "invalid internal frame layout");
-			mux_frame_put(&ss->pool, frame);
+			session_frame_free(ss, frame);
 			return;
 		}
 		if (hdr.stream_id != STREAMID_CTRL) {
@@ -513,7 +505,7 @@ static void session_track_sent(
 		src += entry_len;
 	}
 	if (n == 0) {
-		mux_frame_put(&ss->pool, frame);
+		session_frame_free(ss, frame);
 		return;
 	}
 	frame->len = (size_t)(dst - frame->data);
@@ -588,7 +580,9 @@ bool session_send_push(
 		sched_delay_remove(ss, s);
 	}
 
-	session_log_frame_header(ss, "frame out", p, &hdr);
+	if (LOGLEVEL(VERYVERBOSE)) {
+		session_log_frame_header(ss, "frame out", p, &hdr);
+	}
 	return true;
 }
 
@@ -780,7 +774,7 @@ static void send_cb(struct mux_session *restrict ss)
 					ss->unacked, ss->retransmit_off);
 				/* The offset advances only after the replay copy is fully flushed. */
 				struct mux_frame *copy =
-					mux_frame_get(&ss->pool);
+					session_frame_alloc(ss);
 				if (copy == NULL) {
 					LOGOOM();
 					break;
@@ -862,19 +856,22 @@ static void send_cb(struct mux_session *restrict ss)
 	update_send_timeout(ss, made_progress);
 }
 
-static void recv_cb(struct mux_session *ss)
+/* Read and dispatch one TLS record.  Returns true when a record was
+ * successfully received and dispatched; returns false when no data is
+ * available (EAGAIN) or on error. */
+static bool recv_one(struct mux_session *restrict ss)
 {
 	if (!ringbuf_reserve(&ss->wire.recvbuf, 1, false)) {
 		MUX_LOG(WARNING, ss, "receive buffer full");
 		session_reset(ss);
-		return;
+		return false;
 	}
 
 	const size_t cap = ringbuf_write_space(ss->wire.recvbuf);
 	if (cap == 0) {
 		MUX_LOG(WARNING, ss, "receive buffer full");
 		session_reset(ss);
-		return;
+		return false;
 	}
 
 	size_t nread = cap;
@@ -888,7 +885,7 @@ static void recv_cb(struct mux_session *ss)
 		} else {
 			session_reset(ss);
 		}
-		return;
+		return false;
 	}
 	if (nread == 0) {
 		/* TLS close_notify: wire_recv clears rx_open but returns true.
@@ -908,7 +905,7 @@ static void recv_cb(struct mux_session *ss)
 				session_reset(ss);
 			}
 		}
-		return;
+		return false;
 	}
 
 	ringbuf_produce(ss->wire.recvbuf, nread);
@@ -919,6 +916,17 @@ static void recv_cb(struct mux_session *ss)
 	}
 
 	dispatch_frame(ss);
+	return true;
+}
+
+static void recv_cb(struct mux_session *restrict ss)
+{
+	if (!recv_one(ss)) {
+		return;
+	}
+	while (ss->state == SESSION_ESTABLISHED && wire_has_pending(ss)) {
+		(void)recv_one(ss);
+	}
 }
 
 void session_eager_flush(
@@ -930,13 +938,13 @@ void session_eager_flush(
 		return;
 	}
 	send_cb(ss);
-	session_update_watcher(ss);
+	update_watcher(ss);
 }
 
 void session_flush(struct mux_session *restrict ss)
 {
 	if (ss->state != SESSION_ESTABLISHED) {
-		session_update_watcher(ss);
+		update_watcher(ss);
 		return;
 	}
 
@@ -958,17 +966,17 @@ void session_flush(struct mux_session *restrict ss)
 	if (ss->sched.lp_head != NULL && ss->wire.sendbuf.head == NULL) {
 		ev_idle_start(ss->loop, &ss->sched.w_sched);
 	}
-	session_update_watcher(ss);
+	update_watcher(ss);
 }
 
 void session_flush_oob(struct mux_session *restrict ss)
 {
 	if (ss->wire.tx_pending || ss->state != SESSION_ESTABLISHED) {
-		session_update_watcher(ss);
+		update_watcher(ss);
 		return;
 	}
 	send_cb(ss);
-	session_update_watcher(ss);
+	update_watcher(ss);
 }
 
 /* -------------------------------------------------------------------------
@@ -1256,8 +1264,8 @@ void session_update_session_window(struct mux_session *restrict ss)
 static void session_update_stream_window(
 	struct mux_session *restrict ss, const size_t window_bytes)
 {
-	const size_t target_frames = (window_bytes + MUX_MAX_PAYLOAD_SIZE - 1) /
-				     MUX_MAX_PAYLOAD_SIZE;
+	const size_t target_frames =
+		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
 	const uint_least32_t frames =
 		(uint_least32_t)MAX(target_frames, (size_t)1u);
 
@@ -1267,7 +1275,7 @@ static void session_update_stream_window(
 	const uint_least32_t old_stream = ss->stream_window;
 	ss->stream_window = frames;
 	if (frames > old_stream && ss->sched.streams != NULL) {
-		uint_fast32_t w = (uint_fast32_t)frames * MUX_MAX_PAYLOAD_SIZE;
+		uint_fast32_t w = (uint_fast32_t)frames * MUX_WINDOW_UNIT;
 		table_iterate(ss->sched.streams, update_stream_window_cb, &w);
 	}
 	/* On shrink: leave per-stream recv_window intact now; each
@@ -1526,7 +1534,7 @@ void session_initiate_shutdown(struct mux_session *restrict ss)
 		&ss->w_connect_timeout, (double)ss->conf.connect_timeout, 0.0);
 	ev_timer_start(loop, &ss->w_connect_timeout);
 	ss->wire.tx_pending = true;
-	session_update_watcher(ss);
+	update_watcher(ss);
 }
 
 void session_close(struct mux_session *restrict ss)
@@ -1664,7 +1672,7 @@ void session_start(struct mux_session *restrict ss)
 		ss->w_send_timeout.repeat = 0.0;
 	}
 	handshake_start(ss);
-	session_update_watcher(ss);
+	update_watcher(ss);
 	ev_timer_again(ss->loop, &ss->w_connect_timeout);
 }
 
@@ -1817,7 +1825,7 @@ void session_discard_stream_frames(
 		    ss->wire.sendbuf.tail == frame) {
 			ss->wire.sendbuf_staging = false;
 		}
-		mux_frame_put(&ss->pool, frame);
+		session_frame_free(ss, frame);
 		frame = next;
 	}
 }
@@ -1829,7 +1837,7 @@ bool session_send_ctrl(
 	if (flags & MUX_FLAG_RST) {
 		COUNTER_ADD(ss->cnt.num_rst_sent, 1);
 	}
-	struct mux_frame *frame = mux_frame_get(&ss->pool);
+	struct mux_frame *frame = session_frame_alloc(ss);
 	if (frame == NULL) {
 		LOGOOM();
 		return false;
@@ -1848,7 +1856,9 @@ bool session_send_ctrl(
 
 	mux_write_header(frame->data, &hdr);
 
-	session_log_frame_header(ss, "frame out", frame->data, &hdr);
+	if (LOGLEVEL(VERYVERBOSE)) {
+		session_log_frame_header(ss, "frame out", frame->data, &hdr);
+	}
 	wire_sendbuf_push(ss, frame);
 	mux_notify_write(ss);
 	return true;
@@ -1859,7 +1869,7 @@ bool session_send_oob(
 	const unsigned char *restrict payload, const size_t payload_len)
 {
 	ASSERT(payload_len <= MUX_MAX_PAYLOAD_SIZE);
-	struct mux_frame *frame = mux_frame_get(&ss->pool);
+	struct mux_frame *frame = session_frame_alloc(ss);
 	if (frame == NULL) {
 		LOGOOM();
 		return false;
@@ -1886,7 +1896,9 @@ bool session_send_oob(
 		}
 	}
 
-	session_log_frame_header(ss, "frame out", frame->data, &hdr);
+	if (LOGLEVEL(VERYVERBOSE)) {
+		session_log_frame_header(ss, "frame out", frame->data, &hdr);
+	}
 	mux_notify_write(ss);
 	return true;
 }
@@ -1994,7 +2006,7 @@ bool session_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count
 		} else {
 			remaining -= f->unacked_count;
 			(void)mux_frame_ring_pop(ss->unacked);
-			mux_frame_put(&ss->pool, f);
+			session_frame_free(ss, f);
 			popped++;
 		}
 	}
@@ -2057,7 +2069,7 @@ void session_suspend(struct mux_session *restrict ss)
 		struct mux_frame *frame;
 		while ((frame = mux_frame_list_pop(&captured)) != NULL) {
 			if (frame == ss->retransmit_copy) {
-				mux_frame_put(&ss->pool, frame);
+				session_frame_free(ss, frame);
 			} else {
 				session_track_sent(ss, frame);
 			}
@@ -2089,6 +2101,7 @@ void session_suspend(struct mux_session *restrict ss)
 		struct mux_stream *next = cs->next;
 		cs->sched_queue = SCHED_QUEUE_NONE;
 		cs->next = NULL;
+		cs->prev = NULL;
 		cs = next;
 	}
 	ss->sched.ctrl_head = NULL;
@@ -2240,7 +2253,7 @@ bool session_resume_transport(
 		ss->wire.tx_pending = true;
 	}
 	ev_io_start(ss->loop, &ss->w_socket);
-	session_update_watcher(ss);
+	update_watcher(ss);
 	return true;
 }
 
@@ -2266,5 +2279,3 @@ bool session_resume_ack_recv(
 		(ss->unacked != NULL && ss->unacked->count > 0) ? 0 : SIZE_MAX;
 	return true;
 }
-
-#endif /* MUX_SESSION_TABLE_OPTS_ONLY */

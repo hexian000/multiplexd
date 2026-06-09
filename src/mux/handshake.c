@@ -459,7 +459,7 @@ bool handshake_process_hello(
 	if (ss->unacked != NULL && ss->unacked->count > 0) {
 		ss->retransmit_off = 0;
 		ss->wire.tx_pending = true;
-		session_update_watcher(ss);
+		session_notify(ss);
 	}
 	return true;
 }

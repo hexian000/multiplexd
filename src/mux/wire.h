@@ -79,6 +79,11 @@ bool wire_send(struct mux_session *ss, unsigned char *buf, size_t *len);
  * number of bytes actually received.  Returns false on unrecoverable error. */
 bool wire_recv(struct mux_session *ss, unsigned char *restrict buf, size_t *len);
 
+/* Return true when the TLS layer has data buffered that can be read by
+ * wire_recv without going back to the OS socket; always false for
+ * plain-socket transports. */
+bool wire_has_pending(const struct mux_session *ss);
+
 /* Free all pending send buffers and reset the receive ring. */
 void wire_discard_buffers(struct mux_session *ss);
 

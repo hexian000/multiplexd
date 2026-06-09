@@ -76,7 +76,7 @@ struct mux_stream {
 	uint_least8_t delay_ticks;
 	enum stream_state state;
 	struct mux_session *session;
-	struct mux_stream *next;
+	struct mux_stream *prev, *next;
 	struct mux_stream *delay_prev;
 	struct mux_stream *delay_next;
 
@@ -87,7 +87,6 @@ struct mux_stream {
 			ev_timer w_timeout;
 			/* true once the non-blocking connect() has completed */
 			bool connected : 1;
-
 		} socket;
 		struct {
 			mux_stream_io *w_io;

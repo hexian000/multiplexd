@@ -36,7 +36,8 @@ case "$1" in
         -DUSE_TLS_LIBRARY="none" \
         ..
     cp compile_commands.json ../
-    cmake --build . -t multiplexd
+    cmake --build . -j"$(nproc)"
+    ctest -j"$(nproc)"
     ls -lh bin/multiplexd
     ;;
 "posix")
@@ -48,7 +49,8 @@ case "$1" in
         -DFORCE_POSIX=ON \
         ..
     cp compile_commands.json ../
-    cmake --build . -t multiplexd
+    cmake --build . -j"$(nproc)"
+    ctest -j"$(nproc)"
     ls -lh bin/multiplexd
     ;;
 "clang")
@@ -98,7 +100,8 @@ case "$1" in
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
         -DENABLE_THREADS=ON \
         ..
-    cmake --build . -t multiplexd
+    cmake --build . -j"$(nproc)"
+    ctest -j"$(nproc)"
     (cd bin && objdump -drwS multiplexd >multiplexd.S)
     ls -lh bin/multiplexd
     ;;
@@ -111,7 +114,8 @@ case "$1" in
         -DENABLE_THREADS=ON \
         ..
     cp compile_commands.json ../
-    cmake --build . -t multiplexd
+    cmake --build . -j"$(nproc)"
+    ctest -j"$(nproc)"
     ls -lh bin/multiplexd
     ;;
 "d")

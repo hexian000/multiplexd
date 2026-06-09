@@ -38,7 +38,7 @@
 
 #define TSTAMP_NIL (-1.0)
 
-static inline void util_modify_io_events(
+static inline void modify_io_events(
 	struct ev_loop *restrict loop, ev_io *restrict watcher,
 	const int events)
 {
@@ -105,9 +105,9 @@ int socket_user_timeout(int fd, int ms);
 		}                                                              \
 	} while (0)
 
-void util_init(int argc, char *const *argv);
-void util_loadlibs(void);
-void util_unloadlibs(void);
+void init(int argc, char *const *argv);
+void loadlibs(void);
+void unloadlibs(void);
 
 bool resolve_addr(
 	union sockaddr_max *restrict addr, const char *restrict addrstr,

@@ -10,13 +10,16 @@
  * Local scheduler invariants only; the full model lives in doc/impl.md.
  *
  * - sched_head/tail hold the ready FIFO, while round_end snapshots the tail
- *   that bounds the current DRR round.
+ *   that bounds the current DRR round.  prev/next form a doubly-linked list
+ *   with O(1) insertion, head removal, and arbitrary-node dequeue.
  * - drr_active is temporarily removed from the FIFO while it spends the
  *   remainder of its current byte budget across successive EV_WRITE visits.
  * - delay_head is an unsorted intrusive list; delay_prev/delay_next make
  *   expiration and cancellation O(1) at the stream node.
  * - EV_IDLE owns lifecycle work such as INIT/CLOSED handling, while EV_WRITE
  *   only advances payload/control transmission already made ready here.
+ * - lp_head/tail and ctrl_head also use the same prev/next pair; all queues
+ *   are mutually exclusive — a stream is on at most one at a time.
  */
 
 #include "mux/sched.h"
@@ -58,6 +61,7 @@ static bool stream_free_and_decount_cb(
 
 void sched_free_streams(struct mux_session *restrict ss)
 {
+	ss->sched.cache_stream = NULL;
 	ss->sched.sched_head = NULL;
 	ss->sched.sched_tail = NULL;
 	ss->sched.round_end = NULL;
@@ -103,6 +107,9 @@ bool sched_add_stream(
 static void sched_remove_stream(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
+	if (ss->sched.cache_stream == s) {
+		ss->sched.cache_stream = NULL;
+	}
 	void *elem = NULL;
 	ss->sched.streams = table_del(
 		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
@@ -131,6 +138,10 @@ static void sched_remove_stream(
 struct mux_stream *sched_find_stream(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id)
 {
+	struct mux_stream *const cached = ss->sched.cache_stream;
+	if (cached != NULL && cached->id == stream_id) {
+		return cached;
+	}
 	if (ss->sched.streams == NULL) {
 		return NULL;
 	}
@@ -139,6 +150,7 @@ struct mux_stream *sched_find_stream(
 	if (table_find(
 		    ss->sched.streams, (const void *)(uintptr_t)id_key,
 		    &elem)) {
+		ss->sched.cache_stream = elem;
 		return elem;
 	}
 	return NULL;
@@ -196,6 +208,8 @@ static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
 		ss->sched.sched_head = s->next;
 		if (ss->sched.sched_head == NULL) {
 			ss->sched.sched_tail = NULL;
+		} else {
+			ss->sched.sched_head->prev = NULL;
 		}
 		s->next = NULL;
 		s->sched_queue = SCHED_QUEUE_NONE;
@@ -232,6 +246,7 @@ sched_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 	    !ev_is_active(&s->w_tombstone)) {
 		s->sched_queue = SCHED_QUEUE_DRR;
 		s->next = NULL;
+		s->prev = ss->sched.sched_tail;
 		if (ss->sched.sched_tail != NULL) {
 			ss->sched.sched_tail->next = s;
 		} else {
@@ -259,6 +274,7 @@ sched_lp_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 	if (s->sched_queue == SCHED_QUEUE_NONE) {
 		s->sched_queue = SCHED_QUEUE_LP;
 		s->next = NULL;
+		s->prev = ss->sched.lp_tail;
 		if (ss->sched.lp_tail != NULL) {
 			ss->sched.lp_tail->next = s;
 		} else {
@@ -289,7 +305,7 @@ void sched_wake(struct mux_session *restrict ss, struct mux_stream *restrict s)
 		sched_enqueue(ss, s);
 		ss->wire.tx_pending = true;
 	}
-	session_update_watcher(ss);
+	session_notify(ss);
 }
 
 void sched_delay(
@@ -537,26 +553,23 @@ bool sched_next_data(struct mux_session *restrict ss)
  * grants would never reach the peer, causing a bidirectional stall. */
 void sched_flush_ctrl(struct mux_session *restrict ss)
 {
-	struct mux_stream **indirect = &ss->sched.ctrl_head;
-	while (*indirect != NULL) {
-		struct mux_stream *s = *indirect;
+	struct mux_stream *s = ss->sched.ctrl_head;
+	while (s != NULL) {
+		struct mux_stream *next = s->next;
 		if (s->sched_queue != SCHED_QUEUE_CTRL ||
 		    s->state == STREAM_CLOSED) {
 			/* Lazy cleanup of stale or tombstone entries. */
-			*indirect = s->next;
-			s->next = NULL;
-			s->sched_queue = SCHED_QUEUE_NONE;
+			sched_ctrl_dequeue(ss, s);
+			s = next;
 			continue;
 		}
 		stream_check_ack(s);
 		sched_send_ctrl_flags(ss, s);
 		if (s->sched_queue != SCHED_QUEUE_CTRL) {
-			/* Control frame was sent; remove from list. */
-			*indirect = s->next;
-			s->next = NULL;
-		} else {
-			indirect = &s->next;
+			/* Control frame was sent; already removed from list
+			 * by sched_send_ctrl_flags / sched_ctrl_dequeue. */
 		}
+		s = next;
 	}
 
 	/* Fallback: during send_stalled, streams stuck in the DRR ready
@@ -579,8 +592,8 @@ void sched_flush_ctrl(struct mux_session *restrict ss)
 }
 
 /* --- Control-pending list ---
- * Singly-linked via mux_stream::next (reuses DRR/lp queue pointer; mutually
- * exclusive — a stream is on at most one of {DRR, lp, ctrl} at a time). */
+ * Doubly-linked via mux_stream::next / mux_stream::prev; mutually
+ * exclusive — a stream is on at most one of {DRR, lp, ctrl} at a time. */
 
 void sched_ctrl_enqueue(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
@@ -589,7 +602,11 @@ void sched_ctrl_enqueue(
 		return;
 	}
 	s->sched_queue = SCHED_QUEUE_CTRL;
+	s->prev = NULL;
 	s->next = ss->sched.ctrl_head;
+	if (ss->sched.ctrl_head != NULL) {
+		ss->sched.ctrl_head->prev = s;
+	}
 	ss->sched.ctrl_head = s;
 }
 
@@ -599,17 +616,17 @@ void sched_ctrl_dequeue(
 	if (s->sched_queue != SCHED_QUEUE_CTRL) {
 		return;
 	}
-	struct mux_stream **indirect = &ss->sched.ctrl_head;
-	while (*indirect != NULL) {
-		if (*indirect == s) {
-			*indirect = s->next;
-			s->next = NULL;
-			s->sched_queue = SCHED_QUEUE_NONE;
-			return;
-		}
-		indirect = &(*indirect)->next;
+	/* O(1) doubly-linked removal. */
+	if (s->prev != NULL) {
+		s->prev->next = s->next;
+	} else {
+		ss->sched.ctrl_head = s->next;
 	}
-	/* Not found in list: flag may have been cleared elsewhere; still sync. */
+	if (s->next != NULL) {
+		s->next->prev = s->prev;
+	}
+	s->next = NULL;
+	s->prev = NULL;
 	s->sched_queue = SCHED_QUEUE_NONE;
 }
 
@@ -662,6 +679,8 @@ static void sched_cb(struct ev_loop *loop, ev_idle *w, const int revents)
 		ss->sched.lp_head = s->next;
 		if (ss->sched.lp_head == NULL) {
 			ss->sched.lp_tail = NULL;
+		} else {
+			ss->sched.lp_head->prev = NULL;
 		}
 		s->sched_queue = SCHED_QUEUE_NONE;
 		s->next = NULL;

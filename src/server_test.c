@@ -516,7 +516,7 @@ static void mock_conn_update_events(struct mock_conn *restrict conn)
 	if (conn->out_off < conn->out_len) {
 		events |= EV_WRITE;
 	}
-	util_modify_io_events(conn->mock->loop, &conn->w_io, events);
+	modify_io_events(conn->mock->loop, &conn->w_io, events);
 }
 
 static void mock_conn_io_cb(struct ev_loop *loop, ev_io *w, const int revents)
@@ -1898,8 +1898,8 @@ T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
 
 int main(void)
 {
-	util_init(0, NULL);
-	util_loadlibs();
+	init(0, NULL);
+	loadlibs();
 
 	T_DECLARE_CTX(t);
 	T_RUN_CASE(t, test_bidirectional_stream_and_forward);
@@ -1915,6 +1915,6 @@ int main(void)
 	T_RUN_CASE(t, test_server_max_sessions_rejects);
 	T_RUN_CASE(t, test_server_graceful_shutdown_via_signal);
 
-	util_unloadlibs();
+	unloadlibs();
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -132,10 +132,15 @@ void session_handshake_done(struct mux_session *ss)
 	g_handshake_done_calls++;
 }
 
-void session_update_watcher(struct mux_session *ss)
+void update_watcher(struct mux_session *ss)
 {
 	(void)ss;
 	g_update_watcher_calls++;
+}
+
+void session_notify(struct mux_session *restrict ss)
+{
+	update_watcher(ss);
 }
 
 bool session_resume_transport(

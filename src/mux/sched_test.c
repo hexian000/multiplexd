@@ -67,10 +67,15 @@ int stream_format_tag(
 	return snprintf(buf, buflen, "[stream]:");
 }
 
-void session_update_watcher(struct mux_session *ss)
+void update_watcher(struct mux_session *ss)
 {
 	(void)ss;
 	g_update_watcher_calls++;
+}
+
+void session_notify(struct mux_session *restrict ss)
+{
+	update_watcher(ss);
 }
 
 bool session_send_ctrl(

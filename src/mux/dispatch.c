@@ -495,7 +495,9 @@ void dispatch_frame(struct mux_session *ss)
 
 		struct mux_header hdr;
 		mux_read_header(p, &hdr);
-		session_log_frame_header(ss, "frame in", p, &hdr);
+		if (LOGLEVEL(VERYVERBOSE)) {
+			session_log_frame_header(ss, "frame in", p, &hdr);
+		}
 
 		if (hdr.length > MUX_MAX_PAYLOAD_SIZE) {
 			MUX_LOG_F(

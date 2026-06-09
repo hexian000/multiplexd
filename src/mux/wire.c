@@ -147,6 +147,16 @@ bool wire_recv(
 	return true;
 }
 
+bool wire_has_pending(const struct mux_session *restrict ss)
+{
+#if WITH_TLS
+	if (ss->wire.tlsconn != NULL) {
+		return tls_has_pending(ss->wire.tlsconn);
+	}
+#endif
+	return false;
+}
+
 void wire_discard_buffers(struct mux_session *restrict ss)
 {
 	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
@@ -172,18 +182,18 @@ void wire_sendbuf_push(
 			memcpy(staging->data + staging->len, frame->data,
 			       frame->len);
 			staging->len += frame->len;
-			mux_frame_put(&ss->pool, frame);
+			session_frame_free(ss, frame);
 			return;
 		}
 		/* No suitable staging tail: allocate a fresh staging entry. */
-		struct mux_frame *const new_staging = mux_frame_get(&ss->pool);
+		struct mux_frame *const new_staging = session_frame_alloc(ss);
 		if (new_staging != NULL) {
 			memcpy(new_staging->data, frame->data, frame->len);
 			new_staging->pos = 0;
 			new_staging->len = frame->len;
 			mux_frame_list_push(&ss->wire.sendbuf, new_staging);
 			ss->wire.sendbuf_staging = true;
-			mux_frame_put(&ss->pool, frame);
+			session_frame_free(ss, frame);
 			return;
 		}
 		/* Pool exhausted: fall through and append the original by reference. */

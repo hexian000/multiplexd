@@ -188,8 +188,7 @@ static void update_watcher(struct mux_stream *restrict s)
 		return;
 	}
 	if (!s->socket.connected) {
-		util_modify_io_events(
-			s->session->loop, &s->socket.w_io, EV_WRITE);
+		modify_io_events(s->session->loop, &s->socket.w_io, EV_WRITE);
 		return;
 	}
 
@@ -226,7 +225,7 @@ static void update_watcher(struct mux_stream *restrict s)
 			stream_state_str[s->state], stream_read_credit_avail(s),
 			s->queued_send_bytes);
 	}
-	util_modify_io_events(s->session->loop, &s->socket.w_io, events);
+	modify_io_events(s->session->loop, &s->socket.w_io, events);
 }
 
 static void stream_stop(struct mux_stream *s)
@@ -416,22 +415,22 @@ static inline bool stream_can_send_data(const struct mux_stream *restrict s)
 	       s->state == STREAM_CLOSE_WAIT;
 }
 
-static void recv_cb(struct mux_stream *restrict s)
+static bool recv_cb(struct mux_stream *restrict s)
 {
 	if (s->rx_eof || !stream_can_send_data(s)) {
-		return;
+		return false;
 	}
 
 	const uint_fast32_t read_credit = stream_read_credit_avail(s);
 	if (read_credit == 0) {
 		STREAM_LOG(VERBOSE, s, "send credit exhausted, pausing read");
-		return;
+		return false;
 	}
 
-	struct mux_frame *frame = mux_frame_get(&s->session->pool);
+	struct mux_frame *frame = session_frame_alloc(s->session);
 	if (frame == NULL) {
 		STREAM_LOG(WARNING, s, "out of memory for send frame");
-		return;
+		return false;
 	}
 
 	unsigned char *buf = frame->data + MUX_FRAME_HEADER_SIZE;
@@ -443,13 +442,13 @@ static void recv_cb(struct mux_stream *restrict s)
 		if (err != 0) {
 			if (err == EAGAIN || err == EWOULDBLOCK ||
 			    err == ENOBUFS || err == ENOMEM) {
-				mux_frame_put(&s->session->pool, frame);
-				return; /* wait for EV_READ */
+				session_frame_free(s->session, frame);
+				return false; /* wait for EV_READ */
 			}
 			LOGE_F("recv [fd:%d]: (%d) %s", fd, err, strerror(err));
-			mux_frame_put(&s->session->pool, frame);
+			session_frame_free(s->session, frame);
 			stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
-			return;
+			return false;
 		}
 		nread = nrecv; /* 0 means EOF */
 	}
@@ -460,12 +459,13 @@ static void recv_cb(struct mux_stream *restrict s)
 
 		stream_queue_send(s, frame);
 	} else {
-		mux_frame_put(&s->session->pool, frame);
+		session_frame_free(s->session, frame);
 		s->rx_eof = true;
 		STREAM_LOG(VERBOSE, s, "local recv: EOF");
 	}
 
 	session_eager_flush(s->session, s);
+	return nread > 0;
 }
 
 static void local_on_connected(struct mux_stream *restrict s)
@@ -508,7 +508,8 @@ static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		VERBOSE, s, "stream socket: state=%s revents=%d",
 		stream_state_str[s->state], revents);
 	if (revents & EV_READ) {
-		recv_cb(s);
+		while (recv_cb(s) && s->state != STREAM_CLOSED) {
+		}
 	}
 	if ((revents & EV_WRITE) && s->state != STREAM_CLOSED) {
 		send_cb(s);
@@ -931,7 +932,7 @@ void stream_check_ack(struct mux_stream *restrict s)
 		 * for pure control-frame emission via ctrl_pending list. */
 		sched_ctrl_enqueue(s->session, s);
 		s->session->wire.tx_pending = true;
-		session_update_watcher(s->session);
+		session_notify(s->session);
 	} else if (s->sched_queue != SCHED_QUEUE_DRR) {
 		sched_wake(s->session, s);
 	}

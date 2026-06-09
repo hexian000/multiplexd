@@ -8,11 +8,38 @@
 
 #include "mux/frame.h"
 
+#include "algo/hashtable.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Prebuilt stream-table configuration.  Test translation units that only
+ * need stream-table operations can link frame.c without pulling in the full
+ * session state machine. */
+static uint_fast32_t stream_id_hash(const void *key, const uint_fast32_t seed)
+{
+	const uint_least16_t id = (uint_least16_t)(uintptr_t)key;
+	uint_fast32_t hash = seed;
+	hash ^= (uint_fast32_t)(id & 0xffu);
+	hash *= (uint_fast32_t)0x01000193u;
+	hash ^= (uint_fast32_t)((id >> 8) & 0xffu);
+	hash *= (uint_fast32_t)0x01000193u;
+	return hash;
+}
+
+static bool stream_id_eq(const void *a, const void *b)
+{
+	return a == b;
+}
+
+const struct table_opts mux_stream_table_opts = {
+	.hash = stream_id_hash,
+	.eq = stream_id_eq,
+	.flags = TABLE_FAST,
+};
 
 bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 {

@@ -66,14 +66,9 @@ conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 	return true;
 }
 
-static struct identity_peer *identity_listen_upsert(
+static struct identity_peer *identity_listen_add(
 	struct config *restrict conf, const char *restrict id, size_t id_len)
 {
-	for (size_t i = 0; i < conf->identity.peers_count; i++) {
-		if (strcmp(conf->identity.peers[i].id, id) == 0) {
-			return &conf->identity.peers[i];
-		}
-	}
 	const size_t n = conf->identity.peers_count;
 	if (n >= SIZE_MAX / sizeof(*conf->identity.peers)) {
 		LOGOOM();
@@ -102,33 +97,19 @@ static bool identity_listen_cb(
 	struct config *restrict conf, const char *restrict key, size_t key_len,
 	char *restrict val, size_t val_len)
 {
-	if (key[0] == '-') {
-		return true;
-	}
-	size_t consumed = val_len;
-	struct json_val v = json_parse(val, &consumed);
-	if (v.type != JSON_STRING) {
+	char *s;
+	size_t slen;
+	if (!json_parse_string(val, val_len, &s, &slen)) {
 		LOGE_F("identity.listen.%s: must be a string", key);
 		return false;
 	}
-	/* Reject trailing non-whitespace content after the parsed value */
-	while (consumed < val_len) {
-		if (!json_iswhitespace((unsigned char)val[consumed])) {
-			break;
-		}
-		consumed++;
-	}
-	if (consumed != val_len) {
-		LOGE_F("identity.listen.%s: unexpected trailing content", key);
-		return false;
-	}
 	struct identity_peer *restrict p =
-		identity_listen_upsert(conf, key, key_len);
+		identity_listen_add(conf, key, key_len);
 	if (p == NULL) {
 		return false;
 	}
 	free(p->listen);
-	p->listen = strndup(v.str, v.len);
+	p->listen = strndup(s, slen);
 	if (p->listen == NULL) {
 		LOGOOM();
 		return false;
@@ -136,14 +117,9 @@ static bool identity_listen_cb(
 	return true;
 }
 
-static struct conf_identity_authcert *identity_authcert_upsert(
+static struct conf_identity_authcert *identity_authcert_add(
 	struct config *restrict conf, const char *restrict id, size_t id_len)
 {
-	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
-		if (strcmp(conf->identity.authcerts[i].peer, id) == 0) {
-			return &conf->identity.authcerts[i];
-		}
-	}
 	const size_t n = conf->identity.authcerts_count;
 	if (n >= SIZE_MAX / sizeof(*conf->identity.authcerts)) {
 		LOGOOM();
@@ -176,9 +152,6 @@ static bool identity_authcert_cb(
 	struct config *restrict conf, const char *restrict key, size_t key_len,
 	char *restrict val, size_t val_len)
 {
-	if (key[0] == '-') {
-		return true;
-	}
 	size_t consumed = val_len;
 	struct json_val v = json_parse(val, &consumed);
 	if (v.type != JSON_ARRAY) {
@@ -198,18 +171,10 @@ static bool identity_authcert_cb(
 	}
 
 	struct conf_identity_authcert *restrict ac =
-		identity_authcert_upsert(conf, key, key_len);
+		identity_authcert_add(conf, key, key_len);
 	if (ac == NULL) {
 		return false;
 	}
-
-	/* Free any previously-parsed certs (upsert may replace existing). */
-	for (size_t i = 0; i < ac->certs_count; i++) {
-		free(ac->certs[i]);
-	}
-	free(ac->certs);
-	ac->certs = NULL;
-	ac->certs_count = 0;
 
 	/* Parse each string element in the array. */
 	json_iter it = v.iter;
@@ -341,21 +306,25 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	cfg->mux.idle_timeout = (int)obj->mux.idle_timeout;
 	cfg->mux.resume_timeout = (int)obj->mux.resume_timeout;
 	{
-		const uintmax_t v = obj->mux.session_window;
-		if (v == 0) {
+		const uintmax_t session_window_bytes = obj->mux.session_window;
+		if (session_window_bytes == 0) {
 			cfg->mux.session_window = 0;
 		} else {
+			const uintmax_t session_window_frames =
+				session_window_bytes / MUX_WINDOW_UNIT;
 			cfg->mux.session_window = (int)CLAMP(
-				v / MUX_MAX_PAYLOAD_SIZE, 4, UINT16_MAX);
+				session_window_frames, 4, UINT16_MAX);
 		}
 	}
 	{
-		const uintmax_t v = obj->mux.stream_window;
-		if (v == 0) {
+		const uintmax_t stream_window_bytes = obj->mux.stream_window;
+		if (stream_window_bytes == 0) {
 			cfg->mux.stream_window = 0;
 		} else {
-			cfg->mux.stream_window = (int)CLAMP(
-				v / MUX_MAX_PAYLOAD_SIZE, 4, UINT16_MAX);
+			const uintmax_t stream_window_frames =
+				stream_window_bytes / MUX_WINDOW_UNIT;
+			cfg->mux.stream_window =
+				(int)CLAMP(stream_window_frames, 4, UINT16_MAX);
 		}
 	}
 	cfg->mux.mem_pressure_hi = (int)obj->mux.mem_pressure.hi;
@@ -407,9 +376,9 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	/* identity.listen: raw JSON fragment pointing into the json buffer.
 	 * Walk it now and strdup each peer address before json_free_conf. */
 	if (obj->identity.listen_json.str != NULL) {
-		struct json_val parsed = json_parse(
-			obj->identity.listen_json.str,
-			&(size_t){ obj->identity.listen_json.len });
+		size_t frag_len = obj->identity.listen_json.len;
+		struct json_val parsed =
+			json_parse(obj->identity.listen_json.str, &frag_len);
 		if (parsed.type != JSON_OBJECT) {
 			LOGE("identity.listen: must be an object");
 			return false;
@@ -438,9 +407,9 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 
 	/* identity.authcerts: raw JSON fragment → conf_identity_authcert[] */
 	if (obj->identity.authcerts_json.str != NULL) {
-		struct json_val parsed = json_parse(
-			obj->identity.authcerts_json.str,
-			&(size_t){ obj->identity.authcerts_json.len });
+		size_t frag_len = obj->identity.authcerts_json.len;
+		struct json_val parsed =
+			json_parse(obj->identity.authcerts_json.str, &frag_len);
 		if (parsed.type != JSON_OBJECT) {
 			LOGE("identity.authcerts: must be an object");
 			return false;
@@ -579,30 +548,6 @@ static bool conf_check(struct config *restrict conf)
 		       " throttle range is empty",
 		       conf->startup_limit_start, conf->startup_limit_full);
 		return false;
-	}
-	/* Validate identity peers: no duplicate peer IDs. */
-	for (size_t i = 0; i < conf->identity.peers_count; i++) {
-		for (size_t j = i + 1; j < conf->identity.peers_count; j++) {
-			if (strcmp(conf->identity.peers[i].id,
-				   conf->identity.peers[j].id) == 0) {
-				LOGE_F("duplicate identity.listen peer id: \"%s\"",
-				       conf->identity.peers[i].id);
-				return false;
-			}
-		}
-	}
-	/* Validate identity authcerts: no duplicate peer identities. */
-	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
-		for (size_t j = i + 1; j < conf->identity.authcerts_count;
-		     j++) {
-			if (strcmp(conf->identity.authcerts[i].peer,
-				   conf->identity.authcerts[j].peer) == 0) {
-				LOGE_F("duplicate identity.authcerts"
-				       " peer: \"%s\"",
-				       conf->identity.authcerts[i].peer);
-				return false;
-			}
-		}
 	}
 	/* Require identity.claim when identity entries are configured. */
 	if ((conf->identity.mux_connect_count > 0 ||
@@ -949,16 +894,13 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		max_startups = startups_buf;
 	}
 
-	/* Convert window fields from internal frame units to bytes. */
 	const uintmax_t session_window_bytes =
 		conf->mux.session_window != 0 ?
-			(uintmax_t)conf->mux.session_window *
-				MUX_MAX_PAYLOAD_SIZE :
+			(uintmax_t)conf->mux.session_window * MUX_WINDOW_UNIT :
 			0;
 	const uintmax_t stream_window_bytes =
 		conf->mux.stream_window != 0 ?
-			(uintmax_t)conf->mux.stream_window *
-				MUX_MAX_PAYLOAD_SIZE :
+			(uintmax_t)conf->mux.stream_window * MUX_WINDOW_UNIT :
 			0;
 
 	const char *const type_str =

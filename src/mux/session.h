@@ -69,6 +69,11 @@ enum session_state {
 struct sched_ctx {
 	/* Per-session stream table, keyed by uint_least16_t stream ID. */
 	struct hashtable *streams;
+	/* Single-entry lookup cache for sched_find_stream.  Frame bursts target
+	 * the same stream, so caching the last hit skips the hash lookup.  The
+	 * cached stream's own id is the key; cleared whenever a stream leaves
+	 * the table (sched_remove_stream / sched_free_streams). */
+	struct mux_stream *cache_stream;
 	/* Number of CLOSED (tombstone) streams currently in the stream table.
 	 * These linger for MUX_TOMBSTONE_PERIOD_S but are no longer "live".
 	 * Used to exclude tombstones from the max_streams admission gate. */
@@ -146,6 +151,11 @@ struct mux_session {
 	struct mux_config conf;
 	/* Frame allocator; set at creation time and never changed. */
 	struct mux_frame_allocator pool;
+	/* One-deep frame cache layered over pool; holds at most one idle frame
+	 * so the steady alloc/free churn of the data path rarely reaches the
+	 * cross-thread server allocator.  Accessed only via session_frame_alloc
+	 * / session_frame_free; released by session_cleanup. */
+	struct mux_frame *frame_spare;
 	/* Non-owning pointer to the session log tag buffer; set at creation time. */
 	char *tag;
 	/* Pointer block into server_stats; NULL pointers are silently skipped. */
@@ -259,6 +269,34 @@ struct mux_session {
 	};
 };
 
+/* Acquire a frame for the session, reusing the one-deep spare when present.
+ * The returned frame carries the same freshly-reset state as mux_frame_get. */
+static inline struct mux_frame *
+session_frame_alloc(struct mux_session *restrict ss)
+{
+	struct mux_frame *const frame = ss->frame_spare;
+	if (frame == NULL) {
+		return mux_frame_get(&ss->pool);
+	}
+	ss->frame_spare = NULL;
+	frame->pos = 0;
+	frame->len = 0;
+	frame->next = NULL;
+	return frame;
+}
+
+/* Release a frame back to the session, retaining it as the spare when the
+ * cache slot is free; otherwise it returns to the shared allocator. */
+static inline void session_frame_free(
+	struct mux_session *restrict ss, struct mux_frame *restrict frame)
+{
+	if (ss->frame_spare == NULL) {
+		ss->frame_spare = frame;
+		return;
+	}
+	mux_frame_put(&ss->pool, frame);
+}
+
 #define MUX_LOG_F(level, ss, format, ...)                                      \
 	do {                                                                   \
 		if (!LOGLEVEL(level)) {                                        \
@@ -311,7 +349,7 @@ void session_discard_stream_frames(
 	struct mux_session *restrict ss, uint_fast16_t stream_id);
 
 /* Recompute and apply the correct EV_READ/EV_WRITE mask for the mux socket watcher. */
-void session_update_watcher(struct mux_session *restrict ss);
+void session_notify(struct mux_session *restrict ss);
 
 /** Prebuilt table_opts for the per-session stream table, keyed by stream ID.
  * Uses a 16-bit integer hash suitable for the stream-ID key space. */

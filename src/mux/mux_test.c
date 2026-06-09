@@ -1080,10 +1080,10 @@ cleanup:
 			frame = NULL;
 		}
 		fx.cli->wire.tx_pending = false;
-		session_update_watcher(fx.cli);
+		session_notify(fx.cli);
 	}
 	if (fx.srv != NULL) {
-		session_update_watcher(fx.srv);
+		session_notify(fx.srv);
 	}
 	fixture_teardown(&fx);
 }
@@ -3090,8 +3090,8 @@ static void test_pump_unacked_no_wait(struct mux_test_fixture *restrict fx)
 		}
 	}
 
-	session_update_watcher(fx->cli);
-	session_update_watcher(fx->srv);
+	session_notify(fx->cli);
+	session_notify(fx->srv);
 }
 
 /* -------------------------------------------------------------------------

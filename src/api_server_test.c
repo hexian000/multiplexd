@@ -1088,7 +1088,7 @@ T_DECLARE_CASE(test_connection_close_on_non_keepalive_request)
 
 int main(void)
 {
-	util_loadlibs();
+	loadlibs();
 
 	T_DECLARE_CTX(t);
 	T_RUN_CASE(t, test_healthy_get);
@@ -1111,6 +1111,6 @@ int main(void)
 	T_RUN_CASE(t, test_not_found_keepalive_followed_by_success);
 	T_RUN_CASE(t, test_connection_close_on_non_keepalive_request);
 
-	util_unloadlibs();
+	unloadlibs();
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -3,6 +3,9 @@
 
 #include "tlsutil.h"
 
+#define UTILS_MEASURE_H
+#include "io/io.h"
+#include "os/clock.h"
 #include "utils/testing.h"
 
 #include <stdlib.h>
@@ -589,6 +592,218 @@ T_DECLARE_CASE(test_tls_peer_cert_der_after_handshake)
 	rm_tmpdir(tmpl);
 }
 
+/* ---- throughput benchmark: plain TCP baseline ---- */
+
+static int tcp_bench_fds[2] = { -1, -1 };
+
+static void tcp_bench_teardown(void)
+{
+	if (tcp_bench_fds[0] >= 0) {
+		close(tcp_bench_fds[0]);
+		close(tcp_bench_fds[1]);
+		tcp_bench_fds[0] = -1;
+		tcp_bench_fds[1] = -1;
+	}
+}
+
+static bool tcp_bench_setup(void)
+{
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, tcp_bench_fds) != 0) {
+		return false;
+	}
+	return true;
+}
+
+T_DECLARE_BENCH(bench_tcp_throughput)
+{
+	unsigned char send_buf[IO_BUFSIZE];
+	unsigned char recv_buf[IO_BUFSIZE];
+	memset(send_buf, 0xA5, sizeof(send_buf));
+
+	for (uint_fast64_t i = 0; i < _b_->N; i++) {
+		size_t n = sizeof(send_buf);
+		T_CHECK(send(tcp_bench_fds[1], send_buf, n, 0) == (ssize_t)n);
+
+		n = sizeof(recv_buf);
+		T_CHECK(recv(tcp_bench_fds[0], recv_buf, n, 0) == (ssize_t)n);
+	}
+}
+
+/* ---- throughput benchmark: RSA 4096, production-matching TLS config ----
+ *
+ * Uses built-in static certificate and key so the benchmark works with
+ * both OpenSSL and mbedTLS backends (no gencerts dependency).  Cert and key
+ * are passed in-memory (no '@' prefix) and the same self-signed cert serves
+ * as the authorized peer certificate for mutual authentication. */
+
+static char bench_cert_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIIFKjCCAxKgAwIBAgIUM70vOlOUSVk9dQ7tbW/ih/8sKCwwDQYJKoZIhvcNAQEL\n"
+	"BQAwFzEVMBMGA1UEAwwMdGVzdC5leGFtcGxlMCAXDTI2MDYwOTAyNDQ0NVoYDzIx\n"
+	"MjYwNTE2MDI0NDQ1WjAXMRUwEwYDVQQDDAx0ZXN0LmV4YW1wbGUwggIiMA0GCSqG\n"
+	"SIb3DQEBAQUAA4ICDwAwggIKAoICAQC+SzjGbGTgjqsKQCEGYS3hFnO1hBoy1VQ8\n"
+	"zypDdzFLyluGRZMym7Qb5W4dXZiSVTDFw8B+/GkB6uceOaVYLXIe3f96+TucfBJw\n"
+	"Wh1TFc6toUP315rjauntWqTSOQQe3apuP3z9WyU+tXkaxOOVaayRJx79cPxqqLFr\n"
+	"rDIUi2JBLOqN1dxwh6XYE6ny3wE27SOXB1J8gDVyl4gW9tNYRrZWVoTe21m2apl6\n"
+	"/9T+Mn5GCZgjCiF21e/4Nq9oWXHS7K6P561XlfdWnPGmRNzcAnguhIIe3z8qbwDH\n"
+	"1M0BtLiS84DIqJ0cZ3Jkl7UIKKCJrHS7oCLIMdbe9qVpmL6QLpMolNS0cznJgVo2\n"
+	"eAGjQDt+b1nC9R/dT2kukvyltPEz4Ybd9CDzoP3MyDSV08tZNLeNoN3ezRXsEYE2\n"
+	"/RVRGX0rJ35iqxKtj6hEip6HhQvBEQX1SiUHLAw0baozaQwoGNzDO/QXffAADp/W\n"
+	"F2vG2VB6we1YXvFnwBKvPNplvTRHBPTXpVX2MQMXwKus2IBTNFZp+mW8mCliYWop\n"
+	"zfVSamrV1aNXWn52Nx5iNVQ6JQzjziAWXEn58hWorkUi0omuKHTR326KPLkG7IpW\n"
+	"agolWR89JHPaSM+ffRzgobbKHwNwhABRT3Ye9BqfxX6Rn0bwaeCR6t0or8ru7Dxs\n"
+	"dq/TW93U5wIDAQABo2wwajAdBgNVHQ4EFgQU3hgHVZAn/Lh/xbRhabVaEGQbxc8w\n"
+	"HwYDVR0jBBgwFoAU3hgHVZAn/Lh/xbRhabVaEGQbxc8wDwYDVR0TAQH/BAUwAwEB\n"
+	"/zAXBgNVHREEEDAOggx0ZXN0LmV4YW1wbGUwDQYJKoZIhvcNAQELBQADggIBAIWF\n"
+	"in4MUtRj4R6GYGtjjnWt1m9aN4I/w22kdD183G07uTJZ+i545DdFNglt8ZIO1f2F\n"
+	"eQ67wQfxIeFeZrr4x6wA7B+RVwX/mRuj3aby5QXhNDVkjAp2su9GRPyIe3jXPDv/\n"
+	"/quE4Oufa0kE8HuvqPIOSO6UYWkNAP81LDoyDhyoadB5+mIuxpM3+NyKh6AK2g8n\n"
+	"Ran7GYKtMUrL7ryRoJyPcpFk/QyrWAMCbmO3p2Rxx5sj3RtL+6HNYTqNij5qsB+S\n"
+	"zmdmX8XyAW5Bgog3hrnrTn1j1AaxNgEczsjdDmaGQiYKscyLwMe38DI8NP/rPP4X\n"
+	"rMH8B/TLl+uRwY1THRtkyHI6y4ZnGzmdEBf001J/KUfBFnLxHZBrJwMYbgqLWjba\n"
+	"nVXS5GXAtt7Mmz2tKQo7gCHUjgByWcnun3qMGcEoCkkTaqi0pxf2844BYyy73VRT\n"
+	"XdPJnfOOHDhuwkkeOfVJbPnfYFAAd8qMpmzBQvz4Clz2q4plB7odyWPSGwvLbFYs\n"
+	"sdwuTXnyLqCrB3K0uMBlKr7xeWiVHUfe5oGCwgp7TjV/2AmKUxNzdg41d3Fn7TPK\n"
+	"CncDeSmMy1elKbutfBvWvl8d7C0A9viO49Vy0CVR41uQnF09bzdFTYoaOrX8c+w4\n"
+	"VtiUoGP5D91X1vhTixpq4BqoHRkKVQpZ0Z/9386J\n"
+	"-----END CERTIFICATE-----\n";
+
+static char bench_key_pem[] =
+	"-----BEGIN PRIVATE KEY-----\n"
+	"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\n"
+	"NL+YLwobqSZhkl4iZWt2wGODitzp/aQ=\n"
+	"-----END PRIVATE KEY-----\n";
+
+static struct tls_connection *bench_srv_conn;
+static struct tls_connection *bench_cli_conn;
+static struct tls_context *bench_srv_ctx;
+static struct tls_context *bench_cli_ctx;
+static int bench_fds[2] = { -1, -1 };
+
+static void bench_teardown(void)
+{
+	if (bench_cli_conn != NULL && bench_srv_conn != NULL) {
+		(void)drive_shutdown(bench_cli_conn, bench_srv_conn, 20);
+	}
+	tls_conn_free(bench_cli_conn);
+	bench_cli_conn = NULL;
+	tls_conn_free(bench_srv_conn);
+	bench_srv_conn = NULL;
+	tls_ctx_free(bench_cli_ctx);
+	bench_cli_ctx = NULL;
+	tls_ctx_free(bench_srv_ctx);
+	bench_srv_ctx = NULL;
+	if (bench_fds[0] >= 0) {
+		close(bench_fds[0]);
+		close(bench_fds[1]);
+		bench_fds[0] = -1;
+		bench_fds[1] = -1;
+	}
+}
+
+static bool bench_setup(void)
+{
+	char *authcerts[] = { bench_cert_pem };
+
+	bench_srv_ctx = tls_ctx_server(
+		bench_cert_pem, bench_key_pem, authcerts, 1, NULL);
+	bench_cli_ctx = tls_ctx_client(
+		bench_cert_pem, bench_key_pem, authcerts, 1, NULL);
+	if (bench_srv_ctx == NULL || bench_cli_ctx == NULL) {
+		goto fail;
+	}
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, bench_fds) != 0) {
+		goto fail;
+	}
+	if (fcntl(bench_fds[0], F_SETFL, O_NONBLOCK) != 0 ||
+	    fcntl(bench_fds[1], F_SETFL, O_NONBLOCK) != 0) {
+		goto fail;
+	}
+
+	bench_srv_conn = tls_accept(bench_srv_ctx, bench_fds[0]);
+	bench_cli_conn = tls_connect(bench_cli_ctx, bench_fds[1]);
+	if (bench_srv_conn == NULL || bench_cli_conn == NULL) {
+		goto fail;
+	}
+	if (!drive_handshake(bench_srv_conn, bench_cli_conn, 50)) {
+		goto fail;
+	}
+
+	return true;
+
+fail:
+	bench_teardown();
+	return false;
+}
+
+T_DECLARE_BENCH(bench_tls_throughput)
+{
+	unsigned char send_buf[IO_BUFSIZE];
+	unsigned char recv_buf[IO_BUFSIZE];
+	memset(send_buf, 0xA5, sizeof(send_buf));
+
+	for (uint_fast64_t i = 0; i < _b_->N; i++) {
+		size_t n = sizeof(send_buf);
+		T_CHECK(tls_send(bench_cli_conn, send_buf, &n) ==
+			TLS_ERROR_NONE);
+		T_CHECK(n == sizeof(send_buf));
+
+		n = sizeof(recv_buf);
+		T_CHECK(tls_recv(bench_srv_conn, recv_buf, &n) ==
+			TLS_ERROR_NONE);
+		T_CHECK(n == sizeof(send_buf));
+	}
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -605,6 +820,14 @@ int main(void)
 	T_RUN_CASE(t, test_tls_load_key_from_memory_succeeds);
 	T_RUN_CASE(t, test_tls_full_handshake_and_io);
 	T_RUN_CASE(t, test_tls_peer_cert_der_after_handshake);
+	if (getenv("BENCH") != NULL && tcp_bench_setup()) {
+		T_RUN_BENCH(t, bench_tcp_throughput);
+		tcp_bench_teardown();
+	}
+	if (getenv("BENCH") != NULL && bench_setup()) {
+		T_RUN_BENCH(t, bench_tls_throughput);
+		bench_teardown();
+	}
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 

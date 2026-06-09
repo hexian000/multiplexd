@@ -609,6 +609,13 @@ enum tls_error tls_recv(
 	return map_io_error(ret, "mbedtls_ssl_read");
 }
 
+bool tls_has_pending(const struct tls_connection *const conn)
+{
+	const struct tls_conn_impl *const c =
+		(const struct tls_conn_impl *)conn;
+	return mbedtls_ssl_get_bytes_avail(&c->ssl) > 0;
+}
+
 int tls_shutdown(
 	struct tls_connection *restrict conn, bool *restrict want_read,
 	bool *restrict want_write)

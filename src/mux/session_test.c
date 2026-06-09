@@ -143,6 +143,12 @@ static void teardown_fixture(struct session_fixture *restrict fx)
 	mux_frame_ring_free(&fx->ss.unacked, &fx->ss.pool);
 	fx->ss.unacked_frames = 0;
 	fx->ss.retransmit_off = SIZE_MAX;
+	/* Drain the one-deep frame spare so ASAN does not flag it as a leak.
+	 * session_cleanup frees it in production; tests are self-contained. */
+	if (fx->ss.frame_spare != NULL) {
+		mux_frame_put(&fx->ss.pool, fx->ss.frame_spare);
+		fx->ss.frame_spare = NULL;
+	}
 	if (fx->fds[0] >= 0) {
 		close(fx->fds[0]);
 		fx->fds[0] = -1;

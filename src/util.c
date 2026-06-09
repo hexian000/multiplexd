@@ -75,7 +75,7 @@ int socket_user_timeout(const int fd, const int ms)
 #define PATH_SEPARATOR '/'
 #endif
 
-void util_init(int argc, char *const *argv)
+void init(int argc, char *const *argv)
 {
 	UNUSED(argc);
 	UNUSED(argv);
@@ -101,7 +101,7 @@ void util_init(int argc, char *const *argv)
 	crashhandler_install();
 }
 
-void util_loadlibs(void)
+void loadlibs(void)
 {
 	srand64((uint_fast64_t)time(NULL));
 
@@ -112,7 +112,7 @@ void util_loadlibs(void)
 #endif
 }
 
-void util_unloadlibs(void)
+void unloadlibs(void)
 {
 	LOGD("library cleanup complete");
 }

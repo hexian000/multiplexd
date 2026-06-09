@@ -91,7 +91,7 @@ static bool identity_listener_add(
 		const size_t new_cap =
 			sl->cap_tunnels > 0 ? sl->cap_tunnels * 2 : 4;
 		struct tunnel **arr =
-			realloc(sl->tunnels, new_cap * sizeof(*arr));
+			realloc(sl->tunnels, new_cap * sizeof(struct tunnel *));
 		if (arr == NULL) {
 			LOGOOM();
 			return false;

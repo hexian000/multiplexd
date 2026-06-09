@@ -47,6 +47,100 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def check_port_available(port: int, bind_addr: str = "127.0.0.1") -> bool:
+    """Return True if nothing is listening on *bind_addr:port*."""
+    try:
+        proc = subprocess.run(
+            ["ss", "-tlnp"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True  # cannot determine — assume available
+    needle = "%s:%d" % (bind_addr, port)
+    for line in proc.stdout.splitlines():
+        if needle in line:
+            return False
+    return True
+
+
+def _parse_listening_pids(port: int, bind_addr: str = "127.0.0.1") -> List[int]:
+    """Return list of PIDs listening on *bind_addr:port*."""
+    pids: List[int] = []
+    try:
+        proc = subprocess.run(
+            ["ss", "-tlnp"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return pids
+    needle = "%s:%d" % (bind_addr, port)
+    for line in proc.stdout.splitlines():
+        if needle not in line:
+            continue
+        for part in line.split():
+            if part.startswith("pid="):
+                pid_str = part.split("=", 1)[1].rstrip(",")
+                try:
+                    pids.append(int(pid_str))
+                except ValueError:
+                    pass
+    return pids
+
+
+def kill_leftover_on_ports(
+        ports: Sequence[tuple[int, str]],
+) -> int:
+    """Kill processes holding any of the *ports* (port, description) pairs.
+    Returns count of processes terminated."""
+    killed_pids: set[int] = set()
+    for port, desc in ports:
+        for pid in _parse_listening_pids(port):
+            if pid == os.getpid():
+                continue
+            if pid in killed_pids:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed_pids.add(pid)
+                log("terminated leftover pid %d on port %d (%s)" % (pid, port, desc))
+            except OSError:
+                pass
+    if killed_pids:
+        time.sleep(1.0)
+    return len(killed_pids)
+
+
+def verify_process_running(
+        proc: subprocess.Popen[str],
+        name: str,
+        *,
+        log_path: Optional[Path] = None,
+        wait_seconds: float = 0.5,
+) -> None:
+    """Wait briefly and check that *proc* is still alive; raise on early exit."""
+    time.sleep(wait_seconds)
+    ret = proc.poll()
+    if ret is None:
+        return  # still running
+    # Collect tail of log for diagnostics
+    tail_text = ""
+    if log_path is not None and log_path.exists():
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+            tail_text = "\n".join(lines[-20:])
+        except Exception:
+            pass
+    raise SystemExit(
+        "%s exited early (status %d). Last log lines:\n%s"
+        % (name, ret, tail_text or "(no log available)")
+    )
+
+
 def quote_command(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
@@ -770,12 +864,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.keep_profile_data:
                 removed = remove_stale_profile_data(profile_build_dir)
                 log("removed %d stale gprof files" % removed)
-            server_log = (profile_build_dir /
-                          "multiplexd-server.log").open("w", encoding="utf-8")
-            client_log = (profile_build_dir /
-                          "multiplexd-client.log").open("w", encoding="utf-8")
-            iperf_server_log = (
-                profile_build_dir / "iperf3-server.log").open("w", encoding="utf-8")
+
+            # --- pre-flight: port availability & leftover cleanup ---
+            required_ports = [
+                (5201, "iperf3 server"),
+                (5202, "multiplexd client listen"),
+                (5203, "multiplexd server listen"),
+                (8443, "multiplexd mux listen"),
+                (9081, "multiplexd api listen"),
+            ]
+            unavailable: list[str] = []
+            for port, desc in required_ports:
+                if not check_port_available(port):
+                    unavailable.append("%d (%s)" % (port, desc))
+            if unavailable:
+                log("ports in use: %s — attempting cleanup" % ", ".join(unavailable))
+                removed = kill_leftover_on_ports(required_ports)
+                if removed:
+                    log("cleaned up %d leftover process(es); re-checking ports" % removed)
+                    time.sleep(0.5)
+                still_unavailable: list[str] = []
+                for port, desc in required_ports:
+                    if not check_port_available(port):
+                        still_unavailable.append("%d (%s)" % (port, desc))
+                if still_unavailable:
+                    raise SystemExit(
+                        "required ports still in use after cleanup: %s\n"
+                        "Please stop the conflicting processes and try again."
+                        % ", ".join(still_unavailable)
+                    )
+
+            server_log_path = profile_build_dir / "multiplexd-server.log"
+            client_log_path = profile_build_dir / "multiplexd-client.log"
+            iperf_server_log_path = profile_build_dir / "iperf3-server.log"
+            server_log = server_log_path.open("w", encoding="utf-8")
+            client_log = client_log_path.open("w", encoding="utf-8")
+            iperf_server_log = iperf_server_log_path.open(
+                "w", encoding="utf-8")
             benchmark_stdout_path = profile_build_dir / "iperf3-parallel.stdout"
             benchmark_stderr_path = profile_build_dir / "iperf3-parallel.stderr"
 
@@ -786,6 +911,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 stdout=iperf_server_log,
                 stderr=subprocess.STDOUT,
                 text=True,
+            )
+            verify_process_running(
+                iperf_server_proc,
+                "iperf3 server",
+                log_path=iperf_server_log_path,
             )
 
             server_env = os.environ.copy()
@@ -801,6 +931,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
+            verify_process_running(
+                server_proc,
+                "multiplexd server",
+                log_path=server_log_path,
+            )
 
             client_env = os.environ.copy()
             client_env["GMON_OUT_PREFIX"] = str(
@@ -815,8 +950,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
+            verify_process_running(
+                client_proc,
+                "multiplexd client",
+                log_path=client_log_path,
+            )
 
-            time.sleep(args.startup_wait)
+            # additional grace period for full service readiness
+            remaining_wait = max(0.0, args.startup_wait - 1.5)
+            if remaining_wait > 0:
+                time.sleep(remaining_wait)
             benchmark_output = run_benchmark(
                 benchmark_commands,
                 cwd=profile_build_dir,
