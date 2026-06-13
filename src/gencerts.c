@@ -181,7 +181,7 @@ static bool create_certificate(
 		X509_free(cert);
 		return false;
 	}
-	const intmax_t now = clock_unix_ns();
+	const int_fast64_t now = clock_unix_ns();
 	if (ASN1_INTEGER_set_int64(serial, now) == 0) {
 		LOG_SSLERROR("ASN1_INTEGER_set");
 		ASN1_INTEGER_free(serial);

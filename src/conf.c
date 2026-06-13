@@ -158,17 +158,6 @@ static bool identity_authcert_cb(
 		LOGE_F("identity.authcerts.%s: must be an array", key);
 		return false;
 	}
-	while (consumed < val_len) {
-		if (!json_iswhitespace((unsigned char)val[consumed])) {
-			break;
-		}
-		consumed++;
-	}
-	if (consumed != val_len) {
-		LOGE_F("identity.authcerts.%s: unexpected trailing content",
-		       key);
-		return false;
-	}
 
 	struct conf_identity_authcert *restrict ac =
 		identity_authcert_add(conf, key, key_len);
@@ -181,7 +170,9 @@ static bool identity_authcert_cb(
 	char *elem;
 	size_t elem_len;
 	size_t count = 0;
-	while (json_arr_next(val, &val_len, &it, &elem, &elem_len)) {
+	int r;
+	while ((r = json_arr_next(val, &val_len, &it, &elem, &elem_len)) ==
+	       JSON_NEXT_ITEM) {
 		char *cert_str;
 		size_t cert_len;
 		if (!json_parse_string(elem, elem_len, &cert_str, &cert_len)) {
@@ -190,8 +181,8 @@ static bool identity_authcert_cb(
 			       key, count);
 			return false;
 		}
-		char **new_certs =
-			realloc(ac->certs, (count + 1) * sizeof(*ac->certs));
+		char **new_certs = (char **)realloc(
+			(void *)ac->certs, (count + 1) * sizeof(*ac->certs));
 		if (new_certs == NULL) {
 			LOGOOM();
 			return false;
@@ -203,8 +194,23 @@ static bool identity_authcert_cb(
 			return false;
 		}
 		count++;
+		/* Keep the count in sync so conf_free releases every element
+		 * even when a later iteration fails. */
+		ac->certs_count = count;
 	}
-	ac->certs_count = count;
+	if (r != JSON_NEXT_END) {
+		LOGE_F("identity.authcerts.%s: malformed array", key);
+		return false;
+	}
+	/* Reject trailing content after the closing ']'. */
+	while (it < val_len && json_iswhitespace((unsigned char)val[it])) {
+		it++;
+	}
+	if (it != val_len) {
+		LOGE_F("identity.authcerts.%s: unexpected trailing content",
+		       key);
+		return false;
+	}
 	return true;
 }
 
@@ -230,6 +236,7 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	STRNDUP_FIELD(cfg->mux_connect, obj->mux_connect);
 	STRNDUP_FIELD(cfg->listen, obj->listen);
 	STRNDUP_FIELD(cfg->connect, obj->connect);
+	STRNDUP_FIELD(cfg->log, obj->log);
 #undef STRNDUP_FIELD
 
 	cfg->loglevel = (int)obj->loglevel;
@@ -388,16 +395,26 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		size_t key_len;
 		char *val;
 		size_t val_len;
-		while (json_obj_next(
-			obj->identity.listen_json.str,
-			&obj->identity.listen_json.len, &it, &key, &key_len,
-			&val, &val_len)) {
+		int r;
+		while ((r = json_obj_next(
+				obj->identity.listen_json.str,
+				&obj->identity.listen_json.len, &it, &key,
+				&key_len, &val, &val_len)) == JSON_NEXT_ITEM) {
 			if (!identity_listen_cb(
 				    cfg, key, key_len, val, val_len)) {
 				return false;
 			}
 		}
+		if (r != JSON_NEXT_END) {
+			LOGE("identity.listen: malformed object");
+			return false;
+		}
 		/* Reject trailing content after the closing '}' */
+		while (it < obj->identity.listen_json.len &&
+		       json_iswhitespace((unsigned char)obj->identity
+						 .listen_json.str[it])) {
+			it++;
+		}
 		if (it != obj->identity.listen_json.len) {
 			LOGE("identity.listen: unexpected trailing content"
 			     " after object");
@@ -419,14 +436,24 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		size_t key_len;
 		char *val;
 		size_t val_len;
-		while (json_obj_next(
-			obj->identity.authcerts_json.str,
-			&obj->identity.authcerts_json.len, &it, &key, &key_len,
-			&val, &val_len)) {
+		int r;
+		while ((r = json_obj_next(
+				obj->identity.authcerts_json.str,
+				&obj->identity.authcerts_json.len, &it, &key,
+				&key_len, &val, &val_len)) == JSON_NEXT_ITEM) {
 			if (!identity_authcert_cb(
 				    cfg, key, key_len, val, val_len)) {
 				return false;
 			}
+		}
+		if (r != JSON_NEXT_END) {
+			LOGE("identity.authcerts: malformed object");
+			return false;
+		}
+		while (it < obj->identity.authcerts_json.len &&
+		       json_iswhitespace((unsigned char)obj->identity
+						 .authcerts_json.str[it])) {
+			it++;
 		}
 		if (it != obj->identity.authcerts_json.len) {
 			LOGE("identity.authcerts: unexpected trailing content"
@@ -933,6 +960,10 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 			.str = conf->connect,
 			.len = conf->connect != NULL ? strlen(conf->connect) : 0,
 		},
+		.log = {
+			.str = conf->log,
+			.len = conf->log != NULL ? strlen(conf->log) : 0,
+		},
 		.loglevel = (unsigned)conf->loglevel,
 		.max_sessions = (uintmax_t)conf->max_sessions,
 		.max_startups = {
@@ -1208,7 +1239,8 @@ bool conf_inline_pem(struct config *conf)
 		if (n == 0) {
 			continue;
 		}
-		ac->certs_der = calloc(n, sizeof(*ac->certs_der));
+		ac->certs_der =
+			(unsigned char **)calloc(n, sizeof(*ac->certs_der));
 		ac->certs_der_len = calloc(n, sizeof(*ac->certs_der_len));
 		if (ac->certs_der == NULL || ac->certs_der_len == NULL) {
 			LOGOOM();
@@ -1241,6 +1273,7 @@ void conf_free(struct config *restrict conf)
 	free(conf->mux_connect);
 	free(conf->listen);
 	free(conf->connect);
+	free(conf->log);
 #if WITH_TLS
 	free(conf->tls_cert);
 	free(conf->tls_key);
@@ -1262,15 +1295,19 @@ void conf_free(struct config *restrict conf)
 	}
 	free(conf->identity.peers);
 	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
-		free(conf->identity.authcerts[i].peer);
-		for (size_t j = 0; j < conf->identity.authcerts[i].certs_count;
-		     j++) {
-			free(conf->identity.authcerts[i].certs[j]);
-			free(conf->identity.authcerts[i].certs_der[j]);
+		struct conf_identity_authcert *restrict ac =
+			&conf->identity.authcerts[i];
+		free(ac->peer);
+		for (size_t j = 0; j < ac->certs_count; j++) {
+			free(ac->certs[j]);
+			/* certs_der is NULL unless conf_inline_pem succeeded */
+			if (ac->certs_der != NULL) {
+				free(ac->certs_der[j]);
+			}
 		}
-		free(conf->identity.authcerts[i].certs);
-		free(conf->identity.authcerts[i].certs_der);
-		free(conf->identity.authcerts[i].certs_der_len);
+		free((void *)ac->certs);
+		free((void *)ac->certs_der);
+		free(ac->certs_der_len);
 	}
 	free(conf->identity.authcerts);
 	free(conf);

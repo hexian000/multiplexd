@@ -44,24 +44,21 @@ void sched_delay(
 	struct mux_session *restrict ss, struct mux_stream *restrict s,
 	const uint_fast8_t ticks);
 
-/* Dequeue one data-ready stream from the DRR queue and produce at most one
- * PUSH frame into sendbuf.  On the first visit to a stream in each round its
+/* Scan the DRR ready queue and produce at most one PUSH frame into sendbuf.
+ * Skips past streams that cannot currently produce a frame (credit exhausted,
+ * queue empty, Nagle-held, or non-ESTABLISHED state) until a frame is
+ * produced or the queue is exhausted.  On the first visit to a stream its
  * deficit is incremented by MUX_MAX_PAYLOAD_SIZE bytes; subsequent frames are
  * served via drr_active without a re-queue round-trip until the deficit is
- * exhausted.  Returns true if a data frame was produced. */
+ * exhausted.  Returns true if a data frame was produced, false if no stream
+ * in the queue can produce one. */
 bool sched_next_data(struct mux_session *restrict ss);
 
-/* Emit pending per-stream ACK/FIN control headers for all live streams
- * without touching the DRR data queue.  Must be called when the session
- * send window is exhausted so that credit-grant frames still reach the
- * peer (and unblock the session stall). */
+/* Emit pending per-stream ACK/FIN control headers for all DRR-queued
+ * streams.  Control frames are packed into a single sendbuf staging
+ * entry for batched transport flush.  Safe to call regardless of
+ * send_stalled state. */
 void sched_flush_ctrl(struct mux_session *restrict ss);
-
-/* Add/remove a stream from the control-pending list (ACK/FIN queued, no data). */
-void sched_ctrl_enqueue(
-	struct mux_session *restrict ss, struct mux_stream *restrict s);
-void sched_ctrl_dequeue(
-	struct mux_session *restrict ss, struct mux_stream *restrict s);
 
 /* Arm the coalescing timer if it is not already active.  Called when a
  * stream enters the delay list or when a deferred session ACK is pending. */

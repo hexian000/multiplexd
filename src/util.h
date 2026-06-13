@@ -38,34 +38,6 @@
 
 #define TSTAMP_NIL (-1.0)
 
-static inline void modify_io_events(
-	struct ev_loop *restrict loop, ev_io *restrict watcher,
-	const int events)
-{
-	const int fd = watcher->fd;
-	ASSERT(fd != -1);
-	const int ioevents = events & (EV_READ | EV_WRITE);
-	if (ioevents == EV_NONE) {
-		if (ev_is_active(watcher)) {
-			LOGV_F("io: [fd:%d] stop", fd);
-			ev_io_stop(loop, watcher);
-		}
-		return;
-	}
-	if (ioevents != (watcher->events & (EV_READ | EV_WRITE))) {
-		ev_io_stop(loop, watcher);
-#ifdef ev_io_modify
-		ev_io_modify(watcher, ioevents);
-#else
-		ev_io_set(watcher, fd, ioevents);
-#endif
-	}
-	if (!ev_is_active(watcher)) {
-		LOGV_F("io: [fd:%d] events=0x%x", fd, ioevents);
-		ev_io_start(loop, watcher);
-	}
-}
-
 struct util_socket_opts {
 	bool tcp_keepalive : 1;
 	bool tcp_nodelay : 1;
@@ -84,14 +56,6 @@ struct util_socket_opts {
  * @param bytes The threshold in bytes.
  */
 void socket_notsent_lowat(int fd, int bytes);
-
-/**
- * @brief Sets TCP_USER_TIMEOUT on the socket.
- * @param fd The socket file descriptor.
- * @param ms The timeout in milliseconds.
- * @return 0 on success, -1 if unsupported or setsockopt fails.
- */
-int socket_user_timeout(int fd, int ms);
 
 #define CHECK_REVENTS(revents, accept)                                         \
 	do {                                                                   \

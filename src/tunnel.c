@@ -28,12 +28,14 @@
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #if WITH_THREADS
+#include <stdatomic.h>
 #include <threads.h>
 #endif
 
@@ -93,7 +95,7 @@ struct tunnel {
 		struct tunnel_callbacks cb;
 	} relay;
 
-	intmax_t last_changed;
+	int_least64_t last_changed;
 
 	/* Callback data passed to wrapped callbacks. */
 	void *callback_data;
@@ -171,7 +173,7 @@ struct tunnel {
 	} traffic_cnt;
 	/* SYN->SYN|ACK latency ring; written on the server thread only. */
 	size_t stream_establish_count;
-	intmax_t stream_establish_ns[256];
+	int_least64_t stream_establish_ns[256];
 };
 
 static bool stream_connect(
@@ -265,16 +267,16 @@ static void relay_dispatch_on_event(void *p)
 /* Task argument for on_established / on_resumed relays. */
 struct relay_connected_arg {
 	struct tunnel *t;
-	intmax_t lat_ns;
-	void (*cb)(void *, struct tunnel *, intmax_t);
+	int_fast64_t lat_ns;
+	void (*cb)(void *, struct tunnel *, int_fast64_t);
 };
 
 static void relay_dispatch_connected(void *p)
 {
 	struct relay_connected_arg *restrict arg = p;
 	struct tunnel *restrict t = arg->t;
-	const intmax_t lat_ns = arg->lat_ns;
-	void (*const cb)(void *, struct tunnel *, intmax_t) = arg->cb;
+	const int_fast64_t lat_ns = arg->lat_ns;
+	void (*const cb)(void *, struct tunnel *, int_fast64_t) = arg->cb;
 	free(arg);
 	if (cb != NULL) {
 		cb(t->callback_data, t, lat_ns);
@@ -284,7 +286,8 @@ static void relay_dispatch_connected(void *p)
 
 static void relay_connected(
 	struct tunnel *restrict t,
-	void (*cb)(void *, struct tunnel *, intmax_t), const intmax_t lat_ns)
+	void (*cb)(void *, struct tunnel *, int_fast64_t),
+	const int_fast64_t lat_ns)
 {
 	if (cb == NULL) {
 		return;
@@ -519,7 +522,7 @@ static bool handle_closed(struct tunnel *restrict t)
 	return false;
 }
 
-static void handle_stream_established(struct tunnel *t, intmax_t lat_ns)
+static void handle_stream_established(struct tunnel *t, int_fast64_t lat_ns)
 {
 	const size_t idx =
 		t->stream_establish_count % ARRAY_SIZE(t->stream_establish_ns);
@@ -1010,7 +1013,8 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	out->rx_window = snap.rx_window;
 	out->tx_window = snap.tx_window;
 	out->rtt_ns = snap.rtt;
-	out->bdp = snap.bdp;
+	out->bdp_rx = snap.bdp_rx;
+	out->bdp_tx = snap.bdp_tx;
 	out->last_changed = t->last_changed;
 #if WITH_THREADS
 	out->num_streams = (size_t)atomic_load_explicit(

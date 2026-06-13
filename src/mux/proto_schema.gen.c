@@ -87,92 +87,108 @@ void json_free_proto(struct json_proto *obj)
 static bool json_unmarshal_proto_extensions(
 	struct json_proto_extensions *obj, char *json, size_t length)
 {
+	*obj = (struct json_proto_extensions){
+		.reject_inbound = false,
+	};
 	const struct json_val root_ = json_parse(json, &(size_t){ length });
 	if (root_.type != JSON_OBJECT) { return false; }
 	json_iter iter_ = root_.iter;
 	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	*obj = (struct json_proto_extensions){
-		.reject_inbound = false,
-	};
+	int next_;
 
-	while (json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) {
+	while ((next_ = json_obj_next(json, &length, &iter_,
+			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
 		const int k_ = json_lookup_proto_extensions(key_, key_len_);
 		switch (k_) {
 		case JSON_PROTO_EXTENSIONS_IDENTITY: {
-			if (!json_parse_string(val_, val_len_, &obj->identity.str, &obj->identity.len)) { return false; }
-			if (obj->identity.len > 255u) { return false; }
+			if (!json_parse_string(val_, val_len_, &obj->identity.str, &obj->identity.len)) { goto fail_; }
+			if (obj->identity.len > 255u) { goto fail_; }
 			break;
 		}
 		case JSON_PROTO_EXTENSIONS_REJECT_INBOUND: {
-			if (!json_parse_bool(val_, val_len_, &obj->reject_inbound)) { return false; }
+			if (!json_parse_bool(val_, val_len_, &obj->reject_inbound)) { goto fail_; }
 			break;
 		}
 		default:
 			break;
 		}
 	}
+	if (next_ != JSON_NEXT_END) { goto fail_; }
 	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { return false; }
+		if (!json_iswhitespace(json[iter_])) { goto fail_; }
 	}
 	return true;
+
+fail_:
+	json_free_proto_extensions(obj);
+	*obj = (struct json_proto_extensions){ 0 };
+	return false;
 }
 
 bool json_unmarshal_proto(
 	struct json_proto *obj, char *json, size_t length)
 {
-	const struct json_val root_ = json_parse(json, &(size_t){ length });
-	if (root_.type != JSON_OBJECT) { return false; }
-	json_iter iter_ = root_.iter;
-	char *key_; size_t key_len_; char *val_; size_t val_len_;
 	*obj = (struct json_proto){
 		.extensions = {
 			.reject_inbound = false,
 		},
 	};
-	int required_ = 2;
+	const struct json_val root_ = json_parse(json, &(size_t){ length });
+	if (root_.type != JSON_OBJECT) { return false; }
+	json_iter iter_ = root_.iter;
+	char *key_; size_t key_len_; char *val_; size_t val_len_;
+	uint64_t required_ = 0;
+	int next_;
 
-	while (json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) {
+	while ((next_ = json_obj_next(json, &length, &iter_,
+			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
 		const int k_ = json_lookup_proto(key_, key_len_);
 		switch (k_) {
 		case JSON_PROTO_EXTENSIONS: {
+			/* duplicate key: release the previous value first */
+			json_free_proto_extensions(&obj->extensions);
 			if (!json_unmarshal_proto_extensions(&obj->extensions, val_, val_len_)) {
-				return false;
+				goto fail_;
 			}
 			break;
 		}
 		case JSON_PROTO_MSGID: {
-			if (!json_parse_imax(val_, val_len_, &obj->msgid)) { return false; }
-			if (obj->msgid != INTMAX_C(0) && obj->msgid != INTMAX_C(1)) { return false; }
-			required_--;
+			if (!json_parse_imax(val_, val_len_, &obj->msgid)) { goto fail_; }
+			if (obj->msgid != INTMAX_C(0) && obj->msgid != INTMAX_C(1)) { goto fail_; }
+			required_ |= UINT64_C(1) << 0;
 			break;
 		}
 		case JSON_PROTO_RESUME_SEQ: {
-			if (!json_parse_uint(val_, val_len_, &obj->resume_seq)) { return false; }
-			if (obj->resume_seq > 4294967295u) { return false; }
+			if (!json_parse_uint(val_, val_len_, &obj->resume_seq)) { goto fail_; }
+			if (obj->resume_seq > 4294967295u) { goto fail_; }
 			break;
 		}
 		case JSON_PROTO_SESSION_ID: {
-			if (!json_parse_string(val_, val_len_, &obj->session_id.str, &obj->session_id.len)) { return false; }
-			if (obj->session_id.len < 24u) { return false; }
-			if (obj->session_id.len > 24u) { return false; }
+			if (!json_parse_string(val_, val_len_, &obj->session_id.str, &obj->session_id.len)) { goto fail_; }
+			if (obj->session_id.len < 24u) { goto fail_; }
+			if (obj->session_id.len > 24u) { goto fail_; }
 			break;
 		}
 		case JSON_PROTO_TYPE: {
-			if (!json_parse_string(val_, val_len_, &obj->type.str, &obj->type.len)) { return false; }
-			required_--;
+			if (!json_parse_string(val_, val_len_, &obj->type.str, &obj->type.len)) { goto fail_; }
+			required_ |= UINT64_C(1) << 1;
 			break;
 		}
 		default:
 			break;
 		}
 	}
-	if (required_) { return false; }
+	if (next_ != JSON_NEXT_END) { goto fail_; }
+	if (required_ != UINT64_C(0x3)) { goto fail_; }
 	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { return false; }
+		if (!json_iswhitespace(json[iter_])) { goto fail_; }
 	}
 	return true;
+
+fail_:
+	json_free_proto(obj);
+	*obj = (struct json_proto){ 0 };
+	return false;
 }
 
 /** @} */
@@ -180,55 +196,72 @@ bool json_unmarshal_proto(
 /** @name Marshal
  *  @{ */
 
-#define EMIT(fmt, ...) do { \
-	r_ = snprintf(buf ? buf + n_ : NULL, \
-		bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, fmt, __VA_ARGS__); \
+#define EMIT(c) do { \
+	if (buf != NULL && (size_t)n_ < bufsz) { buf[n_] = (char)(c); } \
+	n_++; \
+} while (0)
+#define EMITF(fmt, ...) do { \
+	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
+	r_ = snprintf(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, fmt, __VA_ARGS__); \
 	if (r_ < 0) { return -1; } \
 	n_ += r_; \
 } while (0)
 #define EMIT_STR(s, len) do { \
-	r_ = json_marshal_string(buf ? buf + n_ : NULL, \
-		bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, (s), (len)); \
+	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
+	r_ = json_marshal_string(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (s), (len)); \
 	if (r_ < 0) { return -1; } \
 	n_ += r_; \
 } while (0)
 #define EMIT_SUB(fn, arg) do { \
-	r_ = (fn)(buf ? buf + n_ : NULL, \
-		bufsz > (size_t)n_ ? bufsz - (size_t)n_ : 0, (arg)); \
+	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
+	r_ = (fn)(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (arg)); \
 	if (r_ < 0) { return -1; } \
 	n_ += r_; \
 } while (0)
 #define EMIT_LIT(s) do { \
 	static const char lit_[] = s; \
-	const int l_ = (int)(sizeof(lit_) - 1); \
-	if (buf && bufsz > (size_t)n_ + (size_t)l_) \
-		memcpy(buf + n_, lit_, (size_t)l_); \
-	n_ += l_; \
+	const size_t l_ = sizeof(lit_) - 1; \
+	if (buf != NULL && (size_t)n_ < bufsz) { \
+		const size_t cap_ = bufsz - (size_t)n_; \
+		memcpy(buf + n_, lit_, l_ < cap_ ? l_ : cap_); \
+	} \
+	n_ += (int)l_; \
 } while (0)
 
 static int json_marshal_proto_extensions(
 	char *buf, size_t bufsz, const struct json_proto_extensions *obj)
 {
 	int n_ = 0;
-	int r_;
+	int r_ = 0;
+	(void)r_;
 
-	EMIT_LIT("{");
+	EMIT('{');
 	const int n_start_ = n_;
 
 	if (obj->identity.str != NULL) {
-		EMIT_LIT("\"identity\":");
+		EMIT('"');
+		EMIT_LIT("identity");
+		EMIT('"');
+		EMIT(':');
 		EMIT_STR(obj->identity.str, obj->identity.len);
-		EMIT_LIT(",");
+		EMIT(',');
 	}
-	EMIT_LIT("\"reject_inbound\":");
+	EMIT('"');
+	EMIT_LIT("reject_inbound");
+	EMIT('"');
+	EMIT(':');
 	if (obj->reject_inbound) {
-		EMIT_LIT("true,");
+		EMIT_LIT("true");
 	} else {
-		EMIT_LIT("false,");
+		EMIT_LIT("false");
 	}
+	EMIT(',');
 
 	if (n_ > n_start_) { n_--; }
-	EMIT_LIT("}");
+	EMIT('}');
+	if (buf != NULL && bufsz > 0) {
+		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
+	}
 
 	return n_;
 }
@@ -237,37 +270,59 @@ int json_marshal_proto(
 	char *buf, size_t bufsz, const struct json_proto *obj)
 {
 	int n_ = 0;
-	int r_;
+	int r_ = 0;
+	(void)r_;
 
-	EMIT_LIT("{");
+	EMIT('{');
 	const int n_start_ = n_;
 
-	EMIT_LIT("\"extensions\":");
+	EMIT('"');
+	EMIT_LIT("extensions");
+	EMIT('"');
+	EMIT(':');
 	EMIT_SUB(json_marshal_proto_extensions, &obj->extensions);
-	EMIT_LIT(",");
-	EMIT("\"%s\":%jd,", "msgid",
-		(intmax_t)obj->msgid);
-	EMIT("\"%s\":%ju,", "resume_seq",
-		(uintmax_t)obj->resume_seq);
+	EMIT(',');
+	EMIT('"');
+	EMIT_LIT("msgid");
+	EMIT('"');
+	EMIT(':');
+	EMITF("%jd", (intmax_t)obj->msgid);
+	EMIT(',');
+	EMIT('"');
+	EMIT_LIT("resume_seq");
+	EMIT('"');
+	EMIT(':');
+	EMITF("%u", obj->resume_seq);
+	EMIT(',');
 	if (obj->session_id.str != NULL) {
-		EMIT_LIT("\"session_id\":");
+		EMIT('"');
+		EMIT_LIT("session_id");
+		EMIT('"');
+		EMIT(':');
 		EMIT_STR(obj->session_id.str, obj->session_id.len);
-		EMIT_LIT(",");
+		EMIT(',');
 	}
 	if (obj->type.str != NULL) {
-		EMIT_LIT("\"type\":");
+		EMIT('"');
+		EMIT_LIT("type");
+		EMIT('"');
+		EMIT(':');
 		EMIT_STR(obj->type.str, obj->type.len);
-		EMIT_LIT(",");
+		EMIT(',');
 	}
 
 	if (n_ > n_start_) { n_--; }
-	EMIT_LIT("}");
+	EMIT('}');
+	if (buf != NULL && bufsz > 0) {
+		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
+	}
 
 	return n_;
 }
 
 
 #undef EMIT
+#undef EMITF
 #undef EMIT_STR
 #undef EMIT_SUB
 #undef EMIT_LIT

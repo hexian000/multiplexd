@@ -203,25 +203,42 @@ static void cleanup_session(struct mux_session *restrict ss)
 	}
 }
 
-T_DECLARE_CASE(test_sched_alloc_stream_id_bitmap_nearly_full)
+T_DECLARE_CASE(test_sched_alloc_stream_id_nearly_full)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
 
-	/* Server session: even IDs; bitmap index = id >> 1. */
+	/* Server session: even IDs.  Occupy all even IDs except 65534. */
 	ss.accepted = true;
-	/* Occupy all bitmap slots then free exactly one: index 32767 (ID 65534). */
-	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
-	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] &=
-		~((uint_fast32_t)1 << (32767 % BITMAP_WORD_BITS));
+	/* Fill the table with all even IDs 2..65534 except 65534 itself. */
+	for (unsigned i = 2; i < 65534; i += 2) {
+		void *dummy = (void *)(uintptr_t)i;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)i, &elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
+	/* Fill 65536 (wraps; parity even) as well. */
+	{
+		void *dummy = (void *)(uintptr_t)65536;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)0, &elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
 
-	/* Allocator scans from index 1 (skipping STREAMID_CTRL at 0),
-	 * finds all taken, then finds the free slot at 32767 → ID 65534. */
+	/* Only 65534 remains free. */
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)65534);
 
 	/* Occupy the last slot; next call must report exhaustion. */
-	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] |=
-		(uint_fast32_t)1 << (32767 % BITMAP_WORD_BITS);
+	{
+		void *dummy = (void *)(uintptr_t)65534;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)65534,
+			&elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
 
 	cleanup_session(&ss);
@@ -458,7 +475,14 @@ T_DECLARE_CASE(test_stream_id_exhaustion)
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
 	ss.accepted = false;
-	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
+	/* Fill all odd IDs. */
+	for (unsigned i = 1; i <= 65535; i += 2) {
+		void *dummy = (void *)(uintptr_t)i;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)i, &elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
 	cleanup_session(&ss);
 }
@@ -468,18 +492,33 @@ T_DECLARE_CASE(test_stream_id_wraparound_client)
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
 	ss.accepted = false;
-	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
-	/* Free slot for ID 65535: index = 65535 >> 1 = 32767. */
-	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] &=
-		~((uint_fast32_t)1u << (32767 % BITMAP_WORD_BITS));
+	/* Fill all odd IDs except 65535. */
+	for (unsigned i = 1; i <= 65533; i += 2) {
+		void *dummy = (void *)(uintptr_t)i;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)i, &elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
+	/* Start scan near wrap: next_stream_id=65533; only 65535 free. */
+	ss.sched.next_stream_id = 65533;
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)65535);
-	/* Manually occupy the slot (sched_alloc_stream_id does not set bit). */
-	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] |=
-		(uint_fast32_t)1u << (32767 % BITMAP_WORD_BITS);
-	/* Now full. */
+	/* Now all odd IDs occupied; next allocation fails. */
+	{
+		void *dummy = (void *)(uintptr_t)65535;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)65535,
+			&elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
-	/* Free ID 1 (index 0). */
-	ss.sched.id_bitmap[0] &= ~(uint_fast32_t)1u;
+	/* Remove ID 1; next allocation wraps back to 1. */
+	{
+		void *elem = NULL;
+		ss.sched.streams = table_del(
+			ss.sched.streams, (const void *)(uintptr_t)1, &elem);
+	}
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)1);
 	cleanup_session(&ss);
 }
@@ -489,18 +528,33 @@ T_DECLARE_CASE(test_stream_id_wraparound_server)
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
 	ss.accepted = true;
-	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
-	/* Free slot for ID 65534: index = 32767. */
-	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] &=
-		~((uint_fast32_t)1u << (32767 % BITMAP_WORD_BITS));
+	/* Fill all even IDs except 65534. */
+	for (unsigned i = 2; i <= 65532; i += 2) {
+		void *dummy = (void *)(uintptr_t)i;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)i, &elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
+	/* Start scan near wrap: next_stream_id=65532; only 65534 free. */
+	ss.sched.next_stream_id = 65532;
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)65534);
-	/* Manually occupy the slot. */
-	ss.sched.id_bitmap[32767 / BITMAP_WORD_BITS] |=
-		(uint_fast32_t)1u << (32767 % BITMAP_WORD_BITS);
+	/* Now all even IDs occupied; next allocation fails. */
+	{
+		void *dummy = (void *)(uintptr_t)65534;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)65534,
+			&elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
-	/* Free ID 2 (index 1). */
-	ss.sched.id_bitmap[1 / BITMAP_WORD_BITS] &=
-		~((uint_fast32_t)1u << (1 % BITMAP_WORD_BITS));
+	/* Remove ID 2; next allocation wraps back to 2. */
+	{
+		void *elem = NULL;
+		ss.sched.streams = table_del(
+			ss.sched.streams, (const void *)(uintptr_t)2, &elem);
+	}
 	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)2);
 	cleanup_session(&ss);
 }
@@ -534,16 +588,20 @@ T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 	cleanup_session(&ss);
 }
 
-T_DECLARE_CASE(test_stream_id_search_wraps_past_bitmap_end)
+T_DECLARE_CASE(test_stream_id_collision_skip)
 {
 	struct mux_session ss = make_session();
 	sched_test_bind_watchers(&ss);
 	ss.accepted = true;
-	memset(ss.sched.id_bitmap, 0xFF, sizeof(ss.sched.id_bitmap));
-	/* Free ID 10: index = 5. */
-	ss.sched.id_bitmap[5 / BITMAP_WORD_BITS] &=
-		~((uint_fast32_t)1u << (5 % BITMAP_WORD_BITS));
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)10);
+	/* Occupy ID 2; allocator must skip to 4. */
+	{
+		void *dummy = (void *)(uintptr_t)2;
+		void *elem = dummy;
+		ss.sched.streams = table_set(
+			ss.sched.streams, (const void *)(uintptr_t)2, &elem);
+		T_CHECK(ss.sched.streams != NULL);
+	}
+	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)4);
 	cleanup_session(&ss);
 }
 
@@ -596,10 +654,78 @@ T_DECLARE_CASE(test_lp_queue_double_enqueue_prevented)
 	cleanup_session(&ss);
 }
 
+T_DECLARE_CASE(test_sched_next_data_skips_blocked_stream)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+
+	/* Stream A: ESTABLISHED but no frame to produce (send_queue empty). */
+	struct mux_stream stream_a = {
+		.id = 13,
+		.state = STREAM_ESTABLISHED,
+	};
+	/* Stream B: ESTABLISHED with a frame ready to send. */
+	struct mux_stream stream_b = {
+		.id = 15,
+		.state = STREAM_ESTABLISHED,
+	};
+	struct mux_frame frame_b = {
+		.len = MUX_FRAME_HEADER_SIZE + 32,
+	};
+
+	sched_test_reset();
+	mux_frame_list_push(&stream_b.send_queue, &frame_b);
+
+	/* Enqueue A first so it sits at the head. */
+	sched_enqueue(&ss, &stream_a);
+	sched_enqueue(&ss, &stream_b);
+
+	/* Should skip A (no frame) and produce B's frame. */
+	T_EXPECT(sched_next_data(&ss));
+	T_EXPECT_EQ(g_send_push_calls, 1);
+	T_EXPECT(g_last_sent_frame == &frame_b);
+	T_EXPECT_EQ(g_stream_on_send_calls, 1);
+
+	/* Queue must be empty: both streams were visited and dequeued. */
+	T_EXPECT(ss.sched.sched_head == NULL);
+
+	cleanup_session(&ss);
+}
+
+T_DECLARE_CASE(test_sched_next_data_exhausts_queue_returns_false)
+{
+	struct mux_session ss = make_session();
+	sched_test_bind_watchers(&ss);
+
+	/* Two ESTABLISHED streams, neither can produce a frame. */
+	struct mux_stream stream_a = {
+		.id = 17,
+		.state = STREAM_ESTABLISHED,
+	};
+	struct mux_stream stream_b = {
+		.id = 19,
+		.state = STREAM_ESTABLISHED,
+	};
+
+	sched_test_reset();
+	sched_enqueue(&ss, &stream_a);
+	sched_enqueue(&ss, &stream_b);
+
+	/* Neither has data: must exhaust the queue and return false. */
+	T_EXPECT(!sched_next_data(&ss));
+	T_EXPECT_EQ(g_send_push_calls, 0);
+
+	/* Queue must be empty after exhaustive scan. */
+	T_EXPECT(ss.sched.sched_head == NULL);
+	T_EXPECT(ss.sched.sched_tail == NULL);
+
+	cleanup_session(&ss);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_sched_alloc_stream_id_bitmap_nearly_full);
+	T_RUN_CASE(t, test_sched_alloc_stream_id_nearly_full);
 	T_RUN_CASE(t, test_sched_alloc_stream_id_starts_at_minimum);
 	T_RUN_CASE(t, test_sched_add_remove_updates_table_and_idle_timeout);
 	T_RUN_CASE(t, test_sched_free_streams_clears_stream_counter);
@@ -612,11 +738,13 @@ int main(void)
 		test_sched_next_data_sends_frame_and_resets_deficit_on_drain);
 	T_RUN_CASE(t, test_sched_cb_sends_syn_for_init_stream);
 	T_RUN_CASE(t, test_sched_coalesce_forces_session_ack_after_tick_budget);
+	T_RUN_CASE(t, test_sched_next_data_skips_blocked_stream);
+	T_RUN_CASE(t, test_sched_next_data_exhausts_queue_returns_false);
 	T_RUN_CASE(t, test_stream_id_exhaustion);
 	T_RUN_CASE(t, test_stream_id_wraparound_client);
 	T_RUN_CASE(t, test_stream_id_wraparound_server);
 	T_RUN_CASE(t, test_tombstone_excluded_from_max_streams);
-	T_RUN_CASE(t, test_stream_id_search_wraps_past_bitmap_end);
+	T_RUN_CASE(t, test_stream_id_collision_skip);
 	T_RUN_CASE(t, test_sched_wake_double_enqueue_idempotent);
 	T_RUN_CASE(t, test_lp_queue_double_enqueue_prevented);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;

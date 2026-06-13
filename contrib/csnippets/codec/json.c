@@ -803,7 +803,7 @@ static ptrdiff_t skip_raw_value(const char *restrict buf, const size_t len)
 	}
 }
 
-bool json_obj_next(
+int json_obj_next(
 	char *restrict json, const size_t *len, json_iter *restrict iter,
 	char **restrict key, size_t *restrict key_len, char **restrict val,
 	size_t *restrict val_len)
@@ -813,28 +813,28 @@ bool json_obj_next(
 	const int delim = skip_delim(json, buflen, &i);
 	if (delim == 0) {
 		LOGE("jsonutil: unterminated object");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	if (i >= buflen) {
 		LOGE("jsonutil: unterminated object");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	if (json[i] == '}') {
 		if (delim == 2) {
 			LOGE("jsonutil: trailing comma in object");
-			return false;
+			return JSON_NEXT_ERROR;
 		}
 		*iter = i + 1;
-		return false;
+		return JSON_NEXT_END;
 	}
 	if (i >= buflen || json[i] != '"') {
 		LOGE("jsonutil: expected object key string");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	size_t slen, consumed;
 	if (!scan_string_inplace(
 		    json + i + 1, buflen - i - 1, &slen, &consumed)) {
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	*key = json + i + 1;
 	*key_len = slen;
@@ -844,7 +844,7 @@ bool json_obj_next(
 	}
 	if (i >= buflen || json[i] != ':') {
 		LOGE("jsonutil: expected ':' after object key");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	i++;
 	while (i < buflen && json_iswhitespace(json[i])) {
@@ -852,20 +852,20 @@ bool json_obj_next(
 	}
 	if (i >= buflen) {
 		LOGE("jsonutil: expected value after ':'");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	const ptrdiff_t vlen = skip_raw_value(json + i, buflen - i);
 	if (vlen < 0) {
 		LOGE("jsonutil: invalid JSON value");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	*val = json + i;
 	*val_len = (size_t)vlen;
 	*iter = i + (size_t)vlen;
-	return true;
+	return JSON_NEXT_ITEM;
 }
 
-bool json_arr_next(
+int json_arr_next(
 	char *restrict json, const size_t *len, json_iter *restrict iter,
 	char **restrict val, size_t *restrict val_len)
 {
@@ -874,31 +874,31 @@ bool json_arr_next(
 	const int delim = skip_delim(json, buflen, &i);
 	if (delim == 0) {
 		LOGE("jsonutil: unterminated array");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	if (i >= buflen) {
 		LOGE("jsonutil: unterminated array");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	if (json[i] == ']') {
 		if (delim == 2) {
 			LOGE("jsonutil: trailing comma in array");
-			return false;
+			return JSON_NEXT_ERROR;
 		}
 		*iter = i + 1;
-		return false;
+		return JSON_NEXT_END;
 	}
 	if (i >= buflen) {
 		LOGE("jsonutil: expected array element");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	const ptrdiff_t vlen = skip_raw_value(json + i, buflen - i);
 	if (vlen < 0) {
 		LOGE("jsonutil: invalid JSON value in array");
-		return false;
+		return JSON_NEXT_ERROR;
 	}
 	*val = json + i;
 	*val_len = (size_t)vlen;
 	*iter = i + (size_t)vlen;
-	return true;
+	return JSON_NEXT_ITEM;
 }

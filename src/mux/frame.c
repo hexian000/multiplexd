@@ -83,7 +83,7 @@ bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 struct mux_frame_ring *mux_frame_ring_new(const size_t cap)
 {
 	struct mux_frame_ring *r =
-		malloc(sizeof(*r) + cap * sizeof(r->entries[0]));
+		malloc(sizeof(*r) + cap * sizeof(struct mux_frame *));
 	if (r == NULL) {
 		return NULL;
 	}
@@ -104,7 +104,7 @@ struct mux_frame_ring *mux_frame_ring_grow(struct mux_frame_ring *r)
 		old_cap > 0 ? old_cap * 2 : (size_t)MUX_FRAME_RING_MIN;
 
 	struct mux_frame_ring *nr =
-		malloc(sizeof(*nr) + new_cap * sizeof(nr->entries[0]));
+		malloc(sizeof(*nr) + new_cap * sizeof(struct mux_frame *));
 	if (nr == NULL) {
 		return NULL;
 	}

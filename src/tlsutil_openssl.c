@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 static SSL_CTX *tls_ctx_raw(struct tls_context *restrict ctx)

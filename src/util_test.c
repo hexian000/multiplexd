@@ -26,24 +26,8 @@ T_DECLARE_CASE(test_socket_notsent_lowat_sets_option)
 	T_EXPECT_EQ(val, 4096);
 #else
 	/* Platform lacks TCP_NOTSENT_LOWAT; only verify no crash. */
+	(void)_t_;
 	socket_notsent_lowat(fd, 4096);
-#endif
-	(void)close(fd);
-}
-
-T_DECLARE_CASE(test_socket_user_timeout_sets_option)
-{
-	const int fd = socket(AF_INET, SOCK_STREAM, 0);
-	T_CHECK(fd >= 0);
-#if WITH_TCP_USER_TIMEOUT
-	T_EXPECT_EQ(socket_user_timeout(fd, 5000), 0);
-	int val = 0;
-	socklen_t len = sizeof(val);
-	T_CHECK(getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &val, &len) == 0);
-	T_EXPECT_EQ(val, 5000);
-#else
-	/* Platform lacks TCP_USER_TIMEOUT; function must return -1. */
-	T_EXPECT_EQ(socket_user_timeout(fd, 5000), -1);
 #endif
 	(void)close(fd);
 }
@@ -85,7 +69,6 @@ int main(void)
 {
 	T_DECLARE_CTX(t);
 	T_RUN_CASE(t, test_socket_notsent_lowat_sets_option);
-	T_RUN_CASE(t, test_socket_user_timeout_sets_option);
 	T_RUN_CASE(t, test_resolve_addr_ipv4_parses_correctly);
 	T_RUN_CASE(t, test_resolve_addr_ipv6_parses_correctly);
 	T_RUN_CASE(t, test_resolve_addr_invalid_returns_false);

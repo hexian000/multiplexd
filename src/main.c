@@ -20,6 +20,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,7 +68,7 @@ static void print_usage(const char *argv0)
 		"                             <name>-key.pem\n"
 		"  --keytype <type>           key type: rsa, ecdsa, or ed25519\n"
 		"                             (default: rsa)\n"
-		"  --keysize <bits>           key size (RSA: 4096, ECDSA: 256/384/521)\n"
+		"  --keysize <bits>           key size (RSA: 4096, ECDSA: 224/256/384/521)\n"
 		"\n"
 #endif /* WITH_OPENSSL */
 	);
@@ -248,6 +249,19 @@ int main(int argc, char **argv)
 	}
 
 	slog_setlevel(conf->loglevel);
+	if (conf->log != NULL) {
+		if (strcmp(conf->log, "stdout") == 0) {
+			slog_setoutput(SLOG_OUTPUT_FILE, stdout);
+		} else if (strcmp(conf->log, "stderr") == 0) {
+			slog_setoutput(SLOG_OUTPUT_FILE, stderr);
+		} else if (strcmp(conf->log, "syslog") == 0) {
+			slog_setoutput(SLOG_OUTPUT_SYSLOG, PROJECT_NAME);
+		} else if (strcmp(conf->log, "discard") == 0) {
+			slog_setoutput(SLOG_OUTPUT_DISCARD);
+		} else {
+			LOGW_F("unknown log output: \"%s\"", conf->log);
+		}
+	}
 
 	{
 		char subsystems[128];

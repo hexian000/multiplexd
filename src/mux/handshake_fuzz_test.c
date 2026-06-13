@@ -14,7 +14,7 @@
  *     extra parameters
  *   - proto_parse_session_id Base64 decoding: valid/invalid lengths,
  *     invalid characters, all-padding
- *   - resume_seq boundary values: 0, UINT32_MAX, UINT32_MAX+1, UINTMAX_MAX
+ *   - resume_seq boundary values: 0, UINT32_MAX, UINT32_MAX+1, UINT_FAST64_MAX
  *   - identity string: lengths 0-300 (crosses the 255-char rejection limit)
  *   - Missing mandatory JSON fields (type, msgid)
  *   - Wrong-type values for extensions (e.g. reject_inbound as a string)
@@ -167,14 +167,13 @@ void sched_free_streams(struct mux_session *restrict ss)
 	g_sched_free_calls++;
 	ss->sched.sched_head = NULL;
 	ss->sched.sched_tail = NULL;
-	ss->sched.round_end = NULL;
 	ss->sched.drr_active = NULL;
 	ss->sched.lp_head = NULL;
 	ss->sched.lp_tail = NULL;
 	ss->sched.delay_head = NULL;
 	ss->send_stalled = false;
 	ss->sched.num_tombstones = 0;
-	memset(ss->sched.id_bitmap, 0, sizeof(ss->sched.id_bitmap));
+	ss->sched.next_stream_id = 0;
 	if (ss->sched.streams != NULL) {
 		table_free(ss->sched.streams);
 		ss->sched.streams = NULL;
@@ -313,14 +312,14 @@ static const char *const k_session_ids[] = {
 #define k_nsids (sizeof(k_session_ids) / sizeof(k_session_ids[0]))
 
 /* resume_seq edge-case values as unsigned integers */
-static const uintmax_t k_seqs[] = {
+static const uint_fast64_t k_seqs[] = {
 	0,
 	1,
 	65535,
 	2147483647,
 	4294967295UL, /* UINT32_MAX */
 	4294967296ULL, /* UINT32_MAX + 1 */
-	UINTMAX_MAX,
+	UINT_FAST64_MAX,
 };
 
 #define k_nseqs (sizeof(k_seqs) / sizeof(k_seqs[0]))
@@ -392,8 +391,8 @@ static size_t gen_structured_json(unsigned char *restrict buf, const size_t cap)
 	}
 
 	if (prng_bool()) {
-		const uintmax_t seq = k_seqs[prng_range(k_nseqs)];
-		JAPP(",\"resume_seq\":%" PRIuMAX, seq);
+		const uint_fast64_t seq = k_seqs[prng_range(k_nseqs)];
+		JAPP(",\"resume_seq\":%" PRIuFAST64, seq);
 	}
 
 	if (prng_bool()) {

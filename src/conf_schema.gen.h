@@ -85,6 +85,7 @@ struct json_conf {
 	struct json_string api_listen;
 	struct json_string connect;
 	struct json_string listen;
+	struct json_string log;
 	struct json_string max_startups;
 	struct json_string mux_connect;
 	struct json_string mux_listen;
@@ -100,7 +101,12 @@ struct json_conf {
  *  @{ */
 
 /* Unmarshal json (length bytes) into *obj; the buffer is modified in-place. */
-/* The function zero-initializes *obj and applies schema defaults before parsing; pointer fields of set keys then point into the json buffer (keep it valid). Returns true on success. */
+/* Zero-initializes *obj and applies schema defaults before parsing; pointer
+   fields of set keys then point into the json buffer (keep it valid while
+   *obj is in use).  Raw-fragment fields (dynamic objects) are stored without
+   validation.  Duplicate keys: last value wins.  Returns true on success.
+   On failure returns false; partial allocations are released and *obj is
+   reset to all-zero (calling the free function afterwards is harmless). */
 bool json_unmarshal_conf(
 	struct json_conf *obj, char *json, size_t length);
 
@@ -109,8 +115,11 @@ bool json_unmarshal_conf(
 /** @name Marshal
  *  @{ */
 
-/* Marshal *obj into buf as JSON text (snprintf semantics: returns chars written
-   excluding NUL, or required size including NUL when buf is NULL or bufsz is 0). */
+/* Marshal *obj into buf as JSON text (snprintf semantics): returns the length
+   required to encode *obj, excluding the terminating NUL, regardless of bufsz.
+   The output is NUL-terminated whenever buf != NULL and bufsz > 0, and is
+   truncated when the return value >= bufsz (pass buf = NULL to query the size).
+   Returns -1 on error (e.g. a non-finite number field). */
 int json_marshal_conf(char *buf, size_t bufsz, const struct json_conf *obj);
 
 /** @} */

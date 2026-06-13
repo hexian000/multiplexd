@@ -20,12 +20,10 @@
 
 struct mux_session;
 
-/* Scheduling queue membership for a stream.  At most one queue owns a
- * stream at any time; the DRR data queue, low-priority lifecycle queue,
- * and control-pending list are all mutually exclusive. */
+/* One queue membership per stream at any time; the DRR data queue and
+ * low-priority lifecycle queue are mutually exclusive. */
 enum sched_queue {
 	SCHED_QUEUE_NONE,
-	SCHED_QUEUE_CTRL,
 	SCHED_QUEUE_DRR,
 	SCHED_QUEUE_LP,
 };
@@ -116,8 +114,6 @@ struct mux_stream {
 	uint_least32_t recv_window;
 	/* Cumulative credit granted to the peer so far, in bytes (wrapping). */
 	uint_least32_t grant_sent;
-	/* Remaining budget for immediate-ACK cycles (TCP-style quickack). */
-	uint_least8_t quickack_budget;
 	int_least64_t syn_sent_ns;
 	/* One-shot linger before CLOSED cleanup re-enters EV_IDLE. */
 	ev_timer w_tombstone;

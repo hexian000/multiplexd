@@ -51,24 +51,6 @@ void socket_notsent_lowat(const int fd, const int bytes)
 #endif
 }
 
-int socket_user_timeout(const int fd, const int ms)
-{
-#if WITH_TCP_USER_TIMEOUT
-	if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, sizeof(ms)) !=
-	    0) {
-		const int err = errno;
-		LOGW_F("setsockopt [fd:%d]: TCP_USER_TIMEOUT (%d) %s", fd, err,
-		       strerror(err));
-		return -1;
-	}
-	return 0;
-#else
-	(void)fd;
-	(void)ms;
-	return -1;
-#endif
-}
-
 #if defined(WIN32)
 #define PATH_SEPARATOR '\\'
 #else

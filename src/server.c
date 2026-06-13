@@ -42,6 +42,7 @@
 #include <stdarg.h>
 #if WITH_THREADS
 #include <stdatomic.h>
+#include <threads.h>
 #endif
 #include <stdbool.h>
 #include <stddef.h>
@@ -90,8 +91,8 @@ static bool identity_listener_add(
 	if (sl->num_tunnels >= sl->cap_tunnels) {
 		const size_t new_cap =
 			sl->cap_tunnels > 0 ? sl->cap_tunnels * 2 : 4;
-		struct tunnel **arr =
-			realloc(sl->tunnels, new_cap * sizeof(struct tunnel *));
+		struct tunnel **arr = (struct tunnel **)realloc(
+			(void *)sl->tunnels, new_cap * sizeof(struct tunnel *));
 		if (arr == NULL) {
 			LOGOOM();
 			return false;
@@ -243,7 +244,7 @@ server_evlogf(struct server *restrict srv, const char *restrict fmt, ...)
 
 static void session_on_connected(
 	struct server *restrict srv, struct tunnel *t,
-	const char *restrict verb, intmax_t lat_ns)
+	const char *restrict verb, int_fast64_t lat_ns)
 {
 	char lat_str[16];
 	(void)format_duration(
@@ -295,7 +296,7 @@ static bool server_check_identity_authcerts(
 #endif /* WITH_TLS */
 
 static void server_on_established(
-	void *data, struct tunnel *restrict t, const intmax_t lat_ns)
+	void *data, struct tunnel *restrict t, int_fast64_t lat_ns)
 {
 	struct server *restrict srv = data;
 	const bool is_server = tunnel_is_accepted(t);
@@ -367,7 +368,7 @@ static void server_on_established(
 }
 
 static void
-server_on_resumed(void *data, struct tunnel *restrict t, const intmax_t lat_ns)
+server_on_resumed(void *data, struct tunnel *restrict t, int_fast64_t lat_ns)
 {
 	struct server *restrict srv = data;
 	const bool is_server = tunnel_is_accepted(t);
@@ -877,7 +878,6 @@ static void server_drain_tunnels(
 	const bool forward_changed =
 		!strnull_eq(old_conf->connect, new_conf->connect);
 	struct mux_config drain_conf = conf_get_mux(new_conf);
-	drain_conf.reject_inbound = true;
 #if WITH_TLS
 	drain_conf.tlsctx = new_client_tlsctx;
 #endif
@@ -1365,9 +1365,9 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	/* Task 1 (highest priority): shutdown deadline polling.
 	 * When shutting_down, check the force-exit deadline and return. */
 	if (srv->shutting_down) {
-		const intmax_t elapsed_ns =
+		const int_fast64_t elapsed_ns =
 			clock_monotonic_ns() - srv->shutdown_start_ns;
-		if (elapsed_ns >= (intmax_t)2000000000) {
+		if (elapsed_ns >= (int_fast64_t)2000000000) {
 			LOGW("shutdown timeout: forcing exit");
 			ev_break(loop, EVBREAK_ALL);
 		}
@@ -1383,9 +1383,9 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		const time_t delta = now_wall - srv->last_maintenance_wall;
 		srv->last_maintenance_wall = now_wall;
 		if (delta > (time_t)srv->conf->mux.ping_timeout) {
-			LOGW_F("wall-clock jump of %" PRIdMAX
+			LOGW_F("wall-clock jump of %" PRIdFAST64
 			       "s detected, dropping all transports",
-			       (intmax_t)delta);
+			       (int_fast64_t)delta);
 			const size_t n =
 				(srv->accepted_tunnels != NULL ?
 					 table_size(srv->accepted_tunnels) :
@@ -1990,10 +1990,10 @@ void server_free(struct server *srv)
 	free(srv);
 }
 
-static int cmp_intmax(const void *a, const void *b)
+static int cmp_intfast64(const void *a, const void *b)
 {
-	const intmax_t va = *(const intmax_t *)a;
-	const intmax_t vb = *(const intmax_t *)b;
+	const int_fast64_t va = *(const int_fast64_t *)a;
+	const int_fast64_t vb = *(const int_fast64_t *)b;
 	if (va < vb) {
 		return -1;
 	}
@@ -2023,6 +2023,8 @@ static bool sum_accepted_stream_cnt(
 	out->num_stream_failed += snap.num_stream_failed;
 	out->traffic_byt_mux_recv += snap.byt_mux_recv;
 	out->traffic_byt_mux_sent += snap.byt_mux_sent;
+	out->traffic_byt_push_recv += snap.byt_push_recv;
+	out->traffic_byt_push_sent += snap.byt_push_sent;
 	return true;
 }
 
@@ -2072,7 +2074,7 @@ static size_t calc_stream_percentiles(struct server_stats *restrict out)
 	if (total == 0) {
 		return 0;
 	}
-	intmax_t *samples = malloc(total * sizeof(*samples));
+	int_fast64_t *samples = malloc(total * sizeof(*samples));
 	if (samples == NULL) {
 		LOGOOM();
 		return 0;
@@ -2088,7 +2090,7 @@ static size_t calc_stream_percentiles(struct server_stats *restrict out)
 			samples[n++] = ts->stream_establish_ns[idx];
 		}
 	}
-	qsort(samples, n, sizeof(samples[0]), cmp_intmax);
+	qsort(samples, n, sizeof(samples[0]), cmp_intfast64);
 	const size_t i50 = (50 * n) / 100;
 	const size_t i90 = (90 * n) / 100;
 	const size_t i99 = (99 * n) / 100;

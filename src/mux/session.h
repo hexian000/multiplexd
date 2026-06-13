@@ -18,23 +18,82 @@
 
 #include "algo/hashtable.h"
 #include "os/socket.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
 #include <ev.h>
 
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+
+#include <errno.h>
 #if WITH_THREADS
 #include <stdatomic.h>
 #endif
-#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 struct mux_stream;
 struct mux_session;
 struct tls_context;
 struct tls_connection;
 struct hashtable;
+
+/* Socket/event helpers shared by session.c and stream.c. */
+
+static inline void modify_io_events(
+	struct ev_loop *restrict loop, ev_io *restrict watcher,
+	const int events)
+{
+	const int fd = watcher->fd;
+	ASSERT(fd != -1);
+	const int ioevents = events & (EV_READ | EV_WRITE);
+	if (ioevents == EV_NONE) {
+		if (ev_is_active(watcher)) {
+			LOGV_F("io: [fd:%d] stop", fd);
+			ev_io_stop(loop, watcher);
+		}
+		return;
+	}
+	if (ioevents != (watcher->events & (EV_READ | EV_WRITE))) {
+		ev_io_stop(loop, watcher);
+#ifdef ev_io_modify
+		ev_io_modify(watcher, ioevents);
+#else
+		ev_io_set(watcher, fd, ioevents);
+#endif
+	}
+	if (!ev_is_active(watcher)) {
+		LOGV_F("io: [fd:%d] events=0x%x", fd, ioevents);
+		ev_io_start(loop, watcher);
+	}
+}
+
+/**
+ * @brief Sets TCP_USER_TIMEOUT on the socket.
+ * @param fd The socket file descriptor.
+ * @param ms The timeout in milliseconds.
+ * @return 0 on success, -1 if unsupported or setsockopt fails.
+ */
+static inline int socket_user_timeout(const int fd, const int ms)
+{
+#if WITH_TCP_USER_TIMEOUT
+	if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, sizeof(ms)) !=
+	    0) {
+		const int err = errno;
+		LOGW_F("setsockopt [fd:%d]: TCP_USER_TIMEOUT (%d) %s", fd, err,
+		       strerror(err));
+		return -1;
+	}
+	return 0;
+#else
+	(void)fd;
+	(void)ms;
+	return -1;
+#endif
+}
 
 #define STREAMID_CTRL 0
 
@@ -58,22 +117,10 @@ enum session_state {
 	SESSION_CLOSED,
 };
 
-/* Bits per bitmap word; derived from the actual width of uint_fast32_t. */
-#define BITMAP_WORD_BITS ((int)(CHAR_BIT * sizeof(uint_fast32_t)))
-/* Number of words in the per-session stream-ID allocation bitmap.
- * Covers all 32768 possible (id >> 1) indices. */
-#define SCHED_ID_BITMAP_WORDS                                                  \
-	((32768 + BITMAP_WORD_BITS - 1) / BITMAP_WORD_BITS)
-
 /* Stream scheduling and table state.  Embedded by value in mux_session. */
 struct sched_ctx {
 	/* Per-session stream table, keyed by uint_least16_t stream ID. */
 	struct hashtable *streams;
-	/* Single-entry lookup cache for sched_find_stream.  Frame bursts target
-	 * the same stream, so caching the last hit skips the hash lookup.  The
-	 * cached stream's own id is the key; cleared whenever a stream leaves
-	 * the table (sched_remove_stream / sched_free_streams). */
-	struct mux_stream *cache_stream;
 	/* Number of CLOSED (tombstone) streams currently in the stream table.
 	 * These linger for MUX_TOMBSTONE_PERIOD_S but are no longer "live".
 	 * Used to exclude tombstones from the max_streams admission gate. */
@@ -81,9 +128,6 @@ struct sched_ctx {
 	/* Round-robin ready queue head and tail. */
 	struct mux_stream *sched_head;
 	struct mux_stream *sched_tail;
-	/* Tail of the ready queue at the start of the current scheduling round;
-	 * used by the EV_WRITE data path to enforce DRR round fairness. */
-	struct mux_stream *round_end;
 	/* Currently active DRR stream: dequeued and holding remaining deficit.
 	 * Not in the ready queue; NULL when no stream is mid-round. */
 	struct mux_stream *drr_active;
@@ -94,17 +138,14 @@ struct sched_ctx {
 	 * data path never skips over INIT/CLOSED streams. */
 	struct mux_stream *lp_head;
 	struct mux_stream *lp_tail;
-	/* Control-pending list: streams with queued ACK or FIN that have no
-	 * data to piggyback on.  Drained by sched_flush_ctrl during send-stall
-	 * and opportunistically by sched_next_data during normal operation. */
-	struct mux_stream *ctrl_head;
 	ev_idle w_sched;
 	/* Fixed-period coalescing timer: flushes Nagle-held frames and
 	 * sub-threshold window updates every MUX_COALESCING_INTERVAL seconds. */
 	ev_timer w_coalesce;
-	/* Bitmap of occupied stream IDs, indexed by (id >> 1).  Maintained in
-	 * sync with the stream table to enable O(n/BITMAP_WORD_BITS) ID allocation. */
-	uint_fast32_t id_bitmap[SCHED_ID_BITMAP_WORDS];
+	/* Wrap-around counter for allocating stream IDs.  Client sessions
+	 * assign odd IDs, server sessions assign even IDs.  Incremented by 2
+	 * after each allocation; wraps at 65536 back to the parity base. */
+	uint_least16_t next_stream_id;
 };
 
 /* Session-level ACK, identity, resume, and peer capability state.
@@ -151,11 +192,6 @@ struct mux_session {
 	struct mux_config conf;
 	/* Frame allocator; set at creation time and never changed. */
 	struct mux_frame_allocator pool;
-	/* One-deep frame cache layered over pool; holds at most one idle frame
-	 * so the steady alloc/free churn of the data path rarely reaches the
-	 * cross-thread server allocator.  Accessed only via session_frame_alloc
-	 * / session_frame_free; released by session_cleanup. */
-	struct mux_frame *frame_spare;
 	/* Non-owning pointer to the session log tag buffer; set at creation time. */
 	char *tag;
 	/* Pointer block into server_stats; NULL pointers are silently skipped. */
@@ -168,6 +204,15 @@ struct mux_session {
 	size_t recv_buffered_bytes;
 	size_t send_buffered_frames;
 	size_t unacked_frames;
+	/* Total payload bytes currently in the unacked ring.  Drives
+	 * send_stalled; the ring stores a frame count while the stall
+	 * gate operates on bytes so small frames cannot fill the window. */
+	size_t unacked_bytes;
+	/* Byte offset of the first sub-frame not yet byte-accounted in the
+	 * ring head entry.  Non-zero only while the head entry is being
+	 * partially trimmed across multiple session_ack_trim calls.  Reset
+	 * to 0 whenever the head entry is fully popped. */
+	uint_least32_t unacked_partial_offset;
 	/* Local per-session diagnostics. */
 	int_least64_t last_connect_latency_ns;
 	/* Total mux bytes received from the transport for diagnostics. */
@@ -200,16 +245,18 @@ struct mux_session {
 	 * bandwidth on each inbound PUSH cycle and stream_window tracks the
 	 * resulting effective_bdp with headroom. */
 	bool auto_stream_window : 1;
-	/* true when session_window was configured as 0; session_window tracks
-	 * peer_stream_window (updated on each SYN and SYN|ACK). */
+	/* true when session_window was configured as 0; peer_stream_window
+	 * (updated on each SYN and SYN|ACK) sets the initial floor, and
+	 * session_window then tracks the BDP estimator's effective_bdp on
+	 * each PONG, like stream_window. */
 	bool auto_session_window : 1;
 	/* true when the session should shut down as soon as its last stream
 	 * closes; set by session_drain() and cleared on reconnect. */
 	bool draining : 1;
 
-	/* Effective unacked-frame cap for the session; in auto mode updated from
-	 * peer_stream_window (the peer's per-stream receive window) whenever a
-	 * SYN or SYN|ACK is received.  A floor of
+	/* Effective unacked-frame cap for the session; in auto mode tracks
+	 * max(peer_stream_window, ceil(effective_bdp / MUX_WINDOW_UNIT)),
+	 * updated on each SYN, SYN|ACK, and PONG.  A floor of
 	 * MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT is always enforced. */
 	uint_least32_t session_window;
 	/* Effective per-stream receive window (frames); in auto mode tracks the
@@ -265,37 +312,9 @@ struct mux_session {
 	/* Reconnection state */
 	struct {
 		/* monotonic ns when SESSION_CONNECT entered */
-		intmax_t connect_started;
+		int_least64_t connect_started;
 	};
 };
-
-/* Acquire a frame for the session, reusing the one-deep spare when present.
- * The returned frame carries the same freshly-reset state as mux_frame_get. */
-static inline struct mux_frame *
-session_frame_alloc(struct mux_session *restrict ss)
-{
-	struct mux_frame *const frame = ss->frame_spare;
-	if (frame == NULL) {
-		return mux_frame_get(&ss->pool);
-	}
-	ss->frame_spare = NULL;
-	frame->pos = 0;
-	frame->len = 0;
-	frame->next = NULL;
-	return frame;
-}
-
-/* Release a frame back to the session, retaining it as the spare when the
- * cache slot is free; otherwise it returns to the shared allocator. */
-static inline void session_frame_free(
-	struct mux_session *restrict ss, struct mux_frame *restrict frame)
-{
-	if (ss->frame_spare == NULL) {
-		ss->frame_spare = frame;
-		return;
-	}
-	mux_frame_put(&ss->pool, frame);
-}
 
 #define MUX_LOG_F(level, ss, format, ...)                                      \
 	do {                                                                   \
@@ -431,6 +450,8 @@ static inline void unacked_ring_free_all(struct mux_session *restrict ss)
 {
 	mux_frame_ring_free(&ss->unacked, &ss->pool);
 	ss->unacked_frames = 0;
+	ss->unacked_bytes = 0;
+	ss->unacked_partial_offset = 0;
 	ss->retransmit_off = SIZE_MAX;
 }
 
@@ -451,9 +472,12 @@ void session_recv_pong(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	size_t frame_size);
 
-/* Update session_window from the current peer_stream_window value.
- * Must be called after each SYN and SYN|ACK that changes peer_stream_window.
- * No-op when auto_session_window is false. */
-void session_update_session_window(struct mux_session *restrict ss);
+/* Update session_window towards max(peer_stream_window,
+ * ceil(window_bytes / MUX_WINDOW_UNIT), initial_frames).  Called after each
+ * SYN and SYN|ACK that changes peer_stream_window (with the estimator's
+ * current window as window_bytes), and after each PONG with the estimator's
+ * updated window.  No-op when auto_session_window is false. */
+void session_update_session_window(
+	struct mux_session *restrict ss, size_t window_bytes);
 
 #endif /* MUX_SESSION_H */

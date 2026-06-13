@@ -63,8 +63,8 @@ graph TD
 ```
 
 This graph is the ownership map for the rest of the document: listener and
-tunnel connect the process to the mux core; session is the coordination
-object; dispatch, sched, handshake, estimator, and wire each own one slice of
+tunnel connect the process to the mux core;
+session is the coordination object; dispatch, sched, handshake, estimator, and wire each own one slice of
 behavior but coordinate only through session and stream state.
 
 ### 1.2 Control Ownership by Subsystem
@@ -134,6 +134,8 @@ stateDiagram-v2
   SUSPENDED --> HANDSHAKE: inbound resume steals new fd
   SUSPENDED --> CLOSED: resume timeout or resume failure
 
+  CLOSED --> CONNECT: demand-triggered reconnect (idle-close or resume-timeout expiry)
+
   CLOSING --> CLOSE_WAIT: local shutdown completed
   CLOSING --> CLOSED: shutdown error
 
@@ -144,6 +146,10 @@ stateDiagram-v2
 The enum names are less important than the control handoff: outbound reconnect
 returns through CONNECT, inbound resume re-enters HANDSHAKE on a different
 transport, and terminal `session_reset` skips the suspend path entirely.
+The public API exposes a simplified `enum mux_state` with four externally
+visible states (`ESTABLISHED`, `CONNECT`, `CLOSED`, `SUSPENDED`) via
+`mux_state()`, which collapses the internal `SESSION_HANDSHAKE` → `CONNECT`,
+`SESSION_CLOSING`/`SESSION_CLOSE_WAIT` → `CLOSED`, and `SESSION_INIT` → `CONNECT`.
 Entering `SESSION_SUSPENDED` is observable on both roles: dialed and accepted
 sessions both emit `MUX_EVENT_SUSPENDED`, while reconnect policy remains a
 tunnel-layer decision.
@@ -243,23 +249,23 @@ sequenceDiagram
 
 ## 5. libev Watcher Topology
 
-| Owner                | Watcher                   | Drives                                               | Runtime Coupling                                                                                                                                                                                                                        |
-| -------------------- | ------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Session              | `w_socket`                | transport read/write                                 | gated by `rx_open` and `tx_pending` rather than watcher churn                                                                                                                                                                           |
-| Session              | `w_timeout`               | activity timeout                                     | participates in hard teardown paths                                                                                                                                                                                                     |
-| Session              | `w_keepalive`             | periodic keepalive scheduling                        | armed only on the steady-state path                                                                                                                                                                                                     |
-| Session              | `w_send_timeout`          | pending-send stall detection                         | meaningful only while the one-frame sendbuf is pending                                                                                                                                                                                  |
-| Session              | `w_connect_timeout`       | outbound connection / TLS timeout                    | stops at connect or TLS setup completion; triggers close on expiry                                                                                                                                                                      |
-| Session              | `w_sched`                 | scheduler trigger                                    | bridges lifecycle work into the DRR/send path                                                                                                                                                                                           |
-| Session              | `w_coalesce`              | delayed ACK / grant / Nagle expiry                   | owns the shared per-stream delay list and deferred session ACK budget                                                                                                                                                                   |
-| Session              | `w_idle_timeout`          | client idle-close / lazy reconnect                   | feeds the upper-layer reconnect policy                                                                                                                                                                                                  |
-| Stream (socket mode) | `socket.w_io`             | local fd recv/send pump                              | present only when a real local fd is attached                                                                                                                                                                                           |
-| Stream (socket mode) | `socket.w_timeout`        | local send/connect stall detection                   | local-edge analogue of session send timeout                                                                                                                                                                                             |
-| Stream (direct mode) | `direct.w_io`             | synthesized `EV_READ` / `EV_WRITE`                   | user-visible readiness is derived from stream state rather than kernel fd readiness                                                                                                                                                     |
-| Server               | `w_sighup`                | config reload trigger                                | fires `server_reload()` synchronously on the server loop                                                                                                                                                                                |
-| Server               | `w_sigint`, `w_sigterm`   | graceful shutdown trigger                            | stops listeners, dispatches `mux_shutdown()` to every tunnel, arms `shutting_down` flag for the `w_maintenance` deadline                                                                                                                |
-| Server               | `w_maintenance`           | shutdown deadline, sleep detection, frame-pool drain | fires every second; runs three tasks in priority order: (1) force-exit after 2 s when `shutting_down`; (2) on a wall-clock jump ≥ `mux.ping_timeout`, call `tunnel_drop_transport()` on every tunnel; (3) release one frame-pool object |
-| Server               | `w_relay_async` (threads) | cross-thread event relay                             | drains the server-side dispatcher queue after tunnel-to-server async relay                                                                                                                                                              |
+| Owner                | Watcher                   | Drives                                                                                       | Runtime Coupling                                                                                                                                                                                                                        |
+| -------------------- | ------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session              | `w_socket`                | transport read/write                                                                         | gated by `rx_open` and `tx_pending` rather than watcher churn                                                                                                                                                                           |
+| Session              | `w_timeout`               | activity timeout (currently unused; inactivity detection uses keepalive PING + ping_timeout) | participates in hard teardown paths                                                                                                                                                                                                     |
+| Session              | `w_keepalive`             | keepalive PING probes (also drives BDP estimation via PING/PONG)                             | armed only on the steady-state path                                                                                                                                                                                                     |
+| Session              | `w_send_timeout`          | pending-send stall detection (disabled when OS provides TCP_USER_TIMEOUT)                    | meaningful only while the one-frame sendbuf is pending                                                                                                                                                                                  |
+| Session              | `w_connect_timeout`       | outbound connection / TLS timeout                                                            | stops at connect or TLS setup completion; triggers close on expiry                                                                                                                                                                      |
+| Session              | `w_sched`                 | scheduler trigger                                                                            | bridges lifecycle work into the DRR/send path                                                                                                                                                                                           |
+| Session              | `w_coalesce`              | delayed ACK / grant / Nagle expiry                                                           | owns the shared per-stream delay list and deferred session ACK budget                                                                                                                                                                   |
+| Session              | `w_idle_timeout`          | client idle-close / lazy reconnect                                                           | feeds the upper-layer reconnect policy                                                                                                                                                                                                  |
+| Stream (socket mode) | `socket.w_io`             | local fd recv/send pump                                                                      | present only when a real local fd is attached                                                                                                                                                                                           |
+| Stream (socket mode) | `socket.w_timeout`        | local send/connect stall detection                                                           | local-edge analogue of session send timeout                                                                                                                                                                                             |
+| Stream (direct mode) | `direct.w_io`             | synthesized `EV_READ` / `EV_WRITE`                                                           | user-visible readiness is derived from stream state rather than kernel fd readiness                                                                                                                                                     |
+| Server               | `w_sighup`                | config reload trigger                                                                        | fires `server_reload()` synchronously on the server loop                                                                                                                                                                                |
+| Server               | `w_sigint`, `w_sigterm`   | graceful shutdown trigger                                                                    | stops listeners, dispatches `mux_shutdown()` to every tunnel, arms `shutting_down` flag for the `w_maintenance` deadline                                                                                                                |
+| Server               | `w_maintenance`           | shutdown deadline, sleep detection, frame-pool drain                                         | fires every second; runs three tasks in priority order: (1) force-exit after 2 s when `shutting_down`; (2) on a wall-clock jump ≥ `mux.ping_timeout`, call `tunnel_drop_transport()` on every tunnel; (3) release one frame-pool object |
+| Server               | `w_relay_async` (threads) | cross-thread event relay                                                                     | drains the server-side dispatcher queue after tunnel-to-server async relay                                                                                                                                                              |
 
 Per-stream coalescing uses `delay_ticks` and `delay_pending` flags instead of
 per-stream timers, keeping all delayed-grant state under the single
@@ -411,7 +417,7 @@ flowchart LR
 
 When `send_stalled` is set, `EV_WRITE` stops scheduling fresh payload but still
 flushes sendbuf, retransmit traffic, stream-0 control, and per-stream ACK/FIN
-so the peer can drain the bottleneck. The `oobbuf` queue (PROBE/PING/PONG
+so the peer can drain the bottleneck. The `oobbuf` queue (PING/PONG
 frames) is also exempt from `send_stalled`: the BDP estimator continues to
 probe even during window exhaustion, which is exactly when an accurate BDP
 reading is most needed.
@@ -489,12 +495,12 @@ of triggering a spurious `FLOW_CONTROL_ERROR`.
 
 ### 10.2 Critical Gating Rule
 
-| Gate                  | Trips when                                                                                                                                | Consequence                                                                                                                        |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Read credit           | `queued_send_bytes + bytes_sent >= send_window`                                                                                           | Local socket reads stop before the peer grant is exhausted.                                                                        |
-| Session send stall    | unacked list reaches `session_window` frames                                                                                              | `EV_WRITE` stops scheduling fresh payload but still flushes sendbuf, retransmit traffic, stream-0 control, and per-stream ACK/FIN. |
-| Expressible grant     | newly grantable credit is at least one `MUX_WINDOW_UNIT`                                                                                  | The `ack_pending` flag becomes meaningful only once the wire can represent the increment.                                          |
-| Immediate ACK / grant | `quickack_budget > 0`, or grantable credit reaches `2 * MUX_MAX_PAYLOAD_SIZE`, or `recv_seq - ack_seq >= clamp(session_window / 4, 2, 8)` | The implementation bypasses delayed ACK so both peers do not wait on each other's timers.                                          |
+| Gate                  | Trips when                                                                                                      | Consequence                                                                                                                        |
+| --------------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Read credit           | `queued_send_bytes + bytes_sent >= send_window`                                                                 | Local socket reads stop before the peer grant is exhausted.                                                                        |
+| Session send stall    | unacked bytes reach `session_window × MUX_WINDOW_UNIT` bytes                                                    | `EV_WRITE` stops scheduling fresh payload but still flushes sendbuf, retransmit traffic, stream-0 control, and per-stream ACK/FIN. |
+| Expressible grant     | newly grantable credit is at least one `MUX_WINDOW_UNIT`                                                        | The `ack_pending` flag becomes meaningful only once the wire can represent the increment.                                          |
+| Immediate ACK / grant | grantable credit reaches `2 * MUX_MAX_PAYLOAD_SIZE`, or `recv_seq - ack_seq >= clamp(session_window / 4, 2, 8)` | The implementation bypasses delayed ACK so both peers do not wait on each other's timers.                                          |
 
 `session_ack_trim()` clears `send_stalled` and nudges the scheduler only after a
 session ACK shrinks the unacked list below the cap.
@@ -503,11 +509,11 @@ session ACK shrinks the unacked list below the cap.
 
 Grants follow three paths:
 
-| Path                  | Condition                                                                    | Wire shape                                                                              |
-| --------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Immediate             | `quickack_budget > 0` or grantable credit reaches `2 * MUX_MAX_PAYLOAD_SIZE` | Piggyback in the next data frame when possible; otherwise emit a standalone ACK header. |
-| Delayed per-stream    | grant is expressible but does not meet the immediate threshold               | Put the stream on the coalescing delay list and flush on the next coalescing tick.      |
-| Immediate session ACK | `recv_seq - ack_seq >= clamp(session_window / 4, 2, 8)`                      | Emit a session ACK immediately to relieve session-wide backpressure.                    |
+| Path                  | Condition                                                      | Wire shape                                                                              |
+| --------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Immediate             | grantable credit reaches `2 * MUX_MAX_PAYLOAD_SIZE`            | Piggyback in the next data frame when possible; otherwise emit a standalone ACK header. |
+| Delayed per-stream    | grant is expressible but does not meet the immediate threshold | Put the stream on the coalescing delay list and flush on the next coalescing tick.      |
+| Immediate session ACK | `recv_seq - ack_seq >= clamp(session_window / 4, 2, 8)`        | Emit a session ACK immediately to relieve session-wide backpressure.                    |
 
 ### 10.4 Receive-Buffer Pressure and Auto Window
 
@@ -523,13 +529,27 @@ any non-zero expressible grant, so receive pressure can slow credit growth but
 cannot starve a live stream forever.
 
 Automatic mode is opt-in per direction: `stream_window = 0` in config enables
-`auto_stream_window` (BDP estimator drives the per-stream receive window;
-see §12), and `session_window = 0` enables `auto_session_window` (session cap
-mirrors `peer_stream_window` on each SYN/SYN|ACK).  Either field may be auto
-without the other.  In auto mode the affected cap starts at
-`MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT` frames; when the session cap is
-reached, `send_stalled` throttles payload scheduling rather than closing the
-session.
+`auto_stream_window`, and `session_window = 0` enables `auto_session_window`.
+Either field may be auto without the other, but enabling either one activates
+the shared BDP estimator (§12).  The estimator keeps an independent estimate
+per link direction so asymmetric channel capacities yield independently sized
+windows: `auto_stream_window` drives `stream_window` from the **rx** estimate
+(`dir[ESTIMATOR_RX].effective_bdp`), while `auto_session_window` uses
+`peer_stream_window` (updated on each SYN/SYN|ACK) as an initial floor and
+then tracks the **tx** estimate (`dir[ESTIMATOR_TX].effective_bdp`) on each
+PONG.  In auto mode the affected cap starts at `MUX_INITIAL_SEND_WINDOW /
+MUX_WINDOW_UNIT` frames; `send_stalled` gates on `unacked_bytes >=
+session_window × MUX_WINDOW_UNIT`, a byte-level cap that throttles payload
+scheduling rather than closing the session.
+
+Each direction is fed from its own source: inbound PUSH payload accumulates
+into the rx sample via `estimator_add` (dispatch.c), and bytes that
+`session_ack_trim` drains from the local `unacked` ring on an incoming session
+ACK accumulate into the tx sample via `estimator_add_acked` (session.c),
+gated by the same `auto_stream_window || auto_session_window` condition.  The
+tx sample reflects the sender's own achieved throughput × RTT (an "ack-clock"
+BDP sample) and requires no inbound payload at all, so a near-pure sender
+still grows its `session_window`.  See §12.1 for the per-direction equations.
 
 ## 11. Delayed ACK and Coalescing Timer Behavior
 
@@ -545,7 +565,7 @@ sequenceDiagram
   Dispatch->>Dispatch: recv_seq++
   Dispatch->>Stream: queue payload
   Stream->>Sched: stream_check_ack()
-  alt quickack or 2-frame grant
+  alt 2-frame grant
     Sched->>Peer: immediate ACK/grant
   else sub-threshold grant
     Sched->>Timer: arm delay list
@@ -572,125 +592,154 @@ session leaves the steady-state path.
 
 ## 12. BDP Estimator
 
-The estimator is active when `stream_window = 0` in config (`auto_stream_window`
-mode). It learns a byte-granularity BDP from inbound payload-driven probe cycles and
-sets `stream_window` so the mux credit window is never the throughput
-bottleneck.  TCP handles congestion control; the estimator only ensures the
-per-stream receive window stays ahead of the BDP.  `session_window` is driven
-independently by `session_update_session_window` whenever a SYN or SYN|ACK
-arrives (when `session_window = 0` in config, i.e., `auto_session_window` mode);
-the two modes are fully independent.
+The estimator is active whenever `auto_stream_window` or `auto_session_window`
+is enabled (`stream_window = 0` and/or `session_window = 0` in config).  It
+learns a byte-granularity BDP **per link direction** from probe cycles driven
+by either inbound PUSH payload (`estimator_add` → rx) or locally-sent bytes
+that the peer has acked (`estimator_add_acked` → tx, called from
+`session_ack_trim`).  Both directions share one PING/PONG probe cycle and the
+RTT filter (RTT is inherently a round-trip quantity), but each keeps its own
+bandwidth filter, BDP, `effective_bdp`, and STARTUP/TRACK phase, so an
+asymmetric channel never sizes the slow direction's window from the fast
+direction's bandwidth.  TCP handles congestion control; the estimator only
+ensures the relevant windows stay ahead of the BDP:
+
+- `session_update_stream_window` sets `stream_window` (when
+  `auto_stream_window`) from the rx estimate on every PONG.
+- `session_update_session_window` sets a floor for `session_window` (when
+  `auto_session_window`) from `peer_stream_window` on every SYN/SYN|ACK, then
+  tracks the tx estimate on every PONG.
 
 ```mermaid
 flowchart LR
-  A[inbound PUSH payload] --> B[estimator_add]
-  B --> C[queue PING and accumulate sample]
-  C --> D[PONG]
-  D --> E[estimator_calculate]
-  E --> F["bdp = bw_max × rtt_min"]
-  F --> G{phase}
-  G -- STARTUP --> H1["window_limited → ×3<br/>16 stable rounds → phase=TRACK"]
-  G -- TRACK --> H2["effective_bdp = bdp × 1.25<br/>sample > effective_bdp → phase=STARTUP"]
-  H1 & H2 --> I[session_update_stream_window]
-  I --> J["stream_window = ceil(effective_bdp / MUX_WINDOW_UNIT)"]
-  J --> K[grow: expand live stream recv_window immediately;
-shrink: lazily sync recv_window down in stream_check_ack
-once outstanding peer credit is consumed]
+    A[inbound PUSH payload] --> B[estimator_add]
+    B --> C["queue PING and accumulate rx sample"]
+    A2["session ACK trims unacked ring"] --> B2[estimator_add_acked]
+    B2 --> C2["queue PING and accumulate tx sample"]
+    C --> D[PONG]
+    C2 --> D
+    D --> E["estimator_calculate (per direction d ∈ {rx, tx})"]
+    E --> F["bdp[d] = bw_max[d] × rtt_min"]
+    F --> G{"phase[d]"}
+    G -- STARTUP --> H1["window_limited → ×3<br/>16 stable rounds → phase=TRACK"]
+    G -- TRACK --> H2["effective_bdp[d] = bdp[d] × 1.25<br/>sample[d] > effective_bdp[d] → phase=STARTUP"]
+    H1 & H2 --> I["session_update_stream_window (rx)"]
+    H1 & H2 --> I2["session_update_session_window (tx)"]
+    I --> J["stream_window = max(ceil(effective_bdp[rx] / MUX_WINDOW_UNIT), initial_frames)"]
+    J --> K["grow: expand live stream recv_window immediately;<br/>shrink: lazily sync recv_window down in stream_check_ack once outstanding peer credit is consumed"]
+    I2 --> O["session_window = max(peer_stream_window, ceil(effective_bdp[tx] / MUX_WINDOW_UNIT), initial_frames)"]
 
-  L["inbound SYN or SYN|ACK"] --> M[peer_stream_window updated]
-  M --> N[session_update_session_window]
-  N --> O[session_window = peer_stream_window frames]
+    L["inbound SYN or SYN|ACK"] --> M[peer_stream_window updated]
+    M --> I2
 ```
 
 ### 12.1 Core Equations
 
-`session_update_stream_window` converts `effective_bdp` to frames with
-**ceiling** division, so even a 1-byte headroom translates to at least one
-extra frame.
+`session_update_stream_window` and `session_update_session_window` convert
+`effective_bdp` to frames with **ceiling** division, so even a 1-byte
+headroom translates to at least one extra frame.
 
 ```text
-bw_sample      = sample × 1e9 / rtt_ns
-bw_max         = wndfilter_max(bw_wnd, WND_BW_MAX_NS)     -- 86400 s window
-rtt_min_ns     = wndfilter_min(rtt_wnd, WND_RTT_MIN_NS)   -- 600 s window
-bdp            = bw_max × rtt_min_ns / 1e9
-window_limited = sample + sample/2 > effective_bdp        -- sample > 2/3 target
+rtt_min_ns = wndfilter_min(rtt_wnd, WND_RTT_MIN_NS) -- 600 s window, shared
 
--- STARTUP phase (bw_max == 0 → no-op)
-if window_limited:
-    effective_bdp ×= 3 (capped at WNDSIZE_MAX); stable_rounds = 0
+-- per direction d ∈ {rx, tx}:
+bw_sample[d]      = min(sample[d], clamp_max) × 1e9 / rtt_ns
+bw_max[d]         = wndfilter_max(bw_wnd[d], WND_BW_MAX_NS) -- 86400 s window
+bdp[d]            = bw_max[d] × rtt_min_ns / 1e9
+window_limited[d] = sample[d] + sample[d] / 2 > effective_bdp[d]
+                                                -- demand > 2/3 target
+
+-- STARTUP phase (bw_max[d] == 0 → no-op)
+if window_limited[d]:
+    effective_bdp[d] ×= 3 (capped at WNDSIZE_MAX); stable_rounds[d] = 0
 else:
-    stable_rounds++
-    if stable_rounds >= STARTUP_STABLE_ROUNDS:
-        phase = TRACK
+    stable_rounds[d]++
+    if stable_rounds[d] >= STARTUP_STABLE_ROUNDS: phase[d] = TRACK
 
 -- TRACK phase
-effective_bdp  = bdp + bdp / 4
-if sample > effective_bdp:  phase = STARTUP; stable_rounds = 0
+effective_bdp[d] = bdp[d] + bdp[d] / 4
+if sample[d] > effective_bdp[d]: phase[d] = STARTUP; stable_rounds[d] = 0
 
 initial_frames = MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT
-stream_window  = max(ceil(effective_bdp / MUX_WINDOW_UNIT), initial_frames)
+stream_window  = max(ceil(effective_bdp[rx] / MUX_WINDOW_UNIT), initial_frames)
+session_window = max(peer_stream_window, ceil(effective_bdp[tx] / MUX_WINDOW_UNIT), initial_frames)
 ```
 
-The `bw_wnd` 86400 s window and `rtt_wnd` 600 s window together act as a
+The rx sample (fed by `estimator_add` from inbound PUSH payload) and the tx
+sample (fed by `estimator_add_acked` from session-ACK-driven `unacked` ring
+trims) share the same probe lifecycle: either one starts a cycle and queues a
+PING, both accumulate independently while a PING is in flight, a PING timeout
+discards both, and a valid PONG resets both to 0 at the end of the cycle (see
+§12.2).  Beyond the shared cycle the directions never mix: each direction's
+raw sample is its own demand for the phase decisions, so a near-pure sender
+(`sample[rx] ≈ 0`, `sample[tx] > 0`) gets the fast-startup ×3 ramp and TRACK
+re-entry on its tx estimate while the idle rx estimate stays put.
+`clamp_max = INTMAX_MAX / 1e9` bounds each sample before the `× 1e9`
+multiplication so neither can overflow `intmax_t`.
+
+The `bw_wnd` 86400 s windows and the `rtt_wnd` 600 s window together act as a
 natural floor: a measured peak bandwidth and minimum RTT persist for up to
-their respective window sizes before `effective_bdp` can fall materially
+their respective window sizes before an `effective_bdp` can fall materially
 below the level it once supported.
 
 Constants: `WNDSIZE_MAX = UINT16_MAX × MUX_WINDOW_UNIT`, `WNDSIZE_MIN = 4 × MUX_WINDOW_UNIT`, `STARTUP_STABLE_ROUNDS = 16`, `WND_BW_MAX_NS = 86400 s`, `WND_RTT_MIN_NS = 600 s`, `MUX_PING_RATE_LIMIT_NS = 1 s`.
 
 ### 12.2 Probe Lifecycle
 
-| Event                                                      | Effect                                                                                                                                                                                           |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| First inbound PUSH with no probe in flight                 | Start `sample = bytes`, queue PING with `last_probe_ns` payload, set `ping_in_flight`.                                                                                                           |
-| More eligible PUSH while PING is in flight                 | Accumulate payload into `sample`; no static clamp — overflow guard applied during `bw_sample` calculation.                                                                                       |
-| `now − last_probe_ns < MUX_PING_RATE_LIMIT_NS`             | Rate limit applies in every phase: skip without starting a probe; at most one cycle per `MUX_PING_RATE_LIMIT_NS` (1 s).                                                                          |
-| PING timeout (≥ `conf.ping_timeout` since `last_probe_ns`) | Discard the cycle; suspend the session for resume if `has_session_id`, otherwise close it via `session_notify_closed`; `last_probe_ns` is not updated; no new probe is started on the same call. |
-| Matching PONG (`sent_ns == last_probe_ns`)                 | `estimator_calculate` updates RTT/BW filters and `effective_bdp` per §12.3; advances `last_probe_ns` to gate the next probe.                                                                     |
-| Stale PONG (`sent_ns != last_probe_ns`)                    | Discarded without updating any filter.                                                                                                                                                           |
-| Liveness PING via `estimator_ping`                         | Bypasses the data-driven trigger; queues a PING with `last_probe_ns` current time and sets `ping_in_flight` (no-op when a probe is already in flight).                                           |
+| Event                                                      | Effect                                                                                                                                                                                                                      |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| First eligible bytes with no probe in flight               | Start the calling direction's `sample = bytes`, queue PING with `last_probe_ns` payload, set `ping_in_flight`.                                                                                                              |
+| More eligible bytes while PING is in flight                | Accumulate into the calling direction's `sample`; no static clamp — overflow guard applied during the `bw_sample` calculation.                                                                                              |
+| `now − last_probe_ns < MUX_PING_RATE_LIMIT_NS`             | Rate limit applies in every phase: skip without starting a probe; at most one cycle per `MUX_PING_RATE_LIMIT_NS` (1 s).                                                                                                     |
+| PING timeout (≥ `conf.ping_timeout` since `last_probe_ns`) | Discard the cycle (both directions' samples); suspend the session for resume if `has_session_id`, otherwise close it via `session_notify_closed`; `last_probe_ns` is not updated; no new probe is started on the same call. |
+| Matching PONG (`sent_ns == last_probe_ns`)                 | `estimator_calculate` updates the RTT filter and both directions' BW filters and `effective_bdp` per §12.3; advances `last_probe_ns` to gate the next probe.                                                                |
+| Stale PONG (`sent_ns != last_probe_ns`)                    | Discarded without updating any filter.                                                                                                                                                                                      |
+| Liveness PING via `estimator_ping`                         | Bypasses the data-driven trigger; queues a PING with `last_probe_ns` current time and sets `ping_in_flight` (no-op when a probe is already in flight).                                                                      |
 
 The estimator has no dedicated timer; probes are driven by payload arrival and
 are completed either by a matching PONG or by timeout detection on the next
-PUSH.
+eligible bytes.
 
 ### 12.3 `effective_bdp` Update Rules
 
-Each valid PONG updates `rtt_wnd` (windowed-minimum RTT) and `bw_wnd` (windowed-maximum
-bandwidth); a zero sample cannot raise the bandwidth peak.  `bdp` is computed
-directly as `bw_max × rtt_min_ns / 1e9` without a separate BDP filter.
-`effective_bdp` is then adjusted according to the current phase (`STARTUP` or
-`TRACK`), stored in `est->phase`.
+Each valid PONG updates `rtt_wnd` (windowed-minimum RTT, shared) and then, for
+each direction independently, `bw_wnd[d]` (windowed-maximum bandwidth); a zero
+sample cannot raise a bandwidth peak.  `bdp[d]` is computed directly as
+`bw_max[d] × rtt_min_ns / 1e9` without a separate BDP filter.
+`effective_bdp[d]` is then adjusted according to that direction's phase
+(`STARTUP` or `TRACK`), stored in `dir[d].phase`.
 
 **STARTUP phase** — fast-start, searching for the bandwidth ceiling:
 
-- **window_limited** (`sample > 2/3 × effective_bdp`): the receive window is the
-  throughput bottleneck; triple `effective_bdp` (capped at `WNDSIZE_MAX`) and
-  reset `stable_rounds` to 0.
-- **otherwise**: increment `stable_rounds`; once it reaches
-  `STARTUP_STABLE_ROUNDS` (16) consecutive non-window-limited cycles, the window
-  is confirmed to have headroom — transition to TRACK.
-- `bw_max == 0` (no bandwidth sample yet): `effective_bdp` is unchanged and
-  `stable_rounds` is not advanced.
+- **window_limited** (`sample[d] > 2/3 × effective_bdp[d]`): the window is the
+  throughput bottleneck; triple `effective_bdp[d]` (capped at `WNDSIZE_MAX`)
+  and reset `stable_rounds[d]` to 0.
+- **otherwise**: increment `stable_rounds[d]`; once it reaches
+  `STARTUP_STABLE_ROUNDS` (16) consecutive non-window-limited cycles, the
+  window is confirmed to have headroom — transition to TRACK.
+- `bw_max[d] == 0` (no bandwidth sample yet): `effective_bdp[d]` is unchanged
+  and `stable_rounds[d]` is not advanced.
 
 **TRACK phase** — steady-state, tracking the current BDP:
 
-- **Always**: `effective_bdp = bdp + bdp / 4`, where `bdp = bw_max × rtt_min_ns / 1e9`.
-- **Sample exceeds target** (`sample > effective_bdp`): link bandwidth has
-  improved — re-enter STARTUP and reset `stable_rounds` to 0.  `effective_bdp`
-  is not reset; STARTUP resumes growing from the current TRACK value if the
-  window is still the bottleneck.
+- **Always**: `effective_bdp[d] = bdp[d] + bdp[d] / 4`, where
+  `bdp[d] = bw_max[d] × rtt_min_ns / 1e9`.
+- **Sample exceeds target** (`sample[d] > effective_bdp[d]`): link bandwidth
+  has improved — re-enter STARTUP and reset `stable_rounds[d]` to 0.
+  `effective_bdp[d]` is not reset; STARTUP resumes growing from the current
+  TRACK value if the window is still the bottleneck.
 
 ### 12.4 Window Update and Lifecycle
 
-| Event                            | Result                                                                                                                                                                                                                                                                                                                                      |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Manual mode                      | The estimator is inert; configured frame counts are used as-is.                                                                                                                                                                                                                                                                             |
-| Automatic `stream_window`        | `auto_stream_window = true`; effective `stream_window` starts at `initial_frames` and grows with `effective_bdp`; the `bw_wnd` 86400 s window buffers shrinks—`effective_bdp` cannot fall below the level it once supported until the old peak ages out.                                                                                    |
-| Automatic `session_window`       | `auto_session_window = true`; `session_window` starts at `initial_frames` and is updated from `peer_stream_window` on each SYN/SYN\|ACK.                                                                                                                                                                                                    |
-| `session_update_stream_window()` | `stream_window` is set to `max(ceil(effective_bdp / MUX_WINDOW_UNIT), initial_frames)`; live streams expand `recv_window` immediately on grow; on shrink, each stream's `recv_window` is lazily synced down by `stream_check_ack` once `buffered_bytes + outstanding ≤ target`.                                                             |
-| Disconnect / stop                | `stream_window` is set to `max(effective_bdp / 2 / MUX_WINDOW_UNIT, initial_frames)` without modifying the estimator struct. The learned RTT and bandwidth filters are preserved across reconnects; any stale in-flight probe is detected by the timeout path on the next inbound PUSH, which closes or suspends the session at that point. |
-| First enter auto mode on reload  | `estimator_init()` seeds `effective_bdp` from the current `stream_window * MUX_WINDOW_UNIT` and zeroes the rest of the estimator state.  Subsequent reloads that stay in auto mode preserve the learned state.                                                                                                                              |
+| Event                             | Result                                                                                                                                                                                                                                                                                                                                                                            |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Manual mode                       | The estimator is inert; configured frame counts are used as-is.                                                                                                                                                                                                                                                                                                                   |
+| Automatic `stream_window`         | `auto_stream_window = true`; effective `stream_window` starts at `initial_frames` and grows with the rx `effective_bdp` (fed by inbound PUSH payload); the `bw_wnd` 86400 s window buffers shrinks—the estimate cannot fall below the level it once supported until the old peak ages out.                                                                                        |
+| Automatic `session_window`        | `auto_session_window = true`; `session_window` starts at `initial_frames`, is floored by `peer_stream_window` on each SYN/SYN\|ACK, and tracks the tx `effective_bdp` (fed by the session-ACK-driven ack-clock) on each PONG, so a pure sender grows it without any inbound payload (§12.1).                                                                                      |
+| `session_update_stream_window()`  | `stream_window` is set to `max(ceil(effective_bdp[rx] / MUX_WINDOW_UNIT), initial_frames)`; live streams expand `recv_window` immediately on grow; on shrink, each stream's `recv_window` is lazily synced down by `stream_check_ack` once `buffered_bytes + outstanding ≤ target`.                                                                                               |
+| `session_update_session_window()` | `session_window` is set to `max(peer_stream_window, ceil(effective_bdp[tx] / MUX_WINDOW_UNIT), initial_frames)`; on growth, clears `send_stalled` if `unacked_bytes` is now under the new limit and wakes the scheduler.                                                                                                                                                          |
+| Disconnect / stop                 | `stream_window` is set to `max(CLAMP(effective_bdp[rx], WNDSIZE_MIN, WNDSIZE_MAX) / 2 / MUX_WINDOW_UNIT, initial_frames)` without modifying the estimator struct.  The learned RTT and bandwidth filters are preserved across reconnects; any stale in-flight probe is detected by the timeout path on the next inbound PUSH, which closes or suspends the session at that point. |
+| First enter auto mode on reload   | `estimator_init()` seeds both directions' `effective_bdp` from the current `stream_window * MUX_WINDOW_UNIT` and zeroes the rest of the estimator state.  Subsequent reloads that stay in auto mode preserve the learned state.                                                                                                                                                   |
 
 When `stream_window` decreases (TRACK trim to `bdp + bdp/4`, or manual reload), each
 stream's `recv_window` is lazily synced to the new target inside
@@ -793,6 +842,7 @@ a retired stream is handled by the single-RST path in Section 14.3 instead.
 | Attempt 0 failed, or reconnect triggered from `MUX_EVENT_CLOSED` on a dialed tunnel | tunnel layer  | fall back to `tunnel_schedule_reconnect()` starting at 0.2 s and increment `reconnect_count`                                                                                                                           |
 | Successful `MUX_EVENT_ESTABLISHED` or `MUX_EVENT_RESUMED` on a dialed tunnel        | tunnel layer  | reset `reconnect_count` to 0                                                                                                                                                                                           |
 | Client idle timeout enabled                                                         | tunnel layer  | suppress attempt 0 and automatic CLOSED-time backoff; reconnect becomes demand-triggered from `open_stream_task()`                                                                                                     |
+| Demand-triggered reconnect from `SESSION_CLOSED`                                    | tunnel layer  | `session_attach_fd()` accepts a new fd from `SESSION_CLOSED` (after idle-close or resume-timeout expiry), transitions to `SESSION_CONNECT`, and starts a new connection attempt                                        |
 | Stream-id exhaustion                                                                | session layer | `session_open_stream()` returns `NULL`; session stays up and the caller retries after old streams leave the parity space                                                                                               |
 
 ### 15.1 Inbound Session Admission Control
@@ -848,7 +898,7 @@ session hot paths never need to know the owning struct.
 | Piece                         | Implementation rule                                                                                                                   |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `session_counters`            | `mux.h` stores pointers into the server's flat counters; pointer types are atomic under `WITH_THREADS` and plain otherwise.           |
-| Traffic subgroup              | `traffic` groups `byt_mux_recv`, `byt_mux_sent`, `byt_local_recv`, and `byt_local_sent` to mirror the flat `server_stats` layout.     |
+| Traffic subgroup              | `traffic` groups `byt_mux_recv`, `byt_mux_sent`, `byt_push_recv`, and `byt_push_sent` to mirror the flat `server_stats` layout.       |
 | Update path                   | Sessions write counters directly through `COUNTER_ADD`; there is no snapshot aggregation phase.                                       |
 | Stream-establish latency ring | `server_stats` keeps a fixed 256-entry ring and a monotonic counter; samples are written eagerly on `MUX_EVENT_STREAM_ESTABLISHED`.   |
 | Read path                     | All aggregate reads go through `server_stats()`; per-session diagnostics are delivered by `on_event`, not by polling session objects. |

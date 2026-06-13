@@ -9,8 +9,7 @@
 /*
  * Local scheduler invariants only; the full model lives in doc/impl.md.
  *
- * - sched_head/tail hold the ready FIFO, while round_end snapshots the tail
- *   that bounds the current DRR round.  prev/next form a doubly-linked list
+ * - sched_head/tail hold the ready FIFO.  prev/next form a doubly-linked list
  *   with O(1) insertion, head removal, and arbitrary-node dequeue.
  * - drr_active is temporarily removed from the FIFO while it spends the
  *   remainder of its current byte budget across successive EV_WRITE visits.
@@ -31,7 +30,6 @@
 #include "util.h"
 
 #include "algo/hashtable.h"
-#include "math/intlog2.h"
 #include "os/clock.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
@@ -61,14 +59,11 @@ static bool stream_free_and_decount_cb(
 
 void sched_free_streams(struct mux_session *restrict ss)
 {
-	ss->sched.cache_stream = NULL;
 	ss->sched.sched_head = NULL;
 	ss->sched.sched_tail = NULL;
-	ss->sched.round_end = NULL;
 	ss->sched.drr_active = NULL;
 	ss->sched.lp_head = NULL;
 	ss->sched.lp_tail = NULL;
-	ss->sched.ctrl_head = NULL;
 	/* Clear delay_pending to prevent use-after-free in stream_stop
 	 * during bulk teardown. */
 	for (struct mux_stream *d = ss->sched.delay_head; d != NULL;
@@ -78,7 +73,7 @@ void sched_free_streams(struct mux_session *restrict ss)
 	ss->sched.delay_head = NULL;
 	ss->send_stalled = false;
 	ss->sched.num_tombstones = 0;
-	memset(ss->sched.id_bitmap, 0, sizeof(ss->sched.id_bitmap));
+	ss->sched.next_stream_id = 0;
 	if (ss->sched.streams != NULL) {
 		table_iterate(
 			ss->sched.streams, stream_free_and_decount_cb, ss);
@@ -96,10 +91,6 @@ bool sched_add_stream(
 	if (ss->sched.streams == NULL || elem == s) {
 		return false;
 	}
-	/* Mark the ID occupied in the allocation bitmap. */
-	const size_t add_idx = (size_t)s->id >> 1;
-	ss->sched.id_bitmap[add_idx / (size_t)BITMAP_WORD_BITS] |=
-		(uint_fast32_t)1 << (add_idx % (size_t)BITMAP_WORD_BITS);
 	ev_timer_stop(ss->loop, &ss->w_idle_timeout);
 	return true;
 }
@@ -107,19 +98,12 @@ bool sched_add_stream(
 static void sched_remove_stream(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
-	if (ss->sched.cache_stream == s) {
-		ss->sched.cache_stream = NULL;
-	}
 	void *elem = NULL;
 	ss->sched.streams = table_del(
 		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
 	if (elem == NULL) {
 		return;
 	}
-	/* Release the ID in the allocation bitmap. */
-	const size_t del_idx = (size_t)s->id >> 1;
-	ss->sched.id_bitmap[del_idx / (size_t)BITMAP_WORD_BITS] &=
-		~((uint_fast32_t)1 << (del_idx % (size_t)BITMAP_WORD_BITS));
 	/* CLOSED streams already counted; fail only live streams freed here. */
 	if (s->state != STREAM_CLOSED) {
 		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
@@ -138,10 +122,6 @@ static void sched_remove_stream(
 struct mux_stream *sched_find_stream(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id)
 {
-	struct mux_stream *const cached = ss->sched.cache_stream;
-	if (cached != NULL && cached->id == stream_id) {
-		return cached;
-	}
 	if (ss->sched.streams == NULL) {
 		return NULL;
 	}
@@ -150,55 +130,48 @@ struct mux_stream *sched_find_stream(
 	if (table_find(
 		    ss->sched.streams, (const void *)(uintptr_t)id_key,
 		    &elem)) {
-		ss->sched.cache_stream = elem;
 		return elem;
 	}
 	return NULL;
 }
 
-/* Find the index of the first zero bit in bitmap starting at bit index 'start'.
- * Returns words * BITMAP_WORD_BITS when no zero bit exists in [start, words * BITMAP_WORD_BITS). */
-static size_t bitmap_find_zero_from(
-	const uint_fast32_t *restrict bitmap, const size_t words,
-	const size_t start)
-{
-	size_t w = start / (size_t)BITMAP_WORD_BITS;
-	const size_t bit = start % (size_t)BITMAP_WORD_BITS;
-	if (w >= words) {
-		return words * (size_t)BITMAP_WORD_BITS;
-	}
-	/* First (partial) word: shift out already-scanned positions. */
-	const uint_fast32_t first = ~bitmap[w] >> bit;
-	if (first != 0) {
-		return (w * (size_t)BITMAP_WORD_BITS) + bit +
-		       (size_t)countr_zero((unsigned long long)first);
-	}
-	for (w++; w < words; w++) {
-		const uint_fast32_t word = ~bitmap[w];
-		if (word != 0) {
-			return (w * (size_t)BITMAP_WORD_BITS) +
-			       (size_t)countr_zero((unsigned long long)word);
-		}
-	}
-	return words * (size_t)BITMAP_WORD_BITS;
-}
-
+/* Find the next free stream ID using a wrap-around counter with parity
+ * enforcement.  Client sessions assign odd IDs (starting at 1), server
+ * sessions assign even IDs (starting at 2).  Skips STREAMID_CTRL (0) and
+ * IDs already present in the stream table.  Returns STREAMID_CTRL when all
+ * 32768 IDs of the matching parity are occupied.
+ *
+ * The +2 step after each allocation avoids rapid reuse of recently freed
+ * IDs, reducing the chance of collision with tombstone late-frame
+ * suppression. */
 uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss)
 {
-	/* Parity: 1 = client (odd IDs), 0 = server (even IDs); derived from accepted. */
-	const size_t parity = ss->accepted ? 0u : 1u;
-	/* Server skips bitmap index 0 (STREAMID_CTRL >> 1 = 0). */
-	const size_t min_idx = 1u - parity;
-	/* Scan from the minimum valid index; always returns the lowest free ID. */
-	const size_t idx = bitmap_find_zero_from(
-		ss->sched.id_bitmap, SCHED_ID_BITMAP_WORDS, min_idx);
-	if (idx >= SCHED_ID_BITMAP_WORDS * (size_t)BITMAP_WORD_BITS) {
-		LOGE_F("[fd:%d] stream IDs exhausted", ss->w_socket.fd);
-		return STREAMID_CTRL;
+	const uint_least16_t parity = ss->accepted ? 0u : 1u;
+	uint_least16_t id = ss->sched.next_stream_id;
+
+	/* First call or parity mismatch: start at the parity base. */
+	if ((id & 1u) != parity || id == 0) {
+		id = parity == 1u ? 1u : 2u;
 	}
-	const uint_least16_t id = (uint_least16_t)((idx << 1u) | parity);
-	ASSERT(id != STREAMID_CTRL);
-	return id;
+
+	for (size_t i = 0; i < 32768u; i++) {
+		if (id != STREAMID_CTRL) {
+			void *elem = NULL;
+			const bool found =
+				ss->sched.streams != NULL &&
+				table_find(
+					ss->sched.streams,
+					(const void *)(uintptr_t)id, &elem);
+			if (!found) {
+				ss->sched.next_stream_id = (id + 2u) & 0xFFFFu;
+				return id;
+			}
+		}
+		id = (id + 2u) & 0xFFFFu;
+	}
+
+	LOGE_F("[fd:%d] stream IDs exhausted", ss->w_socket.fd);
+	return STREAMID_CTRL;
 }
 
 static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
@@ -237,10 +210,6 @@ void sched_delay_remove(
 static void
 sched_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
-	/* Transition from CTRL to DRR: remove from control list. */
-	if (s->sched_queue == SCHED_QUEUE_CTRL) {
-		sched_ctrl_dequeue(ss, s);
-	}
 	/* Avoid double-enqueue: skip if owned by drr_active, LP, or tombstone timer. */
 	if (s->sched_queue == SCHED_QUEUE_NONE && s != ss->sched.drr_active &&
 	    !ev_is_active(&s->w_tombstone)) {
@@ -262,9 +231,6 @@ sched_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 static void
 sched_lp_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
-	if (s->sched_queue == SCHED_QUEUE_CTRL) {
-		sched_ctrl_dequeue(ss, s);
-	}
 	if (s->sched_queue == SCHED_QUEUE_DRR || s == ss->sched.drr_active) {
 		return;
 	}
@@ -383,50 +349,30 @@ static void sched_send_ctrl_flags(
 	if (flags & MUX_FLAG_FIN) {
 		stream_mark_fin_sent(s);
 	}
-	/* Remove from ctrl_pending list now that all queued control frames
-	 * for this round have been emitted.  has_fin_pending was computed
-	 * before stream_mark_fin_sent; when FIN was just sent the flag is
-	 * still true but the frame is no longer pending. */
-	if (!s->ack_pending && (!has_fin_pending || (flags & MUX_FLAG_FIN))) {
-		sched_ctrl_dequeue(ss, s);
-	}
 }
 
-static inline bool
-sched_finish_round(struct mux_session *restrict ss, const bool last)
-{
-	if (!last) {
-		return false;
-	}
-	ss->sched.round_end = NULL;
-	return true;
-}
-
-/* Produce at most one PUSH frame from DRR into sendbuf.  INIT/CLOSED are
- * diverted to EV_IDLE, SYN_SENT waits for the handshake, and drr_active keeps
- * a stream off-queue while it still owns enough deficit for the next frame. */
+/* Scan the DRR ready queue and produce at most one PUSH frame into sendbuf.
+ * Continues past streams that cannot currently produce a frame (credit
+ * exhausted, queue empty, Nagle-held, or non-ESTABLISHED state) until a
+ * frame is produced or the queue is exhausted.  INIT/CLOSED are diverted to
+ * EV_IDLE, SYN_SENT waits for the handshake, and drr_active keeps a stream
+ * off-queue while it still owns enough deficit for the next frame.
+ * Returns true if a data frame was produced, false if no stream in the
+ * queue can produce one. */
 bool sched_next_data(struct mux_session *restrict ss)
 {
 	for (;;) {
 		struct mux_stream *s;
-		bool last;
 		const bool fresh_dequeue = (ss->sched.drr_active == NULL);
 
 		if (!fresh_dequeue) {
 			/* Continue the off-queue stream that still owns the round budget. */
 			s = ss->sched.drr_active;
-			last = false;
 		} else {
-			/* Snapshot the current tail so re-queues land in the next round. */
-			if (ss->sched.round_end == NULL) {
-				ss->sched.round_end = ss->sched.sched_tail;
-			}
 			s = sched_dequeue(ss);
 			if (s == NULL) {
-				ss->sched.round_end = NULL;
 				return false;
 			}
-			last = (s == ss->sched.round_end);
 		}
 
 		if (s->state == STREAM_CLOSED) {
@@ -440,9 +386,6 @@ bool sched_next_data(struct mux_session *restrict ss)
 						ss->loop, &ss->sched.w_sched);
 				}
 			}
-			if (sched_finish_round(ss, last)) {
-				return false;
-			}
 			continue;
 		}
 
@@ -454,17 +397,11 @@ bool sched_next_data(struct mux_session *restrict ss)
 			if (ss->wire.sendbuf.head == NULL) {
 				ev_idle_start(ss->loop, &ss->sched.w_sched);
 			}
-			if (sched_finish_round(ss, last)) {
-				return false;
-			}
 			continue;
 		}
 		/* SYN_SENT stays queued-only until the peer's SYN|ACK re-opens credit. */
 		if (s->state == STREAM_SYN_SENT) {
 			ss->sched.drr_active = NULL;
-			if (sched_finish_round(ss, last)) {
-				return false;
-			}
 			continue;
 		}
 
@@ -472,7 +409,6 @@ bool sched_next_data(struct mux_session *restrict ss)
 			s->id);
 
 		struct mux_frame *frame = stream_dequeue_send(s);
-		bool sent_frame = false;
 		if (frame != NULL) {
 			/* Quantum credited on dequeue only: Nagle-held streams earn no budget. */
 			if (fresh_dequeue) {
@@ -510,124 +446,62 @@ bool sched_next_data(struct mux_session *restrict ss)
 				ss->sched.drr_active = NULL;
 				s->deficit = 0;
 			}
-			sent_frame = true;
-		} else {
-			ss->sched.drr_active = NULL;
-			/* Nagle may be holding a small frame; schedule a
-			 * delayed flush if credit is available. */
-			const struct mux_frame *const head = s->send_queue.head;
-			if (head != NULL) {
-				const size_t payload =
-					head->len - MUX_FRAME_HEADER_SIZE;
-				const uint_fast32_t credit =
-					stream_credit_avail(s);
-				if (payload > 0 && credit >= payload &&
-				    !ss->conf.nodelay && s->unacked_bytes > 0 &&
-				    payload < (size_t)MUX_MAX_PAYLOAD_SIZE) {
-					MUX_LOG_F(
-						VERBOSE, ss,
-						"data scheduler delays stream %" PRIuLEAST16
-						" for Nagle: payload=%zu credit=%" PRIuFAST32
-						" unacked=%" PRIuLEAST32,
-						s->id, payload, credit,
-						s->unacked_bytes);
-					sched_delay(ss, s, MUX_NAGLE_TICKS);
-				}
+			sched_send_ctrl_flags(ss, s);
+			return true;
+		}
+
+		ss->sched.drr_active = NULL;
+		/* Nagle may be holding a small frame; schedule a
+		 * delayed flush if credit is available. */
+		const struct mux_frame *const head = s->send_queue.head;
+		if (head != NULL) {
+			const size_t payload =
+				head->len - MUX_FRAME_HEADER_SIZE;
+			const uint_fast32_t credit = stream_credit_avail(s);
+			if (payload > 0 && credit >= payload &&
+			    !ss->conf.nodelay && s->unacked_bytes > 0 &&
+			    payload < (size_t)MUX_MAX_PAYLOAD_SIZE) {
+				MUX_LOG_F(
+					VERBOSE, ss,
+					"data scheduler delays stream %" PRIuLEAST16
+					" for Nagle: payload=%zu credit=%" PRIuFAST32
+					" unacked=%" PRIuLEAST32,
+					s->id, payload, credit,
+					s->unacked_bytes);
+				sched_delay(ss, s, MUX_NAGLE_TICKS);
 			}
+		} else {
+			/* No data pending: discard any accumulated
+			 * deficit so the stream does not jump ahead
+			 * when it re-enters DRR with new data. */
+			s->deficit = 0;
 		}
 
 		sched_send_ctrl_flags(ss, s);
-
-		if (last) {
-			ss->sched.round_end = NULL;
-		}
-		return sent_frame;
+		/* No frame produced from this stream; continue scanning. */
 	}
 }
 
-/* Emit pending ACK/FIN control headers without touching the DRR data queue.
- * Walks the ctrl_pending list — O(k) where k = streams with no data to
- * piggyback on.  When send_stalled, also walks the DRR ready queue as a
- * fallback: streams that entered DRR because they had data at the time
- * stream_check_ack fired would otherwise be invisible and their window
- * grants would never reach the peer, causing a bidirectional stall. */
+/* Emit pending per-stream ACK/FIN control headers for all DRR-queued
+ * streams.  Small control frames (8 B) from multiple streams are packed
+ * into a single sendbuf staging entry by wire_sendbuf_push, so the caller
+ * need only flush once regardless of the number of streams with pending
+ * grants.  Called on every send_cb iteration.
+ *
+ * Never calls stream_check_ack: ack_pending is set exclusively by the
+ * receive dispatch path (dispatch_by_stream → stream_check_ack).  Calling
+ * it here would re-arm already-sent grants each time send_cb iterates,
+ * creating a tight sched_wake→session_notify→update_watcher→send_cb loop
+ * that burns 100 % CPU while send_stalled blocks new payload. */
 void sched_flush_ctrl(struct mux_session *restrict ss)
 {
-	struct mux_stream *s = ss->sched.ctrl_head;
+	struct mux_stream *s = ss->sched.sched_head;
 	while (s != NULL) {
-		struct mux_stream *next = s->next;
-		if (s->sched_queue != SCHED_QUEUE_CTRL ||
-		    s->state == STREAM_CLOSED) {
-			/* Lazy cleanup of stale or tombstone entries. */
-			sched_ctrl_dequeue(ss, s);
-			s = next;
-			continue;
+		if (s->state != STREAM_CLOSED) {
+			sched_send_ctrl_flags(ss, s);
 		}
-		stream_check_ack(s);
-		sched_send_ctrl_flags(ss, s);
-		if (s->sched_queue != SCHED_QUEUE_CTRL) {
-			/* Control frame was sent; already removed from list
-			 * by sched_send_ctrl_flags / sched_ctrl_dequeue. */
-		}
-		s = next;
+		s = s->next;
 	}
-
-	/* Fallback: during send_stalled, streams stuck in the DRR ready
-	 * queue cannot send data, but their pending ACK/FIN must still
-	 * flow so the peer can drain its window and return session ACKs.
-	 * Without this, a bidirectional transfer deadlocks: our ACKs are
-	 * held in DRR, the peer never sees them, its window fills up,
-	 * and it stops sending — so we never receive fresh data that
-	 * would trigger new ACK grants. */
-	if (ss->send_stalled) {
-		struct mux_stream *s = ss->sched.sched_head;
-		while (s != NULL) {
-			if (s->state != STREAM_CLOSED) {
-				stream_check_ack(s);
-				sched_send_ctrl_flags(ss, s);
-			}
-			s = s->next;
-		}
-	}
-}
-
-/* --- Control-pending list ---
- * Doubly-linked via mux_stream::next / mux_stream::prev; mutually
- * exclusive — a stream is on at most one of {DRR, lp, ctrl} at a time. */
-
-void sched_ctrl_enqueue(
-	struct mux_session *restrict ss, struct mux_stream *restrict s)
-{
-	if (s->sched_queue == SCHED_QUEUE_CTRL) {
-		return;
-	}
-	s->sched_queue = SCHED_QUEUE_CTRL;
-	s->prev = NULL;
-	s->next = ss->sched.ctrl_head;
-	if (ss->sched.ctrl_head != NULL) {
-		ss->sched.ctrl_head->prev = s;
-	}
-	ss->sched.ctrl_head = s;
-}
-
-void sched_ctrl_dequeue(
-	struct mux_session *restrict ss, struct mux_stream *restrict s)
-{
-	if (s->sched_queue != SCHED_QUEUE_CTRL) {
-		return;
-	}
-	/* O(1) doubly-linked removal. */
-	if (s->prev != NULL) {
-		s->prev->next = s->next;
-	} else {
-		ss->sched.ctrl_head = s->next;
-	}
-	if (s->next != NULL) {
-		s->next->prev = s->prev;
-	}
-	s->next = NULL;
-	s->prev = NULL;
-	s->sched_queue = SCHED_QUEUE_NONE;
 }
 
 static void
@@ -717,8 +591,18 @@ static void sched_cb(struct ev_loop *loop, ev_idle *w, const int revents)
 				stream_close(s);
 			}
 			/* SYN_SENT: data waits for SYN|ACK;
-			 * stream_recv_window re-schedules on completion. */
-			if (ss->wire.sendbuf.head != NULL) {
+			 * stream_recv_window re-schedules on completion.
+			 *
+			 * Continue batching while the sendbuf tail is still a
+			 * staging entry.  Bare SYN frames (8 B) are packed into
+			 * the same staging buffer by wire_sendbuf_push; SYN+PUSH
+			 * frames are appended by reference and naturally close
+			 * the staging, terminating the batch.  max_halfopen
+			 * bounds the number of concurrent INIT streams; staging
+			 * capacity (~2049 control frames) provides a further
+			 * upper bound, consistent with sched_flush_ctrl. */
+			if (ss->wire.sendbuf.head != NULL &&
+			    !ss->wire.sendbuf_staging) {
 				break;
 			}
 		}

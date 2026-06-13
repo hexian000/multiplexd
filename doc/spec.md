@@ -1,4 +1,3 @@
-
 # multiplexd Protocol Specification
 
 ## Abstract
@@ -28,6 +27,10 @@ when, and only when, they appear in all capitals, as shown here.
 
 All multi-byte integer fields are transmitted in network byte order (big-endian)
 unless otherwise stated.
+
+The hyphenated form "stream-0" is used as a compound adjective (as in
+"stream-0 frames"); the numeric ID itself is referred to as "stream 0" in
+prose.
 
 ### 1.3.  Terminology
 
@@ -127,8 +130,7 @@ values:
 
 For frames with neither SYN, ACK, nor RST set, receivers MUST ignore Extra,
 except for stream-0 frames with Flags = 0x00, whose Extra field is interpreted
-as a keepalive subtype per Section 2.4.4. (This is a compound adjective; the
-numeric ID is referred to as "stream 0" in prose.)
+as a keepalive subtype per Section 2.4.4.
 
 #### 2.4.3.  Session Acknowledgement Encoding (Stream 0 + ACK)
 
@@ -233,7 +235,7 @@ Stream IDs are 16-bit unsigned integers subject to the following rules:
 
 -  Stream 0 is reserved for session-level control.  Frames addressed to stream 0
    with the ACK flag set carry session acknowledgements (Section 5.7).
-   stream-0 frames with Flags = 0x00 serve as keepalive probes or RTT probes
+   Stream-0 frames with Flags = 0x00 serve as keepalive probes or RTT probes
    (Section 5.3).  All stream-0 frames with any flag combination other than
    `0x00` or ACK set MUST be silently discarded.
 
@@ -430,7 +432,8 @@ During the tombstone period:
 
 Once the tombstone period expires, the stream ID is freed and the entry is
 removed from the stream table.  Frames arriving after that point are handled
-as frames for an entirely unknown stream (Section 4.3.1).
+as frames for an entirely unknown stream (Section 4.3.1 for SYN frames;
+Section 8 otherwise).
 
 ## 5.  Session Management
 
@@ -831,8 +834,8 @@ state:
 
 -  All streams and the unacked list are preserved.
 -  No transport I/O occurs.
--  The server waits up to `timeout` seconds for the client to present a resume
-   hello on a new TCP connection.
+-  The server waits up to the resumption timeout for the client to present a
+   resume hello on a new TCP connection.
 -  The client attempts reconnection; the specific reconnect attempt timeout is
    implementation-defined.  The client SHOULD attempt reconnection without
    delay; no backoff applies before the first attempt.
@@ -985,7 +988,7 @@ regardless of gate state:
 -  ACK frames (credit grants) and FIN frames (stream half-close) for any
    non-stream-0 stream.
 
-stream-0 frames are exempt because they carry the session ACKs that unblock the
+Stream-0 frames are exempt because they carry the session ACKs that unblock the
 stalled sender and the RTT probes that maintain session liveness.  RST frames
 are exempt because streams must always be abortable regardless of gate state.
 ACK and FIN frames are exempt so that the peer can continue delivering data to

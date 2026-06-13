@@ -1,3 +1,6 @@
+/* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
+ * This code is licensed under MIT license (see LICENSE for details) */
+
 /* server_test.c - robust server forwarding tests with bounded waits */
 
 #include "conf.h"
@@ -5,8 +8,9 @@
 #include "server.h"
 #include "util.h"
 
+#include "mux/session.h"
+
 #include "os/socket.h"
-#include "utils/minmax.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
@@ -633,13 +637,13 @@ static int mock_server_start(
 	}
 	mock->port = listener_fd_port(mock->listen_fd);
 	if (mock->port <= 0) {
-		close(mock->listen_fd);
+		(void)close(mock->listen_fd);
 		mock->listen_fd = -1;
 		return -1;
 	}
 
 	if (socket_set_nonblock(mock->listen_fd) != 0) {
-		close(mock->listen_fd);
+		(void)close(mock->listen_fd);
 		mock->listen_fd = -1;
 		return -1;
 	}
@@ -915,7 +919,7 @@ static int connect_local(struct test_fixture *restrict fx, const int port)
 	}
 
 	if (socket_set_nonblock(fd) != 0) {
-		close(fd);
+		(void)close(fd);
 		return -1;
 	}
 
@@ -929,7 +933,7 @@ static int connect_local(struct test_fixture *restrict fx, const int port)
 			return fd;
 		}
 	}
-	close(fd);
+	(void)close(fd);
 	return -1;
 }
 
@@ -1073,7 +1077,7 @@ static int connect_and_wait_echo(
 			*out_fd = fd;
 			return 0;
 		}
-		close(fd);
+		(void)close(fd);
 		drive_loop_once(fx);
 	}
 
@@ -1168,10 +1172,10 @@ T_DECLARE_CASE(test_bidirectional_stream_and_forward)
 
 cleanup:
 	if (cl_b >= 0) {
-		close(cl_b);
+		(void)close(cl_b);
 	}
 	if (cl_a >= 0) {
-		close(cl_a);
+		(void)close(cl_a);
 	}
 	T_LOG("forward: teardown begin");
 	fixture_teardown(&fx);
@@ -1214,7 +1218,7 @@ T_DECLARE_CASE(test_half_close_b_to_a)
 
 cleanup:
 	if (cl >= 0) {
-		close(cl);
+		(void)close(cl);
 	}
 	fixture_teardown(&fx);
 }
@@ -1237,7 +1241,7 @@ T_DECLARE_CASE(test_half_close_a_to_b)
 		T_FAIL();
 		goto cleanup;
 	}
-	close(prime);
+	(void)close(prime);
 	prime = -1;
 
 	if (connect_and_wait_echo(&fx, fx.tcp_port_a, "halfclose-a", &cl) !=
@@ -1265,10 +1269,10 @@ T_DECLARE_CASE(test_half_close_a_to_b)
 
 cleanup:
 	if (prime >= 0) {
-		close(prime);
+		(void)close(prime);
 	}
 	if (cl >= 0) {
-		close(cl);
+		(void)close(cl);
 	}
 	fixture_teardown(&fx);
 }
@@ -1698,14 +1702,14 @@ T_DECLARE_CASE(test_server_config_reload)
 		T_FATAL("connect_local failed before reload");
 	}
 	if (wait_for_streams_ready(&fx, 1) != 0) {
-		close(fd_before);
+		(void)close(fd_before);
 		fixture_teardown(&fx);
 		T_FATAL("streams not ready before reload");
 	}
 	T_CHECK(send_and_expect_echo(
 			&fx, fd_before, "pre", 3,
 			(double)ECHO_WAIT_TIMEOUT_MS / 1000.0) == 0);
-	close(fd_before);
+	(void)close(fd_before);
 
 	/* Wait for the stream to close so the session is idle before drain. */
 	if (wait_for_streams_exact(&fx, 0) != 0) {
@@ -1722,7 +1726,7 @@ T_DECLARE_CASE(test_server_config_reload)
 		fixture_teardown(&fx);
 		T_FATAL("mkstemp failed");
 	}
-	close(tmp_fd);
+	(void)close(tmp_fd);
 
 	char *const saved_type = fx.conf_a->type;
 	fx.conf_a->type = NULL;
@@ -1782,7 +1786,7 @@ T_DECLARE_CASE(test_server_config_reload)
 		fixture_teardown(&fx);
 		T_FATAL("connect_and_wait_echo failed after reload");
 	}
-	close(fd_after);
+	(void)close(fd_after);
 
 	(void)unlink(tmp_path);
 	fixture_teardown(&fx);
@@ -1836,7 +1840,7 @@ T_DECLARE_CASE(test_server_max_sessions_rejects)
 	char buf[1];
 	const ssize_t n = read(raw, buf, sizeof(buf));
 	T_EXPECT_EQ(n, (ssize_t)0); /* peer closed the connection */
-	close(raw);
+	(void)close(raw);
 
 	/* Verify the rejection counter was incremented. */
 	T_EXPECT(fx.srv_a->counters.num_rejected > 0);

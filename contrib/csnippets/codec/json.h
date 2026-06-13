@@ -235,19 +235,34 @@ bool json_parse_double(char *val, size_t vlen, double *out);
 int json_marshal_string(
 	char *restrict buf, size_t bufsz, const char *restrict s, size_t len);
 
+/** Step results returned by json_obj_next() / json_arr_next().
+ * Iterate with `while ((r = json_*_next(...)) == JSON_NEXT_ITEM)`, then
+ * check `r == JSON_NEXT_END` to distinguish a properly terminated
+ * container from malformed or truncated input. */
+enum {
+	/* malformed or truncated input; *iter is unchanged */
+	JSON_NEXT_ERROR = -1,
+	/* the closing bracket was reached; *iter points just past it */
+	JSON_NEXT_END = 0,
+	/* an element was produced; *iter points just past its value */
+	JSON_NEXT_ITEM = 1,
+};
+
 /**
  * @brief Advance an object iterator to the next key-value pair.
  * @param[inout] json The same buffer passed to json_parse().
  * @param[in] len Total bytes available in json (the original buffer length,
  * not the position). This value must remain the same across repeated calls.
- * @param[inout] iter Byte offset, updated to point past the current value on success.
+ * @param[inout] iter Byte offset, updated to point past the current value
+ * (JSON_NEXT_ITEM) or past the closing '}' (JSON_NEXT_END).
  * @param[out] key Decoded key, NUL-terminated, points into json.
  * @param[out] key_len Length of the decoded key.
  * @param[out] val Raw JSON fragment, points into json (NOT NUL-terminated).
  * @param[out] val_len Length of the raw JSON fragment.
- * @return true on success; false at end-of-object or on a parse error.
+ * @return JSON_NEXT_ITEM when a pair was produced; JSON_NEXT_END at the
+ * closing '}'; JSON_NEXT_ERROR on malformed or truncated input.
  */
-bool json_obj_next(
+int json_obj_next(
 	char *restrict json, const size_t *len, json_iter *restrict iter,
 	char **restrict key, size_t *restrict key_len, char **restrict val,
 	size_t *restrict val_len);
@@ -257,12 +272,14 @@ bool json_obj_next(
  * @param[inout] json The same buffer passed to json_parse().
  * @param[in] len Total bytes available in json (the original buffer length,
  * not the position). This value must remain the same across repeated calls.
- * @param[inout] iter Byte offset, updated to point past the current value on success.
+ * @param[inout] iter Byte offset, updated to point past the current value
+ * (JSON_NEXT_ITEM) or past the closing ']' (JSON_NEXT_END).
  * @param[out] val Raw JSON fragment, points into json (NOT NUL-terminated).
  * @param[out] val_len Length of the raw JSON fragment.
- * @return true on success; false at end-of-array or on a parse error.
+ * @return JSON_NEXT_ITEM when an element was produced; JSON_NEXT_END at the
+ * closing ']'; JSON_NEXT_ERROR on malformed or truncated input.
  */
-bool json_arr_next(
+int json_arr_next(
 	char *restrict json, const size_t *len, json_iter *restrict iter,
 	char **restrict val, size_t *restrict val_len);
 

@@ -127,12 +127,6 @@ static void teardown_fixture(struct stream_fixture *restrict fx)
 	}
 	ringbuf_free(fx->ss.wire.recvbuf);
 	fx->ss.wire.recvbuf = NULL;
-	/* Drain the one-deep frame spare so ASAN does not flag it as a leak.
-	 * session_cleanup frees it in production; tests are self-contained. */
-	if (fx->ss.frame_spare != NULL) {
-		mux_frame_put(&fx->ss.pool, fx->ss.frame_spare);
-		fx->ss.frame_spare = NULL;
-	}
 	if (fx->fds[0] >= 0) {
 		close(fx->fds[0]);
 		fx->fds[0] = -1;

@@ -70,8 +70,8 @@ multiplexd is a TCP stream multiplexer with zero-RTT stream open, deficit round-
 ### Performance and Fairness
 
 - **Deficit round-robin (DRR) scheduler**: Outbound bandwidth is distributed fairly across active streams at byte-granularity, preventing any single stream from starving others regardless of message size. See [spec.md §7](doc/spec.md#scheduling) for the byte-granularity policy requirement.
-- **BDP estimator**: Measures RTT and bandwidth from payload-driven PING/PONG cycles (a PING is sent on inbound PUSH, the PONG completes the cycle) and sets the per-stream receive window adaptively.
-- **Two-level flow control**: A per-stream sliding receive window bounds per-stream in-flight data; a session-wide unacknowledged-frame cap blocks new payload.
+- **BDP estimator**: Measures RTT and per-direction bandwidth from payload-driven PING/PONG cycles (a PING is sent on inbound PUSH or on acked outbound bytes, the PONG completes the cycle) and adaptively sizes the per-stream receive window and the session send cap from their own direction's estimate, so asymmetric channels get independently sized windows.
+- **Two-level flow control**: A per-stream sliding receive window bounds per-stream in-flight data; a session-wide unacknowledged-byte cap blocks new payload.
 - **Memory back-pressure**: Receive-window grants are linearly throttled as aggregate buffer occupancy rises between `mem_pressure.lo` and `mem_pressure.hi`, bounding memory growth under sustained load.
 - **Multi-threaded offloading**: With `ENABLE_THREADS=ON`, each session runs on a dedicated thread. Parallel tunnels to the same peer distribute load across CPU cores.
 
@@ -121,7 +121,7 @@ The wire format is a fixed 8-byte frame header followed by an optional payload; 
 | **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)        | Per-channel byte window only                                               |
 | **Adaptive window tuning** | Adaptive BDP estimator                                                           | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
 | **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                           | None                                                                       |
-| **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                  | Re-execs the master process; existing child processes drain naturally       |
+| **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                  | Re-execs the master process; existing child processes drain naturally      |
 | **Observability**          | Health check, plain-text stats, Prometheus metrics                               | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors | None                                                                       |
 
 See [doc/spec.md](doc/spec.md) for the full wire protocol and state-machine specification.
@@ -164,12 +164,12 @@ multiplexd --gencerts client1,client2,client3 --sign ca
 
 ### Certificate Options
 
-| Option       | Values              | Description                                                 |
-| ------------ | ------------------- | ----------------------------------------------------------- |
-| `--gencerts` | name[,name...]      | Comma-separated list of certificate names to generate       |
-| `--sni`      | hostname            | Server name for certificates (default: example.com)         |
-| `--sign`     | name                | Sign generated certificates with the named signer (uses `<name>-cert.pem` and `<name>-key.pem`) |
-| `--keytype`  | rsa, ecdsa, ed25519 | Key algorithm (default: rsa)                                |
+| Option       | Values              | Description                                                                                           |
+| ------------ | ------------------- | ----------------------------------------------------------------------------------------------------- |
+| `--gencerts` | name[,name...]      | Comma-separated list of certificate names to generate                                                 |
+| `--sni`      | hostname            | Server name for certificates (default: example.com)                                                   |
+| `--sign`     | name                | Sign generated certificates with the named signer (uses `<name>-cert.pem` and `<name>-key.pem`)       |
+| `--keytype`  | rsa, ecdsa, ed25519 | Key algorithm (default: rsa)                                                                          |
 | `--keysize`  | bits                | Key size in bits: RSA 4096 (default); ECDSA NIST P-224/256/384/521. Ignored when `--keytype ed25519`. |
 
 Generated files: `<name>-cert.pem` and `<name>-key.pem`.
@@ -447,8 +447,13 @@ See the script for the full preset list, including clang, cross, min-size, and p
 Run these helper scripts from the repository root:
 
 - [`scripts/bench.py`](scripts/bench.py) runs the iperf3 benchmark suite and writes a Markdown summary to `build/bench.md`
+- [`scripts/codesize.py`](scripts/codesize.py) builds a release configuration and writes a per-file object size report to `build/codesize.md`
 - [`scripts/gcov.py`](scripts/gcov.py) configures a gcov coverage build, runs the test suite, and writes `build/gcov.md`
+- [`scripts/gen_schema.py`](scripts/gen_schema.py) generates C structs, marshal/unmarshal functions, and perfect-hash key dispatchers from JSON Schema files (also invoked by `./m.sh gen`)
 - [`scripts/gprof.py`](scripts/gprof.py) runs a focused gprof benchmark build and writes `build/gprof.md`
+- [`scripts/linearity_test.py`](scripts/linearity_test.py) runs a bidirectional throughput/CPU linearity benchmark across increasing bandwidth limits and writes `build/linearity_report.md`
+- [`scripts/lint.py`](scripts/lint.py) runs clang-tidy on production sources and writes `build/lint.md`
+- [`scripts/smoke_test.py`](scripts/smoke_test.py) runs an end-to-end smoke test: generates certificates, starts a server/client pair, exercises randomised TCP behavior, then verifies clean shutdown
 
 ## Deployment Notes
 
@@ -469,7 +474,7 @@ The `max_startups` option (`start:rate%:full` format, where `rate` is a percenta
 
 ### API Server
 
-`api_listen` exposes unauthenticated runtime statistics. **Bind it to the loopback address** (`127.0.0.1` or `::1`) or a Unix socket; never expose it to untrusted networks. A warning is logged at startup if a non-local address is configured.
+`api_listen` exposes unauthenticated runtime statistics. **Bind it to the loopback address** (`127.0.0.1` or `::1`); never expose it to untrusted networks. A warning is logged at startup if a non-local address is configured.
 
 ### Configuration Reload
 

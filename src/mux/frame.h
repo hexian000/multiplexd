@@ -68,10 +68,6 @@
  * 2 ticks × 40 ms = 80 ms. */
 #define MUX_SESSION_ACK_MAX_TICKS 2
 
-/* Initial quickack budget assigned to a stream on establishment or
- * receive-window growth; exhausted one ACK at a time. */
-#define MUX_QUICKACK_BUDGET 8
-
 /* Stream-0 / Flags=0 keepalive subtypes (spec §2.4.4, §5.3). */
 #define MUX_CTRL_PROBE 0x0000u
 #define MUX_CTRL_PING 0x0001u
@@ -87,7 +83,7 @@
 #define MUX_TOMBSTONE_PERIOD_S 10.0
 
 /* Minimum nanoseconds between honouring consecutive inbound PINGs (1 s). */
-#define MUX_PING_RATE_LIMIT_NS (INTMAX_C(1000000000))
+#define MUX_PING_RATE_LIMIT_NS (INT64_C(1000000000))
 
 /* Frame structure.  Payload starts at data[MUX_FRAME_HEADER_SIZE]. */
 struct mux_frame {

@@ -115,7 +115,7 @@ static void process_syn_payload(
 				MUX_FRAME_HEADER_SIZE,
 			hdr->length);
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
-		if (ss->auto_stream_window) {
+		if (ss->auto_stream_window || ss->auto_session_window) {
 			estimator_add(ss, hdr->length);
 			session_flush_oob(ss);
 		}
@@ -246,10 +246,12 @@ static void dispatch_by_stream(
 		ss->peer_stream_window =
 			(uint_least32_t)(s->send_window / MUX_WINDOW_UNIT);
 		if (ss->auto_session_window) {
-			session_update_session_window(ss);
+			session_update_session_window(
+				ss, estimator_window_size(
+					    &ss->estimator, ESTIMATOR_TX));
 		}
 		if (s->syn_sent_ns > 0) {
-			const intmax_t latency =
+			const int_fast64_t latency =
 				clock_monotonic_ns() - s->syn_sent_ns;
 			s->syn_sent_ns = 0;
 			if (ss->callbacks.on_event != NULL) {
@@ -304,7 +306,7 @@ static void dispatch_by_stream(
 				MUX_FRAME_HEADER_SIZE,
 			hdr->length);
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
-		if (ss->auto_stream_window) {
+		if (ss->auto_stream_window || ss->auto_session_window) {
 			estimator_add(ss, hdr->length);
 			session_flush_oob(ss);
 		}
@@ -360,6 +362,19 @@ static void dispatch_no_stream(
 			return;
 		}
 
+		if (ss->draining) {
+			MUX_LOG_F(
+				VERBOSE, ss,
+				"reject stream %" PRIuFAST16
+				": session draining",
+				stream_id);
+			session_send_ctrl(
+				ss, stream_id, MUX_FLAG_RST,
+				MUX_STATUS_REFUSED_STREAM);
+			ringbuf_consume(ss->wire.recvbuf, frame_size);
+			return;
+		}
+
 		if (ss->conf.max_streams > 0 &&
 		    table_size(ss->sched.streams) - ss->sched.num_tombstones >=
 			    (size_t)ss->conf.max_streams) {
@@ -409,7 +424,9 @@ static void dispatch_no_stream(
 		 * The initial default send window contributes exactly one frame. */
 		ss->peer_stream_window = (uint_least32_t)hdr->extra + 1u;
 		if (ss->auto_session_window) {
-			session_update_session_window(ss);
+			session_update_session_window(
+				ss, estimator_window_size(
+					    &ss->estimator, ESTIMATOR_TX));
 		}
 		if (LOGLEVEL(INFO)) {
 			char stream_tag_[256];
@@ -546,12 +563,7 @@ void dispatch_frame(struct mux_session *ss)
 		}
 
 		if (hdr.stream_id == STREAMID_CTRL) {
-			const bool ack_clears_stall =
-				ss->send_stalled &&
-				hdr.extra <= ss->unacked_frames &&
-				ss->unacked_frames - hdr.extra <
-					(size_t)ss->session_window;
-			if ((hdr.flags & MUX_FLAG_ACK) && !ack_clears_stall) {
+			if (hdr.flags & MUX_FLAG_ACK) {
 				MUX_LOG_F(
 					DEBUG, ss,
 					"session ACK received: acked=%" PRIuFAST32

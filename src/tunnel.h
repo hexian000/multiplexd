@@ -35,10 +35,10 @@ struct tunnel_callbacks {
 	 * attempt and the client falls back to a new session; implementations
 	 * must be idempotent with respect to any session pool they maintain. */
 	void (*on_established)(
-		void *data, struct tunnel *t, const intmax_t lat_ns);
+		void *data, struct tunnel *t, int_fast64_t lat_ns);
 	/* Fired when the peer confirmed that the suspended session has been
 	 * successfully resumed on the new transport. */
-	void (*on_resumed)(void *data, struct tunnel *t, const intmax_t lat_ns);
+	void (*on_resumed)(void *data, struct tunnel *t, int_fast64_t lat_ns);
 	struct mux_session *(*on_resume)(
 		void *data, struct tunnel *new_t,
 		const unsigned char *session_id);
@@ -134,12 +134,14 @@ struct tunnel_stats {
 	bool established;
 	size_t rx_window;
 	size_t tx_window;
-	intmax_t last_changed;
+	int_least64_t last_changed;
 	/* Round-trip time in nanoseconds; 0 if no measurement has been
 	 * completed yet. */
-	intmax_t rtt_ns;
-	/* Bandwidth-delay product in bytes; 0 if not yet estimated. */
-	size_t bdp;
+	int_least64_t rtt_ns;
+	/* Bandwidth-delay product per direction in bytes (rx: receive
+	 * direction, tx: send direction); 0 if not yet estimated. */
+	size_t bdp_rx;
+	size_t bdp_tx;
 	/* Stream lifecycle counters (per-tunnel snapshot; aggregated by
 	 * server_stats() across all active tunnels). */
 	size_t num_streams;
@@ -163,7 +165,7 @@ struct tunnel_stats {
 	 * min(stream_establish_count, 256) samples.
 	 * Populated only for dialed tunnels (latency is measured client-side). */
 	size_t stream_establish_count;
-	intmax_t stream_establish_ns[256];
+	int_least64_t stream_establish_ns[256];
 };
 
 /* Populate *out with a consistent snapshot of tunnel statistics. */

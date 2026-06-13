@@ -8,6 +8,7 @@
 
 #include "mux/mux.h"
 
+#include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/sched.h"
 #include "mux/session.h"
@@ -118,7 +119,8 @@ void mux_session_stats(
 	out->rx_window = (size_t)ss->stream_window * MUX_WINDOW_UNIT;
 	out->tx_window = (size_t)ss->peer_stream_window * MUX_WINDOW_UNIT;
 	out->rtt = ss->estimator.rtt;
-	out->bdp = ss->estimator.bdp;
+	out->bdp_rx = ss->estimator.dir[ESTIMATOR_RX].bdp;
+	out->bdp_tx = ss->estimator.dir[ESTIMATOR_TX].bdp;
 }
 
 /* --- Session mutators --- */

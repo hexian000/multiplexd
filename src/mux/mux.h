@@ -57,21 +57,21 @@ struct mux_frame_allocator {
  * Use in frame pool implementations instead of sizeof(struct mux_frame). */
 size_t mux_frame_object_size(void);
 
+#if WITH_THREADS
+typedef atomic_uint_least64_t mux_counter;
+typedef atomic_size_t mux_gauge;
+#else
+typedef uint_least64_t mux_counter;
+typedef size_t mux_gauge;
+#endif
+
 /* Traffic byte counters; embedded in mux_session_counters. */
 struct mux_traffic_counters {
-#if WITH_THREADS
-	atomic_uint_least64_t *byt_mux_recv;
-	atomic_uint_least64_t *byt_mux_sent;
+	mux_counter *byt_mux_recv;
+	mux_counter *byt_mux_sent;
 	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
-	atomic_uint_least64_t *byt_push_recv;
-	atomic_uint_least64_t *byt_push_sent;
-#else
-	uint_least64_t *byt_mux_recv;
-	uint_least64_t *byt_mux_sent;
-	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
-	uint_least64_t *byt_push_recv;
-	uint_least64_t *byt_push_sent;
-#endif
+	mux_counter *byt_push_recv;
+	mux_counter *byt_push_sent;
 };
 
 /* Pointer-block into server_stats for direct session-thread updates
@@ -79,51 +79,27 @@ struct mux_traffic_counters {
  * server_counters atomic or plain counters depending on the build mode.
  * NULL pointers are silently skipped by COUNTER_*. */
 struct mux_session_counters {
-#if WITH_THREADS
-	atomic_uint_least64_t *num_session_created;
-	atomic_uint_least64_t *num_session_connect;
-	atomic_uint_least64_t *num_session_connected;
-	atomic_uint_least64_t *num_session_disconnected;
-	atomic_uint_least64_t *num_session_finalized;
-	atomic_size_t *num_sessions;
-	atomic_size_t *num_session_halfopen;
-	atomic_size_t *num_streams;
-	atomic_size_t *num_stream_halfopen;
-	atomic_uint_least64_t *num_stream_opened;
-	atomic_uint_least64_t *num_stream_accepted;
-	atomic_uint_least64_t *num_stream_fastopen;
-	atomic_uint_least64_t *num_stream_established;
-	atomic_uint_least64_t *num_stream_succeeded;
-	atomic_uint_least64_t *num_stream_failed;
-	atomic_uint_least64_t *num_rst_sent;
-	atomic_uint_least64_t *num_rst_recv;
-	atomic_uint_least64_t *num_stream_errors;
-	atomic_size_t *recv_buffered_bytes;
-	atomic_size_t *send_buffered_frames;
-	atomic_size_t *unacked_frames;
-#else
-	uint_least64_t *num_session_created;
-	uint_least64_t *num_session_connect;
-	uint_least64_t *num_session_connected;
-	uint_least64_t *num_session_disconnected;
-	uint_least64_t *num_session_finalized;
-	size_t *num_sessions;
-	size_t *num_session_halfopen;
-	size_t *num_streams;
-	size_t *num_stream_halfopen;
-	uint_least64_t *num_stream_opened;
-	uint_least64_t *num_stream_accepted;
-	uint_least64_t *num_stream_fastopen;
-	uint_least64_t *num_stream_established;
-	uint_least64_t *num_stream_succeeded;
-	uint_least64_t *num_stream_failed;
-	uint_least64_t *num_rst_sent;
-	uint_least64_t *num_rst_recv;
-	uint_least64_t *num_stream_errors;
-	size_t *recv_buffered_bytes;
-	size_t *send_buffered_frames;
-	size_t *unacked_frames;
-#endif
+	mux_counter *num_session_created;
+	mux_counter *num_session_connect;
+	mux_counter *num_session_connected;
+	mux_counter *num_session_disconnected;
+	mux_counter *num_session_finalized;
+	mux_gauge *num_sessions;
+	mux_gauge *num_session_halfopen;
+	mux_gauge *num_streams;
+	mux_gauge *num_stream_halfopen;
+	mux_counter *num_stream_opened;
+	mux_counter *num_stream_accepted;
+	mux_counter *num_stream_fastopen;
+	mux_counter *num_stream_established;
+	mux_counter *num_stream_succeeded;
+	mux_counter *num_stream_failed;
+	mux_counter *num_rst_sent;
+	mux_counter *num_rst_recv;
+	mux_counter *num_stream_errors;
+	mux_gauge *recv_buffered_bytes;
+	mux_gauge *send_buffered_frames;
+	mux_gauge *unacked_frames;
 	struct mux_traffic_counters traffic;
 };
 
@@ -138,9 +114,10 @@ struct mux_config {
 
 	/* Timeout in seconds for a single TCP-connect and mux-handshake attempt. */
 	int connect_timeout;
-	/* Inactivity timeout in seconds before the session is considered dead. */
+	/* Inactivity timeout in seconds before the session is considered dead.
+	 * NOTE: currently unused; inactivity detection is via keepalive PING + ping_timeout. */
 	int timeout;
-	/* Interval in seconds between keepalive PROBE probes. */
+	/* Interval in seconds between keepalive PING probes (also drives BDP estimation). */
 	int keepalive;
 	/* Timeout in seconds for a PING response in the BDP estimator. */
 	int ping_timeout;
@@ -151,9 +128,10 @@ struct mux_config {
 	/* Seconds a suspended server session waits for the client to resume. */
 	int resume_timeout;
 
-	/* Maximum unacknowledged frames in flight for the whole session. */
+	/* Maximum unacknowledged byte cap for the whole session (stored in frames;
+	 * the effective stall gate is session_window × MUX_WINDOW_UNIT bytes). */
 	int session_window;
-	/* Per-stream receive window size in frames. */
+	/* Per-stream receive window size (stored in frames; config value in bytes). */
 	int stream_window;
 
 	/* Receive-buffer level in bytes at which window grants are fully suppressed; 0 disables pressure scaling. */
@@ -163,7 +141,10 @@ struct mux_config {
 
 	/* Send frames immediately without coalescing. */
 	bool nodelay : 1;
-	/* Reject new inbound streams opened by the peer. */
+	/* Advertise the reject_inbound HELLO extension (spec §5.2.3.1) so the
+	 * peer does not open inbound streams.  Read at handshake time only;
+	 * changing it on an established session takes effect at the next
+	 * handshake (reconnect or resume). */
 	bool reject_inbound : 1;
 
 #if WITH_TLS
@@ -267,8 +248,12 @@ struct mux_session_stats {
 	/* Round-trip time in nanoseconds; 0 when no measurement has been
 	 * completed yet. */
 	int_least64_t rtt;
-	/* Bandwidth-delay product in bytes; 0 if not yet estimated. */
-	size_t bdp;
+	/* Bandwidth-delay product of the receive direction (inbound PUSH
+	 * bytes) in bytes; 0 if not yet estimated. */
+	size_t bdp_rx;
+	/* Bandwidth-delay product of the send direction (locally-sent bytes
+	 * acked by the peer) in bytes; 0 if not yet estimated. */
+	size_t bdp_tx;
 };
 
 /* Populate *out with a consistent snapshot of session estimator state. */
@@ -324,13 +309,13 @@ enum mux_event {
 union mux_event_data {
 	/* ESTABLISHED, RESUMED */
 	struct {
-		intmax_t ns;
+		int_least64_t ns;
 		const char *peer_id;
 		const char *peer_identity;
 	} connected;
 	/* STREAM_ESTABLISHED */
 	struct {
-		intmax_t ns;
+		int_least64_t ns;
 	} stream_established;
 	/* CLOSED */
 	struct {

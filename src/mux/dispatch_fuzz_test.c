@@ -271,9 +271,11 @@ void session_recv_pong(
 	consume_frame(ss, frame_size);
 }
 
-void session_update_session_window(struct mux_session *restrict ss)
+void session_update_session_window(
+	struct mux_session *restrict ss, const size_t window_bytes)
 {
 	(void)ss;
+	(void)window_bytes;
 }
 
 void session_flush(struct mux_session *restrict ss)
@@ -406,6 +408,14 @@ void estimator_add(struct mux_session *restrict ss, const uint_least64_t bytes)
 	(void)ss;
 	g_estimator_add_calls++;
 	g_last_estimator_bytes = bytes;
+}
+
+size_t estimator_window_size(
+	const struct estimator_ctx *restrict est, const enum estimator_dir dir)
+{
+	(void)est;
+	(void)dir;
+	return MUX_INITIAL_SEND_WINDOW;
 }
 
 /* ------------------------------------------------------------------ */

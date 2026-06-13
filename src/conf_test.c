@@ -586,6 +586,45 @@ T_DECLARE_CASE(test_identity_authcerts_parse_empty)
 	conf_free(conf);
 }
 
+T_DECLARE_CASE(test_identity_authcerts_free_without_inline_pem)
+{
+	/* Regression: conf_free must not index certs_der when authcerts
+	 * entries were parsed but conf_inline_pem never ran (certs_der is
+	 * only allocated there). */
+	const char *json = "{"
+			   "\"mux_listen\": \"127.0.0.1:9000\","
+			   "\"tls\": {"
+			   "  \"cert\": \"certdata\","
+			   "  \"key\": \"keydata\""
+			   "},"
+			   "\"identity\": {"
+			   "  \"authcerts\": {"
+			   "    \"peer1\": [\"certdata\"]"
+			   "  }"
+			   "}"
+			   "}";
+	struct config *conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->identity.authcerts_count, 1);
+	T_EXPECT_EQ((int)conf->identity.authcerts[0].certs_count, 1);
+	T_EXPECT(conf->identity.authcerts[0].certs_der == NULL);
+	conf_free(conf);
+
+	/* Same scenario via the internal error path: conf_check rejects this
+	 * config (no transport) after conf_load populated authcerts, so
+	 * conf_parse frees the partially-built config itself. */
+	const char *invalid = "{"
+			      "\"identity\": {"
+			      "  \"claim\": \"me\","
+			      "  \"authcerts\": {"
+			      "    \"peer1\": [\"certdata\"]"
+			      "  }"
+			      "}"
+			      "}";
+	struct config *rejected = parse_tmpconf(invalid);
+	T_EXPECT(rejected == NULL);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -624,5 +663,6 @@ int main(void)
 	T_RUN_CASE(t, test_conf_parsefile_stdin_success);
 	T_RUN_CASE(t, test_conf_parsefile_stdin_rejects_oversized);
 	T_RUN_CASE(t, test_identity_authcerts_parse_empty);
+	T_RUN_CASE(t, test_identity_authcerts_free_without_inline_pem);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

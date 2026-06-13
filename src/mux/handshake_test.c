@@ -1,8 +1,6 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-#include "mux/handshake.c"
-
 #include "mux/frame.h"
 #include "mux/session.h"
 
@@ -14,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "mux/handshake.c"
 
 struct frame_pool_ctx {
 	int alloc_calls;

@@ -29,6 +29,11 @@
             "description": "Target address to forward application connections to.",
             "type": "string"
         },
+        "log": {
+            "description": "Log destination. stdout and stderr write to the respective standard streams; syslog sends to the system logger; discard suppresses all output.",
+            "type": "string",
+            "enum": ["stdout", "stderr", "syslog", "discard"]
+        },
         "loglevel": {
             "description": "Log verbosity. 0=off, 1=fatal, 2=error, 3=warning, 4=notice, 5=info, 6=debug, 7=verbose, 8=veryverbose.",
             "type": "integer",

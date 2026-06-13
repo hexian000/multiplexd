@@ -11,30 +11,39 @@
 
 #include "utils/slog.h"
 
+#include <dirent.h>
 #include <errno.h>
-#include <ftw.h>
+#include <limits.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
-/* Remove a file tree; used for temp-directory cleanup. */
-static int rm_entry(
-	const char *path, const struct stat *sb, int typeflag,
-	struct FTW *ftwbuf)
-{
-	(void)sb;
-	(void)ftwbuf;
-	if (typeflag == FTW_F || typeflag == FTW_SL) {
-		return unlink(path);
-	}
-	if (typeflag == FTW_DP) {
-		return rmdir(path);
-	}
-	return 0;
-}
-
+/* Remove a file tree recursively using only POSIX APIs; used for
+ * temp-directory cleanup. */
 static void rm_tmpdir(const char *path)
 {
-	(void)nftw(path, rm_entry, 8, FTW_DEPTH | FTW_PHYS);
+	DIR *const dir = opendir(path);
+	if (dir == NULL) {
+		return;
+	}
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (strcmp(ent->d_name, ".") == 0 ||
+		    strcmp(ent->d_name, "..") == 0) {
+			continue;
+		}
+		char subpath[PATH_MAX];
+		(void)snprintf(
+			subpath, sizeof(subpath), "%s/%s", path, ent->d_name);
+		struct stat st;
+		if (lstat(subpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+			rm_tmpdir(subpath);
+		} else {
+			(void)unlink(subpath);
+		}
+	}
+	closedir(dir);
+	(void)rmdir(path);
 }
 
 /* Enter a fresh temp dir, returning the original dir (must be freed) and

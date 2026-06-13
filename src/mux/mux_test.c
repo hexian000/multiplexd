@@ -165,7 +165,7 @@ struct mux_test_fixture {
 };
 
 /* -------------------------------------------------------------------------
- * wait_until helper (same pattern as server_test.c)
+ * wait_until helpers
  * ---------------------------------------------------------------------- */
 
 typedef int (*wait_predicate_fn)(void *ctx);
@@ -184,8 +184,8 @@ condition_waiter_timer_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	waiter->timed_out = true;
 }
 
-static int wait_until(
-	struct mux_test_fixture *fx, const double timeout_sec,
+static int loop_wait_until(
+	struct ev_loop *loop, const double timeout_sec,
 	wait_predicate_fn predicate, void *ctx)
 {
 	struct condition_waiter waiter = {
@@ -194,20 +194,27 @@ static int wait_until(
 	ev_timer_init(
 		&waiter.w_timer, condition_waiter_timer_cb, timeout_sec, 0.0);
 	waiter.w_timer.data = &waiter;
-	ev_timer_start(fx->loop, &waiter.w_timer);
+	ev_timer_start(loop, &waiter.w_timer);
 
 	while (!waiter.timed_out) {
 		const int status = predicate(ctx);
 		if (status != 0) {
-			ev_timer_stop(fx->loop, &waiter.w_timer);
+			ev_timer_stop(loop, &waiter.w_timer);
 			return status > 0 ? 0 : -1;
 		}
-		ev_run(fx->loop, EVRUN_ONCE);
+		ev_run(loop, EVRUN_ONCE);
 	}
 
-	ev_timer_stop(fx->loop, &waiter.w_timer);
+	ev_timer_stop(loop, &waiter.w_timer);
 	errno = ETIMEDOUT;
 	return -1;
+}
+
+static int wait_until(
+	struct mux_test_fixture *fx, const double timeout_sec,
+	wait_predicate_fn predicate, void *ctx)
+{
+	return loop_wait_until(fx->loop, timeout_sec, predicate, ctx);
 }
 
 /* -------------------------------------------------------------------------
@@ -1980,29 +1987,11 @@ static bool raw_read_all(const int fd, void *const buf, const size_t n)
 	return true;
 }
 
-/* Drive the event loop until predicate fires or timeout_sec elapses. */
 static int raw_wait_until(
 	struct raw_fixture *fx, const double timeout_sec,
 	wait_predicate_fn predicate, void *ctx)
 {
-	struct condition_waiter waiter = { .timed_out = false };
-	ev_timer_init(
-		&waiter.w_timer, condition_waiter_timer_cb, timeout_sec, 0.0);
-	waiter.w_timer.data = &waiter;
-	ev_timer_start(fx->loop, &waiter.w_timer);
-
-	while (!waiter.timed_out) {
-		const int status = predicate(ctx);
-		if (status != 0) {
-			ev_timer_stop(fx->loop, &waiter.w_timer);
-			return status > 0 ? 0 : -1;
-		}
-		ev_run(fx->loop, EVRUN_ONCE);
-	}
-
-	ev_timer_stop(fx->loop, &waiter.w_timer);
-	errno = ETIMEDOUT;
-	return -1;
+	return loop_wait_until(fx->loop, timeout_sec, predicate, ctx);
 }
 
 /* Predicate: server reached SESSION_ESTABLISHED. */
@@ -3561,7 +3550,8 @@ static int pred_control_only_no_bdp(void *ptr)
 	if (ctx->ss->bytes_recv <= ctx->before_bytes_recv) {
 		return 0;
 	}
-	if (wndfilter_get(&ctx->ss->estimator.bw_wnd) > 0 ||
+	if (wndfilter_get(&ctx->ss->estimator.dir[ESTIMATOR_RX].bw_wnd) > 0 ||
+	    wndfilter_get(&ctx->ss->estimator.dir[ESTIMATOR_TX].bw_wnd) > 0 ||
 	    ctx->ss->estimator.ping_in_flight) {
 		return -1;
 	}
@@ -3587,9 +3577,9 @@ static int pred_echo_and_bdp_cycle(void *ptr)
 
 /* -------------------------------------------------------------------------
  * test_bdp_auto_stream_window_updated_by_pong: when both windows are
- * automatic, a PONG-driven BDP update must grow stream_window but leave
- * session_window unchanged (session_window tracks peer_stream_window, not
- * the local BDP estimate).
+ * automatic, a PONG-driven BDP update fed by inbound PUSH bytes (rx) must
+ * grow stream_window, while session_window — driven by the independent tx
+ * estimate — stays at its floor.
  * ---------------------------------------------------------------------- */
 
 T_DECLARE_CASE(test_bdp_auto_stream_window_updated_by_pong)
@@ -3633,7 +3623,7 @@ T_DECLARE_CASE(test_bdp_auto_stream_window_updated_by_pong)
 		goto cleanup;
 	}
 	fx.cli->estimator.last_probe_ns -= 1000000;
-	const intmax_t sent_ns = fx.cli->estimator.last_probe_ns;
+	const int_fast64_t sent_ns = fx.cli->estimator.last_probe_ns;
 
 	const struct mux_header hdr = {
 		.version = MUX_PROTOCOL_VERSION,
@@ -3654,15 +3644,98 @@ T_DECLARE_CASE(test_bdp_auto_stream_window_updated_by_pong)
 	ringbuf_produce(fx.cli->wire.recvbuf, frame_size);
 	session_recv_pong(fx.cli, &hdr, frame_size);
 
-	T_EXPECT(
-		fx.cli->session_window ==
-		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
-	/* PONG updates only stream_window; session_window tracks
-	 * peer_stream_window and is unchanged (no SYN/SYN|ACK in auto mode). */
+	/* PONG grows stream_window from the rx estimate; the idle tx
+	 * direction leaves session_window at its floor. */
 	T_EXPECT(
 		fx.cli->stream_window >
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
+	T_EXPECT_EQ(
+		fx.cli->session_window,
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
+
+cleanup:
+	fixture_teardown(&fx);
+}
+
+/* -------------------------------------------------------------------------
+ * test_bdp_session_window_grows_from_ack_sample_only: a pure sender that
+ * never accumulates an rx sample (no inbound PUSH payload) must still grow
+ * session_window from estimator_add_acked alone (the tx ack-clock), while
+ * stream_window — driven by the independent rx estimate — stays at its
+ * floor.
+ * ---------------------------------------------------------------------- */
+
+T_DECLARE_CASE(test_bdp_session_window_grows_from_ack_sample_only)
+{
+	struct mux_test_fixture fx;
+	if (fixture_setup(&fx) != 0) {
+		T_FATAL("fixture_setup failed");
+		return;
+	}
+
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
+		    &fx) != 0) {
+		T_FATAL("sessions did not establish");
+		goto cleanup;
+	}
+
+	bdp_enable_auto_windows(fx.cli);
+	T_EXPECT_EQ(
+		fx.cli->session_window,
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
+	T_EXPECT_EQ(fx.cli->stream_window, fx.cli->session_window);
+
+	/* Mirror test_bdp_auto_stream_window_updated_by_pong, but drive the
+	 * cycle via estimator_add_acked only: sample stays 0 throughout. */
+	estimator_add_acked(
+		fx.cli, (uint_least64_t)MUX_INITIAL_SEND_WINDOW * 4);
+	T_EXPECT(fx.cli->estimator.ping_in_flight);
+	T_EXPECT_EQ(fx.cli->estimator.dir[ESTIMATOR_RX].sample, (size_t)0);
+	T_EXPECT(fx.cli->estimator.dir[ESTIMATOR_TX].sample > 0);
+	if (!fx.cli->estimator.ping_in_flight) {
+		T_FATAL("estimator did not queue ping frame");
+		goto cleanup;
+	}
+	/* Back-date the timestamp by 1 ms so the measured RTT is positive. */
+	if (fx.cli->estimator.last_probe_ns <= 1000000) {
+		T_FATAL("invalid estimator timestamp");
+		goto cleanup;
+	}
+	fx.cli->estimator.last_probe_ns -= 1000000;
+	const int_fast64_t sent_ns = fx.cli->estimator.last_probe_ns;
+
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = 0,
+		.length = MUX_PING_PAYLOAD_SIZE,
+		.stream_id = STREAMID_CTRL,
+		.extra = MUX_CTRL_PONG,
+	};
+	const size_t frame_size = MUX_FRAME_HEADER_SIZE + MUX_PING_PAYLOAD_SIZE;
+	ringbuf_reset(fx.cli->wire.recvbuf);
+	if (!ringbuf_reserve(&fx.cli->wire.recvbuf, frame_size, false)) {
+		T_FATAL("recvbuf has no space");
+		goto cleanup;
+	}
+	unsigned char *const pong = ringbuf_write_ptr(fx.cli->wire.recvbuf);
+	mux_write_header(pong, &hdr);
+	write_uint64(pong + MUX_FRAME_HEADER_SIZE, (uint_fast64_t)sent_ns);
+	ringbuf_produce(fx.cli->wire.recvbuf, frame_size);
+	session_recv_pong(fx.cli, &hdr, frame_size);
+
+	/* PONG grows session_window from the tx ack-clock estimate; the idle
+	 * rx direction leaves stream_window at its floor. */
+	T_EXPECT(
+		fx.cli->session_window >
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
+	T_EXPECT_EQ(
+		fx.cli->stream_window,
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
+	T_EXPECT(!fx.cli->estimator.ping_in_flight);
+	T_EXPECT_EQ(fx.cli->estimator.dir[ESTIMATOR_RX].sample, (size_t)0);
+	T_EXPECT_EQ(fx.cli->estimator.dir[ESTIMATOR_TX].sample, (size_t)0);
 
 cleanup:
 	fixture_teardown(&fx);
@@ -3753,7 +3826,9 @@ T_DECLARE_CASE(test_bdp_auto_session_window_without_auto_stream_window)
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT);
 	const uint_least32_t new_peer_window = floor_frames * 4;
 	fx.cli->peer_stream_window = new_peer_window;
-	session_update_session_window(fx.cli);
+	session_update_session_window(
+		fx.cli,
+		estimator_window_size(&fx.cli->estimator, ESTIMATOR_TX));
 	T_EXPECT_EQ(fx.cli->session_window, new_peer_window);
 	/* stream_window must not have been modified. */
 	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
@@ -3796,7 +3871,9 @@ T_DECLARE_CASE(test_bdp_auto_session_window_tracks_peer_stream_window)
 	const uint_least32_t initial_stream_window = fx.cli->stream_window;
 
 	fx.cli->peer_stream_window = new_peer_window;
-	session_update_session_window(fx.cli);
+	session_update_session_window(
+		fx.cli,
+		estimator_window_size(&fx.cli->estimator, ESTIMATOR_TX));
 
 	T_EXPECT_EQ(fx.cli->session_window, new_peer_window);
 	/* stream_window is driven by the BDP estimator, not peer_stream_window;
@@ -3839,7 +3916,12 @@ T_DECLARE_CASE(test_bdp_control_only_no_cycle)
 		&fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_control_only_no_bdp,
 		&ctx);
 	T_EXPECT(ret == 0);
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.bw_wnd) == 0);
+	T_EXPECT(
+		wndfilter_get(&fx.cli->estimator.dir[ESTIMATOR_RX].bw_wnd) ==
+		0);
+	T_EXPECT(
+		wndfilter_get(&fx.cli->estimator.dir[ESTIMATOR_TX].bw_wnd) ==
+		0);
 	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 
 cleanup:
@@ -3871,10 +3953,11 @@ T_DECLARE_CASE(test_bdp_ping_queued_before_send_progress)
 	estimator_add(fx.cli, (uint_least64_t)MUX_MAX_PAYLOAD_SIZE);
 
 	T_EXPECT_EQ(
-		estimator_window_size(&fx.cli->estimator),
+		estimator_window_size(&fx.cli->estimator, ESTIMATOR_TX),
 		(size_t)fx.cli->session_window * (size_t)MUX_WINDOW_UNIT);
 	T_EXPECT_EQ(
-		fx.cli->estimator.sample, (uint_least32_t)MUX_MAX_PAYLOAD_SIZE);
+		fx.cli->estimator.dir[ESTIMATOR_RX].sample,
+		(uint_least32_t)MUX_MAX_PAYLOAD_SIZE);
 	T_EXPECT(fx.cli->wire.oobbuf.head != NULL);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
 	T_EXPECT(fx.cli->estimator.last_probe_ns > 0);
@@ -4019,14 +4102,16 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 
 	/* Simulate the stop-path: set window target to a known value; estimator
 	 * state (filters, probe) is intentionally preserved. */
-	fx.cli->estimator.effective_bdp = 3u * (size_t)MUX_INITIAL_SEND_WINDOW;
+	fx.cli->estimator.dir[ESTIMATOR_RX].effective_bdp =
+		3u * (size_t)MUX_INITIAL_SEND_WINDOW;
 	const uint_least32_t initial_frames =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
 	fx.cli->stream_window = (uint_least32_t)MAX(
-		estimator_window_size(&fx.cli->estimator) / 2 / MUX_WINDOW_UNIT,
+		estimator_window_size(&fx.cli->estimator, ESTIMATOR_RX) / 2 /
+			MUX_WINDOW_UNIT,
 		(size_t)initial_frames);
 	T_EXPECT_EQ(
-		estimator_window_size(&fx.cli->estimator),
+		estimator_window_size(&fx.cli->estimator, ESTIMATOR_RX),
 		3u * (size_t)MUX_INITIAL_SEND_WINDOW);
 	T_EXPECT_EQ(fx.cli->stream_window, 3u * initial_frames / 2u);
 	/* Learned state is preserved after stop. */
@@ -4187,6 +4272,76 @@ cleanup:
 }
 
 /* -------------------------------------------------------------------------
+ * test_drain_refuses_peer_syn: a draining session must refuse inbound
+ * streams opened by the peer with RST (REFUSED_STREAM) so the drain can
+ * converge; streams opened before the drain remain in the session table.
+ * ---------------------------------------------------------------------- */
+T_DECLARE_CASE(test_drain_refuses_peer_syn)
+{
+	struct mux_test_fixture fx;
+	if (fixture_setup(&fx) != 0) {
+		T_FATAL("fixture_setup failed");
+		return;
+	}
+
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
+		    &fx) != 0) {
+		T_FATAL("sessions did not establish");
+		goto cleanup;
+	}
+
+	/* Open a stream and wait until the server accepts it, holding the
+	 * server session in ESTABLISHED during the drain. */
+	struct mux_stream *s1 = mux_open_stream(fx.cli);
+	if (s1 == NULL) {
+		T_FATAL("mux_open_stream returned NULL");
+		goto cleanup;
+	}
+	struct test_stream *ts1 = test_stream_new(&fx, s1);
+	if (ts1 == NULL) {
+		T_FATAL("test_stream_new failed");
+		goto cleanup;
+	}
+	fx.cli_streams[fx.n_cli_streams++] = ts1;
+	mux_stream_io_start(fx.loop, &ts1->w_io);
+	struct accepted_count_ctx acc_ctx = { .fx = &fx, .min_accepted = 1 };
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_accepted_count,
+		    &acc_ctx) != 0) {
+		T_FATAL("server did not accept the first stream");
+		goto cleanup;
+	}
+
+	mux_drain(fx.srv);
+
+	/* A stream opened by the peer after the drain must be refused:
+	 * the client observes RST (delivered as a recv error) and the
+	 * server never surfaces the stream to on_accept. */
+	struct mux_stream *s2 = mux_open_stream(fx.cli);
+	if (s2 == NULL) {
+		T_FATAL("mux_open_stream returned NULL");
+		goto cleanup;
+	}
+	struct test_stream *ts2 = test_stream_new(&fx, s2);
+	if (ts2 == NULL) {
+		T_FATAL("test_stream_new failed");
+		goto cleanup;
+	}
+	fx.cli_streams[fx.n_cli_streams++] = ts2;
+	mux_stream_io_start(fx.loop, &ts2->w_io);
+
+	const int ret =
+		wait_until(&fx, EOF_TIMEOUT_MS / 1000.0, pred_error, ts2);
+	T_EXPECT(ret == 0);
+	T_EXPECT(ts2->got_error);
+	T_EXPECT(fx.n_accepted == 1);
+
+cleanup:
+	fixture_teardown(&fx);
+}
+
+/* -------------------------------------------------------------------------
  * main
  * ---------------------------------------------------------------------- */
 
@@ -4230,6 +4385,7 @@ int main(void)
 	T_RUN_CASE(t, test_resume_handshake_transport_lost);
 	T_RUN_CASE(t, test_nodelay_reverse_large);
 	T_RUN_CASE(t, test_bdp_auto_stream_window_updated_by_pong);
+	T_RUN_CASE(t, test_bdp_session_window_grows_from_ack_sample_only);
 	T_RUN_CASE(t, test_bdp_manual_window_mode_no_estimator_effect);
 	T_RUN_CASE(t, test_bdp_auto_session_window_without_auto_stream_window);
 	T_RUN_CASE(t, test_bdp_auto_session_window_tracks_peer_stream_window);
@@ -4239,6 +4395,7 @@ int main(void)
 	T_RUN_CASE(t, test_bdp_stop_halves_stream_window);
 	T_RUN_CASE(t, test_send_queue_saturates_read_credit);
 	T_RUN_CASE(t, test_drain_rejects_new_streams);
+	T_RUN_CASE(t, test_drain_refuses_peer_syn);
 
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

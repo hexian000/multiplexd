@@ -42,7 +42,6 @@ target_compile_options(multiplexd PRIVATE -pedantic -Wall -Wextra -Werror)
 # #pragma inside the generated source.
 set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/conf_schema.gen.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/mux/proto_schema.gen.c
     PROPERTIES COMPILE_OPTIONS "-w")
 
 if(LIBM)
@@ -205,6 +204,7 @@ target_sources(multiplexd
 )
 
 add_subdirectory(mux)
+target_link_libraries(multiplexd PRIVATE mux)
 
 # =============================================================================
 # Tests
@@ -297,17 +297,9 @@ add_src_test(tunnel_test
     server.c server.h
     tunnel.c tunnel.h
     api_server.c api_server.h
-    mux/dispatch.c mux/dispatch.h
-    mux/estimator.c mux/estimator.h
-    mux/handshake.c mux/handshake.h mux/proto_schema.gen.c mux/proto_schema.gen.h
-    mux/mux.c mux/mux.h
-    mux/frame.c mux/frame.h
-    mux/sched.c mux/sched.h
-    mux/session.c mux/session.h
-    mux/stream.c mux/stream.h
-    mux/wire.c mux/wire.h
     tunnel_test.c
 )
+target_link_libraries(tunnel_test PRIVATE mux)
 
 # Server unit tests
 add_src_test(server_test
@@ -319,17 +311,9 @@ add_src_test(server_test
     server.c server.h
     tunnel.c tunnel.h
     api_server.c api_server.h
-    mux/dispatch.c mux/dispatch.h
-    mux/estimator.c mux/estimator.h
-    mux/handshake.c mux/handshake.h mux/proto_schema.gen.c mux/proto_schema.gen.h
-    mux/mux.c mux/mux.h
-    mux/frame.c mux/frame.h
-    mux/sched.c mux/sched.h
-    mux/session.c mux/session.h
-    mux/stream.c mux/stream.h
-    mux/wire.c mux/wire.h
     server_test.c
 )
+target_link_libraries(server_test PRIVATE mux)
 
 # API server unit tests
 add_src_test(api_server_test
@@ -341,14 +325,6 @@ add_src_test(api_server_test
     server.c server.h
     tunnel.c tunnel.h
     api_server.c api_server.h
-    mux/dispatch.c mux/dispatch.h
-    mux/estimator.c mux/estimator.h
-    mux/handshake.c mux/handshake.h mux/proto_schema.gen.c mux/proto_schema.gen.h
-    mux/mux.c mux/mux.h
-    mux/frame.c mux/frame.h
-    mux/sched.c mux/sched.h
-    mux/session.c mux/session.h
-    mux/stream.c mux/stream.h
-    mux/wire.c mux/wire.h
     api_server_test.c
 )
+target_link_libraries(api_server_test PRIVATE mux)

@@ -8,6 +8,9 @@
 #include "utils/testing.h"
 
 #include <ev.h>
+
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -143,12 +146,6 @@ static void teardown_fixture(struct session_fixture *restrict fx)
 	mux_frame_ring_free(&fx->ss.unacked, &fx->ss.pool);
 	fx->ss.unacked_frames = 0;
 	fx->ss.retransmit_off = SIZE_MAX;
-	/* Drain the one-deep frame spare so ASAN does not flag it as a leak.
-	 * session_cleanup frees it in production; tests are self-contained. */
-	if (fx->ss.frame_spare != NULL) {
-		mux_frame_put(&fx->ss.pool, fx->ss.frame_spare);
-		fx->ss.frame_spare = NULL;
-	}
 	if (fx->fds[0] >= 0) {
 		close(fx->fds[0]);
 		fx->fds[0] = -1;
@@ -297,6 +294,66 @@ T_DECLARE_CASE(test_session_ack_trim_overflow_returns_false)
 	teardown_fixture(&fx);
 }
 
+/* session_ack_trim feeds estimator_add_acked with the trimmed payload bytes,
+ * but only when an automatic window is enabled (manual mode never probes). */
+T_DECLARE_CASE(test_session_ack_trim_acks_feed_estimator)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	static const unsigned char payload[100] = { 0 };
+	fx.ss.auto_session_window = true;
+
+	struct mux_frame *const frame = make_frame(
+		&fx.ss.pool, 1, MUX_FLAG_PUSH, 0, payload, sizeof(payload));
+	T_CHECK(frame != NULL);
+	frame->unacked_count = 1;
+	T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
+	fx.ss.unacked_frames = 1;
+	fx.ss.unacked_bytes = sizeof(payload);
+	fx.ss.last_ack_recv = 0;
+
+	T_EXPECT(session_ack_trim(&fx.ss, 1));
+	T_EXPECT_EQ(fx.ss.unacked_bytes, (size_t)0);
+	T_EXPECT_EQ(fx.ss.estimator.dir[ESTIMATOR_TX].sample, sizeof(payload));
+	T_EXPECT_EQ(fx.ss.estimator.dir[ESTIMATOR_RX].sample, (size_t)0);
+	T_EXPECT(fx.ss.estimator.ping_in_flight);
+
+	teardown_fixture(&fx);
+}
+
+/* Manual mode (default: both auto_*_window flags false) must not probe the
+ * estimator on session ACKs. */
+T_DECLARE_CASE(test_session_ack_trim_manual_mode_skips_estimator)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	static const unsigned char payload[100] = { 0 };
+
+	struct mux_frame *const frame = make_frame(
+		&fx.ss.pool, 1, MUX_FLAG_PUSH, 0, payload, sizeof(payload));
+	T_CHECK(frame != NULL);
+	frame->unacked_count = 1;
+	T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
+	fx.ss.unacked_frames = 1;
+	fx.ss.unacked_bytes = sizeof(payload);
+	fx.ss.last_ack_recv = 0;
+
+	T_EXPECT(session_ack_trim(&fx.ss, 1));
+	T_EXPECT_EQ(fx.ss.unacked_bytes, (size_t)0);
+	T_EXPECT_EQ(fx.ss.estimator.dir[ESTIMATOR_TX].sample, (size_t)0);
+	T_EXPECT(!fx.ss.estimator.ping_in_flight);
+
+	teardown_fixture(&fx);
+}
+
 T_DECLARE_CASE(test_session_resume_ack_recv_advances_cursor)
 {
 	struct session_fixture fx;
@@ -439,7 +496,7 @@ T_DECLARE_CASE(test_session_recv_ping_queues_pong_per_ping_outside_rate_limit)
 	const struct mux_frame *const first_pong = fx.ss.wire.oobbuf.head;
 
 	/* Reset the rate-limit clock so the second PING is not dropped. */
-	fx.ss.ping_recv_last_ns = -(intmax_t)MUX_PING_RATE_LIMIT_NS;
+	fx.ss.ping_recv_last_ns = -(int_fast64_t)MUX_PING_RATE_LIMIT_NS;
 	hdr.length = (uint_least16_t)sizeof(payload2);
 	ringbuf_reset(fx.ss.wire.recvbuf);
 	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame2->data,
@@ -734,6 +791,27 @@ T_DECLARE_CASE(test_session_ack_extra_clamped_at_uint16_max)
 	teardown_fixture(&fx);
 }
 
+/* -------------------------------------------------------------------------
+ * Socket helper tests
+ * ---------------------------------------------------------------------- */
+
+T_DECLARE_CASE(test_socket_user_timeout_sets_option)
+{
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	T_CHECK(fd >= 0);
+#if WITH_TCP_USER_TIMEOUT
+	T_EXPECT_EQ(socket_user_timeout(fd, 5000), 0);
+	int val = 0;
+	socklen_t len = sizeof(val);
+	T_CHECK(getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &val, &len) == 0);
+	T_EXPECT_EQ(val, 5000);
+#else
+	/* Platform lacks TCP_USER_TIMEOUT; function must return -1. */
+	T_EXPECT_EQ(socket_user_timeout(fd, 5000), -1);
+#endif
+	(void)close(fd);
+}
+
 int main(void)
 {
 	T_DECLARE_CTX(t);
@@ -741,6 +819,8 @@ int main(void)
 	T_RUN_CASE(t, test_session_send_oob_packs_payload);
 	T_RUN_CASE(t, test_session_ack_trim_releases_frames_and_clears_stall);
 	T_RUN_CASE(t, test_session_ack_trim_overflow_returns_false);
+	T_RUN_CASE(t, test_session_ack_trim_acks_feed_estimator);
+	T_RUN_CASE(t, test_session_ack_trim_manual_mode_skips_estimator);
 	T_RUN_CASE(t, test_session_resume_ack_recv_advances_cursor);
 	T_RUN_CASE(t, test_session_open_stream_enforces_limits);
 	T_RUN_CASE(
@@ -760,5 +840,6 @@ int main(void)
 	T_RUN_CASE(t, test_session_drain_sets_draining_flag);
 	T_RUN_CASE(t, test_session_discard_stream_frames_clears_queued_data);
 	T_RUN_CASE(t, test_session_ack_extra_clamped_at_uint16_max);
+	T_RUN_CASE(t, test_socket_user_timeout_sets_option);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

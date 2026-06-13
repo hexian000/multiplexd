@@ -88,6 +88,7 @@ struct config {
 
 	struct conf_identity identity;
 
+	char *log;
 	int loglevel;
 	int max_sessions;
 	/* Parsed from the "max_startups" string field ("start:rate:full"). */

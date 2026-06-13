@@ -155,9 +155,11 @@ void session_recv_pong(
 	consume_frame(ss, frame_size);
 }
 
-void session_update_session_window(struct mux_session *restrict ss)
+void session_update_session_window(
+	struct mux_session *restrict ss, const size_t window_bytes)
 {
 	(void)ss;
+	(void)window_bytes;
 }
 
 void session_flush(struct mux_session *restrict ss)
@@ -279,6 +281,14 @@ void estimator_add(struct mux_session *restrict ss, const uint_least64_t bytes)
 		ringbuf_reset(ss->wire.recvbuf);
 		ss->state = SESSION_CLOSED;
 	}
+}
+
+size_t estimator_window_size(
+	const struct estimator_ctx *restrict est, const enum estimator_dir dir)
+{
+	(void)est;
+	(void)dir;
+	return MUX_INITIAL_SEND_WINDOW;
 }
 
 static struct mux_session make_session(const bool accepted)

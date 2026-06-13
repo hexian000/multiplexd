@@ -133,7 +133,6 @@ static void stream_set_state(
 		stream_state_str[newstate]);
 	s->state = newstate;
 	if (newstate == STREAM_ESTABLISHED) {
-		s->quickack_budget = MUX_QUICKACK_BUDGET;
 		COUNTER_ADD(s->session->cnt.num_stream_established, 1);
 	}
 }
@@ -427,7 +426,7 @@ static bool recv_cb(struct mux_stream *restrict s)
 		return false;
 	}
 
-	struct mux_frame *frame = session_frame_alloc(s->session);
+	struct mux_frame *frame = mux_frame_get(&s->session->pool);
 	if (frame == NULL) {
 		STREAM_LOG(WARNING, s, "out of memory for send frame");
 		return false;
@@ -442,11 +441,11 @@ static bool recv_cb(struct mux_stream *restrict s)
 		if (err != 0) {
 			if (err == EAGAIN || err == EWOULDBLOCK ||
 			    err == ENOBUFS || err == ENOMEM) {
-				session_frame_free(s->session, frame);
+				mux_frame_put(&s->session->pool, frame);
 				return false; /* wait for EV_READ */
 			}
 			LOGE_F("recv [fd:%d]: (%d) %s", fd, err, strerror(err));
-			session_frame_free(s->session, frame);
+			mux_frame_put(&s->session->pool, frame);
 			stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
 			return false;
 		}
@@ -459,7 +458,7 @@ static bool recv_cb(struct mux_stream *restrict s)
 
 		stream_queue_send(s, frame);
 	} else {
-		session_frame_free(s->session, frame);
+		mux_frame_put(&s->session->pool, frame);
 		s->rx_eof = true;
 		STREAM_LOG(VERBOSE, s, "local recv: EOF");
 	}
@@ -894,46 +893,33 @@ void stream_check_ack(struct mux_stream *restrict s)
 	if (s->ack_pending) {
 		return;
 	}
+
 	const uint_fast32_t grantable = stream_grantable_bytes(s);
 	/* Sub-unit grantable cannot be sent; see stream_grant_inc(). */
 	if (grantable < (uint_fast32_t)MUX_WINDOW_UNIT) {
 		return;
 	}
-	/* Immediate ACK when the quickack budget is active (TCP-style quickack
-	 * for stream startup and window-growth events), or when grantable credit
-	 * reaches the 2-frame batch threshold (avoids half-window starvation at
-	 * large auto-tuned receive windows). */
+	/* Immediate ACK when grantable credit reaches the 2-frame batch
+	 * threshold (avoids half-window starvation at large auto-tuned
+	 * receive windows).  Sub-threshold grants are coalesced (spec §6.4,
+	 * §7.1). */
 	const uint_fast32_t immediate =
 		2u * (uint_fast32_t)MUX_MAX_PAYLOAD_SIZE;
-	const bool quickack = grantable >= immediate || s->quickack_budget > 0;
-	if (!quickack) {
-		/* Sub-threshold: arm the coalescing timer so the grant is conveyed on
-		 * the next flush (spec §6.4, §7.1). */
+	const bool immediate_ack = grantable >= immediate;
+	if (!immediate_ack) {
+		/* Sub-threshold: arm the coalescing timer so the grant is
+		 * conveyed on the next flush (spec §6.4, §7.1). */
 		STREAM_LOG_F(
-			VERBOSE, s,
-			"ACK delayed: grantable=%" PRIuFAST32
-			" quickack_remaining=%u",
-			grantable, (unsigned)s->quickack_budget);
+			VERBOSE, s, "ACK delayed: grantable=%" PRIuFAST32,
+			grantable);
 		sched_delay(s->session, s, MUX_DELAYED_ACK_TICKS);
 		return;
 	}
-	if (s->quickack_budget > 0) {
-		s->quickack_budget--;
-	}
 	STREAM_LOG_F(
-		DEBUG, s,
-		"ACK immediate: grantable=%" PRIuFAST32
-		" quickack_remaining=%u",
-		grantable, (unsigned)s->quickack_budget);
+		DEBUG, s, "ACK immediate: grantable=%" PRIuFAST32, grantable);
 	s->ack_pending = true;
-	if (s->send_queue.head == NULL && s->sched_queue != SCHED_QUEUE_DRR &&
+	if (s->sched_queue != SCHED_QUEUE_DRR &&
 	    s != s->session->sched.drr_active) {
-		/* No data to piggyback on and not already in DRR: queue
-		 * for pure control-frame emission via ctrl_pending list. */
-		sched_ctrl_enqueue(s->session, s);
-		s->session->wire.tx_pending = true;
-		session_notify(s->session);
-	} else if (s->sched_queue != SCHED_QUEUE_DRR) {
 		sched_wake(s->session, s);
 	}
 }
@@ -1043,7 +1029,7 @@ void stream_recv_window(struct mux_stream *s, const uint_fast32_t window_inc)
 	 * The applicable bound is INT32_MAX (the range within which §6.6
 	 * wrapping arithmetic is correct); recv_window is not on the wire. */
 	const uint_fast32_t outstanding = stream_credit_avail(s);
-	if ((uintmax_t)outstanding + inc_bytes > (uintmax_t)INT32_MAX) {
+	if ((uint_fast64_t)outstanding + inc_bytes > (uint_fast64_t)INT32_MAX) {
 		STREAM_LOG_F(
 			WARNING, s,
 			"excessive send credit: outstanding=%" PRIuFAST32

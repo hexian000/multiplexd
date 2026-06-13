@@ -21,11 +21,12 @@
 #include "tlsutil.h"
 #include "utils/slog.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <ftw.h>
 #include <limits.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #endif /* WITH_TLS */
 
 struct frame_pool_ctx {
@@ -291,24 +292,30 @@ T_DECLARE_CASE(test_wire_wait_eof_returns_true_on_clean_peer_close)
 
 #if WITH_TLS
 
-static int wire_test_rm_entry(
-	const char *path, const struct stat *sb, int typeflag,
-	struct FTW *ftwbuf)
-{
-	(void)sb;
-	(void)ftwbuf;
-	if (typeflag == FTW_F || typeflag == FTW_SL) {
-		return unlink(path);
-	}
-	if (typeflag == FTW_DP) {
-		return rmdir(path);
-	}
-	return 0;
-}
-
 static void wire_test_rm_tmpdir(const char *path)
 {
-	(void)nftw(path, wire_test_rm_entry, 8, FTW_DEPTH | FTW_PHYS);
+	DIR *const dir = opendir(path);
+	if (dir == NULL) {
+		return;
+	}
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (strcmp(ent->d_name, ".") == 0 ||
+		    strcmp(ent->d_name, "..") == 0) {
+			continue;
+		}
+		char subpath[PATH_MAX];
+		(void)snprintf(
+			subpath, sizeof(subpath), "%s/%s", path, ent->d_name);
+		struct stat st;
+		if (lstat(subpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+			wire_test_rm_tmpdir(subpath);
+		} else {
+			(void)unlink(subpath);
+		}
+	}
+	closedir(dir);
+	(void)rmdir(path);
 }
 
 #if !WITH_OPENSSL
@@ -672,17 +679,13 @@ T_DECLARE_CASE(test_sendbuf_push_small_frame_packs_into_staging)
 
 	wire_sendbuf_push(&ss, f);
 
-	/* One staging entry was created; the original frame is retained as the
-	 * one-deep spare rather than returned to the pool. */
+	/* One staging entry was created; the original frame is returned to the pool. */
 	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
 	T_EXPECT(ss.wire.sendbuf_staging);
 	T_EXPECT_EQ(ss.wire.sendbuf.tail->len, (size_t)MUX_FRAME_HEADER_SIZE);
-	/* pool: 2 allocs (f + staging); f goes to the spare, so no free yet. */
+	/* pool: 2 allocs (f + staging); f is freed directly (no spare). */
 	T_EXPECT_EQ(pool_ctx.alloc_calls, 2);
-	T_EXPECT_EQ(pool_ctx.free_calls, 0);
-	T_EXPECT(ss.frame_spare == f);
-	mux_frame_put(&ss.pool, ss.frame_spare);
-	ss.frame_spare = NULL;
+	T_EXPECT_EQ(pool_ctx.free_calls, 1);
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
 }
@@ -708,13 +711,9 @@ T_DECLARE_CASE(test_sendbuf_push_second_small_frame_packs_into_existing_staging)
 	T_EXPECT(ss.wire.sendbuf_staging);
 	T_EXPECT_EQ(
 		ss.wire.sendbuf.tail->len, (size_t)(2 * MUX_FRAME_HEADER_SIZE));
-	/* pool: 3 allocs (f1 + f2 + staging).  f1 is retained as the one-deep
-	 * spare; f2 returns to the pool because the spare is already occupied. */
+	/* pool: 3 allocs (f1 + f2 + staging); both f1 and f2 are freed. */
 	T_EXPECT_EQ(pool_ctx.alloc_calls, 3);
-	T_EXPECT_EQ(pool_ctx.free_calls, 1);
-	T_EXPECT(ss.frame_spare == f1);
-	mux_frame_put(&ss.pool, ss.frame_spare);
-	ss.frame_spare = NULL;
+	T_EXPECT_EQ(pool_ctx.free_calls, 2);
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
 }
@@ -764,12 +763,6 @@ T_DECLARE_CASE(test_sendbuf_push_large_after_staging_adds_second_entry)
 	T_EXPECT(ss.wire.sendbuf.tail == large);
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
-	/* small frame was staged -> session_frame_free stashed it in spare;
-	 * drain so ASAN does not flag a leak. */
-	if (ss.frame_spare != NULL) {
-		mux_frame_put(&ss.pool, ss.frame_spare);
-		ss.frame_spare = NULL;
-	}
 }
 
 /* A retransmit copy is always appended by reference even when it fits within
@@ -820,13 +813,9 @@ T_DECLARE_CASE(test_sendbuf_discard_clears_staging)
 	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)0);
 	T_EXPECT(ss.wire.sendbuf.head == NULL);
 	T_EXPECT(!ss.wire.sendbuf_staging);
-	/* pool: 3 allocs (f1 + f2 + staging).  f1 is retained as the one-deep
-	 * spare; f2 (spare occupied) and the staging entry are freed.
-	 * wire_discard_buffers does not touch the session spare. */
-	T_EXPECT_EQ(pool_ctx.free_calls, 2);
-	T_EXPECT(ss.frame_spare == f1);
-	mux_frame_put(&ss.pool, ss.frame_spare);
-	ss.frame_spare = NULL;
+	/* pool: 3 allocs (f1 + f2 + staging); all three are freed:
+	 * f1 and f2 on push, staging in wire_discard_buffers. */
+	T_EXPECT_EQ(pool_ctx.free_calls, 3);
 
 	ringbuf_free(ss.wire.recvbuf);
 }
@@ -858,14 +847,11 @@ T_DECLARE_CASE(test_sendbuf_push_staging_full_starts_new_entry)
 	/* A new staging entry was created for f2. */
 	T_EXPECT(ss.wire.sendbuf_staging);
 	T_EXPECT_EQ(ss.wire.sendbuf.tail->len, (size_t)MUX_FRAME_HEADER_SIZE);
-	/* pool: the spare holds the seed frame from the first push, so the new
-	 * staging entry reuses it (no fresh alloc); only f2 is allocated, and f2
-	 * (after its header is packed) becomes the new spare, so no free yet. */
-	T_EXPECT_EQ(pool_ctx.alloc_calls, 1);
-	T_EXPECT_EQ(pool_ctx.free_calls, 0);
-	T_EXPECT(ss.frame_spare == f2);
-	mux_frame_put(&ss.pool, ss.frame_spare);
-	ss.frame_spare = NULL;
+	/* pool: seed was freed on first push (before counter reset).
+	 * After reset: f2 allocated (1 alloc), new staging allocated (1 alloc),
+	 * f2 freed after header packed (1 free). */
+	T_EXPECT_EQ(pool_ctx.alloc_calls, 2);
+	T_EXPECT_EQ(pool_ctx.free_calls, 1);
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
 }
