@@ -196,8 +196,14 @@ static int loop_wait_until(
 	waiter.w_timer.data = &waiter;
 	ev_timer_start(loop, &waiter.w_timer);
 
+	/* The predicate inspects state mutated by mux event callbacks, which are
+	 * dispatched only from inside ev_run().  Route the call through a volatile
+	 * pointer so the optimizer cannot devirtualize it, treat it as
+	 * loop-invariant, and cache the polled flag across ev_run() — observed as
+	 * a spurious timeout with clang at -O2/-O3. */
+	wait_predicate_fn volatile vpredicate = predicate;
 	while (!waiter.timed_out) {
-		const int status = predicate(ctx);
+		const int status = vpredicate(ctx);
 		if (status != 0) {
 			ev_timer_stop(loop, &waiter.w_timer);
 			return status > 0 ? 0 : -1;

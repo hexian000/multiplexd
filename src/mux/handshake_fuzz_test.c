@@ -359,13 +359,13 @@ static const int k_msgids[] = {
  * Uses _space to hold the remaining capacity, then caps the increment at
  * _space so off never exceeds JBUF_SIZE-1.
  */
-#define JAPP(fmt, ...)                                                         \
+#define JAPP(...)                                                              \
 	do {                                                                   \
 		if (off < JBUF_SIZE - 1) {                                     \
 			const int _space = JBUF_SIZE - 1 - off;                \
 			const int _n = snprintf(                               \
-				json + off, (size_t)(_space + 1), (fmt),       \
-				##__VA_ARGS__);                                \
+				json + off, (size_t)(_space + 1),              \
+				__VA_ARGS__);                                  \
 			off += (_n > 0 && _n <= _space) ? _n : _space;         \
 		}                                                              \
 	} while (0)

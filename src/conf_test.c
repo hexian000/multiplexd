@@ -93,20 +93,14 @@ T_DECLARE_CASE(test_conf_parsefile_nonexistent)
 
 T_DECLARE_CASE(test_conf_parsefile_invalid_json)
 {
-	char tmpl[] = "/tmp/conf_test_XXXXXX";
-	T_CHECK(write_tmpfile(tmpl, "{bad json") == 0);
-	struct config *conf = conf_parsefile(tmpl);
-	(void)unlink(tmpl);
+	struct config *conf = parse_tmpconf("{bad json");
 	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_minimal_client)
 {
-	char tmpl[] = "/tmp/conf_test_XXXXXX";
-	T_CHECK(write_tmpfile(tmpl, "{\"mux_connect\":\"127.0.0.1:9000\"}") ==
-		0);
-	struct config *conf = conf_parsefile(tmpl);
-	(void)unlink(tmpl);
+	struct config *conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\"}");
 	T_CHECK(conf != NULL);
 	T_CHECK(conf->mux_connect != NULL);
 	T_EXPECT_STREQ(conf->mux_connect, "127.0.0.1:9000");
@@ -116,11 +110,8 @@ T_DECLARE_CASE(test_conf_parsefile_minimal_client)
 
 T_DECLARE_CASE(test_conf_parsefile_minimal_server)
 {
-	char tmpl[] = "/tmp/conf_test_XXXXXX";
-	T_CHECK(write_tmpfile(tmpl, "{\"mux_listen\":\"127.0.0.1:9000\"}") ==
-		0);
-	struct config *conf = conf_parsefile(tmpl);
-	(void)unlink(tmpl);
+	struct config *conf =
+		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\"}");
 	T_CHECK(conf != NULL);
 	T_CHECK(conf->mux_listen != NULL);
 	T_EXPECT_STREQ(conf->mux_listen, "127.0.0.1:9000");
@@ -155,14 +146,10 @@ T_DECLARE_CASE(test_conf_dump_roundtrip)
 
 T_DECLARE_CASE(test_conf_identity_connect_count)
 {
-	char tmpl[] = "/tmp/conf_test_XXXXXX";
 	/* Identity-client mode: mux_connect lists destinations; claim is
 	 * required alongside mux_connect. */
-	const char *json =
-		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\",\"127.0.0.1:9002\"]}}";
-	T_CHECK(write_tmpfile(tmpl, json) == 0);
-	struct config *conf = conf_parsefile(tmpl);
-	(void)unlink(tmpl);
+	struct config *conf = parse_tmpconf(
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\",\"127.0.0.1:9002\"]}}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ((int)conf->identity.mux_connect_count, 2);
 	conf_free(conf);
@@ -170,12 +157,8 @@ T_DECLARE_CASE(test_conf_identity_connect_count)
 
 T_DECLARE_CASE(test_conf_loglevel_parsed)
 {
-	char tmpl[] = "/tmp/conf_test_XXXXXX";
-	const char *json =
-		"{\"mux_connect\":\"127.0.0.1:9000\",\"loglevel\":3}";
-	T_CHECK(write_tmpfile(tmpl, json) == 0);
-	struct config *conf = conf_parsefile(tmpl);
-	(void)unlink(tmpl);
+	struct config *conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\",\"loglevel\":3}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->loglevel, 3);
 	conf_free(conf);
