@@ -14,6 +14,7 @@
 #include "mux/handshake.h"
 #include "mux/mux.h"
 #include "mux/sched.h"
+#include "mux/unacked.h"
 #include "mux/wire.h"
 
 #include "algo/hashtable.h"
@@ -23,10 +24,8 @@
 
 #include <ev.h>
 
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-
 #include <errno.h>
+#include <netinet/tcp.h>
 #if WITH_THREADS
 #include <stdatomic.h>
 #endif
@@ -34,6 +33,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/socket.h>
 
 struct mux_stream;
 struct mux_session;
@@ -71,12 +71,8 @@ static inline void modify_io_events(
 	}
 }
 
-/**
- * @brief Sets TCP_USER_TIMEOUT on the socket.
- * @param fd The socket file descriptor.
- * @param ms The timeout in milliseconds.
- * @return 0 on success, -1 if unsupported or setsockopt fails.
- */
+/* Set TCP_USER_TIMEOUT (@p ms); 0 on success, -1 if unsupported or setsockopt
+ * fails. */
 static inline int socket_user_timeout(const int fd, const int ms)
 {
 #if WITH_TCP_USER_TIMEOUT
@@ -92,7 +88,7 @@ static inline int socket_user_timeout(const int fd, const int ms)
 	(void)fd;
 	(void)ms;
 	return -1;
-#endif
+#endif /* WITH_TCP_USER_TIMEOUT */
 }
 
 #define STREAMID_CTRL 0
@@ -117,59 +113,11 @@ enum session_state {
 	SESSION_CLOSED,
 };
 
-/* Stream scheduling and table state.  Embedded by value in mux_session. */
-struct sched_ctx {
-	/* Per-session stream table, keyed by uint_least16_t stream ID. */
-	struct hashtable *streams;
-	/* Number of CLOSED (tombstone) streams currently in the stream table.
-	 * These linger for MUX_TOMBSTONE_PERIOD_S but are no longer "live".
-	 * Used to exclude tombstones from the max_streams admission gate. */
-	size_t num_tombstones;
-	/* Round-robin ready queue head and tail. */
-	struct mux_stream *sched_head;
-	struct mux_stream *sched_tail;
-	/* Currently active DRR stream: dequeued and holding remaining deficit.
-	 * Not in the ready queue; NULL when no stream is mid-round. */
-	struct mux_stream *drr_active;
-	/* Coalescing delay list: streams waiting for the next w_coalesce tick. */
-	struct mux_stream *delay_head;
-	/* Low-priority queue for lifecycle events (INIT SYN / CLOSED cleanup).
-	 * Drained in EV_IDLE; kept separate from the DRR data queue so the
-	 * data path never skips over INIT/CLOSED streams. */
-	struct mux_stream *lp_head;
-	struct mux_stream *lp_tail;
-	ev_idle w_sched;
-	/* Fixed-period coalescing timer: flushes Nagle-held frames and
-	 * sub-threshold window updates every MUX_COALESCING_INTERVAL seconds. */
-	ev_timer w_coalesce;
-	/* Wrap-around counter for allocating stream IDs.  Client sessions
-	 * assign odd IDs, server sessions assign even IDs.  Incremented by 2
-	 * after each allocation; wraps at 65536 back to the parity base. */
-	uint_least16_t next_stream_id;
-};
+/* struct sched_ctx is defined in sched.h and struct handshake_ctx in
+ * handshake.h; both are embedded by value in mux_session below. */
 
-/* Session-level ACK, identity, resume, and peer capability state.
- * Embedded by value in mux_session. */
-struct handshake_ctx {
-	/* Session identity and resume state (spec §5.8) */
-	/* Server-assigned 16-byte session identity, shared by both peers. */
-	unsigned char session_id[16];
-	/* true when session_id has been assigned (always true for server sessions) */
-	bool has_session_id : 1;
-
-	/* Peer capabilities and identity extension */
-	bool peer_rejects_inbound_streams : 1;
-	/* This node's identity announced in hello. */
-	char *identity;
-	/* Internal peer label for diagnostics; NOT sent in hello. */
-	char *peer_id;
-	/* Identity received from the peer's hello. */
-	char *peer_identity;
-};
-
-/* COUNTER_ADD/SUB/LOAD/STORE operate on mux_session_counters pointer fields.
- * All macros are NULL-safe: when the pointer argument is NULL the
- * operation is silently skipped (returns 0 for ADD/SUB/LOAD). */
+/* COUNTER_ADD/SUB/LOAD/STORE operate on mux_session_counters pointer fields;
+ * all are NULL-safe (skipped, returning 0, when the pointer is NULL). */
 #if WITH_THREADS
 #define COUNTER_ADD(p, v)                                                      \
 	((p) ? atomic_fetch_add_explicit((p), (v), memory_order_relaxed) : 0)
@@ -184,7 +132,7 @@ struct handshake_ctx {
 #define COUNTER_SUB(p, v) ((p) ? (*(p) -= (uint_least64_t)(v)) : 0)
 #define COUNTER_LOAD(p) ((p) ? *(p) : 0)
 #define COUNTER_STORE(p, v) ((p) ? (void)(*(p) = (v)) : (void)0)
-#endif
+#endif /* WITH_THREADS */
 
 /* All fields of mux_session are accessed only from the owning ev_loop thread. */
 struct mux_session {
@@ -192,32 +140,23 @@ struct mux_session {
 	struct mux_config conf;
 	/* Frame allocator; set at creation time and never changed. */
 	struct mux_frame_allocator pool;
+	/* Authoritative logical max outbound frame payload, frozen from conf at
+	 * creation.  Framing paths size buffers and bound lengths by this; the
+	 * physical buffer capacity is carried per frame as frame->cap (>= this). */
+	uint_least32_t max_payload;
 	/* Non-owning pointer to the session log tag buffer; set at creation time. */
 	char *tag;
 	/* Pointer block into server_stats; NULL pointers are silently skipped. */
 	struct mux_session_counters cnt;
-	/* Local counter for tracking. */
 	size_t num_halfopen;
-	/* Per-session frame counters for internal flow control.
-	 * These are also pushed to the server-level aggregates via
-	 * mux_session_counters pointers when available (non-NULL). */
+	/* Per-session flow-control counters; also mirrored to server aggregates
+	 * via cnt when set. */
 	size_t recv_buffered_bytes;
 	size_t send_buffered_frames;
-	size_t unacked_frames;
-	/* Total payload bytes currently in the unacked ring.  Drives
-	 * send_stalled; the ring stores a frame count while the stall
-	 * gate operates on bytes so small frames cannot fill the window. */
-	size_t unacked_bytes;
-	/* Byte offset of the first sub-frame not yet byte-accounted in the
-	 * ring head entry.  Non-zero only while the head entry is being
-	 * partially trimmed across multiple session_ack_trim calls.  Reset
-	 * to 0 whenever the head entry is fully popped. */
-	uint_least32_t unacked_partial_offset;
-	/* Local per-session diagnostics. */
 	int_least64_t last_connect_latency_ns;
-	/* Total mux bytes received from the transport for diagnostics. */
+	/* Total mux bytes received, for diagnostics. */
 	uint_least64_t bytes_recv;
-	/* Monotonic ns of the last inbound PING; used for inbound PING rate limiting. */
+	/* Monotonic ns of the last inbound PING; for PING rate limiting. */
 	int_least64_t ping_recv_last_ns;
 	enum session_state state;
 	int_least64_t last_modified;
@@ -238,35 +177,20 @@ struct mux_session {
 
 	/* true for accepted (server-role) sessions */
 	bool accepted : 1;
-	/* true when the unacked ring has reached the session window cap;
-	 * data frame sends are suspended until the peer acknowledges frames. */
-	bool send_stalled : 1;
-	/* true when stream_window was configured as 0; the BDP estimator probes
-	 * bandwidth on each inbound PUSH cycle and stream_window tracks the
-	 * resulting effective_bdp with headroom. */
+	/* stream_window configured as 0: track the RX BDP estimate automatically. */
 	bool auto_stream_window : 1;
-	/* true when session_window was configured as 0; peer_stream_window
-	 * (updated on each SYN and SYN|ACK) sets the initial floor, and
-	 * session_window then tracks the BDP estimator's effective_bdp on
-	 * each PONG, like stream_window. */
+	/* session_window configured as 0: track the TX BDP estimate automatically. */
 	bool auto_session_window : 1;
-	/* true when the session should shut down as soon as its last stream
-	 * closes; set by session_drain() and cleared on reconnect. */
+	/* shut down once the last stream closes; set by session_drain(). */
 	bool draining : 1;
 
-	/* Effective unacked-frame cap for the session; in auto mode tracks
-	 * max(peer_stream_window, ceil(effective_bdp / MUX_WINDOW_UNIT)),
-	 * updated on each SYN, SYN|ACK, and PONG.  A floor of
-	 * MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT is always enforced. */
+	/* Unacked-frame cap (the send-stall gate); auto mode tracks the TX BDP
+	 * above an initial-window floor. */
 	uint_least32_t session_window;
-	/* Effective per-stream receive window (frames); in auto mode tracks the
-	 * RX BDP with headroom so per-stream credit is never the bottleneck.
-	 * Grows and shrinks with the BDP estimate; already-granted per-stream
-	 * recv_window is not clawed back on shrink. */
+	/* Per-stream receive window (frames); auto mode tracks the RX BDP.
+	 * Granted recv_window is not clawed back on shrink. */
 	uint_least32_t stream_window;
-	/* Peer's effective per-stream receive window (frames); updated
-	 * unconditionally on each SYN and SYN|ACK (supports shrinking);
-	 * not derived from ACK credit grants. */
+	/* Peer's per-stream receive window (frames); updated on each SYN/SYN|ACK. */
 	uint_least32_t peer_stream_window;
 
 	/* Transport I/O state (socket buffers, TLS connection, flow-control flags). */
@@ -275,33 +199,8 @@ struct mux_session {
 	/* Stream scheduling and table state. */
 	struct sched_ctx sched;
 
-	/* Session-level ACK and retransmission state (spec §5.7). */
-	struct {
-		/* count of non-stream-0 frames sent (incremented after full flush) */
-		uint_least32_t send_seq;
-		/* count of non-stream-0 frames received */
-		uint_least32_t recv_seq;
-		/* recv_seq value at the time of the last session ACK emission */
-		uint_least32_t ack_seq;
-		/* cumulative send_seq acknowledged by the peer */
-		uint_least32_t last_ack_recv;
-		/* ticks elapsed since the last session ACK was sent while frames are
-		 * pending; reset to 0 on emission or when recv_seq == ack_seq */
-		int session_ack_ticks;
-		/* true when a stream ACK has been sent since the last session ACK,
-		 * meaning a session-level ACK piggyback should be scheduled */
-		bool ack_pending : 1;
-		/* non-stream-0 frames fully flushed but not yet acked.
-		 * Frame pointer ring; O(1) trim by advancing head. */
-		struct mux_frame_ring *unacked;
-		/* Offset from unacked->entries[unacked->head] to the first
-		 * un-retransmitted frame when replaying after a resume;
-		 * SIZE_MAX when no retransmit is in progress. */
-		size_t retransmit_off;
-		/* transient copy currently queued/flushing for retransmission;
-		 * NULL when no retransmit copy is in flight */
-		struct mux_frame *retransmit_copy;
-	};
+	/* Session-level ACK, unacked ring, and retransmission state (spec §5.7). */
+	struct unacked_ctx unacked;
 
 	/* Session negotiation results: identity, peer capabilities, service IDs. */
 	struct handshake_ctx handshake;
@@ -309,11 +208,8 @@ struct mux_session {
 	/* BDP/RTT estimator for auto stream-window mode. */
 	struct estimator_ctx estimator;
 
-	/* Reconnection state */
-	struct {
-		/* monotonic ns when SESSION_CONNECT entered */
-		int_least64_t connect_started;
-	};
+	/* Reconnection state: monotonic ns when SESSION_CONNECT entered. */
+	int_least64_t connect_started;
 };
 
 #define MUX_LOG_F(level, ss, format, ...)                                      \
@@ -325,6 +221,24 @@ struct mux_session {
 		      (ss)->tag != NULL ? (ss)->tag : "[?]:", __VA_ARGS__);    \
 	} while (0)
 #define MUX_LOG(level, ss, message) MUX_LOG_F(level, ss, "%s", message)
+
+/* Fire a session event to the owner's callback, if one is registered. */
+static inline void session_emit(
+	struct mux_session *restrict ss, const enum mux_event event,
+	const union mux_event_data data)
+{
+	if (ss->callbacks.on_event != NULL) {
+		ss->callbacks.on_event(ss->userdata, ss, event, data);
+	}
+}
+
+/* Recompute and apply the EV_READ/EV_WRITE mask for the mux socket watcher.
+ * Shared by session.c and the send/recv pipelines. */
+void session_update_watcher(struct mux_session *restrict ss);
+
+/* conf.keepalive scaled by a random jitter factor; shared with recv.c so a
+ * received PONG can re-arm the keepalive deadline. */
+double keepalive_interval(const struct mux_session *restrict ss);
 
 /* Allocate and initialize a new session; takes ownership of opts->fd. */
 struct mux_session *
@@ -360,55 +274,17 @@ void session_drain(struct mux_session *ss);
 /* Open a new locally-initiated stream; returns NULL when the session rejects it. */
 struct mux_stream *session_open_stream(struct mux_session *restrict ss);
 
-/* Remove all unsent non-RST frames for stream_id from the session send buffer.
- * RST frames are preserved so a previously-queued RST is never suppressed.
- * Must be called before sending a new RST so stale ACK/FIN/PUSH entries do
- * not arrive at the peer ahead of the RST. */
-void session_discard_stream_frames(
-	struct mux_session *restrict ss, uint_fast16_t stream_id);
-
-/* Recompute and apply the correct EV_READ/EV_WRITE mask for the mux socket watcher. */
+/* Request a deferred flush: mark egress pending and arm EV_WRITE. */
 void session_notify(struct mux_session *restrict ss);
 
 /** Prebuilt table_opts for the per-session stream table, keyed by stream ID.
  * Uses a 16-bit integer hash suitable for the stream-ID key space. */
 extern const struct table_opts mux_stream_table_opts;
 
-/* Enqueue a PUSH data frame for stream s into the send buffer; takes ownership of frame. */
-bool session_send_push(
-	struct mux_session *ss, struct mux_stream *s, struct mux_frame *frame);
-
-/* Enqueue a packed control frame for stream_id with the given flags and extra value. */
-bool session_send_ctrl(
-	struct mux_session *restrict ss, uint_fast16_t stream_id,
-	uint_fast8_t flags, uint_fast32_t extra);
-
-/* Enqueue one out-of-band stream-0 frame (PROBE/PING/PONG).
-	 * payload_len is the exact payload size to encode; pass NULL to
-	 * zero-fill the payload.  Returns true on success, false on OOM. */
-bool session_send_oob(
-	struct mux_session *restrict ss, uint_fast8_t extra,
-	const unsigned char *restrict payload, size_t payload_len);
-
-/* Flush the send buffer once; call after enqueuing control frames outside the I/O callback. */
-void session_flush(struct mux_session *restrict ss);
-
-/* Flush OOB control frames (PING/PONG/PROBE) to the wire immediately, bypassing
- * EV_WRITE and the scheduler queue.  Drives send_cb inline when not already
- * pending; no-op when state != SESSION_ESTABLISHED.  Call after ringbuf_consume
- * to guarantee the receive frame has been retired before any teardown that
- * send_cb may trigger. */
-void session_flush_oob(struct mux_session *restrict ss);
-
-/* Wake the scheduler for stream s and, if EV_WRITE was not already pending,
- * flush the send pipeline inline to avoid an extra libev iteration.
- * Must only be called from stream.c:recv_cb(); do not call from any path
- * that may already be inside session.c:send_cb(). */
-void session_eager_flush(
-	struct mux_session *restrict ss, struct mux_stream *restrict s);
-
-/* Co-unit internal interface: used by handshake.c and dispatch.c.
- * Do not call from unrelated translation units. */
+/* The frame producers (session_send_push/ctrl/oob), the flush entry points,
+ * session_eager_flush, session_emit_ack, mux_notify_write, and
+ * session_discard_stream_frames live in send.h.  Frame dispatch and the
+ * receive-side window updates live in recv.h. */
 
 /* Log a parsed frame header at VERYVERBOSE level. */
 void session_log_frame_header(
@@ -416,9 +292,14 @@ void session_log_frame_header(
 	const unsigned char *restrict raw,
 	const struct mux_header *restrict hdr);
 
-/* Internal callbacks: declared here so handshake.c and dispatch.c can call
- * back into session.c. handshake, dispatch, and wire are co-units; do not
+/* Internal callbacks: declared here so handshake.c and recv.c can call
+ * back into session.c. handshake, recv, and wire are co-units; do not
  * call these from unrelated TUs. */
+
+/* Transition the session state machine to newstate, emitting the
+ * corresponding lifecycle events and (re)arming timers.  Exposed so the send
+ * pipeline can drive SESSION_CLOSING on a peer-closed transport. */
+void session_set_state(struct mux_session *ss, enum session_state newstate);
 
 /* Close the transport and transition to SESSION_CLOSED.
  * For established sessions that qualify for resumption, use session_suspend()
@@ -435,49 +316,8 @@ void session_suspend(struct mux_session *ss);
 /* Complete session establishment after a successful hello exchange. */
 void session_handshake_done(struct mux_session *ss);
 
-/* Migrate transport fd from new_ss, send ServerHello, and start retransmission. */
-bool session_resume_transport(
-	struct mux_session *restrict ss, struct mux_session *restrict new_ss,
-	uint_least32_t client_resume_seq);
-
-/* Trim count frames from the unacked ring after a session-level ACK from the peer. */
-bool session_ack_trim(struct mux_session *restrict ss, uint_fast32_t count);
-
-/* Discard all frames in the unacked ring, free the ring array, and reset
- * counters.  Defined inline so handshake tests can use it without linking
- * the full session TU. */
-static inline void unacked_ring_free_all(struct mux_session *restrict ss)
-{
-	mux_frame_ring_free(&ss->unacked, &ss->pool);
-	ss->unacked_frames = 0;
-	ss->unacked_bytes = 0;
-	ss->unacked_partial_offset = 0;
-	ss->retransmit_off = SIZE_MAX;
-}
-
-/* Apply the peer's resume_seq to trim our unacked ring on session resume. */
-bool session_resume_ack_recv(
-	struct mux_session *restrict ss, uint_least32_t peer_ack);
-
-/* Emit a session-level ACK for all unacknowledged non-stream-0 frames. */
-void session_emit_ack(struct mux_session *restrict ss);
-
-/* Process an inbound PING: send PONG if rate limit permits. */
-void session_recv_ping(
-	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
-	size_t frame_size);
-
-/* Process an inbound PONG: feed timestamp to the BDP estimator. */
-void session_recv_pong(
-	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
-	size_t frame_size);
-
-/* Update session_window towards max(peer_stream_window,
- * ceil(window_bytes / MUX_WINDOW_UNIT), initial_frames).  Called after each
- * SYN and SYN|ACK that changes peer_stream_window (with the estimator's
- * current window as window_bytes), and after each PONG with the estimator's
- * updated window.  No-op when auto_session_window is false. */
-void session_update_session_window(
-	struct mux_session *restrict ss, size_t window_bytes);
+/* Resume handoff primitives (mux_transport_detach / mux_resume_attach /
+ * mux_transport_discard) are declared in mux.h: the owner orchestrates any
+ * cross-loop handoff, so they are part of the public, loop-agnostic API. */
 
 #endif /* MUX_SESSION_H */

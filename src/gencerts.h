@@ -13,15 +13,9 @@
 
 #include <stdbool.h>
 
-/**
- * @brief Generate certificate and key pairs.
- * @param names Comma-separated list of certificate names.
- * @param server_name Server name for the certificate.
- * @param sign_cert Signing certificate name (optional).
- * @param keytype Key algorithm: "rsa", "ecdsa", or "ed25519".
- * @param keysize Size of the key.
- * @return true on success, false on failure.
- */
+/* Generate certificate and key pairs from a comma-separated @p names list.
+ * @p sign_cert (optional) signs them; @p keytype is "rsa", "ecdsa", or
+ * "ed25519". false on failure. */
 bool gencerts(
 	const char *names, const char *server_name, const char *sign_cert,
 	const char *keytype, int keysize);

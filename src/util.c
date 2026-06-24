@@ -48,7 +48,7 @@ void socket_notsent_lowat(const int fd, const int bytes)
 #else
 	(void)fd;
 	(void)bytes;
-#endif
+#endif /* WITH_TCP_NOTSENT_LOWAT */
 }
 
 #if defined(WIN32)

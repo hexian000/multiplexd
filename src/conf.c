@@ -15,6 +15,7 @@
 #include "codec/json.h"
 #include "net/mime.h"
 #include "utils/buffer.h"
+#include "utils/debug.h"
 #include "utils/minmax.h"
 #include "utils/slog.h"
 
@@ -214,9 +215,7 @@ static bool identity_authcert_cb(
 	return true;
 }
 
-/* Load raw schema struct into application config struct.
- * Strings are strdup'd since they are zero-copy pointers into the json buffer.
- * Returns false on error. */
+/* Load schema struct into config struct (strings strdup'd).  False on error. */
 static bool
 conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 {
@@ -269,6 +268,20 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		LOGOOM();
 		return false;
 	}
+	cfg->tls_sni = obj->tls.sni.str != NULL ?
+			       strndup(obj->tls.sni.str, obj->tls.sni.len) :
+			       NULL;
+	if (obj->tls.sni.str != NULL && cfg->tls_sni == NULL) {
+		LOGOOM();
+		return false;
+	}
+	cfg->tls_alpn = obj->tls.alpn.str != NULL ?
+				strndup(obj->tls.alpn.str, obj->tls.alpn.len) :
+				NULL;
+	if (obj->tls.alpn.str != NULL && cfg->tls_alpn == NULL) {
+		LOGOOM();
+		return false;
+	}
 	if (obj->tls.authcerts_count > 0) {
 		cfg->tls_authcerts = (char **)malloc(
 			obj->tls.authcerts_count * sizeof(*cfg->tls_authcerts));
@@ -287,6 +300,14 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 				return false;
 			}
 		}
+	}
+	cfg->tls_kernel_offload = obj->tls.kernel_offload;
+	cfg->tls_buffered = obj->tls.buffered;
+	/* buffered takes precedence over kernel_offload */
+	if (cfg->tls_buffered && cfg->tls_kernel_offload) {
+		LOGW("tls: 'buffered' takes precedence over 'kernel_offload'; "
+		     "KTLS offload disabled");
+		cfg->tls_kernel_offload = false;
 	}
 #endif /* WITH_TLS */
 
@@ -307,7 +328,6 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	cfg->mux.max_halfopen = (int)obj->mux.max_halfopen;
 	cfg->mux.max_streams = (int)obj->mux.max_streams;
 	cfg->mux.connect_timeout = (int)obj->mux.connect_timeout;
-	cfg->mux.ping_timeout = (int)obj->mux.ping_timeout;
 	cfg->mux.keepalive = (int)obj->mux.keepalive;
 	cfg->mux.send_timeout = (int)obj->mux.send_timeout;
 	cfg->mux.idle_timeout = (int)obj->mux.idle_timeout;
@@ -332,6 +352,22 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 				stream_window_bytes / MUX_WINDOW_UNIT;
 			cfg->mux.stream_window =
 				(int)CLAMP(stream_window_frames, 4, UINT16_MAX);
+		}
+	}
+	{
+		/* knob is total wire frame size; mux wants payload bytes */
+		const uintmax_t max_frame_size = obj->mux.max_frame_size;
+		if (max_frame_size == 0) {
+			cfg->mux.max_frame_payload =
+				mux_conf_default.max_frame_payload;
+		} else {
+			const uintmax_t max_frame_payload =
+				max_frame_size > MUX_FRAME_HEADER_SIZE ?
+					max_frame_size - MUX_FRAME_HEADER_SIZE :
+					0;
+			cfg->mux.max_frame_payload = (int)CLAMP(
+				max_frame_payload, MUX_MIN_FRAME_PAYLOAD,
+				MUX_MAX_PAYLOAD_SIZE);
 		}
 	}
 	cfg->mux.mem_pressure_hi = (int)obj->mux.mem_pressure.hi;
@@ -471,6 +507,7 @@ static bool conf_check_type(const char *restrict type)
 		return true;
 	}
 	const size_t len = strlen(type);
+	ASSERT(len < CONF_MAXSIZE);
 	char buf[len + 1];
 	memcpy(buf, type, len + 1);
 
@@ -502,15 +539,26 @@ static bool conf_check_type(const char *restrict type)
 	return true;
 }
 
+/* Clamp keepalive and derive the inactivity deadline:
+ * max(keepalive*1.1, keepalive+90s).  keepalive == 0 disables both. */
+static void conf_derive_mux_timeout(struct config *restrict conf)
+{
+	if (conf->mux.keepalive > 0) {
+		conf->mux.keepalive = CLAMP(conf->mux.keepalive, 10, 86400);
+		conf->mux.timeout =
+			conf->mux.keepalive + MAX(conf->mux.keepalive / 10, 90);
+	} else {
+		conf->mux.timeout = 0;
+	}
+}
+
 static bool conf_check(struct config *restrict conf)
 {
 	if (!conf_check_type(conf->type)) {
 		return false;
 	}
-	/* Validate that at least one transport subsystem is configured:
-	 *   - global server:   mux_listen
-	 *   - global client:   mux_connect
-	 *   - identity client: identity.mux_connect entries */
+	/* Require at least one transport: mux_listen, mux_connect, or an
+	 * identity.mux_connect entry. */
 	const bool has_mux_listen = (conf->mux_listen != NULL);
 	const bool has_mux_connect = (conf->mux_connect != NULL);
 	const bool has_identity_connect =
@@ -543,11 +591,8 @@ static bool conf_check(struct config *restrict conf)
 		LOGE("incomplete TLS configuration");
 		return false;
 	}
-#endif
-	conf->mux.ping_timeout = CLAMP(conf->mux.ping_timeout, 10, 86400);
-	if (conf->mux.keepalive > 0) {
-		conf->mux.keepalive = CLAMP(conf->mux.keepalive, 10, 86400);
-	}
+#endif /* WITH_TLS */
+	conf_derive_mux_timeout(conf);
 	if (conf->mux.send_timeout > 0) {
 		conf->mux.send_timeout =
 			CLAMP(conf->mux.send_timeout, 10, 86400);
@@ -670,6 +715,9 @@ struct config *conf_new(void)
 		conf_free(conf);
 		return NULL;
 	}
+	/* conf_new skips conf_check (an empty default has no transport), so derive
+	 * the timeout here too; otherwise a default config would have timeout==0. */
+	conf_derive_mux_timeout(conf);
 	return conf;
 }
 
@@ -990,6 +1038,18 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 					       strlen(conf->tls_ciphersuites) :
 					       0,
 			},
+			.sni = {
+				.str = conf->tls_sni,
+				.len = conf->tls_sni != NULL ?
+					       strlen(conf->tls_sni) :
+					       0,
+			},
+			.alpn = {
+				.str = conf->tls_alpn,
+				.len = conf->tls_alpn != NULL ?
+					       strlen(conf->tls_alpn) :
+					       0,
+			},
 			.authcerts = authcerts_arr,
 			.authcerts_count = conf->tls_authcerts_count,
 		},
@@ -1012,14 +1072,19 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 			.max_halfopen = (unsigned)conf->mux.max_halfopen,
 			.max_streams = (uintmax_t)conf->mux.max_streams,
 			.connect_timeout = (unsigned)conf->mux.connect_timeout,
-
-			.ping_timeout = (unsigned)conf->mux.ping_timeout,
 			.keepalive = (unsigned)conf->mux.keepalive,
 			.send_timeout = (unsigned)conf->mux.send_timeout,
 			.idle_timeout = (unsigned)conf->mux.idle_timeout,
 			.resume_timeout = (unsigned)conf->mux.resume_timeout,
-		.session_window = (unsigned)session_window_bytes,
+			.session_window = (unsigned)session_window_bytes,
 			.stream_window = (unsigned)stream_window_bytes,
+			.max_frame_size = (uintmax_t)(
+				(conf->mux.max_frame_payload > 0 ?
+					 (uint_least32_t)
+						 conf->mux.max_frame_payload :
+					 (uint_least32_t)mux_conf_default
+						 .max_frame_payload) +
+				MUX_FRAME_HEADER_SIZE),
 			.mem_pressure = {
 				.hi = (uintmax_t)conf->mux.mem_pressure_hi,
 				.lo = (uintmax_t)conf->mux.mem_pressure_lo,
@@ -1056,19 +1121,9 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		},
 	};
 
-	/* Two-pass marshal: measure then fill. */
-	const int json_sz = json_marshal_conf(NULL, 0, &raw);
-	if (json_sz <= 0) {
-		VBUF_FREE(listen_vbuf);
-		VBUF_FREE(authcerts_vbuf);
-		free(id_mc_arr);
-#if WITH_TLS
-		free(authcerts_arr);
-#endif
-		LOGOOM();
-		return NULL;
-	}
-	char *out = malloc((size_t)json_sz + 1);
+	/* The dump is bounded by the same CONF_MAXSIZE limit applied when
+	 * reading, so a single allocation avoids a measuring pass. */
+	char *out = malloc(CONF_MAXSIZE + 1);
 	if (out == NULL) {
 		VBUF_FREE(listen_vbuf);
 		VBUF_FREE(authcerts_vbuf);
@@ -1079,7 +1134,20 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		LOGOOM();
 		return NULL;
 	}
-	(void)json_marshal_conf(out, (size_t)json_sz + 1, &raw);
+	const int json_sz =
+		json_marshal_conf(out, CONF_MAXSIZE + 1, &raw, NULL);
+	if (json_sz <= 0 || json_sz > CONF_MAXSIZE) {
+		VBUF_FREE(listen_vbuf);
+		VBUF_FREE(authcerts_vbuf);
+		free(id_mc_arr);
+#if WITH_TLS
+		free(authcerts_arr);
+#endif
+		free(out);
+		LOGE_F("config dump failed or exceeds maximum size of %d bytes",
+		       CONF_MAXSIZE);
+		return NULL;
+	}
 	out[json_sz] = '\0';
 
 	VBUF_FREE(listen_vbuf);
@@ -1111,12 +1179,8 @@ static bool inline_field(char **restrict sp, const char *restrict name)
 	return true;
 }
 
-/**
- * @brief Decode a PEM certificate to DER format.
- * @param pem  NUL-terminated PEM certificate string.
- * @param der_len  Output: DER length in bytes.
- * @return malloc'd DER buffer, or NULL on failure.
- */
+/* Decode a NUL-terminated PEM certificate to a malloc'd DER buffer (caller frees);
+ * @p der_len receives the DER length. NULL on failure. */
 static unsigned char *pem_cert_to_der(const char *pem, size_t *der_len)
 {
 	if (pem == NULL || der_len == NULL) {
@@ -1153,6 +1217,18 @@ static unsigned char *pem_cert_to_der(const char *pem, size_t *der_len)
 	}
 	*der_len = dlen;
 	return der;
+}
+
+/* Append cert plus a newline separator to bundle, returning the new offset. */
+static size_t bundle_append(char *restrict bundle, size_t pos, const char *cert)
+{
+	const size_t len = strlen(cert);
+	/* Copy the cert together with its terminator, then overwrite the
+	 * terminator with the newline separator. */
+	memcpy(bundle + pos, cert, len + 1);
+	pos += len;
+	bundle[pos++] = '\n';
+	return pos;
 }
 
 bool conf_inline_pem(struct config *conf)
@@ -1202,28 +1278,16 @@ bool conf_inline_pem(struct config *conf)
 			}
 			size_t pos = 0;
 			for (size_t i = 0; i < conf->tls_authcerts_count; i++) {
-				const size_t len =
-					strlen(conf->tls_authcerts[i]);
-				memcpy(bundle + pos, conf->tls_authcerts[i],
-				       len);
-				pos += len;
-				bundle[pos++] = '\n';
+				pos = bundle_append(
+					bundle, pos, conf->tls_authcerts[i]);
 			}
 			for (size_t i = 0; i < conf->identity.authcerts_count;
 			     i++) {
-				for (size_t j = 0;
-				     j <
-				     conf->identity.authcerts[i].certs_count;
-				     j++) {
-					const size_t len = strlen(
-						conf->identity.authcerts[i]
-							.certs[j]);
-					memcpy(bundle + pos,
-					       conf->identity.authcerts[i]
-						       .certs[j],
-					       len);
-					pos += len;
-					bundle[pos++] = '\n';
+				const struct conf_identity_authcert *restrict ac =
+					&conf->identity.authcerts[i];
+				for (size_t j = 0; j < ac->certs_count; j++) {
+					pos = bundle_append(
+						bundle, pos, ac->certs[j]);
 				}
 			}
 			bundle[pos] = '\0';
@@ -1278,12 +1342,14 @@ void conf_free(struct config *restrict conf)
 	free(conf->tls_cert);
 	free(conf->tls_key);
 	free(conf->tls_ciphersuites);
+	free(conf->tls_sni);
+	free(conf->tls_alpn);
 	for (size_t i = 0; i < conf->tls_authcerts_count; i++) {
 		free(conf->tls_authcerts[i]);
 	}
 	free((void *)conf->tls_authcerts);
 	free(conf->tls_authcerts_bundle);
-#endif
+#endif /* WITH_TLS */
 	free(conf->identity.claim);
 	for (size_t i = 0; i < conf->identity.mux_connect_count; i++) {
 		free(conf->identity.mux_connect[i]);
@@ -1317,5 +1383,8 @@ struct mux_config conf_get_mux(const struct config *conf)
 {
 	struct mux_config mc = conf->mux;
 	mc.reject_inbound = (conf->connect == NULL);
+#if WITH_TLS
+	mc.tls_buffered = conf->tls_buffered;
+#endif
 	return mc;
 }

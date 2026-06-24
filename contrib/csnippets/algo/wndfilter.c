@@ -3,6 +3,9 @@
 
 #include "wndfilter.h"
 
+#include <stdbool.h>
+#include <stdint.h>
+
 void wndfilter_reset(
 	struct wndfilter *restrict w, const int_fast64_t t,
 	const int_fast64_t v)

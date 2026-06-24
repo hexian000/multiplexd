@@ -18,6 +18,5 @@ const char *multiplexd_version(void);
 #cmakedefine01 WITH_OPENSSL
 #cmakedefine01 WITH_MBEDTLS
 #cmakedefine01 WITH_THREADS
-#cmakedefine01 WITH_ALLOC_CACHE
 
 #endif /* CONFIG_H */

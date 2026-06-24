@@ -3,18 +3,16 @@
 
 #ifndef TLSUTIL_H
 #define TLSUTIL_H
-
 /**
  * @file tlsutil.h
  * @brief Backend-agnostic TLS compatibility layer.
  *
- * This header exposes a minimal, non-blocking-friendly API used across the
- * project to create TLS contexts (client/server), accept/connect TLS
- * connections and perform I/O and shutdown.
+ * A minimal, non-blocking-friendly API to create TLS contexts (client/server),
+ * accept/connect connections, and perform I/O and shutdown. Backend types stay
+ * private behind opaque pointers.
  *
- * All functions operate on opaque pointers to keep backend types private to
- * the implementation. All public functions validate inputs where practical
- * and return appropriate status values on error.
+ * Conventions: unless noted, pointer parameters MUST NOT be NULL; @c bool returns
+ * are true=success, false=failure; @c *_free functions accept NULL.
  */
 
 #if WITH_TLS
@@ -26,272 +24,233 @@ struct tls_context; /* opaque */
 struct tls_connection; /* opaque */
 
 /**
- * @brief Return a human-readable name and version of the active TLS library.
+ * @defgroup tls
+ * @brief Backend-agnostic TLS compatibility layer.
+ * @{
+ */
+
+/**
+ * @brief I/O event notifier attached to a @c tls_connection.
  *
- * The returned string follows the format "<library> <version>" (e.g.
- * "OpenSSL 3.0.13") and has static storage duration; it must not be freed.
+ * Borrowed by reference (pointers copied); @c ctx and the function pointers must
+ * outlive the connection. Either pointer may be NULL to ignore that event.
+ * Callbacks fire synchronously inside @c tls_send / @c tls_recv / @c tls_handshake
+ * / @c tls_shutdown; a handler MUST NOT re-enter those on the same connection, but
+ * may call @c tls_input / @c tls_output.
+ */
+struct tls_callback {
+	void *ctx;
+	/* Outbound ciphertext staged, ready to drain with tls_output; memory-backed
+	 * connections only. */
+	void (*on_send)(void *ctx);
+	/* Buffered plaintext is readable by tls_recv without feeding more ciphertext
+	 * (or, fd-backed, without another socket read). */
+	void (*on_recv)(void *ctx);
+};
+
+/**
+ * @brief Runtime TLS parameters for @c tls_ctx_server / @c tls_ctx_client.
+ *
+ * String fields are PEM data or "@filename" (see @c tls_load_cert), only borrowed
+ * for the duration of the call; the implementation copies what it retains.
+ */
+struct tls_config {
+	/* PEM or "@filename". */
+	const char *cert;
+	const char *key;
+	/* Authorized certificate PEMs/filenames; may be NULL. */
+	char *const *authcerts;
+	size_t authcerts_count;
+	/* Colon-separated TLS 1.3 cipher suites, or NULL for defaults. */
+	const char *ciphersuites;
+	/* Comma-separated ALPN list; NULL or empty omits the extension. */
+	const char *alpn;
+	/* Client only: SNI server name; NULL or empty omits the extension. */
+	const char *sni;
+	/* OpenSSL only: request KTLS offload (kernel frames+encrypts records). */
+	bool kernel_offload : 1;
+};
+
+/**
+ * @brief Active TLS library name and version, e.g. "OpenSSL 3.0.13".
+ * @return Static, NUL-terminated string.
  */
 const char *tls_version(void);
 
-/**
- * @brief Error codes returned by tls_send/tls_recv.
- */
+/* Status codes from tls_send / tls_recv / tls_handshake / tls_shutdown. */
 enum tls_error {
-	/** No error. */
 	TLS_ERROR_NONE = 0,
-	/** A generic TLS/SSL error (see error queue). */
+	/* generic TLS/SSL error (see error queue) */
 	TLS_ERROR_SSL,
-	/** Operation would block and needs a read. */
+	/* would block; needs a read */
 	TLS_ERROR_WANT_READ,
-	/** Operation would block and needs a write. */
+	/* would block; needs a write */
 	TLS_ERROR_WANT_WRITE,
-	/** Underlying syscall error. */
+	/* underlying syscall error */
 	TLS_ERROR_SYSCALL,
-	/** Peer performed an orderly shutdown (EOF). */
+	/* peer performed an orderly shutdown (EOF) */
 	TLS_ERROR_ZERO_RETURN,
-	/** Unknown/unspecified error. */
 	TLS_ERROR_UNKNOWN,
 };
 
 /**
- * @brief Load certificate from memory or file.
- *
- * If @p cert_data begins with '@', the rest is interpreted as a filename and
- * the certificate chain will be read from the file. Otherwise, @p cert_data
- * should point to a NUL-terminated PEM blob in memory.
- *
- * @param ctx TLS context. MUST NOT be NULL.
- * @param cert_data PEM certificate data or filename (prefixed with '@').
- * @return true on success, false on failure.
+ * @brief Load a certificate chain.
+ * @param ctx Target context.
+ * @param[in] cert_data "@filename" to read a file, else a NUL-terminated PEM blob.
+ * @return true on success.
  */
 bool tls_load_cert(struct tls_context *ctx, const char *cert_data);
 
 /**
- * @brief Load private key from memory or file.
- *
- * If @p key_data begins with '@', the rest is interpreted as a filename and
- * the private key will be read from the file. Otherwise, @p key_data should
- * point to a NUL-terminated PEM blob in memory.
- *
- * @param ctx TLS context. MUST NOT be NULL.
- * @param key_data PEM private key data or filename (prefixed with '@').
- * @return true on success, false on failure.
+ * @brief Load a private key.
+ * @param ctx Target context.
+ * @param[in] key_data "@filename" to read a file, else a NUL-terminated PEM blob.
+ * @return true on success.
  */
 bool tls_load_key(struct tls_context *ctx, const char *key_data);
 
 /**
- * @brief Load authorized certificates from memory or files.
- *
- * Each entry in @p authcerts is either a filename (prefixed with '@') or a
- * PEM blob in memory. If @p authcerts is NULL or @p count is zero, this
- * function succeeds (no-op).
- *
- * @param ctx TLS context. MUST NOT be NULL.
- * @param authcerts Array of PEM certificate data or filenames (prefixed with '@').
- * @param count Number of entries in the array.
- * @return true on success, false on failure.
+ * @brief Load authorized certificates, each "@filename" or a PEM blob.
+ * @param ctx Target context.
+ * @param[in] authcerts Certificate references; may be NULL.
+ * @param count Number of entries.
+ * @return true on success; a no-op success when @p authcerts is NULL or @p count is 0.
  */
 bool tls_load_authcerts(
 	struct tls_context *ctx, char *const *authcerts, size_t count);
 
 /**
- * @brief Overwrite a memory region with zeros using the TLS library.
- *
- * Safe to call with NULL or zero length.
- *
- * @param ptr Buffer to clear in place.
- * @param len Buffer size in bytes.
+ * @brief Zero a memory region via the TLS library.
+ * @param[out] ptr Region to erase; NULL is safe.
+ * @param len Length in bytes; 0 is safe.
  */
 void tls_secure_erase(void *ptr, size_t len);
 
 /**
- * @brief Initialize TLS server context with mutual authentication.
- *
- * The returned context enforces TLS 1.3 minimum and configures the context to
- * require a client certificate (mutual authentication). The context must be
- * freed with @c tls_ctx_free().
- *
- * @param tls_cert PEM certificate data or filename (prefixed with '@'). MUST NOT be NULL.
- * @param tls_key PEM private key data or filename (prefixed with '@'). MUST NOT be NULL.
- * @param authcerts Array of authorized certificate PEM data or filenames. May be NULL.
- * @param authcerts_count Number of entries in @p authcerts.
- * @param tls_ciphersuites Colon-separated TLS 1.3 cipher suite list, or NULL for defaults.
- * @return TLS context on success, NULL on failure.
+ * @brief Create a TLS 1.3 server context requiring a client certificate (mutual auth).
+ * @param[in] conf Parameters; conf->cert and conf->key MUST NOT be NULL, conf->sni is ignored.
+ * @return The context, or NULL on failure.
  */
-struct tls_context *tls_ctx_server(
-	const char *tls_cert, const char *tls_key, char *const *authcerts,
-	size_t authcerts_count, const char *tls_ciphersuites);
+struct tls_context *tls_ctx_server(const struct tls_config *conf);
 
 /**
- * @brief Initialize TLS client context with mutual authentication.
- *
- * The client context enforces TLS 1.3 minimum and verifies the peer
- * certificate using the provided authorized certificates.
- *
- * @param tls_cert PEM certificate data or filename (prefixed with '@'). MUST NOT be NULL.
- * @param tls_key PEM private key data or filename (prefixed with '@'). MUST NOT be NULL.
- * @param authcerts Array of authorized certificate PEM data or filenames. May be NULL.
- * @param authcerts_count Number of entries in @p authcerts.
- * @param tls_ciphersuites Colon-separated TLS 1.3 cipher suite list, or NULL for defaults.
- * @return TLS context on success, NULL on failure.
+ * @brief Create a TLS 1.3 client context that verifies the peer against conf->authcerts.
+ * @param[in] conf Parameters; conf->cert and conf->key MUST NOT be NULL.
+ * @return The context, or NULL on failure.
  */
-struct tls_context *tls_ctx_client(
-	const char *tls_cert, const char *tls_key, char *const *authcerts,
-	size_t authcerts_count, const char *tls_ciphersuites);
+struct tls_context *tls_ctx_client(const struct tls_config *conf);
 
 /**
- * @brief Release TLS context resources.
- *
- * The function is safe to call with a NULL pointer.
- *
- * @param ctx TLS context to free.
+ * @brief Free a TLS context.
+ * @param ctx Context to free; NULL is safe.
  */
 void tls_ctx_free(struct tls_context *ctx);
 
 /**
- * @brief Create a new TLS connection for server (accept mode).
- *
- * The returned connection is an opaque object representing an SSL* and must
- * be freed with @c tls_conn_free(). The function does not perform any I/O or
- * handshake; use @c tls_handshake() to continue the non-blocking handshake.
- *
- * @param ctx TLS context. MUST NOT be NULL.
- * @param fd File descriptor (socket) to associate with the TLS connection.
- *           Must be a valid, open socket descriptor.
- * @return TLS connection on success, NULL on failure.
+ * @brief New server-mode (accept) connection; performs no I/O or handshake.
+ * @param ctx Server context.
+ * @param fd Transport fd: >= 0 is fd-backed (the library does socket I/O;
+ * tls_input/tls_output and on_send unused); < 0 is memory-backed (shuttle
+ * ciphertext via tls_input/tls_output).
+ * @return The connection, or NULL on failure.
+ * @note No notifier is installed; call tls_set_callback() before driving
+ * memory-backed I/O.
  */
-struct tls_connection *tls_accept(struct tls_context *ctx, int fd);
+struct tls_connection *tls_server(struct tls_context *ctx, int fd);
 
 /**
- * @brief Create a new TLS connection for client (connect mode).
- *
- * Same semantics as @c tls_accept, but the TLS object is set to connect state.
- *
- * @param ctx TLS context. MUST NOT be NULL.
- * @param fd File descriptor (socket) to associate with the TLS connection.
- * @return TLS connection on success, NULL on failure.
+ * @brief New client-mode (connect) connection; as tls_server() but in connect
+ * state with the client SNI from @p ctx applied.
+ * @param ctx Client context.
+ * @param fd Transport fd (see tls_server()).
+ * @return The connection, or NULL on failure.
  */
-struct tls_connection *tls_connect(struct tls_context *ctx, int fd);
+struct tls_connection *tls_client(struct tls_context *ctx, int fd);
 
 /**
- * @brief Perform non-blocking TLS handshake.
- *
- * Calling this function is optional; @c tls_send and @c tls_recv will
- * implicitly complete the handshake if it has not yet finished.
- *
- * The handshake uses non-blocking semantics. On return:
- * - 0: handshake completed successfully.
- * - 1: handshake in progress; *want_read or *want_write indicates which
- *      I/O event is required next.
- * - -1: fatal error occurred.
- *
- * @param conn TLS connection. MUST NOT be NULL.
- * @param want_read Set to true if a read is required next. May be NULL.
- * @param want_write Set to true if a write is required next. May be NULL.
- * @return 0 on success, 1 if in progress, -1 on error.
+ * @brief Install or replace the I/O event notifier.
+ * @param conn Target connection.
+ * @param[in] cb Notifier (copied by reference); NULL clears it.
  */
-int tls_handshake(
-	struct tls_connection *conn, bool *want_read, bool *want_write);
+void tls_set_callback(
+	struct tls_connection *conn, const struct tls_callback *cb);
 
 /**
- * @brief Send data to TLS connection.
- *
- * @c SSL_MODE_ENABLE_PARTIAL_WRITE is active, so a @c TLS_ERROR_NONE return
- * does not guarantee all bytes were sent. The caller must inspect @p len on
- * return and retry with the remaining data if necessary.
- *
- * @param conn TLS connection. MUST NOT be NULL.
- * @param buf Buffer to write from. MUST NOT be NULL when @p len > 0.
- * @param len Input: bytes to write; Output: actual bytes written.
- * @return TLS_ERROR_NONE (0) on success, TLS_ERROR_WANT_READ/WRITE if needs I/O, or
- *         another error code on failure.
+ * @brief Memory-backed only: feed received ciphertext for tls_recv() / tls_handshake().
+ * @param conn Target connection.
+ * @param[in] data Ciphertext bytes.
+ * @param len Byte count.
+ * @return true on success.
+ */
+bool tls_input(struct tls_connection *conn, const void *data, size_t len);
+
+/**
+ * @brief Memory-backed only: drain pending outbound ciphertext.
+ * @param conn Target connection.
+ * @param[out] buf Destination.
+ * @param len Destination capacity.
+ * @return Bytes copied (0 if none); the on_send notifier reports availability.
+ */
+size_t tls_output(struct tls_connection *conn, void *buf, size_t len);
+
+/**
+ * @brief Drive the non-blocking handshake (optional; tls_send/tls_recv complete it lazily).
+ * @param conn Target connection.
+ * @return NONE when done; WANT_READ/WANT_WRITE while in progress on that
+ * direction; else fatal.
+ */
+enum tls_error tls_handshake(struct tls_connection *conn);
+
+/**
+ * @brief Send plaintext with partial writes.
+ * @param conn Target connection.
+ * @param[in] buf Source bytes.
+ * @param[inout] len In: bytes to write. Out: bytes committed.
+ * @return NONE (advance past @p len bytes); WANT_READ/WANT_WRITE (nothing
+ * committed — retry with the same @p buf and @p len); else fatal.
  */
 enum tls_error tls_send(
 	struct tls_connection *conn, const void *restrict buf,
 	size_t *restrict len);
 
 /**
- * @brief Receive data from TLS connection.
- *
- * @p len is an in/out parameter; on success it is set to the number of bytes
- * read, on error it is set to zero.
- *
- * @param conn TLS connection. MUST NOT be NULL.
- * @param buf Buffer to read into. MUST NOT be NULL when @p len > 0.
- * @param len Input: maximum bytes to read; Output: actual bytes read.
- * @return TLS_ERROR_NONE (0) on success, TLS_ERROR_WANT_READ/WRITE if needs I/O, or
- *         another error code on failure.
+ * @brief Receive plaintext.
+ * @param conn Target connection.
+ * @param[out] buf Destination.
+ * @param[inout] len In: capacity. Out: bytes read (0 on error).
+ * @return A ::tls_error status.
  */
 enum tls_error tls_recv(
 	struct tls_connection *restrict conn, void *restrict buf,
 	size_t *restrict len);
 
 /**
- * @brief Check whether the TLS layer has buffered data ready to be read
- *        without a further I/O operation.
- *
- * Returns true when the TLS implementation has already decrypted data (or
- * buffered TLS record bytes) that can be returned by the next tls_recv call
- * without going back to the OS socket.  Used to drive the recv batch loop in
- * the session layer.
- *
- * @param conn TLS connection. MUST NOT be NULL.
- * @return true if data is available without I/O, false otherwise.
+ * @brief Send this side's close_notify; one-way, does NOT await the peer's.
+ * @param conn Target connection.
+ * @return NONE when flushed; WANT_READ/WANT_WRITE to retry on that direction;
+ * else fatal.
+ * @note To observe the peer's close, keep calling tls_recv() until
+ * TLS_ERROR_ZERO_RETURN.
  */
-bool tls_has_pending(const struct tls_connection *conn);
+enum tls_error tls_shutdown(struct tls_connection *conn);
 
 /**
- * @brief Perform non-blocking TLS shutdown.
- *
- * Performs an orderly TLS shutdown using non-blocking semantics. Returns:
- * - 0: shutdown complete.
- * - 1: shutdown in progress; set *want_read or *want_write to indicate which
- *      I/O operation is required next.
- * - -1: fatal error occurred.
- *
- * @param conn TLS connection. MUST NOT be NULL.
- * @param want_read Pointer to a bool set to true if a read is required next.
- *                  May be NULL.
- * @param want_write Pointer to a bool set to true if a write is required next.
- *                   May be NULL.
- * @return 0 on complete shutdown, 1 if in progress, -1 on error.
- */
-int tls_shutdown(struct tls_connection *conn, bool *want_read, bool *want_write);
-
-/**
- * @brief Free TLS connection.
- *
- * Safe to call with NULL.
- *
- * @param conn TLS connection to free.
+ * @brief Free a TLS connection.
+ * @param conn Connection to free; NULL is safe.
  */
 void tls_conn_free(struct tls_connection *conn);
 
 /**
- * @brief Get the peer's X.509 certificate in DER format.
- *
- * The peer certificate is only available after a successful TLS handshake.
- * Calling this function before the handshake completes returns false.
- *
- * @param conn  TLS connection that completed handshake. MUST NOT be NULL.
- * @param out   Set to malloc'd DER buffer on success; caller must free().
- * @param len   Set to DER length in bytes on success.
- * @return true on success, false if no peer certificate is available.
+ * @brief The peer's X.509 certificate in DER, available only after a successful handshake.
+ * @param conn Target connection.
+ * @param[out] out Receives a malloc'd buffer (caller frees).
+ * @param[out] len Receives its length.
+ * @return true on success; false when no peer certificate is available.
  */
 bool tls_peer_cert_der(
 	struct tls_connection *conn, unsigned char **out, size_t *len);
 
-/**
- * @brief Log pending TLS errors for @p s.
- *
- * This is a thin wrapper around the internal logging used by the project and
- * prints all pending TLS errors from the thread's error queue.
- *
- * @param s Context string used in the log message. May be NULL.
- */
-void tls_perror(const char *s);
-
-#define TLS_PERROR(what) tls_perror((what))
+/** @} */
 
 #endif /* WITH_TLS */
 

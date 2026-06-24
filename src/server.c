@@ -20,12 +20,7 @@
 #include "os/socket.h"
 #if WITH_THREADS
 #include "sync/dispatcher.h"
-#if WITH_ALLOC_CACHE
-#include "sync/queue.h"
-#endif
 #include "sync/shared_mutex.h"
-#elif WITH_ALLOC_CACHE
-#include "utils/mcache.h"
 #endif
 #include "utils/arraysize.h"
 #include "utils/class.h"
@@ -69,9 +64,8 @@ static const struct table_opts SESSION_TABLE_OPTS = {
 	.flags = 0,
 };
 
-/* Iterator over all tunnel objects owned by a server.
- * Yields: mux_tunnel, identities[k].tunnels[j], identity_tunnels[i] (skip NULLs),
- * accepted_sessions.  Zero-initialize before first call; returns NULL when done. */
+/* Iterate over all tunnel objects owned by a server.  Zero-initialize before
+ * the first call; returns NULL when done. */
 struct tunnel_iter {
 	/* 0 = mux_tunnel, 1 = identities, 2 = identity_tunnels, 3 = accepted */
 	size_t phase;
@@ -253,12 +247,8 @@ static void session_on_connected(
 }
 
 #if WITH_TLS
-/**
- * @brief Check whether the peer's TLS certificate matches the configured
- * certificate set for the claimed identity.
- *
- * Uses pre-computed DER from conf_identity_authcert.certs_der.
- */
+/* Check the peer's TLS certificate against the cert set configured for the
+ * claimed identity (pre-computed DER in conf_identity_authcert.certs_der). */
 static bool server_check_identity_authcerts(
 	const struct config *restrict conf, const char *restrict peer_identity,
 	const unsigned char *restrict peer_cert_der, size_t peer_cert_der_len)
@@ -305,10 +295,8 @@ static void server_on_established(
 	session_on_connected(srv, t, "established", lat_ns);
 
 #if WITH_TLS
-	/* Identity-specific certificate enforcement.
-	 * The TLS handshake accepted the peer's certificate from the union
-	 * of all trusted certs.  Now verify that the presented certificate
-	 * matches the certificate set configured for the claimed identity. */
+	/* The handshake accepted the cert from the union of all trusted certs;
+	 * now verify it matches the set configured for the claimed identity. */
 	{
 		size_t cert_der_len = 0;
 		const unsigned char *cert_der =
@@ -327,18 +315,16 @@ static void server_on_established(
 #endif /* WITH_TLS */
 
 	if (!is_server) {
-		/* Clear the identity_tunnels staging slot (set during server_start
-		 * before the handshake completed) so tunnel_iter does not count
-		 * the session twice (via identities and identity_tunnels). */
+		/* Clear the identity_tunnels staging slot now the session is wired
+		 * into identities, so tunnel_iter does not count it twice. */
 		for (size_t i = 0; i < srv->num_identity_tunnels; i++) {
 			if (srv->identity_tunnels[i] == t) {
 				srv->identity_tunnels[i] = NULL;
 				break;
 			}
 		}
-		/* Wire the dialed session into the matching identity pool.
-		 * Guard against duplicate wiring on re-ESTABLISHED after a
-		 * rejected resume. */
+		/* Wire the dialed session into the matching identity pool
+		 * (guard against duplicate wiring on re-ESTABLISHED). */
 		const char *const peer_id = tunnel_peer_identity(t);
 		if (peer_id != NULL) {
 			void *elem = NULL;
@@ -487,8 +473,10 @@ static void tunnel_on_event(
 
 /* Locate a suspended (or still-established) session matching the client's
  * session_id.  Called during session resumption handshake (spec §5.8).
- * Acquires accepted_mu for the duration of the table lookup. */
-static struct mux_session *tunnel_on_resume(
+ *
+ * Takes accepted_mu (shared) and keeps it held on return; released by
+ * server_on_resume_unpin, with which it is paired one-to-one. */
+static struct tunnel *server_on_resume_lookup(
 	void *data, struct tunnel *new_t, const unsigned char *session_id)
 {
 	UNUSED(new_t);
@@ -515,9 +503,28 @@ static struct mux_session *tunnel_on_resume(
 		}
 	}
 #if WITH_THREADS
-	THRD_ASSERT(smtx_sharedunlock(&srv->accepted_mu));
+	if (candidate == NULL) {
+		/* No match: nothing to pin, release immediately (the paired
+		 * server_on_resume_unpin only runs for a non-NULL return). */
+		THRD_ASSERT(smtx_sharedunlock(&srv->accepted_mu));
+	}
+	/* Otherwise the lock stays held; server_on_resume_unpin releases it once
+	 * the handoff to the matched tunnel has been enqueued. */
 #endif
-	return candidate != NULL ? tunnel_session(candidate) : NULL;
+	return candidate;
+}
+
+/* Release the accepted_mu shared lock taken by server_on_resume_lookup, once the
+ * resume handoff has been enqueued. */
+static void server_on_resume_unpin(void *data, struct tunnel *new_t)
+{
+	UNUSED(new_t);
+	struct server *restrict srv = data;
+#if WITH_THREADS
+	THRD_ASSERT(smtx_sharedunlock(&srv->accepted_mu));
+#else
+	UNUSED(srv);
+#endif
 }
 
 static void identity_tcp_serve(
@@ -536,7 +543,6 @@ static void identity_tcp_serve(
 		SOCKET_CLOSE_FD(fd);
 		return;
 	}
-	/* Dispatch mux_open_stream to the session's tunnel thread. */
 	l->srv->counters.num_served_tcp++;
 	tunnel_open_stream(t, fd);
 }
@@ -562,7 +568,6 @@ static void tcp_serve(
 		return;
 	}
 
-	/* Dispatch mux_open_stream to the session's tunnel thread. */
 	srv->counters.num_served_tcp++;
 	tunnel_open_stream(t, fd);
 }
@@ -600,42 +605,6 @@ static bool is_startup_limited(const struct server *restrict srv)
 		}
 	}
 	return false;
-}
-
-#if WITH_ALLOC_CACHE
-/* Maximum frames held in the server-level pool.
- * 128 × 16 KiB ≈ 2 MiB total pool budget. */
-#define FRAME_POOL_CAPACITY 128
-#endif
-
-static struct mux_frame *server_frame_alloc(void *data)
-{
-#if !WITH_ALLOC_CACHE
-	UNUSED(data);
-	return malloc(mux_frame_object_size());
-#elif WITH_THREADS
-	struct mux_frame *frame = mqueue_pop(data);
-	if (frame != NULL) {
-		return frame;
-	}
-	return malloc(mux_frame_object_size());
-#else
-	return mcache_get(data);
-#endif
-}
-
-static void server_frame_free(void *data, struct mux_frame *frame)
-{
-#if !WITH_ALLOC_CACHE
-	UNUSED(data);
-	free(frame);
-#elif WITH_THREADS
-	if (!mqueue_push(data, frame)) {
-		free(frame);
-	}
-#else
-	mcache_put(data, frame);
-#endif
 }
 
 static struct mux_config server_make_mux_config(struct server *restrict srv)
@@ -685,7 +654,7 @@ static void mux_serve(
 	struct server *restrict srv = l->srv;
 	if (LOGLEVEL(DEBUG)) {
 		char addr_str[64];
-		sa_format(addr_str, sizeof(addr_str), sa);
+		(void)sa_format(addr_str, sizeof(addr_str), sa);
 #if WITH_THREADS
 		const size_t n_sessions = atomic_load_explicit(
 			&srv->counters.num_sessions, memory_order_relaxed);
@@ -695,7 +664,7 @@ static void mux_serve(
 #else
 		const size_t n_sessions = srv->counters.num_sessions;
 		const size_t n_halfopen = srv->counters.num_session_halfopen;
-#endif
+#endif /* WITH_THREADS */
 		LOGD_F("accepting from: `%s'; established=%zu, halfopen=%zu",
 		       addr_str, n_sessions, n_halfopen);
 	}
@@ -709,7 +678,10 @@ static void mux_serve(
 #if WITH_TLS
 	struct tls_connection *conn = NULL;
 	if (srv->server_tlsctx != NULL) {
-		conn = tls_accept(srv->server_tlsctx, fd);
+		/* Buffered mode passes fd=-1; otherwise the library drives the
+		 * socket.  The session binds the I/O notifier later. */
+		conn = tls_server(
+			srv->server_tlsctx, srv->conf->tls_buffered ? -1 : fd);
 		if (conn == NULL) {
 			LOGE_F("[fd:%d] TLS accept failed", fd);
 			srv->counters.num_tls_failures++;
@@ -717,14 +689,15 @@ static void mux_serve(
 			return;
 		}
 	}
-#endif
+#endif /* WITH_TLS */
 
 	struct mux_config mux_conf = server_make_mux_config(srv);
 	const struct tunnel_callbacks callbacks = {
 		.on_event = tunnel_on_event,
 		.on_established = server_on_established,
 		.on_resumed = server_on_resumed,
-		.on_resume = tunnel_on_resume,
+		.on_resume_lookup = server_on_resume_lookup,
+		.on_resume_unpin = server_on_resume_unpin,
 	};
 	unsigned char sid[MUX_SESSION_ID_LEN];
 	server_new_session_id(srv, sid);
@@ -732,12 +705,6 @@ static void mux_serve(
 		.cb = &callbacks,
 		.data = srv,
 		.mux_conf = &mux_conf,
-		.pool = { server_frame_alloc, server_frame_free,
-#if !WITH_ALLOC_CACHE
-			  NULL },
-#else
-			  srv->frame_pool },
-#endif
 		.mux_socket = srv->conf->mux_tcp,
 		.local_socket = srv->conf->tcp,
 		.fd = fd,
@@ -812,9 +779,8 @@ static void server_cleanse_tls_config(const struct config *restrict conf)
 	}
 }
 
-/* Build fresh server and client TLS contexts from new_conf.
- * Returns true on success (zeroes credential strings); false on failure
- * (partial context freed; caller frees new_conf). */
+/* Build fresh server and client TLS contexts from new_conf.  True on success
+ * (credential strings zeroed); false on failure (partial context freed). */
 static bool server_reload_make_tls(
 	const struct config *restrict new_conf,
 	struct tls_context **restrict out_server,
@@ -825,18 +791,21 @@ static bool server_reload_make_tls(
 	if (new_conf->tls_cert == NULL || new_conf->tls_key == NULL) {
 		return true;
 	}
-#if WITH_TLS
 	char *authcerts_arr[1] = { new_conf->tls_authcerts_bundle };
 	const size_t authcerts_count =
 		new_conf->tls_authcerts_bundle != NULL ? 1 : 0;
-#else
-	char **authcerts_arr = NULL;
-	const size_t authcerts_count = 0;
-#endif
+	const struct tls_config tls_conf = {
+		.cert = new_conf->tls_cert,
+		.key = new_conf->tls_key,
+		.authcerts = authcerts_arr,
+		.authcerts_count = authcerts_count,
+		.ciphersuites = new_conf->tls_ciphersuites,
+		.alpn = new_conf->tls_alpn,
+		.sni = new_conf->tls_sni,
+		.kernel_offload = new_conf->tls_kernel_offload,
+	};
 	if (new_conf->mux_listen != NULL) {
-		*out_server = tls_ctx_server(
-			new_conf->tls_cert, new_conf->tls_key, authcerts_arr,
-			authcerts_count, new_conf->tls_ciphersuites);
+		*out_server = tls_ctx_server(&tls_conf);
 		if (*out_server == NULL) {
 			LOGE("failed to create server TLS context"
 			     " during reload");
@@ -845,9 +814,7 @@ static bool server_reload_make_tls(
 	}
 	if (new_conf->mux_connect != NULL ||
 	    new_conf->identity.mux_connect_count > 0) {
-		*out_client = tls_ctx_client(
-			new_conf->tls_cert, new_conf->tls_key, authcerts_arr,
-			authcerts_count, new_conf->tls_ciphersuites);
+		*out_client = tls_ctx_client(&tls_conf);
 		if (*out_client == NULL) {
 			LOGE("failed to create client TLS context"
 			     " during reload");
@@ -863,9 +830,45 @@ static bool server_reload_make_tls(
 }
 #endif /* WITH_TLS */
 
-/* Single-pass reload: update addresses and apply drain config in one
- * per-tunnel dispatch.  Sessions drain as soon as their last stream closes;
- * outbound tunnels reconnect with the fresh config afterwards. */
+/* Single-pass reload: update addresses and apply drain config per tunnel.
+ * Sessions drain when their last stream closes; outbound tunnels then
+ * reconnect with the fresh config. */
+/* Set opts' connect/reconnect fields for tunnel t per the config delta. */
+static void tunnel_set_reload_connect(
+	struct tunnel_reload_opts *restrict opts, struct server *restrict s,
+	const struct tunnel *restrict t, const struct config *restrict old_conf,
+	const struct config *restrict new_conf, const size_t old_ni,
+	const size_t new_ni)
+{
+	if (t == s->mux_tunnel) {
+		if (strnull_eq(old_conf->mux_connect, new_conf->mux_connect)) {
+			return;
+		}
+		if (new_conf->mux_connect != NULL) {
+			opts->update_connect_addr = true;
+			opts->connect_addr = new_conf->mux_connect;
+		} else {
+			opts->disable_reconnect = true;
+		}
+		return;
+	}
+	for (size_t i = 0; i < old_ni; i++) {
+		if (s->identity_tunnels[i] != t) {
+			continue;
+		}
+		if (i >= new_ni) {
+			/* Slot removed: prevent reconnect after drain. */
+			opts->disable_reconnect = true;
+		} else if (!strnull_eq(
+				   old_conf->identity.mux_connect[i],
+				   new_conf->identity.mux_connect[i])) {
+			opts->update_connect_addr = true;
+			opts->connect_addr = new_conf->identity.mux_connect[i];
+		}
+		return;
+	}
+}
+
 static void server_drain_tunnels(
 	struct server *restrict s, const struct config *restrict old_conf,
 	const struct config *restrict new_conf
@@ -894,40 +897,8 @@ static void server_drain_tunnels(
 			.update_forward_addr = forward_changed,
 			.forward_addr = new_conf->connect,
 		};
-		if (t == s->mux_tunnel) {
-			if (!strnull_eq(
-				    old_conf->mux_connect,
-				    new_conf->mux_connect)) {
-				if (new_conf->mux_connect != NULL) {
-					opts.update_connect_addr = true;
-					opts.connect_addr =
-						new_conf->mux_connect;
-				} else {
-					opts.disable_reconnect = true;
-				}
-			}
-		} else {
-			for (size_t i = 0; i < old_ni; i++) {
-				if (s->identity_tunnels[i] != t) {
-					continue;
-				}
-				if (i >= new_ni) {
-					/* Slot removed: prevent reconnect
-					 * after drain. */
-					opts.disable_reconnect = true;
-				} else if (!strnull_eq(
-						   old_conf->identity
-							   .mux_connect[i],
-						   new_conf->identity
-							   .mux_connect[i])) {
-					opts.update_connect_addr = true;
-					opts.connect_addr =
-						new_conf->identity
-							.mux_connect[i];
-				}
-				break;
-			}
-		}
+		tunnel_set_reload_connect(
+			&opts, s, t, old_conf, new_conf, old_ni, new_ni);
 		tunnel_reload(t, &opts);
 	}
 }
@@ -957,7 +928,7 @@ static void server_restart_listener(
 	}
 	if (LOGLEVEL(NOTICE)) {
 		char str[64];
-		sa_format(str, sizeof(str), &addr.sa);
+		(void)sa_format(str, sizeof(str), &addr.sa);
 		LOGN_F("listening on %s (%s)", str, kind);
 	}
 }
@@ -985,9 +956,32 @@ static void server_reload_listeners(
 	}
 }
 
-/* Build a fresh identity listener hashtable when the peer table has changed.
- * Stops old listeners, migrates live tunnel pools where peer identities
- * match, starts new listeners, and replaces s->identities. */
+/* Rebuild the identity-listener hashtable for a changed peer table: stop old
+ * listeners, migrate matching tunnel pools, start new ones, replace
+ * s->identities. */
+/* Resolve listen and (re)start sl's identity listener, logging the outcome. */
+static void identity_listener_start(
+	struct identity_listener *restrict sl, struct ev_loop *loop,
+	const char *restrict listen, const char *restrict id)
+{
+	union sockaddr_max addr;
+	if (!resolve_bindaddr(&addr, listen, SA_RESOLVE_TCP)) {
+		LOGE_F("failed to parse identity listen address on reload: %s",
+		       listen);
+		return;
+	}
+	if (!listener_start(&sl->listener, loop, &addr.sa)) {
+		LOGE_F("failed to restart identity listener for \"%s\" on reload",
+		       id);
+		return;
+	}
+	if (LOGLEVEL(NOTICE)) {
+		char str[64];
+		(void)sa_format(str, sizeof(str), &addr.sa);
+		LOGN_F("identity \"%s\" listening on %s (TCP)", id, str);
+	}
+}
+
 static void server_reload_identities_changed(
 	struct server *restrict s, const struct config *restrict new_conf,
 	const size_t new_np)
@@ -1029,6 +1023,7 @@ static void server_reload_identities_changed(
 			sl->peer_identity = p->id;
 			sl->tunnels = NULL;
 			sl->num_tunnels = 0;
+			sl->cap_tunnels = 0;
 			sl->rr_next = 0;
 			/* Migrate live tunnel pool if peer_identity matches. */
 			if (p->id != NULL) {
@@ -1039,9 +1034,11 @@ static void server_reload_identities_changed(
 						*restrict old_sl = old_elem;
 					sl->tunnels = old_sl->tunnels;
 					sl->num_tunnels = old_sl->num_tunnels;
+					sl->cap_tunnels = old_sl->cap_tunnels;
 					sl->rr_next = old_sl->rr_next;
 					old_sl->tunnels = NULL;
 					old_sl->num_tunnels = 0;
+					old_sl->cap_tunnels = 0;
 				}
 			}
 			listener_init(
@@ -1050,27 +1047,8 @@ static void server_reload_identities_changed(
 				&s->counters.num_accepted_tcp);
 			sl->listener.data = sl;
 			if (p->listen != NULL) {
-				union sockaddr_max addr;
-				if (!resolve_bindaddr(
-					    &addr, p->listen, SA_RESOLVE_TCP)) {
-					LOGE_F("failed to parse identity"
-					       " listen address on reload:"
-					       " %s",
-					       p->listen);
-				} else if (!listener_start(
-						   &sl->listener, s->loop,
-						   &addr.sa)) {
-					LOGE_F("failed to restart identity"
-					       " listener for \"%s\" on"
-					       " reload",
-					       p->id);
-				} else if (LOGLEVEL(NOTICE)) {
-					char str[64];
-					sa_format(str, sizeof(str), &addr.sa);
-					LOGN_F("identity \"%s\" listening on"
-					       " %s (TCP)",
-					       p->id, str);
-				}
+				identity_listener_start(
+					sl, s->loop, p->listen, p->id);
 			}
 			void *slot = sl;
 			new_tbl = table_set(new_tbl, sl->peer_identity, &slot);
@@ -1102,9 +1080,8 @@ static void server_reload_identities_changed(
 	s->identities = new_tbl;
 }
 
-/* Rebuild the identity_peers identity listener hashtable if the peer table
- * changed; otherwise fix peer_identity and socket_opts pointers into the
- * new config. */
+/* Rebuild the identity-listener hashtable if the peer table changed; else fix
+ * peer_identity and socket_opts pointers into the new config. */
 static void server_reload_identities(
 	struct server *restrict s, const struct config *restrict old_conf,
 	const struct config *restrict new_conf)
@@ -1123,9 +1100,8 @@ static void server_reload_identities(
 		}
 	}
 	if (!peers_changed) {
-		/* Same peer table: fix peer_identity pointers to point into
-		 * new_conf instead of old_conf, then rebuild the hashtable
-		 * since the key data pointers change. */
+		/* Same peer table: fix peer_identity pointers into new_conf, then
+		 * rebuild the hashtable since the key data pointers changed. */
 		struct hashtable *new_tbl = table_new(&(struct table_opts){
 			.hash = TABLE_OPTS_STR.hash,
 			.eq = TABLE_OPTS_STR.eq,
@@ -1171,12 +1147,6 @@ static struct tunnel *server_new_client_tunnel(
 		.cb = &client_callbacks,
 		.data = s,
 		.mux_conf = &mux_conf,
-		.pool = { server_frame_alloc, server_frame_free,
-#if !WITH_ALLOC_CACHE
-			  NULL },
-#else
-			  s->frame_pool },
-#endif
 		.mux_socket = conf->mux_tcp,
 		.local_socket = conf->tcp,
 		.fd = -1,
@@ -1210,9 +1180,8 @@ static void server_reload_mux_tunnel(
 	tunnel_start(t);
 }
 
-/* Replace closed identity_connect slots and extend the array on count
- * increase.  Live slots are left untouched (their connect_addr was updated
- * by server_drain_tunnels). */
+/* Replace closed identity_connect slots and extend the array when the count
+ * grows; live slots are left untouched. */
 static void server_reload_identity_tunnels(
 	struct server *restrict s, const struct config *restrict new_conf)
 {
@@ -1274,6 +1243,13 @@ static void server_reload_identity_tunnels(
 bool server_apply_config(struct server *restrict s, struct config *new_conf)
 {
 #if WITH_TLS
+	/* Resolve @path certificate references and (re)build the authcerts trust
+	 * bundle, as startup does in main(). */
+	if (!conf_inline_pem(new_conf)) {
+		LOGE("failed to load PEM references during reload");
+		conf_free(new_conf);
+		return false;
+	}
 	struct tls_context *new_server_tlsctx = NULL;
 	struct tls_context *new_client_tlsctx = NULL;
 	if (!server_reload_make_tls(
@@ -1281,7 +1257,7 @@ bool server_apply_config(struct server *restrict s, struct config *new_conf)
 		conf_free(new_conf);
 		return false;
 	}
-#endif
+#endif /* WITH_TLS */
 
 	struct config *const old_conf = s->conf;
 
@@ -1294,8 +1270,7 @@ bool server_apply_config(struct server *restrict s, struct config *new_conf)
 	);
 
 	/* Swap config and TLS contexts before starting any new tunnels or
-	 * listeners so that server_make_mux_config(), identity_tcp_serve(),
-	 * and mux_serve() all see the new configuration immediately. */
+	 * listeners. */
 	s->conf = new_conf;
 	s->local_listener.socket_opts = &new_conf->tcp;
 	s->mux_listener.socket_opts = &new_conf->mux_tcp;
@@ -1357,6 +1332,10 @@ static void server_reload(struct server *restrict s)
 	(void)systemd_notify(DAEMON_SYSTEMD_STATE_READY);
 }
 
+/* Wall-clock jump larger than this (seconds) is treated as resume from system
+ * suspend. */
+#define MAINTENANCE_WALLCLOCK_JUMP_S 15
+
 static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
@@ -1374,15 +1353,15 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		return;
 	}
 
-	/* Task 2: detect system suspend via wall-clock jump (CLOCK_REALTIME
-	 * advances; CLOCK_MONOTONIC does not).  A gap > mux.ping_timeout means
-	 * resume from suspend; drop all transports so sessions reconnect. */
+	/* Task 2: detect system suspend via a wall-clock jump (CLOCK_REALTIME
+	 * advances across suspend, CLOCK_MONOTONIC does not); drop all
+	 * transports to reconnect. */
 	struct timespec now_ts;
 	if (clock_unix(&now_ts)) {
 		const time_t now_wall = now_ts.tv_sec;
 		const time_t delta = now_wall - srv->last_maintenance_wall;
 		srv->last_maintenance_wall = now_wall;
-		if (delta > (time_t)srv->conf->mux.ping_timeout) {
+		if (delta > (time_t)MAINTENANCE_WALLCLOCK_JUMP_S) {
 			LOGW_F("wall-clock jump of %" PRIdFAST64
 			       "s detected, dropping all transports",
 			       (int_fast64_t)delta);
@@ -1406,21 +1385,6 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	} else {
 		LOGE("clock_unix failed");
 	}
-
-	/* Task 3: slowly drain the frame pool to avoid holding excess cached
-	 * memory.  Release at most one object per tick (~1 per second). */
-#if WITH_ALLOC_CACHE
-#if WITH_THREADS
-	{
-		struct mux_frame *frame = mqueue_pop(srv->frame_pool);
-		if (frame != NULL) {
-			free(frame);
-		}
-	}
-#else
-	mcache_shrink(srv->frame_pool, 1);
-#endif
-#endif /* WITH_ALLOC_CACHE */
 }
 
 #if WITH_THREADS
@@ -1476,10 +1440,9 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 			}
 		}
 
-		/* Initiate graceful shutdown on every active session.
-		 * Each session will close itself and emit MUX_EVENT_CLOSED when done.
-		 * Snapshot first: MUX_EVENT_CLOSED handling modifies accepted_tunnels and
-		 * identities, which would invalidate a live iterator. */
+		/* Gracefully shut down every active session.  Snapshot first:
+		 * CLOSED handling mutates accepted_tunnels/identities and would
+		 * invalidate a live iterator. */
 		{
 			const size_t n =
 				(s->accepted_tunnels != NULL ?
@@ -1492,7 +1455,19 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 			struct tunnel_iter it = { 0 };
 			struct tunnel *t;
 			while ((t = tunnel_iter_next(s, &it)) != NULL) {
-				snapshot[count++] = t;
+				/* tunnel_iter yields a tunnel registered under an
+				 * identity more than once; dedupe so each is shut
+				 * down (and freed if suspended) exactly once. */
+				bool seen = false;
+				for (size_t i = 0; i < count; i++) {
+					if (snapshot[i] == t) {
+						seen = true;
+						break;
+					}
+				}
+				if (!seen) {
+					snapshot[count++] = t;
+				}
 			}
 			/* mux_shutdown() writes session internals; dispatch to
 			 * each session's tunnel thread. */
@@ -1523,9 +1498,8 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 			}
 		}
 
-		/* Keep the event loop running; it exits when all sessions close
-		 * (handled in handle_closed) or the 2-second deadline fires
-		 * (handled in maintenance_cb). */
+		/* Keep the event loop running until all sessions close or the
+		 * shutdown deadline fires. */
 		s->shutting_down = true;
 		s->shutdown_start_ns = (int_least64_t)clock_monotonic_ns();
 		break;
@@ -1533,6 +1507,7 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		break;
 	}
 }
+
 struct server *server_new(struct ev_loop *loop, struct config *conf)
 {
 	struct server *srv = malloc(sizeof(struct server));
@@ -1551,7 +1526,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 	listener_init(
 		&srv->mux_listener, &conf->mux_tcp, mux_serve, srv,
 		&srv->counters.num_accepted);
-	static const struct util_socket_opts api_socket_opts = {
+	static const struct conf_socket_opts api_socket_opts = {
 		.tcp_nodelay = true,
 		.tcp_keepalive = false,
 		.backlog = 16,
@@ -1561,24 +1536,9 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 		&srv->counters.num_accepted_api);
 	srv->started = (int_least64_t)clock_monotonic_ns();
 
-#if WITH_ALLOC_CACHE
-#if WITH_THREADS
-	srv->frame_pool = mqueue_new(FRAME_POOL_CAPACITY);
-#else
-	srv->frame_pool =
-		mcache_new(FRAME_POOL_CAPACITY, mux_frame_object_size());
-#endif
-	if (srv->frame_pool == NULL) {
-		LOGOOM();
-		free(srv);
-		return NULL;
-	}
-#endif /* WITH_ALLOC_CACHE */
-
 #if WITH_THREADS
 	if (smtx_init(&srv->accepted_mu) != thrd_success) {
 		LOGOOM();
-		mqueue_free(srv->frame_pool);
 		free(srv);
 		return NULL;
 	}
@@ -1596,10 +1556,18 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 		char *authcerts_arr[1] = { conf->tls_authcerts_bundle };
 		const size_t authcerts_count =
 			conf->tls_authcerts_bundle != NULL ? 1 : 0;
+		const struct tls_config tls_conf = {
+			.cert = conf->tls_cert,
+			.key = conf->tls_key,
+			.authcerts = authcerts_arr,
+			.authcerts_count = authcerts_count,
+			.ciphersuites = conf->tls_ciphersuites,
+			.alpn = conf->tls_alpn,
+			.sni = conf->tls_sni,
+			.kernel_offload = conf->tls_kernel_offload,
+		};
 		if (conf->mux_listen != NULL) {
-			srv->server_tlsctx = tls_ctx_server(
-				conf->tls_cert, conf->tls_key, authcerts_arr,
-				authcerts_count, conf->tls_ciphersuites);
+			srv->server_tlsctx = tls_ctx_server(&tls_conf);
 			if (srv->server_tlsctx == NULL) {
 				LOGE("failed to create server TLS context");
 				server_free(srv);
@@ -1609,9 +1577,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 		bool has_identity_connect =
 			(conf->identity.mux_connect_count > 0);
 		if (conf->mux_connect != NULL || has_identity_connect) {
-			srv->client_tlsctx = tls_ctx_client(
-				conf->tls_cert, conf->tls_key, authcerts_arr,
-				authcerts_count, conf->tls_ciphersuites);
+			srv->client_tlsctx = tls_ctx_client(&tls_conf);
 			if (srv->client_tlsctx == NULL) {
 				LOGE("failed to create client TLS context");
 				server_free(srv);
@@ -1643,7 +1609,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 	}
 	ev_async_init(&srv->w_async, relay_async_cb);
 	srv->w_async.data = srv;
-#endif
+#endif /* WITH_THREADS */
 
 	return srv;
 }
@@ -1674,7 +1640,7 @@ static bool server_start_one_listener(
 	}
 	if (LOGLEVEL(NOTICE)) {
 		char str[64];
-		sa_format(str, sizeof(str), &sa.sa);
+		(void)sa_format(str, sizeof(str), &sa.sa);
 		LOGN_F("listening on %s (%s)", str, kind);
 	}
 	return true;
@@ -1723,9 +1689,8 @@ static bool server_start_mux_tunnel(struct server *restrict s)
 	return true;
 }
 
-/* Identity listeners: each identity.listen entry gets its own listener.
- * Tunnel wiring happens dynamically at handshake time using the peer's
- * announced identity as the lookup key. */
+/* Identity listeners: one per identity.listen entry; tunnels are wired at
+ * handshake time, keyed by the peer's announced identity. */
 static bool server_start_identity_listeners(struct server *restrict s)
 {
 	struct ev_loop *restrict loop = s->loop;
@@ -1781,7 +1746,7 @@ static bool server_start_identity_listeners(struct server *restrict s)
 		}
 		if (LOGLEVEL(NOTICE)) {
 			char resolved[64];
-			sa_format(resolved, sizeof(resolved), &addr.sa);
+			(void)sa_format(resolved, sizeof(resolved), &addr.sa);
 			LOGN_F("identity \"%s\" listening on %s (TCP)", p->id,
 			       resolved);
 		}
@@ -1804,9 +1769,8 @@ static bool server_start_identity_tunnels(struct server *restrict s)
 		LOGOOM();
 		return false;
 	}
-	/* Zero the array before starting any tunnel so that a partial
-	 * allocation is visible to server_stop() via num_identity_tunnels
-	 * without stale pointers. */
+	/* Zero the array before starting any tunnel (no stale pointers on
+	 * partial init). */
 	for (size_t i = 0; i < n; i++) {
 		s->identity_tunnels[i] = NULL;
 	}
@@ -1845,7 +1809,8 @@ bool server_start(struct server *restrict s)
 		}
 		if (LOGLEVEL(NOTICE)) {
 			char addr_str[64];
-			sa_format(addr_str, sizeof(addr_str), &connect_addr.sa);
+			(void)sa_format(
+				addr_str, sizeof(addr_str), &connect_addr.sa);
 			LOGN_F("connect target: %s", addr_str);
 		}
 	}
@@ -1974,19 +1939,6 @@ void server_free(struct server *srv)
 		dispatcher_destroy(srv->disp);
 	}
 #endif
-#if WITH_ALLOC_CACHE
-	if (srv->frame_pool != NULL) {
-#if WITH_THREADS
-		struct mux_frame *frame;
-		while ((frame = mqueue_pop(srv->frame_pool)) != NULL) {
-			free(frame);
-		}
-		mqueue_free(srv->frame_pool);
-#else
-		mcache_free(srv->frame_pool);
-#endif
-	}
-#endif /* WITH_ALLOC_CACHE */
 	free(srv);
 }
 
@@ -2031,9 +1983,10 @@ static bool sum_accepted_stream_cnt(
 /* Context for two-pass collection of accepted tunnels not in any identity pool. */
 struct unmatched_accepted_ctx {
 	const struct server *s;
-	struct server_stats
-		*out; /* NULL = count pass, non-NULL = populate pass */
-	size_t val; /* count (count pass) or tunnels[] index (populate pass) */
+	/* NULL = count pass, non-NULL = populate pass */
+	struct server_stats *out;
+	/* count (count pass) or tunnels[] index (populate pass) */
+	size_t val;
 };
 
 /* table_iterate callback: count or snapshot accepted tunnels that are not
@@ -2060,9 +2013,8 @@ static bool collect_unmatched_accepted(
 	return true;
 }
 
-/* Fills the p50/p90/p99/pmax percentile fields in *out by merging the latency
- * rings from all dialed tunnels already snapshotted in out->tunnels[].
- * Returns the total number of samples used (0 when all rings are empty). */
+/* Fill the p50/p90/p99/pmax percentile fields in *out by merging the latency
+ * rings of all dialed tunnels in out->tunnels[].  Returns the sample count. */
 static size_t calc_stream_percentiles(struct server_stats *restrict out)
 {
 	size_t total = 0;
@@ -2193,7 +2145,7 @@ struct server_stats *server_stats(const struct server *restrict s)
 	out->recv_buffered_bytes = c->recv_buffered_bytes;
 	out->send_buffered_frames = c->send_buffered_frames;
 	out->unacked_frames = c->unacked_frames;
-#endif
+#endif /* WITH_THREADS */
 
 	/* Populate dialed tunnels first; stream aggregation reads their snapshots. */
 	size_t idx = 0;
@@ -2230,9 +2182,8 @@ struct server_stats *server_stats(const struct server *restrict s)
 	}
 	out->num_tunnels = idx;
 
-	/* Aggregate stream counters from dialed tunnels (already snapshotted).
-	 * Accepted tunnels are handled separately by sum_accepted_stream_cnt
-	 * to avoid double-counting tunnels that are also in identity pools. */
+	/* Aggregate stream counters from dialed tunnels (accepted ones are summed
+	 * separately by sum_accepted_stream_cnt). */
 	for (size_t i = 0; i < out->num_tunnels; i++) {
 		const struct tunnel_stats *ts = &out->tunnels[i];
 		if (ts->accepted) {

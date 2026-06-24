@@ -49,7 +49,6 @@ static void print_usage(const char *argv0)
 		stderr, "%s",
 		"  -h, --help                 show usage and exit\n"
 		"  -c, --config <file>        specify json config (use - to read from stdin)\n"
-		"  -C, --color                colorized log output using ANSI escape sequences\n"
 		"  -d, --daemonize            run in background and write logs to syslog\n"
 		"  -u, --user [user][:[group]]\n"
 		"                             run as the specified identity, e.g. `nobody:nogroup'\n"
@@ -104,11 +103,6 @@ static void parse_args(const int argc, char *const *argv)
 		    strcmp(argv[i], "--config") == 0) {
 			OPT_REQUIRE_ARG(argc, argv, i);
 			args.conf_path = argv[++i];
-			continue;
-		}
-		if (strcmp(argv[i], "-C") == 0 ||
-		    strcmp(argv[i], "--color") == 0) {
-			slog_setoutput(SLOG_OUTPUT_TERMINAL, stdout);
 			continue;
 		}
 		if (strcmp(argv[i], "-u") == 0 ||
@@ -254,8 +248,10 @@ int main(int argc, char **argv)
 			slog_setoutput(SLOG_OUTPUT_FILE, stdout);
 		} else if (strcmp(conf->log, "stderr") == 0) {
 			slog_setoutput(SLOG_OUTPUT_FILE, stderr);
+		} else if (strcmp(conf->log, "terminal") == 0) {
+			slog_setoutput(SLOG_OUTPUT_TERMINAL, stderr);
 		} else if (strcmp(conf->log, "syslog") == 0) {
-			slog_setoutput(SLOG_OUTPUT_SYSLOG, PROJECT_NAME);
+			slog_setoutput(SLOG_OUTPUT_SYSLOG, PROJECT_NAME, NULL);
 		} else if (strcmp(conf->log, "discard") == 0) {
 			slog_setoutput(SLOG_OUTPUT_DISCARD);
 		} else {
@@ -264,29 +260,23 @@ int main(int argc, char **argv)
 	}
 
 	{
-		char subsystems[128];
+		char extensions[128];
 		int pos = 0;
-		if (conf->mux_listen != NULL) {
+		if (conf->identity.mux_connect_count > 0 ||
+		    conf->identity.peers_count > 0) {
 			pos += snprintf(
-				subsystems + pos, sizeof(subsystems) - pos,
-				"%smux server", pos > 0 ? ", " : "");
-		}
-		if (conf->mux_connect != NULL) {
-			pos += snprintf(
-				subsystems + pos, sizeof(subsystems) - pos,
-				"%smux client", pos > 0 ? ", " : "");
-		}
-		if (conf->identity.mux_connect_count > 0) {
-			(void)snprintf(
-				subsystems + pos, sizeof(subsystems) - pos,
-				"%sidentity client (%zu address%s)",
+				extensions + pos, sizeof(extensions) - pos,
+				"%sidentity (%zu connect, %zu listen)",
 				pos > 0 ? ", " : "",
 				conf->identity.mux_connect_count,
-				conf->identity.mux_connect_count == 1 ? "" :
-									"es");
+				conf->identity.peers_count);
 		}
-		LOGI_F("%s %s starting (%s)", PROJECT_NAME, PROJECT_VER,
-		       subsystems);
+		if (pos == 0) {
+			(void)snprintf(
+				extensions, sizeof(extensions), "%s", "none");
+		}
+		LOGI_F("%s %s starting (extensions: %s)", PROJECT_NAME,
+		       PROJECT_VER, extensions);
 	}
 
 	struct ev_loop *loop = EV_DEFAULT;
@@ -301,12 +291,11 @@ int main(int argc, char **argv)
 
 	const char *user_name = args.user_name;
 
-	/* Daemonize before any threads start: held mutexes survive into the
-	 * child, causing deadlock.  Privilege drop follows server_start so
-	 * root can bind privileged ports first. */
+	/* Daemonize before threads start (held mutexes would deadlock the child).
+	 * Drop privileges after server_start so root can bind privileged ports. */
 	if (args.daemonize) {
 		daemonize(NULL, false, false);
-		slog_setoutput(SLOG_OUTPUT_SYSLOG, PROJECT_NAME);
+		slog_setoutput(SLOG_OUTPUT_SYSLOG, PROJECT_NAME, NULL);
 	}
 
 	if (!server_start(server)) {
@@ -328,10 +317,13 @@ int main(int argc, char **argv)
 	LOGI("shutting down");
 
 	server_stop(server);
+	/* A reload frees the startup config that `conf` still points at; free the
+	 * server's current config instead to avoid a double free. */
+	struct config *const final_conf = server->conf;
 	server_free(server);
 
 	unloadlibs();
-	conf_free(conf);
+	conf_free(final_conf);
 
 	LOGD("program terminated normally");
 	return EXIT_SUCCESS;

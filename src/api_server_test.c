@@ -2,12 +2,10 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /*
- * api_server_test.c - unit tests for the REST API server.
- *
- * Each test constructs a minimal struct server (no server_start()), pairs two
- * AF_UNIX socket ends with socketpair(), and passes the server-side fd to
- * api_serve().  The client-side fd is driven by a local ev_loop through the
- * standard wait_until() predicate pattern.
+ * api_server_test.c - black-box tests for the REST API server via its public
+ * API.  Dependencies: links the real util/conf/listener/server/tunnel/
+ * api_server and the mux library.  Each test pairs a socketpair(), hands the
+ * server fd to api_serve(), and drives the client fd via wait_until().
  *
  * Covered routes
  *   GET  /healthy              → 200, empty body
@@ -23,10 +21,12 @@
 
 #include "api_server.h"
 #include "conf.h"
+#include "mux/mux.h"
 #include "mux/sched.h"
 #include "mux/session.h"
 #include "mux/stream.h"
 #include "server.h"
+#include "tunnel.h"
 #include "util.h"
 
 #include "algo/hashtable.h"
@@ -55,9 +55,7 @@
 #define STORE_STAT(field, value) ((field) = (value))
 #endif
 
-/* -------------------------------------------------------------------------
- * Constants
- * ---------------------------------------------------------------------- */
+/* Constants */
 
 enum {
 	/* Size of the buffer used to collect a single HTTP response. */
@@ -66,9 +64,7 @@ enum {
 	API_RESP_TIMEOUT_MS = 2000,
 };
 
-/* -------------------------------------------------------------------------
- * Fixture
- * ---------------------------------------------------------------------- */
+/* Fixture */
 
 /*
  * Minimal test fixture: a struct server initialised without server_start().
@@ -83,18 +79,6 @@ struct apifx {
 	int cli_fd;
 };
 
-static struct mux_frame *api_test_alloc(void *data)
-{
-	UNUSED(data);
-	return malloc(sizeof(struct mux_frame));
-}
-
-static void api_test_free(void *data, struct mux_frame *frame)
-{
-	UNUSED(data);
-	free(frame);
-}
-
 static struct tunnel *make_established_tunnel(
 	struct apifx *restrict fx, const char *restrict peer_id,
 	const size_t num_streams)
@@ -102,7 +86,6 @@ static struct tunnel *make_established_tunnel(
 	static const struct tunnel_callbacks cb = { 0 };
 	static const unsigned char session_id[MUX_SESSION_ID_LEN] = { 0 };
 	fx->conf.mux.timeout = 600;
-	fx->conf.mux.ping_timeout = 60;
 	fx->conf.mux.keepalive = 25;
 	fx->conf.mux.send_timeout = 15;
 	fx->conf.mux.connect_timeout = 15;
@@ -117,7 +100,6 @@ static struct tunnel *make_established_tunnel(
 		.cb = &cb,
 		.data = NULL,
 		.mux_conf = &mux_cfg,
-		.pool = { api_test_alloc, api_test_free, NULL },
 		.fd = -1,
 		.id = session_id,
 		.connect_addr = "127.0.0.1:1",
@@ -166,6 +148,7 @@ static int apifx_setup(struct apifx *restrict fx)
 
 	fx->srv = (struct server){
 		.conf = &fx->conf,
+		.loop = fx->loop,
 		.started = clock_monotonic_ns(),
 		.accepted_tunnels = NULL,
 	};
@@ -179,8 +162,8 @@ static int apifx_setup(struct apifx *restrict fx)
 	/* fds[0] = server side (transferred to api_serve), fds[1] = client side */
 	if (socket_set_nonblock(fds[0]) != 0 ||
 	    socket_set_nonblock(fds[1]) != 0) {
-		close(fds[0]);
-		close(fds[1]);
+		(void)close(fds[0]);
+		(void)close(fds[1]);
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 		return -1;
@@ -230,7 +213,7 @@ static void apifx_teardown(struct apifx *restrict fx)
 			for (size_t j = 0; j < sl->num_tunnels; j++) {
 				tunnel_close(sl->tunnels[j]);
 			}
-			free(sl->tunnels);
+			free((void *)sl->tunnels);
 			sl->tunnels = NULL;
 			sl->num_tunnels = 0;
 			free(sl);
@@ -239,7 +222,7 @@ static void apifx_teardown(struct apifx *restrict fx)
 		fx->srv.identities = NULL;
 	}
 	if (fx->cli_fd >= 0) {
-		close(fx->cli_fd);
+		(void)close(fx->cli_fd);
 		fx->cli_fd = -1;
 	}
 	/* Drive one event-loop tick to process the EOF from the closed client fd.
@@ -263,9 +246,7 @@ static void apifx_teardown(struct apifx *restrict fx)
 	fx->loop = NULL;
 }
 
-/* -------------------------------------------------------------------------
- * wait_until() helper (same predicate-driven pattern as server_test.c)
- * ---------------------------------------------------------------------- */
+/* wait_until() helper (same predicate-driven pattern as server_test.c) */
 
 typedef int (*apifx_predicate_fn)(void *ctx);
 
@@ -310,13 +291,8 @@ static int wait_until(
 	return -1;
 }
 
-/* -------------------------------------------------------------------------
- * do_send() — write an exact number of bytes to a non-blocking fd.
- * Small AF_UNIX payloads (< 64 KiB) never block in practice; the EAGAIN
- * branch is reached only under unusual system load and is handled by
- * retrying the write in a tight loop (no ev_loop involvement needed for
- * writes, unlike reads which require the server side to drain first).
- * ---------------------------------------------------------------------- */
+/* do_send(): write an exact number of bytes to a non-blocking fd.  Small
+ * AF_UNIX payloads rarely block; EAGAIN is just retried in a tight loop. */
 
 static int do_send(const int fd, const void *restrict data, const size_t len)
 {
@@ -341,9 +317,7 @@ static int do_send(const int fd, const void *restrict data, const size_t len)
 	return 0;
 }
 
-/* -------------------------------------------------------------------------
- * Response collection predicate
- * ---------------------------------------------------------------------- */
+/* Response collection predicate */
 
 struct resp_wait_ctx {
 	int fd;
@@ -351,12 +325,8 @@ struct resp_wait_ctx {
 	size_t nread;
 };
 
-/*
- * Non-blocking incremental response reader.
- * Returns +1 when a complete HTTP response has been received (headers fully
- * parsed and body fully received as indicated by Content-Length), 0 when more
- * data is still pending, -1 on error.
- */
+/* Non-blocking incremental response reader.  Returns +1 on a complete response
+ * (headers parsed, body received per Content-Length), 0 if pending, -1 on error. */
 static int resp_wait_predicate(void *ptr)
 {
 	struct resp_wait_ctx *restrict ctx = ptr;
@@ -402,9 +372,7 @@ static int resp_wait_predicate(void *ptr)
 	return 0;
 }
 
-/* -------------------------------------------------------------------------
- * EOF predicate — used by test_connection_close
- * ---------------------------------------------------------------------- */
+/* EOF predicate — used by test_connection_close */
 
 struct eof_wait_ctx {
 	int fd;
@@ -426,9 +394,7 @@ static int eof_wait_predicate(void *ptr)
 	return n == 0 ? 1 : 0;
 }
 
-/* -------------------------------------------------------------------------
- * Response inspection helpers
- * ---------------------------------------------------------------------- */
+/* Response inspection helpers */
 
 /* Returns the HTTP status code from the response in buf, or -1 on failure. */
 static int parse_status(const char *restrict buf)
@@ -446,20 +412,14 @@ static int parse_status(const char *restrict buf)
 	return (int)code;
 }
 
-/*
- * Returns true when needle appears anywhere in the NUL-terminated response
- * buf.  For header-only checks (e.g. Content-Type) this is sufficient because
- * the relevant strings do not appear elsewhere; for body-only checks the same
- * holds for the stats field names used below.
- */
+/* Returns true when needle appears anywhere in the NUL-terminated response;
+ * sufficient here since the checked strings are unambiguous. */
 static bool resp_contains(const char *restrict buf, const char *restrict needle)
 {
 	return strstr(buf, needle) != NULL;
 }
 
-/* -------------------------------------------------------------------------
- * Individual test fixtures — small inline request strings
- * ---------------------------------------------------------------------- */
+/* Individual test fixtures — small inline request strings */
 
 #define REQ_HEALTHY_GET                                                        \
 	"GET /healthy HTTP/1.1\r\n"                                            \
@@ -508,10 +468,8 @@ static bool resp_contains(const char *restrict buf, const char *restrict needle)
 	"Host: test\r\n"                                                       \
 	"\r\n"
 
-/* -------------------------------------------------------------------------
- * Helper — perform a single HTTP exchange on fx and fill rctx.
- * Returns 0 on success, -1 on timeout or error.
- * ---------------------------------------------------------------------- */
+/* Helper — perform a single HTTP exchange on fx and fill rctx.
+ * Returns 0 on success, -1 on timeout or error. */
 
 static int do_exchange(
 	struct apifx *restrict fx, struct resp_wait_ctx *restrict rctx,
@@ -540,9 +498,7 @@ T_DECLARE_SUBCASE(
 	}
 }
 
-/* =========================================================================
- * Test cases
- * ===================================================================== */
+/* Test cases */
 
 T_DECLARE_CASE(test_healthy_get)
 {
@@ -666,14 +622,8 @@ T_DECLARE_CASE(test_method_not_allowed)
 	apifx_teardown(&fx);
 }
 
-/*
- * Sends a request whose headers exceed HTTP_MAX_ENTITY (8192 bytes), causing
- * the receive buffer to fill before the header terminator is seen.  The server
- * must respond with 413 Entity Too Large.
- *
- * Request structure (no \r\n\r\n within the first 8192 bytes):
- *   "GET / HTTP/1.1\r\nX-Pad: " (23 bytes) + 8192 × 'a' (total ≈ 8 KiB)
- */
+/* Sends headers exceeding HTTP_MAX_ENTITY (8192 bytes) with no terminator, so
+ * the buffer fills first and the server must respond 413 Entity Too Large. */
 T_DECLARE_CASE(test_request_too_large)
 {
 	struct apifx fx;
@@ -791,7 +741,7 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	T_CHECK(t0 != NULL);
 	/* Reset to non-established so tunnel_stats() reports !established. */
 	tunnel_session(t0)->state = SESSION_CONNECT;
-	sl0->tunnels = malloc(sizeof(struct tunnel *));
+	sl0->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl0->tunnels != NULL);
 	sl0->tunnels[0] = t0;
 	sl0->num_tunnels = 1;
@@ -807,7 +757,7 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	struct tunnel *restrict t1 =
 		make_established_tunnel(&fx, "peer-online", 3);
 	T_CHECK(t1 != NULL);
-	sl1->tunnels = malloc(sizeof(struct tunnel *));
+	sl1->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl1->tunnels != NULL);
 	sl1->tunnels[0] = t1;
 	sl1->num_tunnels = 1;
@@ -852,7 +802,7 @@ T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 	struct mux_session *const ss = tunnel_session(t1);
 	/* 20 ms RTT */
 	ss->estimator.rtt = INT64_C(20000000);
-	sl_rtt->tunnels = malloc(sizeof(struct tunnel *));
+	sl_rtt->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_rtt->tunnels != NULL);
 	sl_rtt->tunnels[0] = t1;
 	sl_rtt->num_tunnels = 1;
@@ -896,7 +846,7 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	struct mux_session *const ss = tunnel_session(t1);
 	ss->stream_window = 2;
 	ss->peer_stream_window = 4;
-	sl_win->tunnels = malloc(sizeof(struct tunnel *));
+	sl_win->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_win->tunnels != NULL);
 	sl_win->tunnels[0] = t1;
 	sl_win->num_tunnels = 1;
@@ -945,7 +895,7 @@ T_DECLARE_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity)
 	T_CHECK(t1 != NULL);
 	struct tunnel *const t2 = make_established_tunnel(&fx, "peer-dup", 0);
 	T_CHECK(t2 != NULL);
-	sl->tunnels = malloc(2 * sizeof(struct tunnel *));
+	sl->tunnels = (struct tunnel **)malloc(2 * sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
 	sl->tunnels[0] = t1;
 	sl->tunnels[1] = t2;
@@ -985,7 +935,7 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 		T_FATAL("apifx_setup failed");
 	}
 
-	fx.srv.started = clock_monotonic_ns() - 5 * 1000 * 1000 * 1000LL;
+	fx.srv.started = clock_monotonic_ns() - 5LL * 1000 * 1000 * 1000;
 	fx.srv.counters.traffic_byt_mux_recv = 2048;
 	fx.srv.counters.traffic_byt_mux_sent = 4096;
 
@@ -1001,7 +951,7 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	fx.srv.counters.traffic_byt_mux_recv = 3072;
 	fx.srv.counters.traffic_byt_mux_sent = 6144;
 	fx.srv.rate_tracker.timestamp =
-		clock_monotonic_ns() - 2 * 1000 * 1000 * 1000LL;
+		clock_monotonic_ns() - 2LL * 1000 * 1000 * 1000;
 
 	struct resp_wait_ctx rctx2;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx2, REQ_STATS_POST);
@@ -1082,9 +1032,7 @@ T_DECLARE_CASE(test_connection_close_on_non_keepalive_request)
 	apifx_teardown(&fx);
 }
 
-/* =========================================================================
- * main
- * ===================================================================== */
+/* main */
 
 int main(void)
 {

@@ -1,10 +1,15 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/* gencerts_test.c - black-box tests for certificate/key generation in
+ * gencerts.c via its public API. Dependencies: links the real gencerts.c + TLS
+ * backend (no-op when TLS disabled). */
+
 #include "gencerts.h"
 
 #include "utils/testing.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #if WITH_OPENSSL
@@ -42,7 +47,7 @@ static void rm_tmpdir(const char *path)
 			(void)unlink(subpath);
 		}
 	}
-	closedir(dir);
+	(void)closedir(dir);
 	(void)rmdir(path);
 }
 

@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,12 +25,22 @@ DEFAULT_BUILD_DIR = ROOT / "build"
 DEFAULT_OUTPUT = DEFAULT_BUILD_DIR / "bench.md"
 BENCH_NETNS_ENV = "BENCH_NETNS"
 MUX_TLS_PORT = 8443
+CLK_TCK = float(os.sysconf("SC_CLK_TCK"))
+PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
+RESOURCE_SAMPLE_INTERVAL = 0.1
 
 
 @dataclass(frozen=True)
 class Scenario:
     name: str
     label: str
+
+
+@dataclass(frozen=True)
+class ResourceUsage:
+    name: str
+    cpu_percent: float
+    peak_rss_bytes: int
 
 
 @dataclass
@@ -44,6 +55,7 @@ class ScenarioResult:
     stddev_bits_per_second: float
     interval_throughputs: List[float]
     duration_seconds: float
+    resource_usage: List[ResourceUsage]
 
 
 @dataclass(frozen=True)
@@ -66,6 +78,114 @@ def log(message: str) -> None:
 
 def quote_command(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
+
+
+def read_proc_cpu_ticks(pid: int) -> Optional[int]:
+    """Return cumulative utime+stime (clock ticks) for all threads of pid."""
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="ascii") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    # The comm field (field 2) is parenthesised and may contain spaces, so
+    # split after the final ')'. fields[0] is then field 3 (state).
+    rparen = data.rfind(")")
+    if rparen < 0:
+        return None
+    fields = data[rparen + 1:].split()
+    try:
+        utime = int(fields[11])  # field 14
+        stime = int(fields[12])  # field 15
+    except (IndexError, ValueError):
+        return None
+    return utime + stime
+
+
+def read_proc_rss_bytes(pid: int) -> Optional[int]:
+    """Return the resident set size in bytes for pid."""
+    try:
+        with open("/proc/%d/statm" % pid, "r", encoding="ascii") as handle:
+            parts = handle.read().split()
+    except OSError:
+        return None
+    if len(parts) < 2:
+        return None
+    try:
+        resident_pages = int(parts[1])
+    except ValueError:
+        return None
+    return resident_pages * PAGE_SIZE
+
+
+class ProcSampler:
+    """Sample CPU time and peak RSS of processes from /proc during a scenario.
+
+    CPU time is read once at start and once at stop (it is cumulative), while
+    RSS is polled on a background thread to capture the peak.
+    """
+
+    def __init__(
+            self,
+            procs: Sequence[tuple[str, int]],
+            *,
+            interval: float = RESOURCE_SAMPLE_INTERVAL,
+    ) -> None:
+        self._procs = list(procs)
+        self._interval = interval
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._peak_rss: Dict[str, int] = {name: 0 for name, _ in self._procs}
+        self._start_ticks: Dict[str, Optional[int]] = {}
+        self._end_ticks: Dict[str, Optional[int]] = {}
+        self._start_time = 0.0
+        self._end_time = 0.0
+
+    def _sample_rss(self) -> None:
+        for name, pid in self._procs:
+            rss = read_proc_rss_bytes(pid)
+            if rss is not None and rss > self._peak_rss[name]:
+                self._peak_rss[name] = rss
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval):
+            self._sample_rss()
+
+    def start(self) -> None:
+        self._start_time = time.monotonic()
+        for name, pid in self._procs:
+            self._start_ticks[name] = read_proc_cpu_ticks(pid)
+        self._sample_rss()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        self._end_time = time.monotonic()
+        for name, pid in self._procs:
+            self._end_ticks[name] = read_proc_cpu_ticks(pid)
+        self._sample_rss()
+
+    def results(self) -> List[ResourceUsage]:
+        wall = max(1e-6, self._end_time - self._start_time)
+        usage: List[ResourceUsage] = []
+        for name, _ in self._procs:
+            start = self._start_ticks.get(name)
+            end = self._end_ticks.get(name)
+            if start is None or end is None:
+                cpu_percent = 0.0
+            else:
+                cpu_percent = (end - start) / CLK_TCK / wall * 100.0
+            usage.append(
+                ResourceUsage(
+                    name=name,
+                    cpu_percent=cpu_percent,
+                    peak_rss_bytes=self._peak_rss[name],
+                )
+            )
+        return usage
 
 
 def ensure_project_root(root: Path) -> None:
@@ -175,7 +295,7 @@ def compute_process_shutdown_budget(
     )
 
 
-def build_server_config(*, use_tls: bool, window: Optional[int] = None) -> Dict[str, object]:
+def build_server_config(*, use_tls: bool, window: Optional[int] = None, max_frame_size: Optional[int] = None, tls_buffered: bool = False) -> Dict[str, object]:
     mux: Dict[str, object] = {
         "tcp": {
             "notsent_lowat": 0,
@@ -184,6 +304,8 @@ def build_server_config(*, use_tls: bool, window: Optional[int] = None) -> Dict[
     if window is not None:
         mux["stream_window"] = window
         mux["session_window"] = window
+    if max_frame_size is not None:
+        mux["max_frame_size"] = max_frame_size
     config: Dict[str, object] = {
         "api_listen": "127.0.0.1:9081",
         "mux_listen": "127.0.0.1:8443",
@@ -200,11 +322,12 @@ def build_server_config(*, use_tls: bool, window: Optional[int] = None) -> Dict[
             "cert": "@server-cert.pem",
             "key": "@server-key.pem",
             "authcerts": ["@client-cert.pem"],
+            "buffered": tls_buffered,
         }
     return config
 
 
-def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int] = None) -> Dict[str, object]:
+def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int] = None, max_frame_size: Optional[int] = None, tls_buffered: bool = False) -> Dict[str, object]:
     mux: Dict[str, object] = {
         "tcp": {
             "notsent_lowat": 0,
@@ -213,6 +336,8 @@ def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int
     if window is not None:
         mux["stream_window"] = window
         mux["session_window"] = window
+    if max_frame_size is not None:
+        mux["max_frame_size"] = max_frame_size
     config: Dict[str, object] = {
         "connect": "127.0.0.1:5201",
         "identity": {
@@ -228,6 +353,7 @@ def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int
             "cert": "@client-cert.pem",
             "key": "@client-key.pem",
             "authcerts": ["@server-cert.pem"],
+            "buffered": tls_buffered,
         }
     return config
 
@@ -255,14 +381,16 @@ def prepare_runtime_assets(
         use_tls: bool,
         tunnels: int = 1,
         window: Optional[int] = None,
+        max_frame_size: Optional[int] = None,
+        tls_buffered: bool = False,
 ) -> tuple[Path, Path]:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if use_tls:
         ensure_certificates(binary_path, runtime_dir)
     server_config_path = runtime_dir / "server.json"
     client_config_path = runtime_dir / "client.json"
-    write_config(server_config_path, build_server_config(use_tls=use_tls, window=window))
-    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels, window=window))
+    write_config(server_config_path, build_server_config(use_tls=use_tls, window=window, max_frame_size=max_frame_size, tls_buffered=tls_buffered))
+    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels, window=window, max_frame_size=max_frame_size, tls_buffered=tls_buffered))
     return server_config_path, client_config_path
 
 
@@ -544,6 +672,20 @@ def format_bits_per_second(bits_per_second: float) -> str:
     return "0.00 bit/s"
 
 
+def format_bytes(num_bytes: int) -> str:
+    units = (
+            ("B", 1.0),
+            ("KiB", 1024.0),
+            ("MiB", 1024.0 ** 2),
+            ("GiB", 1024.0 ** 3),
+    )
+    for index in range(len(units) - 1, -1, -1):
+        unit, scale = units[index]
+        if num_bytes >= scale or scale == 1.0:
+            return "%.2f %s" % (num_bytes / scale, unit)
+    return "0.00 B"
+
+
 def maybe_reexec_in_netns(netem_delay: Optional[str]) -> None:
     if not netem_delay or os.environ.get(BENCH_NETNS_ENV) == "1":
         return
@@ -657,8 +799,10 @@ def render_markdown_report(
     use_tls: bool,
     tunnels: int,
     window: Optional[int],
+    max_frame_size: Optional[int],
     command_timeout_seconds: float,
     shutdown_budget: ProcessShutdownBudget,
+    tls_buffered: bool = False,
 ) -> str:
     output_dir = output_path.parent
     lines = [
@@ -671,8 +815,10 @@ def render_markdown_report(
         "| Duration per run | %d s |" % duration,
         "| Parallel streams | %d |" % parallel,
         "| TLS | %s |" % ("on" if use_tls else "off"),
+        "| TLS buffered | %s |" % ("on" if tls_buffered else "off"),
         "| Tunnels | %d |" % tunnels,
         "| Stream/session window | %s |" % (str(window) if window is not None else "default"),
+        "| Max frame size | %s |" % (str(max_frame_size) if max_frame_size is not None else "default"),
         "| Netem delay | %s |" % (netem_delay or "off"),
         "| Benchmark timeout | %.1f s per scenario |" % command_timeout_seconds,
         "| Shutdown grace | SIGINT %.1f s, terminate %.1f s |"
@@ -726,6 +872,27 @@ def render_markdown_report(
     for result in results:
         lines.append("- %s: `%s`" %
                      (result.scenario.label, " ; ".join(result.command_texts)))
+
+    lines.extend(["", "## Resource Usage", ""])
+    lines.append(
+        "CPU is average utilisation over the scenario "
+        "(100%% = one core); RSS is the peak resident set size sampled "
+        "every %.0f ms from /proc." % (RESOURCE_SAMPLE_INTERVAL * 1000.0)
+    )
+    lines.append("")
+    lines.append("| Scenario | Process | CPU | Peak RSS |")
+    lines.append("| --- | --- | ---: | ---: |")
+    for result in results:
+        for usage in result.resource_usage:
+            lines.append(
+                "| %s | %s | %.1f%% | %s |"
+                % (
+                    result.scenario.label,
+                    usage.name,
+                    usage.cpu_percent,
+                    format_bytes(usage.peak_rss_bytes),
+                )
+            )
 
     lines.extend(["", "## Per-Second Throughput", ""])
     for result in results:
@@ -788,10 +955,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="number of parallel mux tunnels (default: 1)",
     )
     parser.add_argument(
+        "--tls-buffered",
+        action="store_true",
+        default=False,
+        help="enable tls.buffered (memory-transport) mode (default: off)",
+    )
+    parser.add_argument(
         "-w",
         "--window",
         type=int,
         help="set both stream_window and session_window (default: omit from config)",
+    )
+    parser.add_argument(
+        "--max-frame-size",
+        type=int,
+        help="set mux.max_frame_size in bytes, including the 8-byte header "
+             "(default: omit from config, daemon uses 16 KiB frames)",
     )
     parser.add_argument(
         "--netem-delay",
@@ -824,6 +1003,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_tls=args.tls,
         tunnels=args.tunnels,
         window=args.window,
+        max_frame_size=args.max_frame_size,
+        tls_buffered=args.tls_buffered,
     )
     configure_netem(args.netem_delay)
     command_timeout_seconds = compute_command_timeout_seconds(
@@ -894,29 +1075,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 build_dir / ("iperf3-%s-%02d.stderr" % (scenario.name, index))
                 for index in range(1, len(commands) + 1)
             ]
-            if len(commands) == 1:
-                reports = [
-                    run_json_command(
-                        commands[0],
-                        cwd=ROOT,
-                        log_path=log_paths[0],
-                        stderr_path=stderr_paths[0],
-                        timeout_seconds=command_timeout_seconds,
-                    )
+            sampler = ProcSampler(
+                [
+                    ("multiplexd server", server_proc.pid),
+                    ("multiplexd client", client_proc.pid),
                 ]
-            else:
-                reports = [
-                    run_json_command(
-                        command,
-                        cwd=ROOT,
-                        log_path=log_path,
-                        stderr_path=stderr_path,
-                        timeout_seconds=command_timeout_seconds,
-                    )
-                    for command, log_path, stderr_path in zip(
-                        commands, log_paths, stderr_paths
-                    )
-                ]
+            )
+            sampler.start()
+            try:
+                if len(commands) == 1:
+                    reports = [
+                        run_json_command(
+                            commands[0],
+                            cwd=ROOT,
+                            log_path=log_paths[0],
+                            stderr_path=stderr_paths[0],
+                            timeout_seconds=command_timeout_seconds,
+                        )
+                    ]
+                else:
+                    reports = [
+                        run_json_command(
+                            command,
+                            cwd=ROOT,
+                            log_path=log_path,
+                            stderr_path=stderr_path,
+                            timeout_seconds=command_timeout_seconds,
+                        )
+                        for command, log_path, stderr_path in zip(
+                            commands, log_paths, stderr_paths
+                        )
+                    ]
+            finally:
+                sampler.stop()
+            resource_usage = sampler.results()
             total, sent, received, seconds = combine_throughput(
                 reports, scenario)
             stddev = compute_combined_stddev(reports)
@@ -934,6 +1126,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     stddev_bits_per_second=stddev,
                     interval_throughputs=intervals,
                     duration_seconds=seconds,
+                    resource_usage=resource_usage,
                 )
             )
     finally:
@@ -969,8 +1162,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_tls=args.tls,
         tunnels=args.tunnels,
         window=args.window,
+        max_frame_size=args.max_frame_size,
         command_timeout_seconds=command_timeout_seconds,
         shutdown_budget=shutdown_budget,
+        tls_buffered=args.tls_buffered,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(report, encoding="utf-8")

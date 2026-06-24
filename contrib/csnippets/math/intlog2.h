@@ -86,9 +86,8 @@ extern const int intlog2_debruijn_bsr32[32];
 /** @brief De Bruijn lookup table for 32-bit BSF (bit scan forward). */
 extern const int intlog2_debruijn_bsf32[32];
 
-#ifdef UINT32_MAX
-/** @brief Calculate base-2 logarithm for uint32_t using De Bruijn sequence. */
-static inline int log2u32(uint32_t x)
+/** @brief Calculate base-2 logarithm for uint_fast32_t using De Bruijn sequence. */
+static inline int log2u32(uint_fast32_t x)
 {
 	assert(x > 0);
 	x |= x >> 1u;
@@ -96,24 +95,30 @@ static inline int log2u32(uint32_t x)
 	x |= x >> 4u;
 	x |= x >> 8u;
 	x |= x >> 16u;
-	/* De Bruijn constant for 32-bit BSR; pairs with intlog2_debruijn_bsr32[] */
-	return intlog2_debruijn_bsr32[(x * UINT32_C(0x07C4ACDD)) >> 27u];
+	/* De Bruijn constant for 32-bit BSR; pairs with intlog2_debruijn_bsr32[].
+	 * Mask to 32 bits where uint_fast32_t is wider than 32 bits. */
+	return intlog2_debruijn_bsr32
+		[((x * (uint_fast32_t)0x07C4ACDDUL) & UINT32_C(0xFFFFFFFF)) >>
+		 27u];
 }
 
-/** @brief Count trailing zeros for uint32_t using De Bruijn sequence. */
-static inline int countr_zerou32(uint32_t x)
+/** @brief Count trailing zeros for uint_fast32_t using De Bruijn sequence. */
+static inline int countr_zerou32(uint_fast32_t x)
 {
 	assert(x > 0);
-	/* De Bruijn constant for 32-bit BSF; pairs with intlog2_debruijn_bsf32[] */
-	return intlog2_debruijn_bsf32[((x & -x) * UINT32_C(0x077CB531)) >> 27u];
+	/* De Bruijn constant for 32-bit BSF; pairs with intlog2_debruijn_bsf32[].
+	 * Mask to 32 bits where uint_fast32_t is wider than 32 bits. */
+	return intlog2_debruijn_bsf32
+		[(((x & -x) * (uint_fast32_t)0x077CB531UL) &
+		  UINT32_C(0xFFFFFFFF)) >>
+		 27u];
 }
 
-/** @brief Count leading zeros for uint32_t (x=0 returns 32). */
-static inline int countl_zerou32(uint32_t x)
+/** @brief Count leading zeros for a 32-bit value (x=0 returns 32). */
+static inline int countl_zerou32(uint_fast32_t x)
 {
 	return x == 0 ? 32 : 31 - log2u32(x);
 }
-#endif /* UINT32_MAX */
 
 /** @brief De Bruijn lookup table for 64-bit BSR (bit scan reverse). */
 extern const int intlog2_debruijn_bsr64[64];
@@ -163,8 +168,8 @@ static inline int log2u(unsigned int x)
 #if defined(__has_builtin) && __has_builtin(__builtin_clz)
 	return (int)(sizeof(x) << 3u) - 1 - __builtin_clz(x);
 #else
-#if UINT_MAX == UINT32_MAX
-	return log2u32((uint32_t)x);
+#if UINT_MAX == 0xFFFFFFFF
+	return log2u32((uint_fast32_t)x);
 #else
 	return log2u64((uint_fast64_t)x);
 #endif
@@ -177,8 +182,8 @@ static inline int log2ul(unsigned long x)
 #if defined(__has_builtin) && __has_builtin(__builtin_clzl)
 	return (int)(sizeof(x) << 3u) - 1 - __builtin_clzl(x);
 #else
-#if ULONG_MAX == UINT32_MAX
-	return log2u32((uint32_t)x);
+#if ULONG_MAX == 0xFFFFFFFF
+	return log2u32((uint_fast32_t)x);
 #else
 	return log2u64((uint_fast64_t)x);
 #endif
@@ -205,8 +210,8 @@ static inline int countr_zerou(unsigned int x)
 #if defined(__has_builtin) && __has_builtin(__builtin_ctz)
 	return __builtin_ctz(x);
 #else
-#if UINT_MAX == UINT32_MAX
-	return countr_zerou32((uint32_t)x);
+#if UINT_MAX == 0xFFFFFFFF
+	return countr_zerou32((uint_fast32_t)x);
 #else
 	return countr_zerou64((uint_fast64_t)x);
 #endif
@@ -219,8 +224,8 @@ static inline int countr_zeroul(unsigned long x)
 #if defined(__has_builtin) && __has_builtin(__builtin_ctzl)
 	return __builtin_ctzl(x);
 #else
-#if ULONG_MAX == UINT32_MAX
-	return countr_zerou32((uint32_t)x);
+#if ULONG_MAX == 0xFFFFFFFF
+	return countr_zerou32((uint_fast32_t)x);
 #else
 	return countr_zerou64((uint_fast64_t)x);
 #endif
@@ -247,8 +252,8 @@ static inline int countl_zerou(unsigned int x)
 #if defined(__has_builtin) && __has_builtin(__builtin_clz)
 	return x == 0 ? (int)(sizeof(x) << 3u) : __builtin_clz(x);
 #else
-#if UINT_MAX == UINT32_MAX
-	return countl_zerou32((uint32_t)x);
+#if UINT_MAX == 0xFFFFFFFF
+	return countl_zerou32((uint_fast32_t)x);
 #else
 	return countl_zerou64((uint_fast64_t)x);
 #endif
@@ -260,8 +265,8 @@ static inline int countl_zeroul(unsigned long x)
 #if defined(__has_builtin) && __has_builtin(__builtin_clzl)
 	return x == 0 ? (int)(sizeof(x) << 3u) : __builtin_clzl(x);
 #else
-#if ULONG_MAX == UINT32_MAX
-	return countl_zerou32((uint32_t)x);
+#if ULONG_MAX == 0xFFFFFFFF
+	return countl_zerou32((uint_fast32_t)x);
 #else
 	return countl_zerou64((uint_fast64_t)x);
 #endif

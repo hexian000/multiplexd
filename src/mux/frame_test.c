@@ -1,14 +1,27 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/* frame_test.c - white-box tests for frame.c.
+ * Dependencies: frame.c #included (leaf module, no collaborators to mock).
+ * Benches (bench section) are opt-in: run with BENCH set in the env. */
+
 #include "mux/frame.h"
 
+#include "mux/mux.h"
+
+/* Unlock the testing.h bench macros (need a monotonic clock from os/clock.h). */
+#include "os/clock.h"
+#define UTILS_MEASURE_H
 #include "utils/testing.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "mux/frame.c"
+
+/* mock - the test frame allocator */
 
 struct frame_pool_ctx {
 	int alloc_calls;
@@ -17,10 +30,10 @@ struct frame_pool_ctx {
 	bool poison_new_frame;
 };
 
-static struct mux_frame *frame_test_alloc(void *data)
+static struct mux_frame *frame_test_alloc(void *data, const size_t size)
 {
 	struct frame_pool_ctx *const ctx = data;
-	struct mux_frame *const frame = malloc(sizeof(*frame));
+	struct mux_frame *const frame = malloc(size);
 	if (frame == NULL) {
 		return NULL;
 	}
@@ -50,6 +63,8 @@ static struct mux_frame_allocator make_pool(struct frame_pool_ctx *ctx)
 	};
 }
 
+/* regression - targeted cases for one container/codec behavior each */
+
 T_DECLARE_CASE(test_frame_get_resets_runtime_fields)
 {
 	struct frame_pool_ctx ctx = {
@@ -57,7 +72,8 @@ T_DECLARE_CASE(test_frame_get_resets_runtime_fields)
 	};
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
-	struct mux_frame *const frame = mux_frame_get(&pool);
+	struct mux_frame *const frame =
+		mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(frame != NULL);
 	T_EXPECT_EQ(ctx.alloc_calls, 1);
 	T_EXPECT_EQ(frame->pos, (size_t)0);
@@ -72,7 +88,8 @@ T_DECLARE_CASE(test_frame_put_calls_allocator_free)
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
-	struct mux_frame *const frame = mux_frame_get(&pool);
+	struct mux_frame *const frame =
+		mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(frame != NULL);
 	T_EXPECT_EQ(ctx.free_calls, 0);
 
@@ -176,7 +193,7 @@ T_DECLARE_CASE(test_frame_list_drain_clears_head_tail_and_count)
 	struct mux_frame *frames[3] = { 0 };
 
 	for (size_t i = 0; i < sizeof(frames) / sizeof(frames[0]); i++) {
-		frames[i] = mux_frame_get(&pool);
+		frames[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(frames[i] != NULL);
 		mux_frame_list_push(&list, frames[i]);
 	}
@@ -222,7 +239,7 @@ T_DECLARE_CASE(test_frame_ring_push_pop_fifo)
 	struct mux_frame *pushed[8];
 
 	for (int i = 0; i < n; i++) {
-		pushed[i] = mux_frame_get(&pool);
+		pushed[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(pushed[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, pushed[i]));
 	}
@@ -261,14 +278,14 @@ T_DECLARE_CASE(test_frame_ring_grow_contiguous)
 	struct mux_frame *frames[MUX_FRAME_RING_MIN + 1];
 
 	for (int i = 0; i < cap0; i++) {
-		frames[i] = mux_frame_get(&pool);
+		frames[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(frames[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, frames[i]));
 	}
 	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)cap0);
 
 	/* One more push must trigger grow to 2×MIN capacity. */
-	frames[cap0] = mux_frame_get(&pool);
+	frames[cap0] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(frames[cap0] != NULL);
 	T_CHECK(mux_frame_ring_push(&r, frames[cap0]));
 	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)(cap0 + 1));
@@ -301,7 +318,7 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 
 	/* Round 1: fill to capacity. */
 	for (int i = 0; i < cap0; i++) {
-		frames[i] = mux_frame_get(&pool);
+		frames[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(frames[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, frames[i]));
 	}
@@ -313,7 +330,7 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 
 	/* Round 2: push 14 more; slots wrap around, then grow fires. */
 	for (int i = cap0; i < total; i++) {
-		frames[i] = mux_frame_get(&pool);
+		frames[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(frames[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, frames[i]));
 	}
@@ -344,7 +361,8 @@ T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 	const int n = 6;
 
 	for (int i = 0; i < n; i++) {
-		struct mux_frame *f = mux_frame_get(&pool);
+		struct mux_frame *f =
+			mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(f != NULL);
 		T_CHECK(mux_frame_ring_push(&r, f));
 	}
@@ -355,6 +373,67 @@ T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 
 	T_EXPECT(r == NULL);
 	T_EXPECT_EQ(ctx.free_calls, n);
+}
+
+/* bench - per-frame hot-path micro-benchmarks (opt-in: run with BENCH set) */
+
+/* Opaque source/sink (volatile) to keep the optimizer from constant-folding the
+ * benched header round-trip; without it the loop folds to a closed form and
+ * measures ~0 ns/op. */
+static volatile uint_least16_t g_bench_len = 4096;
+static volatile uint_least16_t g_bench_sink;
+
+T_DECLARE_BENCH(bench_header_roundtrip)
+{
+	unsigned char buf[MUX_FRAME_HEADER_SIZE];
+	struct mux_header src = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_SYN | MUX_FLAG_ACK | MUX_FLAG_PUSH,
+		.length = 4096,
+		.stream_id = 321,
+		.extra = 17,
+	};
+	struct mux_header dst = { 0 };
+	uint_least16_t acc = 0;
+	for (uint_fast64_t i = 0; i < _b_->N; i++) {
+		src.length = g_bench_len;
+		mux_write_header(buf, &src);
+		mux_read_header(buf, &dst);
+		acc = (uint_least16_t)(acc + dst.length +
+				       *(const volatile unsigned char *)&buf[2]);
+	}
+	g_bench_sink = acc;
+}
+
+T_DECLARE_BENCH(bench_frame_ring_push_pop)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+	struct mux_frame *const f = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame_ring *r = NULL;
+	/* Prime the ring so the grow cost is excluded from the steady state. */
+	if (mux_frame_ring_push(&r, f)) {
+		(void)mux_frame_ring_pop(r);
+	}
+	for (uint_fast64_t i = 0; i < _b_->N; i++) {
+		(void)mux_frame_ring_push(&r, f);
+		(void)mux_frame_ring_pop(r);
+	}
+	mux_frame_ring_free(&r, &pool);
+	mux_frame_put(&pool, f);
+}
+
+T_DECLARE_BENCH(bench_frame_get_put)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+	for (uint_fast64_t i = 0; i < _b_->N; i++) {
+		struct mux_frame *const f =
+			mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
+		if (f != NULL) {
+			mux_frame_put(&pool, f);
+		}
+	}
 }
 
 int main(void)
@@ -371,5 +450,12 @@ int main(void)
 	T_RUN_CASE(t, test_frame_ring_grow_contiguous);
 	T_RUN_CASE(t, test_frame_ring_grow_wrapped);
 	T_RUN_CASE(t, test_frame_ring_free_releases_all_frames);
+	/* Opt-in micro-benchmarks: each runs ~1s, so keep them out of the
+	 * default ctest run.  Enable with BENCH set in the environment. */
+	if (getenv("BENCH") != NULL) {
+		T_RUN_BENCH(t, bench_header_roundtrip);
+		T_RUN_BENCH(t, bench_frame_ring_push_pop);
+		T_RUN_BENCH(t, bench_frame_get_put);
+	}
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

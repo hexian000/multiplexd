@@ -34,13 +34,13 @@ struct json_proto {
 /** @name Unmarshal
  *  @{ */
 
-/* Unmarshal json (length bytes) into *obj; the buffer is modified in-place. */
-/* Zero-initializes *obj and applies schema defaults before parsing; pointer
-   fields of set keys then point into the json buffer (keep it valid while
-   *obj is in use).  Raw-fragment fields (dynamic objects) are stored without
-   validation.  Duplicate keys: last value wins.  Returns true on success.
-   On failure returns false; partial allocations are released and *obj is
-   reset to all-zero (calling the free function afterwards is harmless). */
+/**
+ * @brief Unmarshal JSON into *obj; modifies @p json in place.
+ * @param obj Output; zeroed and given schema defaults before parsing.
+ * @param json Mutable JSON; @p obj aliases it, so keep it valid in use.
+ * @param length Length of @p json in bytes.
+ * @return true on success; on failure, false and *obj reset to all-zero.
+ */
 bool json_unmarshal_proto(
 	struct json_proto *obj, char *json, size_t length);
 
@@ -49,19 +49,23 @@ bool json_unmarshal_proto(
 /** @name Marshal
  *  @{ */
 
-/* Marshal *obj into buf as JSON text (snprintf semantics): returns the length
-   required to encode *obj, excluding the terminating NUL, regardless of bufsz.
-   The output is NUL-terminated whenever buf != NULL and bufsz > 0, and is
-   truncated when the return value >= bufsz (pass buf = NULL to query the size).
-   Returns -1 on error (e.g. a non-finite number field). */
-int json_marshal_proto(char *buf, size_t bufsz, const struct json_proto *obj);
+/**
+ * @brief Marshal *obj into @p buf as JSON (snprintf semantics).
+ * @param buf Output buffer, or NULL to only compute the size.
+ * @param bufsz Size of @p buf in bytes.
+ * @param obj Object to encode.
+ * @param indent Per-level indent for pretty output, or NULL for compact.
+ * @return Byte length excluding NUL (truncates if >= @p bufsz), or -1 on error.
+ */
+int json_marshal_proto(
+	char *buf, size_t bufsz, const struct json_proto *obj, const char *indent);
 
 /** @} */
 
 /** @name Free
  *  @{ */
 
-/* Free heap-allocated fields inside *obj (arrays). */
+/** @brief Free heap-allocated fields inside *obj (arrays). */
 void json_free_proto(struct json_proto *obj);
 
 /** @} */

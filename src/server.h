@@ -30,11 +30,6 @@
 
 struct config;
 struct hashtable;
-#if WITH_THREADS
-struct mpmc_queue;
-#else
-struct mcache;
-#endif
 struct tls_context;
 
 /* Single event log entry for the session event ring buffer. */
@@ -43,34 +38,28 @@ struct server_evlog_entry {
 	time_t timestamp;
 	/* consecutive occurrence count */
 	size_t count;
-	/* event description */
 	char message[256];
 };
 
 /* Session event ring buffer; owned by the server thread. */
 struct server_evlog {
 	struct server_evlog_entry entries[16];
-	size_t len; /* valid entries */
-	size_t pos; /* next write position */
+	/* valid entries */
+	size_t len;
+	/* next write position */
+	size_t pos;
 };
 
 /*
- * Two monitoring routes feed `server_stats()`:
- *
- *   counters route — `struct server_counters` in `struct server`.
- *     Updated from any thread via `struct mux_session_counters` (mux/mux.h)
- *     using COUNTER_* macros with memory_order_relaxed.
- *
- *   stats route — diagnostic fields in `struct server`, server-thread-only.
- *     Covers the event log, stream-establish latency ring, and per-tunnel
- *     gauges collected at snapshot time by `tunnel_stats()`.
+ * server_stats() has two routes:
+ *   counters route — struct server_counters; updated from any thread via
+ *     mux_session_counters using COUNTER_* (memory_order_relaxed).
+ *   stats route — server-thread-only diagnostic fields: event log,
+ *     stream-establish latency ring, per-tunnel gauges from tunnel_stats().
  */
 
-/* Live cumulative counters and aggregated gauges embedded in struct server
- * (counters route).  All uint_least64_t fields follow Prometheus counter
- * semantics: they increase monotonically and wrap to 0 on overflow;
- * consumers computing rates must handle a decrease in value as a counter
- * reset. */
+/* Counters and gauges embedded in struct server (counters route).
+ * uint_least64_t fields are monotonic Prometheus counters (wrap to 0). */
 struct server_counters {
 	/* listener counters — updated on the server thread only */
 	struct {
@@ -147,21 +136,20 @@ struct server_counters {
 		atomic_size_t recv_buffered_bytes;
 		/* frames currently queued in per-stream send_queue */
 		atomic_size_t send_buffered_frames;
-		/* frames held in the session unacked list (spec §6.7.2) */
+		/* frames held in the session unacked list (spec §5.7.2) */
 		atomic_size_t unacked_frames;
 #else
 		/* bytes currently buffered in per-stream recvbuf rings */
 		size_t recv_buffered_bytes;
 		/* frames currently queued in per-stream send_queue */
 		size_t send_buffered_frames;
-		/* frames held in the session unacked list (spec §6.7.2) */
+		/* frames held in the session unacked list (spec §5.7.2) */
 		size_t unacked_frames;
 #endif /* WITH_THREADS */
 	};
 
-	/* Traffic byte counters for closed tunnels; accumulated on the server
-	 * thread in handle_closed().  Active tunnel traffic is summed at
-	 * snapshot time in server_stats() via tunnel_stats(). */
+	/* Traffic bytes for closed tunnels (accumulated in handle_closed); active
+	 * tunnels summed at snapshot time via tunnel_stats(). */
 	struct {
 		uint_least64_t traffic_byt_mux_recv;
 		uint_least64_t traffic_byt_mux_sent;
@@ -170,9 +158,8 @@ struct server_counters {
 	};
 };
 
-/* Collected snapshot of server statistics; all fields are plain (non-atomic)
- * types, safe to read without synchronization after server_stats() returns.
- * Organized into two groups matching the two monitoring routes. */
+/* Snapshot of server statistics; plain (non-atomic) fields, safe to read
+ * unsynchronized after server_stats() returns. */
 struct server_stats {
 	/* --- counters route snapshot (mirrors struct server_counters) --- */
 	uint_least64_t num_accepted;
@@ -213,8 +200,7 @@ struct server_stats {
 	uint_least64_t traffic_byt_push_recv;
 	uint_least64_t traffic_byt_push_sent;
 
-	/* --- stats route snapshot (mirrors the runtime diagnostic fields
-	 * and per-identity tunnel_stats) --- */
+	/* --- stats route snapshot --- */
 	/* number of latency samples in the ring (capped at 256); 0 = no data */
 	size_t stream_establish_count;
 	/* SYN->SYN|ACK latency percentiles (ns); valid when count > 0 */
@@ -226,8 +212,7 @@ struct server_stats {
 	/* borrowed pointer into struct server; valid until free(server_stats(s)) */
 	const struct server_evlog *evlog;
 
-	/* number of entries in tunnels[] (mux_tunnel + identity pool members
-	 * + accepted tunnels not wired into any identity pool) */
+	/* number of entries in tunnels[] */
 	size_t num_tunnels;
 	/* one entry per active tunnel; peer_identity is NULL for mux_tunnel */
 	struct tunnel_stats tunnels[];
@@ -238,9 +223,7 @@ struct identity_listener {
 	struct listener listener;
 	/* Peer identity expected in hellos — not owned. */
 	const char *peer_identity;
-	/* Active tunnels for this identity (dialed in client mode,
-	 * accepted with matching peer identity in server mode).
-	 * Owned array; all elements are non-NULL. */
+	/* Active tunnels for this identity; owned, all non-NULL. */
 	struct tunnel **tunnels;
 	size_t num_tunnels;
 	/* Allocated capacity of tunnels[]; always a power of two. */
@@ -254,15 +237,6 @@ struct server {
 	struct config *conf;
 	/* path to the config file, used for SIGHUP reload */
 	const char *conf_path;
-#if WITH_ALLOC_CACHE
-#if WITH_THREADS
-	/* Server-level frame allocator shared across all tunnel threads. */
-	struct mpmc_queue *frame_pool;
-#else
-	/* Server-level frame allocator (single-threaded). */
-	struct mcache *frame_pool;
-#endif
-#endif /* WITH_ALLOC_CACHE */
 #if WITH_TLS
 	/* TLS context for accepted mux connections (server role). */
 	struct tls_context *server_tlsctx;
@@ -278,22 +252,14 @@ struct server {
 	 * Each value is a heap-allocated struct identity_listener *. */
 	struct hashtable *identities;
 
-	/* Keyed by tunnel_session_id() (the server-assigned 16-byte session
-	 * identity).  Contains accepted (inbound) sessions only; dialed
-	 * sessions are tracked via mux_tunnel / identities[i].tunnels[]. */
+	/* accepted_tunnels maps accepted session_id to tunnel pointer */
 	struct hashtable *accepted_tunnels;
 	/* Single dialed session for the top-level mux_connect entry, or NULL. */
 	struct tunnel *mux_tunnel;
-	/* Dialed identity_connect sessions, indexed by conf->identity_connect[].
-	 * Elements are set to NULL when wired into identities[i].tunnels[] or after
-	 * tunnel_close().  Tracked here so server_stop() can reach them even if
-	 * the handshake has not completed yet. */
+	/* identity_tunnels contains the dialed tunnels ptr */
 	struct tunnel **identity_tunnels;
 	size_t num_identity_tunnels;
-	/* Monotonically-increasing identifier assigned to every tunnel at
-	 * creation; never reused within the process lifetime.  Used as a
-	 * Prometheus label to disambiguate multiple tunnels sharing the same
-	 * peer identity. */
+	/* monotonically-increasing index */
 	uint_least64_t next_tunnel_index;
 
 	int_least64_t started;
@@ -317,16 +283,15 @@ struct server {
 #if WITH_THREADS
 	ev_async w_async;
 	struct dispatcher *disp;
-	/* Shared mutex protecting accepted_sessions for cross-thread lookups.
-	 * Held exclusively by the server thread when adding or removing entries;
-	 * held shared by worker threads during relay_on_resume. */
+	/* Shared mutex protecting accepted_sessions; exclusive on the server thread
+	 * for add/remove, shared on worker threads for lookups. */
 	smtx_t accepted_mu;
 #endif
 
 	struct server_counters counters;
 
 	/* stats route: server-thread-only diagnostics; read via server_stats() */
-	struct server_evlog evlog; /* session event ring buffer */
+	struct server_evlog evlog;
 
 	/* Rate tracking state for POST /stats bandwidth display */
 	struct {
@@ -337,51 +302,26 @@ struct server {
 	} rate_tracker;
 };
 
-/**
- * @brief Apply a pre-parsed configuration to a running server (hot-reload).
- *
- * Takes ownership of new_conf. On success new_conf becomes s->conf and the
- * function returns true. On failure (e.g., TLS setup error) new_conf is freed,
- * the server retains its current configuration, and the function returns false.
- *
- * @param s The running server.
- * @param new_conf Validated configuration to apply.
- * @return true on success, false on failure.
- */
+/* Apply a pre-parsed configuration to a running server (hot-reload); takes
+ * ownership of @p new_conf. On success it becomes s->conf; on failure it is
+ * freed, the server keeps its current config, and this returns false. */
 bool server_apply_config(struct server *restrict s, struct config *new_conf);
 
-/**
- * @brief Allocate and initialize a server instance.
- * @param loop The main event loop that owns the server.
- * @param conf The validated configuration; ownership transfers to the server.
- * @return A new server on success, or NULL on allocation/setup failure.
- */
+/* Allocate and initialize a server; takes ownership of @p conf.
+ * NULL on allocation/setup failure. */
 struct server *server_new(struct ev_loop *loop, struct config *conf);
 
-/**
- * @brief Start listeners, background workers, and outbound sessions.
- * @param s The server to start.
- * @return true on success, false on startup failure.
- */
+/* Start listeners, background workers, and outbound sessions; false on failure. */
 bool server_start(struct server *s);
 
-/**
- * @brief Stop listeners and initiate shutdown of active sessions.
- * @param s The server to stop.
- */
+/* Stop listeners and initiate shutdown of active sessions. */
 void server_stop(struct server *s);
 
-/**
- * @brief Free a stopped server and all owned resources.
- * @param s The server to free; NULL is allowed.
- */
+/* Free a stopped server and all owned resources; NULL is allowed. */
 void server_free(struct server *s);
 
-/**
- * @brief Allocate and return a consistent snapshot of all server statistics.
- * @param s The server to inspect.
- * @return Heap-allocated snapshot; caller must free(). NULL on OOM (logged).
- */
+/* Allocate a consistent snapshot of all server statistics (caller frees);
+ * NULL on OOM (logged). */
 struct server_stats *server_stats(const struct server *restrict s);
 
 #endif /* SERVER_H */

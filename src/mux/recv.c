@@ -2,20 +2,31 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /**
- * @file dispatch.c
- * @brief Internal mux frame dispatch implementation.
+ * @file recv.c
+ * @brief Mux receive layer (1/3): read and parse frames off the transport, run
+ *        the per-frame logic -- stream dispatch, flow-control accounting,
+ *        control-frame (PING/PONG) handling, receive-driven window updates --
+ *        and hand payload to stream receive buffers.
+ *
+ * The mux fd is handled in three layers: receive (recv.c) -> schedule (sched.c)
+ * -> send (send.c + wire.c).  Cross-layer seam: session_flush_resp lets a
+ * receive batch synchronously drive schedule+send (prompt PONG/ACK) rather than
+ * waiting for the next EV_WRITE.
  */
 
-#include "mux/dispatch.h"
+#include "mux/recv.h"
 
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
 #include "mux/mux.h"
 #include "mux/sched.h"
+#include "mux/send.h"
 #include "mux/session.h"
 #include "mux/stream.h"
+#include "mux/unacked.h"
 #include "mux/wire.h"
+#include "util.h"
 
 #include "algo/hashtable.h"
 #include "os/clock.h"
@@ -23,7 +34,10 @@
 #include "utils/formats.h"
 #include "utils/likely.h"
 #include "utils/minmax.h"
+#include "utils/serialize.h"
 #include "utils/slog.h"
+
+#include <ev.h>
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -124,6 +138,34 @@ static void process_syn_payload(
 	ringbuf_consume(ss->wire.recvbuf, frame_size);
 }
 
+/* Report stream establishment latency once, on the first SYN|ACK. */
+static void stream_report_established(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
+{
+	if (s->syn_sent_ns <= 0) {
+		return;
+	}
+	const int_fast64_t latency = clock_monotonic_ns() - s->syn_sent_ns;
+	s->syn_sent_ns = 0;
+	if (ss->callbacks.on_event != NULL) {
+		ss->callbacks.on_event(
+			ss->userdata, ss, MUX_EVENT_STREAM_ESTABLISHED,
+			(union mux_event_data){
+				.stream_established.ns = latency,
+			});
+	}
+	if (LOGLEVEL(DEBUG)) {
+		char stream_tag_[256];
+		char latency_str[32];
+		(void)stream_format_tag(stream_tag_, sizeof(stream_tag_), s);
+		(void)format_duration(
+			latency_str, sizeof(latency_str),
+			make_duration_nanos(latency));
+		LOG_F(DEBUG, "%s stream connected, latency=%s", stream_tag_,
+		      latency_str);
+	}
+}
+
 static void dispatch_by_stream(
 	struct mux_session *ss, struct mux_stream *restrict s,
 	const struct mux_header *restrict hdr)
@@ -204,25 +246,21 @@ static void dispatch_by_stream(
 		return;
 	}
 
-	/* ACK credit logging: snapshot before the window update.
-	 * Only relevant for ACK-only frames; SYN|ACK is handled inside
-	 * the SYN branch after the retransmit guard below. */
+	/* Snapshot credit before the window update, for ACK-only logging. */
 	const uint_fast32_t credit_before =
 		((flags & MUX_FLAG_ACK) && !(flags & MUX_FLAG_SYN)) ?
 			stream_credit_avail(s) :
 			0;
 
-	/* ACK-only: clear Nagle unacked bytes and grant receive-window
-	 * credit.  SYN|ACK carries its own window update inside the SYN
-	 * branch after the idempotent-retransmit guard. */
+	/* ACK-only: clear Nagle unacked bytes and grant receive-window credit.
+	 * SYN|ACK carries its own window update in the SYN branch below. */
 	if ((flags & MUX_FLAG_ACK) && !(flags & MUX_FLAG_SYN)) {
 		s->unacked_bytes = 0;
 		stream_recv_window(s, hdr->extra);
 	}
 
-	/* SYN|ACK: completes stream establishment (guaranteed by validate_flags_by_stream).
-	 * On session resume, a retransmitted SYN|ACK may arrive when the stream is already
-	 * ESTABLISHED or FIN_WAIT; consume idempotently without re-applying. */
+	/* SYN|ACK completes establishment.  A retransmit on resume may arrive
+	 * when already ESTABLISHED/FIN_WAIT; consume idempotently. */
 	if (flags & MUX_FLAG_SYN) {
 		if (s->state != STREAM_SYN_SENT) {
 			/* Idempotent retransmit: SYN|ACK already processed. */
@@ -232,13 +270,12 @@ static void dispatch_by_stream(
 		MUX_LOG_F(
 			VERBOSE, ss,
 			"stream %" PRIuFAST16
-			" received SYN|ACK: credit_inc=%" PRIuFAST32
+			" received SYN|ACK: credit_inc=%" PRIuLEAST16
 			" queued=%" PRIuLEAST32 " unacked=%" PRIuLEAST32,
 			stream_id, hdr->extra, s->queued_send_bytes,
 			s->unacked_bytes);
-		/* Nagle: clear unacked bytes before stream_recv_window so that
-		 * the watcher update and scheduler wakeup inside see the
-		 * unlocked state and re-enable EV_READ / dequeue correctly. */
+		/* Clear unacked bytes before stream_recv_window so its watcher
+		 * update and wakeup see the unlocked Nagle state. */
 		s->unacked_bytes = 0;
 		stream_recv_window(s, hdr->extra);
 		/* Dividing send_window by MUX_WINDOW_UNIT recovers the peer
@@ -247,53 +284,27 @@ static void dispatch_by_stream(
 			(uint_least32_t)(s->send_window / MUX_WINDOW_UNIT);
 		if (ss->auto_session_window) {
 			session_update_session_window(
-				ss, estimator_window_size(
-					    &ss->estimator, ESTIMATOR_TX));
+				ss, estimator_tx_window_size(&ss->estimator));
 		}
-		if (s->syn_sent_ns > 0) {
-			const int_fast64_t latency =
-				clock_monotonic_ns() - s->syn_sent_ns;
-			s->syn_sent_ns = 0;
-			if (ss->callbacks.on_event != NULL) {
-				ss->callbacks.on_event(
-					ss->userdata, ss,
-					MUX_EVENT_STREAM_ESTABLISHED,
-					(union mux_event_data){
-						.stream_established.ns =
-							latency,
-					});
-			}
-			if (LOGLEVEL(DEBUG)) {
-				char stream_tag_[256];
-				char latency_str[32];
-				(void)stream_format_tag(
-					stream_tag_, sizeof(stream_tag_), s);
-				(void)format_duration(
-					latency_str, sizeof(latency_str),
-					make_duration_nanos(latency));
-				LOG_F(DEBUG, "%s stream connected, latency=%s",
-				      stream_tag_, latency_str);
-			}
-		}
+		stream_report_established(ss, s);
 		stream_start(s);
 		process_syn_payload(ss, s, hdr, frame_size);
 		return;
 	}
 
-	/* ACK: grant credit whenever RST is clear and ACK is set.
-	 * This includes ACK|FIN: Extra carries a credit grant, not a status code.
-	 * stream_recv_window already called in the ACK-only block above. */
+	/* ACK (incl. ACK|FIN): Extra is a credit grant, not a status code;
+	 * stream_recv_window was already called in the ACK-only block. */
 	if (flags & MUX_FLAG_ACK) {
 		if (credit_before == 0 && hdr->extra > 0) {
 			MUX_LOG_F(
 				DEBUG, ss,
 				"stream %" PRIuFAST16
-				" peer ACK restored send credit: inc=%" PRIuFAST32
+				" peer ACK restored send credit: inc=%" PRIuLEAST16
 				" queued=%" PRIuLEAST32,
 				stream_id, hdr->extra, s->queued_send_bytes);
 		}
-		/* send_window is cumulative granted credit, not the peer's window
-		 * setting; do not derive peer_stream_window from ACK increments. */
+		/* send_window is cumulative granted credit, not the peer's window;
+		 * do not derive peer_stream_window from ACK increments. */
 	}
 
 	if (LIKELY((flags & MUX_FLAG_PUSH) && hdr->length > 0)) {
@@ -402,31 +413,23 @@ static void dispatch_no_stream(
 			ringbuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
-		/* Cap the initial send window at our own receive-buffer size
-		 * (stream_window).  A malicious peer could advertise extra = UINT16_MAX
-		 * and force the send_queue to grow without bound; capping at
-		 * stream_window limits per-stream send_queue memory to the same budget
-		 * as the receive buffer.  Use stream_window, not wmem: the peer's grant
-		 * reflects its stream_window, so wmem would silently discard legitimate
-		 * credits and starve the peer's outbound direction.
-		 * When both peers run the same code, extra = stream_window - 1 and the
-		 * MIN has no effect: send_window equals the peer's recv_window immediately
-		 * after the handshake. */
+		/* Cap the initial send window at our own stream_window so a peer
+		 * advertising extra = UINT16_MAX cannot grow send_queue without
+		 * bound.  Use stream_window (not wmem): the grant reflects the
+		 * peer's stream_window, so the cap is a no-op between matched peers. */
 		const uint_fast32_t extra_bytes =
 			(uint_fast32_t)hdr->extra * MUX_WINDOW_UNIT;
 		const uint_fast32_t max_window =
-			(uint_fast32_t)ss->stream_window * MUX_MAX_PAYLOAD_SIZE;
+			(uint_fast32_t)ss->stream_window * MUX_WINDOW_UNIT;
 		s->send_window =
 			MIN(MUX_DEFAULT_SEND_WINDOW + extra_bytes, max_window);
-		/* Use extra directly: send_window may be capped by our own
-		 * stream_window, which would underestimate the peer's window.
-		 * Assigned unconditionally so a shrinking peer window is tracked.
-		 * The initial default send window contributes exactly one frame. */
+		/* Derive peer_stream_window from extra (not the capped send_window),
+		 * unconditionally so a shrinking peer window is tracked; +1 for the
+		 * initial default send window's one frame. */
 		ss->peer_stream_window = (uint_least32_t)hdr->extra + 1u;
 		if (ss->auto_session_window) {
 			session_update_session_window(
-				ss, estimator_window_size(
-					    &ss->estimator, ESTIMATOR_TX));
+				ss, estimator_tx_window_size(&ss->estimator));
 		}
 		if (LOGLEVEL(INFO)) {
 			char stream_tag_[256];
@@ -480,10 +483,8 @@ static void dispatch_no_stream(
 		return;
 	}
 
-	/* Stream IDs are never reused within a session.  A valid non-SYN frame
-	 * for an unknown stream is most likely late data after the tombstone
-	 * period expired; reset that stream without tearing down the whole
-	 * session. */
+	/* IDs are never reused, so a non-SYN frame for an unknown stream is
+	 * likely late data past the tombstone period: RST it, keep the session. */
 	if (unknown_flags == 0) {
 		MUX_LOG_F(
 			DEBUG, ss,
@@ -504,7 +505,55 @@ static void dispatch_no_stream(
 	session_reset(ss);
 }
 
-void dispatch_frame(struct mux_session *ss)
+/* Handle a control-stream frame.  Returns false if the session was reset and
+ * frame dispatch should stop. */
+static bool dispatch_ctrl_frame(
+	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	const size_t frame_size)
+{
+	if (hdr->flags & MUX_FLAG_ACK) {
+		MUX_LOG_F(
+			DEBUG, ss,
+			"session ACK received: acked=%" PRIuLEAST16
+			" unacked=%zu stalled=%d",
+			hdr->extra, ss->unacked.frames, ss->unacked.stalled);
+		const struct unacked_ack_result r =
+			unacked_ack_trim(ss, hdr->extra);
+		if (!r.ok) {
+			/* Peer acked more frames than were sent. */
+			session_reset(ss);
+			return false;
+		}
+		/* unacked stays free of the estimator and send pipeline:
+		 * drive both here from the result. */
+		if ((ss->auto_stream_window || ss->auto_session_window) &&
+		    r.trimmed_bytes > 0) {
+			estimator_add_acked(ss, r.trimmed_bytes);
+		}
+		if (r.unstalled) {
+			mux_notify_write(ss);
+		}
+	}
+	if (hdr->flags == 0) {
+		switch (hdr->extra) {
+		case MUX_CTRL_PING:
+			session_recv_ping(ss, hdr, frame_size);
+			break;
+		case MUX_CTRL_PONG:
+			session_recv_pong(ss, hdr, frame_size);
+			break;
+		default:
+			/* MUX_CTRL_PROBE and reserved: discard */
+			ringbuf_consume(ss->wire.recvbuf, frame_size);
+			break;
+		}
+	} else {
+		ringbuf_consume(ss->wire.recvbuf, frame_size);
+	}
+	return true;
+}
+
+static void dispatch_frame(struct mux_session *ss)
 {
 	while (ringbuf_readable(ss->wire.recvbuf) >= MUX_FRAME_HEADER_SIZE) {
 		const unsigned char *const p =
@@ -516,15 +565,10 @@ void dispatch_frame(struct mux_session *ss)
 			session_log_frame_header(ss, "frame in", p, &hdr);
 		}
 
-		if (hdr.length > MUX_MAX_PAYLOAD_SIZE) {
-			MUX_LOG_F(
-				ERROR, ss,
-				"invalid payload length %" PRIuLEAST16,
-				hdr.length);
-			session_reset(ss);
-			return;
-		}
-
+		/* hdr.length is a 16-bit field (<= 65535), so a peer may send a
+		 * payload larger than our own MUX_MAX_PAYLOAD_SIZE cap.  Accept it:
+		 * the recvbuf grows on demand to assemble the frame contiguously and
+		 * is shrunk back afterwards (session_on_recv).  We never send oversized. */
 		const size_t frame_size = MUX_FRAME_HEADER_SIZE + hdr.length;
 		if (ringbuf_readable(ss->wire.recvbuf) < frame_size) {
 			return;
@@ -563,55 +607,26 @@ void dispatch_frame(struct mux_session *ss)
 		}
 
 		if (hdr.stream_id == STREAMID_CTRL) {
-			if (hdr.flags & MUX_FLAG_ACK) {
-				MUX_LOG_F(
-					DEBUG, ss,
-					"session ACK received: acked=%" PRIuFAST32
-					" unacked=%zu stalled=%d",
-					hdr.extra, ss->unacked_frames,
-					ss->send_stalled);
-			}
-			if ((hdr.flags & MUX_FLAG_ACK) &&
-			    !session_ack_trim(ss, hdr.extra)) {
-				/* Peer acked more frames than were sent. */
-				session_reset(ss);
+			if (!dispatch_ctrl_frame(ss, &hdr, frame_size)) {
 				return;
-			}
-			if (hdr.flags == 0) {
-				switch (hdr.extra) {
-				case MUX_CTRL_PING:
-					session_recv_ping(ss, &hdr, frame_size);
-					break;
-				case MUX_CTRL_PONG:
-					session_recv_pong(ss, &hdr, frame_size);
-					break;
-				default:
-					/* MUX_CTRL_PROBE and reserved: discard */
-					ringbuf_consume(
-						ss->wire.recvbuf, frame_size);
-					break;
-				}
-			} else {
-				ringbuf_consume(ss->wire.recvbuf, frame_size);
 			}
 			continue;
 		}
 
 		/* Count received non-stream-0 frames for session ACK. */
-		ss->recv_seq++;
-		/* Force-send session ACK immediately when the delta hits a
-		 * fraction of session_window (spec §5.7.3 MUST), without
-		 * waiting for the coalesce timer. */
+		ss->unacked.recv_seq++;
+		/* Force a session ACK when the delta hits a fraction of
+		 * session_window (spec §5.7.3 MUST), skipping the coalesce timer. */
 		const uint_fast32_t ack_thresh =
 			(uint_fast32_t)CLAMP(ss->session_window / 4u, 2u, 8u);
-		if (ss->recv_seq - ss->ack_seq >= ack_thresh) {
+		if (ss->unacked.recv_seq - ss->unacked.ack_seq >= ack_thresh) {
 			MUX_LOG_F(
 				DEBUG, ss,
-				"forced session ACK: delta=%" PRIuFAST32,
-				ss->recv_seq - ss->ack_seq);
+				"forced session ACK: delta=%" PRIuLEAST32,
+				ss->unacked.recv_seq - ss->unacked.ack_seq);
 			session_emit_ack(ss);
 		}
-		if (ss->recv_seq != ss->ack_seq) {
+		if (ss->unacked.recv_seq != ss->unacked.ack_seq) {
 			sched_coalesce_arm(ss);
 		}
 
@@ -628,5 +643,239 @@ void dispatch_frame(struct mux_session *ss)
 		if (ss->state != SESSION_ESTABLISHED) {
 			return;
 		}
+	}
+}
+
+/* Read and dispatch one TLS record.  Returns true when a record was
+ * successfully received and dispatched; returns false when no data is
+ * available (EAGAIN) or on error. */
+static bool recv_one(struct mux_session *restrict ss)
+{
+	/* Offer a MUX_RECV_READAHEAD read-ahead window so one plaintext recv()
+	 * can drain several buffered frames per syscall.  The ring still grows on
+	 * demand for a larger peer frame. */
+	if (!ringbuf_reserve(&ss->wire.recvbuf, MUX_RECV_READAHEAD, true)) {
+		LOGOOM();
+		session_reset(ss);
+		return false;
+	}
+
+	const size_t cap = ringbuf_write_space(ss->wire.recvbuf);
+	size_t nread = cap;
+	unsigned char *const buf = ringbuf_write_ptr(ss->wire.recvbuf);
+
+	if (!wire_recv(ss, buf, &nread)) {
+		if (ss->handshake.has_session_id &&
+		    (ss->state == SESSION_ESTABLISHED ||
+		     (ss->state == SESSION_HANDSHAKE && !ss->accepted))) {
+			session_suspend(ss);
+		} else {
+			session_reset(ss);
+		}
+		return false;
+	}
+	if (nread == 0) {
+		/* TLS close_notify during handshake: no send-side handler detects
+		 * it, so drive teardown here.  A client resume attempt suspends
+		 * rather than resets to preserve streams. */
+		if (!ss->wire.rx_open && ss->state == SESSION_HANDSHAKE) {
+			if (ss->handshake.has_session_id && !ss->accepted) {
+				MUX_LOG(DEBUG, ss,
+					"connection closed during resume handshake;"
+					" re-suspending");
+				session_suspend(ss);
+			} else {
+				MUX_LOG(DEBUG, ss,
+					"connection closed during protocol handshake");
+				session_reset(ss);
+			}
+		}
+		return false;
+	}
+
+	ringbuf_produce(ss->wire.recvbuf, nread);
+	ss->bytes_recv += (uint_least64_t)nread;
+	COUNTER_ADD(ss->cnt.traffic.byt_mux_recv, (uint_least64_t)nread);
+	if (ss->state == SESSION_ESTABLISHED) {
+		ev_timer_again(ss->loop, &ss->w_timeout);
+	}
+
+	dispatch_frame(ss);
+	return true;
+}
+
+void session_on_recv(struct mux_session *restrict ss)
+{
+	if (recv_one(ss)) {
+		while (ss->state == SESSION_ESTABLISHED &&
+		       wire_has_pending(ss)) {
+			if (!recv_one(ss)) {
+				break;
+			}
+		}
+	}
+	/* Reclaim capacity the recvbuf grew to assemble an oversized inbound frame.
+	 * The normal working set is one read-ahead window plus a leftover partial,
+	 * so keep that floor to avoid regrowth churn on normal traffic; only genuine
+	 * oversized growth is returned. */
+	ringbuf_shrink(
+		&ss->wire.recvbuf,
+		MUX_RECV_READAHEAD +
+			((size_t)MUX_FRAME_HEADER_SIZE + ss->max_payload));
+	/* Respond to this batch now (PONG, ACKs, data unstalled by credit):
+	 * socket_cb entered on EV_READ, so without this the egress would wait a
+	 * loop turn.  Prompt PONG keeps the peer's RTT sample from absorbing our
+	 * egress delay. */
+	session_flush_resp(ss);
+}
+
+/* Handle an inbound PING (spec §5.3.2): queue a PONG echoing the payload
+ * byte-for-byte.  Silently discards the PING when rate-limited; closes the
+ * connection on an oversized PING, which cannot be echoed. */
+void session_recv_ping(
+	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	const size_t frame_size)
+{
+	/* A PONG must echo the PING payload byte-for-byte into one of our frames,
+	 * so a PING larger than our configured frame payload cannot be answered:
+	 * close the connection rather than reply with a truncated PONG. */
+	if (hdr->length > ss->max_payload) {
+		MUX_LOG_F(
+			ERROR, ss,
+			"oversized PING (%" PRIuLEAST16
+			" bytes) cannot be echoed; closing connection",
+			hdr->length);
+		session_reset(ss);
+		return;
+	}
+
+	const int_fast64_t now = clock_monotonic_ns();
+	if (now - ss->ping_recv_last_ns < MUX_PONG_RATE_LIMIT_NS) {
+		ringbuf_consume(ss->wire.recvbuf, frame_size);
+		return;
+	}
+
+	/* Read the PING payload before discarding the frame; session_send_oob
+	 * copies it into oobbuf. */
+	const unsigned char *ping_payload =
+		ringbuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE;
+	const bool queued =
+		session_send_oob(ss, MUX_CTRL_PONG, ping_payload, hdr->length);
+	ringbuf_consume(ss->wire.recvbuf, frame_size);
+	if (!queued) {
+		/* OOM: PONG dropped.  OOB is never retransmitted, so the peer's
+		 * in-flight BDP probe stalls until the transport is re-established
+		 * (suspend clears OOB state); liveness is unaffected (no PONG dep). */
+		return;
+	}
+
+	ss->ping_recv_last_ns = now;
+	session_flush_oob(ss);
+}
+
+/* Expand the receive window of one stream to new_window bytes.  Called via
+ * table_iterate; only grows already-granted per-stream receive credit. */
+static bool update_stream_window_cb(
+	const struct hashtable *table, const void *key, void *element,
+	void *data)
+{
+	UNUSED(table);
+	UNUSED(key);
+	const uint_fast32_t new_window = *(const uint_fast32_t *)data;
+	struct mux_stream *restrict s = element;
+	if (new_window <= s->recv_window) {
+		return true;
+	}
+	s->recv_window = new_window;
+	stream_check_ack(s);
+	return true;
+}
+
+void session_update_session_window(
+	struct mux_session *restrict ss, const size_t window_bytes)
+{
+	const uint_least32_t initial_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	const size_t target_frames =
+		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
+	const uint_least32_t new_window = (uint_least32_t)MAX(
+		MAX(ss->peer_stream_window, target_frames), initial_frames);
+	if (ss->session_window == new_window) {
+		return;
+	}
+	const bool grew = new_window > ss->session_window;
+	ss->session_window = new_window;
+	MUX_LOG_F(
+		INFO, ss, "session window updated: session=%zu",
+		(size_t)ss->session_window * MUX_WINDOW_UNIT);
+	if (grew && ss->unacked.stalled &&
+	    ss->unacked.bytes < (size_t)ss->session_window * MUX_WINDOW_UNIT) {
+		MUX_LOG_F(
+			DEBUG, ss,
+			"send stall cleared by session window growth:"
+			" unacked_bytes=%zu limit=%zu",
+			ss->unacked.bytes,
+			(size_t)ss->session_window * MUX_WINDOW_UNIT);
+		ss->unacked.stalled = false;
+		mux_notify_write(ss);
+	}
+}
+
+static void session_update_stream_window(
+	struct mux_session *restrict ss, const size_t window_bytes)
+{
+	const size_t target_frames =
+		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
+	const uint_least32_t frames =
+		(uint_least32_t)MAX(target_frames, (size_t)1u);
+
+	if (ss->stream_window == frames) {
+		return;
+	}
+	const uint_least32_t old_stream = ss->stream_window;
+	ss->stream_window = frames;
+	if (frames > old_stream && ss->sched.streams != NULL) {
+		uint_fast32_t w = (uint_fast32_t)frames * MUX_WINDOW_UNIT;
+		table_iterate(ss->sched.streams, update_stream_window_cb, &w);
+	}
+	/* On shrink: each stream lazily syncs recv_window down in
+	 * stream_check_ack once outstanding peer credit is consumed. */
+	MUX_LOG_F(
+		INFO, ss, "estimator updated: window=%zu stream=%zu",
+		window_bytes, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
+}
+
+/* Handle an inbound PONG (spec §5.3.3): feed the echoed timestamp into the
+ * estimator, apply its BDP to the live window floors, and reset the keepalive
+ * timer so a successful PONG always defers the next probe. */
+void session_recv_pong(
+	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	const size_t frame_size)
+{
+	if (hdr->length < MUX_PING_PAYLOAD_SIZE) {
+		ringbuf_consume(ss->wire.recvbuf, frame_size);
+		return;
+	}
+
+	const int_fast64_t sent_ns = (int_fast64_t)read_uint64(
+		ringbuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE);
+	ringbuf_consume(ss->wire.recvbuf, frame_size);
+
+	estimator_calculate(ss, sent_ns);
+	if (ss->auto_stream_window) {
+		session_update_stream_window(
+			ss, estimator_rx_window_size(&ss->estimator));
+	}
+	if (ss->auto_session_window) {
+		session_update_session_window(
+			ss, estimator_tx_window_size(&ss->estimator));
+	}
+
+	/* Any PONG confirms the link is alive: reset the keepalive deadline
+	 * regardless of which path sent the PING. */
+	const double keepalive = keepalive_interval(ss);
+	ev_timer_set(&ss->w_keepalive, 0.0, keepalive);
+	if (ev_is_active(&ss->w_keepalive)) {
+		ev_timer_again(ss->loop, &ss->w_keepalive);
 	}
 }

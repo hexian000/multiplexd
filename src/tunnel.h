@@ -9,52 +9,55 @@
 #ifndef TUNNEL_H
 #define TUNNEL_H
 
+#include "conf.h"
 #include "mux/mux.h"
-#include "util.h"
 #if WITH_TLS
 #include "tlsutil.h"
 #endif
+#include "util.h"
 
 #include <ev.h>
+
 #include <stdbool.h>
 
 struct server;
 struct tunnel;
 
 /* Callbacks invoked on the server loop for session lifecycle events.
- * Inbound stream policy is enforced by tunnel layer; streams are accepted
- * by default, then attached to sockets via tunnel_open_stream().
- * on_event fires for all mux events except MUX_EVENT_ESTABLISHED and
- * MUX_EVENT_RESUMED, which are routed to on_established and on_resumed. */
+ * on_event fires for all mux events except ESTABLISHED and RESUMED, which are
+ * routed to on_established and on_resumed. */
 struct tunnel_callbacks {
 	void (*on_event)(
 		void *data, struct tunnel *t, enum mux_event,
 		union mux_event_data);
-	/* Fired when a handshake completes as a fresh session.  May fire more
-	 * than once on the same tunnel when the server rejects a resume
-	 * attempt and the client falls back to a new session; implementations
-	 * must be idempotent with respect to any session pool they maintain. */
+	/* Fired when a handshake completes as a fresh session.  May fire more than
+	 * once on the same tunnel (resume rejected → fresh session), so handlers
+	 * must be idempotent. */
 	void (*on_established)(
 		void *data, struct tunnel *t, int_fast64_t lat_ns);
 	/* Fired when the peer confirmed that the suspended session has been
 	 * successfully resumed on the new transport. */
 	void (*on_resumed)(void *data, struct tunnel *t, int_fast64_t lat_ns);
-	struct mux_session *(*on_resume)(
+	/* Locate the suspended tunnel matching session_id for a resume.  May keep
+	 * a lock held to pin the returned tunnel until on_resume_unpin; returns
+	 * NULL (no lock obligation) when there is no match. */
+	struct tunnel *(*on_resume_lookup)(
 		void *data, struct tunnel *new_t,
 		const unsigned char *session_id);
+	/* Paired with on_resume_lookup: called once after each non-NULL lookup,
+	 * after the handoff is enqueued, to release the pin lock.  NULL if
+	 * on_resume_lookup takes no lock. */
+	void (*on_resume_unpin)(void *data, struct tunnel *new_t);
 };
 
 struct tunnel_opts {
 	const struct tunnel_callbacks *cb;
 	void *data;
 	const struct mux_config *mux_conf;
-	/* Frame allocator for this tunnel's session; data field is overridden
-	 * by tunnel_new() with the per-tunnel mcache. */
-	struct mux_frame_allocator pool;
 	/* Socket options applied to outbound mux connections. */
-	struct util_socket_opts mux_socket;
+	struct conf_socket_opts mux_socket;
 	/* Socket options applied to inbound forwarded-stream connections. */
-	struct util_socket_opts local_socket;
+	struct conf_socket_opts local_socket;
 	int fd;
 	const unsigned char *id;
 	const char *connect_addr;
@@ -91,11 +94,9 @@ void tunnel_close(struct tunnel *t);
  * through on_event when done. */
 void tunnel_shutdown(struct tunnel *t);
 
-/* Drop the underlying transport connection without closing the mux session.
- * Dispatched to the tunnel loop; shuts down the socket so the mux layer
- * detects transport loss (MUX_EVENT_LOST) and w_reconnect re-establishes
- * the connection.  The mux session enters SUSPENDED state; its session ID
- * and stream state are preserved for resumption. */
+/* Drop the underlying transport without closing the mux session: dispatched to
+ * the tunnel loop, it shuts the socket so the session enters SUSPENDED with its
+ * state preserved, and w_reconnect re-establishes the connection. */
 void tunnel_drop_transport(struct tunnel *t);
 
 /* --- Accessors --- */
@@ -111,8 +112,7 @@ const unsigned char *tunnel_peer_cert_der(const struct tunnel *t, size_t *len);
 const struct sockaddr *tunnel_peer_addr(const struct tunnel *t);
 bool tunnel_is_accepted(const struct tunnel *t);
 const unsigned char *tunnel_session_id(const struct tunnel *t);
-/* Server-wide monotonic identifier assigned at creation; never reused
- * within the process lifetime.  Use as a stable per-tunnel handle. */
+/* Server-wide monotonic index, never reused; a stable per-tunnel handle. */
 uint_least64_t tunnel_index(const struct tunnel *t);
 
 /* Snapshot of per-tunnel statistics. */
@@ -120,9 +120,7 @@ struct tunnel_stats {
 	/* borrowed pointer to the identity string for this tunnel's pool;
 	 * NULL for the top-level mux_tunnel (no identity pool) */
 	const char *peer_identity;
-	/* Server-wide monotonic identifier assigned at creation; never
-	 * reused.  Exposed as a Prometheus label to disambiguate tunnels
-	 * that share the same peer identity. */
+	/* Server-wide monotonic index, never reused. */
 	uint_least64_t tunnel_index;
 	/* borrowed pointer to the tunnel's diagnostic tag ("my <= peer") */
 	const char *tag;
@@ -135,15 +133,13 @@ struct tunnel_stats {
 	size_t rx_window;
 	size_t tx_window;
 	int_least64_t last_changed;
-	/* Round-trip time in nanoseconds; 0 if no measurement has been
-	 * completed yet. */
+	/* 0 if no measurement has been completed yet. */
 	int_least64_t rtt_ns;
-	/* Bandwidth-delay product per direction in bytes (rx: receive
-	 * direction, tx: send direction); 0 if not yet estimated. */
+	/* Per-direction bandwidth-delay product in bytes; 0 if not yet
+	 * estimated. */
 	size_t bdp_rx;
 	size_t bdp_tx;
-	/* Stream lifecycle counters (per-tunnel snapshot; aggregated by
-	 * server_stats() across all active tunnels). */
+	/* Per-tunnel stream lifecycle counters. */
 	size_t num_streams;
 	size_t num_stream_halfopen;
 	uint_least64_t num_stream_opened;
@@ -152,18 +148,14 @@ struct tunnel_stats {
 	uint_least64_t num_stream_established;
 	uint_least64_t num_stream_succeeded;
 	uint_least64_t num_stream_failed;
-	/* Traffic byte counters (per-tunnel snapshot; aggregated by
-	 * server_stats() across all active tunnels plus closed-tunnel
-	 * accumulator in srv->counters). */
+	/* Per-tunnel traffic byte counters. */
 	uint_least64_t byt_mux_recv;
 	uint_least64_t byt_mux_sent;
 	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
 	uint_least64_t byt_push_recv;
 	uint_least64_t byt_push_sent;
-	/* SYN->SYN|ACK latency ring (ns).  stream_establish_count is the
-	 * monotonic write index; the ring holds the most recent
-	 * min(stream_establish_count, 256) samples.
-	 * Populated only for dialed tunnels (latency is measured client-side). */
+	/* SYN->SYN|ACK latency ring (ns); stream_establish_count is the monotonic
+	 * write index.  Populated only for dialed tunnels. */
 	size_t stream_establish_count;
 	int_least64_t stream_establish_ns[256];
 };
@@ -175,13 +167,12 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out);
  * On allocation failure fd is closed and the call returns silently. */
 void tunnel_open_stream(struct tunnel *t, int fd);
 
-/* Options for a single-pass reload dispatch.  Applied atomically in the
- * tunnel thread: address updates precede the drain config, ensuring any
- * reconnect triggered by the drain uses the updated addresses. */
+/* Options for a single-pass reload dispatch, applied atomically in the tunnel
+ * thread: address updates precede the drain config. */
 struct tunnel_reload_opts {
 	struct mux_config conf;
-	struct util_socket_opts mux_socket;
-	struct util_socket_opts local_socket;
+	struct conf_socket_opts mux_socket;
+	struct conf_socket_opts local_socket;
 	/* When true, the session drains: it rejects new inbound streams and
 	 * initiates graceful shutdown when its last active stream closes. */
 	bool drain;

@@ -9,11 +9,9 @@
 #ifndef MUX_HANDSHAKE_H
 #define MUX_HANDSHAKE_H
 
-/* handshake is a co-unit of session, not a standalone module.
- * It owns the hello message codec and the protocol negotiation state machine,
- * and calls back into session.c for lifecycle side-effects:
- * session_reset, session_handshake_done, session_resume_transport,
- * session_ack_trim, and session_resume_ack_recv. */
+/* handshake is a co-unit of session, not a standalone module: it owns the hello
+ * codec and the protocol negotiation state machine, and calls back into
+ * session.c and unacked.c for lifecycle side-effects. */
 
 #include "mux/frame.h"
 
@@ -25,7 +23,25 @@ struct mux_session;
 struct mux_frame;
 struct mux_header;
 
-/* Protocol hello message IDs */
+/* Session identity, resume, and peer capability state.  Embedded by value in
+ * mux_session. */
+struct handshake_ctx {
+	/* Session identity and resume state (spec §5.8) */
+	/* Server-assigned session identity, shared by both peers. */
+	unsigned char session_id[MUX_SESSION_ID_LEN];
+	/* true when session_id has been assigned (always true for server sessions) */
+	bool has_session_id : 1;
+
+	/* Peer capabilities and identity extension */
+	bool peer_rejects_inbound_streams : 1;
+	/* This node's identity announced in hello. */
+	char *identity;
+	/* Internal peer label for diagnostics; NOT sent in hello. */
+	char *peer_id;
+	/* Identity received from the peer's hello. */
+	char *peer_identity;
+};
+
 enum proto_msgid {
 	PROTO_MSG_CLIENT_HELLO = 0,
 	PROTO_MSG_SERVER_HELLO = 1,
@@ -34,7 +50,7 @@ enum proto_msgid {
 struct proto_hello {
 	int version;
 	int msgid;
-	/* Server-assigned 16-byte session identity.
+	/* Server-assigned session identity.
 	 * Present in ServerHello (always) and in ClientHello only on resume.
 	 * Absent in an initial ClientHello; check has_session_id before use. */
 	unsigned char session_id[MUX_SESSION_ID_LEN];

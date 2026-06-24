@@ -32,7 +32,12 @@
         "log": {
             "description": "Log destination. stdout and stderr write to the respective standard streams; syslog sends to the system logger; discard suppresses all output.",
             "type": "string",
-            "enum": ["stdout", "stderr", "syslog", "discard"]
+            "enum": [
+                "stdout",
+                "stderr",
+                "syslog",
+                "discard"
+            ]
         },
         "loglevel": {
             "description": "Log verbosity. 0=off, 1=fatal, 2=error, 3=warning, 4=notice, 5=info, 6=debug, 7=verbose, 8=veryverbose.",
@@ -69,6 +74,15 @@
                     "description": "Colon-separated list of TLS 1.3 ciphersuites to allow.",
                     "type": "string"
                 },
+                "sni": {
+                    "description": "Server Name Indication sent in the client TLS handshake. Set to an empty string to omit the SNI extension entirely.",
+                    "type": "string",
+                    "default": "example.com"
+                },
+                "alpn": {
+                    "description": "Comma-separated ALPN protocol list advertised (client) or selected (server) in the TLS handshake. Empty (the default) omits the ALPN extension entirely.",
+                    "type": "string"
+                },
                 "authcerts": {
                     "description": "Allowed peer certificates. Each entry is '@/path/to/cert.pem' or an inline PEM string.",
                     "type": "array",
@@ -76,6 +90,16 @@
                         "type": "string"
                     },
                     "minItems": 1
+                },
+                "buffered": {
+                    "description": "Use buffered (memory-transport) TLS connections: the TLS library encrypts and decrypts records in memory while the mux layer owns the socket I/O, instead of attaching the socket directly to the TLS library. This decouples the TLS record processing from the transport, at the cost of an extra in-memory copy per direction. May serve as a compatibility or performance workaround in some environments. Leave disabled unless you have a specific reason to enable it.",
+                    "type": "boolean",
+                    "default": false
+                },
+                "kernel_offload": {
+                    "description": "Enable kernel TLS (KTLS) offload so the kernel frames and encrypts records and can coalesce them into full segments. OpenSSL only; ignored otherwise. Ignored when 'buffered' is enabled, since buffered mode attaches no socket fd for the kernel to offload.",
+                    "type": "boolean",
+                    "default": false
                 }
             },
             "additionalProperties": false
@@ -153,19 +177,12 @@
                     "maximum": 86400,
                     "default": 15
                 },
-                "ping_timeout": {
-                    "description": "Seconds to wait for a PONG after a keepalive PING. If no reply arrives the session is suspended.",
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 86400,
-                    "default": 15
-                },
                 "keepalive": {
-                    "description": "Idle interval in seconds before sending a keepalive PING. 0 = disabled.",
+                    "description": "Interval in seconds between one-way keepalive PROBE frames (encrypted TCP-keepalive over the tunnel). The session is declared dead after roughly 1.1x this with no inbound traffic. 0 = disabled.",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 86400,
-                    "default": 300
+                    "default": 7200
                 },
                 "send_timeout": {
                     "description": "Seconds without send progress before the session is suspended and reconnected, enabling faster detection of stalled connections. 0 = disabled.",
@@ -201,6 +218,13 @@
                     "minimum": 0,
                     "maximum": 1073725440,
                     "default": 0
+                },
+                "max_frame_size": {
+                    "description": "Maximum total bytes per outbound mux frame (8-byte header + payload). Larger frames raise single-stream throughput; omit to use the default.",
+                    "type": "integer",
+                    "minimum": 1024,
+                    "maximum": 65543,
+                    "default": 16384
                 },
                 "mem_pressure": {
                     "description": "Receive-buffer memory back-pressure thresholds. hi = 0 disables.",

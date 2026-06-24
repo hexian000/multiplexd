@@ -376,7 +376,7 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		ctx->cbuf, "%-20s: %s (mode: %s)\n", "Uptime", str_uptime,
 		server_modestr(conf));
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: %zu / %ju (+%zu)\n", "Sessions",
+		ctx->cbuf, "%-20s: %zu / %" PRIuLEAST64 " (+%zu)\n", "Sessions",
 		stats->num_sessions,
 		stats->num_session_created - stats->num_session_finalized,
 		stats->num_session_halfopen);
@@ -384,7 +384,9 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		ctx->cbuf, "%-20s: %zu (+%zu)\n", "Streams", stats->num_streams,
 		stats->num_stream_halfopen);
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: %ju active (%ju fastopen), %ju passive\n",
+		ctx->cbuf,
+		"%-20s: %" PRIuLEAST64 " active (%" PRIuLEAST64
+		" fastopen), %" PRIuLEAST64 " passive\n",
 		"Stream Opens", stats->num_stream_opened,
 		stats->num_stream_fastopen, stats->num_stream_accepted);
 	if (stats->stream_establish_count > 0) {
@@ -408,28 +410,34 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 			ctx->cbuf, "%-20s: %s\n", "Stream Latency", "(never)");
 	}
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: %ju accepted, %ju served (%ju rejected)\n",
+		ctx->cbuf,
+		"%-20s: %" PRIuLEAST64 " accepted, %" PRIuLEAST64
+		" served (%" PRIuLEAST64 " rejected)\n",
 		"Mux Listener", stats->num_accepted, stats->num_served,
 		stats->num_rejected);
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: %ju accepted, %ju served\n",
+		ctx->cbuf,
+		"%-20s: %" PRIuLEAST64 " accepted, %" PRIuLEAST64 " served\n",
 		"Stream Listener", stats->num_accepted_tcp,
 		stats->num_served_tcp);
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: %ju accepted, %ju served\n", "API Listener",
-		stats->num_accepted_api, stats->num_served_api);
+		ctx->cbuf,
+		"%-20s: %" PRIuLEAST64 " accepted, %" PRIuLEAST64 " served\n",
+		"API Listener", stats->num_accepted_api, stats->num_served_api);
 #if WITH_TLS
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: %ju\n", "TLS Failures",
+		ctx->cbuf, "%-20s: %" PRIuLEAST64 "\n", "TLS Failures",
 		stats->num_tls_failures);
 #endif
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: %ju\n", "Reconnects", stats->num_reconnects);
+		ctx->cbuf, "%-20s: %" PRIuLEAST64 "\n", "Reconnects",
+		stats->num_reconnects);
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: sent %ju, recv %ju\n", "RST Frames",
-		stats->num_rst_sent, stats->num_rst_recv);
+		ctx->cbuf,
+		"%-20s: sent %" PRIuLEAST64 ", recv %" PRIuLEAST64 "\n",
+		"RST Frames", stats->num_rst_sent, stats->num_rst_recv);
 	VBUF_APPENDF(
-		ctx->cbuf, "%-20s: %ju\n", "Stream Errors",
+		ctx->cbuf, "%-20s: %" PRIuLEAST64 "\n", "Stream Errors",
 		stats->num_stream_errors);
 	{
 		const size_t frame_size = 16384;
@@ -539,9 +547,9 @@ static struct vbuffer *append_tunnel_metrics(
 		"session_bytes_total",
 		"Wire bytes on the mux link per identity session", "counter",
 		"multiplexd_session_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %ju\n"
+		"\",direction=\"rx\"} %" PRIuLEAST64 "\n"
 		"multiplexd_session_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %ju\n",
+		"\",direction=\"tx\"} %" PRIuLEAST64 "\n",
 		true, t->peer_identity, t->tunnel_index, t->byt_mux_recv,
 		t->peer_identity, t->tunnel_index, t->byt_mux_sent);
 	APPEND_TUNNEL_METRIC_F(
@@ -549,9 +557,9 @@ static struct vbuffer *append_tunnel_metrics(
 		"PUSH-frame payload bytes on the mux link per identity session",
 		"counter",
 		"multiplexd_session_payload_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %ju\n"
+		"\",direction=\"rx\"} %" PRIuLEAST64 "\n"
 		"multiplexd_session_payload_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %ju\n",
+		"\",direction=\"tx\"} %" PRIuLEAST64 "\n",
 		true, t->peer_identity, t->tunnel_index, t->byt_push_recv,
 		t->peer_identity, t->tunnel_index, t->byt_push_sent);
 	APPEND_TUNNEL_METRIC_F(
@@ -609,11 +617,14 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	do {                                                                   \
 		APPEND_METRIC_HDR(name, type, help);                           \
 		APPEND_METRIC_L(                                               \
-			name, "listener=\"%s\"", "%ju", "mux", mux_val);       \
+			name, "listener=\"%s\"", "%" PRIuLEAST64, "mux",       \
+			mux_val);                                              \
 		APPEND_METRIC_L(                                               \
-			name, "listener=\"%s\"", "%ju", "local", tcp_val);     \
+			name, "listener=\"%s\"", "%" PRIuLEAST64, "local",     \
+			tcp_val);                                              \
 		APPEND_METRIC_L(                                               \
-			name, "listener=\"%s\"", "%ju", "api", api_val);       \
+			name, "listener=\"%s\"", "%" PRIuLEAST64, "api",       \
+			api_val);                                              \
 	} while (0)
 
 	/* --- Gauges --- */
@@ -621,7 +632,8 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"uptime_seconds", "gauge", "Seconds since server start", "%.3f",
 		uptime);
 	APPEND_METRIC(
-		"sessions", "gauge", "Total mux session objects", "%ju",
+		"sessions", "gauge", "Total mux session objects",
+		"%" PRIuLEAST64,
 		stats->num_session_created - stats->num_session_finalized);
 	APPEND_METRIC(
 		"sessions_established", "gauge", "Established mux sessions",
@@ -640,16 +652,16 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 
 	APPEND_METRIC(
 		"stream_open_total", "counter",
-		"Total successful active-open stream creations", "%ju",
-		stats->num_stream_opened);
+		"Total successful active-open stream creations",
+		"%" PRIuLEAST64, stats->num_stream_opened);
 	APPEND_METRIC(
 		"stream_accept_total", "counter",
-		"Total successful passive-open stream creations", "%ju",
-		stats->num_stream_accepted);
+		"Total successful passive-open stream creations",
+		"%" PRIuLEAST64, stats->num_stream_accepted);
 	APPEND_METRIC(
 		"stream_fastopen_total", "counter",
 		"Total active-open streams whose first flight used SYN|PUSH",
-		"%ju", stats->num_stream_fastopen);
+		"%" PRIuLEAST64, stats->num_stream_fastopen);
 	if (stats->stream_establish_count > 0) {
 		APPEND_METRIC_HDR(
 			"stream_establish_latency_seconds", "summary",
@@ -667,15 +679,15 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 			"%g", "0.99",
 			(double)stats->stream_establish_p99 * 1e-9);
 		APPEND_METRIC_VAL(
-			"stream_establish_latency_seconds_count", "%ju",
-			stats->num_stream_established);
+			"stream_establish_latency_seconds_count",
+			"%" PRIuLEAST64, stats->num_stream_established);
 	} else {
 		APPEND_METRIC_HDR(
 			"stream_establish_latency_seconds", "summary",
 			"Active-open stream establishment latency from SYN to SYN|ACK");
 		APPEND_METRIC_VAL(
-			"stream_establish_latency_seconds_count", "%ju",
-			stats->num_stream_established);
+			"stream_establish_latency_seconds_count",
+			"%" PRIuLEAST64, stats->num_stream_established);
 	}
 
 	/* --- Counters --- */
@@ -689,26 +701,26 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		stats->num_served_tcp, stats->num_served_api);
 	APPEND_METRIC(
 		"connections_rejected_total", "counter",
-		"Connections dropped by startup_limit", "%ju",
+		"Connections dropped by startup_limit", "%" PRIuLEAST64,
 		stats->num_rejected);
 
 #if WITH_TLS
 	APPEND_METRIC(
-		"tls_failures_total", "counter", "TLS accept failures", "%ju",
-		stats->num_tls_failures);
+		"tls_failures_total", "counter", "TLS accept failures",
+		"%" PRIuLEAST64, stats->num_tls_failures);
 #endif
 	APPEND_METRIC(
 		"reconnects_total", "counter", "Client-mode reconnect attempts",
-		"%ju", stats->num_reconnects);
+		"%" PRIuLEAST64, stats->num_reconnects);
 	APPEND_METRIC(
-		"rst_sent_total", "counter", "RST frames sent", "%ju",
+		"rst_sent_total", "counter", "RST frames sent", "%" PRIuLEAST64,
 		stats->num_rst_sent);
 	APPEND_METRIC(
-		"rst_recv_total", "counter", "RST frames received", "%ju",
-		stats->num_rst_recv);
+		"rst_recv_total", "counter", "RST frames received",
+		"%" PRIuLEAST64, stats->num_rst_recv);
 	APPEND_METRIC(
 		"stream_errors_total", "counter",
-		"Streams aborted due to local I/O errors", "%ju",
+		"Streams aborted due to local I/O errors", "%" PRIuLEAST64,
 		stats->num_stream_errors);
 	APPEND_METRIC(
 		"recv_buffered_bytes", "gauge",
@@ -720,7 +732,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		stats->send_buffered_frames);
 	APPEND_METRIC(
 		"unacked_frames", "gauge",
-		"Frames held in the session unacked list (spec §6.7.2)", "%zu",
+		"Frames held in the session unacked list (spec §5.7.2)", "%zu",
 		stats->unacked_frames);
 
 	cbuf = append_tunnel_metrics(cbuf, stats);
@@ -850,10 +862,8 @@ static void send_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	CHECK_REVENTS(revents, EV_WRITE);
 	struct api_ctx *restrict ctx = watcher->data;
 
-	/*
-	 * Logical send buffer: wbuf (HTTP headers) followed by cbuf (body,
-	 * non-empty only for /metrics).  wpos tracks position across both.
-	 */
+	/* Logical send buffer: wbuf (headers) then cbuf (body, /metrics only);
+	 * wpos tracks position across both. */
 	const size_t wlen = ctx->wbuf.len;
 	const size_t clen = ctx->cbuf->len;
 	const size_t total = wlen + clen;
@@ -930,9 +940,7 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		return;
 	}
 	ctx->rbuf.len += n;
-	/* NUL-terminate so http_parse/http_parsehdr can use strstr.  When
-	 * len == cap the next iteration responds HTTP_ENTITY_TOO_LARGE before
-	 * parsing, so no NUL is needed. */
+	/* NUL-terminate so http_parse/http_parsehdr can use strstr. */
 	if (ctx->rbuf.len < ctx->rbuf.cap) {
 		ctx->rbuf.data[ctx->rbuf.len] = '\0';
 	}
@@ -993,9 +1001,8 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		}
 	}
 
-	/* All headers received; handle the request and start responding.
-	 * Keep the idle timeout running so a client that stops reading the
-	 * response cannot hold the connection open forever. */
+	/* All headers received; handle the request and respond.  Keep the idle
+	 * timeout running while responding. */
 	ctx->keepalive = api_should_keepalive(ctx);
 	ev_timer_again(loop, &ctx->w_timeout);
 	ev_io_stop(loop, &ctx->w_recv);

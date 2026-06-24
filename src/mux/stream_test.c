@@ -1,18 +1,168 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/* stream_test.c - white-box tests for stream.c (per-stream state machine,
+ * window/credit accounting, half-close/RST).
+ * Dependencies: stream.c #included; real leaf frame.c linked; its sched/send
+ * collaborators (sched_init/add/free/delay/wake, session_send_ctrl/flush/
+ * eager_flush/discard, wire_discard_buffers) are mocked below. */
+
 #include "mux/frame.h"
+#include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/stream.h"
 
 #include "algo/hashtable.h"
+#include "utils/slog.h"
 #include "utils/testing.h"
 
 #include <ev.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include "mux/stream.c"
+
+/* mock - collaborator mocks, frame pool, session/stream fixtures */
+
+/* sched.c: the scheduler is not under test; sched_add_stream/sched_free_streams
+ * keep the stream table coherent (the fixture relies on them), the queue
+ * arming/coalescing entry points are inert. */
+
+static void st_coalesce_cb(struct ev_loop *loop, ev_timer *w, int revents)
+{
+	(void)loop;
+	(void)w;
+	(void)revents;
+}
+
+void sched_init(struct mux_session *restrict ss)
+{
+	ev_timer_init(&ss->sched.w_coalesce, st_coalesce_cb, 0.0, 1.0);
+	ss->sched.w_coalesce.data = ss;
+}
+
+bool sched_add_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
+{
+	void *elem = s;
+	ss->sched.streams = table_set(
+		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
+	if (ss->sched.streams == NULL || elem == s) {
+		return false;
+	}
+	ev_timer_stop(ss->loop, &ss->w_idle_timeout);
+	return true;
+}
+
+static bool st_free_stream_cb(
+	const struct hashtable *table, const void *key, void *element,
+	void *data)
+{
+	(void)table;
+	(void)key;
+	(void)data;
+	stream_free(element);
+	return true;
+}
+
+void sched_free_streams(struct mux_session *restrict ss)
+{
+	ss->sched.sched_head = NULL;
+	ss->sched.sched_tail = NULL;
+	ss->sched.drr_active = NULL;
+	ss->sched.lp_head = NULL;
+	ss->sched.lp_tail = NULL;
+	for (struct mux_stream *d = ss->sched.delay_head; d != NULL;
+	     d = d->delay_next) {
+		d->delay_pending = false;
+	}
+	ss->sched.delay_head = NULL;
+	ss->unacked.stalled = false;
+	ss->sched.num_tombstones = 0;
+	ss->sched.next_stream_id = 0;
+	if (ss->sched.streams != NULL) {
+		table_iterate(ss->sched.streams, st_free_stream_cb, ss);
+		table_free(ss->sched.streams);
+		ss->sched.streams = NULL;
+	}
+}
+
+void sched_delay(
+	struct mux_session *restrict ss, struct mux_stream *restrict s,
+	const uint_fast8_t ticks)
+{
+	(void)ss;
+	(void)s;
+	(void)ticks;
+}
+
+void sched_delay_remove(struct mux_session *ss, struct mux_stream *s)
+{
+	(void)ss;
+	(void)s;
+}
+
+void sched_wake(struct mux_session *ss, struct mux_stream *s)
+{
+	(void)ss;
+	(void)s;
+}
+
+/* send.c: control-frame emission is reproduced just enough for callers that
+ * inspect the resulting wire frame (e.g. the close-sends-RST case); the flush
+ * entry points are inert. */
+bool session_send_ctrl(
+	struct mux_session *ss, uint_fast16_t stream_id, uint_fast8_t flags,
+	uint_fast32_t extra)
+{
+	struct mux_frame *const frame =
+		mux_frame_get(&ss->pool, ss->max_payload);
+	if (frame == NULL) {
+		return false;
+	}
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = (uint_least8_t)flags,
+		.length = 0,
+		.stream_id = (uint_least16_t)stream_id,
+		.extra = (uint_least16_t)extra,
+	};
+	mux_write_header(frame->data, &hdr);
+	frame->len = MUX_FRAME_HEADER_SIZE;
+	frame->pos = 0;
+	mux_frame_list_push(&ss->wire.sendbuf, frame);
+	return true;
+}
+
+void session_discard_stream_frames(
+	struct mux_session *ss, uint_fast16_t stream_id)
+{
+	(void)ss;
+	(void)stream_id;
+}
+
+void session_flush(struct mux_session *ss)
+{
+	(void)ss;
+}
+
+void session_eager_flush(struct mux_session *ss, struct mux_stream *s)
+{
+	(void)ss;
+	(void)s;
+}
+
+/* wire.c: mirror the real buffer-reset path so teardown reclaims frames. */
+void wire_discard_buffers(struct mux_session *restrict ss)
+{
+	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
+	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
+	ss->wire.sendbuf_staging = false;
+	ringbuf_reset(ss->wire.recvbuf);
+}
 
 struct frame_pool_ctx {
 	int alloc_calls;
@@ -26,10 +176,10 @@ struct stream_fixture {
 	int fds[2];
 };
 
-static struct mux_frame *stream_test_alloc(void *data)
+static struct mux_frame *stream_test_alloc(void *data, const size_t size)
 {
 	struct frame_pool_ctx *const ctx = data;
-	struct mux_frame *const frame = malloc(sizeof(*frame));
+	struct mux_frame *const frame = malloc(size);
 	if (frame != NULL) {
 		ctx->alloc_calls++;
 	}
@@ -85,6 +235,7 @@ static int setup_fixture(struct stream_fixture *restrict fx)
 		.loop = fx->loop,
 		.state = SESSION_ESTABLISHED,
 		.pool = make_pool(&fx->pool_ctx),
+		.max_payload = (uint_least32_t)mux_conf_default.max_frame_payload,
 		.stream_window = 4,
 		.wire = {
 			.rx_open = true,
@@ -92,8 +243,8 @@ static int setup_fixture(struct stream_fixture *restrict fx)
 	};
 	fx->ss.sched.streams = table_new(&mux_stream_table_opts);
 	if (fx->ss.sched.streams == NULL) {
-		close(fx->fds[0]);
-		close(fx->fds[1]);
+		(void)close(fx->fds[0]);
+		(void)close(fx->fds[1]);
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 		return -1;
@@ -103,11 +254,11 @@ static int setup_fixture(struct stream_fixture *restrict fx)
 	ev_timer_init(&fx->ss.w_idle_timeout, stream_test_timer_cb, 1.0, 0.0);
 	fx->ss.w_idle_timeout.data = &fx->ss;
 	sched_init(&fx->ss);
-	fx->ss.wire.recvbuf = ringbuf_new(4u * (size_t)MUX_FRAME_SIZE);
+	fx->ss.wire.recvbuf = ringbuf_new(4u * (size_t)MUX_MAX_FRAME_SIZE);
 	if (fx->ss.wire.recvbuf == NULL) {
 		table_free(fx->ss.sched.streams);
-		close(fx->fds[0]);
-		close(fx->fds[1]);
+		(void)close(fx->fds[0]);
+		(void)close(fx->fds[1]);
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 		return -1;
@@ -128,11 +279,11 @@ static void teardown_fixture(struct stream_fixture *restrict fx)
 	ringbuf_free(fx->ss.wire.recvbuf);
 	fx->ss.wire.recvbuf = NULL;
 	if (fx->fds[0] >= 0) {
-		close(fx->fds[0]);
+		(void)close(fx->fds[0]);
 		fx->fds[0] = -1;
 	}
 	if (fx->fds[1] >= 0) {
-		close(fx->fds[1]);
+		(void)close(fx->fds[1]);
 		fx->fds[1] = -1;
 	}
 	if (fx->loop != NULL) {
@@ -155,7 +306,8 @@ static struct mux_frame *make_payload_frame(
 	const struct mux_frame_allocator *restrict pool,
 	const size_t payload_len)
 {
-	struct mux_frame *const frame = mux_frame_get(pool);
+	struct mux_frame *const frame =
+		mux_frame_get(pool, MUX_MAX_PAYLOAD_SIZE);
 	if (frame == NULL) {
 		return NULL;
 	}
@@ -164,6 +316,8 @@ static struct mux_frame *make_payload_frame(
 	frame->pos = 0;
 	return frame;
 }
+
+/* regression - targeted cases for one stream behavior each */
 
 T_DECLARE_CASE(test_stream_grant_inc_uses_available_window)
 {
@@ -190,9 +344,9 @@ T_DECLARE_CASE(test_stream_grant_inc_scales_under_pressure)
 		return;
 	}
 
-	fx.ss.conf.mem_pressure_lo = 2 * (int)MUX_FRAME_SIZE;
-	fx.ss.conf.mem_pressure_hi = 4 * (int)MUX_FRAME_SIZE;
-	fx.ss.recv_buffered_bytes = 4 * (size_t)MUX_FRAME_SIZE;
+	fx.ss.conf.mem_pressure_lo = 2 * (int)MUX_MAX_FRAME_SIZE;
+	fx.ss.conf.mem_pressure_hi = 4 * (int)MUX_MAX_FRAME_SIZE;
+	fx.ss.recv_buffered_bytes = 4 * (size_t)MUX_MAX_FRAME_SIZE;
 	fx.ss.stream_window = 8;
 
 	struct mux_stream *const s = stream_new(&fx.ss, 1, true);
@@ -411,7 +565,7 @@ T_DECLARE_CASE(test_stream_check_ack_shrinks_recv_window_when_safe)
 	T_CHECK(s != NULL);
 
 	/* Force recv_window to a larger old value. */
-	const uint_fast32_t old_window = 8u * MUX_MAX_PAYLOAD_SIZE;
+	const uint_fast32_t old_window = (uint_fast32_t)8u * MUX_WINDOW_UNIT;
 	s->recv_window = old_window;
 	/* No outstanding credit: grant_sent == bytes_received. */
 	s->grant_sent = 0;
@@ -421,7 +575,7 @@ T_DECLARE_CASE(test_stream_check_ack_shrinks_recv_window_when_safe)
 	stream_check_ack(s);
 
 	const uint_fast32_t expected =
-		(uint_fast32_t)fx.ss.stream_window * MUX_MAX_PAYLOAD_SIZE;
+		(uint_fast32_t)fx.ss.stream_window * MUX_WINDOW_UNIT;
 	T_EXPECT_EQ(s->recv_window, expected);
 
 	stream_free(s);
@@ -444,17 +598,17 @@ T_DECLARE_CASE(test_stream_check_ack_does_not_shrink_while_outstanding)
 	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
 
-	const uint_fast32_t old_window = 8u * MUX_MAX_PAYLOAD_SIZE;
+	const uint_fast32_t old_window = (uint_fast32_t)8u * MUX_WINDOW_UNIT;
 	s->recv_window = old_window;
 
 	/* Peer still has three frames of outstanding credit, which exceeds the
 	 * two-frame target: buffered(0) + outstanding(3) > target(2). */
 	s->bytes_received = 0;
-	s->grant_sent = 3u * (uint_least32_t)MUX_MAX_PAYLOAD_SIZE;
+	s->grant_sent = 3u * (uint_least32_t)MUX_WINDOW_UNIT;
 	s->buffered_bytes = 0;
 
 	const uint_fast32_t target =
-		(uint_fast32_t)fx.ss.stream_window * MUX_MAX_PAYLOAD_SIZE;
+		(uint_fast32_t)fx.ss.stream_window * MUX_WINDOW_UNIT;
 	/* outstanding > target so the shrink must be deferred. */
 	T_CHECK((uint_fast32_t)(s->grant_sent - s->bytes_received) > target);
 
@@ -506,9 +660,7 @@ T_DECLARE_CASE(test_stream_mark_syn_sent_advances_state)
 	teardown_fixture(&fx);
 }
 
-/* -------------------------------------------------------------------------
- * Race condition tests
- * ---------------------------------------------------------------------- */
+/* Race condition tests */
 
 T_DECLARE_CASE(test_syn_received_rst_before_attach)
 {
@@ -551,8 +703,243 @@ T_DECLARE_CASE(test_halfopen_release_before_free)
 	teardown_fixture(&fx);
 }
 
+/* stream_format_tag endpoint rendering: identity strings, peer_identity,
+ * peer_id, and the fd-fallback when no address is available. */
+T_DECLARE_CASE(test_stream_format_tag_endpoint_variants)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	char buf[256];
+
+	char id_buf[] = "local-id";
+	char peer_ident[] = "peer-ident";
+	char peer_id_buf[] = "peer-id";
+
+	/* identity set -> "%s" branch for the local endpoint. */
+	fx.ss.handshake.identity = id_buf;
+	fx.ss.handshake.peer_identity = peer_ident; /* peer_identity branch */
+	T_EXPECT(stream_format_tag(buf, sizeof(buf), s) > 0);
+
+	/* No identity and an unusable fd -> "[fd:%d]" local fallback; peer_id
+	 * branch for the peer endpoint. */
+	fx.ss.handshake.identity = NULL;
+	fx.ss.handshake.peer_identity = NULL;
+	fx.ss.handshake.peer_id = peer_id_buf;
+	const int saved_fd = fx.ss.w_socket.fd;
+	fx.ss.w_socket.fd = -1;
+	T_EXPECT(stream_format_tag(buf, sizeof(buf), s) > 0);
+	fx.ss.w_socket.fd = saved_fd;
+	fx.ss.handshake.peer_id = NULL;
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* session_pressure_scale via stream_grant_inc: no buffering, below the low
+ * watermark, and the linear-decay band between watermarks. */
+T_DECLARE_CASE(test_stream_pressure_scale_branches)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.conf.mem_pressure_lo = 2 * (int)MUX_MAX_FRAME_SIZE;
+	fx.ss.conf.mem_pressure_hi = 4 * (int)MUX_MAX_FRAME_SIZE;
+	fx.ss.stream_window = 8;
+
+	struct mux_stream *const s = stream_new(&fx.ss, 1, true);
+	T_CHECK(s != NULL);
+	s->state = STREAM_ESTABLISHED;
+	s->grant_sent = 0;
+
+	/* pressure enabled but nothing buffered -> scale 1.0 */
+	fx.ss.recv_buffered_bytes = 0;
+	T_EXPECT(stream_grant_inc(s) > 0);
+	/* buffered below the low watermark -> scale 1.0 */
+	fx.ss.recv_buffered_bytes = (size_t)MUX_MAX_FRAME_SIZE;
+	T_EXPECT(stream_grant_inc(s) > 0);
+	/* buffered in the linear-decay band -> 0 < scale < 1.0 */
+	fx.ss.recv_buffered_bytes = 3 * (size_t)MUX_MAX_FRAME_SIZE;
+	T_EXPECT(stream_grant_inc(s) > 0);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* stream_recv_copy: discards data in CLOSED state, and aborts on a receive
+ * window overflow. */
+T_DECLARE_CASE(test_stream_recv_copy_closed_and_overflow)
+{
+	unsigned char payload[64] = { 0 };
+	{
+		struct stream_fixture fx;
+		if (setup_fixture(&fx) != 0) {
+			T_FATAL("setup_fixture failed");
+			return;
+		}
+		struct mux_stream *const s = make_stream(&fx, 1);
+		T_CHECK(s != NULL);
+		s->state = STREAM_CLOSED;
+		stream_recv_copy(s, payload, sizeof(payload));
+		stream_free(s);
+		teardown_fixture(&fx);
+	}
+	{
+		struct stream_fixture fx;
+		if (setup_fixture(&fx) != 0) {
+			T_FATAL("setup_fixture failed");
+			return;
+		}
+		struct mux_stream *const s = make_stream(&fx, 1);
+		T_CHECK(s != NULL);
+		s->state = STREAM_ESTABLISHED;
+		s->recv_window = 16;
+		s->buffered_bytes = 8;
+		stream_recv_copy(s, payload, sizeof(payload)); /* 8+64 > 16 */
+		T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+		stream_free(s);
+		teardown_fixture(&fx);
+	}
+}
+
+/* stream_recv_window: aborts on excessive credit and no-ops when both the
+ * outstanding credit and the increment are zero. */
+T_DECLARE_CASE(test_stream_recv_window_excessive_and_exhausted)
+{
+	{
+		struct stream_fixture fx;
+		if (setup_fixture(&fx) != 0) {
+			T_FATAL("setup_fixture failed");
+			return;
+		}
+		struct mux_stream *const s = make_stream(&fx, 1);
+		T_CHECK(s != NULL);
+		s->send_window = (uint_least32_t)INT32_MAX;
+		s->bytes_sent = 0;
+		stream_recv_window(s, 1); /* outstanding+inc > INT32_MAX */
+		T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+		stream_free(s);
+		teardown_fixture(&fx);
+	}
+	{
+		struct stream_fixture fx;
+		if (setup_fixture(&fx) != 0) {
+			T_FATAL("setup_fixture failed");
+			return;
+		}
+		struct mux_stream *const s = make_stream(&fx, 1);
+		T_CHECK(s != NULL);
+		s->send_window = 0;
+		s->bytes_sent = 0;
+		stream_recv_window(s, 0); /* outstanding == inc == 0 */
+		T_EXPECT_EQ(s->state, (enum stream_state)STREAM_ESTABLISHED);
+		stream_free(s);
+		teardown_fixture(&fx);
+	}
+}
+
+/* stream_mark_fin_sent in an unexpected state logs a warning and is otherwise
+ * inert. */
+T_DECLARE_CASE(test_stream_mark_fin_sent_unexpected_state)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	s->state = STREAM_SYN_SENT; /* neither ESTABLISHED nor CLOSE_WAIT */
+	stream_mark_fin_sent(s);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_SYN_SENT);
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* stream_check_ack early returns: CLOSED state and an already-pending ACK. */
+T_DECLARE_CASE(test_stream_check_ack_early_returns)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+
+	s->state = STREAM_CLOSED;
+	stream_check_ack(s); /* returns immediately */
+
+	s->state = STREAM_ESTABLISHED;
+	s->ack_pending = true;
+	stream_check_ack(s); /* returns after the shrink attempt */
+	T_EXPECT(s->ack_pending);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* timeout_cb aborts the stream on a local-socket send timeout. */
+T_DECLARE_CASE(test_stream_timeout_cb_aborts)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	s->state = STREAM_ESTABLISHED;
+	timeout_cb(fx.ss.loop, &s->socket.w_timeout, EV_TIMER);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* tombstone_cb decrements the tombstone count and re-enters cleanup. */
+T_DECLARE_CASE(test_stream_tombstone_cb_decrements)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	s->state = STREAM_CLOSED;
+	fx.ss.sched.num_tombstones = 1;
+	tombstone_cb(fx.ss.loop, &s->w_tombstone, EV_TIMER);
+	T_EXPECT_EQ(fx.ss.sched.num_tombstones, (size_t)0);
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* stream_close on an already-CLOSED stream is a no-op. */
+T_DECLARE_CASE(test_stream_close_idempotent_when_closed)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	s->state = STREAM_CLOSED;
+	stream_close(s);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
 int main(void)
 {
+	slog_level_ = LOG_LEVEL_VERYVERBOSE;
 	T_DECLARE_CTX(t);
 	T_RUN_CASE(t, test_stream_grant_inc_uses_available_window);
 	T_RUN_CASE(t, test_stream_grant_inc_scales_under_pressure);
@@ -569,5 +956,14 @@ int main(void)
 	T_RUN_CASE(t, test_stream_mark_syn_sent_advances_state);
 	T_RUN_CASE(t, test_syn_received_rst_before_attach);
 	T_RUN_CASE(t, test_halfopen_release_before_free);
+	T_RUN_CASE(t, test_stream_format_tag_endpoint_variants);
+	T_RUN_CASE(t, test_stream_pressure_scale_branches);
+	T_RUN_CASE(t, test_stream_recv_copy_closed_and_overflow);
+	T_RUN_CASE(t, test_stream_recv_window_excessive_and_exhausted);
+	T_RUN_CASE(t, test_stream_mark_fin_sent_unexpected_state);
+	T_RUN_CASE(t, test_stream_check_ack_early_returns);
+	T_RUN_CASE(t, test_stream_timeout_cb_aborts);
+	T_RUN_CASE(t, test_stream_tombstone_cb_decrements);
+	T_RUN_CASE(t, test_stream_close_idempotent_when_closed);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

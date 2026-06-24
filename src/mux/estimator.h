@@ -24,17 +24,6 @@ enum estimator_phase {
 	ESTIMATOR_TRACK,
 };
 
-/* Each direction of the link is estimated independently so asymmetric
- * channel capacities yield independently sized windows. */
-enum estimator_dir {
-	/* inbound PUSH bytes; sizes stream_window (our receive grant) */
-	ESTIMATOR_RX = 0,
-	/* locally-sent bytes acked by the peer; sizes session_window
-	 * (our unacked-frame send cap) */
-	ESTIMATOR_TX,
-	ESTIMATOR_DIR_COUNT,
-};
-
 /* Per-direction bandwidth/BDP estimate and window-growth phase. */
 struct estimator_dir_ctx {
 	size_t sample;
@@ -45,14 +34,15 @@ struct estimator_dir_ctx {
 	uint_least32_t stable_rounds;
 };
 
-/* Estimator state, embedded by value in mux_session.
- * Both directions share one PING/PONG probe cycle and the RTT filter;
- * at most one PING is outstanding at any time. */
+/* Estimator state, embedded by value in mux_session.  Both directions share one
+ * PING/PONG probe cycle and the RTT filter (at most one PING outstanding).  rx
+ * is fed by inbound PUSH bytes and sizes stream_window; tx is fed by peer-acked
+ * bytes and sizes session_window. */
 struct estimator_ctx {
 	int_least64_t last_probe_ns;
 	struct wndfilter rtt_wnd;
 	int_least64_t rtt;
-	struct estimator_dir_ctx dir[ESTIMATOR_DIR_COUNT];
+	struct estimator_dir_ctx rx, tx;
 	bool ping_in_flight : 1;
 };
 
@@ -60,15 +50,11 @@ struct estimator_ctx {
  * from bdp. */
 void estimator_init(struct mux_session *restrict ss, size_t bdp);
 
-/* Liveness PING, bypassing the data-driven rate limit.
- * No-op when a probe is already in flight.  Returns false on send failure. */
-bool estimator_ping(struct mux_session *restrict ss);
-
 void estimator_add(struct mux_session *restrict ss, uint_least64_t bytes);
 void estimator_add_acked(struct mux_session *restrict ss, uint_least64_t bytes);
 void estimator_calculate(struct mux_session *restrict ss, int_fast64_t sent_ns);
 
-size_t estimator_window_size(
-	const struct estimator_ctx *restrict est, enum estimator_dir dir);
+size_t estimator_rx_window_size(const struct estimator_ctx *restrict est);
+size_t estimator_tx_window_size(const struct estimator_ctx *restrict est);
 
 #endif /* MUX_ESTIMATOR_H */

@@ -9,6 +9,7 @@
 #include "mux/frame.h"
 
 #include "algo/hashtable.h"
+#include "mux/mux.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -16,8 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Prebuilt stream-table configuration.  Test translation units that only
- * need stream-table operations can link frame.c without pulling in the full
+/* Prebuilt stream-table config, so tests can link frame.c without the full
  * session state machine. */
 static uint_fast32_t stream_id_hash(const void *key, const uint_fast32_t seed)
 {
@@ -39,6 +39,12 @@ const struct table_opts mux_stream_table_opts = {
 	.hash = stream_id_hash,
 	.eq = stream_id_eq,
 	.flags = TABLE_FAST,
+};
+
+/* Defined here, with the leaf frame allocator, so it resolves in any TU that
+ * links frame.c without the full session state machine. */
+const struct mux_config mux_conf_default = {
+	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 };
 
 bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
@@ -76,6 +82,26 @@ bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 	new_rb->cap = new_cap;
 	*rbp = new_rb;
 	return true;
+}
+
+void ringbuf_shrink(struct ringbuf **restrict rbp, const size_t target_cap)
+{
+	struct ringbuf *rb = *rbp;
+	/* Keep whichever is larger: the requested floor or the live bytes. */
+	const size_t want = rb->len > target_cap ? rb->len : target_cap;
+	if (rb->cap <= want) {
+		return;
+	}
+	/* Move the live bytes to the front so realloc preserves them. */
+	ringbuf_compact(rb);
+	struct ringbuf *const new_rb =
+		realloc(rb, sizeof(struct ringbuf) + want);
+	if (new_rb == NULL) {
+		/* Realloc-smaller failed: keep the larger buffer (non-fatal). */
+		return;
+	}
+	new_rb->cap = want;
+	*rbp = new_rb;
 }
 
 /* --- Frame pointer ring --- */

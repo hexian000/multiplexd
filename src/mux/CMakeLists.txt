@@ -8,15 +8,17 @@ set_source_files_properties(
 # to compiling the sources directly (no archive symbol selection), which is
 # required for coexistence with the white-box tests below and for IPO/LTO.
 add_library(mux OBJECT
-    dispatch.c dispatch.h
+    recv.c recv.h
     estimator.c estimator.h
     frame.c frame.h
     handshake.c handshake.h
     proto_schema.gen.c proto_schema.gen.h
     mux.c mux.h
     sched.c sched.h
+    send.c send.h
     session.c session.h
     stream.c stream.h
+    unacked.c unacked.h
     wire.c wire.h
 )
 
@@ -76,24 +78,19 @@ function(add_mux_test target_name)
     add_dependencies(check ${target_name})
 endfunction()
 
-# Mux unit tests (mux_stream_send / mux_stream_recv direct I/O mode)
+# Black-box: links the entire real mux library (no mocks) and drives it through
+# its public API.  This is the only mux test that exercises the assembled stack
+# (two sessions over a socketpair on one ev_loop, plus a raw peer).
 add_mux_test(mux_test
-    dispatch.c dispatch.h
-    estimator.c estimator.h
-    mux.c mux.h
-    frame.c frame.h
-    proto_schema.gen.c proto_schema.gen.h
-    sched.c sched.h
-    session.c session.h
-    stream.c stream.h
-    wire.c wire.h
     mux_test.c
 )
+target_link_libraries(mux_test PRIVATE mux)
 
+# White-box: compiles frame.c into the TU.  frame.c is a leaf module, so no
+# collaborators are mocked.
 add_mux_test(frame_test
     frame_test.c
 )
-target_link_libraries(frame_test PRIVATE mux)
 
 add_mux_test(handshake_test
     frame.c frame.h
@@ -101,47 +98,51 @@ add_mux_test(handshake_test
     handshake_test.c
 )
 
-add_mux_test(handshake_fuzz_test
-    frame.c frame.h
-    proto_schema.gen.c proto_schema.gen.h
-    handshake_fuzz_test.c
-)
-
 add_mux_test(estimator_test
     estimator_test.c
 )
 
-add_mux_test(dispatch_test
-    frame.c frame.h
-    dispatch_test.c
-)
-
-add_mux_test(dispatch_fuzz_test
-    frame.c frame.h
-    dispatch_fuzz_test.c
-)
-
+# White-box: compiles wire.c into the TU.  wire.c is self-contained (TLS +
+# real socket I/O); only the leaf frame.c is linked, no collaborators mocked.
 add_mux_test(wire_test
     ${GENCERTS_SOURCES}
+    frame.c frame.h
     wire_test.c
 )
-target_link_libraries(wire_test PRIVATE mux)
 
 add_mux_test(sched_test
     sched_test.c
 )
 
+# White-box: compiles session.c into the TU with every sibling module mocked;
+# only the leaf frame.c is linked.
 add_mux_test(session_test
+    frame.c frame.h
     session_test.c
 )
-target_link_libraries(session_test PRIVATE mux)
 
-add_mux_test(mux_api_test
-    mux_api_test.c
+# White-box: compiles send.c into the TU with spied collaborators to reach
+# the static egress-flush state machine (session_flush / session_flush_inline).
+add_mux_test(send_test
+    send_test.c
 )
-target_link_libraries(mux_api_test PRIVATE mux)
 
+# White-box: compiles recv.c into the TU with spied collaborators to reach the
+# static frame-decode/dispatch helpers and the receive-driven window updates.
+add_mux_test(recv_test
+    recv_test.c
+)
+
+# White-box: compiles stream.c into the TU with mocked sched/send/wire
+# collaborators; only the leaf frame.c is linked.
 add_mux_test(stream_test
+    frame.c frame.h
     stream_test.c
 )
-target_link_libraries(stream_test PRIVATE mux)
+
+# White-box: compiles unacked.c into the TU.  unacked.c is a leaf that only
+# uses the real frame.c ring/allocator, so frame.c is linked, not mocked.
+add_mux_test(unacked_test
+    frame.c frame.h
+    unacked_test.c
+)

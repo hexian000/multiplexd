@@ -32,29 +32,11 @@
 	} while (0)
 #else
 #define THRD_ASSERT(expr) ((void)(0))
-#endif
+#endif /* WITH_THREADS */
 
 #define UNUSED(x) ((void)(x))
 
-#define TSTAMP_NIL (-1.0)
-
-struct util_socket_opts {
-	bool tcp_keepalive : 1;
-	bool tcp_nodelay : 1;
-	bool tcp_reuseport : 1;
-	int tcp_sndbuf;
-	int tcp_rcvbuf;
-#if WITH_TCP_NOTSENT_LOWAT
-	int tcp_notsent_lowat;
-#endif
-	int backlog;
-};
-
-/**
- * @brief Sets TCP_NOTSENT_LOWAT on the socket; no-op on unsupported platforms.
- * @param fd The socket file descriptor.
- * @param bytes The threshold in bytes.
- */
+/* Set TCP_NOTSENT_LOWAT (@p bytes threshold); no-op on unsupported platforms. */
 void socket_notsent_lowat(int fd, int bytes);
 
 #define CHECK_REVENTS(revents, accept)                                         \

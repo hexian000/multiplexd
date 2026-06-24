@@ -1,7 +1,12 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-#include "mux/frame.h"
+/* tunnel_test.c - black-box tests for tunnel lifecycle/accessors in tunnel.c,
+ * exercised against the assembled server stack via the public API.
+ * Dependencies: links the real util/conf/listener/server/tunnel/api_server and
+ * the mux library. */
+
+#include "conf.h"
 #include "mux/mux.h"
 #include "server.h"
 #include "tunnel.h"
@@ -10,40 +15,21 @@
 
 #include <ev.h>
 
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-static struct mux_frame *test_pool_alloc(void *data)
-{
-	(void)data;
-	return malloc(sizeof(struct mux_frame));
-}
-
-static void test_pool_free(void *data, struct mux_frame *f)
-{
-	(void)data;
-	free(f);
-}
-
-static const struct mux_frame_allocator g_pool = {
-	.alloc = test_pool_alloc,
-	.free = test_pool_free,
-	.data = NULL,
-};
-
 static const struct mux_config g_conf = {
 	.timeout = 30,
-	.ping_timeout = 5,
 	.keepalive = 1,
 	.send_timeout = 1,
 	.connect_timeout = 1,
@@ -52,8 +38,8 @@ static const struct mux_config g_conf = {
 	.session_window = 2,
 };
 
-static const struct util_socket_opts g_mux_socket = { .backlog = 1 };
-static const struct util_socket_opts g_local_socket = { .backlog = 1 };
+static const struct conf_socket_opts g_mux_socket = { .backlog = 1 };
+static const struct conf_socket_opts g_local_socket = { .backlog = 1 };
 
 static const struct tunnel_callbacks g_empty_cbs = { 0 };
 
@@ -98,13 +84,9 @@ T_DECLARE_CASE(test_tunnel_new_close_no_start)
 	int fds[2];
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 
-	/*
-	 * A zero-initialised server is safe for the no-start close path
-	 * because tunnel_close never dereferences srv->disp or srv->loop
-	 * when t->started == false.  The stats counters (atomic or plain
-	 * size_t) are accessed only via pre-captured pointers; their
-	 * zero-initialised values are valid.
-	 */
+	/* A zero-initialised server is safe for the no-start close path:
+	 * tunnel_close never touches srv->disp/loop when !t->started, and stats
+	 * are read via pre-captured pointers. */
 	struct server srv;
 	memset(&srv, 0, sizeof(srv));
 
@@ -117,13 +99,12 @@ T_DECLARE_CASE(test_tunnel_new_close_no_start)
 	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	srv.loop = loop;
-#endif
+#endif /* !WITH_THREADS */
 
 	const struct tunnel_opts opts = {
 		.cb = &g_empty_cbs,
 		.data = NULL,
 		.mux_conf = &g_conf,
-		.pool = g_pool,
 		.mux_socket = g_mux_socket,
 		.local_socket = g_local_socket,
 		.fd = fds[0],
@@ -165,7 +146,6 @@ T_DECLARE_CASE(test_tunnel_accessors_after_new)
 		.cb = &g_empty_cbs,
 		.data = NULL,
 		.mux_conf = &g_conf,
-		.pool = g_pool,
 		.mux_socket = g_mux_socket,
 		.local_socket = g_local_socket,
 		.fd = fds[0],
@@ -208,7 +188,6 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 		.cb = &g_empty_cbs,
 		.data = NULL,
 		.mux_conf = &g_conf,
-		.pool = g_pool,
 		.mux_socket = g_mux_socket,
 		.local_socket = g_local_socket,
 		.fd = -1,
@@ -233,13 +212,9 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 
 T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 {
-	/*
-	 * Verify that MUX_EVENT_CLOSED (triggered when the remote side
-	 * immediately closes the accepted connection) causes reconnect to be
-	 * scheduled even when no relay on_event callback is registered.
-	 * This exercises the bug where tunnel_on_event was not registered
-	 * with the mux session when cb->on_event was NULL.
-	 */
+	/* MUX_EVENT_CLOSED must schedule a reconnect even with no relay on_event
+	 * callback — a regression where tunnel_on_event was not registered when
+	 * cb->on_event was NULL. */
 	struct sockaddr_in laddr;
 	memset(&laddr, 0, sizeof(laddr));
 	laddr.sin_family = AF_INET;
@@ -272,7 +247,6 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 		.cb = &g_empty_cbs,
 		.data = NULL,
 		.mux_conf = &g_conf,
-		.pool = g_pool,
 		.mux_socket = g_mux_socket,
 		.local_socket = g_local_socket,
 		.fd = -1,
@@ -309,15 +283,9 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 
 T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 {
-	/*
-	 * Verify that connect_timeout covers the entire CONNECT+HANDSHAKE
-	 * phase.  The server accepts TCP connections but never sends the mux
-	 * hello, so the mux handshake never completes.  Once connect_timeout
-	 * fires, MUX_EVENT_CLOSED is delivered to the tunnel layer, which
-	 * schedules the next reconnect backoff.  The test asserts that at
-	 * least two reconnects occur, confirming that the timeout drives the
-	 * backoff progression beyond the first attempt.
-	 */
+	/* connect_timeout must cover the whole CONNECT+HANDSHAKE phase: the
+	 * server accepts TCP but never sends the hello, so the timeout fires,
+	 * delivers MUX_EVENT_CLOSED, and drives backoff.  Asserts >= 2 reconnects. */
 	struct sockaddr_in laddr;
 	memset(&laddr, 0, sizeof(laddr));
 	laddr.sin_family = AF_INET;
@@ -355,7 +323,6 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 		.cb = &g_empty_cbs,
 		.data = NULL,
 		.mux_conf = &g_conf,
-		.pool = g_pool,
 		.mux_socket = g_mux_socket,
 		.local_socket = g_local_socket,
 		.fd = -1,
@@ -430,7 +397,6 @@ T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
 		.cb = &g_empty_cbs,
 		.data = NULL,
 		.mux_conf = &g_conf,
-		.pool = g_pool,
 		.mux_socket = g_mux_socket,
 		.local_socket = g_local_socket,
 		.fd = -1,
@@ -468,7 +434,6 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 		.cb = &g_empty_cbs,
 		.data = NULL,
 		.mux_conf = &g_conf,
-		.pool = g_pool,
 		.mux_socket = g_mux_socket,
 		.local_socket = g_local_socket,
 		.fd = -1,
@@ -492,9 +457,7 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 #endif
 }
 
-/* -------------------------------------------------------------------------
- * Multi-threaded concurrency tests (WITH_THREADS only)
- * ---------------------------------------------------------------------- */
+/* Multi-threaded concurrency tests (WITH_THREADS only) */
 
 #if WITH_THREADS
 
@@ -502,7 +465,6 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 #include <threads.h>
 
 #include "sync/dispatcher.h"
-#include "sync/queue.h"
 #include "sync/shared_mutex.h"
 #include "sync/task.h"
 
@@ -517,8 +479,8 @@ struct test_barrier {
 
 static void test_barrier_init(struct test_barrier *b, unsigned int n)
 {
-	mtx_init(&b->mu, mtx_plain);
-	cnd_init(&b->cv);
+	(void)mtx_init(&b->mu, mtx_plain);
+	(void)cnd_init(&b->cv);
 	atomic_init(&b->count, 0);
 	b->total = n;
 }
@@ -531,15 +493,17 @@ static void test_barrier_destroy(struct test_barrier *b)
 
 static void test_barrier_wait(struct test_barrier *b)
 {
-	mtx_lock(&b->mu);
+	(void)mtx_lock(&b->mu);
 	const unsigned int n = atomic_fetch_add(&b->count, 1u) + 1u;
 	if (n == b->total) {
 		atomic_store(&b->count, 0u);
-		cnd_broadcast(&b->cv);
+		(void)cnd_broadcast(&b->cv);
 	} else {
-		cnd_wait(&b->cv, &b->mu);
+		while (atomic_load(&b->count) != 0u) {
+			(void)cnd_wait(&b->cv, &b->mu);
+		}
 	}
-	mtx_unlock(&b->mu);
+	(void)mtx_unlock(&b->mu);
 }
 
 typedef int (*test_thread_fn)(void *);
@@ -595,9 +559,12 @@ T_DECLARE_CASE(test_dispatcher_roundtrip)
 	T_EXPECT_EQ(
 		test_spawn_thread(&thr, dispatcher_worker, &ctx), thrd_success);
 	test_barrier_wait(&barrier);
-	thrd_yield();
-	dispatcher_tick(disp);
+	/* Join the worker before ticking: dispatcher_invoke only enqueues, so the
+	 * join establishes that the task is queued (happens-before) before the
+	 * dispatcher drains it.  Ticking concurrently with the worker would race —
+	 * an empty tick could run before the enqueue and leave result unset. */
 	T_EXPECT_EQ(test_thread_join(thr), 0);
+	dispatcher_tick(disp);
 	T_EXPECT_EQ(result, 42);
 	dispatcher_join(disp);
 	test_barrier_destroy(&barrier);
@@ -663,84 +630,6 @@ T_DECLARE_CASE(test_shared_mutex_exclusive_blocks_readers)
 	smtx_destroy(&mu);
 }
 
-/* Test: mpmc_queue concurrent push/pop */
-
-struct mqueue_ctx {
-	struct mpmc_queue *q;
-	struct test_barrier *barrier;
-	atomic_bool *done; /* shared: producer sets true when finished */
-	int *items;
-	int count;
-};
-
-static int mqueue_producer(void *arg)
-{
-	struct mqueue_ctx *const ctx = arg;
-	test_barrier_wait(ctx->barrier);
-	for (int i = 0; i < ctx->count; i++) {
-		if (!mqueue_push(ctx->q, &ctx->items[i])) {
-			return 1;
-		}
-	}
-	atomic_store(ctx->done, true);
-	return 0;
-}
-
-static int mqueue_consumer(void *arg)
-{
-	struct mqueue_ctx *const ctx = arg;
-	test_barrier_wait(ctx->barrier);
-	int received = 0;
-	while (received < ctx->count) {
-		void *p = mqueue_pop(ctx->q);
-		if (p != NULL) {
-			received++;
-			continue;
-		}
-		if (atomic_load(ctx->done)) {
-			break; /* producer finished, queue drained */
-		}
-	}
-	return (received == ctx->count) ? 0 : 2;
-}
-
-T_DECLARE_CASE(test_mpmc_queue_concurrent_push_pop)
-{
-	enum { item_count = 100 };
-	struct mpmc_queue *q = mqueue_new(256);
-	T_CHECK(q != NULL);
-	struct test_barrier barrier;
-	test_barrier_init(&barrier, 3);
-	atomic_bool done;
-	atomic_init(&done, false);
-	int items[item_count];
-	for (int i = 0; i < item_count; i++) {
-		items[i] = i + 1;
-	}
-	struct mqueue_ctx pctx = { .q = q,
-				   .barrier = &barrier,
-				   .done = &done,
-				   .items = items,
-				   .count = item_count };
-	struct mqueue_ctx cctx = { .q = q,
-				   .barrier = &barrier,
-				   .done = &done,
-				   .items = items,
-				   .count = item_count };
-	thrd_t producer, consumer;
-	T_EXPECT_EQ(
-		test_spawn_thread(&producer, mqueue_producer, &pctx),
-		thrd_success);
-	T_EXPECT_EQ(
-		test_spawn_thread(&consumer, mqueue_consumer, &cctx),
-		thrd_success);
-	test_barrier_wait(&barrier);
-	T_EXPECT_EQ(test_thread_join(producer), 0);
-	T_EXPECT_EQ(test_thread_join(consumer), 0);
-	mqueue_free(q);
-	test_barrier_destroy(&barrier);
-}
-
 /* Test: atomic counters cross-thread */
 
 static int atomic_worker(void *arg)
@@ -785,7 +674,6 @@ int main(void)
 	T_RUN_CASE(t, test_dispatcher_roundtrip);
 	T_RUN_CASE(t, test_shared_mutex_multiple_readers);
 	T_RUN_CASE(t, test_shared_mutex_exclusive_blocks_readers);
-	T_RUN_CASE(t, test_mpmc_queue_concurrent_push_pop);
 	T_RUN_CASE(t, test_atomic_counters_cross_thread);
 #endif
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;

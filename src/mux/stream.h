@@ -115,7 +115,7 @@ struct mux_stream {
 	/* Cumulative credit granted to the peer so far, in bytes (wrapping). */
 	uint_least32_t grant_sent;
 	int_least64_t syn_sent_ns;
-	/* One-shot linger before CLOSED cleanup re-enters EV_IDLE. */
+	/* One-shot linger before CLOSED cleanup re-enters the lp queue. */
 	ev_timer w_tombstone;
 };
 
@@ -168,7 +168,7 @@ void stream_start(struct mux_stream *s);
 
 struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s);
 
-void stream_on_send(struct mux_stream *restrict s);
+void stream_notify_recv(struct mux_stream *restrict s);
 
 void stream_recv_copy(
 	struct mux_stream *restrict s, const unsigned char *restrict payload,

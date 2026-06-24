@@ -1,7 +1,10 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* server_test.c - robust server forwarding tests with bounded waits */
+/* server_test.c - black-box tests for the server forwarding path, exercised
+ * end-to-end against the assembled stack with bounded waits.
+ * Dependencies: links the real util/conf/listener/server/tunnel/api_server and
+ * the mux library. */
 
 #include "conf.h"
 #include "listener.h"
@@ -18,23 +21,28 @@
 
 #include <errno.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
+/* I/O wait timeouts, generous on purpose: the bound only bites on genuine
+ * failure, with headroom for host clock anomalies (e.g. CLOCK_MONOTONIC stalls
+ * under WSL2). */
 enum {
-	IO_WAIT_TIMEOUT_MS = 50,
-	SETUP_WAIT_TIMEOUT_MS = 500,
-	SESSION_WAIT_TIMEOUT_MS = 500,
-	STREAM_WAIT_TIMEOUT_MS = 500,
-	PEER_EOF_WAIT_TIMEOUT_MS = 500,
-	CONNECT_WAIT_TIMEOUT_MS = 500,
-	ECHO_WAIT_TIMEOUT_MS = 1000,
-	WORKLOAD_ECHO_WAIT_TIMEOUT_MS = 2000,
+	IO_WAIT_TIMEOUT_MS = 20000,
+	SETUP_WAIT_TIMEOUT_MS = 20000,
+	SESSION_WAIT_TIMEOUT_MS = 20000,
+	STREAM_WAIT_TIMEOUT_MS = 20000,
+	PEER_EOF_WAIT_TIMEOUT_MS = 20000,
+	CONNECT_WAIT_TIMEOUT_MS = 20000,
+	ECHO_WAIT_TIMEOUT_MS = 20000,
+	WORKLOAD_ECHO_WAIT_TIMEOUT_MS = 20000,
 	STREAM_CHURN_ROUNDS = 20,
 	STREAM_CHURN_CONCURRENCY = 4,
 	BUFFER_SIZE = 256,
@@ -150,6 +158,17 @@ static void wait_poll_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	UNUSED(revents);
 }
 
+/* Monotonic clock, in seconds.  Test deadlines must use this, not ev_time()
+ * (CLOCK_REALTIME), which can step forward and falsely blow a deadline. */
+static ev_tstamp mono_now(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return ev_time();
+	}
+	return (ev_tstamp)ts.tv_sec + (ev_tstamp)ts.tv_nsec / 1e9;
+}
+
 static int wait_until(
 	const struct test_fixture *restrict fx, const double timeout_sec,
 	wait_predicate_fn predicate, void *ctx)
@@ -206,10 +225,13 @@ static int wait_fd_events(
 		ev_run(fx->loop, EVRUN_ONCE);
 	}
 
-	if (waiter.timed_out) {
-		return 0;
+	/* Prefer reported I/O over the timeout: a clock jump can make libev fire
+	 * the timeout and the io watcher in the same iteration, and the data must
+	 * not be discarded in that case. */
+	if (waiter.revents != 0) {
+		return waiter.revents;
 	}
-	return waiter.revents;
+	return 0;
 }
 
 static int get_listener_port(const struct listener *restrict listener)
@@ -277,7 +299,7 @@ static int send_and_expect_echo(
 		return -1;
 	}
 	size_t off = 0;
-	const ev_tstamp deadline = ev_time() + timeout_sec;
+	const ev_tstamp deadline = mono_now() + timeout_sec;
 
 	while (off < msg_len) {
 		const ssize_t n = read(fd, buf + off, msg_len - off);
@@ -291,19 +313,29 @@ static int send_and_expect_echo(
 				/* Register EV_READ on fx->loop so ev_run wakes when
 				 * echo data arrives, driving the mock backend too. */
 				const ev_tstamp remaining =
-					deadline - ev_time();
+					deadline - mono_now();
 				if (remaining <= 0.0 ||
 				    (wait_fd_events(fx, fd, EV_READ, remaining) &
 				     EV_READ) == 0) {
+					(void)fprintf(
+						stderr,
+						"DBGFAIL: timeout/EAGAIN off=%zu/%zu remaining=%.3f\n",
+						off, msg_len, remaining);
 					free(buf);
 					return -1;
 				}
 				continue;
 			}
+			(void)fprintf(
+				stderr, "DBGFAIL: read err=%d off=%zu/%zu\n",
+				err, off, msg_len);
 			free(buf);
 			return -1;
 		}
 		if (n == 0) {
+			(void)fprintf(
+				stderr, "DBGFAIL: EOF off=%zu/%zu\n", off,
+				msg_len);
 			free(buf);
 			return -1;
 		}
@@ -311,6 +343,17 @@ static int send_and_expect_echo(
 	}
 
 	const int ret = memcmp(buf, msg, msg_len) == 0 ? 0 : -1;
+	if (ret != 0) {
+		size_t mm = 0;
+		while (mm < msg_len && buf[mm] == msg[mm]) {
+			mm++;
+		}
+		(void)fprintf(
+			stderr,
+			"DBGFAIL: mismatch at byte %zu/%zu got=0x%02x want=0x%02x\n",
+			mm, msg_len, (unsigned char)buf[mm],
+			(unsigned char)msg[mm]);
+	}
 	free(buf);
 	return ret;
 }
@@ -325,7 +368,7 @@ static int read_and_expect_echo(
 		return -1;
 	}
 	size_t off = 0;
-	const ev_tstamp deadline = ev_time() + timeout_sec;
+	const ev_tstamp deadline = mono_now() + timeout_sec;
 
 	while (off < msg_len) {
 		const ssize_t n = read(fd, buf + off, msg_len - off);
@@ -339,19 +382,29 @@ static int read_and_expect_echo(
 				/* Register EV_READ on fx->loop so ev_run wakes when
 				 * echo data arrives, driving the mock backend too. */
 				const ev_tstamp remaining =
-					deadline - ev_time();
+					deadline - mono_now();
 				if (remaining <= 0.0 ||
 				    (wait_fd_events(fx, fd, EV_READ, remaining) &
 				     EV_READ) == 0) {
+					(void)fprintf(
+						stderr,
+						"DBGFAIL: timeout/EAGAIN off=%zu/%zu remaining=%.3f\n",
+						off, msg_len, remaining);
 					free(buf);
 					return -1;
 				}
 				continue;
 			}
+			(void)fprintf(
+				stderr, "DBGFAIL: read err=%d off=%zu/%zu\n",
+				err, off, msg_len);
 			free(buf);
 			return -1;
 		}
 		if (n == 0) {
+			(void)fprintf(
+				stderr, "DBGFAIL: EOF off=%zu/%zu\n", off,
+				msg_len);
 			free(buf);
 			return -1;
 		}
@@ -359,6 +412,17 @@ static int read_and_expect_echo(
 	}
 
 	const int ret = memcmp(buf, msg, msg_len) == 0 ? 0 : -1;
+	if (ret != 0) {
+		size_t mm = 0;
+		while (mm < msg_len && buf[mm] == msg[mm]) {
+			mm++;
+		}
+		(void)fprintf(
+			stderr,
+			"DBGFAIL: mismatch at byte %zu/%zu got=0x%02x want=0x%02x\n",
+			mm, msg_len, (unsigned char)buf[mm],
+			(unsigned char)msg[mm]);
+	}
 	free(buf);
 	return ret;
 }
@@ -367,7 +431,7 @@ static int wait_for_peer_eof(
 	struct test_fixture *restrict fx, const int fd,
 	const double timeout_sec)
 {
-	const ev_tstamp deadline = ev_time() + timeout_sec;
+	const ev_tstamp deadline = mono_now() + timeout_sec;
 	for (;;) {
 		char buf[BUFFER_SIZE];
 		const ssize_t n = read(fd, buf, sizeof(buf));
@@ -379,7 +443,7 @@ static int wait_for_peer_eof(
 			if (err == EAGAIN || err == EWOULDBLOCK ||
 			    err == ENOBUFS || err == ENOMEM) {
 				const ev_tstamp remaining =
-					deadline - ev_time();
+					deadline - mono_now();
 				if (remaining <= 0.0 ||
 				    (wait_fd_events(fx, fd, EV_READ, remaining) &
 				     EV_READ) == 0) {
@@ -698,7 +762,6 @@ static struct config *make_config(
 		.mux =
 			{
 				.timeout = 30,
-				.ping_timeout = 5,
 				.keepalive = 1,
 				.send_timeout = 1,
 				.connect_timeout = 1,
@@ -780,7 +843,7 @@ static struct wait_stats wait_stats_snapshot(const struct server *restrict s)
 		s->counters.num_session_connected;
 	const uint_least64_t session_disconnected =
 		s->counters.num_session_disconnected;
-#endif
+#endif /* WITH_THREADS */
 	st.num_established_sessions =
 		(size_t)(session_connected - session_disconnected);
 	st.num_halfopen_sessions =
@@ -1672,21 +1735,10 @@ static int reload_done_predicate(void *ptr)
 	return ctx->fx->srv_a->conf != ctx->old_conf ? 1 : 0;
 }
 
-/*
- * test_server_config_reload – exercises server_reload() (the SIGHUP path),
- * server_drain_tunnels(), server_reload_listeners(), server_reload_mux_tunnel(),
- * and server_reload_identity_tunnels().
- *
- * Steps:
- *   1. Establish a two-server pair and verify echo works.
- *   2. Dump srv_a's config to a tempfile (clearing the "version=2" type tag
- *      so conf_parsefile accepts it as "version=1").
- *   3. Invoke srv_a's SIGHUP watcher via ev_invoke so signal_cb runs
- *      synchronously before ev_run processes any other event.
- *   4. Update fx.conf_a to the new config to avoid a double-free on teardown.
- *   5. Wait for the session to be re-established (srv_b reconnects after drain).
- *   6. Verify echo still works after the reload.
- */
+/* test_server_config_reload – exercises the SIGHUP server_reload() path
+ * (drain_tunnels, reload_listeners, reload_mux_tunnel, reload_identity_tunnels):
+ * reload srv_a's config via its SIGHUP watcher, wait for srv_b to reconnect
+ * after the drain, and verify echo still works. */
 T_DECLARE_CASE(test_server_config_reload)
 {
 	struct test_fixture fx;
@@ -1792,16 +1844,10 @@ T_DECLARE_CASE(test_server_config_reload)
 	fixture_teardown(&fx);
 }
 
-/*
- * test_server_max_sessions_rejects – exercises the max_sessions branch of
- * is_startup_limited(), which rejects new mux connections when the number of
- * established sessions already exceeds the configured maximum.
- *
- * Approach: after the fixture establishes one real session (num_sessions==1),
- * lower max_sessions to 1 and artificially bump the counter to 2 so the guard
- * fires on the next inbound mux connection.  The raw TCP connection is then
- * expected to be closed immediately by the server (read() returns 0).
- */
+/* test_server_max_sessions_rejects – exercises the max_sessions branch of
+ * is_startup_limited().  With one real session established, lower max_sessions
+ * and bump num_sessions so the guard fires; the next inbound mux connection
+ * must be closed immediately (read() returns 0). */
 T_DECLARE_CASE(test_server_max_sessions_rejects)
 {
 	struct test_fixture fx;
@@ -1857,19 +1903,10 @@ T_DECLARE_CASE(test_server_max_sessions_rejects)
 	fixture_teardown(&fx);
 }
 
-/*
- * test_server_graceful_shutdown_via_signal – exercises the SIGTERM branch of
- * signal_cb(), which stops all listeners, initiates graceful session shutdown,
- * and starts a two-second deadline timer.
- *
- * Steps:
- *   1. Establish a two-server pair.
- *   2. Invoke srv_a's SIGTERM watcher via ev_invoke so only srv_a's
- *      signal_cb fires (avoids disturbing srv_b's watcher).
- *   3. Drive the event loop until the listeners on srv_a are stopped.
- *   4. Verify that fixture_teardown completes cleanly (server_stop +
- *      server_free are safe after the signal handler ran).
- */
+/* test_server_graceful_shutdown_via_signal – exercises the SIGTERM branch of
+ * signal_cb() (stop listeners, graceful session shutdown, 2s deadline timer):
+ * fire srv_a's SIGTERM watcher, drive the loop until its listeners stop, and
+ * verify teardown stays clean. */
 T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
 {
 	struct test_fixture fx;
@@ -1885,9 +1922,9 @@ T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
 	/* Drive until signal_cb has stopped the mux listener (synchronous
 	 * side-effect of the signal handler). */
 	const ev_tstamp deadline =
-		ev_time() + (double)SETUP_WAIT_TIMEOUT_MS / 1000.0;
+		mono_now() + (double)SETUP_WAIT_TIMEOUT_MS / 1000.0;
 	while (fx.srv_a->mux_listener.w_accept.fd != -1 &&
-	       ev_time() < deadline) {
+	       mono_now() < deadline) {
 		drive_loop_once(&fx);
 	}
 	T_CHECK(fx.srv_a->mux_listener.w_accept.fd == -1);

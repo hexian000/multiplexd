@@ -137,7 +137,7 @@ bool json_unmarshal_proto(
 	if (root_.type != JSON_OBJECT) { return false; }
 	json_iter iter_ = root_.iter;
 	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	uint64_t required_ = 0;
+	uint_fast64_t required_ = 0;
 	int next_;
 
 	while ((next_ = json_obj_next(json, &length, &iter_,
@@ -212,9 +212,9 @@ fail_:
 	if (r_ < 0) { return -1; } \
 	n_ += r_; \
 } while (0)
-#define EMIT_SUB(fn, arg) do { \
+#define EMIT_SUB(fn, arg, d) do { \
 	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
-	r_ = (fn)(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (arg)); \
+	r_ = (fn)(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (arg), indent, (d)); \
 	if (r_ < 0) { return -1; } \
 	n_ += r_; \
 } while (0)
@@ -227,29 +227,53 @@ fail_:
 	} \
 	n_ += (int)l_; \
 } while (0)
+#define EMIT_RAW(s, len) do { \
+	const size_t rl_ = (len); \
+	if (buf != NULL && (size_t)n_ < bufsz) { \
+		const size_t cap_ = bufsz - (size_t)n_; \
+		memcpy(buf + n_, (s), rl_ < cap_ ? rl_ : cap_); \
+	} \
+	n_ += (int)rl_; \
+} while (0)
+#define EMIT_INDENT(d) do { \
+	if (indent != NULL) { \
+		EMIT('\n'); \
+		for (int id_ = 0; id_ < (d); id_++) { EMIT_RAW(indent, ind_len_); } \
+	} \
+} while (0)
+#define EMIT_COLON() do { \
+	EMIT(':'); \
+	if (indent != NULL) { EMIT(' '); } \
+} while (0)
 
-static int json_marshal_proto_extensions(
-	char *buf, size_t bufsz, const struct json_proto_extensions *obj)
+static int json_marshal_proto_extensions_impl(
+	char *buf, size_t bufsz, const struct json_proto_extensions *obj,
+	const char *indent, int depth)
 {
 	int n_ = 0;
 	int r_ = 0;
 	(void)r_;
+	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
+	(void)ind_len_;
+	(void)depth;
 
 	EMIT('{');
 	const int n_start_ = n_;
 
 	if (obj->identity.str != NULL) {
+		EMIT_INDENT(depth + 1);
 		EMIT('"');
 		EMIT_LIT("identity");
 		EMIT('"');
-		EMIT(':');
+		EMIT_COLON();
 		EMIT_STR(obj->identity.str, obj->identity.len);
 		EMIT(',');
 	}
+	EMIT_INDENT(depth + 1);
 	EMIT('"');
 	EMIT_LIT("reject_inbound");
 	EMIT('"');
-	EMIT(':');
+	EMIT_COLON();
 	if (obj->reject_inbound) {
 		EMIT_LIT("true");
 	} else {
@@ -257,7 +281,76 @@ static int json_marshal_proto_extensions(
 	}
 	EMIT(',');
 
-	if (n_ > n_start_) { n_--; }
+	if (n_ > n_start_) {
+		n_--;
+		EMIT_INDENT(depth);
+	}
+	EMIT('}');
+	if (buf != NULL && bufsz > 0) {
+		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
+	}
+
+	return n_;
+}
+
+static int json_marshal_proto_impl(
+	char *buf, size_t bufsz, const struct json_proto *obj,
+	const char *indent, int depth)
+{
+	int n_ = 0;
+	int r_ = 0;
+	(void)r_;
+	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
+	(void)ind_len_;
+	(void)depth;
+
+	EMIT('{');
+	const int n_start_ = n_;
+
+	EMIT_INDENT(depth + 1);
+	EMIT('"');
+	EMIT_LIT("extensions");
+	EMIT('"');
+	EMIT_COLON();
+	EMIT_SUB(json_marshal_proto_extensions_impl, &obj->extensions, depth + 1);
+	EMIT(',');
+	EMIT_INDENT(depth + 1);
+	EMIT('"');
+	EMIT_LIT("msgid");
+	EMIT('"');
+	EMIT_COLON();
+	EMITF("%jd", (intmax_t)obj->msgid);
+	EMIT(',');
+	EMIT_INDENT(depth + 1);
+	EMIT('"');
+	EMIT_LIT("resume_seq");
+	EMIT('"');
+	EMIT_COLON();
+	EMITF("%u", obj->resume_seq);
+	EMIT(',');
+	if (obj->session_id.str != NULL) {
+		EMIT_INDENT(depth + 1);
+		EMIT('"');
+		EMIT_LIT("session_id");
+		EMIT('"');
+		EMIT_COLON();
+		EMIT_STR(obj->session_id.str, obj->session_id.len);
+		EMIT(',');
+	}
+	if (obj->type.str != NULL) {
+		EMIT_INDENT(depth + 1);
+		EMIT('"');
+		EMIT_LIT("type");
+		EMIT('"');
+		EMIT_COLON();
+		EMIT_STR(obj->type.str, obj->type.len);
+		EMIT(',');
+	}
+
+	if (n_ > n_start_) {
+		n_--;
+		EMIT_INDENT(depth);
+	}
 	EMIT('}');
 	if (buf != NULL && bufsz > 0) {
 		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
@@ -267,57 +360,10 @@ static int json_marshal_proto_extensions(
 }
 
 int json_marshal_proto(
-	char *buf, size_t bufsz, const struct json_proto *obj)
+	char *buf, size_t bufsz, const struct json_proto *obj,
+	const char *indent)
 {
-	int n_ = 0;
-	int r_ = 0;
-	(void)r_;
-
-	EMIT('{');
-	const int n_start_ = n_;
-
-	EMIT('"');
-	EMIT_LIT("extensions");
-	EMIT('"');
-	EMIT(':');
-	EMIT_SUB(json_marshal_proto_extensions, &obj->extensions);
-	EMIT(',');
-	EMIT('"');
-	EMIT_LIT("msgid");
-	EMIT('"');
-	EMIT(':');
-	EMITF("%jd", (intmax_t)obj->msgid);
-	EMIT(',');
-	EMIT('"');
-	EMIT_LIT("resume_seq");
-	EMIT('"');
-	EMIT(':');
-	EMITF("%u", obj->resume_seq);
-	EMIT(',');
-	if (obj->session_id.str != NULL) {
-		EMIT('"');
-		EMIT_LIT("session_id");
-		EMIT('"');
-		EMIT(':');
-		EMIT_STR(obj->session_id.str, obj->session_id.len);
-		EMIT(',');
-	}
-	if (obj->type.str != NULL) {
-		EMIT('"');
-		EMIT_LIT("type");
-		EMIT('"');
-		EMIT(':');
-		EMIT_STR(obj->type.str, obj->type.len);
-		EMIT(',');
-	}
-
-	if (n_ > n_start_) { n_--; }
-	EMIT('}');
-	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
-	}
-
-	return n_;
+	return json_marshal_proto_impl(buf, bufsz, obj, indent, 0);
 }
 
 
@@ -326,5 +372,8 @@ int json_marshal_proto(
 #undef EMIT_STR
 #undef EMIT_SUB
 #undef EMIT_LIT
+#undef EMIT_RAW
+#undef EMIT_INDENT
+#undef EMIT_COLON
 
 /** @} */

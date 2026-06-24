@@ -3,13 +3,17 @@
 cd "$(dirname "$0")"
 set -ex
 
-case "$1" in
-"gen")
-    # generate code from schemas
+gen_schema() {
     # conf: parsed once at startup — optimize for binary size
     python3 scripts/gen_schema.py --prefix json_ --optimize size src/conf_schema.json
     # proto: parsed on every mux frame — optimize for speed
     python3 scripts/gen_schema.py --prefix json_ --optimize fast src/mux/proto_schema.json
+}
+
+case "$1" in
+"gen")
+    # generate code from schemas
+    gen_schema
     ;;
 "c")
     # clean artifacts
@@ -111,6 +115,7 @@ case "$1" in
     cmake \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
         -DCMAKE_BUILD_TYPE="Release" \
+        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
         -DENABLE_THREADS=ON \
         ..
     cp compile_commands.json ../
@@ -120,6 +125,7 @@ case "$1" in
     ;;
 "d")
     # rebuild for debug
+    gen_schema
     if command -v clang-format >/dev/null; then
         find src -type f -regex '.*\.[hc]' -not -regex '.*\.gen\.[hc]' -exec clang-format -i {} +
     fi

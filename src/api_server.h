@@ -13,13 +13,7 @@ struct listener;
 struct ev_loop;
 struct sockaddr;
 
-/**
- * @brief Serve one accepted management API connection.
- * @param l The listener that accepted the connection.
- * @param loop The event loop owning the accepted socket.
- * @param accepted_fd The accepted socket; ownership transfers to this call.
- * @param accepted_sa The peer socket address for logging and request context.
- */
+/* Serve one accepted management API connection; takes ownership of @p accepted_fd. */
 void api_serve(
 	struct listener *l, struct ev_loop *loop, int accepted_fd,
 	const struct sockaddr *accepted_sa);

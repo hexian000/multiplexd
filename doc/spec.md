@@ -6,8 +6,8 @@ This document specifies the multiplexd multiplexing protocol, which enables
 multiple independent bidirectional byte streams to share a single transport
 connection.  The underlying transport is either plain TCP or TLS 1.3.  The
 protocol employs a fixed-size frame header, per-stream credit-based flow
-control, and fairness requirements for outbound scheduling so that no single
-stream monopolizes the transport connection.
+control, and a recommended fair-scheduling policy for outbound frames; together
+these keep any single stream from monopolizing the transport connection.
 
 ## 1.  Introduction
 
@@ -68,13 +68,13 @@ Every frame begins with a fixed 8-octet header:
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-| Field     | Size     | Description                                          |
-| --------- | -------- | ---------------------------------------------------- |
-| Version   | 1 octet  | Protocol version; see Section 2.2                    |
-| Flags     | 1 octet  | Frame flags; see Section 3                           |
-| Length    | 2 octets | Payload length in octets; range 0-16384              |
-| Stream ID | 2 octets | Stream identifier; see Section 4.1                   |
-| Extra     | 2 octets | Context-dependent field; interpreted per Section 2.4 |
+| Field     | Size     | Description                                              |
+| --------- | -------- | -------------------------------------------------------- |
+| Version   | 1 octet  | Protocol version; see Section 2.2                        |
+| Flags     | 1 octet  | Frame flags; see Section 3                               |
+| Length    | 2 octets | Payload length in octets; range 0-65535; see Section 2.3 |
+| Stream ID | 2 octets | Stream identifier; see Section 4.1                       |
+| Extra     | 2 octets | Context-dependent field; interpreted per Section 2.4     |
 
 ### 2.2.  Version Field
 
@@ -89,8 +89,19 @@ value.
 ### 2.3.  Frame Payload
 
 The header is followed by exactly Length octets of payload.  When Length is
-zero, the frame carries no payload.  The maximum payload size is 16384 octets
-(16 KiB).
+zero, the frame carries no payload.  Because the Length field is a 16-bit
+unsigned integer, a payload is between 0 and 65535 octets.  A receiver MUST
+accept any frame whose payload length is within this range; the maximum payload
+is fixed by the wire format and is never negotiated, and there is no smaller
+receive-side limit.
+
+An implementation MAY chunk its own outbound data into frames smaller than
+65535 octets — for example, to bound per-frame buffering or to amortize
+per-frame work.  Any such maximum outbound frame size is a purely local,
+send-side parameter: it is not advertised on the wire and MUST NOT be applied
+as a receive-side limit.  In particular, an implementation MUST NOT reject an
+inbound frame solely because its payload exceeds the implementation's own
+outbound frame size.
 
 ### 2.4.  Extra Field Encoding
 
@@ -204,7 +215,7 @@ available receive capacity, but unlike TCP it carries no delivery
 acknowledgement.  When ACK is set, Extra carries a credit grant that the
 receiver MUST add to its accumulated send credit (see Section 6).  When a
 credit grant is pending, the sender SHOULD set ACK on the next outbound frame
-for that stream so that the grant is conveyed without a separate round-trip.
+for that stream, thereby conveying the grant without a separate round-trip.
 When no other outbound frame is available for that stream, a standalone ACK
 frame MAY be sent.
 
@@ -236,8 +247,10 @@ Stream IDs are 16-bit unsigned integers subject to the following rules:
 -  Stream 0 is reserved for session-level control.  Frames addressed to stream 0
    with the ACK flag set carry session acknowledgements (Section 5.7).
    Stream-0 frames with Flags = 0x00 serve as keepalive probes or RTT probes
-   (Section 5.3).  All stream-0 frames with any flag combination other than
-   `0x00` or ACK set MUST be silently discarded.
+   (Section 5.3).  All other stream-0 frame types are reserved for future use.
+   Absent a negotiated extension or protocol version that defines such a frame,
+   a receiver MUST silently discard any stream-0 frame whose Flags field is
+   neither 0x00 nor has the ACK bit set, without closing the connection.
 
 -  Odd IDs (1, 3, 5, ...) are allocated exclusively by the client.
 
@@ -321,8 +334,8 @@ Active opener (the endpoint that opens the stream):
        formula is in Section 6.4).
     *  The SYN MAY carry an initial payload (Length > 0, PUSH set),
        constituting a fast-open.  This is valid only before the stream leaves
-       STREAM_INIT.  The payload length MUST NOT exceed 16384 octets (the
-       active opener's initial send credit toward the passive opener, Section 6.5).
+       STREAM_INIT.  The payload length MUST NOT exceed 16384 octets (the active
+       opener's initial send credit toward the passive opener, Section 6.5).
 
 4.  Upon receiving SYN|ACK, add extra * 16384 to the local accumulated send
     credit.  If PUSH is set, copy exactly Length octets from the frame payload
@@ -335,12 +348,13 @@ Passive opener (the endpoint that receives the SYN):
 
 1.  Receive SYN.  Under the base protocol, a stream-opening SYN frame carries
     only SYN or SYN|PUSH; active extensions MAY define additional flags on the
-   opening SYN.  Any flag combination not permitted by the base protocol or an
-   active extension MUST cause the receiver to close the connection.
-   Otherwise, transition to STREAM_SYN_RECEIVED and add extra * 16384 to the
-   local accumulated send credit (above the implicit initial credit).
+    opening SYN.  Any flag combination not permitted by the base protocol or an
+    active extension MUST cause the receiver to close the connection.
+    Otherwise, transition to STREAM_SYN_RECEIVED and add extra * 16384 to the
+    local accumulated send credit (above the implicit initial credit).
 
-    *  If the stream cannot be accepted: send RST and transition to STREAM_CLOSED.
+    *  If the stream cannot be accepted: send RST and transition to
+       STREAM_CLOSED.
 
 2.  Upon completion of local stream setup, send SYN|ACK:
 
@@ -415,11 +429,9 @@ the receive queue.  No response frame is sent.
 
 #### 4.3.5.  Closed-Stream Tombstone
 
-When a stream transitions to STREAM_CLOSED, the implementation MUST retain a
-tombstone record for that stream ID for an implementation-defined period before
-freeing the entry from the stream table.
-
-During the tombstone period:
+For an implementation-defined period after a stream reaches STREAM_CLOSED, a
+receiver MUST continue to recognize that stream ID and respond to late frames
+for it as follows, rather than treating them as frames for an unknown stream:
 
 -  An inbound RST MUST be silently discarded.
 
@@ -427,13 +439,14 @@ During the tombstone period:
    routine acknowledgement trailing the graceful close.
 
 -  Any other frame MAY be answered with a single RST (status
-   PROTOCOL_ERROR).  After sending one RST, the implementation MUST
-   suppress further RST replies for the same tombstone entry.
+   PROTOCOL_ERROR).  After sending one such RST, the receiver MUST suppress
+   further RST replies for that stream ID until the period ends.
 
-Once the tombstone period expires, the stream ID is freed and the entry is
-removed from the stream table.  Frames arriving after that point are handled
-as frames for an entirely unknown stream (Section 4.3.1 for SYN frames;
-Section 8 otherwise).
+This grace period absorbs frames that were still in flight when the stream
+closed.  After it ends, the stream ID MAY be reused, and any frame arriving for
+it is handled as a frame for an entirely unknown stream (Section 4.3.1 for SYN
+frames; Section 8 otherwise).  How a receiver records recently closed stream IDs
+during the period is a local matter.
 
 ## 5.  Session Management
 
@@ -472,7 +485,8 @@ following field values, followed immediately by a UTF-8-encoded JSON body:
 -  Flags, Stream ID, Extra: MUST be 0.  Receivers MUST close the connection
    if any of these fields is non-zero.
 
--  Length: the number of octets in the JSON body.  MUST NOT exceed 16384.
+-  Length: the number of octets in the JSON body.  MUST NOT exceed 65535, the
+   maximum payload the Length field can express (Section 2.3).
 
 -  JSON Body: a single JSON object as defined in Section 5.2.2.
 
@@ -483,7 +497,7 @@ following field values, followed immediately by a UTF-8-encoded JSON body:
 | type       | string  | Yes         | MIME media type string; see Section 5.2 for the required value (`application/x-multiplexd-proto; version=1`) |
 | msgid      | integer | Yes         | 0 = ClientHello; 1 = ServerHello                                                                             |
 | session_id | string  | Conditional | 24-character Base64-encoded string (RFC 4648) encoding the server-assigned 16-byte shared session identity   |
-| resume_seq | integer | No          | Number of the peer's non-stream-0 frames actually processed by this endpoint; see Section 5.7                |
+| resume_seq | integer | No          | Number of the peer's non-stream-0 frames processed by this endpoint; see Section 5.7                         |
 | extensions | object  | No          | Extension negotiation; values are extension-specific objects; absent means {}                                |
 
 Additional hello object members are extension points.  Receivers MUST ignore
@@ -499,7 +513,7 @@ Receivers MUST close the connection if `session_id` is present but malformed.
 
 The `resume_seq` field carries the sender's processed prefix of the peer's
 non-stream-0 frame sequence: the number of such frames this endpoint has
-actually processed (see Section 5.7).  Frames strictly before this point have
+processed (see Section 5.7).  Frames strictly before this point have
 already taken effect at the sender and MUST NOT be retransmitted on resume.
 On an initial connection it is 0.  On a resume attempt it tells the peer from
 which point retransmission should begin.  When this field is absent, the
@@ -587,11 +601,11 @@ streams.
 | -------- | ------ | ------------------------------------------------------ |
 | identity | string | UTF-8 identity claim; maximum 255 octets, NUL-excluded |
 
-Either or both endpoints MAY include the `identity` extension.  The value
-advertises the sender's identity to the peer.  If the receiver has a matching
-peer entry, it uses the claimed identity to route inbound streams; otherwise it
-stores it for informational purposes.  The receiving side SHOULD echo this
-extension in its own hello if it also has an identity configured.
+Either or both endpoints MAY include the `identity` extension; the value
+advertises the sender's identity to the peer.  An endpoint that has an identity
+configured SHOULD echo this extension in its own hello.  How a receiver uses a
+claimed identity — for routing, access control (Section 10.1), logging, or not
+at all — is local policy outside the scope of this protocol.
 
 #### 5.2.4.  Handshake Flow
 
@@ -623,17 +637,17 @@ SESSION_ESTABLISHED         SESSION_ESTABLISHED
 
 #### 5.2.5.  Handshake Error Handling
 
-| Condition                               | Action           |
-| --------------------------------------- | ---------------- |
-| Version field is not 0                  | Close connection |
-| Flags, Stream ID, or Extra is non-zero  | Close connection |
-| Length field exceeds 16384              | Close connection |
-| Connection closed before hello received | Close connection |
-| Invalid JSON or missing required field  | Close connection |
-| "type" media type mismatch              | Close connection |
-| Protocol version mismatch               | Close connection |
-| Unexpected msgid                        | Close connection |
-| `session_id` present but malformed      | Close connection |
+| Condition                                       | Action           |
+| ----------------------------------------------- | ---------------- |
+| Version field is not 0                          | Close connection |
+| Flags, Stream ID, or Extra is non-zero          | Close connection |
+| Length field exceeds 65535 octets (Section 2.3) | Close connection |
+| Connection closed before hello received         | Close connection |
+| Invalid JSON or missing required field          | Close connection |
+| "type" media type mismatch                      | Close connection |
+| Protocol version mismatch                       | Close connection |
+| Unexpected msgid                                | Close connection |
+| `session_id` present but malformed              | Close connection |
 
 ### 5.3.  Keepalive and RTT Probes
 
@@ -664,16 +678,19 @@ measure the round-trip time:
 version=0x01, flags=0x00, length=<N>, stream_id=0, extra=0x0001
 ```
 
-The payload is an opaque byte sequence of implementation-defined length and
-format, not interpreted by the protocol.  Implementations MAY embed a
-timestamp in the payload to enable RTT computation upon receipt of the
-corresponding PONG.
+The payload is an opaque byte sequence of implementation-defined format, not
+interpreted by the protocol.  Implementations MAY embed a timestamp in the
+payload to enable RTT computation upon receipt of the corresponding PONG.
+Because the receiver must echo the payload (below), a PING payload SHOULD be
+kept small; it carries only an RTT token, not bulk data.
 
 Upon receiving a PING, the endpoint MUST immediately transmit a PONG frame
 (Section 5.3.3) whose payload is an exact byte-for-byte copy of the PING
-payload.  PONG frames SHOULD be transmitted without deliberate delay and
-SHOULD NOT be coalesced with other frames.  PING frames MUST NOT be gated by
-the send-stall gate (Section 6.2).
+payload.  A receiver that cannot echo the payload — for example, because it
+exceeds the receiver's own outbound frame size (Section 2.3) — MAY instead
+close the connection.  PONG frames SHOULD be transmitted without deliberate
+delay and SHOULD NOT be coalesced with other frames.  PING frames MUST NOT be
+gated by the send-stall gate (Section 6.2).
 
 Implementations SHOULD apply a rate limit to inbound PING frames to bound the
 cost of PONG generation.  When the rate limit is exceeded, the excess PING
@@ -696,8 +713,8 @@ send-stall gate (Section 6.2).
 A sender MAY apply an implementation-defined timeout while awaiting a PONG.
 If this timeout expires before the PONG arrives, the sender SHOULD treat the
 transport as unresponsive.  When session resumption is supported
-(Section 5.8) the sender SHOULD prefer suspending the session over closing it
-so that streams can survive transient blackhole periods.
+(Section 5.8), the sender SHOULD prefer suspending the session over closing
+it, thereby allowing streams to survive transient connectivity loss.
 
 ### 5.4.  Timeouts
 
@@ -706,7 +723,7 @@ endpoint MAY suspend or close the connection if a configurable inactivity
 timeout expires without receiving any frame, including during
 SESSION_HANDSHAKE.  Implementations that support session resumption
 (Section 5.8) SHOULD prefer suspending the session on inactivity timeout
-rather than closing it, allowing streams to survive short blackhole periods.
+rather than closing it, allowing streams to survive brief connectivity loss.
 Only sessions that cannot be resumed (e.g., no shared session_id has been
 negotiated) MUST be closed.
 
@@ -714,8 +731,8 @@ negotiated) MUST be closed.
 
 Reconnection behavior, including backoff strategy and timing, is
 implementation-defined.  When session resumption is in effect (Section 5.8),
-reconnection attempts carry a resume ClientHello so that existing streams
-survive the transport failure.
+reconnection attempts carry a resume ClientHello, allowing existing streams
+to survive the transport failure.
 
 ### 5.6.  Session Shutdown
 
@@ -753,8 +770,12 @@ unacked list.
 
 #### 5.7.1.  Per-Session Counters
 
-Each endpoint maintains four 32-bit unsigned counters, all initialized to zero
-at session establishment:
+The protocol is defined in terms of four per-session quantities, each 32-bit
+unsigned and initialized to zero at session establishment.  These are abstract
+state variables: an implementation MAY represent them differently, provided its
+observable behavior is identical.  Only the *frame process count* is conveyed on
+the wire — as `resume_seq` (Section 5.2.2) and as session-ACK increments; the
+other three are local.
 
 -  The *frame transmit count*: the number of non-stream-0 frames transmitted
    on this session, including retransmissions upon resume.  Incremented by one
@@ -795,9 +816,13 @@ An endpoint SHOULD emit a session ACK frame when the frame process count
 exceeds the reported process count.  The ACK MAY be deferred or piggybacked
 onto the next outgoing control frame.
 
-An endpoint MUST emit session ACKs with sufficient frequency to prevent the
-peer's unacked list from reaching the cap (Section 5.7.2).  The specific
-triggering mechanism is implementation-defined.
+An endpoint MUST NOT defer session ACKs indefinitely: it MUST acknowledge
+processed frames promptly enough that a peer applying send-stall backpressure
+(Section 6.2) is released within bounded time.  Because the peer's unacked-list
+cap is a local parameter this endpoint cannot observe (Section 5.7.2), the
+precise triggering policy is implementation-defined; a common choice is to emit
+an ACK once the count of unacknowledged processed frames reaches a fraction of
+the endpoint's own receive window.
 
 The Extra field of the session ACK frame carries the increment:
 
@@ -896,20 +921,20 @@ NOT retransmit them.
     server-assigned identity).  If matched:
 
     a.  Trim from the head of the server's unacked list all frames strictly
-      before `resume_seq` (frames the client has already processed).
+        before `resume_seq` (frames the client has already processed).
 
     b.  Send ServerHello with the same `session_id` (the shared identity) and
-      `resume_seq` set to the server's processed prefix of the client's
-      non-stream-0 frame sequence.
+        `resume_seq` set to the server's processed prefix of the client's
+        non-stream-0 frame sequence.
 
     c.  Transition to SESSION_ESTABLISHED and retransmit all remaining frames
-      in the unacked list before transmitting new frames.
+        in the unacked list before transmitting new frames.
 
 3.  The client validates that the ServerHello `session_id` matches the stored
-      shared identity and that `resume_seq` is present.  On confirmation: trim
-      from the head of the client's unacked list all frames strictly before
-      `resume_seq`, then transition to SESSION_ESTABLISHED and retransmit
-      remaining unacked frames.
+    shared identity and that `resume_seq` is present.  On confirmation: trim
+    from the head of the client's unacked list all frames strictly before
+    `resume_seq`, then transition to SESSION_ESTABLISHED and retransmit
+    remaining unacked frames.
 
 4.  If the server finds no matching suspended session, it treats the connection
     as a new session: it generates a fresh `session_id`, omits `resume_seq`,
@@ -940,10 +965,11 @@ flow control prevents any single stream from monopolizing those buffers.
 
 ### 6.1.  Credit Model
 
-Each stream direction maintains a credit balance at the sender.  The sender
-tracks two cumulative quantities, each represented as a 32-bit unsigned integer
-and initialized to 16384 octets (the implicit initial credit, Section 6.5) at
-stream creation:
+Each stream direction has a credit balance at the sender, defined by two
+cumulative quantities.  These are abstract state variables: an implementation
+MAY represent them differently, provided its observable behavior is identical.
+Each is a 32-bit unsigned integer initialized to 16384 octets (the implicit
+initial credit, Section 6.5) at stream creation:
 
 -  The *accumulated send credit*: the total send credit received from the peer.
 
@@ -959,28 +985,23 @@ then exceeds the total payload transmitted, the sender MAY resume transmitting.
 
 ### 6.2.  Send-Stall Gate
 
-The send-stall gate is the session-level backpressure mechanism introduced by
-the resumption requirement (Section 5.7.2).  It bounds the memory used by the
-unacked list by halting data-frame transmission when the list reaches the
-configured cap.
+Retaining sent frames for possible resumption (Section 5.7.2) consumes memory,
+so an implementation bounds its unacked list and applies session-level
+backpressure as the list grows: it temporarily stops transmitting new PUSH
+frames for non-stream-0 streams until incoming session ACKs trim the list.  This
+backpressure is called the *send-stall gate*, and the gate is said to be
+*closed* while transmission is held and *open* otherwise.
 
-The sender tracks one session-level quantity for this mechanism:
+The threshold at which the gate engages, and the bookkeeping that drives it, are
+local and unobservable to the peer — a stalled sender is indistinguishable from
+one with no data to send — so they are not specified here; the unacked-list cap
+is a local parameter (Section 5.7.2).  Choosing not to transmit is always
+permitted by flow control, so the decision to stall PUSH frames imposes no
+requirement on a conforming peer.
 
--  The *unacked list length*: the number of non-stream-0 frames currently
-   retained in the unacked list.  It equals the frame transmit count minus the
-   confirmed transmit count (Section 5.7.1) and is always non-negative.
-
-The gate is *open* when the unacked list length is strictly less than the cap
-(C), and *closed* when it equals or exceeds C.  If no cap is configured, the
-gate is always open and no stalling occurs.
-
-When the gate is closed, the endpoint MUST NOT transmit new PUSH frames for any
-non-stream-0 stream.  The gate reopens, and normal PUSH transmission resumes,
-as soon as incoming session ACKs reduce the unacked list length to strictly less
-than C.
-
-The following frames are exempt from the gate and MUST NOT be stalled
-regardless of gate state:
+One constraint is nonetheless normative, because getting it wrong can deadlock
+the session: whatever backpressure an implementation applies, the following
+frames MUST NOT be stalled, regardless of the state of the gate:
 
 -  All stream-0 frames: keepalive probes (PROBE), RTT probes (PING and PONG),
    and session ACKs.
@@ -988,28 +1009,32 @@ regardless of gate state:
 -  ACK frames (credit grants) and FIN frames (stream half-close) for any
    non-stream-0 stream.
 
-Stream-0 frames are exempt because they carry the session ACKs that unblock the
-stalled sender and the RTT probes that maintain session liveness.  RST frames
-are exempt because streams must always be abortable regardless of gate state.
-ACK and FIN frames are exempt so that the peer can continue delivering data to
-us and streams can complete their close handshake while PUSH transmission is
-stalled; without them the peer's receive pipeline and stream lifecycle would
-stall independently of the session window condition.
+Stream-0 frames are exempt because session ACKs are what unblock a stalled
+sender and RTT probes maintain session liveness; were both endpoints to stall
+their session ACKs, neither could ever trim the other's list and the session
+would deadlock.  RST frames are exempt because a stream must always be abortable.
+ACK and FIN frames are exempt so that the peer can keep delivering data to this
+endpoint, and streams can complete their close handshake, while PUSH
+transmission is stalled.
 
 The send-stall gate operates at the session level and is independent of the
-per-stream credit model (Section 6.1).  Transmitting a PUSH frame for a
-non-stream-0 stream requires both conditions to hold: the stream MUST have
-available per-stream credit and the gate MUST be open.  A stream with available
-credit may still be blocked at the session level; conversely, opening the gate
-does not grant per-stream credit.
+per-stream credit model (Section 6.1): a non-stream-0 PUSH frame is transmitted
+only when the stream has per-stream credit (a normative requirement, Section 6.1)
+and the gate is open.  A stream with available credit may still be stalled at
+the session level; conversely, reopening the gate does not grant per-stream
+credit.
 
 ### 6.3.  Receiver State
 
-The receiver tracks the following per-stream quantities:
+The receiver's per-stream flow-control state is defined by the following
+quantities, which are abstract state variables an implementation MAY represent
+as it sees fit:
 
--  The *receive buffer capacity*: the maximum number of octets that may be
-   concurrently buffered; configurable in the range 0 to 1,073,725,440 octets
-   (0 selects automatic, BDP-driven sizing).
+-  The *receive buffer capacity*: the maximum number of octets the receiver is
+   willing to buffer concurrently for this stream.  How this value is chosen,
+   and whether it is fixed or adapted at run time, is a local matter; it is
+   bounded above by 1,073,725,440 octets (65535 × 16384), the largest credit a
+   single window increment can express (Section 6.6).
 
 -  The *buffered data*: octets received but not yet delivered to the local
    stream consumer.
@@ -1027,29 +1052,32 @@ credit is withheld until the local consumer reads buffered data.
 
 ### 6.4.  Window Updates
 
-A credit grant is conveyed in any frame with ACK set.  The Extra field carries
-the grant in units of 16384 octets.  Let the *available capacity* for the
-stream be the receive buffer capacity minus the buffered data minus the
-outstanding credit (Section 6.3).  The Extra value is:
+A credit grant is conveyed in any frame with ACK set; the Extra field carries
+the grant in units of 16384 octets (Section 2.4.1).  Upon sending such a frame,
+the receiver advances its total credit granted by extra * 16384.
+
+Let the *available capacity* for the stream be the receive buffer capacity minus
+the buffered data minus the outstanding credit (Section 6.3).  The grant MUST
+NOT exceed the available capacity, but within that bound the amount granted is
+at the receiver's discretion.  A receiver advertising all currently available
+capacity uses:
 
    extra = floor(available capacity / 16384)
 
-Upon sending such a frame, the receiver advances the total credit granted by
-extra * 16384.
+This formula is a typical choice, not a requirement; the only constraint on the
+grant amount is the capacity bound above.
 
 Window updates SHOULD be piggybacked on the next outbound data frame for the
 stream (PUSH|ACK).  A standalone ACK frame MAY be sent when no data frame is
 available for that stream.
 
-To amortize round-trips, a window update SHOULD be withheld until the available
-capacity reaches half the receive buffer capacity.
-
-When this threshold is reached but no outbound data frame is immediately
-available to carry the ACK as a PUSH|ACK, the endpoint MUST send a standalone
-ACK immediately.  Credit that has accumulated below this threshold SHOULD be
-withheld and conveyed opportunistically on the next outbound frame for the
-stream, including any frame transmitted when the coalescing deferral
-(Section 7.1) expires.
+To amortize round-trips, an endpoint SHOULD coalesce small credit increments
+rather than emitting an ACK for every one.  The specific threshold and timing
+are implementation-defined.  An endpoint MUST, however, convey accumulated
+credit with sufficient promptness that a peer with data to send is not left
+stalled for want of a window update — piggybacked on the next outbound frame
+for the stream where one is available, otherwise as a standalone ACK (including
+any frame transmitted when the coalescing deferral of Section 7.1 expires).
 
 ### 6.5.  Initial Credit
 
@@ -1098,65 +1126,48 @@ a mismatch MUST NOT be treated as a protocol error.
 
 ### 6.7.  Dynamic Window Sizing
 
-Implementations MAY increase the receive buffer capacity (Section 6.3) for a
-stream at any time during the session.  When the receive buffer capacity grows,
-the receiver MUST immediately grant the additional credit to the peer so that
-the enlarged window is usable without a further round-trip.
-
-An implementation MAY similarly adjust the unacked list cap (Section 5.7.2)
-upward at any time.  This cap is a local parameter and is never transmitted to
-the peer.
+An implementation MAY change a stream's receive buffer capacity (Section 6.3)
+during the session.  When the capacity grows, the additional credit MUST be
+granted with the same promptness as any other window update (Section 6.4), so
+the enlarged window is usable without a further round-trip.  Granted credit is
+cumulative and is never revoked; reducing the capacity therefore only restrains
+future grants and never invalidates credit the peer already holds.
 
 ## 7.  Scheduling
 
-Outbound data-frame scheduling is implementation-defined.  When multiple
-streams are ready concurrently, the sender SHOULD use a fair scheduling policy
-that does not indefinitely starve any ready stream while continuing to transmit
-data for other ready streams, and SHOULD prefer a byte-granularity policy so that a
-stream sending large frames does not receive disproportionately more bandwidth
-than a stream sending small frames of equal aggregate volume.
+Outbound data-frame scheduling is implementation-defined and is not observable
+as a protocol behavior: a peer cannot tell, and need not depend on, how a sender
+interleaves its ready streams.  The guidance in this section is therefore a
+quality-of-implementation recommendation, not an interoperability requirement.
 
-A stream is ready when it has pending outbound payload and the accumulated send
-credit exceeds the total payload transmitted.
-
-This requirement ensures that no single stream can monopolize the transport
-connection regardless of its data volume.
+A stream is ready when it has pending outbound payload and its accumulated send
+credit exceeds its total payload transmitted.  When multiple streams are ready
+concurrently, a sender SHOULD use a scheduling policy that does not indefinitely
+starve any ready stream, and SHOULD prefer byte-level fairness so that a stream
+sending large frames does not obtain disproportionately more bandwidth than one
+sending small frames of equal aggregate volume.  Such a policy keeps any single
+stream from monopolizing the transport connection regardless of its data volume.
 
 ### 7.1.  Small-Frame Coalescing
 
-An implementation MAY delay transmission of a small outbound data frame
-to reduce frame overhead, analogous to the Nagle algorithm in TCP.  This
-optimization is OPTIONAL and applies only when both of the following
-conditions hold:
+An implementation MAY delay transmission of a small outbound data frame to
+reduce frame overhead, analogous to the Nagle algorithm in TCP.  This is an
+OPTIONAL, send-side optimization with no effect on the wire contract: a peer
+cannot observe whether frames were coalesced, and every frame remains
+independently valid.  The conditions under which a frame is withheld, and the
+deferral timer that bounds the added latency, are implementation-defined.
 
--  The payload of the queued frame is smaller than the maximum payload size
-   (16384 octets).
+Two constraints preserve interoperability and liveness regardless of how
+coalescing is implemented:
 
--  The stream has previously transmitted data that has not yet been
-   followed by a credit-replenishing inbound window update from the peer
-   (in-flight data is present on the stream).
+-  Coalescing MUST NOT defer a credit grant.  The credit-grant mechanism
+   (Section 6.4) operates independently; an endpoint with a pending window
+   update MUST still convey it promptly, including on the frame transmitted
+   when the deferral timer expires.
 
-When both conditions are satisfied, the sender MAY withhold the frame.
-The frame MUST be transmitted immediately when any of the following conditions
-is met:
-
-1.  The payload of the buffered frame reaches the maximum payload size
-    (16384 octets, a full frame is ready).
-
-2.  The peer grants a credit update (inbound ACK), clearing the
-    in-flight data backlog.
-
-3.  The deferral timer expires.  Upon expiry, the endpoint MUST transmit the
-    withheld frame, and SHOULD set ACK if a credit grant is pending for that
-    stream at the time of transmission.
-
-Implementations SHOULD provide a per-session or per-stream configuration
-switch to disable this behavior, equivalent to TCP_NODELAY.  When the
-switch is enabled, all outbound frames are transmitted immediately
-regardless of frame size or in-flight state.  This switch controls only
-the small-frame coalescing optimization; the credit-grant mechanism
-described in Section 6.4 operates independently and MUST NOT be
-suppressed when the switch is enabled.
+-  Implementations SHOULD provide a switch to disable coalescing entirely,
+   equivalent to TCP_NODELAY, so that all outbound frames are transmitted
+   without delay.
 
 ## 8.  Error Handling
 
@@ -1172,7 +1183,7 @@ suppressed when the switch is enabled.
 | Sender exceeds advertised send window                                                                  | MAY send RST (FLOW_CONTROL_ERROR) |
 | Frame Version field is 0 outside of SESSION_HANDSHAKE                                                  | Close connection                  |
 | Frame Version field does not match negotiated version                                                  | Close connection                  |
-| Length > 16384 in frame header                                                                         | Close connection                  |
+| PING payload too large for the receiver to echo (Section 5.3.2)                                        | Close connection                  |
 | Reserved flag bit set in any frame                                                                     | Close connection                  |
 | Transport read/write error                                                                             | Close connection                  |
 | Activity timeout                                                                                       | Close connection                  |
@@ -1209,33 +1220,23 @@ provides.
 
 ### 10.1.  Identity-Specific Certificate Pinning
 
-Implementations MAY support per-identity certificate sets as a local policy
-enforcement mechanism not visible on the wire.  When enabled:
+Beyond pinning a flat set of trusted peer certificates, an implementation MAY
+bind each trusted certificate to a specific peer identity.  The only
+wire-observable consequence is the following rule: after the hello exchange
+completes and the peer's claimed identity (the `identity` extension,
+Section 5.2.3.2) is known, the implementation MAY verify that the claimed
+identity is consistent with the certificate the peer presented during the TLS
+handshake, and if it is not, MUST close the connection before any stream
+operations are permitted.
 
--  The administrator configures a mapping from peer identity strings to
-   per-identity trusted certificate lists.  Each entry specifies the set of
-   certificates that a peer claiming that identity is permitted to present.
+This binding ensures that compromising one peer's private key does not let the
+attacker impersonate a different peer: the stolen certificate may still pass the
+TLS handshake, but the post-handshake identity check rejects any mismatch
+between the presented certificate and the claimed identity.
 
--  At the TLS layer, the TLS context is built from the union of all
-   certificates in the map (together with any global `tls.authcerts` entries,
-   if configured).  This allows any peer whose certificate is in the union to
-   pass the TLS handshake, regardless of which identity it will later claim.
-
--  After the protocol hello exchange completes and the peer's claimed identity
-   (the `identity` extension, Section 5.2.3.2) is known, the implementation
-   verifies that the claimed identity appears as a key in the per-identity
-   certificate map.  If it does not, the implementation MUST close the
-   connection before any stream operations are permitted.
-
-This mechanism ensures that a compromise of one peer's private key does not
-grant the attacker the ability to impersonate a different peer, because even
-though the attacker's certificate would pass the TLS handshake (it is in the
-union set), the post-handshake identity check would fail — the attacker's
-claimed identity does not correspond to the certificate they presented.
-
-When per-identity certificate sets are configured, implementations SHOULD
-still include a global `tls.authcerts` list for peers that are not listed in
-the identity map, or for sessions where the peer does not claim an identity.
+How the identity-to-certificate mapping is configured, and how the TLS trust
+anchors are assembled from it, is a local matter outside the scope of this
+protocol.
 
 Regardless of transport, implementations MUST enforce:
 
@@ -1276,21 +1277,22 @@ Regardless of transport, implementations MUST enforce:
 The following interoperability tests are REQUIRED for conformant
 implementations:
 
-| ID   | Scenario                               | Test Vector                                                                   | Expected Result                                                                                                      |
-| ---- | -------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| I-1  | Ignorable ACK on unknown stream        | First frame for unknown non-zero stream uses zero-length ACK without SYN      | Receiver MUST ignore the frame for stream-state purposes and keep the session open; it MAY still emit a session ACK  |
-| I-2  | Illegal state-dependent data after FIN | Stream in STREAM_CLOSE_WAIT receives PUSH                                     | Receiver treats the data as undefined for state and MAY send RST                                                     |
-| I-3  | ACK\|FIN Extra field interpretation    | Frame with ACK\|FIN and non-zero Extra                                        | Extra is interpreted as a credit grant per Section 2.4.1 (RST is clear, ACK is set)                                  |
-| I-4  | Stream ID parity violation             | Client sends a frame with an even Stream ID                                   | Receiver MUST close the connection and MUST NOT resume the session                                                   |
-| I-5  | Duplicate SYN for existing stream      | SYN received for an already-existing stream ID                                | Receiver sends RST                                                                                                   |
-| I-6  | Fast-open credit boundary              | SYN\|PUSH frame with payload length exactly 16384 octets                      | Receiver accepts the frame and completes stream establishment; no RST sent                                           |
-| I-7  | Out-of-order FIN then data             | Peer sends FIN, then sends PUSH on the same stream                            | Receiver treats post-FIN data as undefined and MAY send RST                                                          |
-| I-8  | Out-of-order RST handling              | Peer sends RST followed by additional valid non-RST frames on the same stream | Receiver MUST keep the session open; it MAY send one RST for the now-unknown stream and MAY ignore later late frames |
-| I-9  | Reserved flag bit set                  | Frame sets any reserved bit (0x20, 0x40, or 0x80)                             | Receiver MUST close the connection                                                                                   |
-| I-10 | Hello version parameter mismatch       | ClientHello `type` field carries `version=2`                                  | Server MUST close the connection                                                                                     |
-| I-11 | PING/PONG echo                         | Send PING (stream_id=0, flags=0x00, extra=0x0001) with any payload            | Receiver MUST reply with PONG (extra=0x0002) carrying the identical payload                                          |
-| I-12 | Unknown keepalive subtype              | stream_id=0, flags=0x00, extra=0x0003                                         | Receiver MUST silently discard the frame; connection MUST remain open                                                |
-| I-13 | Invalid opening SYN flags              | First frame for unknown non-zero stream uses SYN\|ACK                         | Receiver MUST close the connection and MUST NOT resume the session                                                   |
+| ID   | Scenario                               | Test Vector                                                                           | Expected Result                                                                                                      |
+| ---- | -------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| I-1  | Ignorable ACK on unknown stream        | First frame for unknown non-zero stream uses zero-length ACK without SYN              | Receiver MUST ignore the frame for stream-state purposes and keep the session open; it MAY still emit a session ACK  |
+| I-2  | Illegal state-dependent data after FIN | Stream in STREAM_CLOSE_WAIT receives PUSH                                             | Receiver treats the data as undefined for state and MAY send RST                                                     |
+| I-3  | ACK\|FIN Extra field interpretation    | Frame with ACK\|FIN and non-zero Extra                                                | Extra is interpreted as a credit grant per Section 2.4.1 (RST is clear, ACK is set)                                  |
+| I-4  | Stream ID parity violation             | Client sends a frame with an even Stream ID                                           | Receiver MUST close the connection and MUST NOT resume the session                                                   |
+| I-5  | Duplicate SYN for existing stream      | SYN received for an already-existing stream ID                                        | Receiver sends RST                                                                                                   |
+| I-6  | Fast-open credit boundary              | SYN\|PUSH frame with payload length exactly 16384 octets                              | Receiver accepts the frame and completes stream establishment; no RST sent                                           |
+| I-7  | Out-of-order FIN then data             | Peer sends FIN, then sends PUSH on the same stream                                    | Receiver treats post-FIN data as undefined and MAY send RST                                                          |
+| I-8  | Out-of-order RST handling              | Peer sends RST followed by additional valid non-RST frames on the same stream         | Receiver MUST keep the session open; it MAY send one RST for the now-unknown stream and MAY ignore later late frames |
+| I-9  | Reserved flag bit set                  | Frame sets any reserved bit (0x20, 0x40, or 0x80)                                     | Receiver MUST close the connection                                                                                   |
+| I-10 | Hello version parameter mismatch       | ClientHello `type` field carries `version=2`                                          | Server MUST close the connection                                                                                     |
+| I-11 | PING/PONG echo                         | Send PING (stream_id=0, flags=0x00, extra=0x0001) with a small payload (an RTT token) | Receiver MUST reply with PONG (extra=0x0002) carrying the identical payload                                          |
+| I-12 | Unknown keepalive subtype              | stream_id=0, flags=0x00, extra=0x0003                                                 | Receiver MUST silently discard the frame; connection MUST remain open                                                |
+| I-13 | Invalid opening SYN flags              | First frame for unknown non-zero stream uses SYN\|ACK                                 | Receiver MUST close the connection and MUST NOT resume the session                                                   |
+| I-14 | Reserved stream-0 frame type           | stream_id=0 with a non-zero, non-ACK flag combination (e.g., PUSH)                    | Receiver MUST silently discard the frame; connection MUST remain open                                                |
 
 For each test, endpoints MUST record wire-level evidence (sent and received
 frames, flags, stream IDs, and Extra values) sufficient to diagnose behavioral

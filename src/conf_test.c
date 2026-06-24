@@ -1,6 +1,9 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/* conf_test.c - black-box tests for the JSON config loader in conf.c via its
+ * public API. Dependencies: links the real conf.c + generated schema. */
+
 #include "conf.h"
 
 #include "utils/slog.h"
@@ -78,9 +81,10 @@ T_DECLARE_CASE(test_conf_new_default_fields)
 	T_CHECK(conf != NULL);
 	/* Default type is NULL — no type annotation in a freshly created conf. */
 	T_EXPECT(conf->type == NULL);
-	/* Default timeouts are positive. */
-	T_EXPECT(conf->mux.ping_timeout > 0);
+	/* Default timeouts are positive, including the derived inactivity timeout
+	 * (conf_new must derive it just like conf_check does). */
 	T_EXPECT(conf->mux.keepalive > 0);
+	T_EXPECT(conf->mux.timeout > 0);
 	conf_free(conf);
 }
 
@@ -157,8 +161,8 @@ T_DECLARE_CASE(test_conf_identity_connect_count)
 
 T_DECLARE_CASE(test_conf_loglevel_parsed)
 {
-	struct config *conf =
-		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\",\"loglevel\":3}");
+	struct config *conf = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"loglevel\":3}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->loglevel, 3);
 	conf_free(conf);
@@ -219,12 +223,13 @@ T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_range)
 T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 {
 	const char *json =
-		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"ping_timeout\":10,\"keepalive\":5,\"send_timeout\":30,\"connect_timeout\":40,\"resume_timeout\":1,\"idle_timeout\":2},\"loglevel\":999}";
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"keepalive\":5,\"send_timeout\":30,\"connect_timeout\":40,\"resume_timeout\":1,\"idle_timeout\":2},\"loglevel\":999}";
 	struct config *conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 
-	T_EXPECT_EQ(conf->mux.ping_timeout, 10);
 	T_EXPECT_EQ(conf->mux.keepalive, 10); /* 5 → clamped up to floor 10 */
+	/* timeout derives from keepalive: 10 + max(10/10, 90) = 100. */
+	T_EXPECT_EQ(conf->mux.timeout, 100);
 	T_EXPECT_EQ(conf->mux.send_timeout, 30); /* independent [10,86400] */
 	T_EXPECT_EQ(conf->mux.connect_timeout, 40); /* independent [10,86400] */
 	T_EXPECT_EQ(
@@ -280,7 +285,7 @@ T_DECLARE_CASE(test_conf_dump_tls_fields)
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	orig->tls_cert = strdup("certdata");
 	orig->tls_key = strdup("keydata");
-	orig->tls_authcerts = malloc(sizeof(char *));
+	orig->tls_authcerts = (char **)malloc(sizeof(char *));
 	T_CHECK(orig->tls_authcerts != NULL);
 	orig->tls_authcerts[0] = strdup("authcertdata");
 	T_CHECK(orig->tls_authcerts[0] != NULL);
@@ -356,15 +361,15 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 	 * silently skipped at any nesting level without causing a parse error
 	 * or overwriting the default field values. */
 	const char *json =
-		"{\"mux_connect\":\"127.0.0.1:9000\",\"-mux_connect\":\"should-be-ignored\",\"-loglevel\":0,\"mux\":{\"ping_timeout\":30,\"-ping_timeout\":999,\"-nodelay\":false},\"-tcp\":{\"nodelay\":false},\"identity\":{\"claim\":\"me\",\"-claim\":\"ignored\"}}";
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"-mux_connect\":\"should-be-ignored\",\"-loglevel\":0,\"mux\":{\"send_timeout\":30,\"-send_timeout\":999,\"-nodelay\":false},\"-tcp\":{\"nodelay\":false},\"identity\":{\"claim\":\"me\",\"-claim\":\"ignored\"}}";
 	struct config *conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	/* mux_connect must reflect the real key, not the commented-out one. */
 	T_EXPECT(strcmp(conf->mux_connect, "127.0.0.1:9000") == 0);
 	/* loglevel must stay at the default (not overwritten by -loglevel). */
 	T_EXPECT_EQ(conf->loglevel, LOG_LEVEL_NOTICE);
-	/* mux.ping_timeout must be 30, not 999 from the commented key. */
-	T_EXPECT_EQ(conf->mux.ping_timeout, 30);
+	/* mux.send_timeout must be 30, not 999 from the commented key. */
+	T_EXPECT_EQ(conf->mux.send_timeout, 30);
 	/* mux.nodelay default is true; -nodelay:false must be ignored. */
 	T_EXPECT(conf->mux.nodelay);
 	/* identity.claim must be "me", not "ignored". */
@@ -532,7 +537,7 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 	orig->identity.claim = strdup("mynode");
 	T_CHECK(orig->mux_connect != NULL);
 	T_CHECK(orig->identity.claim != NULL);
-	orig->identity.mux_connect = malloc(sizeof(char *));
+	orig->identity.mux_connect = (char **)malloc(sizeof(char *));
 	T_CHECK(orig->identity.mux_connect != NULL);
 	orig->identity.mux_connect[0] = strdup("127.0.0.1:9001");
 	T_CHECK(orig->identity.mux_connect[0] != NULL);

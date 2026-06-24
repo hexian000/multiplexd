@@ -43,14 +43,16 @@
    mux_write_header / mux_read_header.
 */
 
-#define MUX_FRAME_HEADER_SIZE 8u
-#define MUX_FRAME_SIZE (MUX_FRAME_HEADER_SIZE + MUX_MAX_PAYLOAD_SIZE)
+/* MUX_FRAME_HEADER_SIZE, MUX_MAX_FRAME_SIZE, and MUX_MAX_PAYLOAD_SIZE are defined
+ * together in mux.h so the frame-size cap stays the single anchor. */
 
-/* Protocol version */
 #define MUX_PROTOCOL_VERSION 0x01
 
 /* Default send window before receiving peer's advertisement */
 #define MUX_DEFAULT_SEND_WINDOW 16384u
+
+/* Maximum downward jitter on the idle keepalive interval */
+#define MUX_KEEPALIVE_JITTER 0.2
 
 /* Coalescing timer tick interval in seconds. */
 #define MUX_COALESCING_INTERVAL 0.04
@@ -68,35 +70,61 @@
  * 2 ticks × 40 ms = 80 ms. */
 #define MUX_SESSION_ACK_MAX_TICKS 2
 
+/* Maximum TLS 1.3 record plaintext length (RFC 8446 §5.1: 2^14 bytes).  A frame
+ * fitting the open sendbuf entry within one record is coalesced onto it; one
+ * that would overflow is sent by reference (zero-copy). */
+#define MUX_MAX_RECORD 16384u
+
+/* Receive read-ahead window: contiguous recvbuf space offered to one transport
+ * read, amortizing the recv() and event-loop cost over several frames.  The
+ * wire frame size is unchanged. */
+#define MUX_RECV_READAHEAD (128u * 1024u)
+
 /* Stream-0 / Flags=0 keepalive subtypes (spec §2.4.4, §5.3). */
 #define MUX_CTRL_PROBE 0x0000u
 #define MUX_CTRL_PING 0x0001u
 #define MUX_CTRL_PONG 0x0002u
 
-/* Payload size of the internal RTT timestamp used by the BDP estimator's
- * dedicated PING/PONG cycle.  The protocol also permits other PING/PONG
- * payload lengths; this constant is only for the estimator path. */
+/* Payload size of the internal RTT timestamp for the BDP estimator's PING/PONG
+ * cycle (other PING/PONG payload lengths are also permitted). */
 #define MUX_PING_PAYLOAD_SIZE 8u
 
 /* Seconds a CLOSED stream stays in the stream table before being freed.
  * During this tombstone period late frames are answered with at most one RST. */
 #define MUX_TOMBSTONE_PERIOD_S 10.0
 
-/* Minimum nanoseconds between honouring consecutive inbound PINGs (1 s). */
+/* Minimum nanoseconds between outbound BDP probes in the steady-state (TRACK)
+ * phase (1 s). */
 #define MUX_PING_RATE_LIMIT_NS (INT64_C(1000000000))
 
-/* Frame structure.  Payload starts at data[MUX_FRAME_HEADER_SIZE]. */
+/* Minimum nanoseconds between outbound BDP probes while the session is still
+ * ramping (STARTUP phase) (100 ms): faster probing converges the window. */
+#define MUX_PING_STARTUP_INTERVAL_NS (INT64_C(100000000))
+
+/* Minimum nanoseconds between honouring consecutive inbound PINGs (50 ms);
+ * kept below the startup probe interval so a peer's PINGs are always answered. */
+#define MUX_PONG_RATE_LIMIT_NS (INT64_C(50000000))
+
+/* Frame structure.  Payload starts at data[MUX_FRAME_HEADER_SIZE].  data[] is a
+ * flexible array member, so a frame object is mux_frame_object_size(max_payload)
+ * bytes, never plain sizeof(struct mux_frame). */
 struct mux_frame {
 	union {
 		size_t pos;
 		size_t unacked_count;
 	};
-	size_t len;
+	size_t cap, len;
 	struct mux_frame *next;
-	unsigned char data[MUX_FRAME_SIZE];
+	unsigned char data[];
 };
 
-/* Frame flags */
+/* Allocation size of a frame object whose payload buffer holds up to
+ * @p max_payload bytes.  mux_frame_object_size() is the out-of-line equivalent
+ * for pool implementers (e.g. the app) that include only the public mux.h. */
+#define MUX_FRAME_OBJECT_SIZE(max_payload)                                     \
+	(offsetof(struct mux_frame, data) + MUX_FRAME_HEADER_SIZE +            \
+	 (size_t)(max_payload))
+
 enum mux_flags {
 	MUX_FLAG_FIN = 0x01,
 	MUX_FLAG_SYN = 0x02,
@@ -118,12 +146,17 @@ enum mux_status {
 	MUX_STATUS_CANCEL = 0x0005,
 };
 
+/* Allocate a frame whose payload buffer holds up to @p cap bytes.  The pool
+ * allocator only returns a sized block; this function stamps frame->cap and
+ * resets the runtime cursor fields. */
 static inline struct mux_frame *
-mux_frame_get(const struct mux_frame_allocator *restrict pool)
+mux_frame_get(const struct mux_frame_allocator *restrict pool, const size_t cap)
 {
-	struct mux_frame *frame = pool->alloc(pool->data);
+	struct mux_frame *frame =
+		pool->alloc(pool->data, MUX_FRAME_OBJECT_SIZE(cap));
 	if (frame != NULL) {
 		frame->pos = 0;
+		frame->cap = cap;
 		frame->len = 0;
 		frame->next = NULL;
 	}
@@ -236,7 +269,7 @@ static inline void mux_write_header(
 	write_uint8(buf + 1, header->flags);
 	write_uint16(buf + 2, header->length);
 	write_uint16(buf + 4, header->stream_id);
-	write_uint16(buf + 6, (uint16_t)header->extra);
+	write_uint16(buf + 6, header->extra);
 }
 
 static inline void mux_read_header(
@@ -257,6 +290,11 @@ struct ringbuf {
 };
 
 bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow);
+
+/* Shrink the ring's capacity back toward target_cap, reclaiming memory grown to
+ * assemble an oversized inbound frame.  Never shrinks below the live byte count,
+ * and is a no-op when the capacity is already at or below target_cap. */
+void ringbuf_shrink(struct ringbuf **restrict rbp, size_t target_cap);
 
 static inline struct ringbuf *ringbuf_new(const size_t cap)
 {
@@ -331,17 +369,17 @@ static inline void ringbuf_compact(struct ringbuf *restrict rb)
 }
 
 /* --- Frame pointer ring ---
- * Dynamic circular array of struct mux_frame * pointers.
- * O(1) tail push, O(k) head trim, contiguous memory for cache-friendly scans.
- * The ring struct is heap-allocated as a single block (entries[] is a FAM);
- * use mux_frame_ring_new() to create and mux_frame_ring_free() to destroy. */
+ * Dynamic circular array of struct mux_frame * pointers: O(1) tail push, O(k)
+ * head trim, heap-allocated as a single block (entries[] is a FAM). */
 
 #define MUX_FRAME_RING_MIN 16
 
 struct mux_frame_ring {
 	size_t capacity;
-	size_t head; /* index of oldest entry */
-	size_t count; /* number of entries stored */
+	/* index of oldest entry */
+	size_t head;
+	/* number of entries stored */
+	size_t count;
 	struct mux_frame *entries[];
 };
 

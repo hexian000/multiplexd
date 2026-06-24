@@ -7,7 +7,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <threads.h>
 
 const int intlog2_debruijn_bsr32[32] = {
 	0, 9,  1,  10, 13, 21, 2,  29, 11, 14, 16, 18, 22, 25, 3, 30,
@@ -34,6 +33,8 @@ const int intlog2_debruijn_bsf64[64] = {
 };
 
 #if UINTMAX_MAX > ULLONG_MAX
+
+#include <threads.h>
 
 /* --- Runtime De Bruijn for arbitrary-width uintmax_t --- */
 

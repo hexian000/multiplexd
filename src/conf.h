@@ -18,6 +18,18 @@
 /* Maximum configuration file size in bytes. */
 #define CONF_MAXSIZE 65535
 
+struct conf_socket_opts {
+	bool tcp_keepalive : 1;
+	bool tcp_nodelay : 1;
+	bool tcp_reuseport : 1;
+	int tcp_sndbuf;
+	int tcp_rcvbuf;
+#if WITH_TCP_NOTSENT_LOWAT
+	int tcp_notsent_lowat;
+#endif
+	int backlog;
+};
+
 /* Per-peer listen entry inside the identity block. */
 struct identity_peer {
 	/* Peer-side identity used as routing key. */
@@ -26,11 +38,8 @@ struct identity_peer {
 	char *listen;
 };
 
-/* Per-identity authorized certificate entry.
- *
- * PEM strings in certs[] are staging fields populated by conf_load and
- * consumed/discarded by conf_inline_pem.  After conf_inline_pem, only
- * certs_der[] / certs_der_len[] contain the final DER data. */
+/* Per-identity authorized certificate entry.  certs[] are staging PEM strings
+ * (consumed by conf_inline_pem); afterwards only certs_der[] is set. */
 struct conf_identity_authcert {
 	/* Peer identity string (owned). */
 	char *peer;
@@ -70,21 +79,29 @@ struct config {
 	char *tls_cert;
 	char *tls_key;
 	char *tls_ciphersuites;
+	/* NULL or empty string omits the SNI extension. */
+	char *tls_sni;
+	/* Comma-separated list; NULL or empty string omits the ALPN extension. */
+	char *tls_alpn;
 	/* Staging: per-entry PEM strings (owned; NULLed by conf_inline_pem). */
 	char **tls_authcerts;
 	size_t tls_authcerts_count;
-	/* Final concatenated PEM bundle of all trusted certificates (owned).
-	 * Built by conf_inline_pem from tls_authcerts[] + identity.authcerts.
-	 * NULL when no certificates are configured. */
+	/* Concatenated PEM bundle of trusted certificates (owned); NULL when none. */
 	char *tls_authcerts_bundle;
-#endif
+	/* OpenSSL only: request kernel TLS (KTLS) offload so the kernel frames
+	 * and encrypts records and can coalesce them into full segments. */
+	bool tls_kernel_offload;
+	/* Use buffered (memory-transport) TLS: the mux layer owns socket I/O and
+	 * shuttles ciphertext through the TLS library instead of attaching the fd. */
+	bool tls_buffered;
+#endif /* WITH_TLS */
 
 	/* Mux session parameters; window fields in frame units. */
 	struct mux_config mux;
 	/* TCP socket options for the mux transport socket. */
-	struct util_socket_opts mux_tcp;
+	struct conf_socket_opts mux_tcp;
 	/* TCP socket options for the local application socket. */
-	struct util_socket_opts tcp;
+	struct conf_socket_opts tcp;
 
 	struct conf_identity identity;
 
@@ -97,56 +114,31 @@ struct config {
 	int startup_limit_full;
 };
 
-/**
- * @brief Allocate a new configuration object with default values.
- * @return A heap-allocated configuration, or NULL on allocation failure.
- */
+/* New configuration with defaults; NULL on allocation failure. */
 struct config *conf_new(void);
 
-/**
- * @brief Parse, validate, and normalize a configuration from a JSON buffer.
- * @param json The JSON input buffer (modified in-place; need not be NUL-terminated).
- * @param len The input length in bytes.
- * @return A heap-allocated configuration on success, or NULL on failure.
- */
+/* Parse, validate, and normalize config from a JSON buffer (modified in place;
+ * need not be NUL-terminated). NULL on failure. */
 struct config *conf_parse(char *json, size_t len);
 
-/**
- * @brief Parse, validate, and normalize a configuration file.
- * @param path Path to the JSON configuration file.
- * @return A heap-allocated configuration on success, or NULL on failure.
- */
+/* Parse, validate, and normalize a JSON config file; NULL on failure. */
 struct config *conf_parsefile(const char *path);
 
-/**
- * @brief Serialize a configuration to a heap-allocated JSON string.
- * @param conf The configuration to serialize.
- * @param lenp Optional output for the string length (excluding NUL).
- * @return A heap-allocated NUL-terminated JSON string; caller must free().
- *         Returns NULL on allocation or serialization failure.
- */
+/* Serialize config to a heap JSON string (caller frees); @p lenp optionally
+ * receives the length excluding NUL. NULL on failure. */
 char *conf_dump(const struct config *conf, size_t *lenp);
 
 #if WITH_TLS
-/**
- * @brief Replace @path PEM references with in-memory PEM strings.
- * @param conf The configuration to rewrite in place.
- * @return true on success, false on allocation or file-loading failure.
- */
+/* Replace "@path" PEM references with in-memory PEM strings, in place.
+ * false on allocation or file-loading failure. */
 bool conf_inline_pem(struct config *conf);
 #endif
 
-/**
- * @brief Free a configuration returned by conf_new() or conf_parsefile().
- * @param conf The configuration to free; NULL is allowed.
- */
+/* Free a configuration; NULL is allowed. */
 void conf_free(struct config *conf);
 
-/**
- * @brief Build a struct mux_config for the mux subsystem from the config.
- *
- * Copies conf->mux and sets reject_inbound from conf->connect.
- */
+/* Build a struct mux_config from the config: copies conf->mux and sets
+ * reject_inbound from conf->connect. */
 struct mux_config conf_get_mux(const struct config *conf);
 
 #endif /* CONF_H */

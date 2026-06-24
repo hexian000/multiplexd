@@ -1,21 +1,256 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/* session_test.c - white-box tests for session.c (lifecycle: handshake-done
+ * re-arming, graceful/forced shutdown, drain) plus the socket-option helper.
+ * Dependencies: session.c #included; real leaf frame.c linked; every sibling
+ * module session.c orchestrates (estimator/handshake/sched/send/recv/stream/
+ * unacked/wire) is mocked below.  Cross-module behavior that needs the real
+ * assembled stack lives in send_test/recv_test/unacked_test or mux_test. */
+
+#include "mux/estimator.h"
+#include "mux/frame.h"
+#include "mux/handshake.h"
+#include "mux/mux.h"
+#include "mux/recv.h"
+#include "mux/sched.h"
+#include "mux/send.h"
 #include "mux/session.h"
 #include "mux/stream.h"
+#include "mux/unacked.h"
+#include "mux/wire.h"
 
 #include "algo/hashtable.h"
+#include "utils/slog.h"
 #include "utils/testing.h"
 
 #include <ev.h>
 
-#include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include "mux/session.c"
+
+/* Configurable mock results: each test sets these before driving the code under
+ * test, then restores the inert default.  Declared here so the mock bodies
+ * below can read them. */
+static bool g_session_send_oob_result = true;
+static enum wire_shutdown_state g_wire_shutdown_result = WIRE_SHUTDOWN_DONE;
+static bool g_wire_wait_eof_result = true;
+static bool g_wire_tls_start_result = true;
+static uint_least16_t g_alloc_stream_id_result = STREAMID_CTRL;
+static struct mux_stream *g_stream_new_result = NULL;
+static bool g_sched_add_stream_result = true;
+
+/* mock - collaborator mocks, frame pool, session fixtures
+ *
+ * session.c is the orchestrator; every sibling-module entry point it calls is
+ * stubbed.  Most are inert; a few reproduce just enough behavior for the
+ * lifecycle decisions under test (sched_coalesce_arm actually arms the timer;
+ * the cleanup helpers reclaim the fixture's buffers). */
+
+static void st_coalesce_cb(struct ev_loop *loop, ev_timer *w, int revents)
+{
+	(void)loop;
+	(void)w;
+	(void)revents;
+}
+
+void sched_init(struct mux_session *restrict ss)
+{
+	ev_timer_init(&ss->sched.w_coalesce, st_coalesce_cb, 0.0, 1.0);
+	ss->sched.w_coalesce.data = ss;
+}
+
+void sched_coalesce_arm(struct mux_session *ss)
+{
+	if (!ev_is_active(&ss->sched.w_coalesce)) {
+		ev_timer_start(ss->loop, &ss->sched.w_coalesce);
+	}
+}
+
+void sched_schedule(struct mux_session *ss)
+{
+	(void)ss;
+}
+
+void sched_wake(struct mux_session *ss, struct mux_stream *s)
+{
+	(void)ss;
+	(void)s;
+}
+
+bool sched_add_stream(struct mux_session *ss, struct mux_stream *s)
+{
+	(void)ss;
+	(void)s;
+	return g_sched_add_stream_result;
+}
+
+uint_least16_t sched_alloc_stream_id(struct mux_session *ss)
+{
+	(void)ss;
+	return g_alloc_stream_id_result;
+}
+
+void sched_free_streams(struct mux_session *restrict ss)
+{
+	ss->sched.sched_head = NULL;
+	ss->sched.sched_tail = NULL;
+	ss->sched.drr_active = NULL;
+	ss->sched.lp_head = NULL;
+	ss->sched.lp_tail = NULL;
+	ss->sched.delay_head = NULL;
+	ss->unacked.stalled = false;
+	ss->sched.num_tombstones = 0;
+	ss->sched.next_stream_id = 0;
+	if (ss->sched.streams != NULL) {
+		table_free(ss->sched.streams);
+		ss->sched.streams = NULL;
+	}
+}
+
+void wire_discard_buffers(struct mux_session *restrict ss)
+{
+	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
+	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
+	ss->wire.sendbuf_staging = false;
+	if (ss->wire.recvbuf != NULL) {
+		ringbuf_reset(ss->wire.recvbuf);
+	}
+}
+
+void unacked_free_all(struct mux_session *ss)
+{
+	mux_frame_ring_free(&ss->unacked.ring, &ss->pool);
+	ss->unacked.frames = 0;
+	ss->unacked.bytes = 0;
+	ss->unacked.partial_offset = 0;
+	ss->unacked.retransmit_off = SIZE_MAX;
+}
+
+void wire_conn_free(struct mux_session *ss)
+{
+	(void)ss;
+}
+
+/* Inert sibling entry points: not exercised by the lifecycle cases below. */
+
+void estimator_init(struct mux_session *restrict ss, size_t bdp)
+{
+	(void)ss;
+	(void)bdp;
+}
+
+size_t estimator_rx_window_size(const struct estimator_ctx *restrict est)
+{
+	(void)est;
+	return 0;
+}
+
+bool handshake_enqueue_hello(
+	struct mux_session *ss, int msgid, bool include_resume_seq)
+{
+	(void)ss;
+	(void)msgid;
+	(void)include_resume_seq;
+	return true;
+}
+
+void session_flush_oob(struct mux_session *ss)
+{
+	(void)ss;
+}
+
+void session_on_recv(struct mux_session *ss)
+{
+	(void)ss;
+}
+
+void session_on_send(struct mux_session *ss)
+{
+	(void)ss;
+}
+
+bool session_send_oob(
+	struct mux_session *ss, uint_fast8_t extra,
+	const unsigned char *payload, size_t payload_len)
+{
+	(void)ss;
+	(void)extra;
+	(void)payload;
+	(void)payload_len;
+	return g_session_send_oob_result;
+}
+
+struct mux_stream *
+stream_new(struct mux_session *restrict ss, uint_fast16_t id, bool active_open)
+{
+	(void)ss;
+	(void)id;
+	(void)active_open;
+	return g_stream_new_result;
+}
+
+void stream_free(struct mux_stream *s)
+{
+	(void)s;
+}
+
+bool unacked_resume_ack_recv(struct mux_session *ss, uint_least32_t peer_ack)
+{
+	(void)ss;
+	(void)peer_ack;
+	return true;
+}
+
+void unacked_track_sent(struct mux_session *ss, struct mux_frame *frame)
+{
+	/* Real unacked_track_sent takes ownership; reclaim here to avoid leaks
+	 * when a test routes a captured sendbuf frame through this path. */
+	mux_frame_put(&ss->pool, frame);
+}
+
+void wire_adopt_tlsconn(
+	struct mux_session *restrict ss, struct tls_connection *restrict conn)
+{
+	(void)ss;
+	(void)conn;
+}
+
+void wire_tlsconn_free(struct tls_connection *conn)
+{
+	(void)conn;
+}
+
+enum wire_shutdown_state wire_shutdown(struct mux_session *ss)
+{
+	(void)ss;
+	return g_wire_shutdown_result;
+}
+
+void wire_tls_log_status(struct mux_session *ss)
+{
+	(void)ss;
+}
+
+bool wire_tls_start(struct mux_session *ss)
+{
+	(void)ss;
+	return g_wire_tls_start_result;
+}
+
+bool wire_wait_eof(struct mux_session *ss)
+{
+	(void)ss;
+	return g_wire_wait_eof_result;
+}
 
 struct frame_pool_ctx {
 	int alloc_calls;
@@ -29,10 +264,10 @@ struct session_fixture {
 	int fds[2];
 };
 
-static struct mux_frame *session_test_alloc(void *data)
+static struct mux_frame *session_test_alloc(void *data, const size_t size)
 {
 	struct frame_pool_ctx *const ctx = data;
-	struct mux_frame *const frame = malloc(sizeof(*frame));
+	struct mux_frame *const frame = malloc(size);
 	if (frame != NULL) {
 		ctx->alloc_calls++;
 	}
@@ -89,6 +324,7 @@ static int setup_fixture(struct session_fixture *restrict fx)
 		.loop = fx->loop,
 		.state = SESSION_ESTABLISHED,
 		.pool = make_pool(&fx->pool_ctx),
+		.max_payload = (uint_least32_t)mux_conf_default.max_frame_payload,
 		.session_window = 8,
 		.stream_window = 4,
 		.wire = {
@@ -97,8 +333,8 @@ static int setup_fixture(struct session_fixture *restrict fx)
 	};
 	fx->ss.sched.streams = table_new(&mux_stream_table_opts);
 	if (fx->ss.sched.streams == NULL) {
-		close(fx->fds[0]);
-		close(fx->fds[1]);
+		(void)close(fx->fds[0]);
+		(void)close(fx->fds[1]);
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 		return -1;
@@ -108,22 +344,22 @@ static int setup_fixture(struct session_fixture *restrict fx)
 	ev_timer_init(&fx->ss.w_idle_timeout, session_test_timer_cb, 1.0, 0.0);
 	fx->ss.w_idle_timeout.data = &fx->ss;
 	sched_init(&fx->ss);
-	fx->ss.wire.recvbuf = ringbuf_new(4u * (size_t)MUX_FRAME_SIZE);
+	fx->ss.wire.recvbuf = ringbuf_new(4u * (size_t)MUX_MAX_FRAME_SIZE);
 	if (fx->ss.wire.recvbuf == NULL) {
 		table_free(fx->ss.sched.streams);
-		close(fx->fds[0]);
-		close(fx->fds[1]);
+		(void)close(fx->fds[0]);
+		(void)close(fx->fds[1]);
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 		return -1;
 	}
-	fx->ss.unacked = mux_frame_ring_new(MUX_FRAME_RING_MIN);
-	if (fx->ss.unacked == NULL) {
+	fx->ss.unacked.ring = mux_frame_ring_new(MUX_FRAME_RING_MIN);
+	if (fx->ss.unacked.ring == NULL) {
 		ringbuf_free(fx->ss.wire.recvbuf);
 		fx->ss.wire.recvbuf = NULL;
 		table_free(fx->ss.sched.streams);
-		close(fx->fds[0]);
-		close(fx->fds[1]);
+		(void)close(fx->fds[0]);
+		(void)close(fx->fds[1]);
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 		return -1;
@@ -131,399 +367,6 @@ static int setup_fixture(struct session_fixture *restrict fx)
 	return 0;
 }
 
-static void teardown_fixture(struct session_fixture *restrict fx)
-{
-	if (fx->ss.sched.streams != NULL) {
-		sched_free_streams(&fx->ss);
-	}
-	if (fx->ss.wire.oobbuf.head != NULL ||
-	    ringbuf_readable(fx->ss.wire.recvbuf) > 0 ||
-	    fx->ss.wire.sendbuf.head != NULL) {
-		wire_discard_buffers(&fx->ss);
-	}
-	ringbuf_free(fx->ss.wire.recvbuf);
-	fx->ss.wire.recvbuf = NULL;
-	mux_frame_ring_free(&fx->ss.unacked, &fx->ss.pool);
-	fx->ss.unacked_frames = 0;
-	fx->ss.retransmit_off = SIZE_MAX;
-	if (fx->fds[0] >= 0) {
-		close(fx->fds[0]);
-		fx->fds[0] = -1;
-	}
-	if (fx->fds[1] >= 0) {
-		close(fx->fds[1]);
-		fx->fds[1] = -1;
-	}
-	if (fx->loop != NULL) {
-		ev_loop_destroy(fx->loop);
-		fx->loop = NULL;
-	}
-}
-
-static struct mux_frame *make_frame(
-	const struct mux_frame_allocator *restrict pool,
-	const uint_least16_t stream_id, const uint_least8_t flags,
-	const uint_least16_t extra, const void *restrict payload,
-	const size_t payload_len)
-{
-	struct mux_frame *const frame = mux_frame_get(pool);
-	if (frame == NULL) {
-		return NULL;
-	}
-	const struct mux_header hdr = {
-		.version = MUX_PROTOCOL_VERSION,
-		.flags = flags,
-		.length = (uint_least16_t)payload_len,
-		.stream_id = stream_id,
-		.extra = extra,
-	};
-	mux_write_header(frame->data, &hdr);
-	if (payload_len > 0 && payload != NULL) {
-		memcpy(frame->data + MUX_FRAME_HEADER_SIZE, payload,
-		       payload_len);
-	}
-	frame->len = MUX_FRAME_HEADER_SIZE + payload_len;
-	frame->pos = 0;
-	return frame;
-}
-
-T_DECLARE_CASE(test_session_send_ctrl_packs_header_and_clamps_extra)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	T_EXPECT(session_send_ctrl(&fx.ss, 7, MUX_FLAG_ACK, UINT32_MAX));
-	T_CHECK(fx.ss.wire.sendbuf.head != NULL);
-	T_EXPECT(fx.ss.wire.tx_pending);
-	T_EXPECT_EQ(
-		fx.ss.wire.sendbuf.head->len, (size_t)MUX_FRAME_HEADER_SIZE);
-	{
-		struct mux_header hdr = { 0 };
-		mux_read_header(fx.ss.wire.sendbuf.head->data, &hdr);
-		T_EXPECT_EQ(hdr.stream_id, (uint_least16_t)7);
-		T_EXPECT_EQ(hdr.flags, (uint_least8_t)MUX_FLAG_ACK);
-		T_EXPECT_EQ(hdr.extra, (uint_least16_t)UINT16_MAX);
-	}
-
-	teardown_fixture(&fx);
-}
-
-T_DECLARE_CASE(test_session_send_oob_packs_payload)
-{
-	struct session_fixture fx;
-	static const unsigned char payload[] = { 1, 2, 3, 4 };
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	T_EXPECT(session_send_oob(
-		&fx.ss, MUX_CTRL_PONG, payload, sizeof(payload)));
-	T_CHECK(fx.ss.wire.oobbuf.head != NULL);
-	T_EXPECT(fx.ss.wire.tx_pending);
-	{
-		struct mux_header hdr = { 0 };
-		mux_read_header(fx.ss.wire.oobbuf.head->data, &hdr);
-		T_EXPECT_EQ(hdr.stream_id, (uint_least16_t)STREAMID_CTRL);
-		T_EXPECT_EQ(hdr.extra, (uint_least16_t)MUX_CTRL_PONG);
-		T_EXPECT_EQ(hdr.length, (uint_least16_t)sizeof(payload));
-		T_EXPECT(
-			memcmp(fx.ss.wire.oobbuf.head->data +
-				       MUX_FRAME_HEADER_SIZE,
-			       payload, sizeof(payload)) == 0);
-	}
-
-	teardown_fixture(&fx);
-}
-
-T_DECLARE_CASE(test_session_ack_trim_releases_frames_and_clears_stall)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	for (int i = 0; i < 3; i++) {
-		struct mux_frame *const frame = make_frame(
-			&fx.ss.pool, (uint_least16_t)(i + 1), MUX_FLAG_PUSH, 0,
-			NULL, 0);
-		T_CHECK(frame != NULL);
-		frame->unacked_count = 1;
-		T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
-	}
-	fx.ss.unacked_frames = 3;
-	fx.ss.last_ack_recv = 1;
-	fx.ss.session_window = 2;
-	fx.ss.send_stalled = true;
-
-	T_EXPECT(session_ack_trim(&fx.ss, 2));
-	T_EXPECT_EQ(fx.ss.unacked_frames, (size_t)1);
-	T_EXPECT_EQ(fx.ss.last_ack_recv, (uint_least32_t)3);
-	T_EXPECT(!fx.ss.send_stalled);
-	T_EXPECT(fx.ss.wire.tx_pending);
-
-	teardown_fixture(&fx);
-}
-
-T_DECLARE_CASE(test_session_ack_trim_overflow_returns_false)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	struct mux_frame *const frame =
-		make_frame(&fx.ss.pool, 1, MUX_FLAG_PUSH, 0, NULL, 0);
-	T_CHECK(frame != NULL);
-	frame->unacked_count = 1;
-	T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
-	fx.ss.unacked_frames = 1;
-	fx.ss.last_ack_recv = 5;
-
-	/* count=2 > unacked_frames=1: must return false, ring unchanged. */
-	T_EXPECT(!session_ack_trim(&fx.ss, 2));
-	T_EXPECT_EQ(fx.ss.unacked_frames, (size_t)1);
-	T_EXPECT_EQ(fx.ss.last_ack_recv, (uint_least32_t)5);
-	T_EXPECT(mux_frame_ring_peek(fx.ss.unacked, 0) == frame);
-
-	teardown_fixture(&fx);
-}
-
-/* session_ack_trim feeds estimator_add_acked with the trimmed payload bytes,
- * but only when an automatic window is enabled (manual mode never probes). */
-T_DECLARE_CASE(test_session_ack_trim_acks_feed_estimator)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	static const unsigned char payload[100] = { 0 };
-	fx.ss.auto_session_window = true;
-
-	struct mux_frame *const frame = make_frame(
-		&fx.ss.pool, 1, MUX_FLAG_PUSH, 0, payload, sizeof(payload));
-	T_CHECK(frame != NULL);
-	frame->unacked_count = 1;
-	T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
-	fx.ss.unacked_frames = 1;
-	fx.ss.unacked_bytes = sizeof(payload);
-	fx.ss.last_ack_recv = 0;
-
-	T_EXPECT(session_ack_trim(&fx.ss, 1));
-	T_EXPECT_EQ(fx.ss.unacked_bytes, (size_t)0);
-	T_EXPECT_EQ(fx.ss.estimator.dir[ESTIMATOR_TX].sample, sizeof(payload));
-	T_EXPECT_EQ(fx.ss.estimator.dir[ESTIMATOR_RX].sample, (size_t)0);
-	T_EXPECT(fx.ss.estimator.ping_in_flight);
-
-	teardown_fixture(&fx);
-}
-
-/* Manual mode (default: both auto_*_window flags false) must not probe the
- * estimator on session ACKs. */
-T_DECLARE_CASE(test_session_ack_trim_manual_mode_skips_estimator)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	static const unsigned char payload[100] = { 0 };
-
-	struct mux_frame *const frame = make_frame(
-		&fx.ss.pool, 1, MUX_FLAG_PUSH, 0, payload, sizeof(payload));
-	T_CHECK(frame != NULL);
-	frame->unacked_count = 1;
-	T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
-	fx.ss.unacked_frames = 1;
-	fx.ss.unacked_bytes = sizeof(payload);
-	fx.ss.last_ack_recv = 0;
-
-	T_EXPECT(session_ack_trim(&fx.ss, 1));
-	T_EXPECT_EQ(fx.ss.unacked_bytes, (size_t)0);
-	T_EXPECT_EQ(fx.ss.estimator.dir[ESTIMATOR_TX].sample, (size_t)0);
-	T_EXPECT(!fx.ss.estimator.ping_in_flight);
-
-	teardown_fixture(&fx);
-}
-
-T_DECLARE_CASE(test_session_resume_ack_recv_advances_cursor)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	for (int i = 0; i < 2; i++) {
-		struct mux_frame *const frame = make_frame(
-			&fx.ss.pool, (uint_least16_t)(i + 1), MUX_FLAG_PUSH, 0,
-			NULL, 0);
-		T_CHECK(frame != NULL);
-		frame->unacked_count = 1;
-		T_CHECK(mux_frame_ring_push(&fx.ss.unacked, frame));
-	}
-	fx.ss.unacked_frames = 2;
-	fx.ss.last_ack_recv = 1;
-
-	T_EXPECT(session_resume_ack_recv(&fx.ss, 2));
-	T_EXPECT_EQ(fx.ss.last_ack_recv, (uint_least32_t)2);
-	T_EXPECT_EQ(fx.ss.unacked_frames, (size_t)1);
-	T_EXPECT(fx.ss.retransmit_off == 0 && fx.ss.unacked->count > 0);
-
-	teardown_fixture(&fx);
-}
-
-T_DECLARE_CASE(test_session_open_stream_enforces_limits)
-{
-	struct session_fixture fx;
-	struct mux_stream *existing = NULL;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	fx.ss.conf.max_halfopen = 1;
-	fx.ss.num_halfopen = 1;
-	T_EXPECT(session_open_stream(&fx.ss) == NULL);
-
-	fx.ss.num_halfopen = 0;
-	fx.ss.conf.max_halfopen = 0;
-	fx.ss.conf.max_streams = 1;
-	existing = stream_new(&fx.ss, 3, true);
-	T_CHECK(existing != NULL);
-	T_EXPECT(sched_add_stream(&fx.ss, existing));
-	T_EXPECT(session_open_stream(&fx.ss) == NULL);
-
-	teardown_fixture(&fx);
-}
-
-T_DECLARE_CASE(test_session_open_stream_success_sets_default_send_window)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	struct mux_stream *const s = session_open_stream(&fx.ss);
-	T_CHECK(s != NULL);
-	T_EXPECT_EQ(s->id, (uint_least16_t)1);
-	T_EXPECT_EQ(s->send_window, (uint_least32_t)MUX_DEFAULT_SEND_WINDOW);
-	T_EXPECT(sched_find_stream(&fx.ss, s->id) == s);
-
-	teardown_fixture(&fx);
-}
-
-T_DECLARE_CASE(test_session_recv_ping_copies_payload_into_pong)
-{
-	struct session_fixture fx;
-	static const unsigned char payload[] = { 9, 8, 7, 6, 5, 4, 3, 2 };
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	struct mux_frame *const frame = make_frame(
-		&fx.ss.pool, STREAMID_CTRL, 0, MUX_CTRL_PING, payload,
-		sizeof(payload));
-	struct mux_header hdr = {
-		.version = MUX_PROTOCOL_VERSION,
-		.flags = 0,
-		.length = (uint_least16_t)sizeof(payload),
-		.stream_id = STREAMID_CTRL,
-		.extra = MUX_CTRL_PING,
-	};
-	T_CHECK(frame != NULL);
-	ringbuf_reset(fx.ss.wire.recvbuf);
-	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(fx.ss.wire.recvbuf, frame->len);
-
-	session_recv_ping(&fx.ss, &hdr, frame->len);
-	T_CHECK(fx.ss.wire.oobbuf.head != NULL);
-	{
-		struct mux_header pong_hdr = { 0 };
-		mux_read_header(fx.ss.wire.oobbuf.head->data, &pong_hdr);
-		T_EXPECT_EQ(pong_hdr.extra, (uint_least16_t)MUX_CTRL_PONG);
-	}
-	T_EXPECT(
-		memcmp(fx.ss.wire.oobbuf.head->data + MUX_FRAME_HEADER_SIZE,
-		       payload, sizeof(payload)) == 0);
-	mux_frame_put(&fx.ss.pool, frame);
-
-	teardown_fixture(&fx);
-}
-
-T_DECLARE_CASE(test_session_recv_ping_queues_pong_per_ping_outside_rate_limit)
-{
-	struct session_fixture fx;
-	static const unsigned char payload1[] = { 1, 2, 3, 4 };
-	static const unsigned char payload2[] = { 5, 6, 7, 8 };
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	struct mux_frame *const frame1 = make_frame(
-		&fx.ss.pool, STREAMID_CTRL, 0, MUX_CTRL_PING, payload1,
-		sizeof(payload1));
-	struct mux_frame *const frame2 = make_frame(
-		&fx.ss.pool, STREAMID_CTRL, 0, MUX_CTRL_PING, payload2,
-		sizeof(payload2));
-	struct mux_header hdr = {
-		.version = MUX_PROTOCOL_VERSION,
-		.flags = 0,
-		.length = (uint_least16_t)sizeof(payload1),
-		.stream_id = STREAMID_CTRL,
-		.extra = MUX_CTRL_PING,
-	};
-	T_CHECK(frame1 != NULL);
-	T_CHECK(frame2 != NULL);
-
-	ringbuf_reset(fx.ss.wire.recvbuf);
-	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame1->data,
-	       frame1->len);
-	ringbuf_produce(fx.ss.wire.recvbuf, frame1->len);
-	session_recv_ping(&fx.ss, &hdr, frame1->len);
-	T_CHECK(fx.ss.wire.oobbuf.head != NULL);
-	const struct mux_frame *const first_pong = fx.ss.wire.oobbuf.head;
-
-	/* Reset the rate-limit clock so the second PING is not dropped. */
-	fx.ss.ping_recv_last_ns = -(int_fast64_t)MUX_PING_RATE_LIMIT_NS;
-	hdr.length = (uint_least16_t)sizeof(payload2);
-	ringbuf_reset(fx.ss.wire.recvbuf);
-	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame2->data,
-	       frame2->len);
-	ringbuf_produce(fx.ss.wire.recvbuf, frame2->len);
-	session_recv_ping(&fx.ss, &hdr, frame2->len);
-
-	/* Each PING outside the rate-limit window queues its own PONG. */
-	T_EXPECT(fx.ss.wire.oobbuf.head == first_pong);
-	T_EXPECT(fx.ss.wire.oobbuf.tail != first_pong);
-	T_EXPECT(fx.ss.wire.oobbuf.head->next != NULL);
-	T_EXPECT(
-		memcmp(first_pong->data + MUX_FRAME_HEADER_SIZE, payload1,
-		       sizeof(payload1)) == 0);
-	T_EXPECT(
-		memcmp(fx.ss.wire.oobbuf.tail->data + MUX_FRAME_HEADER_SIZE,
-		       payload2, sizeof(payload2)) == 0);
-
-	mux_frame_put(&fx.ss.pool, frame1);
-	mux_frame_put(&fx.ss.pool, frame2);
-
-	teardown_fixture(&fx);
-}
-
-/* Build a session in SESSION_HANDSHAKE state with all timers needed for
- * session_handshake_done initialised.  Reuses setup_fixture for the common
- * parts (socket pair, pool, streams table, sched_init). */
 static int setup_handshake_fixture(struct session_fixture *restrict fx)
 {
 	if (setup_fixture(fx) != 0) {
@@ -545,99 +388,37 @@ static int setup_handshake_fixture(struct session_fixture *restrict fx)
 	return 0;
 }
 
-/* Regression: a received PONG must clear the estimator's ping_in_flight token
- * and reset w_keepalive.repeat to the full keepalive interval so the next
- * keepalive_cb fires a fresh PING rather than treating the unanswered PING as
- * a liveness failure. */
-T_DECLARE_CASE(test_session_recv_pong_clears_ping_in_flight)
+static void teardown_fixture(struct session_fixture *restrict fx)
 {
-	struct session_fixture fx;
-	static const unsigned char payload[MUX_PING_PAYLOAD_SIZE] = { 0 };
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
+	if (fx->ss.sched.streams != NULL) {
+		sched_free_streams(&fx->ss);
 	}
-
-	/* Simulate a probe in flight (sent by keepalive or data path):
-	 * payload is all-zero so sent_ns == 0, which matches last_probe_ns. */
-	fx.ss.conf.keepalive = 60;
-	fx.ss.conf.ping_timeout = 15;
-	ev_timer_init(&fx.ss.w_keepalive, session_test_timer_cb, 0.0, 15.0);
-	fx.ss.w_keepalive.data = &fx.ss;
-	fx.ss.estimator.ping_in_flight = true;
-	fx.ss.estimator.last_probe_ns = 0;
-
-	/* Build a minimal PONG frame in recvbuf. */
-	struct mux_frame *const frame = make_frame(
-		&fx.ss.pool, STREAMID_CTRL, 0, MUX_CTRL_PONG, payload,
-		sizeof(payload));
-	T_CHECK(frame != NULL);
-	const struct mux_header hdr = {
-		.version = MUX_PROTOCOL_VERSION,
-		.flags = 0,
-		.length = (uint_least16_t)sizeof(payload),
-		.stream_id = STREAMID_CTRL,
-		.extra = MUX_CTRL_PONG,
-	};
-	ringbuf_reset(fx.ss.wire.recvbuf);
-	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(fx.ss.wire.recvbuf, frame->len);
-
-	session_recv_pong(&fx.ss, &hdr, frame->len);
-
-	T_EXPECT(!fx.ss.estimator.ping_in_flight);
-	/* Timer repeat must be restored to the full keepalive interval. */
-	T_EXPECT_EQ(fx.ss.w_keepalive.repeat, 60.0);
-
-	mux_frame_put(&fx.ss.pool, frame);
-	teardown_fixture(&fx);
+	if (fx->ss.wire.oobbuf.head != NULL ||
+	    ringbuf_readable(fx->ss.wire.recvbuf) > 0 ||
+	    fx->ss.wire.sendbuf.head != NULL) {
+		wire_discard_buffers(&fx->ss);
+	}
+	ringbuf_free(fx->ss.wire.recvbuf);
+	fx->ss.wire.recvbuf = NULL;
+	mux_frame_ring_free(&fx->ss.unacked.ring, &fx->ss.pool);
+	fx->ss.unacked.frames = 0;
+	fx->ss.unacked.retransmit_off = SIZE_MAX;
+	if (fx->fds[0] >= 0) {
+		(void)close(fx->fds[0]);
+		fx->fds[0] = -1;
+	}
+	if (fx->fds[1] >= 0) {
+		(void)close(fx->fds[1]);
+		fx->fds[1] = -1;
+	}
+	if (fx->loop != NULL) {
+		ev_loop_destroy(fx->loop);
+		fx->loop = NULL;
+	}
 }
 
-/* Any received PONG resets w_keepalive.repeat to the full keepalive interval,
- * regardless of whether a probe was in flight.  This defers the next probe
- * correctly even for unsolicited PONGs. */
-T_DECLARE_CASE(test_session_recv_pong_resets_keepalive_interval)
-{
-	struct session_fixture fx;
-	static const unsigned char payload[MUX_PING_PAYLOAD_SIZE] = { 0 };
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
+/* regression - targeted cases for one session-lifecycle decision each */
 
-	fx.ss.conf.keepalive = 60;
-	ev_timer_init(&fx.ss.w_keepalive, session_test_timer_cb, 0.0, 60.0);
-	fx.ss.w_keepalive.data = &fx.ss;
-	fx.ss.estimator.ping_in_flight = false;
-
-	struct mux_frame *const frame = make_frame(
-		&fx.ss.pool, STREAMID_CTRL, 0, MUX_CTRL_PONG, payload,
-		sizeof(payload));
-	T_CHECK(frame != NULL);
-	const struct mux_header hdr = {
-		.version = MUX_PROTOCOL_VERSION,
-		.flags = 0,
-		.length = (uint_least16_t)sizeof(payload),
-		.stream_id = STREAMID_CTRL,
-		.extra = MUX_CTRL_PONG,
-	};
-	ringbuf_reset(fx.ss.wire.recvbuf);
-	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(fx.ss.wire.recvbuf, frame->len);
-
-	session_recv_pong(&fx.ss, &hdr, frame->len);
-
-	T_EXPECT(!fx.ss.estimator.ping_in_flight);
-	/* Timer repeat must be set to the keepalive interval. */
-	T_EXPECT_EQ(fx.ss.w_keepalive.repeat, 60.0);
-
-	mux_frame_put(&fx.ss.pool, frame);
-	teardown_fixture(&fx);
-}
-
-/* Regression: after session_handshake_done, w_coalesce must be re-armed when
- * delay_head is non-NULL (streams held in the Nagle / ACK coalescing list
- * from before suspension). */
 T_DECLARE_CASE(test_session_handshake_done_rearms_coalesce_for_delay_list)
 {
 	struct session_fixture fx;
@@ -675,8 +456,8 @@ T_DECLARE_CASE(test_session_handshake_done_rearms_coalesce_for_ack_backlog)
 		return;
 	}
 
-	fx.ss.recv_seq = 5;
-	fx.ss.ack_seq = 3;
+	fx.ss.unacked.recv_seq = 5;
+	fx.ss.unacked.ack_seq = 3;
 	T_EXPECT(!ev_is_active(&fx.ss.sched.w_coalesce));
 
 	session_handshake_done(&fx.ss);
@@ -748,53 +529,6 @@ T_DECLARE_CASE(test_session_drain_sets_draining_flag)
 	teardown_fixture(&fx);
 }
 
-T_DECLARE_CASE(test_session_discard_stream_frames_clears_queued_data)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-
-	/* Enqueue two non-RST frames for stream 5. */
-	T_CHECK(session_send_ctrl(&fx.ss, 5, MUX_FLAG_ACK, 0));
-	T_CHECK(session_send_ctrl(&fx.ss, 5, MUX_FLAG_ACK, 0));
-	T_CHECK(fx.ss.wire.sendbuf.head != NULL);
-
-	session_discard_stream_frames(&fx.ss, 5);
-	T_EXPECT(fx.ss.wire.sendbuf.head == NULL);
-
-	teardown_fixture(&fx);
-}
-
-/* -------------------------------------------------------------------------
- * Flow-control boundary tests
- * ---------------------------------------------------------------------- */
-
-T_DECLARE_CASE(test_session_ack_extra_clamped_at_uint16_max)
-{
-	struct session_fixture fx;
-	if (setup_fixture(&fx) != 0) {
-		T_FATAL("setup_fixture failed");
-		return;
-	}
-	T_EXPECT(session_send_ctrl(
-		&fx.ss, STREAMID_CTRL, MUX_FLAG_ACK, UINT32_MAX));
-	T_CHECK(fx.ss.wire.sendbuf.head != NULL);
-	{
-		struct mux_header hdr = { 0 };
-		mux_read_header(fx.ss.wire.sendbuf.head->data, &hdr);
-		T_EXPECT_EQ(hdr.stream_id, (uint_least16_t)STREAMID_CTRL);
-		T_EXPECT(hdr.flags & MUX_FLAG_ACK);
-		T_EXPECT_EQ(hdr.extra, (uint_least16_t)UINT16_MAX);
-	}
-	teardown_fixture(&fx);
-}
-
-/* -------------------------------------------------------------------------
- * Socket helper tests
- * ---------------------------------------------------------------------- */
-
 T_DECLARE_CASE(test_socket_user_timeout_sets_option)
 {
 	const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -808,29 +542,396 @@ T_DECLARE_CASE(test_socket_user_timeout_sets_option)
 #else
 	/* Platform lacks TCP_USER_TIMEOUT; function must return -1. */
 	T_EXPECT_EQ(socket_user_timeout(fd, 5000), -1);
-#endif
+#endif /* WITH_TCP_USER_TIMEOUT */
 	(void)close(fd);
+}
+
+/* session_log_frame_header / format_frame_flags: VERYVERBOSE-gated diagnostic.
+ * Exercises the flag-name join, the unknown-bit branch, and the NONE branch. */
+T_DECLARE_CASE(test_session_log_frame_header_formats_flags)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	unsigned char raw[MUX_FRAME_HEADER_SIZE] = { 0 };
+	/* Multiple known flags: exercises the "|" separator join. */
+	struct mux_header hdr = {
+		.flags = MUX_FLAG_SYN | MUX_FLAG_ACK | MUX_FLAG_FIN |
+			 MUX_FLAG_RST | MUX_FLAG_PUSH,
+	};
+	session_log_frame_header(&fx.ss, "all-flags", raw, &hdr);
+	/* Known flag plus unknown bits: exercises the UNKNOWN(...) branch. */
+	hdr.flags = MUX_FLAG_SYN | (uint_least8_t)(~MUX_FLAG_MASK);
+	session_log_frame_header(&fx.ss, "unknown", raw, &hdr);
+	/* No flags: exercises the NONE branch. */
+	hdr.flags = 0;
+	session_log_frame_header(&fx.ss, "none", raw, &hdr);
+
+	teardown_fixture(&fx);
+}
+
+/* closing_cb dispatch on the transport-shutdown state machine: PENDING returns
+ * without a state change; ERROR resets the session. */
+T_DECLARE_CASE(test_closing_cb_pending_then_error)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_CLOSING;
+
+	g_wire_shutdown_result = WIRE_SHUTDOWN_PENDING;
+	closing_cb(&fx.ss);
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSING);
+
+	g_wire_shutdown_result = WIRE_SHUTDOWN_ERROR;
+	closing_cb(&fx.ss);
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+	g_wire_shutdown_result = WIRE_SHUTDOWN_DONE;
+
+	fx.fds[0] = -1; /* session_cleanup closed it */
+	teardown_fixture(&fx);
+}
+
+/* close_wait_cb logs and resets when wire_wait_eof reports unexpected state. */
+T_DECLARE_CASE(test_close_wait_cb_unexpected)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_CLOSE_WAIT;
+
+	g_wire_wait_eof_result = false;
+	close_wait_cb(&fx.ss);
+	g_wire_wait_eof_result = true;
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+
+	fx.fds[0] = -1;
+	teardown_fixture(&fx);
+}
+
+/* connect_cb after TCP connect: TLS start failure resets; a live TLS connection
+ * advances to the mux handshake. */
+T_DECLARE_CASE(test_connect_cb_tls_paths)
+{
+#if WITH_TLS
+	{
+		struct session_fixture fx;
+		if (setup_fixture(&fx) != 0) {
+			T_FATAL("setup_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_CONNECT;
+		g_wire_tls_start_result = false;
+		connect_cb(&fx.ss);
+		g_wire_tls_start_result = true;
+		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+		fx.fds[0] = -1;
+		teardown_fixture(&fx);
+	}
+	{
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_CONNECT;
+		/* Opaque non-NULL: connect_cb only tests tlsconn for NULL, and the
+		 * mocked wire/handshake paths never dereference it. */
+		fx.ss.wire.tlsconn = (struct tls_connection *)(uintptr_t)1;
+		connect_cb(&fx.ss);
+		fx.ss.wire.tlsconn = NULL;
+		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_HANDSHAKE);
+		teardown_fixture(&fx);
+	}
+#else
+	T_SKIP();
+#endif /* WITH_TLS */
+}
+
+/* session_on_dead_link: a negotiated session id suspends for resume; without
+ * one the session is closed.  The suspend path also captures a sendbuf with one
+ * frame equal to retransmit_copy (reclaimed) and one tracked for replay. */
+T_DECLARE_CASE(test_dead_link_suspend_for_resume)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.handshake.has_session_id = true;
+
+	struct mux_frame *const copy =
+		mux_frame_get(&fx.ss.pool, fx.ss.max_payload);
+	struct mux_frame *const tracked =
+		mux_frame_get(&fx.ss.pool, fx.ss.max_payload);
+	if (copy == NULL || tracked == NULL) {
+		T_FATAL("frame alloc failed");
+		teardown_fixture(&fx);
+		return;
+	}
+	copy->len = tracked->len = MUX_FRAME_HEADER_SIZE;
+	copy->pos = tracked->pos = 0;
+	mux_frame_list_push(&fx.ss.wire.sendbuf, copy);
+	mux_frame_list_push(&fx.ss.wire.sendbuf, tracked);
+	fx.ss.unacked.retransmit_copy = copy;
+
+	session_on_dead_link(&fx.ss, "send timeout");
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_SUSPENDED);
+
+	fx.fds[0] = -1; /* session_suspend closed it */
+	teardown_fixture(&fx);
+}
+
+T_DECLARE_CASE(test_dead_link_close_without_session_id)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.handshake.has_session_id = false;
+
+	session_on_dead_link(&fx.ss, "send timeout");
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+
+	fx.fds[0] = -1;
+	teardown_fixture(&fx);
+}
+
+/* Liveness timer callbacks all funnel into session_on_dead_link. */
+T_DECLARE_CASE(test_timeout_and_send_timeout_callbacks)
+{
+	{
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_ESTABLISHED;
+		fx.ss.handshake.has_session_id = false;
+		timeout_cb(fx.ss.loop, &fx.ss.w_timeout, EV_TIMER);
+		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+		fx.fds[0] = -1;
+		teardown_fixture(&fx);
+	}
+	{
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_ESTABLISHED;
+		fx.ss.handshake.has_session_id = false;
+		send_timeout_cb(fx.ss.loop, &fx.ss.w_send_timeout, EV_TIMER);
+		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+		fx.fds[0] = -1;
+		teardown_fixture(&fx);
+	}
+}
+
+/* keepalive_cb emits a PROBE (or logs and skips on pool exhaustion) and re-arms
+ * the keepalive timer; the session stays ESTABLISHED either way. */
+T_DECLARE_CASE(test_keepalive_cb_emits_and_rearms)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.conf.keepalive = 5;
+
+	g_session_send_oob_result = false; /* exhausted-pool skip branch */
+	keepalive_cb(fx.ss.loop, &fx.ss.w_keepalive, EV_TIMER);
+	g_session_send_oob_result = true; /* normal PROBE branch */
+	keepalive_cb(fx.ss.loop, &fx.ss.w_keepalive, EV_TIMER);
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_ESTABLISHED);
+
+	teardown_fixture(&fx);
+}
+
+/* connect_timeout_cb covers the resume-timeout (SUSPENDED) and close-timeout
+ * (CLOSING) arms; both close the session. */
+T_DECLARE_CASE(test_connect_timeout_cb_states)
+{
+	{
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_SUSPENDED;
+		connect_timeout_cb(
+			fx.ss.loop, &fx.ss.w_connect_timeout, EV_TIMER);
+		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+		fx.fds[0] = -1;
+		teardown_fixture(&fx);
+	}
+	{
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_CLOSING;
+		connect_timeout_cb(
+			fx.ss.loop, &fx.ss.w_connect_timeout, EV_TIMER);
+		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+		fx.fds[0] = -1;
+		teardown_fixture(&fx);
+	}
+}
+
+/* session_open_stream rejection paths: closed, not-established, peer rejects
+ * inbound, stream-id exhaustion, stream_new OOM, and sched_add failure. */
+T_DECLARE_CASE(test_open_stream_rejections)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	fx.ss.state = SESSION_CLOSED;
+	T_EXPECT(session_open_stream(&fx.ss) == NULL);
+
+	fx.ss.state = SESSION_HANDSHAKE;
+	T_EXPECT(session_open_stream(&fx.ss) == NULL);
+
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.handshake.peer_rejects_inbound_streams = true;
+	T_EXPECT(session_open_stream(&fx.ss) == NULL);
+	fx.ss.handshake.peer_rejects_inbound_streams = false;
+
+	/* sched_alloc_stream_id returns STREAMID_CTRL: IDs exhausted. */
+	g_alloc_stream_id_result = STREAMID_CTRL;
+	T_EXPECT(session_open_stream(&fx.ss) == NULL);
+
+	/* A valid id, but stream_new fails (OOM). */
+	g_alloc_stream_id_result = 5;
+	g_stream_new_result = NULL;
+	T_EXPECT(session_open_stream(&fx.ss) == NULL);
+
+	/* stream_new succeeds, but sched_add_stream fails. */
+	struct mux_stream dummy = { .id = 5 };
+	g_stream_new_result = &dummy;
+	g_sched_add_stream_result = false;
+	T_EXPECT(session_open_stream(&fx.ss) == NULL);
+	g_stream_new_result = NULL;
+	g_sched_add_stream_result = true;
+	g_alloc_stream_id_result = STREAMID_CTRL;
+
+	teardown_fixture(&fx);
+}
+
+/* session_set_config on a live session: auto session-window floor, timer
+ * stop/restart for timeout/keepalive/send/connect/idle. */
+T_DECLARE_CASE(test_set_config_live_session_branches)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.auto_session_window = true;
+	fx.ss.session_window = 1; /* below the initial floor */
+
+	/* Arm the timers whose "active -> ev_timer_again" arms we want to hit. */
+	ev_timer_set(&fx.ss.w_send_timeout, 0.0, 5.0);
+	ev_timer_again(fx.ss.loop, &fx.ss.w_send_timeout);
+	ev_timer_set(&fx.ss.w_connect_timeout, 0.0, 5.0);
+	ev_timer_again(fx.ss.loop, &fx.ss.w_connect_timeout);
+	ev_timer_set(&fx.ss.w_idle_timeout, 0.0, 5.0);
+	ev_timer_again(fx.ss.loop, &fx.ss.w_idle_timeout);
+
+	struct mux_config conf = fx.ss.conf;
+	conf.session_window =
+		0; /* auto: enforce floor (covers the floor branch) */
+	conf.stream_window = 4; /* manual */
+	conf.timeout = 0; /* established: stop w_timeout */
+	conf.keepalive = 0; /* established: stop w_keepalive */
+	conf.send_timeout =
+		5; /* AF_UNIX: TCP_USER_TIMEOUT fails, repeat kept */
+	conf.connect_timeout = 5;
+	conf.idle_timeout = 5;
+	session_set_config(&fx.ss, &conf);
+
+	T_EXPECT(
+		fx.ss.session_window >=
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT);
+
+	ev_timer_stop(fx.ss.loop, &fx.ss.w_send_timeout);
+	ev_timer_stop(fx.ss.loop, &fx.ss.w_connect_timeout);
+	ev_timer_stop(fx.ss.loop, &fx.ss.w_idle_timeout);
+	teardown_fixture(&fx);
+}
+
+/* session_start aborts and resets when the TLS layer fails to start. */
+T_DECLARE_CASE(test_session_start_tls_failed)
+{
+#if WITH_TLS
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_INIT;
+	g_wire_tls_start_result = false;
+	session_start(&fx.ss);
+	g_wire_tls_start_result = true;
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+	fx.fds[0] = -1;
+	teardown_fixture(&fx);
+#else
+	T_SKIP();
+#endif /* WITH_TLS */
+}
+
+/* session_handshake_done: pending egress arms tx_pending; a drain request with
+ * no active streams initiates an immediate graceful shutdown. */
+T_DECLARE_CASE(test_handshake_done_sched_head_and_drain)
+{
+	{
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		struct mux_stream s = { .id = 1 };
+		fx.ss.sched.sched_head = &s;
+		session_handshake_done(&fx.ss);
+		T_EXPECT(fx.ss.wire.tx_pending);
+		fx.ss.sched.sched_head = NULL;
+		teardown_fixture(&fx);
+	}
+	{
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		fx.ss.draining =
+			true; /* no active streams -> graceful shutdown */
+		session_handshake_done(&fx.ss);
+		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSING);
+		teardown_fixture(&fx);
+	}
 }
 
 int main(void)
 {
+	slog_level_ = LOG_LEVEL_VERYVERBOSE;
 	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_session_send_ctrl_packs_header_and_clamps_extra);
-	T_RUN_CASE(t, test_session_send_oob_packs_payload);
-	T_RUN_CASE(t, test_session_ack_trim_releases_frames_and_clears_stall);
-	T_RUN_CASE(t, test_session_ack_trim_overflow_returns_false);
-	T_RUN_CASE(t, test_session_ack_trim_acks_feed_estimator);
-	T_RUN_CASE(t, test_session_ack_trim_manual_mode_skips_estimator);
-	T_RUN_CASE(t, test_session_resume_ack_recv_advances_cursor);
-	T_RUN_CASE(t, test_session_open_stream_enforces_limits);
-	T_RUN_CASE(
-		t, test_session_open_stream_success_sets_default_send_window);
-	T_RUN_CASE(t, test_session_recv_ping_copies_payload_into_pong);
-	T_RUN_CASE(
-		t,
-		test_session_recv_ping_queues_pong_per_ping_outside_rate_limit);
-	T_RUN_CASE(t, test_session_recv_pong_clears_ping_in_flight);
-	T_RUN_CASE(t, test_session_recv_pong_resets_keepalive_interval);
 	T_RUN_CASE(
 		t, test_session_handshake_done_rearms_coalesce_for_delay_list);
 	T_RUN_CASE(
@@ -838,8 +939,19 @@ int main(void)
 	T_RUN_CASE(t, test_session_handshake_done_no_coalesce_without_backlog);
 	T_RUN_CASE(t, test_session_initiate_shutdown_transitions_to_closed);
 	T_RUN_CASE(t, test_session_drain_sets_draining_flag);
-	T_RUN_CASE(t, test_session_discard_stream_frames_clears_queued_data);
-	T_RUN_CASE(t, test_session_ack_extra_clamped_at_uint16_max);
 	T_RUN_CASE(t, test_socket_user_timeout_sets_option);
+	T_RUN_CASE(t, test_session_log_frame_header_formats_flags);
+	T_RUN_CASE(t, test_closing_cb_pending_then_error);
+	T_RUN_CASE(t, test_close_wait_cb_unexpected);
+	T_RUN_CASE(t, test_connect_cb_tls_paths);
+	T_RUN_CASE(t, test_dead_link_suspend_for_resume);
+	T_RUN_CASE(t, test_dead_link_close_without_session_id);
+	T_RUN_CASE(t, test_timeout_and_send_timeout_callbacks);
+	T_RUN_CASE(t, test_keepalive_cb_emits_and_rearms);
+	T_RUN_CASE(t, test_connect_timeout_cb_states);
+	T_RUN_CASE(t, test_open_stream_rejections);
+	T_RUN_CASE(t, test_set_config_live_session_branches);
+	T_RUN_CASE(t, test_session_start_tls_failed);
+	T_RUN_CASE(t, test_handshake_done_sched_head_and_drain);
 	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

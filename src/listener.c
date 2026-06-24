@@ -8,6 +8,7 @@
 
 #include "listener.h"
 
+#include "conf.h"
 #include "util.h"
 
 #include "os/socket.h"
@@ -28,10 +29,9 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	CHECK_REVENTS(revents, EV_READ);
 
 	struct listener *restrict l = w->data;
-	const struct util_socket_opts *restrict socket_opts = l->socket_opts;
+	const struct conf_socket_opts *restrict socket_opts = l->socket_opts;
 	uint_least64_t *restrict num_accepted = l->num_accepted;
 
-	/* Accept connections in a loop until no more are available */
 	for (;;) {
 		union sockaddr_max addr;
 		socklen_t addrlen = sizeof(addr);
@@ -60,12 +60,11 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 
 		if (LOGLEVEL(VERYVERBOSE)) {
 			char addr_str[64];
-			sa_format(addr_str, sizeof(addr_str), &addr.sa);
+			(void)sa_format(addr_str, sizeof(addr_str), &addr.sa);
 			LOGVV_F("listener [fd:%d]: accepted [fd:%d] from %s",
 				w->fd, fd, addr_str);
 		}
 
-		/* Configure the accepted socket */
 		if (socket_set_cloexec(fd) != 0 ||
 		    socket_set_nonblock(fd) != 0) {
 			SOCKET_CLOSE_FD(fd);
@@ -97,7 +96,7 @@ timer_cb(struct ev_loop *restrict loop, ev_timer *watcher, const int revents)
 }
 
 void listener_init(
-	struct listener *l, const struct util_socket_opts *socket_opts,
+	struct listener *l, const struct conf_socket_opts *socket_opts,
 	listener_serve_fn serve, struct server *server,
 	uint_least64_t *restrict num_accepted)
 {
@@ -127,7 +126,7 @@ bool listener_start(
 		return false;
 	}
 
-	const struct util_socket_opts *restrict socket_opts = l->socket_opts;
+	const struct conf_socket_opts *restrict socket_opts = l->socket_opts;
 	socket_set_buffer(fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf);
 	socket_set_tcp(
 		fd, socket_opts->tcp_nodelay, socket_opts->tcp_keepalive);

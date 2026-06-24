@@ -1,11 +1,15 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/* util_test.c - black-box tests for util.c (socket options, address resolution,
+ * identity helpers) via its public API.
+ * Dependencies: links the real util.c (+ TLS backend). */
+
+#include "os/socket.h"
 #include "util.h"
 
 #include "utils/testing.h"
 
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
@@ -28,7 +32,7 @@ T_DECLARE_CASE(test_socket_notsent_lowat_sets_option)
 	/* Platform lacks TCP_NOTSENT_LOWAT; only verify no crash. */
 	(void)_t_;
 	socket_notsent_lowat(fd, 4096);
-#endif
+#endif /* WITH_TCP_NOTSENT_LOWAT */
 	(void)close(fd);
 }
 

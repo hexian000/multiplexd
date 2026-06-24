@@ -10,13 +10,16 @@
 
 #if WITH_OPENSSL
 
-#include "os/clock.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
 
+#include <openssl/asn1.h>
+#include <openssl/bn.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/obj_mac.h>
 #include <openssl/pem.h>
+#include <openssl/types.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
@@ -51,7 +54,7 @@ static bool format_pem_filename(
 {
 	const int len = snprintf(buf, buflen, "%s%s", name, suffix);
 	if (len < 0 || (size_t)len >= buflen) {
-		LOGE_F("gencerts: path too long: %s%s", name, suffix);
+		LOGE_F("path too long: %s%s", name, suffix);
 		return false;
 	}
 	return true;
@@ -63,7 +66,7 @@ static bool format_subject_alt_name(
 {
 	const int len = snprintf(buf, buflen, "DNS:%s", server_name);
 	if (len < 0 || (size_t)len >= buflen) {
-		LOGE_F("gencerts: subjectAltName too long: %s", server_name);
+		LOGE_F("subjectAltName too long: %s", server_name);
 		return false;
 	}
 	return true;
@@ -75,7 +78,7 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 		if (keysize == 0) {
 			keysize = 4096;
 		}
-		LOGN_F("gencerts: keytype=rsa keysize=%d", keysize);
+		LOGN_F("keytype=rsa keysize=%d", keysize);
 		EVP_PKEY *pkey =
 			EVP_PKEY_Q_keygen(NULL, NULL, "RSA", (size_t)keysize);
 		if (pkey == NULL) {
@@ -102,10 +105,10 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 			curve = "P-521";
 			break;
 		default:
-			LOGE_F("gencerts: invalid ECDSA key size: %d", keysize);
+			LOGE_F("invalid ECDSA key size: %d", keysize);
 			return NULL;
 		}
-		LOGN_F("gencerts: keytype=ecdsa keysize=%d", keysize);
+		LOGN_F("keytype=ecdsa keysize=%d", keysize);
 		EVP_PKEY *pkey = EVP_PKEY_Q_keygen(NULL, NULL, "EC", curve);
 		if (pkey == NULL) {
 			LOG_SSLERROR("EVP_PKEY_Q_keygen(EC)");
@@ -113,14 +116,14 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 		return pkey;
 	}
 	if (strcmp(type, "ed25519") == 0) {
-		LOGN("gencerts: keytype=ed25519");
+		LOGN("keytype=ed25519");
 		EVP_PKEY *pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
 		if (pkey == NULL) {
 			LOG_SSLERROR("EVP_PKEY_Q_keygen(ED25519)");
 		}
 		return pkey;
 	}
-	LOGE_F("gencerts: invalid key type: %s", type);
+	LOGE_F("invalid key type: %s", type);
 	return NULL;
 }
 
@@ -135,7 +138,7 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 
 	FILE *fp = fopen(cert_file, "r");
 	if (fp == NULL) {
-		LOGE_F("gencerts: failed to open %s", cert_file);
+		LOGE_F("failed to open %s", cert_file);
 		return false;
 	}
 	*out_cert = PEM_read_X509(fp, NULL, NULL, NULL);
@@ -147,7 +150,7 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 
 	fp = fopen(key_file, "r");
 	if (fp == NULL) {
-		LOGE_F("gencerts: failed to open %s", key_file);
+		LOGE_F("failed to open %s", key_file);
 		X509_free(*out_cert);
 		*out_cert = NULL;
 		return false;
@@ -161,7 +164,7 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 		return false;
 	}
 
-	LOGN_F("gencerts: read %s, %s", cert_file, key_file);
+	LOGN_F("read %s, %s", cert_file, key_file);
 	return true;
 }
 
@@ -175,19 +178,34 @@ static bool create_certificate(
 		return false;
 	}
 
+	/* RFC 5280 requires a positive serial number; use 128 random bits. */
+	BIGNUM *bn = BN_new();
+	if (bn == NULL) {
+		LOG_SSLERROR("BN_new");
+		X509_free(cert);
+		return false;
+	}
+	if (BN_rand(bn, 128, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) == 0) {
+		LOG_SSLERROR("BN_rand");
+		BN_free(bn);
+		X509_free(cert);
+		return false;
+	}
 	ASN1_INTEGER *serial = ASN1_INTEGER_new();
 	if (serial == NULL) {
 		LOG_SSLERROR("ASN1_INTEGER_new");
+		BN_free(bn);
 		X509_free(cert);
 		return false;
 	}
-	const int_fast64_t now = clock_unix_ns();
-	if (ASN1_INTEGER_set_int64(serial, now) == 0) {
-		LOG_SSLERROR("ASN1_INTEGER_set");
+	if (BN_to_ASN1_INTEGER(bn, serial) == NULL) {
+		LOG_SSLERROR("BN_to_ASN1_INTEGER");
 		ASN1_INTEGER_free(serial);
+		BN_free(bn);
 		X509_free(cert);
 		return false;
 	}
+	BN_free(bn);
 	if (X509_set_serialNumber(cert, serial) == 0) {
 		LOG_SSLERROR("X509_set_serialNumber");
 		ASN1_INTEGER_free(serial);
@@ -196,7 +214,9 @@ static bool create_certificate(
 	}
 	ASN1_INTEGER_free(serial);
 
-	if (X509_time_adj_ex(X509_getm_notBefore(cert), 0, 0, NULL) == NULL) {
+	/* Backdate notBefore by an hour to tolerate verifier clock skew. */
+	if (X509_time_adj_ex(X509_getm_notBefore(cert), 0, -3600, NULL) ==
+	    NULL) {
 		LOG_SSLERROR("X509_time_adj_ex");
 		X509_free(cert);
 		return false;
@@ -215,48 +235,8 @@ static bool create_certificate(
 		return false;
 	}
 	if (X509_NAME_add_entry_by_txt(
-		    name, "C", MBSTRING_ASC, (unsigned char *)"US", -1, -1,
-		    0) == 0) {
-		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
-		X509_NAME_free(name);
-		X509_free(cert);
-		return false;
-	}
-	if (X509_NAME_add_entry_by_txt(
-		    name, "ST", MBSTRING_ASC, (unsigned char *)"California", -1,
-		    -1, 0) == 0) {
-		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
-		X509_NAME_free(name);
-		X509_free(cert);
-		return false;
-	}
-	if (X509_NAME_add_entry_by_txt(
-		    name, "L", MBSTRING_ASC, (unsigned char *)"Mountain View",
-		    -1, -1, 0) == 0) {
-		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
-		X509_NAME_free(name);
-		X509_free(cert);
-		return false;
-	}
-	if (X509_NAME_add_entry_by_txt(
-		    name, "O", MBSTRING_ASC,
-		    (unsigned char *)"Your Organization", -1, -1, 0) == 0) {
-		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
-		X509_NAME_free(name);
-		X509_free(cert);
-		return false;
-	}
-	if (X509_NAME_add_entry_by_txt(
-		    name, "OU", MBSTRING_ASC, (unsigned char *)"Your Unit", -1,
-		    -1, 0) == 0) {
-		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
-		X509_NAME_free(name);
-		X509_free(cert);
-		return false;
-	}
-	if (X509_NAME_add_entry_by_txt(
-		    name, "CN", MBSTRING_ASC, (unsigned char *)server_name, -1,
-		    -1, 0) == 0) {
+		    name, "CN", MBSTRING_ASC,
+		    (const unsigned char *)server_name, -1, -1, 0) == 0) {
 		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
 		X509_NAME_free(name);
 		X509_free(cert);
@@ -386,7 +366,7 @@ static bool create_certificate(
 	X509_EXTENSION_free(ext);
 
 	const EVP_MD *md = EVP_sha256();
-	int pkey_type = EVP_PKEY_get_base_id(sign_key);
+	const int pkey_type = EVP_PKEY_get_base_id(sign_key);
 	if (pkey_type == EVP_PKEY_ED25519 || pkey_type == EVP_PKEY_ED448) {
 		md = NULL;
 	}
@@ -416,15 +396,14 @@ write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 	int fd = open(cert_file, O_WRONLY | O_CREAT | O_TRUNC | O_EXCL, 0644);
 	if (fd < 0) {
 		const int err = errno;
-		LOGE_F("gencerts: failed to open %s: (%d) %s", cert_file, err,
+		LOGE_F("failed to open %s: (%d) %s", cert_file, err,
 		       strerror(err));
 		return false;
 	}
 	FILE *fp = fdopen(fd, "w");
 	if (fp == NULL) {
 		const int err = errno;
-		LOGE_F("gencerts: fdopen %s: (%d) %s", cert_file, err,
-		       strerror(err));
+		LOGE_F("fdopen %s: (%d) %s", cert_file, err, strerror(err));
 		(void)close(fd);
 		return false;
 	}
@@ -447,15 +426,14 @@ write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 	fd = open(key_file, O_WRONLY | O_CREAT | O_TRUNC | O_EXCL, 0600);
 	if (fd < 0) {
 		const int err = errno;
-		LOGE_F("gencerts: failed to open %s: (%d) %s", key_file, err,
+		LOGE_F("failed to open %s: (%d) %s", key_file, err,
 		       strerror(err));
 		return false;
 	}
 	fp = fdopen(fd, "w");
 	if (fp == NULL) {
 		const int err = errno;
-		LOGE_F("gencerts: fdopen %s: (%d) %s", key_file, err,
-		       strerror(err));
+		LOGE_F("fdopen %s: (%d) %s", key_file, err, strerror(err));
 		(void)close(fd);
 		return false;
 	}
@@ -466,7 +444,7 @@ write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 	}
 	(void)fclose(fp);
 
-	LOGN_F("gencerts: write %s, %s", cert_file, key_file);
+	LOGN_F("write %s, %s", cert_file, key_file);
 	return true;
 }
 
@@ -475,7 +453,7 @@ bool gencerts(
 	const char *keytype, int keysize)
 {
 	if (names == NULL) {
-		LOGE("gencerts: invalid options");
+		LOGE("invalid options");
 		return false;
 	}
 
@@ -484,7 +462,7 @@ bool gencerts(
 
 	if (sign_cert != NULL) {
 		if (!read_keypair(sign_cert, &parent_cert, &sign_key)) {
-			LOGE_F("gencerts: failed to read signing certificate: %s",
+			LOGE_F("failed to read signing certificate: %s",
 			       sign_cert);
 			return false;
 		}
@@ -507,8 +485,8 @@ bool gencerts(
 
 	bool success = true;
 	char *saveptr = NULL;
-	char *name = strtok_r(names_copy, ",", &saveptr);
-	while (name != NULL) {
+	for (char *name = strtok_r(names_copy, ",", &saveptr); name != NULL;
+	     name = strtok_r(NULL, ",", &saveptr)) {
 		while (*name == ' ') {
 			name++;
 		}
@@ -519,13 +497,12 @@ bool gencerts(
 		}
 
 		if (*name == '\0') {
-			name = strtok_r(NULL, ",", &saveptr);
 			continue;
 		}
 
 		EVP_PKEY *pkey = generate_key(keytype, keysize);
 		if (pkey == NULL) {
-			LOGE_F("gencerts: failed to generate key for %s", name);
+			LOGE_F("failed to generate key for %s", name);
 			success = false;
 			break;
 		}
@@ -534,16 +511,14 @@ bool gencerts(
 		if (!create_certificate(
 			    &cert, parent_cert, sign_key, server_name_val,
 			    pkey)) {
-			LOGE_F("gencerts: failed to create certificate for %s",
-			       name);
+			LOGE_F("failed to create certificate for %s", name);
 			EVP_PKEY_free(pkey);
 			success = false;
 			break;
 		}
 
 		if (!write_keypair(name, cert, pkey, parent_cert)) {
-			LOGE_F("gencerts: failed to write key pair for %s",
-			       name);
+			LOGE_F("failed to write key pair for %s", name);
 			X509_free(cert);
 			EVP_PKEY_free(pkey);
 			success = false;
@@ -552,8 +527,6 @@ bool gencerts(
 
 		X509_free(cert);
 		EVP_PKEY_free(pkey);
-
-		name = strtok_r(NULL, ",", &saveptr);
 	}
 
 	free(names_copy);
@@ -566,7 +539,7 @@ bool gencerts(
 	}
 
 	if (success) {
-		LOGN("gencerts: ok");
+		LOGN("ok");
 	}
 
 	return success;

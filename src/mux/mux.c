@@ -15,6 +15,7 @@
 #include "mux/stream.h"
 #include "mux/wire.h"
 
+#include "utils/debug.h"
 #include "utils/minmax.h"
 #include "utils/slog.h"
 
@@ -27,9 +28,9 @@
 #include <string.h>
 #include <sys/socket.h>
 
-size_t mux_frame_object_size(void)
+size_t mux_frame_object_size(const size_t max_payload)
 {
-	return sizeof(struct mux_frame);
+	return MUX_FRAME_OBJECT_SIZE(max_payload);
 }
 
 struct mux_session *
@@ -119,8 +120,8 @@ void mux_session_stats(
 	out->rx_window = (size_t)ss->stream_window * MUX_WINDOW_UNIT;
 	out->tx_window = (size_t)ss->peer_stream_window * MUX_WINDOW_UNIT;
 	out->rtt = ss->estimator.rtt;
-	out->bdp_rx = ss->estimator.dir[ESTIMATOR_RX].bdp;
-	out->bdp_tx = ss->estimator.dir[ESTIMATOR_TX].bdp;
+	out->bdp_rx = ss->estimator.rx.bdp;
+	out->bdp_tx = ss->estimator.tx.bdp;
 }
 
 /* --- Session mutators --- */
@@ -228,7 +229,8 @@ int mux_stream_send(
 	const unsigned char *p = buf;
 
 	while (remaining > 0) {
-		struct mux_frame *frame = mux_frame_get(&s->session->pool);
+		struct mux_frame *frame = mux_frame_get(
+			&s->session->pool, s->session->max_payload);
 		if (frame == NULL) {
 			if (to_send == remaining) {
 				/* OOM before any frame was queued. */
@@ -238,7 +240,7 @@ int mux_stream_send(
 			}
 			break; /* partial success: frames already queued */
 		}
-		const size_t chunk = MIN(remaining, MUX_MAX_PAYLOAD_SIZE);
+		const size_t chunk = MIN(remaining, frame->cap);
 		frame->len = MUX_FRAME_HEADER_SIZE + chunk;
 		frame->pos = 0;
 		memcpy(frame->data + MUX_FRAME_HEADER_SIZE, p, chunk);
@@ -272,10 +274,8 @@ int mux_stream_recv(
 			errno = EAGAIN;
 			return -1;
 		}
-		/* Peer FIN received (CLOSE_WAIT) or both FINs exchanged (CLOSING):
-		 * return EOF.  For CLOSING, close the stream now that the receive
-		 * buffer is fully drained; stream_close is idempotent on
-		 * STREAM_CLOSED.  EOF (*len=0) is returned below. */
+		/* CLOSE_WAIT (peer FIN) or CLOSING (both FINs): return EOF below.
+		 * On CLOSING the recv buffer is drained, so close now (idempotent). */
 		if (s->state == STREAM_CLOSING) {
 			stream_close(s);
 		}
@@ -294,6 +294,8 @@ int mux_stream_recv(
 		ringbuf_consume(s->recvbuf, take);
 		copied += take;
 	}
+	ASSERT(s->buffered_bytes >= copied);
+	ASSERT(s->session->recv_buffered_bytes >= copied);
 	s->buffered_bytes -= (uint_least32_t)copied;
 	s->session->recv_buffered_bytes -= copied;
 	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, copied);

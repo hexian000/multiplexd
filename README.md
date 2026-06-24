@@ -5,7 +5,7 @@
 [![Downloads](https://img.shields.io/github/downloads/hexian000/multiplexd/total.svg)](https://github.com/hexian000/multiplexd/releases)
 [![Release](https://img.shields.io/github/release/hexian000/multiplexd.svg?style=flat)](https://github.com/hexian000/multiplexd/releases)
 
-multiplexd is a TCP stream multiplexer with zero-RTT stream open, deficit round-robin scheduling, flow-control with adaptive BDP estimation, transparent session resumption with unacknowledged-frame replay, and TLS 1.3 mutual authentication against a private trust store.
+multiplexd is a TCP stream multiplexer with 0-RTT stream open, fair bandwidth sharing, flow-control with BDP estimation, transparent session resumption, and TLS 1.3 mutual authentication against a private trust store.
 
 **Table of Contents**
 - [Features](#features)
@@ -57,31 +57,31 @@ multiplexd is a TCP stream multiplexer with zero-RTT stream open, deficit round-
 ### Protocol Efficiency
 
 - **Low frame overhead**: Fixed 8-byte frame header.
-- **Zero-RTT stream open** (called *fast-open* in the protocol spec): The stream open frame carries the first data payload, allowing new streams to deliver their first bytes without a dedicated round-trip.
-- **No per-stream negotiation**: The forward target is fixed at session configuration time.
-- **Up to 65535 concurrent streams per session**: 32768 client-initiated and 32767 server-initiated, with a configurable per-session limit via `max_streams`. Multiple parallel sessions to the same peer can be configured to scale beyond this limit.
+- **Zero-RTT stream open**: First data payload rides the open frame; no setup round-trip.
+- **No per-stream negotiation**: Forward target fixed at session configuration time.
+- **Up to 65535 concurrent streams per session**: 32768 client-opened plus 32767 server-opened, with a configurable `max_streams` limit. Scale further by adding sessions (additively via multiple parallel sessions, or multiplicatively via nested sessions).
 
 ### Reliability
 
-- **Transparent session resumption**: During a transient transport loss, both sides enter a suspended state. The client reconnects and replays all unacknowledged frames in order over the new transport; active streams continue without application-visible disruption.
-- **TCP half-close**: FIN-based half-close semantics are preserved end to end across the tunnel.
-- **Bidirectional forwarding**: Forward and reverse port forwarding can run simultaneously over the same session.
+- **Transparent session resumption**: Reconnect replays unacknowledged frames; active streams survive transport loss.
+- **TCP half-close**: FIN semantics preserved end to end.
+- **Bidirectional forwarding**: Forward and reverse forwarding over one session.
 
 ### Performance and Fairness
 
-- **Deficit round-robin (DRR) scheduler**: Outbound bandwidth is distributed fairly across active streams at byte-granularity, preventing any single stream from starving others regardless of message size. See [spec.md §7](doc/spec.md#scheduling) for the byte-granularity policy requirement.
-- **BDP estimator**: Measures RTT and per-direction bandwidth from payload-driven PING/PONG cycles (a PING is sent on inbound PUSH or on acked outbound bytes, the PONG completes the cycle) and adaptively sizes the per-stream receive window and the session send cap from their own direction's estimate, so asymmetric channels get independently sized windows.
-- **Two-level flow control**: A per-stream sliding receive window bounds per-stream in-flight data; a session-wide unacknowledged-byte cap blocks new payload.
-- **Memory back-pressure**: Receive-window grants are linearly throttled as aggregate buffer occupancy rises between `mem_pressure.lo` and `mem_pressure.hi`, bounding memory growth under sustained load.
-- **Multi-threaded offloading**: With `ENABLE_THREADS=ON`, each session runs on a dedicated thread. Parallel tunnels to the same peer distribute load across CPU cores.
+- **Deficit round-robin (DRR) scheduler**: Fair byte-granular bandwidth sharing across active streams.
+- **BDP estimator**: Per-direction RTT/bandwidth measurement adaptively sizes windows.
+- **Two-level flow control**: Per-stream receive window plus a session-wide unacknowledged-byte cap.
+- **Memory back-pressure**: Receive grants throttle between `mem_pressure.lo` and `mem_pressure.hi`.
+- **Multi-threaded offloading**: Per-session threads distribute load across CPU cores (`ENABLE_THREADS=ON`). With the default configuration and the OpenSSL backend, instances usually can be planned for about 1 Gbps per modern x86 core as a stable sustained load line.
 
 ### Security and Operations
 
-- **mTLS with private trust store**: TLS 1.3 mutual authentication against an explicit set of trusted certificates. The `tls` object can be omitted on trusted networks.
-- **Hot configuration reload**: Sending `SIGHUP` reloads the configuration and gracefully drains existing sessions. TLS certificates, keys, and trust roots take effect for new sessions immediately.
-- **Multi-peer routing**: The `identity` block lets a node maintain simultaneous sessions with multiple named peers, with per-peer listeners and round-robin distribution across parallel tunnels.
-- **Built-in observability**: Health check, plain-text stats, and Prometheus-compatible metrics endpoints.
-- **Standards-compliant**: ISO C11 and POSIX.1-2008, with platform-specific extensions available where supported.
+- **mTLS with private trust store**: TLS 1.3 mutual authentication; omittable on trusted networks.
+- **Hot configuration reload**: `SIGHUP` reloads config and gracefully drains existing sessions.
+- **Multi-peer routing**: The `identity` block maintains simultaneous sessions with multiple named peers.
+- **Built-in observability**: Health check, plain-text stats, and Prometheus metrics endpoints.
+- **Standards-compliant**: ISO C11 and POSIX.1-2008.
 
 ## Architecture
 
@@ -119,7 +119,7 @@ The wire format is a fixed 8-byte frame header followed by an optional payload; 
 | **Session resumption**     | Transparent; unacknowledged frames replayed                                      | None                                                                           | None                                                                       |
 | **Inter-stream fairness**  | Deficit round-robin scheduler; byte-granularity fairness                         | Round-robin scheduler; frame-granularity fairness                              | No inter-stream scheduling; systematically skewed under load               |
 | **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)        | Per-channel byte window only                                               |
-| **Adaptive window tuning** | Adaptive BDP estimator                                                           | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
+| **Adaptive window tuning** | 2-phase BDP estimator                                                            | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
 | **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                           | None                                                                       |
 | **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                  | Re-execs the master process; existing child processes drain naturally      |
 | **Observability**          | Health check, plain-text stats, Prometheus metrics                               | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors | None                                                                       |
@@ -331,11 +331,11 @@ Returns metrics in Prometheus exposition format, including cumulative counters a
 
 #### `GET /config`
 
-Returns the currently active configuration as JSON, with all `@path` references inlined as PEM strings. Equivalent to `--dump-config` at runtime.
+Returns the currently active configuration as JSON. TLS private key material is **not** included: `tls.cert`, `tls.key`, and `tls.authcerts` are erased from memory once loaded into the TLS context at startup, so they come back as empty strings over the API. (This differs from `--dump-config`, which runs before that erase and does inline the PEM.) Consequently the body of a `GET /config` cannot be fed straight back to `PUT /config` for a TLS-enabled config — supply the certificate references (`@path`) or PEM yourself.
 
 #### `PUT /config`
 
-Replaces the active configuration with the JSON body of the request and performs a hot reload, identical in effect to `SIGHUP` with a new config file. Returns `204 No Content` on success or `400 Bad Request` if the body fails to parse.
+Replaces the active configuration with the JSON body of the request and performs a hot reload, identical in effect to `SIGHUP` with a new config file. The body must carry the full configuration, including TLS credentials (as `@path` references or inline PEM). Returns `204 No Content` on success or `400 Bad Request` if the body fails to parse.
 
 ## Usage
 
@@ -346,8 +346,8 @@ Replaces the active configuration with the JSON body of the request and performs
 # Run as client
 ./multiplexd -c client.json
 
-# Run with colorful and very verbose output
-./multiplexd -c config.json -C --loglevel 8
+# Run with very verbose output
+./multiplexd -c config.json --loglevel 8
 
 # Run in background and log to syslog, dropping privileges
 ./multiplexd -c config.json -u nobody: -d
@@ -358,7 +358,7 @@ Replaces the active configuration with the JSON body of the request and performs
 
 ## Pre-built Binaries
 
-Pre-built binaries are available on the [Releases](https://github.com/hexian000/multiplexd/releases) page. The naming convention is `multiplexd[-static].<arch>-<platform>`.
+Pre-built binaries are available on the [Releases](https://github.com/hexian000/multiplexd/releases) page. The naming convention is `multiplexd[-static].<arch>[-<vendor>]-<os>-<abi>`.
 
 ### Binary Variants
 
@@ -430,17 +430,16 @@ See the script for the full preset list, including clang, cross, min-size, and p
 
 ### Build Options
 
-| Option               | Default | Description                                                      |
-| -------------------- | ------- | ---------------------------------------------------------------- |
-| `USE_TLS_LIBRARY`    | auto    | TLS library to use (`auto`, `openssl`, `mbedtls`, `none`)        |
-| `BUILD_STATIC`       | OFF     | Build a static executable (incompatible with sanitizers/systemd) |
-| `BUILD_PIE`          | OFF     | Build a position-independent executable                          |
-| `LINK_STATIC_LIBS`   | OFF     | Link against static libraries                                    |
-| `ENABLE_SANITIZERS`  | OFF     | Enable address/leak/undefined sanitizers (`BUILD_STATIC=OFF`)    |
-| `ENABLE_SYSTEMD`     | OFF     | Enable systemd state notify (`BUILD_STATIC=OFF`)                 |
-| `ENABLE_THREADS`     | OFF     | Enable multi-threaded offloading                                 |
-| `ENABLE_ALLOC_CACHE` | ON      | Enable allocation caching and pooling                            |
-| `FORCE_POSIX`        | OFF     | Use POSIX.1 APIs only                                            |
+| Option              | Default | Description                                                      |
+| ------------------- | ------- | ---------------------------------------------------------------- |
+| `USE_TLS_LIBRARY`   | auto    | TLS library to use (`auto`, `openssl`, `mbedtls`, `none`)        |
+| `BUILD_STATIC`      | OFF     | Build a static executable (incompatible with sanitizers/systemd) |
+| `BUILD_PIE`         | OFF     | Build a position-independent executable                          |
+| `LINK_STATIC_LIBS`  | OFF     | Link against static libraries                                    |
+| `ENABLE_SANITIZERS` | OFF     | Enable address/leak/undefined sanitizers (`BUILD_STATIC=OFF`)    |
+| `ENABLE_SYSTEMD`    | OFF     | Enable systemd state notify (`BUILD_STATIC=OFF`)                 |
+| `ENABLE_THREADS`    | OFF     | Enable multi-threaded offloading                                 |
+| `FORCE_POSIX`       | OFF     | Use POSIX.1 APIs only                                            |
 
 ### Developer Scripts
 
@@ -453,7 +452,7 @@ Run these helper scripts from the repository root:
 - [`scripts/gprof.py`](scripts/gprof.py) runs a focused gprof benchmark build and writes `build/gprof.md`
 - [`scripts/linearity_test.py`](scripts/linearity_test.py) runs a bidirectional throughput/CPU linearity benchmark across increasing bandwidth limits and writes `build/linearity_report.md`
 - [`scripts/lint.py`](scripts/lint.py) runs clang-tidy on production sources and writes `build/lint.md`
-- [`scripts/smoke_test.py`](scripts/smoke_test.py) runs an end-to-end smoke test: generates certificates, starts a server/client pair, exercises randomised TCP behavior, then verifies clean shutdown
+- [`scripts/smoke_test.py`](scripts/smoke_test.py) runs a multi-scenario end-to-end smoke test against live server/client topologies: byte-exact bidirectional transfers, high stream concurrency, TCP half-close, bulk/interactive (DRR) coexistence, the observability API, hot config reload, identity routing with parallel tunnels, randomised TCP fuzzing, session resumption across transport loss, and graceful shutdown under load (`--quick` for a fast run)
 
 ## Deployment Notes
 
@@ -470,7 +469,7 @@ Operational requirements:
 
 ### Connection Backoff
 
-The `max_startups` option (`start:rate%:full` format, where `rate` is a percentage from 0 to 100) rate-limits incoming session attempts: the first `start` are accepted freely; beyond that, each new attempt is rejected with probability `rate%` until `full` is reached.
+The `max_startups` option (`start:rate:full` format, where `rate` is a percentage from 0 to 100) rate-limits incoming session attempts: the first `start` are accepted freely; beyond that, each new attempt is rejected with probability `rate%` until `full` is reached.
 
 ### API Server
 
@@ -492,6 +491,6 @@ On reload, all existing sessions drain: each session stops accepting new inbound
 ## Credits
 
 Thanks to:
-- [libev](http://software.schmorp.de/pkg/libev.html) (HTTP)
+- [libev](http://software.schmorp.de/pkg/libev.html)
 - [OpenSSL](https://www.openssl.org/)
 - [mbedTLS](https://github.com/Mbed-TLS/mbedtls)

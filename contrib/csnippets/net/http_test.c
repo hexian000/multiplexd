@@ -2,6 +2,7 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 #include "http.h"
+#include "utils/arraysize.h"
 #include "utils/testing.h"
 
 #include <stddef.h>
@@ -175,9 +176,10 @@ T_DECLARE_CASE(test_http_methods)
 	const char *methods[] = { "GET",     "POST",  "PUT",   "DELETE", "HEAD",
 				  "OPTIONS", "PATCH", "TRACE", "CONNECT" };
 
-	for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(methods); i++) {
 		char buf[256];
-		snprintf(buf, sizeof(buf), "%s /path HTTP/1.1\r\n", methods[i]);
+		(void)snprintf(
+			buf, sizeof(buf), "%s /path HTTP/1.1\r\n", methods[i]);
 		struct http_message msg;
 		char *next = http_parse(buf, &msg);
 		T_EXPECT(next != NULL);
@@ -207,9 +209,10 @@ T_DECLARE_CASE(test_http_urls)
 		{ "*", "asterisk (OPTIONS)" },
 	};
 
-	for (size_t i = 0; i < sizeof(urls) / sizeof(urls[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(urls); i++) {
 		char buf[256];
-		snprintf(buf, sizeof(buf), "GET %s HTTP/1.1\r\n", urls[i].url);
+		(void)snprintf(
+			buf, sizeof(buf), "GET %s HTTP/1.1\r\n", urls[i].url);
 		struct http_message msg;
 		char *next = http_parse(buf, &msg);
 		T_EXPECT(next != NULL);
@@ -227,9 +230,9 @@ T_DECLARE_CASE(test_http_versions)
 		"HTTP/2.0",
 	};
 
-	for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(versions); i++) {
 		char buf[256];
-		snprintf(buf, sizeof(buf), "GET / %s\r\n", versions[i]);
+		(void)snprintf(buf, sizeof(buf), "GET / %s\r\n", versions[i]);
 		struct http_message msg;
 		char *next = http_parse(buf, &msg);
 		T_EXPECT(next != NULL);
@@ -262,7 +265,7 @@ T_DECLARE_CASE(test_http_response_codes)
 		{ HTTP_SERVICE_UNAVAILABLE, "Service Unavailable" },
 	};
 
-	for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(codes); i++) {
 		const char *name = http_status(codes[i].code);
 		T_EXPECT(name != NULL);
 		T_EXPECT_STREQ(name, codes[i].name);
@@ -316,7 +319,7 @@ T_DECLARE_CASE(test_http_multiple_headers)
 	};
 
 	char *next = buf;
-	for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(expected); i++) {
 		char *key, *value;
 		next = http_parsehdr(next, &key, &value);
 		T_EXPECT(next != NULL);
@@ -388,9 +391,10 @@ T_DECLARE_CASE(test_http_connection_header)
 	/* Test Connection header values */
 	const char *values[] = { "close", "keep-alive", "upgrade" };
 
-	for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(values); i++) {
 		char buf[256];
-		snprintf(buf, sizeof(buf), "Connection: %s\r\n\r\n", values[i]);
+		(void)snprintf(
+			buf, sizeof(buf), "Connection: %s\r\n\r\n", values[i]);
 		char *key, *value;
 		char *next = http_parsehdr(buf, &key, &value);
 		T_EXPECT(next != NULL);
@@ -435,7 +439,7 @@ T_DECLARE_CASE(test_http_complete_request)
 	T_EXPECT_STREQ(key, "Connection");
 	T_EXPECT_STREQ(value, "keep-alive");
 
-	next = http_parsehdr(next, &key, &value);
+	(void)http_parsehdr(next, &key, &value);
 	T_EXPECT(key == NULL);
 	T_EXPECT(value == NULL);
 
@@ -474,7 +478,7 @@ T_DECLARE_CASE(test_http_complete_response)
 	next = http_parsehdr(next, &key, &value);
 	T_EXPECT_STREQ(key, "Connection");
 
-	next = http_parsehdr(next, &key, &value);
+	(void)http_parsehdr(next, &key, &value);
 	T_EXPECT(key == NULL);
 
 	T_LOGF("%s", "http complete response: parsed successfully");

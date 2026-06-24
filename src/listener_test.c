@@ -1,9 +1,11 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/* listener_test.c - black-box tests for the socket listener in listener.c via
+ * its public API. Dependencies: links the real util.c and listener.c. */
+
+#include "conf.h"
 #include "listener.h"
-#include "mux/mux.h"
-#include "util.h"
 
 #include "utils/testing.h"
 
@@ -18,7 +20,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static const struct util_socket_opts g_socket_opts = {
+static const struct conf_socket_opts g_socket_opts = {
 	.backlog = 4,
 };
 
@@ -43,7 +45,7 @@ static int get_bound_port(const struct listener *restrict l)
 	if (fd < 0) {
 		return -1;
 	}
-	struct sockaddr_in sa;
+	struct sockaddr_in sa = { 0 };
 	socklen_t len = sizeof(sa);
 	if (getsockname(fd, (struct sockaddr *)&sa, &len) != 0) {
 		return -1;
