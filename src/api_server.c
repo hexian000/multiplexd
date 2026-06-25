@@ -916,13 +916,16 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	CHECK_REVENTS(revents, EV_READ);
 	struct api_ctx *restrict ctx = watcher->data;
 
+	/* Reserve one byte so received data can always be NUL-terminated for the
+	 * strstr-based HTTP parser.  When only that byte remains, the request has
+	 * filled the buffer without completing its headers: too large. */
 	const size_t cap = ctx->rbuf.cap - ctx->rbuf.len;
-	if (cap == 0) {
+	if (cap <= 1) {
 		recv_error(loop, ctx, HTTP_ENTITY_TOO_LARGE);
 		return;
 	}
 
-	size_t n = cap;
+	size_t n = cap - 1;
 	const int err =
 		socket_recv(ctx->fd, ctx->rbuf.data + ctx->rbuf.len, &n);
 	if (err != 0) {
@@ -940,10 +943,9 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		return;
 	}
 	ctx->rbuf.len += n;
-	/* NUL-terminate so http_parse/http_parsehdr can use strstr. */
-	if (ctx->rbuf.len < ctx->rbuf.cap) {
-		ctx->rbuf.data[ctx->rbuf.len] = '\0';
-	}
+	/* NUL-terminate so http_parse/http_parsehdr can use strstr; the byte
+	 * reserved above guarantees room. */
+	ctx->rbuf.data[ctx->rbuf.len] = '\0';
 
 	if (ctx->msg.req.method == NULL) {
 		char *const parsed = http_parse(ctx->next, &ctx->msg);

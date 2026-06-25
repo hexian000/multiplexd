@@ -14,6 +14,7 @@
 
 #include "utils/testing.h"
 
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -661,9 +662,22 @@ T_DECLARE_CASE(test_wire_tls_send_recv_data)
 	size_t rlen = sizeof(recv_buf) - 1;
 	T_EXPECT(wire_send(&cli_ss, send_buf, &slen));
 	T_EXPECT_EQ(slen, sizeof(send_buf) - 1);
-	T_EXPECT(wire_recv(&srv_ss, recv_buf, &rlen));
-	T_EXPECT_EQ(rlen, sizeof(send_buf) - 1);
-	T_EXPECT(memcmp(recv_buf, send_buf, rlen) == 0);
+	/* The peer's ciphertext may not have reached fds[0] yet: AF_UNIX
+	 * socketpairs deliver synchronously on Linux but asynchronously over the
+	 * loopback emulation on Windows/msys2.  Retry wire_recv, waiting on
+	 * readability between attempts, until the payload arrives. */
+	size_t got = 0;
+	for (int i = 0; i < 20 && got == 0; i++) {
+		rlen = sizeof(recv_buf) - 1;
+		T_EXPECT(wire_recv(&srv_ss, recv_buf, &rlen));
+		got = rlen;
+		if (got == 0) {
+			struct pollfd pfd = { .fd = fds[0], .events = POLLIN };
+			(void)poll(&pfd, 1, 100);
+		}
+	}
+	T_EXPECT_EQ(got, sizeof(send_buf) - 1);
+	T_EXPECT(memcmp(recv_buf, send_buf, got) == 0);
 
 	/* Prevent double-free: clear wire pointers before explicit conn_free. */
 	srv_ss.wire.tlsconn = NULL;

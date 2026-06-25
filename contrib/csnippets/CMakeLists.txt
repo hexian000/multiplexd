@@ -24,9 +24,15 @@ add_subdirectory(net)
 add_subdirectory(os)
 add_subdirectory(utils)
 
+# for wcwidth()
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/utils/debug.c"
+    PROPERTIES COMPILE_DEFINITIONS _XOPEN_SOURCE=700
+)
+
 include(CheckSymbolExists)
 if(FORCE_POSIX)
-    list(APPEND CMAKE_REQUIRED_DEFINITIONS "-D_POSIX_C_SOURCE=200809L")
+    list(APPEND CMAKE_REQUIRED_DEFINITIONS "-D_POSIX_C_SOURCE=200809L" "-D_XOPEN_SOURCE=700")
 else()
     list(APPEND CMAKE_REQUIRED_DEFINITIONS "-D_GNU_SOURCE")
 endif()
