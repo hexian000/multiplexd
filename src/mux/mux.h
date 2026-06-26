@@ -191,9 +191,9 @@ struct mux_config {
 #if WITH_TLS
 	/* TLS context for outbound reconnects; NULL leaves the existing context unchanged. */
 	struct tls_context *tlsctx;
-	/* Buffered (memory-transport) TLS: drive the socket from wire.c instead of
-	 * attaching the fd to the TLS library. */
-	bool tls_buffered : 1;
+	/* Let the TLS library own the socket fd. When false, wire.c drives the
+	 * socket and shuttles ciphertext through the library (memory transport). */
+	bool tls_socket_offload : 1;
 #endif
 };
 

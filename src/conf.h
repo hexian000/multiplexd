@@ -91,9 +91,10 @@ struct config {
 	/* OpenSSL only: request kernel TLS (KTLS) offload so the kernel frames
 	 * and encrypts records and can coalesce them into full segments. */
 	bool tls_kernel_offload;
-	/* Use buffered (memory-transport) TLS: the mux layer owns socket I/O and
-	 * shuttles ciphertext through the TLS library instead of attaching the fd. */
-	bool tls_buffered;
+	/* Let the TLS library own the socket fd and drive record I/O directly.
+	 * When false, the mux layer owns socket I/O and shuttles ciphertext through
+	 * the TLS library over in-memory buffers (memory transport). */
+	bool tls_socket_offload;
 #endif /* WITH_TLS */
 
 	/* Mux session parameters; window fields in frame units. */
@@ -115,7 +116,7 @@ struct config {
 };
 
 /* New configuration with defaults; NULL on allocation failure. */
-struct config *conf_new(void);
+struct config *conf_new_default(void);
 
 /* Parse, validate, and normalize config from a JSON buffer (modified in place;
  * need not be NUL-terminated). NULL on failure. */

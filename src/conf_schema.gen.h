@@ -22,8 +22,8 @@ struct json_conf_tls {
 	struct json_string *authcerts;
 	size_t authcerts_count;
 
-	bool buffered;
 	bool kernel_offload;
+	bool socket_offload;
 };
 
 struct json_conf_tcp {

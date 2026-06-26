@@ -212,7 +212,7 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 	} else {
-		conf = conf_new();
+		conf = conf_new_default();
 		if (conf == NULL) {
 			LOGF("failed to create default config");
 			return EXIT_FAILURE;

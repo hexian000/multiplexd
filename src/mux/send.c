@@ -426,7 +426,7 @@ void session_on_send(struct mux_session *restrict ss)
 	 * send_blocked so the discard path knows the sendbuf head is in flight. */
 	const bool residue = (ss->wire.sendbuf.head != NULL);
 	bool cipher_residue = false;
-	/* Buffered TLS (tls.buffered): drain ciphertext the library produced once
+	/* Memory transport (socket_offload disabled): drain ciphertext the library produced once
 	 * the frame pump idles, since recv/handshake records can outlive the send
 	 * queue.  A no-op for plaintext, fd-backed TLS, and a non-empty sendbuf
 	 * (whose wire_send already drains the ciphertext in order). */

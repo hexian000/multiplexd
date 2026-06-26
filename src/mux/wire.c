@@ -225,7 +225,7 @@ bool wire_send(
 {
 #if WITH_TLS
 	if (ss->wire.tlsconn != NULL) {
-		if (ss->conf.tls_buffered) {
+		if (!ss->conf.tls_socket_offload) {
 			return wire_send_buffered(ss, buf, len);
 		}
 		ss->wire.tls_want = 0;
@@ -288,7 +288,7 @@ bool wire_recv(
 {
 #if WITH_TLS
 	if (ss->wire.tlsconn != NULL) {
-		if (ss->conf.tls_buffered) {
+		if (!ss->conf.tls_socket_offload) {
 			return wire_recv_buffered(ss, buf, len);
 		}
 		ss->wire.tls_want = 0;
@@ -406,7 +406,7 @@ void wire_sendbuf_push(
 enum wire_flush_result wire_flush(struct mux_session *restrict ss)
 {
 #if WITH_TLS
-	if (ss->wire.tlsconn != NULL && ss->conf.tls_buffered) {
+	if (ss->wire.tlsconn != NULL && !ss->conf.tls_socket_offload) {
 		switch (wire_cipher_push(ss)) {
 		case 0:
 			return WIRE_FLUSH_DONE;
@@ -437,9 +437,9 @@ bool wire_tls_start(struct mux_session *restrict ss)
 	if (ss->wire.tlsctx == NULL && ss->wire.tlsconn == NULL) {
 		return true;
 	}
-	/* Buffered (memory-transport) connections pass fd=-1; fd-backed ones let
-	 * the library drive the socket directly. */
-	const int tlsfd = ss->conf.tls_buffered ? -1 : ss->w_socket.fd;
+	/* With socket offload the library drives the socket directly; without it
+	 * the connection is memory-transport, so pass fd=-1. */
+	const int tlsfd = ss->conf.tls_socket_offload ? ss->w_socket.fd : -1;
 	const struct tls_callback cb = {
 		.ctx = ss,
 		.on_send = wire_on_tls_send,
@@ -527,9 +527,9 @@ enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
 		case TLS_ERROR_NONE:
 			/* Our close_notify is flushed (one-way); fall through to TCP
 			 * half-close.  The peer's close_notify is read later in the
-			 * CLOSE_WAIT phase via wire_wait_eof.  In buffered mode the alert
-			 * is staged in memory, so push it to the socket first. */
-			if (ss->conf.tls_buffered) {
+			 * CLOSE_WAIT phase via wire_wait_eof.  In memory-transport mode
+			 * the alert is staged in memory, so push it to the socket first. */
+			if (!ss->conf.tls_socket_offload) {
 				switch (wire_flush(ss)) {
 				case WIRE_FLUSH_DONE:
 					break;
@@ -564,8 +564,8 @@ bool wire_wait_eof(struct mux_session *restrict ss)
 {
 	unsigned char buf[256];
 #if WITH_TLS
-	if (ss->wire.tlsconn != NULL && ss->conf.tls_buffered) {
-		/* Buffered transport: drain the socket ourselves and feed the library
+	if (ss->wire.tlsconn != NULL && !ss->conf.tls_socket_offload) {
+		/* Memory transport: drain the socket ourselves and feed the library
 		 * before checking for the peer's close_notify or stray data. */
 		size_t clen = sizeof(buf);
 		const int serr = socket_recv(ss->w_socket.fd, buf, &clen);

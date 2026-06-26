@@ -77,12 +77,12 @@ find_peer(const struct config *restrict conf, const char *restrict id)
 
 T_DECLARE_CASE(test_conf_new_default_fields)
 {
-	struct config *conf = conf_new();
+	struct config *conf = conf_new_default();
 	T_CHECK(conf != NULL);
 	/* Default type is NULL — no type annotation in a freshly created conf. */
 	T_EXPECT(conf->type == NULL);
 	/* Default timeouts are positive, including the derived inactivity timeout
-	 * (conf_new must derive it just like conf_check does). */
+	 * (conf_new_default must derive it just like conf_check does). */
 	T_EXPECT(conf->mux.keepalive > 0);
 	T_EXPECT(conf->mux.timeout > 0);
 	conf_free(conf);
@@ -125,7 +125,7 @@ T_DECLARE_CASE(test_conf_parsefile_minimal_server)
 
 T_DECLARE_CASE(test_conf_dump_roundtrip)
 {
-	struct config *orig = conf_new();
+	struct config *orig = conf_new_default();
 	T_CHECK(orig != NULL);
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	T_CHECK(orig->mux_connect != NULL);
@@ -278,9 +278,11 @@ T_DECLARE_CASE(test_conf_parsefile_authcerts_array)
 
 T_DECLARE_CASE(test_conf_dump_tls_fields)
 {
-	/* Verify that tls.cert, tls.key, and tls.authcerts survive a
-	 * dump/parse round-trip, exercising dump_tls. */
-	struct config *orig = conf_new();
+	/* Verify that tls.cert, tls.key, tls.authcerts, and the socket_offload /
+	 * kernel_offload booleans survive a dump/parse round-trip, exercising
+	 * dump_tls.  Both booleans are set to true (non-zero) so a dump that fails
+	 * to serialize them would reparse as false and fail this test. */
+	struct config *orig = conf_new_default();
 	T_CHECK(orig != NULL);
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	orig->tls_cert = strdup("certdata");
@@ -290,6 +292,8 @@ T_DECLARE_CASE(test_conf_dump_tls_fields)
 	orig->tls_authcerts[0] = strdup("authcertdata");
 	T_CHECK(orig->tls_authcerts[0] != NULL);
 	orig->tls_authcerts_count = 1;
+	orig->tls_socket_offload = true;
+	orig->tls_kernel_offload = true;
 	T_CHECK(orig->mux_connect != NULL);
 	T_CHECK(orig->tls_cert != NULL);
 	T_CHECK(orig->tls_key != NULL);
@@ -307,6 +311,8 @@ T_DECLARE_CASE(test_conf_dump_tls_fields)
 	T_EXPECT_STREQ(reparsed->tls_key, "keydata");
 	T_EXPECT_EQ((int)reparsed->tls_authcerts_count, 1);
 	T_EXPECT_STREQ(reparsed->tls_authcerts[0], "authcertdata");
+	T_EXPECT(reparsed->tls_socket_offload);
+	T_EXPECT(reparsed->tls_kernel_offload);
 
 	conf_free(reparsed);
 	conf_free(orig);
@@ -320,7 +326,7 @@ T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
 	T_CHECK(write_tmpfile(cert_tmpl, "CERTCONTENT") == 0);
 	T_CHECK(write_tmpfile(key_tmpl, "KEYCONTENT") == 0);
 
-	struct config *conf = conf_new();
+	struct config *conf = conf_new_default();
 	T_CHECK(conf != NULL);
 
 	char cert_at[256], key_at[256];
@@ -343,7 +349,7 @@ T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
 T_DECLARE_CASE(test_conf_inline_pem_fails_for_missing_file)
 {
 	/* conf_inline_pem must return false if an @path file does not exist. */
-	struct config *conf = conf_new();
+	struct config *conf = conf_new_default();
 	T_CHECK(conf != NULL);
 	conf->tls_cert = strdup("@/tmp/conf_inline_nonexistent_XXXXXX.pem");
 	conf->tls_key = strdup("plaintext");
@@ -531,7 +537,7 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 {
 	/* Verify that identity.claim and identity.mux_connect survive a
 	 * dump/parse round-trip, exercising dump_identity_scope. */
-	struct config *orig = conf_new();
+	struct config *orig = conf_new_default();
 	T_CHECK(orig != NULL);
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	orig->identity.claim = strdup("mynode");

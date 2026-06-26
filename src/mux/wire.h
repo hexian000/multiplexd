@@ -55,8 +55,8 @@ struct wire_ctx {
 	int tls_want;
 	/* Weak reference to the current server-owned TLS context. */
 	struct tls_context *tlsctx;
-	/* Buffered (tls.buffered) transport only: outbound ciphertext the socket
-	 * could not yet accept.  Lazily allocated; NULL otherwise. */
+	/* Memory transport (socket_offload disabled) only: outbound ciphertext the
+	 * socket could not yet accept.  Lazily allocated; NULL otherwise. */
 	struct ringbuf *rawbuf;
 #endif /* WITH_TLS */
 };
@@ -105,9 +105,10 @@ enum wire_flush_result {
 	WIRE_FLUSH_ERROR,
 };
 
-/* Buffered transport (tls.buffered) only: push any outbound ciphertext the TLS
- * library has produced out to the socket, retaining what the socket cannot yet
- * accept.  A no-op (returns WIRE_FLUSH_DONE) for plaintext and fd-backed TLS. */
+/* Memory transport (socket_offload disabled) only: push any outbound ciphertext
+ * the TLS library has produced out to the socket, retaining what the socket
+ * cannot yet accept.  A no-op (returns WIRE_FLUSH_DONE) for plaintext and
+ * fd-backed TLS. */
 enum wire_flush_result wire_flush(struct mux_session *ss);
 
 #if WITH_TLS

@@ -91,13 +91,13 @@
                     },
                     "minItems": 1
                 },
-                "buffered": {
-                    "description": "Use buffered (memory-transport) TLS connections: the TLS library encrypts and decrypts records in memory while the mux layer owns the socket I/O, instead of attaching the socket directly to the TLS library. This decouples the TLS record processing from the transport, at the cost of an extra in-memory copy per direction. May serve as a compatibility or performance workaround in some environments. Leave disabled unless you have a specific reason to enable it.",
+                "socket_offload": {
+                    "description": "Enable the TLS library to own the socket and perform record I/O directly. Disable to drive the library over in-memory buffers instead of attaching the socket fd. Leave enabled unless you have a specific reason to disable it.",
                     "type": "boolean",
-                    "default": false
+                    "default": true
                 },
                 "kernel_offload": {
-                    "description": "Enable kernel TLS (KTLS) offload so the kernel frames and encrypts records and can coalesce them into full segments. OpenSSL only; ignored otherwise. Ignored when 'buffered' is enabled, since buffered mode attaches no socket fd for the kernel to offload.",
+                    "description": "Enable kernel TLS (KTLS) offload so the kernel frames and encrypts records and can coalesce them into full segments. Ignored when unsupported or when 'socket_offload' is disabled.",
                     "type": "boolean",
                     "default": false
                 }

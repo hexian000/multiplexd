@@ -172,14 +172,14 @@ json_lookup_conf_tcp(const char *str, size_t len)
 /* --- json_conf_tls --- */
 typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_tls_entry_;
 static const json_lookup_conf_tls_entry_ json_lookup_conf_tls_keys_[] = {
-	{"key", 3, 6},
-	{"sni", 3, 7},
+	{"key", 3, 5},
+	{"sni", 3, 6},
 	{"alpn", 4, 0},
-	{"cert", 4, 3},
-	{"buffered", 8, 2},
+	{"cert", 4, 2},
 	{"authcerts", 9, 1},
-	{"ciphersuites", 12, 4},
-	{"kernel_offload", 14, 5},
+	{"ciphersuites", 12, 3},
+	{"kernel_offload", 14, 4},
+	{"socket_offload", 14, 7},
 };
 static int json_lookup_conf_tls_cmp_(const void *key_, const void *entry_)
 {
@@ -271,12 +271,12 @@ enum json_conf_tcp_key {
 enum json_conf_tls_key {
 	JSON_CONF_TLS_ALPN = 0,
 	JSON_CONF_TLS_AUTHCERTS = 1,
-	JSON_CONF_TLS_BUFFERED = 2,
-	JSON_CONF_TLS_CERT = 3,
-	JSON_CONF_TLS_CIPHERSUITES = 4,
-	JSON_CONF_TLS_KERNEL_OFFLOAD = 5,
-	JSON_CONF_TLS_KEY = 6,
-	JSON_CONF_TLS_SNI = 7,
+	JSON_CONF_TLS_CERT = 2,
+	JSON_CONF_TLS_CIPHERSUITES = 3,
+	JSON_CONF_TLS_KERNEL_OFFLOAD = 4,
+	JSON_CONF_TLS_KEY = 5,
+	JSON_CONF_TLS_SNI = 6,
+	JSON_CONF_TLS_SOCKET_OFFLOAD = 7,
 };
 
 /** @} */
@@ -369,9 +369,9 @@ static bool json_unmarshal_conf_tls(
 	struct json_conf_tls *obj, char *json, size_t length)
 {
 	*obj = (struct json_conf_tls){
-		.buffered = false,
 		.kernel_offload = false,
 		.sni = { .str = "example.com", .len = 11 },
+		.socket_offload = true,
 	};
 	const struct json_val root_ = json_parse(json, &(size_t){ length });
 	if (root_.type != JSON_OBJECT) { return false; }
@@ -392,10 +392,6 @@ static bool json_unmarshal_conf_tls(
 			if (obj->authcerts_count < 1u) { goto fail_; }
 			break;
 		}
-		case JSON_CONF_TLS_BUFFERED: {
-			if (!json_parse_bool(val_, val_len_, &obj->buffered)) { goto fail_; }
-			break;
-		}
 		case JSON_CONF_TLS_CERT: {
 			if (!json_parse_string(val_, val_len_, &obj->cert.str, &obj->cert.len)) { goto fail_; }
 			break;
@@ -414,6 +410,10 @@ static bool json_unmarshal_conf_tls(
 		}
 		case JSON_CONF_TLS_SNI: {
 			if (!json_parse_string(val_, val_len_, &obj->sni.str, &obj->sni.len)) { goto fail_; }
+			break;
+		}
+		case JSON_CONF_TLS_SOCKET_OFFLOAD: {
+			if (!json_parse_bool(val_, val_len_, &obj->socket_offload)) { goto fail_; }
 			break;
 		}
 		default:
@@ -848,9 +848,9 @@ bool json_unmarshal_conf(
 			.reuseport = false,
 		},
 		.tls = {
-			.buffered = false,
 			.kernel_offload = false,
 			.sni = { .str = "example.com", .len = 11 },
+			.socket_offload = true,
 		},
 	};
 	const struct json_val root_ = json_parse(json, &(size_t){ length });
@@ -1047,17 +1047,6 @@ static int json_marshal_conf_tls_impl(
 		EMIT(']');
 		EMIT(',');
 	}
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("buffered");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->buffered) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
 	if (obj->cert.str != NULL) {
 		EMIT_INDENT(depth + 1);
 		EMIT('"');
@@ -1105,6 +1094,17 @@ static int json_marshal_conf_tls_impl(
 		EMIT_STR(obj->sni.str, obj->sni.len);
 		EMIT(',');
 	}
+	EMIT_INDENT(depth + 1);
+	EMIT('"');
+	EMIT_LIT("socket_offload");
+	EMIT('"');
+	EMIT_COLON();
+	if (obj->socket_offload) {
+		EMIT_LIT("true");
+	} else {
+		EMIT_LIT("false");
+	}
+	EMIT(',');
 
 	if (n_ > n_start_) {
 		n_--;

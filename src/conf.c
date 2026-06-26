@@ -302,10 +302,10 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		}
 	}
 	cfg->tls_kernel_offload = obj->tls.kernel_offload;
-	cfg->tls_buffered = obj->tls.buffered;
-	/* buffered takes precedence over kernel_offload */
-	if (cfg->tls_buffered && cfg->tls_kernel_offload) {
-		LOGW("tls: 'buffered' takes precedence over 'kernel_offload'; "
+	cfg->tls_socket_offload = obj->tls.socket_offload;
+	/* KTLS requires the library to own the socket fd */
+	if (cfg->tls_kernel_offload && !cfg->tls_socket_offload) {
+		LOGW("tls: 'kernel_offload' requires 'socket_offload'; "
 		     "KTLS offload disabled");
 		cfg->tls_kernel_offload = false;
 	}
@@ -693,7 +693,7 @@ static char *read_file(const char *restrict path, size_t *restrict lenp)
 	return buf;
 }
 
-struct config *conf_new(void)
+struct config *conf_new_default(void)
 {
 	struct config *restrict conf = malloc(sizeof(struct config));
 	if (conf == NULL) {
@@ -715,7 +715,7 @@ struct config *conf_new(void)
 		conf_free(conf);
 		return NULL;
 	}
-	/* conf_new skips conf_check (an empty default has no transport), so derive
+	/* conf_new_default skips conf_check (an empty default has no transport), so derive
 	 * the timeout here too; otherwise a default config would have timeout==0. */
 	conf_derive_mux_timeout(conf);
 	return conf;
@@ -1052,6 +1052,8 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 			},
 			.authcerts = authcerts_arr,
 			.authcerts_count = conf->tls_authcerts_count,
+			.kernel_offload = conf->tls_kernel_offload,
+			.socket_offload = conf->tls_socket_offload,
 		},
 #endif /* WITH_TLS */
 		.mux = {
@@ -1384,7 +1386,7 @@ struct mux_config conf_get_mux(const struct config *conf)
 	struct mux_config mc = conf->mux;
 	mc.reject_inbound = (conf->connect == NULL);
 #if WITH_TLS
-	mc.tls_buffered = conf->tls_buffered;
+	mc.tls_socket_offload = conf->tls_socket_offload;
 #endif
 	return mc;
 }

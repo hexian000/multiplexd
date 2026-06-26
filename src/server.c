@@ -678,10 +678,11 @@ static void mux_serve(
 #if WITH_TLS
 	struct tls_connection *conn = NULL;
 	if (srv->server_tlsctx != NULL) {
-		/* Buffered mode passes fd=-1; otherwise the library drives the
-		 * socket.  The session binds the I/O notifier later. */
+		/* With socket offload the library drives the socket; otherwise it is
+		 * memory-transport (fd=-1).  The session binds the I/O notifier later. */
 		conn = tls_server(
-			srv->server_tlsctx, srv->conf->tls_buffered ? -1 : fd);
+			srv->server_tlsctx,
+			srv->conf->tls_socket_offload ? fd : -1);
 		if (conn == NULL) {
 			LOGE_F("[fd:%d] TLS accept failed", fd);
 			srv->counters.num_tls_failures++;

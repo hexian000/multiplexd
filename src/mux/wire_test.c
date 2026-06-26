@@ -79,6 +79,11 @@ make_session(struct frame_pool_ctx *restrict pool_ctx, const int fd)
 		.pool = make_pool(pool_ctx),
 	};
 	ss.w_socket.fd = fd;
+#if WITH_TLS
+	/* Match the production default: the TLS library owns the socket fd.
+	 * Memory-transport tests opt out by clearing this. */
+	ss.conf.tls_socket_offload = true;
+#endif
 	return ss;
 }
 
@@ -765,9 +770,9 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 	wire_test_rm_tmpdir(tmpl);
 }
 
-/* End-to-end buffered (tls.buffered) transport: wire_send/wire_recv own the
- * socketpair while the TLS library works in memory.  Drives the full mutual-auth
- * handshake and a bidirectional payload exchange purely through the wire API. */
+/* End-to-end memory transport (tls.socket_offload disabled): wire_send/wire_recv
+ * own the socketpair while the TLS library works in memory.  Drives the full
+ * mutual-auth handshake and a bidirectional payload exchange through the wire API. */
 T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 {
 	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
@@ -807,9 +812,9 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
 	srv_ss.wire.tlsconn = srv_conn;
 	cli_ss.wire.tlsconn = cli_conn;
-	/* Buffered transport mode is selected by the session's mux config. */
-	srv_ss.conf.tls_buffered = true;
-	cli_ss.conf.tls_buffered = true;
+	/* Memory transport is selected by disabling socket offload in the mux config. */
+	srv_ss.conf.tls_socket_offload = false;
+	cli_ss.conf.tls_socket_offload = false;
 
 	/* Drive the handshake and exchange by pumping each side's hello plaintext
 	 * through wire_send (returns 0 bytes until the handshake completes) and
