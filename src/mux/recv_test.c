@@ -395,6 +395,7 @@ const struct table_opts mux_stream_table_opts = {
  * since this white-box TU does not link frame.c. */
 const struct mux_config mux_conf_default = {
 	.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE,
+	.tls_readahead = 128 * 1024,
 };
 
 /* Pull in the unit under test after the stubs so its references bind here. */
@@ -428,6 +429,7 @@ static int rf_setup(struct recv_fixture *restrict fx)
 		.state = SESSION_ESTABLISHED,
 		.max_payload =
 			(uint_least32_t)mux_conf_default.max_frame_payload,
+		.tls_readahead = (size_t)mux_conf_default.tls_readahead,
 		.session_window = 8,
 		.stream_window = 4,
 		.wire = { .rx_open = true },

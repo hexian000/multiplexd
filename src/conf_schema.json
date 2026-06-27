@@ -92,14 +92,21 @@
                     "minItems": 1
                 },
                 "socket_offload": {
-                    "description": "Enable the TLS library to own the socket and perform record I/O directly. Disable to drive the library over in-memory buffers instead of attaching the socket fd. Leave enabled unless you have a specific reason to disable it.",
+                    "description": "Enable the TLS library to own the socket and perform record I/O directly. When disabled (the default) the mux drives the library over in-memory buffers and batches records into larger socket writes, which is faster on loopback and low-latency links; enable it to let the library (or the kernel, via 'kernel_offload') own the socket fd.",
                     "type": "boolean",
-                    "default": true
+                    "default": false
                 },
                 "kernel_offload": {
                     "description": "Enable kernel TLS (KTLS) offload so the kernel frames and encrypts records and can coalesce them into full segments. Ignored when unsupported or when 'socket_offload' is disabled.",
                     "type": "boolean",
                     "default": false
+                },
+                "readahead": {
+                    "description": "Receive read-ahead window in bytes: contiguous buffer space offered to one transport read so a single recv() can drain several frames, amortizing the syscall and event-loop cost. Larger values raise throughput on loopback and low-latency links at the cost of receive buffer memory. With 'socket_offload' enabled only the on/off state matters (it drives the library read-ahead). 0 disables read-ahead. The wire frame size is unchanged.",
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 16777216,
+                    "default": 131072
                 }
             },
             "additionalProperties": false

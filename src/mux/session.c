@@ -368,6 +368,9 @@ session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
 				       (uint_least32_t)conf->max_frame_payload :
 				       (uint_least32_t)mux_conf_default
 					       .max_frame_payload,
+		.tls_readahead = conf->tls_readahead > 0 ?
+					 (size_t)conf->tls_readahead :
+					 0,
 		.tag = opts->tag,
 		.callbacks = *opts->callbacks,
 		.userdata = opts->userdata,

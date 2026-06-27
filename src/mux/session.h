@@ -156,6 +156,9 @@ struct mux_session {
 	 * creation.  Framing paths size buffers and bound lengths by this; the
 	 * physical buffer capacity is carried per frame as frame->cap (>= this). */
 	uint_least32_t max_payload;
+	/* Receive read-ahead window in bytes, frozen from conf at creation; 0
+	 * disables read-ahead (recv falls back to a one-frame window). */
+	size_t tls_readahead;
 	/* Non-owning pointer to the session log tag buffer; set at creation time. */
 	const char *tag;
 	/* Pointer block into server_stats; NULL pointers are silently skipped. */

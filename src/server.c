@@ -822,6 +822,7 @@ static bool server_reload_make_tls(
 		.alpn = new_conf->tls_alpn,
 		.sni = new_conf->tls_sni,
 		.kernel_offload = new_conf->tls_kernel_offload,
+		.readahead = new_conf->mux.tls_readahead > 0,
 	};
 	if (new_conf->mux_listen != NULL) {
 		*out_server = tls_ctx_server(&tls_conf);
@@ -1603,6 +1604,7 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 			.alpn = conf->tls_alpn,
 			.sni = conf->tls_sni,
 			.kernel_offload = conf->tls_kernel_offload,
+			.readahead = conf->mux.tls_readahead > 0,
 		};
 		if (conf->mux_listen != NULL) {
 			srv->server_tlsctx = tls_ctx_server(&tls_conf);

@@ -27,6 +27,7 @@
  * since this white-box TU does not link frame.c. */
 const struct mux_config mux_conf_default = {
 	.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE,
+	.tls_readahead = 128 * 1024,
 };
 
 /* mock - collaborator spies and reset helper */

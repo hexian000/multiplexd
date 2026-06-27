@@ -176,6 +176,13 @@ struct mux_config {
 	 * takes effect only on a new session. */
 	int max_frame_payload;
 
+	/* tls.readahead: receive read-ahead window in bytes offered to one transport
+	 * read so a single recv() drains several frames, amortizing the recv() and
+	 * event-loop cost.  With socket_offload only its >0 state matters (it drives
+	 * the TLS library read-ahead).  0 disables read-ahead.  The wire frame size
+	 * is unchanged. */
+	int tls_readahead;
+
 	/* Receive-buffer level in bytes at which window grants are fully suppressed; 0 disables pressure scaling. */
 	int mem_pressure_hi;
 	/* Receive-buffer level in bytes at which window-grant scaling begins (default: hi/2). */

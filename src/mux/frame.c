@@ -46,6 +46,7 @@ const struct table_opts mux_stream_table_opts = {
  * links frame.c without the full session state machine. */
 const struct mux_config mux_conf_default = {
 	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
+	.tls_readahead = 128 * 1024,
 };
 
 bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)

@@ -647,15 +647,33 @@ static void dispatch_frame(struct mux_session *ss)
 	}
 }
 
+/* Contiguous recvbuf window offered to one transport read.  The floor is one
+ * full frame; tls.readahead widens it so a single recv() drains several frames
+ * per syscall.  With socket_offload the TLS library owns the socket reads (its
+ * read-ahead is set via SSL_CTX_set_read_ahead), so the floor is enough here. */
+static size_t recv_window(const struct mux_session *restrict ss)
+{
+	const size_t frame = (size_t)MUX_FRAME_HEADER_SIZE + ss->max_payload;
+#if WITH_TLS
+	if (ss->conf.tls_socket_offload) {
+		return frame;
+	}
+#endif
+	if (ss->tls_readahead > frame) {
+		return ss->tls_readahead;
+	}
+	return frame;
+}
+
 /* Read and dispatch one TLS record.  Returns true when a record was
  * successfully received and dispatched; returns false when no data is
  * available (EAGAIN) or on error. */
 static bool recv_one(struct mux_session *restrict ss)
 {
-	/* Offer a MUX_RECV_READAHEAD read-ahead window so one plaintext recv()
-	 * can drain several buffered frames per syscall.  The ring still grows on
-	 * demand for a larger peer frame. */
-	if (!ringbuf_reserve(&ss->wire.recvbuf, MUX_RECV_READAHEAD, true)) {
+	/* Offer the read-ahead window so one plaintext recv() can drain several
+	 * buffered frames per syscall.  The ring still grows on demand for a larger
+	 * peer frame. */
+	if (!ringbuf_reserve(&ss->wire.recvbuf, recv_window(ss), true)) {
 		LOGOOM();
 		session_reset(ss);
 		return false;
@@ -719,7 +737,7 @@ void session_on_recv(struct mux_session *restrict ss)
 	 * window plus one partial frame to avoid regrowth churn. */
 	ringbuf_shrink(
 		&ss->wire.recvbuf,
-		MUX_RECV_READAHEAD +
+		recv_window(ss) +
 			((size_t)MUX_FRAME_HEADER_SIZE + ss->max_payload));
 	/* Flush responses (PONG, ACKs, credit) immediately rather than waiting
 	 * for EV_WRITE; prompt PONG avoids inflating the peer's RTT sample. */

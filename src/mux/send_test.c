@@ -324,6 +324,7 @@ const struct table_opts mux_stream_table_opts = { 0 };
  * since this white-box TU does not link frame.c. */
 const struct mux_config mux_conf_default = {
 	.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE,
+	.tls_readahead = 128 * 1024,
 };
 
 /* Session-core collaborators: send.c calls back into these for watcher/state

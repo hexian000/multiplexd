@@ -69,6 +69,9 @@ struct tls_config {
 	const char *sni;
 	/* OpenSSL only: request KTLS offload (kernel frames+encrypts records). */
 	bool kernel_offload : 1;
+	/* tls.readahead > 0: enable the library read-ahead (SSL_CTX_set_read_ahead)
+	 * so one socket read can buffer several records.  OpenSSL only. */
+	bool readahead : 1;
 };
 
 /**

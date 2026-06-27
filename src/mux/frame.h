@@ -75,11 +75,6 @@
  * that would overflow is sent by reference (zero-copy). */
 #define MUX_MAX_RECORD 16384u
 
-/* Receive read-ahead window: contiguous recvbuf space offered to one transport
- * read, amortizing the recv() and event-loop cost over several frames.  The
- * wire frame size is unchanged. */
-#define MUX_RECV_READAHEAD ((size_t)128 * 1024)
-
 /* Stream-0 / Flags=0 keepalive subtypes (spec §2.4.4, §5.3). */
 #define MUX_CTRL_PROBE 0x0000u
 #define MUX_CTRL_PING 0x0001u

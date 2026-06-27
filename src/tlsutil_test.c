@@ -1227,6 +1227,9 @@ static bool bench_setup(void)
 #else
 		.ciphersuites = "TLS1-3-AES-128-GCM-SHA256",
 #endif
+		/* Enable library read-ahead so the bench measures the high-throughput
+		 * path (one socket read can buffer several records). */
+		.readahead = true,
 	};
 
 	bench_srv_ctx = tls_ctx_server(&tls_conf);

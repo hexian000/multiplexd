@@ -5422,6 +5422,8 @@ static int bench_fixture_setup(struct mux_test_fixture *restrict fx)
 #else
 			.ciphersuites = "TLS1-3-AES-128-GCM-SHA256",
 #endif
+			/* Read-ahead on so the bench measures the high-throughput path. */
+			.readahead = true,
 		};
 		bench_srv_tlsctx = tls_ctx_server(&tls_conf);
 		bench_cli_tlsctx = tls_ctx_client(&tls_conf);
@@ -5443,11 +5445,13 @@ static int bench_fixture_setup(struct mux_test_fixture *restrict fx)
 	struct mux_config conf = make_cli_conf(true);
 	conf.stream_window = 256;
 #if WITH_TLS
-	/* Socket-offloaded TLS on both ends (the production default): the
-	 * pre-wrapped server connection owns fds[0] and the client's tlsctx is
-	 * offloaded onto fds[1], so the mux wire must not also do buffered I/O on
-	 * those fds (doing so steals handshake bytes from the TLS library). */
+	/* Socket-offloaded TLS on both ends: the pre-wrapped server connection owns
+	 * fds[0] and the client's tlsctx is offloaded onto fds[1], so the mux wire
+	 * must not also do buffered I/O on those fds (doing so steals handshake bytes
+	 * from the TLS library).  tls_readahead matches the tlsctx read-ahead above
+	 * so the offloaded recv path measures the high-throughput config. */
 	conf.tls_socket_offload = true;
+	conf.tls_readahead = 128 * 1024;
 #endif
 	unsigned char srv_sid[MUX_SESSION_ID_LEN];
 	unsigned char cli_sid[MUX_SESSION_ID_LEN];

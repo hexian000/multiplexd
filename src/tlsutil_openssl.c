@@ -196,7 +196,9 @@ static int alpn_select_cb(
 	return SSL_TLSEXT_ERR_OK;
 }
 
-static void tls_ctx_tune(SSL_CTX *restrict ssl_ctx, const bool kernel_offload)
+static void tls_ctx_tune(
+	SSL_CTX *restrict ssl_ctx, const bool kernel_offload,
+	const bool readahead)
 {
 	const long want_mode =
 		SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_AUTO_RETRY;
@@ -205,9 +207,13 @@ static void tls_ctx_tune(SSL_CTX *restrict ssl_ctx, const bool kernel_offload)
 		LOGW_F("SSL_CTX_set_mode: requested 0x%lx but active mode is 0x%lx",
 		       (unsigned long)want_mode, (unsigned long)got_mode);
 	}
-	(void)SSL_CTX_set_read_ahead(ssl_ctx, 1);
-	if (SSL_CTX_get_read_ahead(ssl_ctx) != 1) {
-		LOGW("SSL_CTX_set_read_ahead: read-ahead was not enabled");
+	/* tls.readahead: let one socket read buffer several records.  Disabled
+	 * makes the library read at most one record per socket read. */
+	const int want_read_ahead = readahead ? 1 : 0;
+	(void)SSL_CTX_set_read_ahead(ssl_ctx, want_read_ahead);
+	if (SSL_CTX_get_read_ahead(ssl_ctx) != want_read_ahead) {
+		LOGW_F("SSL_CTX_set_read_ahead: read-ahead could not be set to %d",
+		       want_read_ahead);
 	}
 	/* tls.kernel_offload: let the kernel frame+encrypt records (KTLS).  Default
 	 * off, strictly opt-in (degrades on some platforms). */
@@ -519,7 +525,7 @@ struct tls_context *tls_ctx_server(const struct tls_config *conf)
 		return NULL;
 	}
 
-	tls_ctx_tune(ssl_ctx, conf->kernel_offload);
+	tls_ctx_tune(ssl_ctx, conf->kernel_offload, conf->readahead);
 
 	if (!tls_load_cert(ctx, conf->cert)) {
 		LOGE("failed to load TLS certificate");
@@ -583,7 +589,7 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf)
 		tls_ctx_free(ctx);
 		return NULL;
 	}
-	tls_ctx_tune(ssl_ctx, conf->kernel_offload);
+	tls_ctx_tune(ssl_ctx, conf->kernel_offload, conf->readahead);
 
 	/* Client certificate is mandatory for mutual authentication */
 	if (!tls_load_cert(ctx, conf->cert)) {

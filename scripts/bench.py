@@ -988,8 +988,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--socket-offload",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="set tls.socket_offload; pass --no-socket-offload for in-memory "
-             "record batching (default: omit from config, daemon default is on)",
+        help="set tls.socket_offload; pass --socket-offload to let the TLS "
+             "library own the socket (default: omit from config, daemon default "
+             "is off -> in-memory record batching)",
     )
     parser.add_argument(
         "--kernel-offload",

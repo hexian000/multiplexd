@@ -375,6 +375,10 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 				MUX_MAX_PAYLOAD_SIZE);
 		}
 	}
+	/* tls.readahead drives the mux receive window (and the TLS library
+	 * read-ahead under socket_offload); kept in mux_config so the no-TLS recv
+	 * path can use it too.  Schema-validated to [0, 16777216], fits int. */
+	cfg->mux.tls_readahead = (int)obj->tls.readahead;
 	cfg->mux.mem_pressure_hi = (int)obj->mux.mem_pressure.hi;
 	cfg->mux.mem_pressure_lo = (int)obj->mux.mem_pressure.lo;
 
@@ -1060,6 +1064,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 			.authcerts_count = conf->tls_authcerts_count,
 			.kernel_offload = conf->tls_kernel_offload,
 			.socket_offload = conf->tls_socket_offload,
+			.readahead = (unsigned)conf->mux.tls_readahead,
 		},
 #endif /* WITH_TLS */
 		.mux = {
