@@ -17,6 +17,7 @@
 #include "os/socket.h"
 #if WITH_THREADS
 #include "sync/dispatcher.h"
+#include "sync/shared_mutex.h"
 #endif
 #include "sync/task.h"
 #include "utils/arraysize.h"
@@ -30,16 +31,16 @@
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
+#if WITH_THREADS
+#include <stdatomic.h>
+#include <threads.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#if WITH_THREADS
-#include <stdatomic.h>
-#include <threads.h>
-#endif
 
 #define TUNNEL_LOG_F(level, t, format, ...)                                    \
 	do {                                                                   \
@@ -62,7 +63,6 @@ static void task_mux_start(void *p)
 	mux_start(p);
 }
 
-/* Truncation is fine: snprintf always null-terminates. */
 static void tunnel_set_tag_part(
 	char *restrict buf, const size_t buflen, const char *restrict text)
 {
@@ -104,7 +104,25 @@ struct tunnel {
 		struct tunnel_callbacks cb;
 	} relay;
 
+	/* Monotonic ns of the last transport state change.  Written on the session
+	 * thread, read on the server thread (tunnel_stats); relaxed-atomic. */
+#if WITH_THREADS
+	atomic_int_least64_t last_changed;
+#else
 	int_least64_t last_changed;
+#endif
+
+	/* Snapshot published by the session thread under pub_mtx and read by
+	 * the server thread; strings are not atomic so the mutex guards a coherent
+	 * copy; peer_identity is inlined to avoid touching a freeable heap pointer. */
+#if WITH_THREADS
+	mtx_t pub_mtx;
+#endif
+	struct {
+		char tag[256];
+		char peer_identity[256];
+		bool has_peer_identity;
+	} pub;
 
 	/* Callback data passed to wrapped callbacks. */
 	void *callback_data;
@@ -133,7 +151,7 @@ struct tunnel {
 	unsigned char *peer_cert_der;
 	size_t peer_cert_der_len;
 #endif
-	/* Session log tag: "my <= peer" or "my => peer". Owned buffer. */
+	/* Session log tag: "my <= peer" or "my => peer". */
 	char tag[256];
 	/* Socket options cached at creation; updated on reload. */
 	struct conf_socket_opts mux_socket;
@@ -178,10 +196,68 @@ struct tunnel {
 		uint_least64_t byt_push_sent;
 #endif /* WITH_THREADS */
 	} traffic_cnt;
-	/* SYN->SYN|ACK latency ring; written on the server thread only. */
+	/* SYN->SYN|ACK latency ring; written per stream-established on the session
+	 * thread (handle_stream_established), read on the server thread
+	 * (tunnel_stats).  High-frequency, so relaxed-atomic rather than locked. */
+#if WITH_THREADS
+	atomic_size_t stream_establish_count;
+	atomic_int_least64_t stream_establish_ns[256];
+#else
 	size_t stream_establish_count;
 	int_least64_t stream_establish_ns[256];
+#endif
 };
+
+/* TPUB_STORE/TPUB_LOAD: relaxed-atomic access to a session-thread-owned scalar
+ * tunnel field (last_changed, stream_establish ring/count) read by the server
+ * thread.  Operate on the field lvalue. */
+#if WITH_THREADS
+#define TPUB_STORE(field, v)                                                   \
+	atomic_store_explicit(&(field), (v), memory_order_relaxed)
+#define TPUB_LOAD(field) atomic_load_explicit(&(field), memory_order_relaxed)
+#else
+#define TPUB_STORE(field, v) ((void)((field) = (v)))
+#define TPUB_LOAD(field) (field)
+#endif /* WITH_THREADS */
+
+/* Lock/unlock the per-tunnel stats-snapshot mutex.  Takes const because the
+ * snapshot read path holds a const tunnel; the mutex is not part of the object's
+ * const-observable state (the build uses no -Wcast-qual). */
+static void tunnel_pub_lock(const struct tunnel *restrict t)
+{
+#if WITH_THREADS
+	THRD_ASSERT(mtx_lock((mtx_t *)&t->pub_mtx));
+#else
+	(void)t;
+#endif
+}
+
+static void tunnel_pub_unlock(const struct tunnel *restrict t)
+{
+#if WITH_THREADS
+	THRD_ASSERT(mtx_unlock((mtx_t *)&t->pub_mtx));
+#else
+	(void)t;
+#endif
+}
+
+/* Publish the coherent diagnostic snapshot (tag + peer_identity) under pub_mtx
+ * so the server thread can read it race-free.  Runs on the session thread. */
+static void tunnel_publish_pub(struct tunnel *restrict t)
+{
+	tunnel_pub_lock(t);
+	(void)memcpy(t->pub.tag, t->tag, sizeof(t->pub.tag));
+	if (t->peer_identity != NULL) {
+		(void)snprintf(
+			t->pub.peer_identity, sizeof(t->pub.peer_identity),
+			"%s", t->peer_identity);
+		t->pub.has_peer_identity = true;
+	} else {
+		t->pub.peer_identity[0] = '\0';
+		t->pub.has_peer_identity = false;
+	}
+	tunnel_pub_unlock(t);
+}
 
 static bool stream_connect(
 	const struct tunnel *restrict t, struct mux_stream *stream,
@@ -239,8 +315,8 @@ static bool stream_connect(
 static bool tunnel_on_accept(
 	void *data, const struct mux_session *ss, struct mux_stream *stream)
 {
-	UNUSED(ss);
-	const struct tunnel *restrict t = data;
+	(void)ss;
+	const struct tunnel *const restrict t = data;
 	if (t->forward_addr == NULL) {
 		TUNNEL_LOG_F(
 			WARNING, t,
@@ -261,8 +337,8 @@ struct relay_event_arg {
 
 static void relay_dispatch_on_event(void *p)
 {
-	struct relay_event_arg *restrict arg = p;
-	struct tunnel *restrict t = arg->t;
+	struct relay_event_arg *const restrict arg = p;
+	struct tunnel *const restrict t = arg->t;
 	const enum mux_event event = arg->event;
 	const union mux_event_data data = arg->data;
 	free(arg);
@@ -280,8 +356,8 @@ struct relay_connected_arg {
 
 static void relay_dispatch_connected(void *p)
 {
-	struct relay_connected_arg *restrict arg = p;
-	struct tunnel *restrict t = arg->t;
+	struct relay_connected_arg *const restrict arg = p;
+	struct tunnel *const restrict t = arg->t;
 	const int_fast64_t lat_ns = arg->lat_ns;
 	void (*const cb)(void *, struct tunnel *, int_fast64_t) = arg->cb;
 	free(arg);
@@ -300,7 +376,7 @@ static void relay_connected(
 		return;
 	}
 #if WITH_THREADS
-	struct relay_connected_arg *restrict arg = malloc(sizeof(*arg));
+	struct relay_connected_arg *const restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
 		return;
@@ -412,9 +488,9 @@ static void
 tunnel_reconnect_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct tunnel *restrict t = w->data;
+	struct tunnel *const restrict t = w->data;
 	ASSERT(loop == t->loop);
-	UNUSED(loop);
+	(void)loop;
 	ev_timer_stop(loop, &t->w_reconnect);
 	if (tunnel_do_connect(t)) {
 		return;
@@ -479,35 +555,48 @@ static void handle_connected(
 	}
 #endif /* WITH_TLS */
 
-	if (t->accepted) {
-		if (peer_id == NULL) {
-			return;
-		}
-		/* Update tag for accepted identity sessions once peer identity
-		 * is known from the completed handshake. */
-		const struct server *const srv = t->relay.srv;
-		const bool matched = table_find(srv->identities, peer_id, NULL);
-		const char *const my = matched ? t->identity : "?";
-		tunnel_set_tag(t->tag, sizeof(t->tag), my, " <= ", peer_id);
-	} else {
-		if (peer_id == NULL) {
-			return;
-		}
-		/* server.c server_on_established wires identities[].tunnels[];
-		 * here we just update the diagnostic tag. */
-		char my[64];
-		if (t->identity != NULL) {
-			tunnel_set_tag_part(my, sizeof(my), t->identity);
+	/* Rebuild the diagnostic tag once the peer identity is known; skipped when
+	 * the peer sent no identity (the connect-time "=> ?" tag is retained). */
+	if (peer_id != NULL) {
+		if (t->accepted) {
+			/* Update tag for accepted identity sessions; runs on the
+			 * session thread, so srv->identities must be read under
+			 * accepted_mu (pins the table across SIGHUP reload swaps). */
+			struct server *const srv = t->relay.srv;
+#if WITH_THREADS
+			THRD_ASSERT(smtx_sharedlock(&srv->accepted_mu));
+#endif
+			const bool matched =
+				table_find(srv->identities, peer_id, NULL);
+#if WITH_THREADS
+			THRD_ASSERT(smtx_sharedunlock(&srv->accepted_mu));
+#endif
+			const char *const my = matched ? t->identity : "?";
+			tunnel_set_tag(
+				t->tag, sizeof(t->tag), my, " <= ", peer_id);
 		} else {
-			union sockaddr_max addr;
-			if (socket_get_addr(mux_fd(ss), &addr) > 0) {
-				(void)sa_format(my, sizeof(my), &addr.sa);
+			/* server.c server_on_established wires
+			 * identities[].tunnels[]; here we just update the tag. */
+			char my[64];
+			if (t->identity != NULL) {
+				tunnel_set_tag_part(
+					my, sizeof(my), t->identity);
 			} else {
-				tunnel_set_tag_part(my, sizeof(my), "?");
+				union sockaddr_max addr;
+				if (socket_get_addr(mux_fd(ss), &addr) > 0) {
+					(void)sa_format(
+						my, sizeof(my), &addr.sa);
+				} else {
+					tunnel_set_tag_part(
+						my, sizeof(my), "?");
+				}
 			}
+			tunnel_set_tag(
+				t->tag, sizeof(t->tag), my, " => ", peer_id);
 		}
-		tunnel_set_tag(t->tag, sizeof(t->tag), my, " => ", peer_id);
 	}
+	/* Publish tag + peer_identity for the server thread's stats path. */
+	tunnel_publish_pub(t);
 }
 
 /* Returns false when the event should not be relayed to the server:
@@ -527,10 +616,10 @@ static bool handle_closed(struct tunnel *restrict t)
 
 static void handle_stream_established(struct tunnel *t, int_fast64_t lat_ns)
 {
-	const size_t idx =
-		t->stream_establish_count % ARRAY_SIZE(t->stream_establish_ns);
-	t->stream_establish_ns[idx] = lat_ns;
-	t->stream_establish_count++;
+	const size_t count = TPUB_LOAD(t->stream_establish_count);
+	const size_t idx = count % ARRAY_SIZE(t->stream_establish_ns);
+	TPUB_STORE(t->stream_establish_ns[idx], lat_ns);
+	TPUB_STORE(t->stream_establish_count, count + 1);
 }
 
 static void tunnel_on_event(
@@ -542,13 +631,13 @@ static void tunnel_on_event(
 	/* Update reconnect state before relaying to the server loop. */
 	switch (event) {
 	case MUX_EVENT_LOST:
-		t->last_changed = clock_monotonic_ns();
+		TPUB_STORE(t->last_changed, clock_monotonic_ns());
 		break;
 	case MUX_EVENT_SUSPENDED:
 		handle_transport_lost(t);
 		break;
 	case MUX_EVENT_ESTABLISHED:
-		t->last_changed = clock_monotonic_ns();
+		TPUB_STORE(t->last_changed, clock_monotonic_ns());
 		handle_connected(t, ss, edata);
 		break;
 	case MUX_EVENT_RESUMED:
@@ -608,13 +697,13 @@ static void tunnel_async_cb(struct ev_loop *loop, ev_async *w, int revents)
 {
 	(void)loop;
 	(void)revents;
-	struct tunnel *restrict t = w->data;
+	struct tunnel *const restrict t = w->data;
 	dispatcher_tick(t->disp);
 }
 
 static int tunnel_thread(void *arg)
 {
-	struct tunnel *restrict t = arg;
+	struct tunnel *const restrict t = arg;
 	ev_run(t->loop, 0);
 	/* If ev_run exits before task_tunnel_teardown is dispatched, drain it
 	 * here so mux_close/free(ss) always run on the allocating thread. */
@@ -718,9 +807,9 @@ static bool tunnel_on_resume(
 
 static struct mux_frame *tunnel_frame_alloc(void *data, const size_t size)
 {
-	struct mcache *restrict cache = data;
+	struct mcache *const restrict cache = data;
 	ASSERT(size == cache->elem_size);
-	UNUSED(size);
+	(void)size;
 	return mcache_get(cache);
 }
 
@@ -733,9 +822,9 @@ static void
 tunnel_maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct tunnel *restrict t = w->data;
+	struct tunnel *const restrict t = w->data;
 	ASSERT(loop == t->loop);
-	UNUSED(loop);
+	(void)loop;
 	/* Release one cached frame per tick: a steady stream keeps refilling the
 	 * cache, while an idle tunnel drains it back to malloc over time. */
 	mcache_shrink(t->frame_cache, 1);
@@ -767,7 +856,7 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 	t->callback_data = data;
 	t->forward_addr = forward_addr != NULL ? strdup(forward_addr) : NULL;
 	t->connect_addr = connect_addr != NULL ? strdup(connect_addr) : NULL;
-	t->last_changed = clock_monotonic_ns();
+	TPUB_STORE(t->last_changed, clock_monotonic_ns());
 	t->reconnect_count = 0;
 	t->shutting_down = false;
 	t->accepted = (fd >= 0);
@@ -827,7 +916,7 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 		tunnel_reconnect_delays[0]);
 	t->w_reconnect.data = t;
 	/* Per-tunnel L1 allocator: a fixed-size frame cache (mcache) over malloc,
-	 * each object sized to the session's frame payload.  opts->pool is ignored. */
+	 * each object sized to the session's frame payload. */
 	const size_t frame_obj_size = mux_frame_object_size(
 		conf->max_frame_payload > 0 ?
 			(size_t)conf->max_frame_payload :
@@ -951,7 +1040,7 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 		.conn = conn,
 #endif
 	};
-	struct mux_session *restrict ss = mux_new(t->loop, &ss_opts);
+	struct mux_session *const restrict ss = mux_new(t->loop, &ss_opts);
 	if (ss == NULL) {
 		ev_timer_stop(t->loop, &t->w_maintenance);
 #if WITH_THREADS
@@ -967,7 +1056,27 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 		free(t);
 		return NULL;
 	}
+#if WITH_THREADS
+	/* Init the stats-snapshot mutex last so the failure paths above need no
+	 * mtx_destroy; only tunnel_close pairs with this. */
+	if (mtx_init(&t->pub_mtx, mtx_plain) != thrd_success) {
+		mux_close(ss);
+		ev_timer_stop(t->loop, &t->w_maintenance);
+		ev_async_stop(t->loop, &t->w_async);
+		dispatcher_destroy(t->disp);
+		ev_loop_destroy(t->loop);
+		mcache_free(t->frame_cache);
+		free(t->forward_addr);
+		free(t->connect_addr);
+		free(t->identity);
+		free(t->peer_id);
+		free(t);
+		return NULL;
+	}
+#endif /* WITH_THREADS */
 	t->ss = ss;
+	/* Publish the creation-time tag for the stats path before the thread runs. */
+	tunnel_publish_pub(t);
 	return t;
 }
 
@@ -982,7 +1091,7 @@ static void tunnel_dispatch(struct tunnel *t, struct task task)
 
 static void tunnel_initial_connect_task(void *p)
 {
-	struct tunnel *restrict t = p;
+	struct tunnel *const restrict t = p;
 	if (!tunnel_do_connect(t)) {
 		tunnel_schedule_reconnect(t);
 	}
@@ -1006,7 +1115,7 @@ void tunnel_start(struct tunnel *t)
  * session, stop event loop.  Clears t->ss so tunnel_close knows it ran. */
 static void task_tunnel_teardown(void *p)
 {
-	struct tunnel *restrict t = p;
+	struct tunnel *const restrict t = p;
 	ev_timer_stop(t->loop, &t->w_reconnect);
 	ev_timer_stop(t->loop, &t->w_maintenance);
 	mux_set_callbacks(t->ss, &(struct mux_callbacks){ 0 });
@@ -1056,6 +1165,9 @@ void tunnel_close(struct tunnel *t)
 #if WITH_TLS
 	free(t->peer_cert_der);
 #endif
+#if WITH_THREADS
+	mtx_destroy(&t->pub_mtx);
+#endif
 	/* After mux_close: any frames released during teardown are now back in
 	 * the cache, so it is safe to drop. */
 	mcache_free(t->frame_cache);
@@ -1082,7 +1194,7 @@ void tunnel_shutdown(struct tunnel *t)
 
 static void task_drop_transport(void *p)
 {
-	const struct tunnel *restrict t = p;
+	const struct tunnel *const restrict t = p;
 	const int fd = mux_fd(t->ss);
 	if (fd < 0) {
 		return;
@@ -1122,9 +1234,16 @@ const char *tunnel_peer_id(const struct tunnel *t)
 	return t->peer_id;
 }
 
-const char *tunnel_peer_identity(const struct tunnel *t)
+bool tunnel_peer_identity_copy(
+	const struct tunnel *t, char *restrict buf, const size_t buflen)
 {
-	return t->peer_identity;
+	tunnel_pub_lock(t);
+	const bool has = t->pub.has_peer_identity;
+	if (buflen > 0) {
+		(void)snprintf(buf, buflen, "%s", t->pub.peer_identity);
+	}
+	tunnel_pub_unlock(t);
+	return has;
 }
 
 #if WITH_TLS
@@ -1159,10 +1278,14 @@ uint_least64_t tunnel_index(const struct tunnel *t)
 
 void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 {
+	/* mux_state/mux_session_stats read relaxed-atomic mirrors; safe here. */
 	out->established = mux_state(t->ss) == MUX_STATE_ESTABLISHED;
-	out->tag = t->tag;
 	out->accepted = t->accepted;
 	out->tunnel_index = t->tunnel_index;
+	/* tag is a string, so copy it from the published snapshot under the lock. */
+	tunnel_pub_lock(t);
+	(void)memcpy(out->tag, t->pub.tag, sizeof(out->tag));
+	tunnel_pub_unlock(t);
 	struct mux_session_stats snap;
 	mux_session_stats(t->ss, &snap);
 	out->rx_window = snap.rx_window;
@@ -1170,7 +1293,7 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	out->rtt_ns = snap.rtt;
 	out->bdp_rx = snap.bdp_rx;
 	out->bdp_tx = snap.bdp_tx;
-	out->last_changed = t->last_changed;
+	out->last_changed = TPUB_LOAD(t->last_changed);
 #if WITH_THREADS
 	out->num_streams = (size_t)atomic_load_explicit(
 		&t->stream_cnt.num_streams, memory_order_relaxed);
@@ -1210,9 +1333,11 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	out->byt_push_recv = t->traffic_cnt.byt_push_recv;
 	out->byt_push_sent = t->traffic_cnt.byt_push_sent;
 #endif /* WITH_THREADS */
-	out->stream_establish_count = t->stream_establish_count;
-	memcpy(out->stream_establish_ns, t->stream_establish_ns,
-	       sizeof(t->stream_establish_ns));
+	out->stream_establish_count = TPUB_LOAD(t->stream_establish_count);
+	for (size_t i = 0; i < ARRAY_SIZE(t->stream_establish_ns); i++) {
+		out->stream_establish_ns[i] =
+			TPUB_LOAD(t->stream_establish_ns[i]);
+	}
 }
 
 struct open_stream_arg {
@@ -1223,10 +1348,10 @@ struct open_stream_arg {
 
 static void open_stream_task(void *p)
 {
-	struct open_stream_arg *restrict arg = p;
-	struct tunnel *restrict t = arg->t;
+	struct open_stream_arg *const restrict arg = p;
+	struct tunnel *const restrict t = arg->t;
 	const int fd = arg->fd;
-	struct mux_stream *stream = mux_open_stream(arg->ss);
+	struct mux_stream *const stream = mux_open_stream(arg->ss);
 	if (stream == NULL) {
 		/* Demand-triggered reconnect: when idle-closed/suspended with
 		 * idle_timeout set, reconnect so the next open_stream succeeds. */
@@ -1256,7 +1381,7 @@ static void open_stream_task(void *p)
 
 void tunnel_open_stream(struct tunnel *t, const int fd)
 {
-	struct open_stream_arg *restrict arg = malloc(sizeof(*arg));
+	struct open_stream_arg *const restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
 		SOCKET_CLOSE_FD(fd);
@@ -1284,8 +1409,8 @@ struct reload_arg {
 
 static void reload_task(void *p)
 {
-	struct reload_arg *restrict arg = p;
-	struct tunnel *restrict t = arg->t;
+	struct reload_arg *const restrict arg = p;
+	struct tunnel *const restrict t = arg->t;
 	if (arg->update_connect_addr) {
 		free(t->connect_addr);
 		t->connect_addr = arg->connect_addr;
@@ -1309,7 +1434,7 @@ static void reload_task(void *p)
 
 void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 {
-	struct reload_arg *restrict arg = malloc(sizeof(*arg));
+	struct reload_arg *const restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
 		return;

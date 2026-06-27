@@ -4,8 +4,9 @@
 /* listener_test.c - black-box tests for the socket listener in listener.c via
  * its public API. Dependencies: links the real util.c and listener.c. */
 
-#include "conf.h"
 #include "listener.h"
+
+#include "conf.h"
 
 #include "utils/testing.h"
 
@@ -65,7 +66,7 @@ static struct sockaddr_in make_loopback_any(void)
 
 T_DECLARE_CASE(test_listener_start_binds_port)
 {
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 
 	struct listener l;
@@ -83,7 +84,7 @@ T_DECLARE_CASE(test_listener_start_binds_port)
 
 T_DECLARE_CASE(test_listener_stop_after_start)
 {
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 
 	struct listener l;
@@ -101,16 +102,14 @@ T_DECLARE_CASE(test_listener_stop_after_start)
 
 T_DECLARE_CASE(test_listener_start_bad_addr_fails)
 {
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 
 	struct listener l;
 	listener_init(&l, &g_socket_opts, test_serve, NULL, NULL);
 
-	/*
-	 * 192.0.2.1 is TEST-NET-1 (RFC 5737) and is never a local interface
-	 * address; bind() must fail with EADDRNOTAVAIL.
-	 */
+	/* 192.0.2.1 is TEST-NET-1 (RFC 5737) and is never a local interface
+	 * address; bind() must fail with EADDRNOTAVAIL. */
 	struct sockaddr_in bad;
 	memset(&bad, 0, sizeof(bad));
 	bad.sin_family = AF_INET;
@@ -124,7 +123,7 @@ T_DECLARE_CASE(test_listener_start_bad_addr_fails)
 
 T_DECLARE_CASE(test_listener_serve_fn_called)
 {
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 
 	g_serve_fd = -1;
@@ -145,7 +144,7 @@ T_DECLARE_CASE(test_listener_serve_fn_called)
 	memset(&peer, 0, sizeof(peer));
 	peer.sin_family = AF_INET;
 	peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	peer.sin_port = htons((unsigned)port & 0xFFFFu);
+	peer.sin_port = htons((uint16_t)port);
 
 	const int cfd = socket(AF_INET, SOCK_STREAM, 0);
 	T_CHECK(cfd >= 0);
@@ -156,7 +155,7 @@ T_DECLARE_CASE(test_listener_serve_fn_called)
 	ev_run(loop, EVRUN_ONCE);
 
 	T_EXPECT_EQ(g_serve_calls, 1);
-	T_EXPECT((uint_least64_t)accepted >= 1u);
+	T_EXPECT(accepted >= 1u);
 
 	(void)close(cfd);
 	listener_stop(&l, loop);
@@ -165,7 +164,7 @@ T_DECLARE_CASE(test_listener_serve_fn_called)
 
 T_DECLARE_CASE(test_listener_stop_and_restart_binds_again)
 {
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 
 	struct listener l;
@@ -190,13 +189,16 @@ T_DECLARE_CASE(test_listener_stop_and_restart_binds_again)
 	ev_loop_destroy(loop);
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_listener_start_binds_port),
+	T_CASE(test_listener_stop_after_start),
+	T_CASE(test_listener_start_bad_addr_fails),
+	T_CASE(test_listener_serve_fn_called),
+	T_CASE(test_listener_stop_and_restart_binds_again),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_listener_start_binds_port);
-	T_RUN_CASE(t, test_listener_stop_after_start);
-	T_RUN_CASE(t, test_listener_start_bad_addr_fails);
-	T_RUN_CASE(t, test_listener_serve_fn_called);
-	T_RUN_CASE(t, test_listener_stop_and_restart_binds_again);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

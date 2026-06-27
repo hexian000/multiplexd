@@ -180,7 +180,11 @@ static struct tunnel *tunnel_iter_next(
 /* Log session establishment/close with peer address formatting */
 #define SESSION_EVLOGF(srv, t, fmt, ...)                                       \
 	do {                                                                   \
-		const char *id_ = tunnel_peer_identity(t);                     \
+		char id_buf_[256];                                             \
+		const char *id_ = tunnel_peer_identity_copy(                   \
+					  (t), id_buf_, sizeof(id_buf_)) ?     \
+					  id_buf_ :                            \
+					  NULL;                                \
 		if (id_ == NULL) {                                             \
 			id_ = tunnel_peer_id(t);                               \
 		}                                                              \
@@ -204,10 +208,11 @@ static struct tunnel *tunnel_iter_next(
 static void
 server_evlogf(struct server *restrict srv, const char *restrict fmt, ...)
 {
-	struct server_evlog *restrict evlog = &srv->evlog;
+	struct server_evlog *const restrict evlog = &srv->evlog;
 	const size_t evlog_size = ARRAY_SIZE(evlog->entries);
 	const time_t now = time(NULL);
-	struct server_evlog_entry *restrict entry = &evlog->entries[evlog->pos];
+	struct server_evlog_entry *const restrict entry =
+		&evlog->entries[evlog->pos];
 	va_list ap;
 	va_start(ap, fmt);
 	const int fmtlen =
@@ -219,7 +224,7 @@ server_evlogf(struct server *restrict srv, const char *restrict fmt, ...)
 	/* Merge into the previous entry if the message is identical. */
 	if (evlog->len > 0) {
 		const size_t prev = (evlog->pos + evlog_size - 1) % evlog_size;
-		struct server_evlog_entry *restrict last =
+		struct server_evlog_entry *const restrict last =
 			&evlog->entries[prev];
 		if (strncmp(last->message, entry->message,
 			    sizeof(last->message)) == 0) {
@@ -288,7 +293,7 @@ static bool server_check_identity_authcerts(
 static void server_on_established(
 	void *data, struct tunnel *restrict t, int_fast64_t lat_ns)
 {
-	struct server *restrict srv = data;
+	struct server *const restrict srv = data;
 	const bool is_server = tunnel_is_accepted(t);
 	LOGN_F("[fd:%d] %s session established", tunnel_fd(t),
 	       is_server ? "server" : "client");
@@ -301,9 +306,14 @@ static void server_on_established(
 		size_t cert_der_len = 0;
 		const unsigned char *cert_der =
 			tunnel_peer_cert_der(t, &cert_der_len);
+		char peer_id_buf[256];
+		const char *const peer_id =
+			tunnel_peer_identity_copy(
+				t, peer_id_buf, sizeof(peer_id_buf)) ?
+				peer_id_buf :
+				NULL;
 		if (!server_check_identity_authcerts(
-			    srv->conf, tunnel_peer_identity(t), cert_der,
-			    cert_der_len)) {
+			    srv->conf, peer_id, cert_der, cert_der_len)) {
 			SESSION_EVLOG(
 				srv, t,
 				"identity not authorized by"
@@ -325,7 +335,12 @@ static void server_on_established(
 		}
 		/* Wire the dialed session into the matching identity pool
 		 * (guard against duplicate wiring on re-ESTABLISHED). */
-		const char *const peer_id = tunnel_peer_identity(t);
+		char peer_id_buf[256];
+		const char *const peer_id =
+			tunnel_peer_identity_copy(
+				t, peer_id_buf, sizeof(peer_id_buf)) ?
+				peer_id_buf :
+				NULL;
 		if (peer_id != NULL) {
 			void *elem = NULL;
 			if (table_find(srv->identities, peer_id, &elem)) {
@@ -344,7 +359,12 @@ static void server_on_established(
 		}
 		return;
 	}
-	const char *const peer_identity = tunnel_peer_identity(t);
+	char peer_identity_buf[256];
+	const char *const peer_identity =
+		tunnel_peer_identity_copy(
+			t, peer_identity_buf, sizeof(peer_identity_buf)) ?
+			peer_identity_buf :
+			NULL;
 	if (peer_identity != NULL) {
 		void *elem = NULL;
 		if (table_find(srv->identities, peer_identity, &elem)) {
@@ -356,7 +376,7 @@ static void server_on_established(
 static void
 server_on_resumed(void *data, struct tunnel *restrict t, int_fast64_t lat_ns)
 {
-	struct server *restrict srv = data;
+	struct server *const restrict srv = data;
 	const bool is_server = tunnel_is_accepted(t);
 	LOGN_F("[fd:%d] %s session resumed", tunnel_fd(t),
 	       is_server ? "server" : "client");
@@ -448,7 +468,7 @@ static void tunnel_on_event(
 	void *data, struct tunnel *t, const enum mux_event event,
 	const union mux_event_data edata)
 {
-	struct server *restrict srv = data;
+	struct server *const restrict srv = data;
 	switch (event) {
 	case MUX_EVENT_CONNECT:
 	case MUX_EVENT_ESTABLISHED:
@@ -471,16 +491,14 @@ static void tunnel_on_event(
 	}
 }
 
-/* Locate a suspended (or still-established) session matching the client's
- * session_id.  Called during session resumption handshake (spec §5.8).
- *
- * Takes accepted_mu (shared) and keeps it held on return; released by
- * server_on_resume_unpin, with which it is paired one-to-one. */
+/* Locate a suspended/established session matching session_id (spec §5.8);
+ * takes accepted_mu (shared) and holds it on return; released by
+ * server_on_resume_unpin (paired one-to-one). */
 static struct tunnel *server_on_resume_lookup(
 	void *data, struct tunnel *new_t, const unsigned char *session_id)
 {
-	UNUSED(new_t);
-	struct server *restrict srv = data;
+	(void)new_t;
+	struct server *const restrict srv = data;
 
 #if WITH_THREADS
 	THRD_ASSERT(smtx_sharedlock(&srv->accepted_mu));
@@ -518,12 +536,12 @@ static struct tunnel *server_on_resume_lookup(
  * resume handoff has been enqueued. */
 static void server_on_resume_unpin(void *data, struct tunnel *new_t)
 {
-	UNUSED(new_t);
-	struct server *restrict srv = data;
+	(void)new_t;
+	struct server *const restrict srv = data;
 #if WITH_THREADS
 	THRD_ASSERT(smtx_sharedunlock(&srv->accepted_mu));
 #else
-	UNUSED(srv);
+	(void)srv;
 #endif
 }
 
@@ -531,11 +549,11 @@ static void identity_tcp_serve(
 	struct listener *l, struct ev_loop *loop, const int fd,
 	const struct sockaddr *sa)
 {
-	UNUSED(loop);
-	UNUSED(sa);
-	struct identity_listener *restrict sl = DOWNCAST(
+	(void)loop;
+	(void)sa;
+	struct identity_listener *const restrict sl = DOWNCAST(
 		struct listener, struct identity_listener, listener, l);
-	struct tunnel *restrict t = identity_listener_pick(sl);
+	struct tunnel *const restrict t = identity_listener_pick(sl);
 	if (t == NULL) {
 		LOGD_F("[fd:%d] no session for identity \"%s\","
 		       " closing",
@@ -551,9 +569,9 @@ static void tcp_serve(
 	struct listener *l, struct ev_loop *loop, const int fd,
 	const struct sockaddr *sa)
 {
-	UNUSED(loop);
-	UNUSED(sa);
-	struct server *restrict srv = l->srv;
+	(void)loop;
+	(void)sa;
+	struct server *const restrict srv = l->srv;
 	struct tunnel *restrict t = srv->mux_tunnel;
 	if (t == NULL && srv->accepted_tunnels != NULL) {
 		size_t cursor = 0;
@@ -574,8 +592,8 @@ static void tcp_serve(
 
 static bool is_startup_limited(const struct server *restrict srv)
 {
-	const struct config *restrict conf = srv->conf;
-	const struct server_counters *restrict stats = &srv->counters;
+	const struct config *const restrict conf = srv->conf;
+	const struct server_counters *const restrict stats = &srv->counters;
 #if WITH_THREADS
 	const size_t n_sessions = atomic_load_explicit(
 		&stats->num_sessions, memory_order_relaxed);
@@ -651,7 +669,7 @@ static void mux_serve(
 	const struct sockaddr *sa)
 {
 	(void)loop;
-	struct server *restrict srv = l->srv;
+	struct server *const restrict srv = l->srv;
 	if (LOGLEVEL(DEBUG)) {
 		char addr_str[64];
 		(void)sa_format(addr_str, sizeof(addr_str), sa);
@@ -1077,8 +1095,17 @@ static void server_reload_identities_changed(
 			free(sl);
 		}
 	}
+	/* Session threads read s->identities under accepted_mu (shared) in
+	 * tunnel handle_connected; hold it exclusive across the free+swap so a
+	 * concurrent lookup never observes a freed or half-swapped table. */
+#if WITH_THREADS
+	THRD_ASSERT(smtx_lock(&s->accepted_mu));
+#endif
 	table_free(s->identities);
 	s->identities = new_tbl;
+#if WITH_THREADS
+	THRD_ASSERT(smtx_unlock(&s->accepted_mu));
+#endif
 }
 
 /* Rebuild the identity-listener hashtable if the peer table changed; else fix
@@ -1128,8 +1155,16 @@ static void server_reload_identities(
 				LOGOOM();
 			}
 		}
+		/* See server_reload_identities_changed: pin under accepted_mu so a
+		 * concurrent session-thread lookup never sees a freed table. */
+#if WITH_THREADS
+		THRD_ASSERT(smtx_lock(&s->accepted_mu));
+#endif
 		table_free(s->identities);
 		s->identities = new_tbl;
+#if WITH_THREADS
+		THRD_ASSERT(smtx_unlock(&s->accepted_mu));
+#endif
 		return;
 	}
 	server_reload_identities_changed(s, new_conf, new_np);
@@ -1340,7 +1375,7 @@ static void server_reload(struct server *restrict s)
 static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct server *restrict srv = w->data;
+	struct server *const restrict srv = w->data;
 
 	/* Task 1 (highest priority): shutdown deadline polling.
 	 * When shutting_down, check the force-exit deadline and return. */
@@ -1372,6 +1407,7 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 					 0) +
 				1 + table_size(srv->identities) +
 				srv->num_identity_tunnels;
+			ASSERT(n <= 65536);
 			struct tunnel *snapshot[n];
 			size_t count = 0;
 			struct tunnel_iter it = { 0 };
@@ -1392,8 +1428,8 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void relay_async_cb(struct ev_loop *loop, ev_async *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_ASYNC);
-	UNUSED(loop);
-	struct server *restrict srv = w->data;
+	(void)loop;
+	struct server *const restrict srv = w->data;
 	dispatcher_tick(srv->disp);
 }
 #endif
@@ -1401,7 +1437,7 @@ static void relay_async_cb(struct ev_loop *loop, ev_async *w, const int revents)
 static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_SIGNAL);
-	struct server *restrict s = w->data;
+	struct server *const restrict s = w->data;
 	const int signo = w->signum;
 
 	switch (signo) {
@@ -1451,6 +1487,7 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 					 0) +
 				1 + table_size(s->identities) +
 				s->num_identity_tunnels;
+			ASSERT(n <= 65536);
 			struct tunnel *snapshot[n];
 			size_t count = 0;
 			struct tunnel_iter it = { 0 };
@@ -1649,8 +1686,8 @@ static bool server_start_one_listener(
 
 static bool server_start_listeners(struct server *restrict s)
 {
-	struct ev_loop *restrict loop = s->loop;
-	const struct config *restrict conf = s->conf;
+	struct ev_loop *const restrict loop = s->loop;
+	const struct config *const restrict conf = s->conf;
 
 	if (conf->listen != NULL &&
 	    !server_start_one_listener(
@@ -1675,7 +1712,7 @@ static bool server_start_listeners(struct server *restrict s)
 
 static bool server_start_mux_tunnel(struct server *restrict s)
 {
-	const struct config *restrict conf = s->conf;
+	const struct config *const restrict conf = s->conf;
 	if (conf->mux_connect == NULL) {
 		return true;
 	}
@@ -1694,8 +1731,8 @@ static bool server_start_mux_tunnel(struct server *restrict s)
  * handshake time, keyed by the peer's announced identity. */
 static bool server_start_identity_listeners(struct server *restrict s)
 {
-	struct ev_loop *restrict loop = s->loop;
-	const struct config *restrict conf = s->conf;
+	struct ev_loop *const restrict loop = s->loop;
+	const struct config *const restrict conf = s->conf;
 	const size_t n = conf->identity.peers_count;
 	if (n == 0) {
 		return true;
@@ -1759,7 +1796,7 @@ static bool server_start_identity_listeners(struct server *restrict s)
  * Sessions are wired to the matching identity listener in server_on_established. */
 static bool server_start_identity_tunnels(struct server *restrict s)
 {
-	const struct config *restrict conf = s->conf;
+	const struct config *const restrict conf = s->conf;
 	const size_t n = conf->identity.mux_connect_count;
 	if (n == 0) {
 		return true;
@@ -1793,8 +1830,8 @@ static bool server_start_identity_tunnels(struct server *restrict s)
 
 bool server_start(struct server *restrict s)
 {
-	struct ev_loop *restrict loop = s->loop;
-	const struct config *restrict conf = s->conf;
+	struct ev_loop *const restrict loop = s->loop;
+	const struct config *const restrict conf = s->conf;
 
 #if WITH_THREADS
 	ev_async_start(s->loop, &s->w_async);
@@ -1841,7 +1878,7 @@ void server_stop(struct server *srv)
 		return;
 	}
 	LOGN("stopping server");
-	struct ev_loop *loop = srv->loop;
+	struct ev_loop *const loop = srv->loop;
 
 	ev_signal_stop(loop, &srv->w_sighup);
 	ev_signal_stop(loop, &srv->w_sigint);
@@ -1961,9 +1998,9 @@ static bool sum_accepted_stream_cnt(
 	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
-	UNUSED(table);
-	UNUSED(key);
-	struct server_stats *restrict out = data;
+	(void)table;
+	(void)key;
+	struct server_stats *const restrict out = data;
 	struct tunnel_stats snap;
 	tunnel_stats(element, &snap);
 	out->num_streams += snap.num_streams;
@@ -1996,10 +2033,15 @@ static bool collect_unmatched_accepted(
 	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
-	UNUSED(table);
-	UNUSED(key);
-	struct unmatched_accepted_ctx *ctx = data;
-	const char *const peer_id = tunnel_peer_identity(element);
+	(void)table;
+	(void)key;
+	struct unmatched_accepted_ctx *const ctx = data;
+	char peer_id_buf[256];
+	const char *const peer_id =
+		tunnel_peer_identity_copy(
+			element, peer_id_buf, sizeof(peer_id_buf)) ?
+			peer_id_buf :
+			NULL;
 	if (peer_id != NULL && table_find(ctx->s->identities, peer_id, NULL)) {
 		return true; /* already counted via identity pool */
 	}
@@ -2027,14 +2069,14 @@ static size_t calc_stream_percentiles(struct server_stats *restrict out)
 	if (total == 0) {
 		return 0;
 	}
-	int_fast64_t *samples = malloc(total * sizeof(*samples));
+	int_fast64_t *const samples = malloc(total * sizeof(*samples));
 	if (samples == NULL) {
 		LOGOOM();
 		return 0;
 	}
 	size_t n = 0;
 	for (size_t i = 0; i < out->num_tunnels; i++) {
-		const struct tunnel_stats *ts = &out->tunnels[i];
+		const struct tunnel_stats *const ts = &out->tunnels[i];
 		const size_t ring = ARRAY_SIZE(ts->stream_establish_ns);
 		const size_t count = MIN(ts->stream_establish_count, ring);
 		for (size_t j = 0; j < count; j++) {
@@ -2082,7 +2124,7 @@ struct server_stats *server_stats(const struct server *restrict s)
 		return NULL;
 	}
 
-	const struct server_counters *restrict c = &s->counters;
+	const struct server_counters *const restrict c = &s->counters;
 	out->num_accepted = c->num_accepted;
 	out->num_served = c->num_served;
 	out->num_accepted_tcp = c->num_accepted_tcp;
@@ -2161,7 +2203,8 @@ struct server_stats *server_stats(const struct server *restrict s)
 		size_t cursor = 0;
 		void *elem;
 		while (table_next(s->identities, &cursor, NULL, &elem)) {
-			const struct identity_listener *restrict sl = elem;
+			const struct identity_listener *const restrict sl =
+				elem;
 			for (size_t j = 0; j < sl->num_tunnels; j++) {
 				struct tunnel_stats *ts = &out->tunnels[idx];
 				ts->peer_identity = sl->peer_identity;
@@ -2186,7 +2229,7 @@ struct server_stats *server_stats(const struct server *restrict s)
 	/* Aggregate stream counters from dialed tunnels (accepted ones are summed
 	 * separately by sum_accepted_stream_cnt). */
 	for (size_t i = 0; i < out->num_tunnels; i++) {
-		const struct tunnel_stats *ts = &out->tunnels[i];
+		const struct tunnel_stats *const ts = &out->tunnels[i];
 		if (ts->accepted) {
 			continue;
 		}

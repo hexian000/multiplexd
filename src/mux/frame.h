@@ -152,7 +152,7 @@ enum mux_status {
 static inline struct mux_frame *
 mux_frame_get(const struct mux_frame_allocator *restrict pool, const size_t cap)
 {
-	struct mux_frame *frame =
+	struct mux_frame *const frame =
 		pool->alloc(pool->data, MUX_FRAME_OBJECT_SIZE(cap));
 	if (frame != NULL) {
 		frame->pos = 0;
@@ -205,7 +205,7 @@ static inline void mux_frame_list_push_front(
 static inline struct mux_frame *
 mux_frame_list_pop(struct mux_frame_list *restrict list)
 {
-	struct mux_frame *frame = list->head;
+	struct mux_frame *const frame = list->head;
 	if (frame != NULL) {
 		list->head = frame->next;
 		if (list->head == NULL) {
@@ -441,7 +441,7 @@ mux_frame_ring_pop(struct mux_frame_ring *restrict r)
 	if (r == NULL || r->count == 0) {
 		return NULL;
 	}
-	struct mux_frame *f = r->entries[r->head];
+	struct mux_frame *const f = r->entries[r->head];
 	r->entries[r->head] = NULL;
 	r->head = (r->head + 1) & (r->capacity - 1);
 	r->count--;
@@ -454,12 +454,12 @@ static inline void mux_frame_ring_free(
 	struct mux_frame_ring **restrict rp,
 	const struct mux_frame_allocator *restrict pool)
 {
-	struct mux_frame_ring *r = *rp;
+	struct mux_frame_ring *const r = *rp;
 	if (r == NULL) {
 		return;
 	}
 	for (size_t i = 0; i < r->count; i++) {
-		struct mux_frame *f =
+		struct mux_frame *const f =
 			r->entries[(r->head + i) & (r->capacity - 1)];
 		mux_frame_put(pool, f);
 	}

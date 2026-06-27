@@ -79,7 +79,7 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 			keysize = 4096;
 		}
 		LOGN_F("keytype=rsa keysize=%d", keysize);
-		EVP_PKEY *pkey =
+		EVP_PKEY *const pkey =
 			EVP_PKEY_Q_keygen(NULL, NULL, "RSA", (size_t)keysize);
 		if (pkey == NULL) {
 			LOG_SSLERROR("EVP_PKEY_Q_keygen(RSA)");
@@ -109,7 +109,8 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 			return NULL;
 		}
 		LOGN_F("keytype=ecdsa keysize=%d", keysize);
-		EVP_PKEY *pkey = EVP_PKEY_Q_keygen(NULL, NULL, "EC", curve);
+		EVP_PKEY *const pkey =
+			EVP_PKEY_Q_keygen(NULL, NULL, "EC", curve);
 		if (pkey == NULL) {
 			LOG_SSLERROR("EVP_PKEY_Q_keygen(EC)");
 		}
@@ -117,7 +118,7 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 	}
 	if (strcmp(type, "ed25519") == 0) {
 		LOGN("keytype=ed25519");
-		EVP_PKEY *pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
+		EVP_PKEY *const pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
 		if (pkey == NULL) {
 			LOG_SSLERROR("EVP_PKEY_Q_keygen(ED25519)");
 		}
@@ -172,14 +173,14 @@ static bool create_certificate(
 	X509 **out_cert, X509 *parent, EVP_PKEY *sign_key,
 	const char *server_name, EVP_PKEY *pkey)
 {
-	X509 *cert = X509_new();
+	X509 *const cert = X509_new();
 	if (cert == NULL) {
 		LOG_SSLERROR("X509_new");
 		return false;
 	}
 
 	/* RFC 5280 requires a positive serial number; use 128 random bits. */
-	BIGNUM *bn = BN_new();
+	BIGNUM *const bn = BN_new();
 	if (bn == NULL) {
 		LOG_SSLERROR("BN_new");
 		X509_free(cert);
@@ -191,7 +192,7 @@ static bool create_certificate(
 		X509_free(cert);
 		return false;
 	}
-	ASN1_INTEGER *serial = ASN1_INTEGER_new();
+	ASN1_INTEGER *const serial = ASN1_INTEGER_new();
 	if (serial == NULL) {
 		LOG_SSLERROR("ASN1_INTEGER_new");
 		BN_free(bn);
@@ -228,7 +229,7 @@ static bool create_certificate(
 		return false;
 	}
 
-	X509_NAME *name = X509_NAME_new();
+	X509_NAME *const name = X509_NAME_new();
 	if (name == NULL) {
 		LOG_SSLERROR("X509_NAME_new");
 		X509_free(cert);
@@ -257,7 +258,7 @@ static bool create_certificate(
 		parent = cert;
 		sign_key = pkey;
 	}
-	if (X509_set_version(cert, 2) == 0) {
+	if (X509_set_version(cert, X509_VERSION_3) == 0) {
 		LOG_SSLERROR("X509_set_version");
 		X509_free(cert);
 		return false;
@@ -471,7 +472,7 @@ bool gencerts(
 	const char *server_name_val =
 		(server_name != NULL) ? server_name : "example.com";
 
-	char *names_copy = strdup(names);
+	char *const names_copy = strdup(names);
 	if (names_copy == NULL) {
 		LOGOOM();
 		if (parent_cert != NULL) {
@@ -500,7 +501,7 @@ bool gencerts(
 			continue;
 		}
 
-		EVP_PKEY *pkey = generate_key(keytype, keysize);
+		EVP_PKEY *const pkey = generate_key(keytype, keysize);
 		if (pkey == NULL) {
 			LOGE_F("failed to generate key for %s", name);
 			success = false;

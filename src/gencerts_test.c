@@ -7,18 +7,16 @@
 
 #include "gencerts.h"
 
-#include "utils/testing.h"
-
-#include <stdio.h>
-#include <stdlib.h>
-
 #if WITH_OPENSSL
 
 #include "utils/slog.h"
+#include "utils/testing.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,7 +53,7 @@ static void rm_tmpdir(const char *path)
  * filling tmpl with the created path. */
 static char *enter_tmpdir(char *restrict tmpl)
 {
-	char *origdir = getcwd(NULL, 0);
+	char *const origdir = getcwd(NULL, 0);
 	if (origdir == NULL) {
 		return NULL;
 	}
@@ -83,7 +81,7 @@ leave_tmpdir(const char *restrict origdir, const char *restrict tmpl)
 T_DECLARE_CASE(test_gencerts_ed25519)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok =
@@ -101,7 +99,7 @@ T_DECLARE_CASE(test_gencerts_ed25519)
 T_DECLARE_CASE(test_gencerts_ecdsa)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok = gencerts("ec256", "ec.example", NULL, "ecdsa", 256);
@@ -118,7 +116,7 @@ T_DECLARE_CASE(test_gencerts_ecdsa)
 T_DECLARE_CASE(test_gencerts_rsa)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	/* Use 2048-bit RSA to keep the test reasonably fast. */
@@ -136,7 +134,7 @@ T_DECLARE_CASE(test_gencerts_rsa)
 T_DECLARE_CASE(test_gencerts_invalid_keytype)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok = gencerts("x", "test", NULL, "nosuchthing", 0);
@@ -149,7 +147,7 @@ T_DECLARE_CASE(test_gencerts_invalid_keytype)
 T_DECLARE_CASE(test_gencerts_invalid_ecdsa_keysize)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok = gencerts("ecbad", "ec.example", NULL, "ecdsa", 255);
@@ -162,7 +160,7 @@ T_DECLARE_CASE(test_gencerts_invalid_ecdsa_keysize)
 T_DECLARE_CASE(test_gencerts_missing_signing_cert_fails)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok =
@@ -176,7 +174,7 @@ T_DECLARE_CASE(test_gencerts_missing_signing_cert_fails)
 T_DECLARE_CASE(test_gencerts_refuses_overwrite_existing_files)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	bool ok = gencerts("dup", "dup.example", NULL, "ed25519", 0);
@@ -191,7 +189,7 @@ T_DECLARE_CASE(test_gencerts_refuses_overwrite_existing_files)
 T_DECLARE_CASE(test_gencerts_multiple_names)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok =
@@ -211,14 +209,12 @@ T_DECLARE_CASE(test_gencerts_multiple_names)
 T_DECLARE_CASE(test_gencerts_with_signing_cert)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
-	/* Generate a self-signed CA certificate. */
 	bool ok = gencerts("ca", "ca.example", NULL, "ed25519", 0);
 	T_CHECK(ok);
 
-	/* Generate a server certificate signed by the CA. */
 	ok = gencerts("server", "server.example", "ca", "ed25519", 0);
 	T_EXPECT(ok);
 	if (ok) {
@@ -233,7 +229,7 @@ T_DECLARE_CASE(test_gencerts_with_signing_cert)
 T_DECLARE_CASE(test_gencerts_ecdsa_p224)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok = gencerts("p224", "p224.example", NULL, "ecdsa", 224);
@@ -250,7 +246,7 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p224)
 T_DECLARE_CASE(test_gencerts_ecdsa_p384)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok = gencerts("p384", "p384.example", NULL, "ecdsa", 384);
@@ -267,7 +263,7 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p384)
 T_DECLARE_CASE(test_gencerts_ecdsa_p521)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
-	char *origdir = enter_tmpdir(tmpl);
+	char *const origdir = enter_tmpdir(tmpl);
 	T_CHECK(origdir != NULL);
 
 	const bool ok = gencerts("p521", "p521.example", NULL, "ecdsa", 521);
@@ -281,25 +277,30 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p521)
 	free(origdir);
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_gencerts_ed25519),
+	T_CASE(test_gencerts_ecdsa),
+	T_CASE(test_gencerts_rsa),
+	T_CASE(test_gencerts_invalid_keytype),
+	T_CASE(test_gencerts_invalid_ecdsa_keysize),
+	T_CASE(test_gencerts_missing_signing_cert_fails),
+	T_CASE(test_gencerts_refuses_overwrite_existing_files),
+	T_CASE(test_gencerts_multiple_names),
+	T_CASE(test_gencerts_with_signing_cert),
+	T_CASE(test_gencerts_ecdsa_p224),
+	T_CASE(test_gencerts_ecdsa_p384),
+	T_CASE(test_gencerts_ecdsa_p521),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_gencerts_ed25519);
-	T_RUN_CASE(t, test_gencerts_ecdsa);
-	T_RUN_CASE(t, test_gencerts_rsa);
-	T_RUN_CASE(t, test_gencerts_invalid_keytype);
-	T_RUN_CASE(t, test_gencerts_invalid_ecdsa_keysize);
-	T_RUN_CASE(t, test_gencerts_missing_signing_cert_fails);
-	T_RUN_CASE(t, test_gencerts_refuses_overwrite_existing_files);
-	T_RUN_CASE(t, test_gencerts_multiple_names);
-	T_RUN_CASE(t, test_gencerts_with_signing_cert);
-	T_RUN_CASE(t, test_gencerts_ecdsa_p224);
-	T_RUN_CASE(t, test_gencerts_ecdsa_p384);
-	T_RUN_CASE(t, test_gencerts_ecdsa_p521);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }
 
 #else /* !WITH_OPENSSL */
+
+#include <stdlib.h>
 
 int main(void)
 {

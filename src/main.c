@@ -229,7 +229,7 @@ int main(int argc, char **argv)
 
 	if (args.dump_config) {
 		size_t dump_len;
-		char *dump_json = conf_dump(conf, &dump_len);
+		char *const dump_json = conf_dump(conf, &dump_len);
 		if (dump_json == NULL) {
 			LOGF("failed to dump config");
 			conf_free(conf);
@@ -279,9 +279,9 @@ int main(int argc, char **argv)
 		       PROJECT_VER, extensions);
 	}
 
-	struct ev_loop *loop = EV_DEFAULT;
+	struct ev_loop *const loop = EV_DEFAULT;
 
-	struct server *server = server_new(loop, conf);
+	struct server *const server = server_new(loop, conf);
 	if (server == NULL) {
 		LOGF("failed to create server");
 		conf_free(conf);
@@ -289,7 +289,7 @@ int main(int argc, char **argv)
 	}
 	server->conf_path = args.conf_path;
 
-	const char *user_name = args.user_name;
+	const char *const user_name = args.user_name;
 
 	/* Daemonize before threads start (held mutexes would deadlock the child).
 	 * Drop privileges after server_start so root can bind privileged ports. */

@@ -1,23 +1,9 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/*
- * api_server_test.c - black-box tests for the REST API server via its public
- * API.  Dependencies: links the real util/conf/listener/server/tunnel/
- * api_server and the mux library.  Each test pairs a socketpair(), hands the
- * server fd to api_serve(), and drives the client fd via wait_until().
- *
- * Covered routes
- *   GET  /healthy              → 200, empty body
- *   GET  /stats                → 200, text/plain, sessions/streams lines
- *   POST /stats                → 200, text/plain, Server Load line
- *   GET  /metrics              → 200, text/plain Prometheus format, multiplexd_* lines
- *   GET  /nonexistent          → 404
- *   DELETE /stats              → 405
- *   oversized request          → 413
- *   keep-alive reuse           → two successive 200s on one connection
- *   Connection: close          → 200 then peer EOF
- */
+/* api_server_test.c - black-box tests for the REST API server (real stack
+ * linked); each test drives a socketpair via api_serve(); covers healthy,
+ * stats, metrics, 404/405/413, keep-alive, and Connection: close. */
 
 #include "api_server.h"
 #include "conf.h"
@@ -60,7 +46,7 @@
 enum {
 	/* Size of the buffer used to collect a single HTTP response. */
 	RESP_BUF_SIZE = 16384,
-	/* Timeout in seconds for a complete HTTP response to arrive. */
+	/* Timeout in milliseconds for a complete HTTP response. */
 	API_RESP_TIMEOUT_MS = 2000,
 	/* Re-poll cadence for the client fd while waiting (see wait_until). */
 	API_POLL_INTERVAL_MS = 5,
@@ -68,11 +54,8 @@ enum {
 
 /* Fixture */
 
-/*
- * Minimal test fixture: a struct server initialised without server_start().
- * api_server.c only reads srv.conf, srv.started, srv.stats, and srv.sessions,
- * so everything else can be zero-initialised.
- */
+/* Minimal fixture: struct server without server_start(); api_server only
+ * reads conf, started, stats, and sessions. */
 struct apifx {
 	struct ev_loop *loop;
 	struct config conf;
@@ -97,7 +80,7 @@ static struct tunnel *make_established_tunnel(
 	fx->conf.mux.max_halfopen = 16;
 	fx->conf.mux.nodelay = true;
 
-	struct mux_config mux_cfg = conf_get_mux(&fx->conf);
+	const struct mux_config mux_cfg = conf_get_mux(&fx->conf);
 	const struct tunnel_opts opts = {
 		.cb = &cb,
 		.data = NULL,
@@ -114,9 +97,12 @@ static struct tunnel *make_established_tunnel(
 		return NULL;
 	}
 	struct mux_session *const ss = tunnel_session(t);
-	ss->stream_window = 2;
-	ss->peer_stream_window = 4;
+	/* White-box setup: use the setters / mirror so the stats path (which reads
+	 * the relaxed-atomic mirrors) observes the fabricated state. */
+	session_set_stream_window(ss, 2);
+	session_set_peer_stream_window(ss, 4);
 	ss->state = SESSION_ESTABLISHED;
+	PUB_STORE(ss->_pub_state, SESSION_ESTABLISHED);
 	for (size_t i = 0; i < num_streams; i++) {
 		struct mux_stream *const s =
 			stream_new(ss, (uint_fast16_t)(i * 2u + 1u), true);
@@ -187,18 +173,18 @@ struct teardown_waiter {
 static void
 teardown_waiter_tick_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
-	UNUSED(loop);
-	UNUSED(revents);
-	struct teardown_waiter *restrict tw = w->data;
+	(void)loop;
+	(void)revents;
+	struct teardown_waiter *const restrict tw = w->data;
 	tw->ticked = true;
 }
 
 static void
 teardown_waiter_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
-	UNUSED(loop);
-	UNUSED(revents);
-	struct teardown_waiter *restrict tw = w->data;
+	(void)loop;
+	(void)revents;
+	struct teardown_waiter *const restrict tw = w->data;
 	tw->timed_out = true;
 }
 
@@ -211,7 +197,7 @@ static void apifx_teardown(struct apifx *restrict fx)
 		size_t cursor = 0;
 		void *elem;
 		while (table_next(fx->srv.identities, &cursor, NULL, &elem)) {
-			struct identity_listener *sl = elem;
+			struct identity_listener *const sl = elem;
 			for (size_t j = 0; j < sl->num_tunnels; j++) {
 				tunnel_close(sl->tunnels[j]);
 			}
@@ -261,35 +247,25 @@ struct condition_waiter {
 static void
 condition_waiter_timer_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
-	UNUSED(loop);
-	UNUSED(revents);
-	struct condition_waiter *restrict cw = w->data;
+	(void)loop;
+	(void)revents;
+	struct condition_waiter *const restrict cw = w->data;
 	cw->timed_out = true;
 }
 
 static void
 condition_waiter_poll_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
-	UNUSED(loop);
-	UNUSED(w);
-	UNUSED(revents);
+	(void)loop;
+	(void)w;
+	(void)revents;
 	/* No state to update: this watcher exists only to bound how long
 	 * ev_run() blocks so the loop re-polls the client fd (see wait_until). */
 }
 
-/*
- * Drives fx->loop until predicate(ctx) returns non-zero or timeout expires.
- * Returns 0 on success (predicate returned > 0), -1 on error or timeout.
- *
- * The predicate reads the client fd directly; that fd is not registered with
- * the loop (only the server side is, via api_serve).  On Linux an AF_UNIX
- * socketpair delivers written data to the peer synchronously, so the response
- * is visible on the next predicate call.  On Windows/msys2 the socketpair is
- * emulated over loopback and delivery is asynchronous: once the server has
- * written its response there are no server-side events left, so ev_run() would
- * block on the timeout while the response sits unread in the client buffer.
- * A short repeating timer bounds each ev_run() so the predicate re-polls.
- */
+/* Drives fx->loop until predicate returns nonzero or timeout expires.
+ * The poll timer re-enters the loop so the predicate re-checks the fd
+ * on platforms where AF_UNIX delivery is asynchronous. */
 static int wait_until(
 	struct apifx *restrict fx, const double timeout_sec,
 	apifx_predicate_fn predicate, void *ctx)
@@ -328,7 +304,7 @@ static int wait_until(
 
 static int do_send(const int fd, const void *restrict data, const size_t len)
 {
-	const char *restrict ptr = data;
+	const char *const restrict ptr = data;
 	size_t sent = 0;
 	while (sent < len) {
 		const ssize_t n = write(fd, ptr + sent, len - sent);
@@ -361,7 +337,7 @@ struct resp_wait_ctx {
  * (headers parsed, body received per Content-Length), 0 if pending, -1 on error. */
 static int resp_wait_predicate(void *ptr)
 {
-	struct resp_wait_ctx *restrict ctx = ptr;
+	struct resp_wait_ctx *const restrict ctx = ptr;
 
 	if (ctx->nread < sizeof(ctx->buf) - 1u) {
 		const ssize_t n =
@@ -385,13 +361,14 @@ static int resp_wait_predicate(void *ptr)
 	}
 
 	/* Check that the header section has arrived */
-	const char *restrict hend = strstr(ctx->buf, "\r\n\r\n");
+	const char *const restrict hend = strstr(ctx->buf, "\r\n\r\n");
 	if (hend == NULL) {
 		return 0;
 	}
 
 	/* Determine body length from Content-Length header */
-	const char *restrict cl = strstr(ctx->buf, "\r\nContent-Length: ");
+	const char *const restrict cl =
+		strstr(ctx->buf, "\r\nContent-Length: ");
 	size_t content_length = 0;
 	if (cl != NULL) {
 		content_length = (size_t)strtoul(cl + 18, NULL, 10);
@@ -412,7 +389,7 @@ struct eof_wait_ctx {
 
 static int eof_wait_predicate(void *ptr)
 {
-	const struct eof_wait_ctx *restrict ctx = ptr;
+	const struct eof_wait_ctx *const restrict ctx = ptr;
 	char buf[1];
 	const ssize_t n = read(ctx->fd, buf, sizeof(buf));
 	if (n < 0) {
@@ -426,11 +403,9 @@ static int eof_wait_predicate(void *ptr)
 	return n == 0 ? 1 : 0;
 }
 
-/* Predicate for the oversized-request path.  The server replies 413 and closes;
- * that close may reach the client as a connection reset that discards the queued
- * response (e.g. on Windows).  Both a complete response and a peer reset/EOF are
- * acceptable terminal outcomes, so collapse resp_wait_predicate's read-error
- * result (-1) into success (+1). */
+/* 413 path: server closes, which may surface as a reset discarding the
+ * queued response. Treat any non-pending result as success so both
+ * a 413 and a peer reset are acceptable. */
 static int oversized_wait_predicate(void *ptr)
 {
 	return resp_wait_predicate(ptr) != 0 ? 1 : 0;
@@ -526,10 +501,7 @@ static int do_exchange(
 		rctx);
 }
 
-/*
- * Performs a single HTTP exchange and aborts the test case immediately on
- * failure.  rctx->buf is valid for inspection when this subcase returns.
- */
+/* Single HTTP exchange; T_FAILNOW on error. rctx->buf valid on return. */
 T_DECLARE_SUBCASE(
 	assert_exchange, struct apifx *restrict fx,
 	struct resp_wait_ctx *restrict rctx, const char *restrict request)
@@ -664,10 +636,9 @@ T_DECLARE_CASE(test_method_not_allowed)
 	apifx_teardown(&fx);
 }
 
-/* Sends headers exceeding HTTP_MAX_ENTITY (8192 bytes) with no terminator, so
- * the buffer fills before any header terminator.  The server rejects the request
- * with 413 Entity Too Large, then closes; that close may surface to the client
- * as a connection reset (acceptable on this error path). */
+/* Headers exceed HTTP_MAX_ENTITY with no terminator; server rejects with
+ * 413 and closes. The close may surface as a reset (see
+ * oversized_wait_predicate). */
 T_DECLARE_CASE(test_request_too_large)
 {
 	struct apifx fx;
@@ -717,11 +688,8 @@ cleanup:
 	apifx_teardown(&fx);
 }
 
-/*
- * Sends two GET /healthy requests on the same HTTP/1.1 connection (default
- * keep-alive) and verifies that both receive a 200 response without
- * reconnecting.
- */
+/* Two GET /healthy on the same HTTP/1.1 connection (keep-alive reuse);
+ * both must return 200. */
 T_DECLARE_CASE(test_keepalive)
 {
 	struct apifx fx;
@@ -742,10 +710,7 @@ T_DECLARE_CASE(test_keepalive)
 	apifx_teardown(&fx);
 }
 
-/*
- * Sends "Connection: close" and verifies the server closes the connection
- * after sending the response.
- */
+/* "Connection: close": server must close after sending the response. */
 T_DECLARE_CASE(test_connection_close)
 {
 	struct apifx fx;
@@ -783,10 +748,11 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 		.flags = TABLE_FAST,
 	});
 	T_CHECK(fx.srv.identities != NULL);
-	struct identity_listener *sl0 = calloc(1, sizeof(*sl0));
+	struct identity_listener *const sl0 = calloc(1, sizeof(*sl0));
 	T_CHECK(sl0 != NULL);
 	sl0->peer_identity = "peer-offline";
-	struct tunnel *t0 = make_established_tunnel(&fx, "peer-offline", 0);
+	struct tunnel *const t0 =
+		make_established_tunnel(&fx, "peer-offline", 0);
 	T_CHECK(t0 != NULL);
 	/* Reset to non-established so tunnel_stats() reports !established. */
 	tunnel_session(t0)->state = SESSION_CONNECT;
@@ -800,10 +766,10 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 			table_set(fx.srv.identities, sl0->peer_identity, &slot);
 		T_CHECK(slot == NULL);
 	}
-	struct identity_listener *sl1 = calloc(1, sizeof(*sl1));
+	struct identity_listener *const sl1 = calloc(1, sizeof(*sl1));
 	T_CHECK(sl1 != NULL);
 	sl1->peer_identity = "peer-online";
-	struct tunnel *restrict t1 =
+	struct tunnel *const restrict t1 =
 		make_established_tunnel(&fx, "peer-online", 3);
 	T_CHECK(t1 != NULL);
 	sl1->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
@@ -842,15 +808,16 @@ T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 		.flags = TABLE_FAST,
 	});
 	T_CHECK(fx.srv.identities != NULL);
-	struct identity_listener *sl_rtt = calloc(1, sizeof(*sl_rtt));
+	struct identity_listener *const sl_rtt = calloc(1, sizeof(*sl_rtt));
 	T_CHECK(sl_rtt != NULL);
 	sl_rtt->peer_identity = "peer-rtt";
-	struct tunnel *restrict t1 =
+	struct tunnel *const restrict t1 =
 		make_established_tunnel(&fx, "peer-rtt", 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
 	/* 20 ms RTT */
 	ss->estimator.rtt = INT64_C(20000000);
+	session_publish_estimate(ss);
 	sl_rtt->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_rtt->tunnels != NULL);
 	sl_rtt->tunnels[0] = t1;
@@ -886,15 +853,15 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 		.flags = TABLE_FAST,
 	});
 	T_CHECK(fx.srv.identities != NULL);
-	struct identity_listener *sl_win = calloc(1, sizeof(*sl_win));
+	struct identity_listener *const sl_win = calloc(1, sizeof(*sl_win));
 	T_CHECK(sl_win != NULL);
 	sl_win->peer_identity = "peer-win";
-	struct tunnel *restrict t1 =
+	struct tunnel *const restrict t1 =
 		make_established_tunnel(&fx, "peer-win", 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
-	ss->stream_window = 2;
-	ss->peer_stream_window = 4;
+	session_set_stream_window(ss, 2);
+	session_set_peer_stream_window(ss, 4);
 	sl_win->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_win->tunnels != NULL);
 	sl_win->tunnels[0] = t1;
@@ -937,7 +904,7 @@ T_DECLARE_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity)
 		.flags = TABLE_FAST,
 	});
 	T_CHECK(fx.srv.identities != NULL);
-	struct identity_listener *sl = calloc(1, sizeof(*sl));
+	struct identity_listener *const sl = calloc(1, sizeof(*sl));
 	T_CHECK(sl != NULL);
 	sl->peer_identity = "peer-dup";
 	struct tunnel *const t1 = make_established_tunnel(&fx, "peer-dup", 0);
@@ -1083,31 +1050,32 @@ T_DECLARE_CASE(test_connection_close_on_non_keepalive_request)
 
 /* main */
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_healthy_get),
+	T_CASE(test_stats_get_text),
+	T_CASE(test_stats_get_nobanner),
+	T_CASE(test_stats_post_text),
+	T_CASE(test_metrics_get),
+	T_CASE(test_not_found),
+	T_CASE(test_method_not_allowed),
+	T_CASE(test_request_too_large),
+	T_CASE(test_keepalive),
+	T_CASE(test_connection_close),
+	T_CASE(test_stats_get_includes_identity_rows),
+	T_CASE(test_stats_identity_shows_window_when_rtt_known),
+	T_CASE(test_metrics_reports_identity_window_bytes),
+	T_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity),
+	T_CASE(test_stats_post_tracks_rate_deltas),
+	T_CASE(test_metrics_reports_non_zero_mux_counters),
+	T_CASE(test_not_found_keepalive_followed_by_success),
+	T_CASE(test_connection_close_on_non_keepalive_request),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
 	loadlibs();
-
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_healthy_get);
-	T_RUN_CASE(t, test_stats_get_text);
-	T_RUN_CASE(t, test_stats_get_nobanner);
-	T_RUN_CASE(t, test_stats_post_text);
-	T_RUN_CASE(t, test_metrics_get);
-	T_RUN_CASE(t, test_not_found);
-	T_RUN_CASE(t, test_method_not_allowed);
-	T_RUN_CASE(t, test_request_too_large);
-	T_RUN_CASE(t, test_keepalive);
-	T_RUN_CASE(t, test_connection_close);
-	T_RUN_CASE(t, test_stats_get_includes_identity_rows);
-	T_RUN_CASE(t, test_stats_identity_shows_window_when_rtt_known);
-	T_RUN_CASE(t, test_metrics_reports_identity_window_bytes);
-	T_RUN_CASE(
-		t, test_metrics_unique_tunnel_label_for_repeated_peer_identity);
-	T_RUN_CASE(t, test_stats_post_tracks_rate_deltas);
-	T_RUN_CASE(t, test_metrics_reports_non_zero_mux_counters);
-	T_RUN_CASE(t, test_not_found_keepalive_followed_by_success);
-	T_RUN_CASE(t, test_connection_close_on_non_keepalive_request);
-
+	const int ret = testing_main(argc, argv, suite);
 	unloadlibs();
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return ret;
 }

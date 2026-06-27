@@ -12,6 +12,7 @@
 #include "mux/mux.h"
 #include "mux/session.h"
 
+#include "math/serial.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
 
@@ -54,7 +55,8 @@ static bool unacked_ring_push(
 	ss->unacked.frames += count;
 	COUNTER_ADD(ss->cnt.unacked_frames, count);
 	ss->unacked.bytes += frame->len - count * MUX_FRAME_HEADER_SIZE;
-	ss->unacked.send_seq += count;
+	ss->unacked.send_seq = (uint_least32_t)serial_add32(
+		ss->unacked.send_seq, (uint_fast32_t)count);
 	return true;
 }
 
@@ -85,10 +87,9 @@ static bool unacked_push(
 	return true;
 }
 
-/* Keep flushed frames only when resume replay may need them: hello and
- * stream-0 controls are one-shot, retransmit copies only advance the cursor.
- * Walks the full header list so mixed PUSH/non-PUSH staging frames (from
- * wire_sendbuf_push) are counted and compacted correctly. */
+/* Keep flushed frames only when resume replay may need them; hello and
+ * stream-0 controls are one-shot; retransmit copies only advance the cursor;
+ * walks all header entries to handle mixed PUSH/non-PUSH staging frames. */
 void unacked_track_sent(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
@@ -174,21 +175,21 @@ unacked_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
 	const uint_fast32_t trim = count;
 	ss->unacked.frames -= trim;
 	COUNTER_SUB(ss->cnt.unacked_frames, trim);
-	ss->unacked.last_ack_recv += trim;
+	ss->unacked.last_ack_recv =
+		(uint_least32_t)serial_add32(ss->unacked.last_ack_recv, trim);
 	/* Walk physical frames from head; advance for fully-consumed entries,
 	 * partial-consume the last frame in-place. */
 	size_t remaining = trim;
 	size_t popped = 0;
 	size_t trimmed_bytes = 0;
 	while (remaining > 0) {
-		struct mux_frame *f = mux_frame_ring_peek(ss->unacked.ring, 0);
+		struct mux_frame *const f =
+			mux_frame_ring_peek(ss->unacked.ring, 0);
 		if (f == NULL) {
 			/* Ring empty but logical counter says otherwise;
 			 * clamp to prevent out-of-bounds access. */
-			ss->unacked.frames += (uint_fast32_t)remaining;
-			COUNTER_ADD(
-				ss->cnt.unacked_frames,
-				(uint_fast32_t)remaining);
+			ss->unacked.frames += remaining;
+			COUNTER_ADD(ss->cnt.unacked_frames, remaining);
 			ss->unacked.bytes = 0;
 			ss->unacked.partial_offset = 0;
 			break;
@@ -254,7 +255,7 @@ unacked_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
 bool unacked_resume_ack_recv(
 	struct mux_session *restrict ss, const uint_least32_t peer_ack)
 {
-	if (peer_ack < ss->unacked.last_ack_recv) {
+	if (serial_lt32(peer_ack, ss->unacked.last_ack_recv)) {
 		MUX_LOG_F(
 			ERROR, ss,
 			"session resume: peer_ack %" PRIuLEAST32
@@ -286,7 +287,8 @@ uint_fast32_t unacked_ack_delta(const struct mux_session *restrict ss)
 void unacked_ack_emitted(
 	struct mux_session *restrict ss, const uint_fast32_t emit)
 {
-	ss->unacked.ack_seq += emit;
+	ss->unacked.ack_seq =
+		(uint_least32_t)serial_add32(ss->unacked.ack_seq, emit);
 	ss->unacked.ack_ticks = 0;
 	ss->unacked.ack_pending = false;
 }

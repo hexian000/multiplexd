@@ -96,10 +96,16 @@ static void tls_fire_send(struct tls_conn_impl *restrict c)
 	}
 }
 
-/* Fire the on_recv notifier when buffered plaintext can be read without I/O. */
+/* Fire on_recv when more plaintext is available without another socket read:
+ * mbedtls_ssl_check_pending misses ciphertext staged in conn->in (buffered
+ * mode pulls one record at a time), so test in_len too. */
 static void tls_fire_recv(struct tls_conn_impl *restrict c)
 {
-	if (c->cb.on_recv != NULL && mbedtls_ssl_check_pending(&c->ssl) != 0) {
+	if (c->cb.on_recv == NULL) {
+		return;
+	}
+	if (mbedtls_ssl_check_pending(&c->ssl) != 0 ||
+	    (c->fd < 0 && c->in_len > 0)) {
 		c->cb.on_recv(c->cb.ctx);
 	}
 }
@@ -107,10 +113,10 @@ static void tls_fire_recv(struct tls_conn_impl *restrict c)
 #define LOG_MBEDERROR(level, s, err)                                           \
 	do {                                                                   \
 		if (LOGLEVEL(level)) {                                         \
-			char _buf[160];                                        \
-			mbedtls_strerror((err), _buf, sizeof(_buf));           \
+			char errbuf[160];                                      \
+			mbedtls_strerror((err), errbuf, sizeof(errbuf));       \
 			LOG_F(level, "%s: -0x%04x %s", (s),                    \
-			      (unsigned int)-(err), _buf);                     \
+			      (unsigned int)-(err), errbuf);                   \
 		}                                                              \
 	} while (0)
 
@@ -287,10 +293,9 @@ static int *parse_ciphersuites(const char *restrict list)
 	return ids;
 }
 
-/* Parse a comma-separated ALPN list into the NULL-terminated heap-string array
- * mbedtls_ssl_conf_alpn_protocols expects (empty entries skipped).  The RFC 4180
- * CSV reader is used so a protocol name may itself contain a comma when quoted.
- * Returns NULL on failure or when empty; the caller treats NULL as "no ALPN". */
+/* Parse a comma-separated ALPN list into the NULL-terminated heap array
+ * mbedtls_ssl_conf_alpn_protocols expects; uses RFC 4180 CSV so a name
+ * may contain a comma when quoted.  Returns NULL on failure or empty list. */
 static char **parse_alpn(const char *restrict list)
 {
 	if (list == NULL || list[0] == '\0') {
@@ -406,7 +411,7 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 {
 	struct tls_ctx_impl *const c = malloc(sizeof(*c));
 	if (c == NULL) {
-		LOGE("tls_ctx_init: allocation failed");
+		LOGOOM();
 		return NULL;
 	}
 	tls_ctx_impl_init(c);
@@ -446,6 +451,10 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 	}
 	mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
 	mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+	if (conf->kernel_offload) {
+		LOGW("tls.kernel_offload: not supported by the mbedTLS backend; "
+		     "ignored");
+	}
 #ifdef MBEDTLS_LEGACY_RNG
 	mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
 #endif
@@ -637,7 +646,7 @@ static struct tls_conn_impl *tls_conn_alloc(struct tls_ctx_impl *restrict c)
 {
 	struct tls_conn_impl *const conn = calloc(1, sizeof(*conn));
 	if (conn == NULL) {
-		LOGE("tls_conn_alloc: allocation failed");
+		LOGOOM();
 		return NULL;
 	}
 	mbedtls_ssl_init(&conn->ssl);
@@ -652,10 +661,9 @@ static struct tls_conn_impl *tls_conn_alloc(struct tls_ctx_impl *restrict c)
 	return conn;
 }
 
-/* Create a connection: with @p fd >= 0 the library drives the socket directly;
- * otherwise the buffered (in/out) BIO is installed for the tls_input/tls_output
- * shuttle.  The connection starts with no notifier; install one with
- * tls_set_callback.  The client variant applies the SNI. */
+/* Create a connection; fd >= 0: library drives socket directly; fd < 0:
+ * buffered in/out arrays for tls_input/tls_output shuttle.  No notifier
+ * until tls_set_callback.  Client variant applies SNI. */
 static struct tls_connection *tls_conn_new(
 	struct tls_ctx_impl *restrict c, const bool is_server, const int fd)
 {

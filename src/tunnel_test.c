@@ -1,16 +1,20 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* tunnel_test.c - black-box tests for tunnel lifecycle/accessors in tunnel.c,
- * exercised against the assembled server stack via the public API.
- * Dependencies: links the real util/conf/listener/server/tunnel/api_server and
- * the mux library. */
+/* tunnel_test.c - black-box tests for tunnel lifecycle/accessors;
+ * real util/conf/listener/server/tunnel/api_server + mux library linked;
+ * exercised via the public API. */
 
 #include "conf.h"
 #include "mux/mux.h"
 #include "server.h"
 #include "tunnel.h"
 
+#if WITH_THREADS
+#include "sync/dispatcher.h"
+#include "sync/shared_mutex.h"
+#include "sync/task.h"
+#endif
 #include "utils/testing.h"
 
 #include <ev.h>
@@ -19,6 +23,11 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
+#if WITH_THREADS
+#include <stdatomic.h>
+#include <threads.h>
+#include <time.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -55,32 +64,51 @@ static uint_least64_t test_num_reconnects(const struct server *srv)
 #endif
 }
 
+#if !WITH_THREADS
+static void reconnect_timeout_cb(struct ev_loop *loop, ev_timer *w, int revents)
+{
+	(void)loop;
+	(void)revents;
+	*(bool *)w->data = true;
+}
+#endif /* !WITH_THREADS */
+
 static bool wait_for_reconnects(
 	struct ev_loop *loop, const struct server *srv, uint_least64_t minimum)
 {
-	for (int i = 0; i < 100; i++) {
-		if (loop != NULL) {
-			ev_run(loop, EVRUN_NOWAIT);
-		}
+#if WITH_THREADS
+	(void)loop;
+	/* Tunnel runs in its own thread; poll with bounded sleep — unavoidable
+	 * without timer mocking or production-code synchronization hooks. */
+	for (int i = 0; i < 1000; i++) {
 		if (test_num_reconnects(srv) >= minimum) {
 			return true;
 		}
-		(void)poll(NULL, 0, 10);
-	}
-	if (loop != NULL) {
-		ev_run(loop, EVRUN_NOWAIT);
+		(void)thrd_sleep(
+			&(struct timespec){ .tv_nsec = 10000000L }, NULL);
 	}
 	return test_num_reconnects(srv) >= minimum;
+#else
+	/* Drive the shared event loop with EVRUN_ONCE so no sleep is needed;
+	 * a 10-second guard prevents an infinite hang if no reconnect fires. */
+	bool timed_out = false;
+	ev_timer tw;
+	tw.data = &timed_out;
+	ev_timer_init(&tw, reconnect_timeout_cb, 10.0, 0.0);
+	ev_timer_start(loop, &tw);
+	while (!timed_out && test_num_reconnects(srv) < minimum) {
+		ev_run(loop, EVRUN_ONCE);
+	}
+	ev_timer_stop(loop, &tw);
+	return !timed_out && test_num_reconnects(srv) >= minimum;
+#endif /* WITH_THREADS */
 }
 
 T_DECLARE_CASE(test_tunnel_new_close_no_start)
 {
 	(void)_t_;
-	/*
-	 * Verify that a tunnel created from a socketpair can be destroyed
-	 * before the tunnel thread is ever started, without crashing or
-	 * leaking resources.
-	 */
+	/* Verify that a tunnel can be destroyed before tunnel_start() without
+	 * crashing or leaking resources. */
 	int fds[2];
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 
@@ -91,12 +119,9 @@ T_DECLARE_CASE(test_tunnel_new_close_no_start)
 	memset(&srv, 0, sizeof(srv));
 
 #if !WITH_THREADS
-	/*
-	 * Without threads the tunnel borrows srv->loop; give it a real one
-	 * so that session_stop's ev_*_stop calls are safe even for inactive
-	 * watchers.
-	 */
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	/* Without threads the tunnel borrows srv->loop; give it a real one
+	 * so that ev_*_stop calls in session_stop are safe. */
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	srv.loop = loop;
 #endif /* !WITH_THREADS */
@@ -111,7 +136,7 @@ T_DECLARE_CASE(test_tunnel_new_close_no_start)
 		.id = g_zero_id,
 	};
 
-	struct tunnel *t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&srv, &opts);
 	T_CHECK(t != NULL);
 
 	/* fds[0] is owned by the tunnel; close only the other end. */
@@ -126,10 +151,8 @@ T_DECLARE_CASE(test_tunnel_new_close_no_start)
 
 T_DECLARE_CASE(test_tunnel_accessors_after_new)
 {
-	/*
-	 * Verify that accessor functions return correct values immediately
-	 * after tunnel_new() and before tunnel_start().
-	 */
+	/* Verify that accessors return correct values after tunnel_new()
+	 * and before tunnel_start(). */
 	int fds[2];
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 
@@ -137,7 +160,7 @@ T_DECLARE_CASE(test_tunnel_accessors_after_new)
 	memset(&srv, 0, sizeof(srv));
 
 #if !WITH_THREADS
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	srv.loop = loop;
 #endif
@@ -152,7 +175,7 @@ T_DECLARE_CASE(test_tunnel_accessors_after_new)
 		.id = g_zero_id,
 	};
 
-	struct tunnel *t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&srv, &opts);
 	T_CHECK(t != NULL);
 	(void)close(fds[1]);
 
@@ -179,7 +202,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 	srv.disp = dispatcher_create(4);
 	T_CHECK(srv.disp != NULL);
 #else
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	srv.loop = loop;
 #endif
@@ -195,7 +218,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 		.connect_addr = "invalid",
 	};
 
-	struct tunnel *t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&srv, &opts);
 	T_CHECK(t != NULL);
 	tunnel_start(t);
 
@@ -220,7 +243,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 	laddr.sin_family = AF_INET;
 	laddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	laddr.sin_port = 0;
-	int lfd = socket(AF_INET, SOCK_STREAM, 0);
+	const int lfd = socket(AF_INET, SOCK_STREAM, 0);
 	T_CHECK(lfd >= 0);
 	T_CHECK(bind(lfd, (struct sockaddr *)&laddr, sizeof(laddr)) == 0);
 	T_CHECK(listen(lfd, 1) == 0);
@@ -238,7 +261,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 	srv.disp = dispatcher_create(4);
 	T_CHECK(srv.disp != NULL);
 #else
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	srv.loop = loop;
 #endif
@@ -254,18 +277,27 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 		.connect_addr = connect_addr,
 	};
 
-	struct tunnel *t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&srv, &opts);
 	T_CHECK(t != NULL);
 	tunnel_start(t);
 
 	/* Accept the connection and immediately close it. */
 	{
-		struct pollfd pfd = { .fd = lfd, .events = POLLIN };
-		(void)poll(&pfd, 1, 1000);
-		int cfd = accept(lfd, NULL, NULL);
+#if !WITH_THREADS
+		/* tunnel_do_connect ran inline in tunnel_start; the TCP connection
+		 * is already in the accept queue before we reach this point. */
+		const int cfd = accept(lfd, NULL, NULL);
 		if (cfd >= 0) {
 			(void)close(cfd);
 		}
+#else /* WITH_THREADS */
+		struct pollfd pfd = { .fd = lfd, .events = POLLIN };
+		T_EXPECT(poll(&pfd, 1, 1000) > 0);
+		const int cfd = accept(lfd, NULL, NULL);
+		if (cfd >= 0) {
+			(void)close(cfd);
+		}
+#endif /* WITH_THREADS */
 	}
 	(void)close(lfd);
 
@@ -291,7 +323,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 	laddr.sin_family = AF_INET;
 	laddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	laddr.sin_port = 0;
-	int lfd = socket(AF_INET, SOCK_STREAM, 0);
+	const int lfd = socket(AF_INET, SOCK_STREAM, 0);
 	T_CHECK(lfd >= 0);
 	T_CHECK(bind(lfd, (struct sockaddr *)&laddr, sizeof(laddr)) == 0);
 	T_CHECK(listen(lfd, 4) == 0);
@@ -302,7 +334,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 		connect_addr, sizeof(connect_addr), "127.0.0.1:%" PRIu16,
 		ntohs(laddr.sin_port));
 	{
-		int flags = fcntl(lfd, F_GETFL, 0);
+		const int flags = fcntl(lfd, F_GETFL, 0);
 		T_CHECK(flags >= 0);
 		T_CHECK(fcntl(lfd, F_SETFL, flags | O_NONBLOCK) == 0);
 	}
@@ -314,7 +346,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 	srv.disp = dispatcher_create(4);
 	T_CHECK(srv.disp != NULL);
 #else
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	srv.loop = loop;
 #endif
@@ -330,23 +362,18 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 		.connect_addr = connect_addr,
 	};
 
-	struct tunnel *t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&srv, &opts);
 	T_CHECK(t != NULL);
 	tunnel_start(t);
 
-	/*
-	 * Accept each incoming TCP connection and hold it without replying.
-	 * connect_timeout (1 s) will fire, triggering MUX_EVENT_CLOSED and
-	 * the next reconnect backoff.
-	 */
+	/* Accept and hold incoming connections without replying; connect_timeout
+	 * (1 s) fires, triggering MUX_EVENT_CLOSED and reconnect backoff. */
 	int held_fds[8];
 	int num_held = 0;
 	bool ok = false;
-	for (int i = 0; i < 300; i++) {
-#if !WITH_THREADS
-		ev_run(srv.loop, EVRUN_NOWAIT);
-#endif
-		int cfd = accept(lfd, NULL, NULL);
+#if WITH_THREADS
+	for (int i = 0; i < 1000; i++) {
+		const int cfd = accept(lfd, NULL, NULL);
 		if (cfd >= 0) {
 			if (num_held <
 			    (int)(sizeof(held_fds) / sizeof(held_fds[0]))) {
@@ -359,8 +386,36 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 			ok = true;
 			break;
 		}
-		(void)poll(NULL, 0, 10);
+		(void)thrd_sleep(
+			&(struct timespec){ .tv_nsec = 10000000L }, NULL);
 	}
+#else /* !WITH_THREADS */
+	{
+		/* Drive the event loop one event at a time; accept between steps so
+		 * each TCP connect is captured before the next timer fires.  The
+		 * 10-second guard prevents an infinite hang if connect_timeout or
+		 * the reconnect timer never fires. */
+		bool timed_out = false;
+		ev_timer tw;
+		tw.data = &timed_out;
+		ev_timer_init(&tw, reconnect_timeout_cb, 10.0, 0.0);
+		ev_timer_start(srv.loop, &tw);
+		while (!timed_out && test_num_reconnects(&srv) < 2) {
+			const int cfd = accept(lfd, NULL, NULL);
+			if (cfd >= 0) {
+				if (num_held < (int)(sizeof(held_fds) /
+						     sizeof(held_fds[0]))) {
+					held_fds[num_held++] = cfd;
+				} else {
+					(void)close(cfd);
+				}
+			}
+			ev_run(srv.loop, EVRUN_ONCE);
+		}
+		ev_timer_stop(srv.loop, &tw);
+		ok = !timed_out && test_num_reconnects(&srv) >= 2;
+	}
+#endif /* WITH_THREADS */
 	T_EXPECT(ok);
 
 	tunnel_close(t);
@@ -379,16 +434,13 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 
 T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
 {
-	/*
-	 * Verify that a freshly created outbound tunnel (fd = -1, not yet
-	 * started) reports MUX_STATE_CONNECT, confirming that the session is
-	 * in its initial state rather than already established or closed.
-	 */
+	/* Freshly created outbound tunnel (fd=-1, not started) must report
+	 * MUX_STATE_CONNECT. */
 	struct server srv;
 	memset(&srv, 0, sizeof(srv));
 
 #if !WITH_THREADS
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	srv.loop = loop;
 #endif
@@ -403,7 +455,7 @@ T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
 		.id = g_zero_id,
 	};
 
-	struct tunnel *t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&srv, &opts);
 	T_CHECK(t != NULL);
 
 	T_EXPECT_EQ(tunnel_state(t), (enum mux_state)MUX_STATE_CONNECT);
@@ -417,15 +469,13 @@ T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
 
 T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 {
-	/*
-	 * Verify that all stream and traffic counters are zero immediately
-	 * after tunnel_new() and before tunnel_start().
-	 */
+	/* All stream/traffic counters must be zero after tunnel_new()
+	 * and before tunnel_start(). */
 	struct server srv;
 	memset(&srv, 0, sizeof(srv));
 
 #if !WITH_THREADS
-	struct ev_loop *loop = ev_loop_new(EVFLAG_AUTO);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	srv.loop = loop;
 #endif
@@ -440,7 +490,7 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 		.id = g_zero_id,
 	};
 
-	struct tunnel *t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&srv, &opts);
 	T_CHECK(t != NULL);
 
 	struct tunnel_stats stats;
@@ -460,13 +510,6 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 /* Multi-threaded concurrency tests (WITH_THREADS only) */
 
 #if WITH_THREADS
-
-#include <stdatomic.h>
-#include <threads.h>
-
-#include "sync/dispatcher.h"
-#include "sync/shared_mutex.h"
-#include "sync/task.h"
 
 /* Inline concurrency helpers */
 
@@ -538,7 +581,8 @@ static int dispatcher_worker(void *arg)
 {
 	struct dispatcher_ctx *const ctx = arg;
 	test_barrier_wait(ctx->barrier);
-	struct task t = { .func = dispatcher_task_cb, .data = ctx->result };
+	const struct task t = { .func = dispatcher_task_cb,
+				.data = ctx->result };
 	if (!dispatcher_invoke(ctx->disp, t)) {
 		return 1;
 	}
@@ -549,7 +593,7 @@ T_DECLARE_CASE(test_dispatcher_roundtrip)
 {
 	struct test_barrier barrier;
 	test_barrier_init(&barrier, 2);
-	struct dispatcher *disp = dispatcher_create(4);
+	struct dispatcher *const disp = dispatcher_create(4);
 	T_CHECK(disp != NULL);
 	int result = 0;
 	struct dispatcher_ctx ctx = { .barrier = &barrier,
@@ -559,10 +603,8 @@ T_DECLARE_CASE(test_dispatcher_roundtrip)
 	T_EXPECT_EQ(
 		test_spawn_thread(&thr, dispatcher_worker, &ctx), thrd_success);
 	test_barrier_wait(&barrier);
-	/* Join the worker before ticking: dispatcher_invoke only enqueues, so the
-	 * join establishes that the task is queued (happens-before) before the
-	 * dispatcher drains it.  Ticking concurrently with the worker would race —
-	 * an empty tick could run before the enqueue and leave result unset. */
+	/* Join before ticking: establish happens-before (task enqueued) so
+	 * the drain doesn't race with the worker's dispatcher_invoke call. */
 	T_EXPECT_EQ(test_thread_join(thr), 0);
 	dispatcher_tick(disp);
 	T_EXPECT_EQ(result, 42);
@@ -660,21 +702,24 @@ T_DECLARE_CASE(test_atomic_counters_cross_thread)
 
 #endif /* WITH_THREADS */
 
-int main(void)
-{
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_tunnel_new_close_no_start);
-	T_RUN_CASE(t, test_tunnel_accessors_after_new);
-	T_RUN_CASE(t, test_tunnel_reconnect_rearms_after_failed_retry);
-	T_RUN_CASE(t, test_tunnel_reconnect_on_transport_lost);
-	T_RUN_CASE(t, test_tunnel_reconnect_after_connect_timeout);
-	T_RUN_CASE(t, test_tunnel_state_returns_connecting_after_new);
-	T_RUN_CASE(t, test_tunnel_stats_initial_zero);
+static const struct testing_suite suite[] = {
+	T_CASE(test_tunnel_new_close_no_start),
+	T_CASE(test_tunnel_accessors_after_new),
+	T_CASE(test_tunnel_reconnect_rearms_after_failed_retry),
+	T_CASE(test_tunnel_reconnect_on_transport_lost),
+	T_CASE(test_tunnel_reconnect_after_connect_timeout),
+	T_CASE(test_tunnel_state_returns_connecting_after_new),
+	T_CASE(test_tunnel_stats_initial_zero),
 #if WITH_THREADS
-	T_RUN_CASE(t, test_dispatcher_roundtrip);
-	T_RUN_CASE(t, test_shared_mutex_multiple_readers);
-	T_RUN_CASE(t, test_shared_mutex_exclusive_blocks_readers);
-	T_RUN_CASE(t, test_atomic_counters_cross_thread);
+	T_CASE(test_dispatcher_roundtrip),
+	T_CASE(test_shared_mutex_multiple_readers),
+	T_CASE(test_shared_mutex_exclusive_blocks_readers),
+	T_CASE(test_atomic_counters_cross_thread),
 #endif
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
+{
+	return testing_main(argc, argv, suite);
 }

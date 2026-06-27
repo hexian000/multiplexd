@@ -112,9 +112,8 @@ struct mux_traffic_counters {
 	mux_counter *byt_push_sent;
 };
 
-/* Pointer-block into server_stats for direct session-thread updates
- * (counters route; see src/server.h).  Pointer fields point to
- * server_counters atomic or plain counters depending on the build mode.
+/* Pointer-block into server_stats for direct session-thread updates.
+ * Pointer fields point to atomic or plain counters by build mode.
  * NULL pointers are silently skipped by COUNTER_*. */
 struct mux_session_counters {
 	mux_counter *num_session_created;
@@ -221,7 +220,7 @@ struct mux_session_opts {
 	 * session's frozen max outbound payload. */
 	struct mux_frame_allocator pool;
 	/* Non-owning pointer to the session log tag buffer; must outlive the session. */
-	char *tag;
+	const char *tag;
 #if WITH_TLS
 	struct tls_context *tlsctx;
 	struct tls_connection *conn;

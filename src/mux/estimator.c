@@ -23,12 +23,9 @@
 #define WNDSIZE_MAX ((size_t)UINT16_MAX * MUX_WINDOW_UNIT)
 #define WNDSIZE_MIN ((size_t)4 * MUX_WINDOW_UNIT)
 
-/* Minimum feedback latency: the inherent per-window round-trip the link cannot
- * beat (peer decrypt + window-update emit + our re-fill).  On low-latency paths
- * min-RTT is dominated by this floor, so the window floor is raised to
- * bandwidth*WND_FEEDBACK_FLOOR_NS to keep a high-bandwidth pipe saturated
- * between window updates.  Bandwidth-scaled, so low-bandwidth links are
- * unaffected. */
+/* Minimum per-window feedback latency floor.  On low-latency paths min-RTT
+ * is dominated by this floor, so the window is raised to bw×floor to keep
+ * a high-bandwidth pipe saturated between window updates. */
 #define WND_FEEDBACK_FLOOR_NS (INT64_C(600000))
 
 #define WND_RTT_MIN_NS (INT64_C(600) * INT64_C(1000000000))
@@ -45,6 +42,7 @@ void estimator_init(struct mux_session *restrict ss, const size_t bdp)
 	ss->estimator = (struct estimator_ctx){ 0 };
 	ss->estimator.rx.effective_bdp = bdp;
 	ss->estimator.tx.effective_bdp = bdp;
+	session_publish_estimate(ss);
 }
 
 static void reset_samples(struct estimator_ctx *restrict est)
@@ -61,7 +59,7 @@ send_ping(struct mux_session *restrict ss, const int_fast64_t now_ns)
 	if (!session_send_oob(ss, MUX_CTRL_PING, payload, sizeof(payload))) {
 		return false;
 	}
-	struct estimator_ctx *restrict est = &ss->estimator;
+	struct estimator_ctx *const restrict est = &ss->estimator;
 	est->last_probe_ns = now_ns;
 	est->ping_in_flight = true;
 	return true;
@@ -73,7 +71,7 @@ static void estimator_probe(
 	struct mux_session *restrict ss, struct estimator_dir_ctx *restrict d,
 	const char *restrict label, const uint_least64_t bytes)
 {
-	struct estimator_ctx *restrict est = &ss->estimator;
+	struct estimator_ctx *const restrict est = &ss->estimator;
 	if (est->ping_in_flight) {
 		/* No probe timeout: the ordered transport delivers the PONG
 		 * eventually, and abandoning early can't speed it up (a new PING only
@@ -199,10 +197,9 @@ static void calc_dir(
 	const double bdp_sample = (double)bw_max * (double)c->rtt_min_ns / 1e9;
 	d->bdp = (size_t)bdp_sample;
 
-	/* Demand is normalized to one min-RTT, not the raw byte count:
-	 * with no probe timeout a transient RTT spike stretches the cycle
-	 * and inflates d->sample, which would otherwise trip spurious
-	 * STARTUP growth. */
+	/* Demand normalized to one min-RTT: a transient RTT spike stretches
+	 * the cycle and inflates d->sample, which would otherwise trip
+	 * spurious STARTUP growth. */
 	const double demand_bdp =
 		(double)bw_sample * (double)c->rtt_min_ns / 1e9;
 	const size_t demand = (size_t)demand_bdp;
@@ -220,7 +217,7 @@ static void calc_dir(
 void estimator_calculate(
 	struct mux_session *restrict ss, const int_fast64_t sent_ns)
 {
-	struct estimator_ctx *restrict est = &ss->estimator;
+	struct estimator_ctx *const restrict est = &ss->estimator;
 	if (!est->ping_in_flight || sent_ns != est->last_probe_ns) {
 		LOGD_F("discarding PONG: sent_ns=%" PRIdFAST64
 		       " last_probe_ns=%" PRIdLEAST64,
@@ -253,9 +250,10 @@ void estimator_calculate(
 	};
 	calc_dir(ss, &est->rx, "rx", &cycle);
 	calc_dir(ss, &est->tx, "tx", &cycle);
+	session_publish_estimate(ss);
 
-	const struct estimator_dir_ctx *restrict rx = &est->rx;
-	const struct estimator_dir_ctx *restrict tx = &est->tx;
+	const struct estimator_dir_ctx *const restrict rx = &est->rx;
+	const struct estimator_dir_ctx *const restrict tx = &est->tx;
 	MUX_LOG_F(
 		INFO, ss,
 		"PONG: rtt=%.1f ms (min=%.1f ms) rx{bw=%" PRIdFAST64
@@ -276,10 +274,9 @@ void estimator_calculate(
 
 static size_t window_size(const struct estimator_dir_ctx *restrict d)
 {
-	/* Raise the floor to cover the inherent feedback latency on low-latency,
-	 * high-bandwidth paths (see WND_FEEDBACK_FLOOR_NS).  bw_max is the windowed
-	 * peak-bandwidth estimate; the product cannot overflow because bw_max is
-	 * bounded by a real measurement and the floor is capped at WNDSIZE_MAX. */
+	/* Raise the floor to cover inherent feedback latency (WND_FEEDBACK_FLOOR_NS).
+	 * The bw_max product cannot overflow: it is bounded by a real measurement
+	 * and capped at WNDSIZE_MAX. */
 	size_t floor = WNDSIZE_MIN;
 	const int_fast64_t bw_max = wndfilter_get(&d->bw_wnd);
 	if (bw_max > 0) {

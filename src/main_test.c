@@ -1,19 +1,15 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* main_test.c - white-box tests for the daemon entry point in main.c (the
- * static CLI parser parse_args and print_usage).
- * Dependencies: main.c #included with its main() renamed away (the daemon
- * body is linked but never run); the real project modules it references are
- * linked per CMakeLists so that body resolves -- the tests invoke only the
- * static parse_args/print_usage and inspect the static args state. */
+/* main_test.c - white-box tests for parse_args/print_usage in main.c;
+ * main() renamed to avoid conflict; the daemon body is compiled but never
+ * run; tests inspect only the static args state. */
 
 #include "utils/slog.h"
 #include "utils/testing.h"
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdlib.h>
 #include <string.h>
 
 /* Rename the daemon entry point so the test owns main().  main.c's body is
@@ -101,16 +97,19 @@ T_DECLARE_CASE(test_parse_args_gencerts_options)
 }
 #endif /* WITH_OPENSSL */
 
-int main(void)
-{
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_parse_args_config_short_and_long);
-	T_RUN_CASE(t, test_parse_args_loglevel_parses_number);
-	T_RUN_CASE(t, test_parse_args_daemonize_and_dump_config_flags);
-	T_RUN_CASE(t, test_parse_args_user_identity);
-	T_RUN_CASE(t, test_parse_args_double_dash_stops_parsing);
+static const struct testing_suite suite[] = {
+	T_CASE(test_parse_args_config_short_and_long),
+	T_CASE(test_parse_args_loglevel_parses_number),
+	T_CASE(test_parse_args_daemonize_and_dump_config_flags),
+	T_CASE(test_parse_args_user_identity),
+	T_CASE(test_parse_args_double_dash_stops_parsing),
 #if WITH_OPENSSL
-	T_RUN_CASE(t, test_parse_args_gencerts_options);
+	T_CASE(test_parse_args_gencerts_options),
 #endif
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
+{
+	return testing_main(argc, argv, suite);
 }

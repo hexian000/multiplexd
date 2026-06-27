@@ -777,6 +777,11 @@ observable behavior is identical.  Only the *frame process count* is conveyed on
 the wire — as `resume_seq` (Section 5.2.2) and as session-ACK increments; the
 other three are local.
 
+All four counters form a 32-bit serial number space (RFC 1982).  Ordering
+comparisons (e.g., "strictly before N" in Section 5.8.3) MUST use RFC 1982
+serial-number arithmetic rather than plain unsigned comparison, so that
+implementations remain correct across the 2^32 boundary.
+
 -  The *frame transmit count*: the number of non-stream-0 frames transmitted
    on this session, including retransmissions upon resume.  Incremented by one
    after each such frame is sent.

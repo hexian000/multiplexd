@@ -2,11 +2,8 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* session_test.c - white-box tests for session.c (lifecycle: handshake-done
- * re-arming, graceful/forced shutdown, drain) plus the socket-option helper.
- * Dependencies: session.c #included; real leaf frame.c linked; every sibling
- * module session.c orchestrates (estimator/handshake/sched/send/recv/stream/
- * unacked/wire) is mocked below.  Cross-module behavior that needs the real
- * assembled stack lives in send_test/recv_test/unacked_test or mux_test. */
+ * re-arming, graceful/forced shutdown, drain, socket-option helper);
+ * session.c #included; all sibling-module collaborators mocked below. */
 
 #include "mux/estimator.h"
 #include "mux/frame.h"
@@ -48,12 +45,9 @@ static uint_least16_t g_alloc_stream_id_result = STREAMID_CTRL;
 static struct mux_stream *g_stream_new_result = NULL;
 static bool g_sched_add_stream_result = true;
 
-/* mock - collaborator mocks, frame pool, session fixtures
- *
- * session.c is the orchestrator; every sibling-module entry point it calls is
- * stubbed.  Most are inert; a few reproduce just enough behavior for the
- * lifecycle decisions under test (sched_coalesce_arm actually arms the timer;
- * the cleanup helpers reclaim the fixture's buffers). */
+/* mock - collaborator stubs for session.c's sibling-module calls; most are
+ * inert, a few reproduce minimal behavior for lifecycle decisions under test
+ * (e.g. sched_coalesce_arm actually arms the timer). */
 
 static void st_coalesce_cb(struct ev_loop *loop, ev_timer *w, int revents)
 {
@@ -497,11 +491,9 @@ T_DECLARE_CASE(test_session_initiate_shutdown_transitions_to_closed)
 		return;
 	}
 
-	/* Using SESSION_INIT takes the force-close path in
-	 * session_initiate_shutdown, which requires no timer initialisation
-	 * and leaves the session in SESSION_CLOSED.  session_cleanup closes
-	 * and clears w_socket.fd (== fds[0]); update the fixture to prevent
-	 * double-close in teardown_fixture. */
+	/* SESSION_INIT takes the force-close path: no timer init required;
+	 * session_cleanup closes w_socket.fd (== fds[0]), so clear it in
+	 * the fixture to prevent double-close in teardown_fixture. */
 	fx.ss.state = SESSION_INIT;
 	session_initiate_shutdown(&fx.ss);
 	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
@@ -928,30 +920,32 @@ T_DECLARE_CASE(test_handshake_done_sched_head_and_drain)
 	}
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_session_handshake_done_rearms_coalesce_for_delay_list),
+	T_CASE(test_session_handshake_done_rearms_coalesce_for_ack_backlog),
+	T_CASE(test_session_handshake_done_no_coalesce_without_backlog),
+	T_CASE(test_session_initiate_shutdown_transitions_to_closed),
+	T_CASE(test_session_drain_sets_draining_flag),
+	T_CASE(test_socket_user_timeout_sets_option),
+	T_CASE(test_session_log_frame_header_formats_flags),
+	T_CASE(test_closing_cb_pending_then_error),
+	T_CASE(test_close_wait_cb_unexpected),
+	T_CASE(test_connect_cb_tls_paths),
+	T_CASE(test_dead_link_suspend_for_resume),
+	T_CASE(test_dead_link_close_without_session_id),
+	T_CASE(test_timeout_and_send_timeout_callbacks),
+	T_CASE(test_keepalive_cb_emits_and_rearms),
+	T_CASE(test_connect_timeout_cb_states),
+	T_CASE(test_open_stream_rejections),
+	T_CASE(test_set_config_live_session_branches),
+	T_CASE(test_session_start_tls_failed),
+	T_CASE(test_handshake_done_sched_head_and_drain),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
 	slog_level_ = LOG_LEVEL_VERYVERBOSE;
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(
-		t, test_session_handshake_done_rearms_coalesce_for_delay_list);
-	T_RUN_CASE(
-		t, test_session_handshake_done_rearms_coalesce_for_ack_backlog);
-	T_RUN_CASE(t, test_session_handshake_done_no_coalesce_without_backlog);
-	T_RUN_CASE(t, test_session_initiate_shutdown_transitions_to_closed);
-	T_RUN_CASE(t, test_session_drain_sets_draining_flag);
-	T_RUN_CASE(t, test_socket_user_timeout_sets_option);
-	T_RUN_CASE(t, test_session_log_frame_header_formats_flags);
-	T_RUN_CASE(t, test_closing_cb_pending_then_error);
-	T_RUN_CASE(t, test_close_wait_cb_unexpected);
-	T_RUN_CASE(t, test_connect_cb_tls_paths);
-	T_RUN_CASE(t, test_dead_link_suspend_for_resume);
-	T_RUN_CASE(t, test_dead_link_close_without_session_id);
-	T_RUN_CASE(t, test_timeout_and_send_timeout_callbacks);
-	T_RUN_CASE(t, test_keepalive_cb_emits_and_rearms);
-	T_RUN_CASE(t, test_connect_timeout_cb_states);
-	T_RUN_CASE(t, test_open_stream_rejections);
-	T_RUN_CASE(t, test_set_config_live_session_branches);
-	T_RUN_CASE(t, test_session_start_tls_failed);
-	T_RUN_CASE(t, test_handshake_done_sched_head_and_drain);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+
+	return testing_main(argc, argv, suite);
 }

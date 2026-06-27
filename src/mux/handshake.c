@@ -95,16 +95,27 @@ static bool proto_hello_build(
 static bool proto_parse_type(const char *type, int *const version_out)
 {
 	const size_t len = strlen(type);
-	ASSERT(len <= MUX_MAX_PAYLOAD_SIZE);
-	char buf[len + 1];
+	if (len > MUX_MAX_PAYLOAD_SIZE) {
+		LOGE("protocol type too large");
+		return false;
+	}
+	/* mime_parse tokenizes the buffer in place; copy onto the heap rather
+	 * than a peer-sized stack VLA (the ASSERT bound compiles out under
+	 * NDEBUG, leaving the stack at the mercy of the peer's type length). */
+	char *const buf = malloc(len + 1);
+	if (buf == NULL) {
+		LOGOOM();
+		return false;
+	}
 	memcpy(buf, type, len + 1);
 
+	bool ok = false;
 	char *media_type, *media_subtype;
 	char *next = mime_parse(buf, &media_type, &media_subtype);
 	if (next == NULL || strcmp(media_type, "application") != 0 ||
 	    strcmp(media_subtype, "x-multiplexd-proto") != 0) {
 		LOGE_F("unsupported protocol: \"%s\"", type);
-		return false;
+		goto done;
 	}
 
 	const char *version = NULL;
@@ -118,7 +129,7 @@ static bool proto_parse_type(const char *type, int *const version_out)
 	}
 	if (version == NULL) {
 		LOGE("protocol version not specified");
-		return false;
+		goto done;
 	}
 	errno = 0;
 	char *end = NULL;
@@ -126,10 +137,13 @@ static bool proto_parse_type(const char *type, int *const version_out)
 	if (errno != 0 || end == version || *end != '\0' || parsed == 0 ||
 	    parsed > (uintmax_t)UINT8_MAX) {
 		LOGE_F("invalid protocol version: %s", version);
-		return false;
+		goto done;
 	}
 	*version_out = (int)parsed;
-	return true;
+	ok = true;
+done:
+	free(buf);
+	return ok;
 }
 
 /* Decode a Base64-encoded session_id string into a binary buffer.
@@ -215,7 +229,8 @@ done:
 bool handshake_enqueue_hello(
 	struct mux_session *ss, const int msgid, const bool include_resume_seq)
 {
-	struct mux_frame *frame = mux_frame_get(&ss->pool, ss->max_payload);
+	struct mux_frame *const frame =
+		mux_frame_get(&ss->pool, ss->max_payload);
 	if (frame == NULL) {
 		LOGOOM();
 		session_reset(ss);
@@ -344,9 +359,8 @@ static bool handshake_client_fresh(
 }
 
 /* Client side: received ServerHello (spec §5.8.3).  A resume is confirmed when
- * the server echoes the same session_id the client stored (the match is the
- * discriminant; resume_seq=0 is valid and may not be transmitted).  Returns
- * true to continue, false on error. */
+ * the server echoes the same session_id; resume_seq=0 is valid and may not be
+ * transmitted.  Returns true to continue, false on error. */
 static bool process_hello_client(
 	struct mux_session *restrict ss,
 	const struct proto_hello *restrict peer_hello)

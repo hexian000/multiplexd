@@ -70,10 +70,9 @@ static SSL_CTX *tls_ssl_ctx(struct tls_context *restrict ctx)
 	return ((struct tls_ctx_impl *)ctx)->ssl_ctx;
 }
 
-/* Connection wrapper: the SSL object plus the I/O event notifier and the
- * transport mode.  Memory-backed connections use a pair of memory BIOs and the
- * tls_input/tls_output ciphertext shuttle; fd-backed connections (fd >= 0) let
- * the library drive the socket directly. */
+/* Connection wrapper: SSL object plus I/O notifier and transport mode;
+ * memory-backed uses a pair of memory BIOs (tls_input/tls_output shuttle);
+ * fd-backed (fd >= 0) lets the library drive the socket directly. */
 struct tls_conn_impl {
 	SSL *ssl;
 	struct tls_callback cb;
@@ -99,10 +98,9 @@ static void tls_fire_send(struct tls_conn_impl *restrict c)
 	}
 }
 
-/* Fire the on_recv notifier when more plaintext can be produced without another
- * socket read: the SSL object holds buffered data, or ciphertext fed into the
- * read memory BIO is not yet consumed (SSL_has_pending alone misses BIO-buffered
- * records).  The read BIO only exists in buffered (memory-transport) mode. */
+/* Fire on_recv when more plaintext is available without another read:
+ * SSL_has_pending misses BIO-buffered records so also check the read BIO
+ * (exists only in memory-transport mode). */
 static void tls_fire_recv(struct tls_conn_impl *restrict c)
 {
 	if (c->cb.on_recv == NULL) {
@@ -114,11 +112,9 @@ static void tls_fire_recv(struct tls_conn_impl *restrict c)
 	}
 }
 
-/* Build an ALPN wire buffer (each protocol prefixed by a 1-byte length) from a
- * comma-separated list, parsed with the RFC 4180 CSV reader so a protocol name
- * may itself contain a comma when quoted.  Sets *out (heap, caller frees) and
- * *outlen; an empty list yields *out=NULL.  Empty entries skipped; entries
- * > 255 bytes rejected. */
+/* Build an ALPN wire buffer (each protocol prefixed by a 1-byte length)
+ * from a comma-separated list (RFC 4180 CSV; quoted commas allowed);
+ * sets *out (heap, caller frees) and *outlen; *out=NULL for empty list. */
 static bool alpn_wire_from_list(
 	const char *restrict list, unsigned char **restrict out,
 	size_t *restrict outlen)
@@ -226,6 +222,11 @@ static void tls_ctx_tune(SSL_CTX *restrict ssl_ctx, const bool kernel_offload)
 		LOGW("tls.kernel_offload: this OpenSSL build has no KTLS support");
 #endif
 	}
+	/* mux implements its own session resumption, so TLS 1.3 session tickets
+	 * are redundant stateful surface.  Disabling them also keeps the door
+	 * shut on 0-RTT early-data replay should tickets ever be re-enabled. */
+	(void)SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_TICKET);
+	(void)SSL_CTX_set_num_tickets(ssl_ctx, 0);
 }
 
 static struct tls_context *tls_ctx_new(const SSL_METHOD *method)
@@ -408,7 +409,7 @@ bool tls_load_cert(
 		LOGE("tls_load_cert: ctx is NULL");
 		return false;
 	}
-	SSL_CTX *ssl_ctx = tls_ssl_ctx(ctx);
+	SSL_CTX *const ssl_ctx = tls_ssl_ctx(ctx);
 	bool ok;
 	switch (*cert_data) {
 	case '\0':
@@ -431,7 +432,7 @@ bool tls_load_key(
 		LOGE("tls_load_key: ctx is NULL");
 		return false;
 	}
-	SSL_CTX *ssl_ctx = tls_ssl_ctx(ctx);
+	SSL_CTX *const ssl_ctx = tls_ssl_ctx(ctx);
 	bool ok;
 	switch (*key_data) {
 	case '\0':
@@ -455,7 +456,7 @@ bool tls_load_authcerts(
 		LOGE("tls_load_authcerts: ctx is NULL");
 		return false;
 	}
-	SSL_CTX *ssl_ctx = tls_ssl_ctx(ctx);
+	SSL_CTX *const ssl_ctx = tls_ssl_ctx(ctx);
 	if (authcerts == NULL || count == 0) {
 		return true;
 	}
@@ -650,11 +651,9 @@ void tls_ctx_free(struct tls_context *restrict ctx)
 	free(c);
 }
 
-/* Attach a pair of memory BIOs to @p ssl for a buffered connection: the library
- * reads incoming ciphertext from the read BIO (fed by tls_input) and writes
- * outgoing ciphertext to the write BIO (drained by tls_output).  The read BIO is
- * set to return "retry" (not EOF) when empty so an exhausted inbound buffer maps
- * to SSL_ERROR_WANT_READ.  Returns false on failure (no BIO is leaked). */
+/* Attach memory BIOs to ssl: read BIO fed by tls_input, write BIO drained
+ * by tls_output; read BIO set to "retry" (not EOF) so empty → WANT_READ.
+ * Returns false on failure; no BIO is leaked. */
 static bool tls_set_mem_bio(SSL *restrict ssl)
 {
 	BIO *const rbio = BIO_new(BIO_s_mem());
@@ -670,11 +669,9 @@ static bool tls_set_mem_bio(SSL *restrict ssl)
 	return true;
 }
 
-/* Allocate the connection wrapper around an SSL object.  With @p fd >= 0 the
- * library drives the socket directly; otherwise a pair of memory BIOs is set up
- * for the tls_input/tls_output shuttle.  The connection starts with no notifier;
- * install one with tls_set_callback.  On failure the SSL is freed and NULL
- * returned. */
+/* Allocate the connection wrapper around an SSL object; fd >= 0: library
+ * drives socket directly; fd < 0: memory BIOs for tls_input/tls_output.
+ * No notifier until tls_set_callback; on failure the SSL is freed. */
 static struct tls_connection *tls_conn_new(
 	struct tls_ctx_impl *restrict c, const bool is_server, const int fd)
 {
@@ -775,7 +772,7 @@ enum tls_error tls_handshake(struct tls_connection *restrict conn)
 {
 	ERR_clear_error();
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
-	SSL *ssl = c->ssl;
+	SSL *const ssl = c->ssl;
 
 	const int ret = SSL_do_handshake(ssl);
 	tls_fire_send(c);
@@ -813,7 +810,7 @@ enum tls_error tls_send(
 		return TLS_ERROR_NONE;
 	}
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
-	SSL *ssl = c->ssl;
+	SSL *const ssl = c->ssl;
 	ERR_clear_error();
 	const int req_len = (int)(*len > (size_t)INT_MAX ? INT_MAX : *len);
 	const int ret = SSL_write(ssl, buf, req_len);
@@ -854,7 +851,7 @@ enum tls_error tls_recv(
 		return TLS_ERROR_NONE;
 	}
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
-	SSL *ssl = c->ssl;
+	SSL *const ssl = c->ssl;
 	ERR_clear_error();
 	const int req_len = (int)(*len > (size_t)INT_MAX ? INT_MAX : *len);
 	const int ret = SSL_read(ssl, buf, req_len);
@@ -894,7 +891,7 @@ enum tls_error tls_shutdown(struct tls_connection *restrict conn)
 {
 	ERR_clear_error();
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
-	SSL *ssl = c->ssl;
+	SSL *const ssl = c->ssl;
 
 	const int ret = SSL_shutdown(ssl);
 	tls_fire_send(c);
@@ -934,9 +931,9 @@ bool tls_peer_cert_der(
 	if (conn == NULL || out == NULL || len == NULL) {
 		return false;
 	}
-	SSL *ssl = tls_conn_ssl(conn);
+	SSL *const ssl = tls_conn_ssl(conn);
 	ERR_clear_error();
-	X509 *cert = SSL_get_peer_certificate(ssl);
+	X509 *const cert = SSL_get_peer_certificate(ssl);
 	if (cert == NULL) {
 		return false;
 	}
@@ -945,7 +942,7 @@ bool tls_peer_cert_der(
 		X509_free(cert);
 		return false;
 	}
-	unsigned char *der = malloc((size_t)der_len);
+	unsigned char *const der = malloc((size_t)der_len);
 	if (der == NULL) {
 		X509_free(cert);
 		return false;

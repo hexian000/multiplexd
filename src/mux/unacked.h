@@ -32,17 +32,19 @@ struct unacked_ctx {
 	/* Byte offset into the ring head entry while it is partially trimmed
 	 * across unacked_ack_trim calls; 0 once the head is fully popped. */
 	uint_least32_t partial_offset;
-	/* Count of non-stream-0 frames sent (advanced on each ring push). */
+	/* Count of non-stream-0 frames sent (advanced on each ring push);
+	 * 32-bit serial number (RFC 1982). */
 	uint_least32_t send_seq;
 	/* Count of non-stream-0 frames received. */
 	uint_least32_t recv_seq;
 	/* recv_seq value at the time of the last session ACK emission. */
 	uint_least32_t ack_seq;
-	/* Cumulative send_seq acknowledged by the peer. */
+	/* Cumulative send_seq acknowledged by the peer; 32-bit serial number
+	 * (RFC 1982) — resume comparison uses serial_lt32. */
 	uint_least32_t last_ack_recv;
 	/* Ticks since the last session ACK while frames are pending; reset on
 	 * emission or when recv_seq == ack_seq. */
-	int ack_ticks;
+	uint_least8_t ack_ticks;
 	/* A stream ACK was sent since the last session ACK; schedule a
 	 * session-level ACK piggyback. */
 	bool ack_pending : 1;
@@ -56,10 +58,9 @@ struct unacked_ctx {
 	struct mux_frame *retransmit_copy;
 };
 
-/* Result of unacked_ack_trim.  ok is false on a protocol violation (the peer
- * acked more frames than were sent).  trimmed_bytes and unstalled let the
- * caller drive the BDP estimator and the EV_WRITE re-arm, so this module never
- * calls into the estimator or the send pipeline. */
+/* Result of unacked_ack_trim: ok=false on protocol violation (peer acked
+ * more than sent); trimmed_bytes/unstalled let the caller drive the BDP
+ * estimator and EV_WRITE re-arm without coupling this module to them. */
 struct unacked_ack_result {
 	bool ok;
 	size_t trimmed_bytes;

@@ -1,25 +1,19 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* sched_test.c - white-box tests for the stream scheduler in sched.c (DRR/LP
- * queues, stream-id allocation, coalescing, control-frame emission).
- * Dependencies: sched.c #included; its collaborators (update_watcher,
- * session_send_ctrl, ...) are mocked below; no sibling TUs linked.
- * Benches (bench section) are opt-in: run with BENCH set in the env. */
+/* sched_test.c - white-box tests for sched.c (DRR/LP queues, stream-id
+ * allocation, coalescing, control-frame emission); sched.c #included, its
+ * collaborators mocked; benches opt-in via BENCH env. */
 
 #include "mux/frame.h"
-#include "algo/hashtable.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/stream.h"
 
-/* Unlock the testing.h bench macros (need a monotonic clock from os/clock.h). */
-#include "os/clock.h"
+#include "algo/hashtable.h"
+#include "utils/testing.h"
 
 #include <ev.h>
-
-#define UTILS_MEASURE_H
-#include "utils/testing.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -46,7 +40,7 @@ static uint_fast32_t g_stream_grant_inc;
 static int g_mark_fin_sent_calls;
 static int g_send_push_calls;
 static struct mux_frame *g_last_sent_frame;
-static int g_stream_on_send_calls;
+static int g_notify_recv_calls;
 static int g_flush_calls;
 static int g_mark_syn_sent_calls;
 static int g_stream_free_calls;
@@ -65,7 +59,7 @@ static void sched_test_reset(void)
 	g_mark_fin_sent_calls = 0;
 	g_send_push_calls = 0;
 	g_last_sent_frame = NULL;
-	g_stream_on_send_calls = 0;
+	g_notify_recv_calls = 0;
 	g_flush_calls = 0;
 	g_mark_syn_sent_calls = 0;
 	g_stream_free_calls = 0;
@@ -146,7 +140,7 @@ struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 void stream_notify_recv(struct mux_stream *restrict s)
 {
 	(void)s;
-	g_stream_on_send_calls++;
+	g_notify_recv_calls++;
 }
 
 void session_flush(struct mux_session *ss)
@@ -194,7 +188,7 @@ static struct mux_session make_session(void)
 			(uint_least32_t)mux_conf_default.max_frame_payload,
 		.session_window = 8,
 		.stream_window = 4,
-		.tag = (char *)"[test]:",
+		.tag = "[test]:",
 	};
 	T_CHECK(ss.loop != NULL);
 	ss.sched.streams = table_new(&(struct table_opts){
@@ -309,8 +303,8 @@ T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
 T_DECLARE_CASE(test_sched_free_streams_clears_stream_counter)
 {
 	struct mux_session ss = make_session();
-	struct mux_stream *first = calloc(1, sizeof(*first));
-	struct mux_stream *second = calloc(1, sizeof(*second));
+	struct mux_stream *const first = calloc(1, sizeof(*first));
+	struct mux_stream *const second = calloc(1, sizeof(*second));
 
 	sched_test_bind_watchers(&ss);
 	T_CHECK(first != NULL);
@@ -452,7 +446,7 @@ T_DECLARE_CASE(test_sched_next_data_sends_frame_and_resets_deficit_on_drain)
 	T_EXPECT(sched_next_data(&ss));
 	T_EXPECT_EQ(g_send_push_calls, 1);
 	T_EXPECT(g_last_sent_frame == &frame);
-	T_EXPECT_EQ(g_stream_on_send_calls, 1);
+	T_EXPECT_EQ(g_notify_recv_calls, 1);
 	T_EXPECT_EQ(stream.deficit, (uint_least32_t)0);
 	T_EXPECT(ss.sched.drr_active == NULL);
 
@@ -631,7 +625,7 @@ T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 	sched_test_reset();
 
 	for (int i = 0; i < 4; i++) {
-		struct mux_stream *s = calloc(1, sizeof(*s));
+		struct mux_stream *const s = calloc(1, sizeof(*s));
 		T_CHECK(s != NULL);
 		s->id = (uint_least16_t)(i * 2 + 1);
 		s->state = STREAM_ESTABLISHED;
@@ -641,7 +635,7 @@ T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 	ss.sched.num_tombstones = 2;
 	/* Live count = 4 - 2 = 2 < max_streams(4), so admission OK. */
 	{
-		struct mux_stream *s = calloc(1, sizeof(*s));
+		struct mux_stream *const s = calloc(1, sizeof(*s));
 		T_CHECK(s != NULL);
 		s->id = 9;
 		s->state = STREAM_INIT;
@@ -676,7 +670,7 @@ T_DECLARE_CASE(test_sched_wake_double_enqueue_idempotent)
 	sched_test_bind_watchers(&ss);
 	sched_test_reset();
 
-	struct mux_stream *s = calloc(1, sizeof(*s));
+	struct mux_stream *const s = calloc(1, sizeof(*s));
 	T_CHECK(s != NULL);
 	s->id = 1;
 	s->state = STREAM_ESTABLISHED;
@@ -699,7 +693,7 @@ T_DECLARE_CASE(test_lp_queue_double_enqueue_prevented)
 	sched_test_bind_watchers(&ss);
 	sched_test_reset();
 
-	struct mux_stream *s = calloc(1, sizeof(*s));
+	struct mux_stream *const s = calloc(1, sizeof(*s));
 	T_CHECK(s != NULL);
 	s->id = 1;
 	s->state = STREAM_INIT;
@@ -745,7 +739,7 @@ T_DECLARE_CASE(test_sched_next_data_skips_blocked_stream)
 	T_EXPECT(sched_next_data(&ss));
 	T_EXPECT_EQ(g_send_push_calls, 1);
 	T_EXPECT(g_last_sent_frame == &frame_b);
-	T_EXPECT_EQ(g_stream_on_send_calls, 1);
+	T_EXPECT_EQ(g_notify_recv_calls, 1);
 
 	/* Queue must be empty: both streams were visited and dequeued. */
 	T_EXPECT(ss.sched.sched_head == NULL);
@@ -783,10 +777,9 @@ T_DECLARE_CASE(test_sched_next_data_exhausts_queue_returns_false)
 	cleanup_session(&ss);
 }
 
-/* The lifecycle-drain request is self-guarding: callers invoke it
- * unconditionally and it must no-op on an empty queue or an occupied sendbuf
- * (which the session_on_send epilogue re-arms), only marking pending and arming EV_WRITE
- * (via session_notify) when there is queued work and the sendbuf is clear. */
+/* The lifecycle-drain request is self-guarding: no-op on an empty queue or
+ * occupied sendbuf; marks pending and arms EV_WRITE (via session_notify) only
+ * when there is queued work and the sendbuf is clear. */
 T_DECLARE_CASE(test_sched_schedule_self_guards_on_queue_and_sendbuf)
 {
 	struct mux_session ss = make_session();
@@ -980,43 +973,43 @@ T_DECLARE_CASE(test_sched_coalesce_cb_decrements_multi_tick)
 	cleanup_session(&ss);
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_sched_alloc_stream_id_nearly_full),
+	T_CASE(test_sched_alloc_stream_id_starts_at_minimum),
+	T_CASE(test_sched_add_remove_updates_table_and_idle_timeout),
+	T_CASE(test_sched_free_streams_clears_stream_counter),
+	T_CASE(test_sched_wake_enqueues_only_once),
+	T_CASE(test_sched_dequeue_preserves_fifo_order),
+	T_CASE(test_sched_delay_remove_handles_head_middle_and_tail),
+	T_CASE(test_sched_send_ctrl_flags_emits_ack_and_fin),
+	T_CASE(test_sched_next_data_sends_frame_and_resets_deficit_on_drain),
+	T_CASE(test_sched_sole_stream_drains_without_requeue),
+	T_CASE(test_sched_cb_sends_syn_for_init_stream),
+	T_CASE(test_sched_coalesce_forces_session_ack_after_tick_budget),
+	T_CASE(test_sched_next_data_skips_blocked_stream),
+	T_CASE(test_sched_next_data_exhausts_queue_returns_false),
+	T_CASE(test_sched_schedule_self_guards_on_queue_and_sendbuf),
+	T_CASE(test_stream_id_exhaustion),
+	T_CASE(test_stream_id_wraparound_client),
+	T_CASE(test_stream_id_wraparound_server),
+	T_CASE(test_tombstone_excluded_from_max_streams),
+	T_CASE(test_stream_id_collision_skip),
+	T_CASE(test_sched_wake_double_enqueue_idempotent),
+	T_CASE(test_lp_queue_double_enqueue_prevented),
+	T_CASE(test_sched_wake_before_established_uses_single_queue),
+	T_CASE(test_sched_delay_shortens_pending_deadline),
+	T_CASE(test_sched_find_stream_null_table),
+	T_CASE(test_sched_send_ctrl_flags_subunit_clears_ack),
+	T_CASE(test_sched_remove_stream_drain_and_absent),
+	T_CASE(test_sched_drain_lp_frees_closed_stream),
+	T_CASE(test_sched_coalesce_cb_decrements_multi_tick),
+	/* Opt-in micro-benchmark: ~1s, skipped by the default (unfiltered) run.
+	 * Select with `--run <ere>` or TESTING_FILTER. */
+	T_BENCH(bench_sched_enqueue_dequeue),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_sched_alloc_stream_id_nearly_full);
-	T_RUN_CASE(t, test_sched_alloc_stream_id_starts_at_minimum);
-	T_RUN_CASE(t, test_sched_add_remove_updates_table_and_idle_timeout);
-	T_RUN_CASE(t, test_sched_free_streams_clears_stream_counter);
-	T_RUN_CASE(t, test_sched_wake_enqueues_only_once);
-	T_RUN_CASE(t, test_sched_dequeue_preserves_fifo_order);
-	T_RUN_CASE(t, test_sched_delay_remove_handles_head_middle_and_tail);
-	T_RUN_CASE(t, test_sched_send_ctrl_flags_emits_ack_and_fin);
-	T_RUN_CASE(
-		t,
-		test_sched_next_data_sends_frame_and_resets_deficit_on_drain);
-	T_RUN_CASE(t, test_sched_sole_stream_drains_without_requeue);
-	T_RUN_CASE(t, test_sched_cb_sends_syn_for_init_stream);
-	T_RUN_CASE(t, test_sched_coalesce_forces_session_ack_after_tick_budget);
-	T_RUN_CASE(t, test_sched_next_data_skips_blocked_stream);
-	T_RUN_CASE(t, test_sched_next_data_exhausts_queue_returns_false);
-	T_RUN_CASE(t, test_sched_schedule_self_guards_on_queue_and_sendbuf);
-	T_RUN_CASE(t, test_stream_id_exhaustion);
-	T_RUN_CASE(t, test_stream_id_wraparound_client);
-	T_RUN_CASE(t, test_stream_id_wraparound_server);
-	T_RUN_CASE(t, test_tombstone_excluded_from_max_streams);
-	T_RUN_CASE(t, test_stream_id_collision_skip);
-	T_RUN_CASE(t, test_sched_wake_double_enqueue_idempotent);
-	T_RUN_CASE(t, test_lp_queue_double_enqueue_prevented);
-	T_RUN_CASE(t, test_sched_wake_before_established_uses_single_queue);
-	T_RUN_CASE(t, test_sched_delay_shortens_pending_deadline);
-	T_RUN_CASE(t, test_sched_find_stream_null_table);
-	T_RUN_CASE(t, test_sched_send_ctrl_flags_subunit_clears_ack);
-	T_RUN_CASE(t, test_sched_remove_stream_drain_and_absent);
-	T_RUN_CASE(t, test_sched_drain_lp_frees_closed_stream);
-	T_RUN_CASE(t, test_sched_coalesce_cb_decrements_multi_tick);
-	/* Opt-in micro-benchmark: ~1s, kept out of the default ctest run. */
-	if (getenv("BENCH") != NULL) {
-		T_RUN_BENCH(t, bench_sched_enqueue_dequeue);
-	}
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

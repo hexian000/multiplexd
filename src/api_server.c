@@ -37,14 +37,8 @@ enum { HTTP_MAX_ENTITY = 8192 };
 
 #define API_TIMEOUT 30.0
 
-enum api_state {
-	STATE_RECEIVE,
-	STATE_RESPOND,
-};
-
 struct api_ctx {
 	struct server *s;
-	enum api_state state;
 	int fd;
 	ev_io w_recv, w_send;
 	ev_timer w_timeout;
@@ -52,7 +46,7 @@ struct api_ctx {
 	char *next;
 	bool hdr_done : 1;
 	bool keepalive : 1;
-	/* copy of Connection: request header value */
+	/* Connection header value */
 	char connection[32];
 	size_t wpos;
 	/* parsed Content-Length from the request; 0 when absent */
@@ -94,7 +88,6 @@ static void api_ctx_reset(struct ev_loop *loop, struct api_ctx *restrict ctx)
 	BUF_RESET(ctx->wbuf);
 	VBUF_RESET(ctx->cbuf);
 	ctx->wpos = 0;
-	ctx->state = STATE_RECEIVE;
 	ev_io_stop(loop, &ctx->w_send);
 	ev_timer_again(loop, &ctx->w_timeout);
 	ev_io_start(loop, &ctx->w_recv);
@@ -137,7 +130,7 @@ static void respond_status(struct api_ctx *restrict ctx, const int code)
 {
 	char date_str[32];
 	const size_t date_len = http_date(date_str, sizeof(date_str));
-	const char *status = http_status((uint_fast16_t)code);
+	const char *const status = http_status((uint_fast16_t)code);
 	BUF_RESET(ctx->wbuf);
 	BUF_APPENDF(
 		ctx->wbuf,
@@ -186,7 +179,7 @@ static double process_load(void)
 		struct timespec monotime, cputime;
 		bool set;
 	} last = { .set = false };
-	double load = -1;
+	double load = -1.0;
 	struct timespec monotime, cputime;
 	if (!clock_monotonic(&monotime)) {
 		return load;
@@ -213,9 +206,8 @@ static void append_stateful_stats(
 	struct api_ctx *restrict ctx, const struct server_stats *restrict stats,
 	const int_fast64_t now, const int_fast64_t started)
 {
-	struct server *restrict s = ctx->s;
+	struct server *const restrict s = ctx->s;
 
-	/* Rate tracking state stored per-server to avoid static shared state. */
 	if (!s->rate_tracker.is_set) {
 		s->rate_tracker.timestamp = (int_least64_t)started;
 		s->rate_tracker.is_set = true;
@@ -273,7 +265,8 @@ static void append_sessions(
 {
 	VBUF_APPENDSTR(ctx->cbuf, "\n> Sessions\n");
 	for (size_t i = 0; i < stats->num_tunnels; i++) {
-		const struct tunnel_stats *restrict t = &stats->tunnels[i];
+		const struct tunnel_stats *const restrict t =
+			&stats->tunnels[i];
 		if (t->peer_identity == NULL) {
 			continue;
 		}
@@ -306,13 +299,13 @@ static void append_eventlog(
 	struct api_ctx *restrict ctx, const struct server_stats *restrict stats)
 {
 	VBUF_APPENDSTR(ctx->cbuf, "\n> Recent Events\n");
-	const struct server_evlog *restrict evlog = stats->evlog;
+	const struct server_evlog *const restrict evlog = stats->evlog;
 	const size_t evlog_size = ARRAY_SIZE(evlog->entries);
 	const size_t n = MIN(evlog->len, 10);
 	for (size_t i = 0; i < n; i++) {
 		const size_t idx =
 			(evlog->pos + evlog_size - 1 - i) % evlog_size;
-		const struct server_evlog_entry *restrict e =
+		const struct server_evlog_entry *const restrict e =
 			&evlog->entries[idx];
 		char ts[32] = "(unknown)";
 		if (e->timestamp != (time_t)-1) {
@@ -347,9 +340,9 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		}
 	}
 
-	struct server *restrict s = ctx->s;
-	const struct config *restrict conf = s->conf;
-	struct server_stats *restrict stats = server_stats(s);
+	struct server *const restrict s = ctx->s;
+	const struct config *const restrict conf = s->conf;
+	struct server_stats *const restrict stats = server_stats(s);
 	if (stats == NULL) {
 		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
 		return;
@@ -594,8 +587,8 @@ static struct vbuffer *append_tunnel_metrics(
 /* Handles GET /metrics — Prometheus text format (version 0.0.4). */
 static void handle_metrics(struct api_ctx *restrict ctx)
 {
-	struct server *restrict s = ctx->s;
-	struct server_stats *restrict stats = server_stats(s);
+	struct server *const restrict s = ctx->s;
+	struct server_stats *const restrict stats = server_stats(s);
 	if (stats == NULL) {
 		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
 		return;
@@ -761,7 +754,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 static void handle_config_get(struct api_ctx *restrict ctx)
 {
 	size_t len;
-	char *restrict json = conf_dump(ctx->s->conf, &len);
+	char *const restrict json = conf_dump(ctx->s->conf, &len);
 	if (json == NULL) {
 		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
 		return;
@@ -783,7 +776,7 @@ static void handle_config_put(struct api_ctx *restrict ctx)
 		respond_status(ctx, HTTP_LENGTH_REQUIRED);
 		return;
 	}
-	struct config *restrict new_conf =
+	struct config *const restrict new_conf =
 		conf_parse(ctx->next, ctx->content_length);
 	if (new_conf == NULL) {
 		respond_status(ctx, HTTP_BAD_REQUEST);
@@ -849,7 +842,7 @@ static void api_handle(struct api_ctx *restrict ctx)
 /* Returns true if the connection should be kept alive after the response. */
 static bool api_should_keepalive(const struct api_ctx *restrict ctx)
 {
-	const char *version = ctx->msg.req.version;
+	const char *const version = ctx->msg.req.version;
 	if (version == NULL || strncmp(version, "HTTP/1.1", 8) != 0) {
 		return false;
 	}
@@ -860,7 +853,7 @@ static bool api_should_keepalive(const struct api_ctx *restrict ctx)
 static void send_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 {
 	CHECK_REVENTS(revents, EV_WRITE);
-	struct api_ctx *restrict ctx = watcher->data;
+	struct api_ctx *const restrict ctx = watcher->data;
 
 	/* Logical send buffer: wbuf (headers) then cbuf (body, /metrics only);
 	 * wpos tracks position across both. */
@@ -905,7 +898,6 @@ static void
 recv_error(struct ev_loop *loop, struct api_ctx *restrict ctx, const int code)
 {
 	respond_status(ctx, code);
-	ctx->state = STATE_RESPOND;
 	ev_io_stop(loop, &ctx->w_recv);
 	ev_io_start(loop, &ctx->w_send);
 }
@@ -914,7 +906,7 @@ recv_error(struct ev_loop *loop, struct api_ctx *restrict ctx, const int code)
 static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ);
-	struct api_ctx *restrict ctx = watcher->data;
+	struct api_ctx *const restrict ctx = watcher->data;
 
 	/* Reserve one byte so received data can always be NUL-terminated for the
 	 * strstr-based HTTP parser.  When only that byte remains, the request has
@@ -991,9 +983,9 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	}
 
 	/* Wait for the complete request body before dispatching */
+	const size_t body_off =
+		(size_t)((unsigned char *)ctx->next - ctx->rbuf.data);
 	if (ctx->content_length > 0) {
-		const size_t body_off =
-			(size_t)((unsigned char *)ctx->next - ctx->rbuf.data);
 		if (ctx->content_length > ctx->rbuf.cap - body_off) {
 			recv_error(loop, ctx, HTTP_ENTITY_TOO_LARGE);
 			return;
@@ -1002,14 +994,18 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			return; /* wait for more body data */
 		}
 	}
+	/* This server does not support request pipelining; api_ctx_reset discards
+	 * the rx buffer, so any bytes past this request's body would be silently
+	 * lost.  Force the connection closed instead of keeping it alive. */
+	const bool has_trailing =
+		ctx->rbuf.len > body_off + ctx->content_length;
 
 	/* All headers received; handle the request and respond.  Keep the idle
 	 * timeout running while responding. */
-	ctx->keepalive = api_should_keepalive(ctx);
+	ctx->keepalive = api_should_keepalive(ctx) && !has_trailing;
 	ev_timer_again(loop, &ctx->w_timeout);
 	ev_io_stop(loop, &ctx->w_recv);
 	api_handle(ctx);
-	ctx->state = STATE_RESPOND;
 	ctx->wpos = 0;
 	ev_io_start(loop, &ctx->w_send);
 }
@@ -1018,21 +1014,20 @@ static void
 timeout_cb(struct ev_loop *loop, ev_timer *watcher, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct api_ctx *restrict ctx = watcher->data;
+	struct api_ctx *const restrict ctx = watcher->data;
 	LOGD_F("api [fd:%d]: timeout", ctx->fd);
 	api_ctx_free(loop, ctx);
 }
 
 static struct api_ctx *api_ctx_new(struct server *restrict s, const int fd)
 {
-	struct api_ctx *restrict ctx = malloc(sizeof(struct api_ctx));
+	struct api_ctx *const restrict ctx = malloc(sizeof(struct api_ctx));
 	if (ctx == NULL) {
 		LOGOOM();
 		return NULL;
 	}
 	*ctx = (struct api_ctx){
 		.s = s,
-		.state = STATE_RECEIVE,
 		.fd = fd,
 		.hdr_done = false,
 	};
@@ -1060,9 +1055,9 @@ void api_serve(
 	struct listener *l, struct ev_loop *loop, const int accepted_fd,
 	const struct sockaddr *accepted_sa)
 {
-	UNUSED(accepted_sa);
-	struct server *restrict s = l->srv;
-	struct api_ctx *restrict ctx = api_ctx_new(s, accepted_fd);
+	(void)accepted_sa;
+	struct server *const restrict s = l->srv;
+	struct api_ctx *const restrict ctx = api_ctx_new(s, accepted_fd);
 	if (ctx == NULL) {
 		SOCKET_CLOSE_FD(accepted_fd);
 		return;

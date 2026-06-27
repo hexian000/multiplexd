@@ -5,15 +5,14 @@
  * identity helpers) via its public API.
  * Dependencies: links the real util.c (+ TLS backend). */
 
-#include "os/socket.h"
 #include "util.h"
 
+#include "os/socket.h"
 #include "utils/testing.h"
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -69,12 +68,15 @@ T_DECLARE_CASE(test_resolve_addr_invalid_returns_false)
 	T_EXPECT(!resolve_addr(&addr, "127.0.0.1", SA_RESOLVE_TCP));
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_socket_notsent_lowat_sets_option),
+	T_CASE(test_resolve_addr_ipv4_parses_correctly),
+	T_CASE(test_resolve_addr_ipv6_parses_correctly),
+	T_CASE(test_resolve_addr_invalid_returns_false),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_socket_notsent_lowat_sets_option);
-	T_RUN_CASE(t, test_resolve_addr_ipv4_parses_correctly);
-	T_RUN_CASE(t, test_resolve_addr_ipv6_parses_correctly);
-	T_RUN_CASE(t, test_resolve_addr_invalid_returns_false);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

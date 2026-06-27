@@ -105,10 +105,9 @@ enum wire_flush_result {
 	WIRE_FLUSH_ERROR,
 };
 
-/* Memory transport (socket_offload disabled) only: push any outbound ciphertext
- * the TLS library has produced out to the socket, retaining what the socket
- * cannot yet accept.  A no-op (returns WIRE_FLUSH_DONE) for plaintext and
- * fd-backed TLS. */
+/* Memory-transport TLS only: push outbound ciphertext to the socket,
+ * retaining what cannot yet be accepted.  No-op for plaintext and
+ * fd-backed TLS (returns WIRE_FLUSH_DONE). */
 enum wire_flush_result wire_flush(struct mux_session *ss);
 
 #if WITH_TLS
@@ -116,15 +115,12 @@ enum wire_flush_result wire_flush(struct mux_session *ss);
  * No-op when the new context is the same as the current one. */
 void wire_set_tlsctx(struct mux_session *ss, struct tls_context *tlsctx);
 
-/* Set up the TLS layer over the already-connected TCP socket.
- * For outbound sessions this creates wire.tlsconn from wire.tlsctx; for
- * accepted sessions wire.tlsconn is already attached and this is a no-op.
- * The handshake itself is driven implicitly by the subsequent wire_send /
- * wire_recv that pump the mux hello exchange.
- * Returns false on failure; caller must reset the session. */
+/* Set up TLS over the connected socket; outbound creates wire.tlsconn from
+ * wire.tlsctx; accepted is a no-op (already attached).  Handshake is driven
+ * implicitly by wire_send/wire_recv.  Returns false on failure. */
 bool wire_tls_start(struct mux_session *ss);
 
-#if WITH_TLS && !defined(NDEBUG)
+#if !defined(NDEBUG)
 /* Debug-only: trigger the TLS backend's KTLS-status log once the mux handshake
  * has completed.  No-op when the session is not using TLS.  Implemented by an
  * idempotent tls_handshake() call; compiled out entirely in release builds. */
@@ -145,16 +141,14 @@ void wire_tlsconn_free(struct tls_connection *conn);
  * No-op in plain-TCP builds. */
 void wire_conn_free(struct mux_session *ss);
 
-/* Drive the TLS close_notify exchange (WITH_TLS) or issue TCP SHUT_WR.
- * Returns WIRE_SHUTDOWN_PENDING when the TLS handshake needs more I/O,
- * WIRE_SHUTDOWN_DONE when the transport write side is fully shut down, or
- * WIRE_SHUTDOWN_ERROR on an unrecoverable error. */
+/* Drive TLS close_notify (WITH_TLS) or issue TCP SHUT_WR; returns
+ * WIRE_SHUTDOWN_PENDING when more I/O is needed, WIRE_SHUTDOWN_DONE
+ * when shut down, or WIRE_SHUTDOWN_ERROR on error. */
 enum wire_shutdown_state wire_shutdown(struct mux_session *ss);
 
-/* Drain the read side while waiting for the peer's TCP FIN (or TLS
- * close_notify after our own shutdown).  Returns true when the peer
- * has cleanly closed the connection, false on error or unexpected data.
- * Does NOT modify wire.rx_open or wire.tls_want. */
+/* Drain the read side waiting for peer's TCP FIN or TLS close_notify;
+ * returns true on clean close, false on error or unexpected data.
+ * Does not modify wire.rx_open or wire.tls_want. */
 bool wire_wait_eof(struct mux_session *ss);
 
 #endif /* MUX_WIRE_H */

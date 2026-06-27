@@ -9,20 +9,9 @@
  *        retransmit replay bypass this layer -- send_pump stages them directly.
  */
 
-/*
- * Local scheduler invariants only; the full model lives in doc/impl.md.
- *
- * - sched_head/tail hold the ready FIFO via prev/next (doubly-linked, O(1)).
- * - drr_active is off the FIFO while it spends its byte budget across EV_WRITE
- *   visits.
- * - delay_head is an unsorted intrusive list; delay_prev/delay_next give O(1)
- *   expiration and cancellation.
- * - the low-priority (lp) queue owns lifecycle work (INIT/CLOSED); the DRR
- *   ready queue carries payload/control transmission.
- * - the ready FIFO and the lp queue share the same prev/next pair and are
- *   mutually exclusive (a stream is on at most one; the delay list uses
- *   delay_prev/next).
- */
+/* Local scheduler invariants; full model in doc/impl.md.
+ * ready FIFO and lp queue share prev/next (mutually exclusive); delay list
+ * uses delay_prev/next; drr_active is off-FIFO while spending its budget. */
 
 #include "mux/sched.h"
 
@@ -34,6 +23,7 @@
 #include "util.h"
 
 #include "algo/hashtable.h"
+#include "math/serial.h"
 #include "os/clock.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
@@ -50,10 +40,10 @@ static bool stream_free_and_decount_cb(
 	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
-	UNUSED(table);
-	UNUSED(key);
-	struct mux_stream *restrict s = element;
-	struct mux_session *restrict ss = data;
+	(void)table;
+	(void)key;
+	struct mux_stream *const restrict s = element;
+	struct mux_session *const restrict ss = data;
 	if (s->state != STREAM_CLOSED) {
 		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
 	}
@@ -139,10 +129,9 @@ struct mux_stream *sched_find_stream(
 	return NULL;
 }
 
-/* Find the next free stream ID via a wrap-around counter with parity
- * enforcement (client odd, server even), skipping STREAMID_CTRL and IDs already
- * in the table.  The +2 step avoids rapid reuse of recently freed IDs.  Returns
- * STREAMID_CTRL when all IDs of the matching parity are occupied. */
+/* Wrap-around counter with parity enforcement (client odd, server even);
+ * +2 step avoids rapid ID reuse; returns STREAMID_CTRL when all matching-
+ * parity IDs are occupied. */
 uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss)
 {
 	const uint_least16_t parity = ss->accepted ? 0u : 1u;
@@ -162,11 +151,12 @@ uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss)
 					ss->sched.streams,
 					(const void *)(uintptr_t)id, &elem);
 			if (!found) {
-				ss->sched.next_stream_id = (id + 2u) & 0xFFFFu;
+				ss->sched.next_stream_id =
+					(uint_least16_t)serial_add16(id, 2u);
 				return id;
 			}
 		}
-		id = (id + 2u) & 0xFFFFu;
+		id = (uint_least16_t)serial_add16(id, 2u);
 	}
 
 	LOGE_F("[fd:%d] stream IDs exhausted", ss->w_socket.fd);
@@ -175,7 +165,7 @@ uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss)
 
 static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
 {
-	struct mux_stream *s = ss->sched.sched_head;
+	struct mux_stream *const s = ss->sched.sched_head;
 	if (s != NULL) {
 		ss->sched.sched_head = s->next;
 		if (ss->sched.sched_head == NULL) {
@@ -372,10 +362,9 @@ static void sched_drr_continue(
 		s->deficit = 0;
 		return;
 	}
-	/* Sole ready stream: no contender to be fair to, so stay active and drain
-	 * the whole queue in one pump (its records coalesce under TCP_CORK into a
-	 * full segment) without paying a re-queue round-trip per frame.  It yields
-	 * naturally when the queue empties (above) or the stream stalls on credit. */
+	/* Sole ready stream: drain the whole queue in one pump (records coalesce
+	 * under TCP_CORK) without re-queue overhead; yields when queue empties or
+	 * the stream stalls on credit. */
 	if (ss->sched.sched_head == NULL) {
 		ss->sched.drr_active = s;
 		return;
@@ -393,11 +382,9 @@ static void sched_drr_continue(
 	sched_wake(ss, s);
 }
 
-/* Scan the DRR ready queue and stage at most one PUSH frame, skipping streams
- * that cannot currently produce (credit exhausted, queue empty, Nagle-held, or
- * non-ESTABLISHED).  INIT/CLOSED divert to the lp queue, SYN_SENT waits for the
- * handshake, drr_active continues off-queue.  Returns true iff a frame was
- * staged. */
+/* Scan the DRR ready queue and stage at most one PUSH frame; skips streams
+ * blocked on credit, queue empty, Nagle, or non-ESTABLISHED state.
+ * Returns true iff a frame was staged. */
 bool sched_next_data(struct mux_session *restrict ss)
 {
 	for (;;) {
@@ -443,17 +430,13 @@ bool sched_next_data(struct mux_session *restrict ss)
 		LOGVV_F("[fd:%d] sched stream=%" PRIuLEAST16, ss->w_socket.fd,
 			s->id);
 
-		struct mux_frame *frame = stream_dequeue_send(s);
+		struct mux_frame *const frame = stream_dequeue_send(s);
 		if (frame != NULL) {
 			const size_t payload =
 				frame->len - MUX_FRAME_HEADER_SIZE;
-			/* Credit one frame of quantum on a fresh dequeue (Nagle-held
-			 * streams earn no budget), or to top up a stream draining
-			 * continuously as the sole ready stream -- both keep the
-			 * deficit >= payload invariant for the deduction below.  A
-			 * contended stream continuing mid-round already has
-			 * deficit >= next payload (sched_drr_continue), so it never
-			 * tops up here. */
+			/* Credit one frame of quantum on fresh dequeue (Nagle-held
+			 * streams earn none), or top up the sole-stream drain; both
+			 * maintain deficit >= payload for the deduction below. */
 			if (fresh_dequeue ||
 			    s->deficit < (uint_least32_t)payload) {
 				s->deficit += ss->max_payload;
@@ -497,11 +480,9 @@ bool sched_next_data(struct mux_session *restrict ss)
 	}
 }
 
-/* Emit pending per-stream ACK/FIN headers for all DRR-queued streams; the small
- * (8 B) control frames pack into one staging entry, so one flush suffices.
- * Never calls stream_check_ack -- ack_pending is set only by the receive dispatch
- * path; re-arming already-sent grants here would spin session_on_send at 100 % CPU
- * while send_stalled blocks new payload. */
+/* Emit pending per-stream ACK/FIN headers for all DRR-queued streams; the
+ * 8-byte control frames pack into one staging entry.  Never calls
+ * stream_check_ack — ack_pending is set only by the receive path. */
 void sched_flush_ctrl(struct mux_session *restrict ss)
 {
 	for (struct mux_stream *s = ss->sched.sched_head; s != NULL;
@@ -515,7 +496,7 @@ void sched_flush_ctrl(struct mux_session *restrict ss)
 static void
 sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
-	struct mux_frame *frame = stream_dequeue_send(s);
+	struct mux_frame *const frame = stream_dequeue_send(s);
 	if (frame != NULL) {
 		LOGVV_F("[fd:%d] sent SYN|PUSH for stream=%" PRIuLEAST16
 			" payload=%zu",
@@ -538,10 +519,9 @@ sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 	s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
 }
 
-/* Drain the low-priority lifecycle queue (INIT → SYN batching, CLOSED →
- * cleanup); data streams use the DRR queue.  Deferred to batch SYN flights for
- * streams opened together, and re-armed by the session_on_send epilogue if the
- * sendbuf is still occupied when lifecycle work remains. */
+/* Drain the low-priority lifecycle queue (INIT→SYN batching, CLOSED→
+ * cleanup); deferred to batch SYN flights for streams opened together,
+ * re-armed by session_on_send if sendbuf is still occupied. */
 void sched_drain_lp(struct mux_session *restrict ss)
 {
 	if (ss->state != SESSION_ESTABLISHED) {
@@ -590,10 +570,9 @@ void sched_drain_lp(struct mux_session *restrict ss)
 					s->id);
 				stream_close(s);
 			}
-			/* SYN_SENT: data waits for SYN|ACK.  Continue batching
-			 * while the sendbuf tail is still a staging entry: bare
-			 * SYN frames pack into it, while a SYN+PUSH appended by
-			 * reference closes the staging and ends the batch. */
+			/* SYN_SENT: data waits for SYN|ACK; continue batching
+			 * while the sendbuf tail is a staging entry; a SYN+PUSH
+			 * appended by reference closes the staging. */
 			if (ss->wire.sendbuf.head != NULL &&
 			    !ss->wire.sendbuf_staging) {
 				break;
@@ -610,9 +589,9 @@ static void
 sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *restrict ss = w->data;
+	struct mux_session *const restrict ss = w->data;
 	ASSERT(loop == ss->loop);
-	UNUSED(loop);
+	(void)loop;
 	/* Walk the list in-place: survivors stay; expired nodes are removed in
 	 * O(1) and scheduled.  Reentrant sched_delay calls prepend to
 	 * delay_head and are visited in the next tick. */
@@ -640,10 +619,9 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		s = next;
 	}
 
-	/* Emit deferred session-level ACK for non-stream-0 frames (spec §5.7.3).
-	 * The force path (delta >= CLAMP(session_window / 4, 2, 8)) is handled
-	 * immediately in process_frame upon receipt; this timer covers the
-	 * normal deferred case and serves as a fallback on allocation failure. */
+	/* Emit deferred session-level ACK (spec §5.7.3); this coalescing timer
+	 * covers the normal path; the force path (delta >= window/4) is handled
+	 * in recv.c immediately on receipt. */
 	if (ss->state == SESSION_ESTABLISHED &&
 	    ss->unacked.recv_seq != ss->unacked.ack_seq) {
 		ss->unacked.ack_ticks++;

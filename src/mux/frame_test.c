@@ -9,9 +9,6 @@
 
 #include "mux/mux.h"
 
-/* Unlock the testing.h bench macros (need a monotonic clock from os/clock.h). */
-#include "os/clock.h"
-#define UTILS_MEASURE_H
 #include "utils/testing.h"
 
 #include <stdbool.h>
@@ -361,7 +358,7 @@ T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 	const int n = 6;
 
 	for (int i = 0; i < n; i++) {
-		struct mux_frame *f =
+		struct mux_frame *const f =
 			mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(f != NULL);
 		T_CHECK(mux_frame_ring_push(&r, f));
@@ -436,26 +433,27 @@ T_DECLARE_BENCH(bench_frame_get_put)
 	}
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_frame_get_resets_runtime_fields),
+	T_CASE(test_frame_put_calls_allocator_free),
+	T_CASE(test_header_roundtrip_preserves_all_fields),
+	T_CASE(test_header_roundtrip_with_flag_combinations),
+	T_CASE(test_frame_list_push_pop_fifo),
+	T_CASE(test_frame_list_drain_clears_head_tail_and_count),
+	T_CASE(test_frame_ring_null_and_empty_ops),
+	T_CASE(test_frame_ring_push_pop_fifo),
+	T_CASE(test_frame_ring_grow_contiguous),
+	T_CASE(test_frame_ring_grow_wrapped),
+	T_CASE(test_frame_ring_free_releases_all_frames),
+	/* Opt-in micro-benchmarks: each runs ~1s, so they are skipped by the
+	 * default (unfiltered) run.  Select with `--run <ere>` or TESTING_FILTER. */
+	T_BENCH(bench_header_roundtrip),
+	T_BENCH(bench_frame_ring_push_pop),
+	T_BENCH(bench_frame_get_put),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_frame_get_resets_runtime_fields);
-	T_RUN_CASE(t, test_frame_put_calls_allocator_free);
-	T_RUN_CASE(t, test_header_roundtrip_preserves_all_fields);
-	T_RUN_CASE(t, test_header_roundtrip_with_flag_combinations);
-	T_RUN_CASE(t, test_frame_list_push_pop_fifo);
-	T_RUN_CASE(t, test_frame_list_drain_clears_head_tail_and_count);
-	T_RUN_CASE(t, test_frame_ring_null_and_empty_ops);
-	T_RUN_CASE(t, test_frame_ring_push_pop_fifo);
-	T_RUN_CASE(t, test_frame_ring_grow_contiguous);
-	T_RUN_CASE(t, test_frame_ring_grow_wrapped);
-	T_RUN_CASE(t, test_frame_ring_free_releases_all_frames);
-	/* Opt-in micro-benchmarks: each runs ~1s, so keep them out of the
-	 * default ctest run.  Enable with BENCH set in the environment. */
-	if (getenv("BENCH") != NULL) {
-		T_RUN_BENCH(t, bench_header_roundtrip);
-		T_RUN_BENCH(t, bench_frame_ring_push_pop);
-		T_RUN_BENCH(t, bench_frame_get_put);
-	}
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

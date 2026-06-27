@@ -70,12 +70,9 @@ struct tunnel_opts {
 #endif
 };
 
-/* Allocate a tunnel and create the underlying mux session.  Does NOT start
- * the tunnel thread; call tunnel_start() after successful registration.
- * Accepts ownership of opts->fd.  opts->connect_addr is the outbound address
- * for client-mode sessions (NULL for server-accepted).  opts->identity and
- * opts->peer_id are optional metadata that are copied if non-NULL.
- * Returns NULL on allocation failure. */
+/* Allocate a tunnel and create the underlying mux session; does NOT start
+ * the tunnel thread (call tunnel_start() after registration).  Takes
+ * ownership of opts->fd; returns NULL on allocation failure. */
 struct tunnel *
 tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts);
 
@@ -83,10 +80,9 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts);
  * tunnel_new() succeeds and the tunnel has been registered. */
 void tunnel_start(struct tunnel *t);
 
-/* Force-close the tunnel and release all resources.  Disconnects relay
- * callbacks, suppresses mux callbacks, closes the session, joins the
- * tunnel thread, and frees the tunnel struct.  Safe to call regardless
- * of whether the tunnel thread was started. */
+/* Force-close: disconnect relay callbacks, suppress mux callbacks, close
+ * the session, join the tunnel thread, and free the struct.  Safe even if
+ * the tunnel thread was never started. */
 void tunnel_close(struct tunnel *t);
 
 /* Dispatch a graceful shutdown request to the session's tunnel loop.
@@ -105,7 +101,11 @@ int tunnel_fd(const struct tunnel *t);
 enum mux_state tunnel_state(const struct tunnel *t);
 struct mux_session *tunnel_session(const struct tunnel *t);
 const char *tunnel_peer_id(const struct tunnel *t);
-const char *tunnel_peer_identity(const struct tunnel *t);
+/* Copy the peer identity (from the session thread's published snapshot) into buf;
+ * returns whether a peer identity is present.  Safe to call from the server
+ * thread while the tunnel's session thread runs. */
+bool tunnel_peer_identity_copy(
+	const struct tunnel *t, char *restrict buf, size_t buflen);
 #if WITH_TLS
 const unsigned char *tunnel_peer_cert_der(const struct tunnel *t, size_t *len);
 #endif
@@ -122,8 +122,9 @@ struct tunnel_stats {
 	const char *peer_identity;
 	/* Server-wide monotonic index, never reused. */
 	uint_least64_t tunnel_index;
-	/* borrowed pointer to the tunnel's diagnostic tag ("my <= peer") */
-	const char *tag;
+	/* the tunnel's diagnostic tag ("my <= peer"), copied from the session
+	 * thread's published snapshot */
+	char tag[256];
 	/* true for passively-accepted (server-role) tunnels; used by
 	 * server_stats() to avoid double-counting stream counters. */
 	bool accepted;
@@ -189,10 +190,9 @@ struct tunnel_reload_opts {
 	const char *forward_addr;
 };
 
-/* Dispatch a single-pass reload to the session's tunnel loop.
- * Address updates, drain config, socket options, and TLS context are all
- * applied in one atomic task.  On allocation failure the dispatch is
- * skipped and the error is logged; the caller's loop continues. */
+/* Dispatch a single-pass reload to the session's tunnel loop; address
+ * updates, drain config, socket options, and TLS context applied atomically.
+ * On OOM the dispatch is skipped and the error is logged. */
 void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts);
 
 #endif /* TUNNEL_H */

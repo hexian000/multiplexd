@@ -88,7 +88,8 @@ const struct sockaddr *mux_peer_addr(const struct mux_session *ss)
 
 enum mux_state mux_state(const struct mux_session *ss)
 {
-	switch (ss->state) {
+	/* Read the relaxed-atomic mirror: callable from the server thread. */
+	switch ((enum session_state)PUB_LOAD(ss->_pub_state)) {
 	case SESSION_ESTABLISHED:
 	case SESSION_CLOSING:
 	case SESSION_CLOSE_WAIT:
@@ -117,11 +118,13 @@ const struct mux_config *mux_conf(const struct mux_session *ss)
 void mux_session_stats(
 	const struct mux_session *ss, struct mux_session_stats *restrict out)
 {
-	out->rx_window = (size_t)ss->stream_window * MUX_WINDOW_UNIT;
-	out->tx_window = (size_t)ss->peer_stream_window * MUX_WINDOW_UNIT;
-	out->rtt = ss->estimator.rtt;
-	out->bdp_rx = ss->estimator.rx.bdp;
-	out->bdp_tx = ss->estimator.tx.bdp;
+	/* Read the relaxed-atomic mirrors: callable from the server thread. */
+	out->rx_window = PUB_LOAD(ss->_pub_stream_window) * MUX_WINDOW_UNIT;
+	out->tx_window =
+		PUB_LOAD(ss->_pub_peer_stream_window) * MUX_WINDOW_UNIT;
+	out->rtt = PUB_LOAD(ss->_pub_rtt);
+	out->bdp_rx = PUB_LOAD(ss->_pub_bdp_rx);
+	out->bdp_tx = PUB_LOAD(ss->_pub_bdp_tx);
 }
 
 /* --- Session mutators --- */
@@ -229,7 +232,7 @@ int mux_stream_send(
 	const unsigned char *p = buf;
 
 	while (remaining > 0) {
-		struct mux_frame *frame = mux_frame_get(
+		struct mux_frame *const frame = mux_frame_get(
 			&s->session->pool, s->session->max_payload);
 		if (frame == NULL) {
 			if (to_send == remaining) {
@@ -285,7 +288,7 @@ int mux_stream_recv(
 
 	const size_t cap = *len;
 	size_t copied = 0;
-	unsigned char *dst = buf;
+	unsigned char *const dst = buf;
 
 	while (ringbuf_readable(s->recvbuf) > 0 && copied < cap) {
 		const size_t take =

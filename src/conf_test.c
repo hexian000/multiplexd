@@ -38,11 +38,11 @@ static bool
 write_conf_file(const struct config *restrict conf, const char *restrict path)
 {
 	size_t len;
-	char *json = conf_dump(conf, &len);
+	char *const json = conf_dump(conf, &len);
 	if (json == NULL) {
 		return false;
 	}
-	FILE *fp = fopen(path, "w");
+	FILE *const fp = fopen(path, "w");
 	if (fp == NULL) {
 		free(json);
 		return false;
@@ -77,9 +77,8 @@ find_peer(const struct config *restrict conf, const char *restrict id)
 
 T_DECLARE_CASE(test_conf_new_default_fields)
 {
-	struct config *conf = conf_new_default();
+	struct config *const conf = conf_new_default();
 	T_CHECK(conf != NULL);
-	/* Default type is NULL — no type annotation in a freshly created conf. */
 	T_EXPECT(conf->type == NULL);
 	/* Default timeouts are positive, including the derived inactivity timeout
 	 * (conf_new_default must derive it just like conf_check does). */
@@ -90,20 +89,20 @@ T_DECLARE_CASE(test_conf_new_default_fields)
 
 T_DECLARE_CASE(test_conf_parsefile_nonexistent)
 {
-	struct config *conf =
+	struct config *const conf =
 		conf_parsefile("/nonexistent/path/that/cannot/exist.json");
 	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_invalid_json)
 {
-	struct config *conf = parse_tmpconf("{bad json");
+	struct config *const conf = parse_tmpconf("{bad json");
 	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_minimal_client)
 {
-	struct config *conf =
+	struct config *const conf =
 		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\"}");
 	T_CHECK(conf != NULL);
 	T_CHECK(conf->mux_connect != NULL);
@@ -114,7 +113,7 @@ T_DECLARE_CASE(test_conf_parsefile_minimal_client)
 
 T_DECLARE_CASE(test_conf_parsefile_minimal_server)
 {
-	struct config *conf =
+	struct config *const conf =
 		parse_tmpconf("{\"mux_listen\":\"127.0.0.1:9000\"}");
 	T_CHECK(conf != NULL);
 	T_CHECK(conf->mux_listen != NULL);
@@ -125,7 +124,7 @@ T_DECLARE_CASE(test_conf_parsefile_minimal_server)
 
 T_DECLARE_CASE(test_conf_dump_roundtrip)
 {
-	struct config *orig = conf_new_default();
+	struct config *const orig = conf_new_default();
 	T_CHECK(orig != NULL);
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	T_CHECK(orig->mux_connect != NULL);
@@ -136,7 +135,7 @@ T_DECLARE_CASE(test_conf_dump_roundtrip)
 	(void)close(fd);
 	T_CHECK(write_conf_file(orig, tmpl));
 
-	struct config *reparsed = conf_parsefile(tmpl);
+	struct config *const reparsed = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
 	T_CHECK(reparsed != NULL);
 	T_CHECK(reparsed->mux_connect != NULL);
@@ -152,7 +151,7 @@ T_DECLARE_CASE(test_conf_identity_connect_count)
 {
 	/* Identity-client mode: mux_connect lists destinations; claim is
 	 * required alongside mux_connect. */
-	struct config *conf = parse_tmpconf(
+	struct config *const conf = parse_tmpconf(
 		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\",\"127.0.0.1:9002\"]}}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ((int)conf->identity.mux_connect_count, 2);
@@ -161,7 +160,7 @@ T_DECLARE_CASE(test_conf_identity_connect_count)
 
 T_DECLARE_CASE(test_conf_loglevel_parsed)
 {
-	struct config *conf = parse_tmpconf(
+	struct config *const conf = parse_tmpconf(
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"loglevel\":3}");
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->loglevel, 3);
@@ -170,13 +169,13 @@ T_DECLARE_CASE(test_conf_loglevel_parsed)
 
 T_DECLARE_CASE(test_conf_parsefile_requires_transport)
 {
-	struct config *conf = parse_tmpconf("{}");
+	struct config *const conf = parse_tmpconf("{}");
 	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_requires_claim_for_identity)
 {
-	struct config *conf = parse_tmpconf(
+	struct config *const conf = parse_tmpconf(
 		"{\"identity\":{\"mux_connect\":[\"127.0.0.1:9001\"]}}");
 	T_EXPECT(conf == NULL);
 }
@@ -185,7 +184,7 @@ T_DECLARE_CASE(test_conf_parsefile_parses_identity_listen)
 {
 	const char *json =
 		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer1\":\"127.0.0.1:9002\",\"peer2\":\"127.0.0.1:9003\"}}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ((int)conf->identity.mux_connect_count, 1);
 	T_EXPECT_EQ((int)conf->identity.peers_count, 2);
@@ -200,7 +199,7 @@ T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_format)
 {
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"10:20\"}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_EXPECT(conf == NULL);
 }
 
@@ -208,7 +207,7 @@ T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_rate)
 {
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"10:101:20\"}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_EXPECT(conf == NULL);
 }
 
@@ -216,7 +215,7 @@ T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_range)
 {
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"10:20:10\"}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_EXPECT(conf == NULL);
 }
 
@@ -224,7 +223,7 @@ T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 {
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"keepalive\":5,\"send_timeout\":30,\"connect_timeout\":40,\"resume_timeout\":1,\"idle_timeout\":2},\"loglevel\":999}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 
 	T_EXPECT_EQ(conf->mux.keepalive, 10); /* 5 → clamped up to floor 10 */
@@ -247,7 +246,7 @@ T_DECLARE_CASE(test_conf_parsefile_partial_window_config_accepted)
 	 * 32768/16384=2 frames, clamped to the minimum of 4. */
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"stream_window\":32768}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->mux.stream_window, 4);
 	T_EXPECT_EQ(conf->mux.session_window, 0);
@@ -259,7 +258,7 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_partial_tls_config)
 {
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"cert\":\"dummy\"}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_EXPECT(conf == NULL);
 }
 
@@ -268,7 +267,7 @@ T_DECLARE_CASE(test_conf_parsefile_authcerts_array)
 	/* Verify that the authcerts array is parsed and stored correctly. */
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"cert\":\"certdata\",\"key\":\"keydata\",\"authcerts\":[\"ca1.pem\",\"ca2.pem\"]}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ((int)conf->tls_authcerts_count, 2);
 	T_EXPECT_STREQ(conf->tls_authcerts[0], "ca1.pem");
@@ -278,11 +277,10 @@ T_DECLARE_CASE(test_conf_parsefile_authcerts_array)
 
 T_DECLARE_CASE(test_conf_dump_tls_fields)
 {
-	/* Verify that tls.cert, tls.key, tls.authcerts, and the socket_offload /
-	 * kernel_offload booleans survive a dump/parse round-trip, exercising
-	 * dump_tls.  Both booleans are set to true (non-zero) so a dump that fails
-	 * to serialize them would reparse as false and fail this test. */
-	struct config *orig = conf_new_default();
+	/* dump/parse round-trip for tls.cert, tls.key, tls.authcerts,
+	 * socket_offload, and kernel_offload; both booleans set to true so
+	 * a failed serialization would reparse as false. */
+	struct config *const orig = conf_new_default();
 	T_CHECK(orig != NULL);
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	orig->tls_cert = strdup("certdata");
@@ -304,7 +302,7 @@ T_DECLARE_CASE(test_conf_dump_tls_fields)
 	(void)close(fd);
 	T_CHECK(write_conf_file(orig, tmpl));
 
-	struct config *reparsed = conf_parsefile(tmpl);
+	struct config *const reparsed = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
 	T_CHECK(reparsed != NULL);
 	T_EXPECT_STREQ(reparsed->tls_cert, "certdata");
@@ -326,7 +324,7 @@ T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
 	T_CHECK(write_tmpfile(cert_tmpl, "CERTCONTENT") == 0);
 	T_CHECK(write_tmpfile(key_tmpl, "KEYCONTENT") == 0);
 
-	struct config *conf = conf_new_default();
+	struct config *const conf = conf_new_default();
 	T_CHECK(conf != NULL);
 
 	char cert_at[256], key_at[256];
@@ -349,7 +347,7 @@ T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
 T_DECLARE_CASE(test_conf_inline_pem_fails_for_missing_file)
 {
 	/* conf_inline_pem must return false if an @path file does not exist. */
-	struct config *conf = conf_new_default();
+	struct config *const conf = conf_new_default();
 	T_CHECK(conf != NULL);
 	conf->tls_cert = strdup("@/tmp/conf_inline_nonexistent_XXXXXX.pem");
 	conf->tls_key = strdup("plaintext");
@@ -368,7 +366,7 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 	 * or overwriting the default field values. */
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"-mux_connect\":\"should-be-ignored\",\"-loglevel\":0,\"mux\":{\"send_timeout\":30,\"-send_timeout\":999,\"-nodelay\":false},\"-tcp\":{\"nodelay\":false},\"identity\":{\"claim\":\"me\",\"-claim\":\"ignored\"}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	/* mux_connect must reflect the real key, not the commented-out one. */
 	T_EXPECT(strcmp(conf->mux_connect, "127.0.0.1:9000") == 0);
@@ -388,7 +386,7 @@ T_DECLARE_CASE(test_conf_parsefile_unknown_root_key)
 	/* Unknown keys at the root level must be warned about but not fail. */
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"nosuchkey\":\"value\"}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_STREQ(conf->mux_listen, "127.0.0.1:9000");
 	conf_free(conf);
@@ -399,7 +397,7 @@ T_DECLARE_CASE(test_conf_parsefile_unknown_mux_key)
 	/* Unknown keys inside a scope must be warned about but not fail. */
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"nosuchfield\":1}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_STREQ(conf->mux_connect, "127.0.0.1:9000");
 	conf_free(conf);
@@ -410,7 +408,7 @@ T_DECLARE_CASE(test_conf_parsefile_mem_pressure_config)
 	/* Verify that the mux.mem_pressure sub-object is parsed correctly. */
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"mem_pressure\":{\"hi\":1000,\"lo\":500}}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->mux.mem_pressure_hi, 1000);
 	T_EXPECT_EQ(conf->mux.mem_pressure_lo, 500);
@@ -423,7 +421,7 @@ T_DECLARE_CASE(test_conf_parsefile_session_window_positive)
 	 * each axis is independent.  65536/16384=4 frames. */
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"session_window\":65536}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	/* session_window stored as frames; stream_window not set (auto). */
 	T_EXPECT_EQ(conf->mux.session_window, 4);
@@ -433,13 +431,11 @@ T_DECLARE_CASE(test_conf_parsefile_session_window_positive)
 
 T_DECLARE_CASE(test_conf_parsefile_both_windows_positive)
 {
-	/* When both stream_window and session_window are given positive values,
-	 * the parser stores them in units (divided by MUX_MAX_PAYLOAD_SIZE),
-	 * clamped to [4, max].  32768/16384=2 → clamped to 4;
-	 * 131072/16384=8, within range. */
+	/* Both windows positive: stored as frame counts (/ MUX_MAX_PAYLOAD_SIZE),
+	 * clamped to [4, max]. 32768/16384=2 → 4; 131072/16384=8 in range. */
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"stream_window\":32768,\"session_window\":131072}}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->mux.stream_window, 4);
 	T_EXPECT_EQ(conf->mux.session_window, 8);
@@ -452,7 +448,7 @@ T_DECLARE_CASE(test_conf_parsefile_max_startups_valid)
 	 * throttle fields. */
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"10:50:200\"}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ(conf->startup_limit_start, 10);
 	T_EXPECT_EQ(conf->startup_limit_rate, 50);
@@ -477,7 +473,7 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_file)
 		remaining -= (size_t)w;
 	}
 	(void)close(fd);
-	struct config *conf = conf_parsefile(tmpl);
+	struct config *const conf = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
 	T_EXPECT(conf == NULL);
 }
@@ -495,7 +491,7 @@ T_DECLARE_CASE(test_conf_parsefile_stdin_success)
 	T_CHECK(saved_stdin >= 0);
 	T_CHECK(dup2(pipefd[0], STDIN_FILENO) == STDIN_FILENO);
 	(void)close(pipefd[0]);
-	struct config *conf = conf_parsefile("-");
+	struct config *const conf = conf_parsefile("-");
 	T_CHECK(dup2(saved_stdin, STDIN_FILENO) == STDIN_FILENO);
 	(void)close(saved_stdin);
 	T_CHECK(conf != NULL);
@@ -527,7 +523,7 @@ T_DECLARE_CASE(test_conf_parsefile_stdin_rejects_oversized)
 	T_CHECK(saved_stdin >= 0);
 	T_CHECK(dup2(filefd, STDIN_FILENO) == STDIN_FILENO);
 	(void)close(filefd);
-	struct config *conf = conf_parsefile("-");
+	struct config *const conf = conf_parsefile("-");
 	T_CHECK(dup2(saved_stdin, STDIN_FILENO) == STDIN_FILENO);
 	(void)close(saved_stdin);
 	T_EXPECT(conf == NULL);
@@ -537,7 +533,7 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 {
 	/* Verify that identity.claim and identity.mux_connect survive a
 	 * dump/parse round-trip, exercising dump_identity_scope. */
-	struct config *orig = conf_new_default();
+	struct config *const orig = conf_new_default();
 	T_CHECK(orig != NULL);
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	orig->identity.claim = strdup("mynode");
@@ -555,7 +551,7 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 	(void)close(fd);
 	T_CHECK(write_conf_file(orig, tmpl));
 
-	struct config *reparsed = conf_parsefile(tmpl);
+	struct config *const reparsed = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
 	T_CHECK(reparsed != NULL);
 	T_EXPECT_STREQ(reparsed->identity.claim, "mynode");
@@ -574,7 +570,7 @@ T_DECLARE_CASE(test_identity_authcerts_parse_empty)
 			   "  \"authcerts\": {}"
 			   "}"
 			   "}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ((int)conf->identity.authcerts_count, 0);
 	conf_free(conf);
@@ -597,7 +593,7 @@ T_DECLARE_CASE(test_identity_authcerts_free_without_inline_pem)
 			   "  }"
 			   "}"
 			   "}";
-	struct config *conf = parse_tmpconf(json);
+	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
 	T_EXPECT_EQ((int)conf->identity.authcerts_count, 1);
 	T_EXPECT_EQ((int)conf->identity.authcerts[0].certs_count, 1);
@@ -615,48 +611,51 @@ T_DECLARE_CASE(test_identity_authcerts_free_without_inline_pem)
 			      "  }"
 			      "}"
 			      "}";
-	struct config *rejected = parse_tmpconf(invalid);
+	struct config *const rejected = parse_tmpconf(invalid);
 	T_EXPECT(rejected == NULL);
 }
 
-int main(void)
-{
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_conf_new_default_fields);
-	T_RUN_CASE(t, test_conf_parsefile_nonexistent);
-	T_RUN_CASE(t, test_conf_parsefile_invalid_json);
-	T_RUN_CASE(t, test_conf_parsefile_minimal_client);
-	T_RUN_CASE(t, test_conf_parsefile_minimal_server);
-	T_RUN_CASE(t, test_conf_dump_roundtrip);
-	T_RUN_CASE(t, test_conf_identity_connect_count);
-	T_RUN_CASE(t, test_conf_loglevel_parsed);
-	T_RUN_CASE(t, test_conf_parsefile_requires_transport);
-	T_RUN_CASE(t, test_conf_parsefile_requires_claim_for_identity);
-	T_RUN_CASE(t, test_conf_parsefile_parses_identity_listen);
-	T_RUN_CASE(t, test_conf_parsefile_invalid_max_startups_format);
-	T_RUN_CASE(t, test_conf_parsefile_invalid_max_startups_rate);
-	T_RUN_CASE(t, test_conf_parsefile_invalid_max_startups_range);
-	T_RUN_CASE(t, test_conf_parsefile_clamps_timeout_fields);
-	T_RUN_CASE(t, test_conf_parsefile_partial_window_config_accepted);
+static const struct testing_suite suite[] = {
+	T_CASE(test_conf_new_default_fields),
+	T_CASE(test_conf_parsefile_nonexistent),
+	T_CASE(test_conf_parsefile_invalid_json),
+	T_CASE(test_conf_parsefile_minimal_client),
+	T_CASE(test_conf_parsefile_minimal_server),
+	T_CASE(test_conf_dump_roundtrip),
+	T_CASE(test_conf_identity_connect_count),
+	T_CASE(test_conf_loglevel_parsed),
+	T_CASE(test_conf_parsefile_requires_transport),
+	T_CASE(test_conf_parsefile_requires_claim_for_identity),
+	T_CASE(test_conf_parsefile_parses_identity_listen),
+	T_CASE(test_conf_parsefile_invalid_max_startups_format),
+	T_CASE(test_conf_parsefile_invalid_max_startups_rate),
+	T_CASE(test_conf_parsefile_invalid_max_startups_range),
+	T_CASE(test_conf_parsefile_clamps_timeout_fields),
+	T_CASE(test_conf_parsefile_partial_window_config_accepted),
 #if WITH_TLS
-	T_RUN_CASE(t, test_conf_parsefile_rejects_partial_tls_config);
-	T_RUN_CASE(t, test_conf_parsefile_authcerts_array);
-	T_RUN_CASE(t, test_conf_dump_tls_fields);
-	T_RUN_CASE(t, test_conf_inline_pem_replaces_at_path);
-	T_RUN_CASE(t, test_conf_inline_pem_fails_for_missing_file);
+	T_CASE(test_conf_parsefile_rejects_partial_tls_config),
+	T_CASE(test_conf_parsefile_authcerts_array),
+	T_CASE(test_conf_dump_tls_fields),
+	T_CASE(test_conf_inline_pem_replaces_at_path),
+	T_CASE(test_conf_inline_pem_fails_for_missing_file),
 #endif
-	T_RUN_CASE(t, test_conf_parsefile_ignores_comment_keys);
-	T_RUN_CASE(t, test_conf_parsefile_unknown_root_key);
-	T_RUN_CASE(t, test_conf_parsefile_unknown_mux_key);
-	T_RUN_CASE(t, test_conf_parsefile_mem_pressure_config);
-	T_RUN_CASE(t, test_conf_parsefile_session_window_positive);
-	T_RUN_CASE(t, test_conf_parsefile_both_windows_positive);
-	T_RUN_CASE(t, test_conf_parsefile_max_startups_valid);
-	T_RUN_CASE(t, test_conf_dump_identity_fields);
-	T_RUN_CASE(t, test_conf_parsefile_rejects_oversized_file);
-	T_RUN_CASE(t, test_conf_parsefile_stdin_success);
-	T_RUN_CASE(t, test_conf_parsefile_stdin_rejects_oversized);
-	T_RUN_CASE(t, test_identity_authcerts_parse_empty);
-	T_RUN_CASE(t, test_identity_authcerts_free_without_inline_pem);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	T_CASE(test_conf_parsefile_ignores_comment_keys),
+	T_CASE(test_conf_parsefile_unknown_root_key),
+	T_CASE(test_conf_parsefile_unknown_mux_key),
+	T_CASE(test_conf_parsefile_mem_pressure_config),
+	T_CASE(test_conf_parsefile_session_window_positive),
+	T_CASE(test_conf_parsefile_both_windows_positive),
+	T_CASE(test_conf_parsefile_max_startups_valid),
+	T_CASE(test_conf_dump_identity_fields),
+	T_CASE(test_conf_parsefile_rejects_oversized_file),
+	T_CASE(test_conf_parsefile_stdin_success),
+	T_CASE(test_conf_parsefile_stdin_rejects_oversized),
+	T_CASE(test_identity_authcerts_parse_empty),
+	T_CASE(test_identity_authcerts_free_without_inline_pem),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
+{
+	return testing_main(argc, argv, suite);
 }

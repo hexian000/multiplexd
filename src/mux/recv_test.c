@@ -1,10 +1,9 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* recv_test.c - white-box tests for the receive pipeline in recv.c (frame
- * decode/dispatch, flag matrices, stream-id parity, admission, window updates).
- * Dependencies: recv.c #included; all collaborators (stream/sched/estimator/
- * handshake/send/wire/session) replaced by spies below; no sibling TUs linked. */
+/* recv_test.c - white-box tests for recv.c (frame decode/dispatch, flag
+ * matrices, stream-id parity, admission, window updates); recv.c #included,
+ * all collaborators replaced by spies. */
 
 #include "mux/estimator.h"
 #include "mux/frame.h"
@@ -32,10 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* mock - collaborator spies
- *
- * Spy state: every collaborator call a routing decision depends on is
- * recorded here; controllable return fields steer the decisions. */
+/* mock - collaborator spies; every routing-decision call is recorded
+ * in struct spies; controllable return fields steer the decisions. */
 
 static struct spies {
 	int send_ctrl_calls;
@@ -1717,60 +1714,63 @@ T_DECLARE_CASE(test_session_on_recv_dispatches_and_loops)
 	rf_teardown(&fx);
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_validate_flags_syn_sent),
+	T_CASE(test_validate_flags_established),
+	T_CASE(test_validate_flags_closing_states),
+	T_CASE(test_validate_flags_inert_states),
+	T_CASE(test_ignorable_terminal_frame),
+	T_CASE(test_valid_peer_stream_id),
+	T_CASE(test_update_session_window_floors_and_noop),
+	T_CASE(test_update_session_window_clears_stall_on_growth),
+	T_CASE(test_update_stream_window_grows_and_iterates),
+	T_CASE(test_dispatch_by_stream_rst),
+	T_CASE(test_dispatch_by_stream_invalid_flags_sends_rst),
+	T_CASE(test_dispatch_by_stream_synack_establishes),
+	T_CASE(test_dispatch_by_stream_synack_idempotent),
+	T_CASE(test_dispatch_by_stream_push_fin),
+	T_CASE(test_dispatch_by_stream_ack_grants_credit),
+	T_CASE(test_dispatch_by_stream_closed_ignores_rst),
+	T_CASE(test_dispatch_by_stream_closed_late_frame_rst_once),
+	T_CASE(test_dispatch_no_stream_rst_ignored),
+	T_CASE(test_dispatch_no_stream_bad_syn_flags_resets),
+	T_CASE(test_dispatch_no_stream_bad_parity_resets),
+	T_CASE(test_dispatch_no_stream_draining_refuses),
+	T_CASE(test_dispatch_no_stream_max_streams_refuses),
+	T_CASE(test_dispatch_no_stream_accept_null_refuses),
+	T_CASE(test_dispatch_no_stream_accept_rejects),
+	T_CASE(test_dispatch_no_stream_accept_ok),
+	T_CASE(test_dispatch_no_stream_stream_new_oom),
+	T_CASE(test_dispatch_no_stream_add_stream_fails),
+	T_CASE(test_dispatch_no_stream_reserved_flags_resets),
+	T_CASE(test_dispatch_no_stream_late_nonsyn_rst),
+	T_CASE(test_dispatch_no_stream_ignorable_terminal),
+	T_CASE(test_dispatch_frame_accepts_oversized_length),
+	T_CASE(test_dispatch_by_stream_oversized_push),
+	T_CASE(test_dispatch_frame_unsupported_version_resets),
+	T_CASE(test_dispatch_frame_reserved_flags_resets),
+	T_CASE(test_dispatch_frame_hello_routed_to_handshake),
+	T_CASE(test_dispatch_frame_session_ack_trims),
+	T_CASE(test_dispatch_frame_session_ack_overflow_resets),
+	T_CASE(test_dispatch_frame_ctrl_ping_pong_probe),
+	T_CASE(test_dispatch_frame_data_forces_session_ack),
+	T_CASE(test_recv_ping_rate_limited),
+	T_CASE(test_recv_ping_oom_drops_pong),
+	T_CASE(test_recv_ping_oversized_resets),
+	T_CASE(test_recv_pong_short_payload_ignored),
+	T_CASE(test_recv_pong_feeds_estimator),
+	T_CASE(test_recv_one_error_suspends_resumable),
+	T_CASE(test_recv_one_error_resets_fresh),
+	T_CASE(test_recv_one_handshake_suspends_resumable),
+	T_CASE(test_recv_one_reserve_oom_resets),
+	T_CASE(test_session_on_recv_dispatches_and_loops),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
 	/* Surface the VERYVERBOSE/DEBUG diagnostic branches in recv.c. */
 	slog_level_ = LOG_LEVEL_VERYVERBOSE;
 
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_validate_flags_syn_sent);
-	T_RUN_CASE(t, test_validate_flags_established);
-	T_RUN_CASE(t, test_validate_flags_closing_states);
-	T_RUN_CASE(t, test_validate_flags_inert_states);
-	T_RUN_CASE(t, test_ignorable_terminal_frame);
-	T_RUN_CASE(t, test_valid_peer_stream_id);
-	T_RUN_CASE(t, test_update_session_window_floors_and_noop);
-	T_RUN_CASE(t, test_update_session_window_clears_stall_on_growth);
-	T_RUN_CASE(t, test_update_stream_window_grows_and_iterates);
-	T_RUN_CASE(t, test_dispatch_by_stream_rst);
-	T_RUN_CASE(t, test_dispatch_by_stream_invalid_flags_sends_rst);
-	T_RUN_CASE(t, test_dispatch_by_stream_synack_establishes);
-	T_RUN_CASE(t, test_dispatch_by_stream_synack_idempotent);
-	T_RUN_CASE(t, test_dispatch_by_stream_push_fin);
-	T_RUN_CASE(t, test_dispatch_by_stream_ack_grants_credit);
-	T_RUN_CASE(t, test_dispatch_by_stream_closed_ignores_rst);
-	T_RUN_CASE(t, test_dispatch_by_stream_closed_late_frame_rst_once);
-	T_RUN_CASE(t, test_dispatch_no_stream_rst_ignored);
-	T_RUN_CASE(t, test_dispatch_no_stream_bad_syn_flags_resets);
-	T_RUN_CASE(t, test_dispatch_no_stream_bad_parity_resets);
-	T_RUN_CASE(t, test_dispatch_no_stream_draining_refuses);
-	T_RUN_CASE(t, test_dispatch_no_stream_max_streams_refuses);
-	T_RUN_CASE(t, test_dispatch_no_stream_accept_null_refuses);
-	T_RUN_CASE(t, test_dispatch_no_stream_accept_rejects);
-	T_RUN_CASE(t, test_dispatch_no_stream_accept_ok);
-	T_RUN_CASE(t, test_dispatch_no_stream_stream_new_oom);
-	T_RUN_CASE(t, test_dispatch_no_stream_add_stream_fails);
-	T_RUN_CASE(t, test_dispatch_no_stream_reserved_flags_resets);
-	T_RUN_CASE(t, test_dispatch_no_stream_late_nonsyn_rst);
-	T_RUN_CASE(t, test_dispatch_no_stream_ignorable_terminal);
-	T_RUN_CASE(t, test_dispatch_frame_accepts_oversized_length);
-	T_RUN_CASE(t, test_dispatch_by_stream_oversized_push);
-	T_RUN_CASE(t, test_dispatch_frame_unsupported_version_resets);
-	T_RUN_CASE(t, test_dispatch_frame_reserved_flags_resets);
-	T_RUN_CASE(t, test_dispatch_frame_hello_routed_to_handshake);
-	T_RUN_CASE(t, test_dispatch_frame_session_ack_trims);
-	T_RUN_CASE(t, test_dispatch_frame_session_ack_overflow_resets);
-	T_RUN_CASE(t, test_dispatch_frame_ctrl_ping_pong_probe);
-	T_RUN_CASE(t, test_dispatch_frame_data_forces_session_ack);
-	T_RUN_CASE(t, test_recv_ping_rate_limited);
-	T_RUN_CASE(t, test_recv_ping_oom_drops_pong);
-	T_RUN_CASE(t, test_recv_ping_oversized_resets);
-	T_RUN_CASE(t, test_recv_pong_short_payload_ignored);
-	T_RUN_CASE(t, test_recv_pong_feeds_estimator);
-	T_RUN_CASE(t, test_recv_one_error_suspends_resumable);
-	T_RUN_CASE(t, test_recv_one_error_resets_fresh);
-	T_RUN_CASE(t, test_recv_one_handshake_suspends_resumable);
-	T_RUN_CASE(t, test_recv_one_reserve_oom_resets);
-	T_RUN_CASE(t, test_session_on_recv_dispatches_and_loops);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

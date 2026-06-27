@@ -75,7 +75,7 @@ static struct identity_peer *identity_listen_add(
 		LOGOOM();
 		return NULL;
 	}
-	struct identity_peer *restrict entries = realloc(
+	struct identity_peer *const restrict entries = realloc(
 		conf->identity.peers, (n + 1) * sizeof(*conf->identity.peers));
 	if (entries == NULL) {
 		LOGOOM();
@@ -104,7 +104,7 @@ static bool identity_listen_cb(
 		LOGE_F("identity.listen.%s: must be a string", key);
 		return false;
 	}
-	struct identity_peer *restrict p =
+	struct identity_peer *const restrict p =
 		identity_listen_add(conf, key, key_len);
 	if (p == NULL) {
 		return false;
@@ -126,7 +126,7 @@ static struct conf_identity_authcert *identity_authcert_add(
 		LOGOOM();
 		return NULL;
 	}
-	struct conf_identity_authcert *restrict entries =
+	struct conf_identity_authcert *const restrict entries =
 		realloc(conf->identity.authcerts,
 			(n + 1) * sizeof(*conf->identity.authcerts));
 	if (entries == NULL) {
@@ -160,7 +160,7 @@ static bool identity_authcert_cb(
 		return false;
 	}
 
-	struct conf_identity_authcert *restrict ac =
+	struct conf_identity_authcert *const restrict ac =
 		identity_authcert_add(conf, key, key_len);
 	if (ac == NULL) {
 		return false;
@@ -182,7 +182,7 @@ static bool identity_authcert_cb(
 			       key, count);
 			return false;
 		}
-		char **new_certs = (char **)realloc(
+		char **const new_certs = (char **)realloc(
 			(void *)ac->certs, (count + 1) * sizeof(*ac->certs));
 		if (new_certs == NULL) {
 			LOGOOM();
@@ -315,10 +315,15 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	cfg->mux_tcp.tcp_reuseport = obj->mux.tcp.reuseport;
 	cfg->mux_tcp.tcp_keepalive = obj->mux.tcp.keepalive;
 	cfg->mux_tcp.tcp_nodelay = obj->mux.tcp.nodelay;
-	cfg->mux_tcp.tcp_sndbuf = (int)obj->mux.tcp.sndbuf;
-	cfg->mux_tcp.tcp_rcvbuf = (int)obj->mux.tcp.rcvbuf;
+	/* Clamp to INT_MAX: a value past it would wrap to a negative socket
+	 * option. */
+	cfg->mux_tcp.tcp_sndbuf =
+		(int)MIN(obj->mux.tcp.sndbuf, (uintmax_t)INT_MAX);
+	cfg->mux_tcp.tcp_rcvbuf =
+		(int)MIN(obj->mux.tcp.rcvbuf, (uintmax_t)INT_MAX);
 #if WITH_TCP_NOTSENT_LOWAT
-	cfg->mux_tcp.tcp_notsent_lowat = (int)obj->mux.tcp.notsent_lowat;
+	cfg->mux_tcp.tcp_notsent_lowat =
+		(int)MIN(obj->mux.tcp.notsent_lowat, (uintmax_t)INT_MAX);
 #else
 	if (obj->mux.tcp.notsent_lowat != 0) {
 		LOGW("unknown config: \"mux.tcp.notsent_lowat\"");
@@ -376,10 +381,11 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	cfg->tcp.tcp_reuseport = obj->tcp.reuseport;
 	cfg->tcp.tcp_keepalive = obj->tcp.keepalive;
 	cfg->tcp.tcp_nodelay = obj->tcp.nodelay;
-	cfg->tcp.tcp_sndbuf = (int)obj->tcp.sndbuf;
-	cfg->tcp.tcp_rcvbuf = (int)obj->tcp.rcvbuf;
+	cfg->tcp.tcp_sndbuf = (int)MIN(obj->tcp.sndbuf, (uintmax_t)INT_MAX);
+	cfg->tcp.tcp_rcvbuf = (int)MIN(obj->tcp.rcvbuf, (uintmax_t)INT_MAX);
 #if WITH_TCP_NOTSENT_LOWAT
-	cfg->tcp.tcp_notsent_lowat = (int)obj->tcp.notsent_lowat;
+	cfg->tcp.tcp_notsent_lowat =
+		(int)MIN(obj->tcp.notsent_lowat, (uintmax_t)INT_MAX);
 #else
 	if (obj->tcp.notsent_lowat != 0) {
 		LOGW("unknown config: \"tcp.notsent_lowat\"");
@@ -651,7 +657,7 @@ static char *read_file(const char *restrict path, size_t *restrict lenp)
 	}
 	/* The +1 allocation serves double duty: oversize detection and NUL
 	 * termination. Both regular files and stdin are read the same way. */
-	char *buf = malloc(CONF_MAXSIZE + 1);
+	char *const buf = malloc(CONF_MAXSIZE + 1);
 	if (buf == NULL) {
 		LOGOOM();
 		if (fp != stdin) {
@@ -754,11 +760,11 @@ struct config *conf_parse(char *json, const size_t len)
 struct config *conf_parsefile(const char *path)
 {
 	size_t len;
-	char *buf = read_file(path, &len);
+	char *const buf = read_file(path, &len);
 	if (buf == NULL) {
 		return NULL;
 	}
-	struct config *conf = conf_parse(buf, len);
+	struct config *const conf = conf_parse(buf, len);
 	free(buf);
 	return conf;
 }
@@ -910,12 +916,12 @@ static struct vbuffer *build_authcerts_json(const struct config *restrict conf)
 char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 {
 	struct vbuffer *listen_vbuf = build_listen_json(conf);
-	char *listen_json =
+	char *const listen_json =
 		listen_vbuf != NULL ? (char *)listen_vbuf->data : NULL;
 	const size_t listen_len = listen_vbuf != NULL ? listen_vbuf->len : 0;
 
 	struct vbuffer *authcerts_vbuf = build_authcerts_json(conf);
-	char *authcerts_json =
+	char *const authcerts_json =
 		authcerts_vbuf != NULL ? (char *)authcerts_vbuf->data : NULL;
 	const size_t authcerts_json_len =
 		authcerts_vbuf != NULL ? authcerts_vbuf->len : 0;
@@ -1125,7 +1131,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 
 	/* The dump is bounded by the same CONF_MAXSIZE limit applied when
 	 * reading, so a single allocation avoids a measuring pass. */
-	char *out = malloc(CONF_MAXSIZE + 1);
+	char *const out = malloc(CONF_MAXSIZE + 1);
 	if (out == NULL) {
 		VBUF_FREE(listen_vbuf);
 		VBUF_FREE(authcerts_vbuf);
@@ -1171,7 +1177,7 @@ static bool inline_field(char **restrict sp, const char *restrict name)
 	if (*sp == NULL || **sp != '@') {
 		return true;
 	}
-	char *content = read_file(*sp + 1, NULL);
+	char *const content = read_file(*sp + 1, NULL);
 	if (content == NULL) {
 		LOGE_F("failed to inline PEM field: %s", name);
 		return false;
@@ -1209,7 +1215,7 @@ static unsigned char *pem_cert_to_der(const char *pem, size_t *der_len)
 		return NULL;
 	}
 	size_t dlen = (b64_len * 3) / 4 + 4;
-	unsigned char *der = malloc(dlen);
+	unsigned char *const der = malloc(dlen);
 	if (der == NULL) {
 		return NULL;
 	}

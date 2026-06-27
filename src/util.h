@@ -34,8 +34,6 @@
 #define THRD_ASSERT(expr) ((void)(0))
 #endif /* WITH_THREADS */
 
-#define UNUSED(x) ((void)(x))
-
 /* Set TCP_NOTSENT_LOWAT (@p bytes threshold); no-op on unsupported platforms. */
 void socket_notsent_lowat(int fd, int bytes);
 

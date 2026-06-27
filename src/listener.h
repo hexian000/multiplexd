@@ -14,7 +14,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-struct config;
 struct ev_loop;
 struct listener;
 struct server;

@@ -2,16 +2,15 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* estimator_test.c - white-box tests for the BDP/RTT estimator in estimator.c.
- * Dependencies: estimator.c #included (with clock_monotonic_ns redirected to a
- * scripted mock); send_urgent and the monotonic clock are the only mocked
- * collaborators; no sibling TUs linked. */
+ * estimator.c is #included; clock_monotonic_ns redirected to a scripted mock;
+ * session_send_oob is the only other mocked collaborator; no siblings linked. */
 
-#include "algo/wndfilter.h"
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 
+#include "algo/wndfilter.h"
 /* Pre-include clock.h so its guard blocks the later clock_monotonic_ns-mocked
  * inclusion pulled in by estimator.c below. */
 #include "os/clock.h"
@@ -29,31 +28,31 @@ static int_fast64_t estimator_test_clock_monotonic_ns(void);
 #include "mux/estimator.c"
 #undef clock_monotonic_ns
 
-/* mock - scripted monotonic clock, send_urgent spy, reset helper */
+/* mock - scripted monotonic clock, session_send_oob spy, reset helper */
 
 enum {
 	CLOCK_SEQ_MAX = 8,
-	URGENT_PAYLOAD_MAX = 16,
+	OOB_PAYLOAD_MAX = 16,
 };
 
-static int_least64_t g_clock_seq[CLOCK_SEQ_MAX];
+static int_fast64_t g_clock_seq[CLOCK_SEQ_MAX];
 static size_t g_clock_len;
 static size_t g_clock_pos;
-static bool g_send_urgent_ok;
-static int g_send_urgent_calls;
-static uint_fast8_t g_last_urgent_extra;
-static unsigned char g_last_urgent_payload[URGENT_PAYLOAD_MAX];
-static size_t g_last_urgent_payload_len;
+static bool g_send_oob_ok;
+static int g_send_oob_calls;
+static uint_fast8_t g_last_oob_extra;
+static unsigned char g_last_oob_payload[OOB_PAYLOAD_MAX];
+static size_t g_last_oob_payload_len;
 
 static void estimator_test_reset(void)
 {
 	g_clock_len = 0;
 	g_clock_pos = 0;
-	g_send_urgent_ok = true;
-	g_send_urgent_calls = 0;
-	g_last_urgent_extra = 0;
-	memset(g_last_urgent_payload, 0, sizeof(g_last_urgent_payload));
-	g_last_urgent_payload_len = 0;
+	g_send_oob_ok = true;
+	g_send_oob_calls = 0;
+	g_last_oob_extra = 0;
+	memset(g_last_oob_payload, 0, sizeof(g_last_oob_payload));
+	g_last_oob_payload_len = 0;
 }
 
 static void set_clock_sequence(const int_fast64_t *seq, const size_t len)
@@ -81,13 +80,13 @@ bool session_send_oob(
 	const unsigned char *restrict payload, const size_t payload_len)
 {
 	(void)ss;
-	g_send_urgent_calls++;
-	g_last_urgent_extra = extra;
-	g_last_urgent_payload_len = payload_len;
-	if (payload_len <= sizeof(g_last_urgent_payload)) {
-		memcpy(g_last_urgent_payload, payload, payload_len);
+	g_send_oob_calls++;
+	g_last_oob_extra = extra;
+	g_last_oob_payload_len = payload_len;
+	if (payload_len <= sizeof(g_last_oob_payload)) {
+		memcpy(g_last_oob_payload, payload, payload_len);
 	}
-	return g_send_urgent_ok;
+	return g_send_oob_ok;
 }
 
 void session_suspend(struct mux_session *restrict ss)
@@ -108,7 +107,7 @@ static struct mux_session make_session(void)
 		.auto_session_window = true,
 		.session_window = 4,
 		.stream_window = 4,
-		.tag = (char *)"[test]:",
+		.tag = "[test]:",
 		.conf.timeout = 600,
 	};
 	return ss;
@@ -175,7 +174,7 @@ T_DECLARE_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight)
 
 	estimator_add(&ss, 20);
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)35);
-	T_EXPECT_EQ(g_send_urgent_calls, 0);
+	T_EXPECT_EQ(g_send_oob_calls, 0);
 	T_EXPECT(ss.estimator.ping_in_flight);
 }
 
@@ -193,9 +192,9 @@ T_DECLARE_CASE(test_estimator_add_starts_cycle_after_rate_limit)
 	ss.estimator.last_probe_ns = 1;
 
 	estimator_add(&ss, 40000);
-	T_EXPECT_EQ(g_send_urgent_calls, 1);
-	T_EXPECT_EQ(g_last_urgent_extra, (uint_fast8_t)MUX_CTRL_PING);
-	T_EXPECT_EQ(g_last_urgent_payload_len, (size_t)MUX_PING_PAYLOAD_SIZE);
+	T_EXPECT_EQ(g_send_oob_calls, 1);
+	T_EXPECT_EQ(g_last_oob_extra, (uint_fast8_t)MUX_CTRL_PING);
+	T_EXPECT_EQ(g_last_oob_payload_len, (size_t)MUX_PING_PAYLOAD_SIZE);
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)40000);
 	T_EXPECT_EQ(ss.estimator.last_probe_ns, now);
 	T_EXPECT(ss.estimator.ping_in_flight);
@@ -216,7 +215,7 @@ T_DECLARE_CASE(test_estimator_add_track_enforces_rate_limit)
 	ss.estimator.last_probe_ns = now - (MUX_PING_RATE_LIMIT_NS / 2);
 
 	estimator_add(&ss, 40000);
-	T_EXPECT_EQ(g_send_urgent_calls, 0);
+	T_EXPECT_EQ(g_send_oob_calls, 0);
 	T_EXPECT(!ss.estimator.ping_in_flight);
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)0);
 }
@@ -234,7 +233,7 @@ T_DECLARE_CASE(test_estimator_add_startup_enforces_rate_limit)
 	ss.estimator.last_probe_ns = now - (MUX_PING_STARTUP_INTERVAL_NS / 2);
 
 	estimator_add(&ss, 40000);
-	T_EXPECT_EQ(g_send_urgent_calls, 0);
+	T_EXPECT_EQ(g_send_oob_calls, 0);
 	T_EXPECT(!ss.estimator.ping_in_flight);
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)0);
 }
@@ -254,9 +253,9 @@ T_DECLARE_CASE(test_estimator_add_startup_starts_cycle_after_floor)
 	ss.estimator.last_probe_ns = now - 2 * MUX_PING_STARTUP_INTERVAL_NS;
 
 	estimator_add(&ss, 40000);
-	T_EXPECT_EQ(g_send_urgent_calls, 1);
-	T_EXPECT_EQ(g_last_urgent_extra, (uint_fast8_t)MUX_CTRL_PING);
-	T_EXPECT_EQ(g_last_urgent_payload_len, (size_t)MUX_PING_PAYLOAD_SIZE);
+	T_EXPECT_EQ(g_send_oob_calls, 1);
+	T_EXPECT_EQ(g_last_oob_extra, (uint_fast8_t)MUX_CTRL_PING);
+	T_EXPECT_EQ(g_last_oob_payload_len, (size_t)MUX_PING_PAYLOAD_SIZE);
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)40000);
 	T_EXPECT_EQ(ss.estimator.last_probe_ns, now);
 	T_EXPECT(ss.estimator.ping_in_flight);
@@ -276,7 +275,7 @@ T_DECLARE_CASE(test_estimator_add_acked_accumulates_while_ping_in_flight)
 	estimator_add_acked(&ss, 20);
 	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)35);
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)0);
-	T_EXPECT_EQ(g_send_urgent_calls, 0);
+	T_EXPECT_EQ(g_send_oob_calls, 0);
 	T_EXPECT(ss.estimator.ping_in_flight);
 }
 
@@ -294,9 +293,9 @@ T_DECLARE_CASE(test_estimator_add_acked_starts_cycle_after_rate_limit)
 	ss.estimator.last_probe_ns = 1;
 
 	estimator_add_acked(&ss, 40000);
-	T_EXPECT_EQ(g_send_urgent_calls, 1);
-	T_EXPECT_EQ(g_last_urgent_extra, (uint_fast8_t)MUX_CTRL_PING);
-	T_EXPECT_EQ(g_last_urgent_payload_len, (size_t)MUX_PING_PAYLOAD_SIZE);
+	T_EXPECT_EQ(g_send_oob_calls, 1);
+	T_EXPECT_EQ(g_last_oob_extra, (uint_fast8_t)MUX_CTRL_PING);
+	T_EXPECT_EQ(g_last_oob_payload_len, (size_t)MUX_PING_PAYLOAD_SIZE);
 	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)40000);
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)0);
 	T_EXPECT_EQ(ss.estimator.last_probe_ns, now);
@@ -368,10 +367,9 @@ T_DECLARE_CASE(test_estimator_calculate_updates_effective_bdp)
 	T_EXPECT(wndfilter_get(&ss.estimator.tx.bw_wnd) == 0);
 }
 
-/* Mirror of test_estimator_calculate_updates_effective_bdp, but the cycle is
- * driven entirely by the tx sample (rx sample stays 0): a pure sender's
- * ack-clock alone must grow the tx effective_bdp via the fast-startup path,
- * while the idle rx direction stays untouched. */
+/* Mirror of test_estimator_calculate_updates_effective_bdp driven by the tx
+ * sample only: a pure sender's ack-clock must grow tx effective_bdp via fast
+ * startup while the idle rx direction stays untouched. */
 T_DECLARE_CASE(test_estimator_calculate_ack_sample_drives_tx)
 {
 	struct mux_session ss = make_session();
@@ -649,10 +647,9 @@ T_DECLARE_CASE(test_estimator_track_sample_exceeds_window_returns_to_startup)
 	T_EXPECT(!ss.estimator.ping_in_flight);
 }
 
-/* Mirror of test_estimator_track_sample_exceeds_window_returns_to_startup,
- * but both cycles drive the tx direction via the ack-clock: a pure sender
- * (no estimator_add activity) must trigger the TRACK→STARTUP re-entry on
- * the tx estimate alone, leaving the idle rx direction untouched. */
+/* Mirror of test_estimator_track_sample_exceeds_window_returns_to_startup
+ * for the tx direction: ack-clock alone must trigger TRACK→STARTUP
+ * while the idle rx direction stays untouched. */
 T_DECLARE_CASE(test_estimator_track_ack_sample_exceeds_window_returns_to_startup)
 {
 	struct mux_session ss = make_session();
@@ -696,10 +693,9 @@ T_DECLARE_CASE(test_estimator_track_ack_sample_exceeds_window_returns_to_startup
 	T_EXPECT_EQ(ss.estimator.rx.effective_bdp, (size_t)0);
 }
 
-/* Asymmetric cycle: both directions carry traffic, but only rx is
- * window-limited.  rx must fast-startup (×3) while tx, app-limited in the
- * same cycle, only advances its stable_rounds — no MAX-coupling between
- * the directions. */
+/* Asymmetric cycle: rx window-limited (×3 fast-startup), tx app-limited
+ * (advances stable_rounds only) — growth is per-direction with no
+ * MAX-coupling. */
 T_DECLARE_CASE(test_estimator_asymmetric_samples_grow_independently)
 {
 	struct mux_session ss = make_session();
@@ -762,10 +758,9 @@ T_DECLARE_CASE(test_estimator_rtt_spike_does_not_inflate_window)
 	const size_t window = bdp_bytes + bdp_bytes / 4;
 	T_EXPECT_EQ(ss.estimator.rx.effective_bdp, window);
 
-	/* Cycle 2: a 2.58 s RTT spike at the same 16 MB/s accumulates
-	 * sample = bw × 2.58 s, far larger than the window.  Pre-fix this raw
-	 * count tripped TRACK→STARTUP; normalized demand and d->bdp are
-	 * unchanged. */
+	/* Cycle 2: 2.58 s RTT spike — sample = bw × spike >> window.
+	 * Pre-fix: raw count tripped TRACK→STARTUP.  This verifies normalized
+	 * demand and d->bdp stay unchanged. */
 	const int_fast64_t spike_ns = INT64_C(2580000000); /* 2.58 s */
 	const int_fast64_t sent2_ns = now1_ns + INT64_C(1000000000);
 	const int_fast64_t now2_ns = sent2_ns + spike_ns;
@@ -784,42 +779,35 @@ T_DECLARE_CASE(test_estimator_rtt_spike_does_not_inflate_window)
 	T_EXPECT_EQ(ss.estimator.rtt, spike_ns);
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_estimator_init_seeds_effective_bdp),
+	T_CASE(test_estimator_init_resets_all_state),
+	T_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight),
+	T_CASE(test_estimator_add_starts_cycle_after_rate_limit),
+	T_CASE(test_estimator_add_track_enforces_rate_limit),
+	T_CASE(test_estimator_add_startup_enforces_rate_limit),
+	T_CASE(test_estimator_add_startup_starts_cycle_after_floor),
+	T_CASE(test_estimator_add_acked_accumulates_while_ping_in_flight),
+	T_CASE(test_estimator_add_acked_starts_cycle_after_rate_limit),
+	T_CASE(test_estimator_calculate_discards_stale_timestamp),
+	T_CASE(test_estimator_calculate_invalid_rtt_clears_cycle),
+	T_CASE(test_estimator_calculate_updates_effective_bdp),
+	T_CASE(test_estimator_calculate_ack_sample_drives_tx),
+	T_CASE(test_estimator_startup_stable_rounds_exit_to_track),
+	T_CASE(test_estimator_effective_bdp_stores_value),
+	T_CASE(test_estimator_calculate_effective_bdp_floored_at_min),
+	T_CASE(test_estimator_calculate_invalid_cycle_preserves_effective_bdp),
+	T_CASE(test_estimator_startup_app_limited_increments_stable_rounds),
+	T_CASE(test_estimator_startup_window_limited_resets_stable_rounds),
+	T_CASE(test_estimator_track_sample_within_window_stays_track),
+	T_CASE(test_estimator_track_sample_exceeds_window_returns_to_startup),
+	T_CASE(test_estimator_track_ack_sample_exceeds_window_returns_to_startup),
+	T_CASE(test_estimator_asymmetric_samples_grow_independently),
+	T_CASE(test_estimator_rtt_spike_does_not_inflate_window),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_estimator_init_seeds_effective_bdp);
-	T_RUN_CASE(t, test_estimator_init_resets_all_state);
-	T_RUN_CASE(
-		t, test_estimator_add_accumulates_sample_while_ping_in_flight);
-	T_RUN_CASE(t, test_estimator_add_starts_cycle_after_rate_limit);
-	T_RUN_CASE(t, test_estimator_add_track_enforces_rate_limit);
-	T_RUN_CASE(t, test_estimator_add_startup_enforces_rate_limit);
-	T_RUN_CASE(t, test_estimator_add_startup_starts_cycle_after_floor);
-	T_RUN_CASE(
-		t, test_estimator_add_acked_accumulates_while_ping_in_flight);
-	T_RUN_CASE(t, test_estimator_add_acked_starts_cycle_after_rate_limit);
-	T_RUN_CASE(t, test_estimator_calculate_discards_stale_timestamp);
-	T_RUN_CASE(t, test_estimator_calculate_invalid_rtt_clears_cycle);
-	T_RUN_CASE(t, test_estimator_calculate_updates_effective_bdp);
-	T_RUN_CASE(t, test_estimator_calculate_ack_sample_drives_tx);
-	T_RUN_CASE(t, test_estimator_startup_stable_rounds_exit_to_track);
-	T_RUN_CASE(t, test_estimator_effective_bdp_stores_value);
-	T_RUN_CASE(t, test_estimator_calculate_effective_bdp_floored_at_min);
-	T_RUN_CASE(
-		t,
-		test_estimator_calculate_invalid_cycle_preserves_effective_bdp);
-	T_RUN_CASE(
-		t, test_estimator_startup_app_limited_increments_stable_rounds);
-	T_RUN_CASE(
-		t, test_estimator_startup_window_limited_resets_stable_rounds);
-	T_RUN_CASE(t, test_estimator_track_sample_within_window_stays_track);
-	T_RUN_CASE(
-		t,
-		test_estimator_track_sample_exceeds_window_returns_to_startup);
-	T_RUN_CASE(
-		t,
-		test_estimator_track_ack_sample_exceeds_window_returns_to_startup);
-	T_RUN_CASE(t, test_estimator_asymmetric_samples_grow_independently);
-	T_RUN_CASE(t, test_estimator_rtt_spike_does_not_inflate_window);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

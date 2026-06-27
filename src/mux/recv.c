@@ -26,7 +26,6 @@
 #include "mux/stream.h"
 #include "mux/unacked.h"
 #include "mux/wire.h"
-#include "util.h"
 
 #include "algo/hashtable.h"
 #include "os/clock.h"
@@ -35,6 +34,7 @@
 #include "utils/likely.h"
 #include "utils/minmax.h"
 #include "utils/serialize.h"
+#include "math/serial.h"
 #include "utils/slog.h"
 
 #include <ev.h>
@@ -280,8 +280,8 @@ static void dispatch_by_stream(
 		stream_recv_window(s, hdr->extra);
 		/* Dividing send_window by MUX_WINDOW_UNIT recovers the peer
 		 * stream_window; assigned unconditionally to track shrinks. */
-		ss->peer_stream_window =
-			(uint_least32_t)(s->send_window / MUX_WINDOW_UNIT);
+		session_set_peer_stream_window(
+			ss, (uint_least32_t)(s->send_window / MUX_WINDOW_UNIT));
 		if (ss->auto_session_window) {
 			session_update_session_window(
 				ss, estimator_tx_window_size(&ss->estimator));
@@ -401,7 +401,7 @@ static void dispatch_no_stream(
 			return;
 		}
 
-		struct mux_stream *s = stream_new(ss, stream_id, false);
+		struct mux_stream *const s = stream_new(ss, stream_id, false);
 		if (s == NULL) {
 			MUX_LOG(ERROR, ss, "stream allocation failed");
 			ringbuf_consume(ss->wire.recvbuf, frame_size);
@@ -413,10 +413,9 @@ static void dispatch_no_stream(
 			ringbuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
-		/* Cap the initial send window at our own stream_window so a peer
-		 * advertising extra = UINT16_MAX cannot grow send_queue without
-		 * bound.  Use stream_window (not wmem): the grant reflects the
-		 * peer's stream_window, so the cap is a no-op between matched peers. */
+		/* Cap at stream_window: extra=UINT16_MAX cannot grow send_queue
+		 * without bound; cap is a no-op between matched peers since extra
+		 * reflects the peer's own stream_window. */
 		const uint_fast32_t extra_bytes =
 			(uint_fast32_t)hdr->extra * MUX_WINDOW_UNIT;
 		const uint_fast32_t max_window =
@@ -426,7 +425,8 @@ static void dispatch_no_stream(
 		/* Derive peer_stream_window from extra (not the capped send_window),
 		 * unconditionally so a shrinking peer window is tracked; +1 for the
 		 * initial default send window's one frame. */
-		ss->peer_stream_window = (uint_least32_t)hdr->extra + 1u;
+		session_set_peer_stream_window(
+			ss, (uint_least32_t)hdr->extra + 1u);
 		if (ss->auto_session_window) {
 			session_update_session_window(
 				ss, estimator_tx_window_size(&ss->estimator));
@@ -565,10 +565,9 @@ static void dispatch_frame(struct mux_session *ss)
 			session_log_frame_header(ss, "frame in", p, &hdr);
 		}
 
-		/* hdr.length is a 16-bit field (<= 65535), so a peer may send a
-		 * payload larger than our own MUX_MAX_PAYLOAD_SIZE cap.  Accept it:
-		 * the recvbuf grows on demand to assemble the frame contiguously and
-		 * is shrunk back afterwards (session_on_recv).  We never send oversized. */
+		/* hdr.length is 16-bit so a peer may exceed MUX_MAX_PAYLOAD_SIZE;
+		 * recvbuf grows on demand and is shrunk after (session_on_recv).
+		 * We never send oversized frames. */
 		const size_t frame_size = MUX_FRAME_HEADER_SIZE + hdr.length;
 		if (ringbuf_readable(ss->wire.recvbuf) < frame_size) {
 			return;
@@ -614,7 +613,8 @@ static void dispatch_frame(struct mux_session *ss)
 		}
 
 		/* Count received non-stream-0 frames for session ACK. */
-		ss->unacked.recv_seq++;
+		ss->unacked.recv_seq =
+			(uint_least32_t)serial_add32(ss->unacked.recv_seq, 1u);
 		/* Force a session ACK when the delta hits a fraction of
 		 * session_window (spec §5.7.3 MUST), skipping the coalesce timer. */
 		const uint_fast32_t ack_thresh =
@@ -634,7 +634,8 @@ static void dispatch_frame(struct mux_session *ss)
 			COUNTER_ADD(ss->cnt.num_rst_recv, 1);
 		}
 
-		struct mux_stream *s = sched_find_stream(ss, hdr.stream_id);
+		struct mux_stream *const s =
+			sched_find_stream(ss, hdr.stream_id);
 		if (s != NULL) {
 			dispatch_by_stream(ss, s, &hdr);
 		} else {
@@ -714,18 +715,14 @@ void session_on_recv(struct mux_session *restrict ss)
 			}
 		}
 	}
-	/* Reclaim capacity the recvbuf grew to assemble an oversized inbound frame.
-	 * The normal working set is one read-ahead window plus a leftover partial,
-	 * so keep that floor to avoid regrowth churn on normal traffic; only genuine
-	 * oversized growth is returned. */
+	/* Reclaim capacity grown for oversized frames; floor is one read-ahead
+	 * window plus one partial frame to avoid regrowth churn. */
 	ringbuf_shrink(
 		&ss->wire.recvbuf,
 		MUX_RECV_READAHEAD +
 			((size_t)MUX_FRAME_HEADER_SIZE + ss->max_payload));
-	/* Respond to this batch now (PONG, ACKs, data unstalled by credit):
-	 * socket_cb entered on EV_READ, so without this the egress would wait a
-	 * loop turn.  Prompt PONG keeps the peer's RTT sample from absorbing our
-	 * egress delay. */
+	/* Flush responses (PONG, ACKs, credit) immediately rather than waiting
+	 * for EV_WRITE; prompt PONG avoids inflating the peer's RTT sample. */
 	session_flush_resp(ss);
 }
 
@@ -757,7 +754,7 @@ void session_recv_ping(
 
 	/* Read the PING payload before discarding the frame; session_send_oob
 	 * copies it into oobbuf. */
-	const unsigned char *ping_payload =
+	const unsigned char *const ping_payload =
 		ringbuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE;
 	const bool queued =
 		session_send_oob(ss, MUX_CTRL_PONG, ping_payload, hdr->length);
@@ -779,46 +776,16 @@ static bool update_stream_window_cb(
 	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
-	UNUSED(table);
-	UNUSED(key);
+	(void)table;
+	(void)key;
 	const uint_fast32_t new_window = *(const uint_fast32_t *)data;
-	struct mux_stream *restrict s = element;
+	struct mux_stream *const restrict s = element;
 	if (new_window <= s->recv_window) {
 		return true;
 	}
 	s->recv_window = new_window;
 	stream_check_ack(s);
 	return true;
-}
-
-void session_update_session_window(
-	struct mux_session *restrict ss, const size_t window_bytes)
-{
-	const uint_least32_t initial_frames =
-		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
-	const size_t target_frames =
-		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
-	const uint_least32_t new_window = (uint_least32_t)MAX(
-		MAX(ss->peer_stream_window, target_frames), initial_frames);
-	if (ss->session_window == new_window) {
-		return;
-	}
-	const bool grew = new_window > ss->session_window;
-	ss->session_window = new_window;
-	MUX_LOG_F(
-		INFO, ss, "session window updated: session=%zu",
-		(size_t)ss->session_window * MUX_WINDOW_UNIT);
-	if (grew && ss->unacked.stalled &&
-	    ss->unacked.bytes < (size_t)ss->session_window * MUX_WINDOW_UNIT) {
-		MUX_LOG_F(
-			DEBUG, ss,
-			"send stall cleared by session window growth:"
-			" unacked_bytes=%zu limit=%zu",
-			ss->unacked.bytes,
-			(size_t)ss->session_window * MUX_WINDOW_UNIT);
-		ss->unacked.stalled = false;
-		mux_notify_write(ss);
-	}
 }
 
 static void session_update_stream_window(
@@ -833,7 +800,7 @@ static void session_update_stream_window(
 		return;
 	}
 	const uint_least32_t old_stream = ss->stream_window;
-	ss->stream_window = frames;
+	session_set_stream_window(ss, frames);
 	if (frames > old_stream && ss->sched.streams != NULL) {
 		uint_fast32_t w = (uint_fast32_t)frames * MUX_WINDOW_UNIT;
 		table_iterate(ss->sched.streams, update_stream_window_cb, &w);
@@ -877,5 +844,35 @@ void session_recv_pong(
 	ev_timer_set(&ss->w_keepalive, 0.0, keepalive);
 	if (ev_is_active(&ss->w_keepalive)) {
 		ev_timer_again(ss->loop, &ss->w_keepalive);
+	}
+}
+
+void session_update_session_window(
+	struct mux_session *restrict ss, const size_t window_bytes)
+{
+	const uint_least32_t initial_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	const size_t target_frames =
+		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
+	const uint_least32_t new_window = (uint_least32_t)MAX(
+		MAX(ss->peer_stream_window, target_frames), initial_frames);
+	if (ss->session_window == new_window) {
+		return;
+	}
+	const bool grew = new_window > ss->session_window;
+	ss->session_window = new_window;
+	MUX_LOG_F(
+		INFO, ss, "session window updated: session=%zu",
+		(size_t)ss->session_window * MUX_WINDOW_UNIT);
+	if (grew && ss->unacked.stalled &&
+	    ss->unacked.bytes < (size_t)ss->session_window * MUX_WINDOW_UNIT) {
+		MUX_LOG_F(
+			DEBUG, ss,
+			"send stall cleared by session window growth:"
+			" unacked_bytes=%zu limit=%zu",
+			ss->unacked.bytes,
+			(size_t)ss->session_window * MUX_WINDOW_UNIT);
+		ss->unacked.stalled = false;
+		mux_notify_write(ss);
 	}
 }

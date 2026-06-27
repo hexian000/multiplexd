@@ -54,151 +54,6 @@ static const char *session_state_str[] = {
 	[SESSION_CLOSED] = "CLOSED",
 };
 
-/* conf.keepalive scaled by a random factor in (1 - MUX_KEEPALIVE_JITTER, 1],
- * never exceeding the configured value.  Returns it unchanged when disabled. */
-double keepalive_interval(const struct mux_session *restrict ss)
-{
-	const double base = (double)ss->conf.keepalive;
-	if (!(base > 0.0)) {
-		return base;
-	}
-	return base * (1.0 - MUX_KEEPALIVE_JITTER * frand());
-}
-
-/* Infrastructure & Lifecycle: state, stream table, raw socket I/O.
- * session_emit() lives in session.h so the send/recv pipelines share it. */
-
-/* Reset stream_window to half the current RX estimate (floored at the initial
- * window) on every exit from ESTABLISHED so a resumed session re-probes
- * conservatively. */
-static void session_reset_stream_window_floor(struct mux_session *restrict ss)
-{
-	ss->stream_window = (uint_least32_t)MAX(
-		estimator_rx_window_size(&ss->estimator) / 2 / MUX_WINDOW_UNIT,
-		(size_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
-}
-
-void session_set_state(struct mux_session *ss, enum session_state newstate)
-{
-	if (ss->state == newstate) {
-		return;
-	}
-	MUX_LOG_F(
-		DEBUG, ss, "state: %s -> %s", session_state_str[ss->state],
-		session_state_str[newstate]);
-	const enum session_state oldstate = ss->state;
-
-	if (oldstate == SESSION_ESTABLISHED) {
-		ev_timer_stop(ss->loop, &ss->w_timeout);
-		ev_timer_stop(ss->loop, &ss->w_keepalive);
-		ev_timer_stop(ss->loop, &ss->w_send_timeout);
-		ss->estimator.ping_in_flight = false;
-		session_reset_stream_window_floor(ss);
-		COUNTER_ADD(ss->cnt.num_session_disconnected, 1);
-		COUNTER_SUB(ss->cnt.num_sessions, 1);
-		session_emit(ss, MUX_EVENT_LOST, (union mux_event_data){ 0 });
-	} else if (
-		(oldstate == SESSION_CONNECT ||
-		 oldstate == SESSION_HANDSHAKE) &&
-		newstate != SESSION_CONNECT && newstate != SESSION_HANDSHAKE &&
-		newstate != SESSION_ESTABLISHED &&
-		newstate != SESSION_SUSPENDED) {
-		COUNTER_SUB(ss->cnt.num_session_halfopen, 1);
-		session_emit(
-			ss, MUX_EVENT_CONNECT_FAILED,
-			(union mux_event_data){ 0 });
-	}
-
-	ss->state = newstate;
-
-	if ((newstate == SESSION_CONNECT || newstate == SESSION_HANDSHAKE) &&
-	    oldstate != SESSION_CONNECT && oldstate != SESSION_HANDSHAKE) {
-		COUNTER_ADD(ss->cnt.num_session_connect, 1);
-		COUNTER_ADD(ss->cnt.num_session_halfopen, 1);
-		session_emit(
-			ss, MUX_EVENT_CONNECT, (union mux_event_data){ 0 });
-	} else if (newstate == SESSION_ESTABLISHED) {
-		if (ss->connect_started > 0) {
-			const int_fast64_t lat =
-				clock_monotonic_ns() - ss->connect_started;
-			ss->last_connect_latency_ns = lat;
-			ss->connect_started = 0;
-		}
-		/* peer_addr survives suspend but is cleared after reconnect, so
-		 * it distinguishes first establishment (CONNECT) from resume. */
-		const bool first_establish =
-			(ss->peer_addr.sa.sa_family == AF_UNSPEC);
-		(void)socket_get_peer(ss->w_socket.fd, &ss->peer_addr);
-		ev_timer_again(ss->loop, &ss->w_keepalive);
-		COUNTER_ADD(ss->cnt.num_session_connected, 1);
-		COUNTER_SUB(ss->cnt.num_session_halfopen, 1);
-		COUNTER_ADD(ss->cnt.num_sessions, 1);
-		session_emit(
-			ss,
-			first_establish ? MUX_EVENT_ESTABLISHED :
-					  MUX_EVENT_RESUMED,
-			(union mux_event_data){
-				.connected.ns = ss->last_connect_latency_ns,
-				.connected.peer_id = ss->handshake.peer_id,
-				.connected.peer_identity =
-					ss->handshake.peer_identity,
-			});
-	}
-}
-
-static void session_stop(struct mux_session *ss)
-{
-	struct ev_loop *loop = ss->loop;
-	ev_io_stop(loop, &ss->w_socket);
-	ss->sched.lp_pending = false;
-	ev_timer_stop(loop, &ss->w_timeout);
-	ev_timer_stop(loop, &ss->w_keepalive);
-	ev_timer_stop(loop, &ss->w_send_timeout);
-	ev_timer_stop(loop, &ss->w_connect_timeout);
-	ev_timer_stop(loop, &ss->sched.w_coalesce);
-	ev_timer_stop(loop, &ss->w_idle_timeout);
-	session_reset_stream_window_floor(ss);
-}
-
-static void session_cleanup(struct mux_session *restrict ss)
-{
-	sched_free_streams(ss);
-	wire_conn_free(ss);
-	if (ss->w_socket.fd != -1) {
-		SOCKET_CLOSE_FD(ss->w_socket.fd);
-		ss->w_socket.fd = -1;
-	}
-
-	wire_discard_buffers(ss);
-	unacked_free_all(ss);
-	ss->unacked.retransmit_copy = NULL;
-}
-
-static void handshake_cleanup(struct mux_session *restrict ss)
-{
-	free(ss->handshake.identity);
-	free(ss->handshake.peer_id);
-	free(ss->handshake.peer_identity);
-}
-
-void session_reset(struct mux_session *ss)
-{
-	if (ss->state == SESSION_CLOSED) {
-		return;
-	}
-	MUX_LOG(VERBOSE, ss, "closing");
-	session_set_state(ss, SESSION_CLOSED);
-	session_stop(ss);
-	session_cleanup(ss);
-
-	if (ss->accepted) {
-		return;
-	}
-	/* Reset peer_addr so the next establishment is recognised as first. */
-	memset(&ss->peer_addr, 0, sizeof(ss->peer_addr));
-	ss->num_halfopen = 0;
-}
-
 void session_update_watcher(struct mux_session *restrict ss)
 {
 	int events = 0;
@@ -242,100 +97,27 @@ void session_update_watcher(struct mux_session *restrict ss)
 	modify_io_events(ss->loop, &ss->w_socket, events);
 }
 
-/* Mark egress pending and arm EV_WRITE; the send pump runs on the next loop
- * iteration (coalesced) or inline via session_flush under low load. */
-void session_notify(struct mux_session *restrict ss)
+/* conf.keepalive scaled by a random factor in (1 - MUX_KEEPALIVE_JITTER, 1],
+ * never exceeding the configured value.  Returns it unchanged when disabled. */
+double keepalive_interval(const struct mux_session *restrict ss)
 {
-	ss->wire.tx_pending = true;
-	if (ss->w_socket.fd != -1) {
-		session_update_watcher(ss);
+	const double base = (double)ss->conf.keepalive;
+	if (!(base > 0.0)) {
+		return base;
 	}
+	return base * (1.0 - MUX_KEEPALIVE_JITTER * frand());
 }
 
-/* Connection & Frame Processing: parsing, dispatch, send/recv flush. */
-
-void session_notify_closed(struct mux_session *restrict ss, const bool expired)
+static void handshake_start(struct mux_session *ss)
 {
-	session_reset(ss);
-	if (ss->state == SESSION_CLOSED) {
-		session_emit(
-			ss, MUX_EVENT_CLOSED,
-			(union mux_event_data){
-				.closed.clean = ss->wire.rx_eof,
-				.closed.expired = expired,
-			});
+	session_set_state(ss, SESSION_HANDSHAKE);
+	if (!ss->accepted) {
+		/* Client: build and send ClientHello. */
+		handshake_enqueue_hello(
+			ss, PROTO_MSG_CLIENT_HELLO,
+			ss->handshake.has_session_id /* resume request */);
 	}
 }
-
-static void format_frame_flags(
-	char *restrict buf, const size_t buflen, const uint_fast8_t flags)
-{
-	static const struct {
-		uint_least8_t flag;
-		const char *name;
-	} names[] = {
-		{ MUX_FLAG_SYN, "SYN" },   { MUX_FLAG_ACK, "ACK" },
-		{ MUX_FLAG_FIN, "FIN" },   { MUX_FLAG_RST, "RST" },
-		{ MUX_FLAG_PUSH, "PUSH" },
-	};
-
-	char *p = buf;
-	const char *const end = buf + buflen;
-	bool wrote = false;
-	for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
-		if ((flags & names[i].flag) == 0) {
-			continue;
-		}
-		if (wrote && p + 1 < end) {
-			*p++ = '|';
-		}
-		for (const char *s = names[i].name; *s != '\0' && p + 1 < end;
-		     s++) {
-			*p++ = *s;
-		}
-		wrote = true;
-	}
-	const uint_fast8_t unknown = flags & (uint_fast8_t)(~MUX_FLAG_MASK);
-	if (unknown != 0) {
-		const int ret = snprintf(
-			p, (size_t)(end - p), "%sUNKNOWN(0x%02" PRIxFAST8 ")",
-			wrote ? "|" : "", unknown);
-		if (ret < 0 && buflen > 0) {
-			buf[0] = '\0';
-		}
-		return;
-	}
-	if (!wrote) {
-		const int ret = snprintf(buf, buflen, "NONE");
-		if (ret < 0 && buflen > 0) {
-			buf[0] = '\0';
-		}
-	} else if (p < end) {
-		*p = '\0';
-	}
-}
-
-void session_log_frame_header(
-	struct mux_session *restrict ss, const char *restrict what,
-	const unsigned char *restrict raw,
-	const struct mux_header *restrict hdr)
-{
-	if (!LOGLEVEL(VERYVERBOSE)) {
-		return;
-	}
-	char flags_str[64];
-	format_frame_flags(flags_str, sizeof(flags_str), hdr->flags);
-
-	LOG_BIN_F(
-		VERYVERBOSE, raw, MUX_FRAME_HEADER_SIZE, 0,
-		"[fd:%d] %s: stream_id=%" PRIuLEAST16 " length=%" PRIuLEAST16
-		" flags=0x%02" PRIxLEAST8 "(%s)"
-		" extra=%" PRIuLEAST16,
-		ss->w_socket.fd, what, hdr->stream_id, hdr->length, hdr->flags,
-		flags_str, hdr->extra);
-}
-
-/* Event Callbacks & Public API: libev callbacks, creation, control packets. */
 
 static void closing_cb(struct mux_session *ss)
 {
@@ -361,17 +143,6 @@ static void close_wait_cb(struct mux_session *ss)
 	session_reset(ss);
 }
 
-static void handshake_start(struct mux_session *ss)
-{
-	session_set_state(ss, SESSION_HANDSHAKE);
-	if (!ss->accepted) {
-		/* Client: build and send ClientHello. */
-		handshake_enqueue_hello(
-			ss, PROTO_MSG_CLIENT_HELLO,
-			ss->handshake.has_session_id /* resume request */);
-	}
-}
-
 static void connect_cb(struct mux_session *ss)
 {
 	const int err = socket_get_error(ss->w_socket.fd);
@@ -389,10 +160,6 @@ static void connect_cb(struct mux_session *ss)
 		session_reset(ss);
 		return;
 	}
-	if (ss->wire.tlsconn != NULL) {
-		handshake_start(ss);
-		return;
-	}
 #endif /* WITH_TLS */
 
 	handshake_start(ss);
@@ -401,9 +168,9 @@ static void connect_cb(struct mux_session *ss)
 static void socket_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ | EV_WRITE);
-	struct mux_session *restrict ss = w->data;
+	struct mux_session *const restrict ss = w->data;
 	ASSERT(loop == ss->loop);
-	UNUSED(loop);
+	(void)loop;
 	MUX_LOG_F(
 		VERBOSE, ss, "mux socket: state=%s revents=%d",
 		session_state_str[ss->state], revents);
@@ -480,9 +247,9 @@ static void
 connect_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *restrict ss = w->data;
+	struct mux_session *const restrict ss = w->data;
 	ASSERT(loop == ss->loop);
-	UNUSED(loop);
+	(void)loop;
 	const bool was_suspended = (ss->state == SESSION_SUSPENDED);
 	switch (ss->state) {
 	case SESSION_CONNECT:
@@ -506,9 +273,9 @@ static void
 send_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *restrict ss = w->data;
+	struct mux_session *const restrict ss = w->data;
 	ASSERT(loop == ss->loop);
-	UNUSED(loop);
+	(void)loop;
 	switch (ss->state) {
 	case SESSION_ESTABLISHED:
 		break;
@@ -521,9 +288,9 @@ send_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *restrict ss = w->data;
+	struct mux_session *const restrict ss = w->data;
 	ASSERT(loop == ss->loop);
-	UNUSED(loop);
+	(void)loop;
 	CHECKMSGF(
 		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
 		ss->state);
@@ -535,9 +302,9 @@ static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *restrict ss = w->data;
+	struct mux_session *const restrict ss = w->data;
 	ASSERT(loop == ss->loop);
-	UNUSED(loop);
+	(void)loop;
 	CHECKMSGF(
 		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
 		ss->state);
@@ -561,9 +328,9 @@ static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void idle_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *restrict ss = w->data;
+	struct mux_session *const restrict ss = w->data;
 	ASSERT(loop == ss->loop);
-	UNUSED(loop);
+	(void)loop;
 	CHECKMSGF(
 		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
 		ss->state);
@@ -694,33 +461,23 @@ session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
 	return ss;
 }
 
-/* Initiate an immediate graceful shutdown: abandon transfers, close streams,
- * discard buffered data, then enter SESSION_CLOSING for the transport close
- * handshake (TLS close_notify then TCP FIN). */
-void session_initiate_shutdown(struct mux_session *restrict ss)
+/* Reset stream_window to half the current RX estimate (floored at the initial
+ * window) on every exit from ESTABLISHED so a resumed session re-probes
+ * conservatively. */
+static void session_reset_stream_window_floor(struct mux_session *restrict ss)
 {
-	if (ss->state != SESSION_ESTABLISHED &&
-	    ss->state != SESSION_HANDSHAKE) {
-		/* Not transferring: force-close without reconnection
-		 * (session_reset would reschedule a reconnect for outbound). */
-		if (ss->state != SESSION_CLOSED) {
-			session_set_state(ss, SESSION_CLOSED);
-			session_stop(ss);
-			session_cleanup(ss);
-		}
-		session_emit(
-			ss, MUX_EVENT_CLOSED,
-			(union mux_event_data){
-				.closed.clean = ss->wire.rx_eof,
-			});
-		return;
-	}
-	MUX_LOG(INFO, ss,
-		"initiating graceful shutdown; dropping in-flight data");
+	session_set_stream_window(
+		ss,
+		(uint_least32_t)MAX(
+			estimator_rx_window_size(&ss->estimator) / 2 /
+				MUX_WINDOW_UNIT,
+			(size_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT)));
+}
 
-	/* Stop all timers and the lifecycle drain; keep the socket watcher so the
-	 * close frames still flush via EV_WRITE. */
-	struct ev_loop *restrict loop = ss->loop;
+static void session_stop(struct mux_session *ss)
+{
+	struct ev_loop *const loop = ss->loop;
+	ev_io_stop(loop, &ss->w_socket);
 	ss->sched.lp_pending = false;
 	ev_timer_stop(loop, &ss->w_timeout);
 	ev_timer_stop(loop, &ss->w_keepalive);
@@ -729,23 +486,27 @@ void session_initiate_shutdown(struct mux_session *restrict ss)
 	ev_timer_stop(loop, &ss->sched.w_coalesce);
 	ev_timer_stop(loop, &ss->w_idle_timeout);
 	session_reset_stream_window_floor(ss);
+}
 
-	/* Free all streams: closes local fds, drains queues; no protocol
-	 * frames are sent (per spec §5.6: streams are implicitly aborted). */
+static void session_cleanup(struct mux_session *restrict ss)
+{
 	sched_free_streams(ss);
+	wire_conn_free(ss);
+	if (ss->w_socket.fd != -1) {
+		SOCKET_CLOSE_FD(ss->w_socket.fd);
+		ss->w_socket.fd = -1;
+	}
 
-	/* Discard all pending session-level data. */
 	wire_discard_buffers(ss);
 	unacked_free_all(ss);
+	ss->unacked.retransmit_copy = NULL;
+}
 
-	session_set_state(ss, SESSION_CLOSING);
-	ev_timer_set(
-		&ss->w_connect_timeout, (double)ss->conf.connect_timeout, 0.0);
-	ev_timer_start(loop, &ss->w_connect_timeout);
-	ss->wire.tx_pending = true;
-	/* Synchronous arm: this may be called outside the loop, so EV_WRITE
-	 * must be set before the next poll. */
-	session_update_watcher(ss);
+static void handshake_cleanup(struct mux_session *restrict ss)
+{
+	free(ss->handshake.identity);
+	free(ss->handshake.peer_id);
+	free(ss->handshake.peer_identity);
 }
 
 void session_close(struct mux_session *restrict ss)
@@ -770,16 +531,17 @@ void session_set_config(
 	ss->conf = *conf;
 	ss->auto_stream_window = (conf->stream_window <= 0);
 	ss->auto_session_window = (conf->session_window <= 0);
-	const uint_least32_t initial_frames =
+	const uint_fast32_t initial_frames =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
 	/* auto window resets to the floor only on a manual->auto switch, else keeps
 	 * the learned value; manual mode uses the configured value verbatim. */
 	if (ss->auto_stream_window) {
 		if (!was_auto_stream_window) {
-			ss->stream_window = initial_frames;
+			session_set_stream_window(ss, initial_frames);
 		}
 	} else {
-		ss->stream_window = (uint_least32_t)conf->stream_window;
+		session_set_stream_window(
+			ss, (uint_least32_t)conf->stream_window);
 	}
 	/* As above, but auto session_window additionally enforces the floor. */
 	if (ss->auto_session_window) {
@@ -847,17 +609,6 @@ void session_set_config(
 	 * already-auto session would wipe the learned RTT/BW windows. */
 	if (ss->auto_stream_window && !was_auto_stream_window) {
 		estimator_init(ss, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
-	}
-}
-
-void session_drain(struct mux_session *restrict ss)
-{
-	ss->draining = true;
-	/* Already idle (established, no active streams): shut down now.  Subtract
-	 * tombstones, which linger for late-frame suppression and aren't active. */
-	if (ss->state == SESSION_ESTABLISHED && ss->sched.streams != NULL &&
-	    table_size(ss->sched.streams) == ss->sched.num_tombstones) {
-		session_initiate_shutdown(ss);
 	}
 }
 
@@ -940,6 +691,71 @@ void session_attach_fd(struct mux_session *restrict ss, const int fd)
 	MUX_LOG_F(DEBUG, ss, "transport attached [fd:%d]", fd);
 }
 
+/* Initiate an immediate graceful shutdown: abandon transfers, close streams,
+ * discard buffered data, then enter SESSION_CLOSING for the transport close
+ * handshake (TLS close_notify then TCP FIN). */
+void session_initiate_shutdown(struct mux_session *restrict ss)
+{
+	if (ss->state != SESSION_ESTABLISHED &&
+	    ss->state != SESSION_HANDSHAKE) {
+		/* Not transferring: force-close without reconnection
+		 * (session_reset would reschedule a reconnect for outbound). */
+		if (ss->state != SESSION_CLOSED) {
+			session_set_state(ss, SESSION_CLOSED);
+			session_stop(ss);
+			session_cleanup(ss);
+		}
+		session_emit(
+			ss, MUX_EVENT_CLOSED,
+			(union mux_event_data){
+				.closed.clean = ss->wire.rx_eof,
+			});
+		return;
+	}
+	MUX_LOG(INFO, ss,
+		"initiating graceful shutdown; dropping in-flight data");
+
+	/* Stop all timers and the lifecycle drain; keep the socket watcher so the
+	 * close frames still flush via EV_WRITE. */
+	struct ev_loop *const restrict loop = ss->loop;
+	ss->sched.lp_pending = false;
+	ev_timer_stop(loop, &ss->w_timeout);
+	ev_timer_stop(loop, &ss->w_keepalive);
+	ev_timer_stop(loop, &ss->w_send_timeout);
+	ev_timer_stop(loop, &ss->w_connect_timeout);
+	ev_timer_stop(loop, &ss->sched.w_coalesce);
+	ev_timer_stop(loop, &ss->w_idle_timeout);
+	session_reset_stream_window_floor(ss);
+
+	/* Free all streams: closes local fds, drains queues; no protocol
+	 * frames are sent (per spec §5.6: streams are implicitly aborted). */
+	sched_free_streams(ss);
+
+	/* Discard all pending session-level data. */
+	wire_discard_buffers(ss);
+	unacked_free_all(ss);
+
+	session_set_state(ss, SESSION_CLOSING);
+	ev_timer_set(
+		&ss->w_connect_timeout, (double)ss->conf.connect_timeout, 0.0);
+	ev_timer_start(loop, &ss->w_connect_timeout);
+	ss->wire.tx_pending = true;
+	/* Synchronous arm: this may be called outside the loop, so EV_WRITE
+	 * must be set before the next poll. */
+	session_update_watcher(ss);
+}
+
+void session_drain(struct mux_session *restrict ss)
+{
+	ss->draining = true;
+	/* Already idle (established, no active streams): shut down now.  Subtract
+	 * tombstones, which linger for late-frame suppression and aren't active. */
+	if (ss->state == SESSION_ESTABLISHED && ss->sched.streams != NULL &&
+	    table_size(ss->sched.streams) == ss->sched.num_tombstones) {
+		session_initiate_shutdown(ss);
+	}
+}
+
 struct mux_stream *session_open_stream(struct mux_session *restrict ss)
 {
 	if (ss->state == SESSION_CLOSED) {
@@ -984,7 +800,7 @@ struct mux_stream *session_open_stream(struct mux_session *restrict ss)
 		return NULL;
 	}
 
-	struct mux_stream *s = stream_new(ss, id, true);
+	struct mux_stream *const s = stream_new(ss, id, true);
 	if (s == NULL) {
 		LOGOOM();
 		return NULL;
@@ -994,7 +810,6 @@ struct mux_stream *session_open_stream(struct mux_session *restrict ss)
 		stream_free(s);
 		return NULL;
 	}
-	s->send_window = MUX_DEFAULT_SEND_WINDOW;
 	MUX_LOG_F(DEBUG, ss, "opened stream %" PRIuFAST16, id);
 	sched_wake(ss, s);
 	MUX_LOG_F(
@@ -1003,72 +818,184 @@ struct mux_stream *session_open_stream(struct mux_session *restrict ss)
 	return s;
 }
 
-/* Send Path: handshake completion, ack trimming, suspend/resume. */
-
-void session_handshake_done(struct mux_session *ss)
+/* Mark egress pending and arm EV_WRITE; the send pump runs on the next loop
+ * iteration (coalesced) or inline via session_flush under low load. */
+void session_notify(struct mux_session *restrict ss)
 {
-	MUX_LOG(VERBOSE, ss, "mux negotiation completed");
-	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
-	/* Distinguish fresh establish from resume before session_set_state
-	 * clears connect_started and updates peer_addr. */
-	const bool is_resume = (ss->peer_addr.sa.sa_family != AF_UNSPEC);
-	session_set_state(ss, SESSION_ESTABLISHED);
-	ev_timer_again(ss->loop, &ss->w_timeout);
-	if (LOGLEVEL(NOTICE)) {
-		char str[32];
-		format_duration(
-			str, sizeof(str),
-			make_duration_nanos(ss->last_connect_latency_ns));
-		const char *const verb = is_resume ? "resumed" : "established";
-		if (ss->peer_addr.sa.sa_family != AF_UNSPEC) {
-			char peer_str[64];
-			(void)sa_format(
-				peer_str, sizeof(peer_str), &ss->peer_addr.sa);
-			MUX_LOG_F(
-				NOTICE, ss, "session %s peer=%s setup=%s", verb,
-				peer_str, str);
-		} else {
-			MUX_LOG_F(NOTICE, ss, "session %s setup=%s", verb, str);
-		}
-	}
-	ss->last_modified = (int_least64_t)clock_monotonic_ns();
-
-#if WITH_TLS && !defined(NDEBUG)
-	/* mux handshake completion implies TLS is up; log KTLS offload status. */
-	wire_tls_log_status(ss);
-#endif
-
-	if (!ss->accepted) {
-		if (ss->conf.idle_timeout > 0 &&
-		    table_size(ss->sched.streams) == 0) {
-			ev_timer_again(ss->loop, &ss->w_idle_timeout);
-		}
-	}
-
-	/* Re-activate streams queued during suspension: data-ready arms EV_WRITE
-	 * directly, INIT/CLOSED lifecycle via sched_schedule (also EV_WRITE). */
-	if (ss->sched.sched_head != NULL) {
-		ss->wire.tx_pending = true;
-	}
-	sched_schedule(ss);
-	/* Re-arm w_coalesce on resume with preserved Nagle/ACK backlog or
-	 * session ACK delta.  sched_coalesce_arm is idempotent. */
-	if (ss->sched.delay_head != NULL ||
-	    ss->unacked.recv_seq != ss->unacked.ack_seq) {
-		sched_coalesce_arm(ss);
-	}
-
-	/* If draining was requested before the handshake completed and there
-	 * are no active streams, initiate a graceful shutdown immediately. */
-	if (ss->draining && ss->sched.streams != NULL &&
-	    table_size(ss->sched.streams) == 0) {
-		session_initiate_shutdown(ss);
+	ss->wire.tx_pending = true;
+	if (ss->w_socket.fd != -1) {
+		session_update_watcher(ss);
 	}
 }
 
-/* Close the transport only, preserving stream state and the unacked ring for
- * resume over a new connection.  Called on transport error while ESTABLISHED or
- * on a client mid-resume-handshake; enters SESSION_SUSPENDED with a timeout. */
+static void format_frame_flags(
+	char *restrict buf, const size_t buflen, const uint_fast8_t flags)
+{
+	static const struct {
+		uint_least8_t flag;
+		const char *name;
+	} names[] = {
+		{ MUX_FLAG_SYN, "SYN" },   { MUX_FLAG_ACK, "ACK" },
+		{ MUX_FLAG_FIN, "FIN" },   { MUX_FLAG_RST, "RST" },
+		{ MUX_FLAG_PUSH, "PUSH" },
+	};
+
+	char *p = buf;
+	const char *const end = buf + buflen;
+	bool wrote = false;
+	for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+		if ((flags & names[i].flag) == 0) {
+			continue;
+		}
+		if (wrote && p + 1 < end) {
+			*p++ = '|';
+		}
+		for (const char *s = names[i].name; *s != '\0' && p + 1 < end;
+		     s++) {
+			*p++ = *s;
+		}
+		wrote = true;
+	}
+	const uint_fast8_t unknown = flags & (uint_fast8_t)(~MUX_FLAG_MASK);
+	if (unknown != 0) {
+		const int ret = snprintf(
+			p, (size_t)(end - p), "%sUNKNOWN(0x%02" PRIxFAST8 ")",
+			wrote ? "|" : "", unknown);
+		if (ret < 0 && buflen > 0) {
+			buf[0] = '\0';
+		}
+		return;
+	}
+	if (!wrote) {
+		const int ret = snprintf(buf, buflen, "NONE");
+		if (ret < 0 && buflen > 0) {
+			buf[0] = '\0';
+		}
+	} else if (p < end) {
+		*p = '\0';
+	}
+}
+
+void session_log_frame_header(
+	struct mux_session *restrict ss, const char *restrict what,
+	const unsigned char *restrict raw,
+	const struct mux_header *restrict hdr)
+{
+	if (!LOGLEVEL(VERYVERBOSE)) {
+		return;
+	}
+	char flags_str[64];
+	format_frame_flags(flags_str, sizeof(flags_str), hdr->flags);
+
+	LOG_BIN_F(
+		VERYVERBOSE, raw, MUX_FRAME_HEADER_SIZE, 0,
+		"[fd:%d] %s: stream_id=%" PRIuLEAST16 " length=%" PRIuLEAST16
+		" flags=0x%02" PRIxLEAST8 "(%s)"
+		" extra=%" PRIuLEAST16,
+		ss->w_socket.fd, what, hdr->stream_id, hdr->length, hdr->flags,
+		flags_str, hdr->extra);
+}
+
+void session_set_state(struct mux_session *ss, enum session_state newstate)
+{
+	if (ss->state == newstate) {
+		return;
+	}
+	MUX_LOG_F(
+		DEBUG, ss, "state: %s -> %s", session_state_str[ss->state],
+		session_state_str[newstate]);
+	const enum session_state oldstate = ss->state;
+
+	if (oldstate == SESSION_ESTABLISHED) {
+		ev_timer_stop(ss->loop, &ss->w_timeout);
+		ev_timer_stop(ss->loop, &ss->w_keepalive);
+		ev_timer_stop(ss->loop, &ss->w_send_timeout);
+		ss->estimator.ping_in_flight = false;
+		session_reset_stream_window_floor(ss);
+		COUNTER_ADD(ss->cnt.num_session_disconnected, 1);
+		COUNTER_SUB(ss->cnt.num_sessions, 1);
+		session_emit(ss, MUX_EVENT_LOST, (union mux_event_data){ 0 });
+	} else if (
+		(oldstate == SESSION_CONNECT ||
+		 oldstate == SESSION_HANDSHAKE) &&
+		newstate != SESSION_CONNECT && newstate != SESSION_HANDSHAKE &&
+		newstate != SESSION_ESTABLISHED &&
+		newstate != SESSION_SUSPENDED) {
+		COUNTER_SUB(ss->cnt.num_session_halfopen, 1);
+		session_emit(
+			ss, MUX_EVENT_CONNECT_FAILED,
+			(union mux_event_data){ 0 });
+	}
+
+	ss->state = newstate;
+	PUB_STORE(ss->_pub_state, newstate);
+
+	if ((newstate == SESSION_CONNECT || newstate == SESSION_HANDSHAKE) &&
+	    oldstate != SESSION_CONNECT && oldstate != SESSION_HANDSHAKE) {
+		COUNTER_ADD(ss->cnt.num_session_connect, 1);
+		COUNTER_ADD(ss->cnt.num_session_halfopen, 1);
+		session_emit(
+			ss, MUX_EVENT_CONNECT, (union mux_event_data){ 0 });
+	} else if (newstate == SESSION_ESTABLISHED) {
+		if (ss->connect_started > 0) {
+			const int_fast64_t lat =
+				clock_monotonic_ns() - ss->connect_started;
+			ss->last_connect_latency_ns = lat;
+			ss->connect_started = 0;
+		}
+		/* peer_addr survives suspend but is cleared after reconnect, so
+		 * it distinguishes first establishment (CONNECT) from resume. */
+		const bool first_establish =
+			(ss->peer_addr.sa.sa_family == AF_UNSPEC);
+		(void)socket_get_peer(ss->w_socket.fd, &ss->peer_addr);
+		ev_timer_again(ss->loop, &ss->w_keepalive);
+		COUNTER_ADD(ss->cnt.num_session_connected, 1);
+		COUNTER_SUB(ss->cnt.num_session_halfopen, 1);
+		COUNTER_ADD(ss->cnt.num_sessions, 1);
+		session_emit(
+			ss,
+			first_establish ? MUX_EVENT_ESTABLISHED :
+					  MUX_EVENT_RESUMED,
+			(union mux_event_data){
+				.connected.ns = ss->last_connect_latency_ns,
+				.connected.peer_id = ss->handshake.peer_id,
+				.connected.peer_identity =
+					ss->handshake.peer_identity,
+			});
+	}
+}
+
+void session_reset(struct mux_session *ss)
+{
+	if (ss->state == SESSION_CLOSED) {
+		return;
+	}
+	MUX_LOG(VERBOSE, ss, "closing");
+	session_set_state(ss, SESSION_CLOSED);
+	session_stop(ss);
+	session_cleanup(ss);
+
+	if (ss->accepted) {
+		return;
+	}
+	/* Reset peer_addr so the next establishment is recognised as first. */
+	memset(&ss->peer_addr, 0, sizeof(ss->peer_addr));
+	ss->num_halfopen = 0;
+}
+
+void session_notify_closed(struct mux_session *restrict ss, const bool expired)
+{
+	session_reset(ss);
+	if (ss->state == SESSION_CLOSED) {
+		session_emit(
+			ss, MUX_EVENT_CLOSED,
+			(union mux_event_data){
+				.closed.clean = ss->wire.rx_eof,
+				.closed.expired = expired,
+			});
+	}
+}
+
 void session_suspend(struct mux_session *restrict ss)
 {
 	ASSERT(ss->state == SESSION_ESTABLISHED ||
@@ -1142,6 +1069,67 @@ void session_suspend(struct mux_session *restrict ss)
 	session_emit(ss, MUX_EVENT_SUSPENDED, (union mux_event_data){ 0 });
 }
 
+void session_handshake_done(struct mux_session *ss)
+{
+	MUX_LOG(VERBOSE, ss, "mux negotiation completed");
+	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
+	/* Distinguish fresh establish from resume before session_set_state
+	 * clears connect_started and updates peer_addr. */
+	const bool is_resume = (ss->peer_addr.sa.sa_family != AF_UNSPEC);
+	session_set_state(ss, SESSION_ESTABLISHED);
+	ev_timer_again(ss->loop, &ss->w_timeout);
+	if (LOGLEVEL(NOTICE)) {
+		char str[32];
+		format_duration(
+			str, sizeof(str),
+			make_duration_nanos(ss->last_connect_latency_ns));
+		const char *const verb = is_resume ? "resumed" : "established";
+		if (ss->peer_addr.sa.sa_family != AF_UNSPEC) {
+			char peer_str[64];
+			(void)sa_format(
+				peer_str, sizeof(peer_str), &ss->peer_addr.sa);
+			MUX_LOG_F(
+				NOTICE, ss, "session %s peer=%s setup=%s", verb,
+				peer_str, str);
+		} else {
+			MUX_LOG_F(NOTICE, ss, "session %s setup=%s", verb, str);
+		}
+	}
+	ss->last_modified = (int_least64_t)clock_monotonic_ns();
+
+#if WITH_TLS && !defined(NDEBUG)
+	/* mux handshake completion implies TLS is up; log KTLS offload status. */
+	wire_tls_log_status(ss);
+#endif
+
+	if (!ss->accepted) {
+		if (ss->conf.idle_timeout > 0 &&
+		    table_size(ss->sched.streams) == 0) {
+			ev_timer_again(ss->loop, &ss->w_idle_timeout);
+		}
+	}
+
+	/* Re-activate streams queued during suspension: data-ready arms EV_WRITE
+	 * directly, INIT/CLOSED lifecycle via sched_schedule (also EV_WRITE). */
+	if (ss->sched.sched_head != NULL) {
+		ss->wire.tx_pending = true;
+	}
+	sched_schedule(ss);
+	/* Re-arm w_coalesce on resume with preserved Nagle/ACK backlog or
+	 * session ACK delta.  sched_coalesce_arm is idempotent. */
+	if (ss->sched.delay_head != NULL ||
+	    ss->unacked.recv_seq != ss->unacked.ack_seq) {
+		sched_coalesce_arm(ss);
+	}
+
+	/* If draining was requested before the handshake completed and there
+	 * are no active streams, initiate a graceful shutdown immediately. */
+	if (ss->draining && ss->sched.streams != NULL &&
+	    table_size(ss->sched.streams) == 0) {
+		session_initiate_shutdown(ss);
+	}
+}
+
 void mux_transport_detach(
 	struct mux_session *restrict new_ss, struct mux_transport *restrict out)
 {
@@ -1158,22 +1146,9 @@ void mux_transport_detach(
 #endif
 }
 
-void mux_transport_discard(struct mux_transport *restrict transport)
-{
-	if (transport->fd != -1) {
-		SOCKET_CLOSE_FD(transport->fd);
-		transport->fd = -1;
-	}
-#if WITH_TLS
-	wire_tlsconn_free(transport->tlsconn);
-	transport->tlsconn = NULL;
-#endif
-}
-
-/* Install a detached transport on the resumed session and complete the resume
- * handshake (send ServerHello, replay unacked frames).  Runs on @p ss's own
- * loop.  On success consumes @p t (clears its fd/tlsconn); on any failure
- * leaves @p t untouched for the caller to discard. */
+/* Install a detached transport on a suspended session; sends ServerHello
+ * and replays unacked frames.  Consumes @p t on success; leaves it
+ * untouched on failure for the caller to discard. */
 static void session_resume_attach(
 	struct mux_session *restrict ss, struct mux_transport *restrict t,
 	const uint_least32_t client_resume_seq)
@@ -1291,4 +1266,16 @@ void mux_resume_attach(
 	/* Single consume point: a no-op when the attach installed the transport
 	 * (fd/tlsconn already cleared), frees it on every failure path. */
 	mux_transport_discard(transport);
+}
+
+void mux_transport_discard(struct mux_transport *restrict transport)
+{
+	if (transport->fd != -1) {
+		SOCKET_CLOSE_FD(transport->fd);
+		transport->fd = -1;
+	}
+#if WITH_TLS
+	wire_tlsconn_free(transport->tlsconn);
+	transport->tlsconn = NULL;
+#endif
 }

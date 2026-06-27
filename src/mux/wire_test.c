@@ -1,11 +1,9 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* wire_test.c - white-box tests for wire.c (TLS/plain socket I/O and the
- * send-buffer staging/coalescing).
- * Dependencies: wire.c #included; real leaf frame.c and the TLS backend
- * (tlsutil + gencerts) linked; socket I/O via real socketpairs (csnippets).
- * wire.c is self-contained, so no sibling collaborators are mocked. */
+/* wire_test.c - white-box tests for wire.c (TLS/plain socket I/O, send-buffer
+ * staging/coalescing); wire.c #included, real frame.c and TLS backend linked,
+ * real socketpairs used; no sibling collaborators mocked. */
 
 #include "mux/frame.h"
 #include "mux/mux.h"
@@ -419,7 +417,7 @@ static const char wire_test_key_pem[] =
 
 static bool wire_test_write_pem(const char *path, const char *data)
 {
-	FILE *fp = fopen(path, "w");
+	FILE *const fp = fopen(path, "w");
 	if (fp == NULL) {
 		return false;
 	}
@@ -448,7 +446,7 @@ static char *wire_test_setup_cert_dir(
 	char *restrict tmpl, char *restrict cert_out, const size_t cert_sz,
 	char *restrict key_out, const size_t key_sz)
 {
-	char *origdir = getcwd(NULL, 0);
+	char *const origdir = getcwd(NULL, 0);
 	if (origdir == NULL) {
 		return NULL;
 	}
@@ -554,13 +552,13 @@ T_DECLARE_CASE(test_wire_tls_start_creates_outbound_conn)
 {
 	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
 	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *origdir = wire_test_setup_cert_dir(
+	char *const origdir = wire_test_setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -590,13 +588,13 @@ T_DECLARE_CASE(test_wire_conn_free_clears_tlsconn)
 {
 	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
 	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *origdir = wire_test_setup_cert_dir(
+	char *const origdir = wire_test_setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -606,7 +604,7 @@ T_DECLARE_CASE(test_wire_conn_free_clears_tlsconn)
 	int fds[2];
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 	/* tls_server with a valid fd creates the SSL object without I/O. */
-	struct tls_connection *conn = tls_server(ctx, fds[0]);
+	struct tls_connection *const conn = tls_server(ctx, fds[0]);
 	T_CHECK(conn != NULL);
 
 	struct frame_pool_ctx pool_ctx = { 0 };
@@ -625,18 +623,18 @@ T_DECLARE_CASE(test_wire_tls_send_recv_data)
 {
 	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
 	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *origdir = wire_test_setup_cert_dir(
+	char *const origdir = wire_test_setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *srv_ctx =
+	struct tls_context *const srv_ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1 });
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -649,8 +647,8 @@ T_DECLARE_CASE(test_wire_tls_send_recv_data)
 	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
 	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
 
-	struct tls_connection *srv_conn = tls_server(srv_ctx, fds[0]);
-	struct tls_connection *cli_conn = tls_client(cli_ctx, fds[1]);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
 	T_CHECK(srv_conn != NULL);
 	T_CHECK(cli_conn != NULL);
 	T_CHECK(wire_test_drive_handshake(srv_conn, cli_conn, 20));
@@ -667,10 +665,9 @@ T_DECLARE_CASE(test_wire_tls_send_recv_data)
 	size_t rlen = sizeof(recv_buf) - 1;
 	T_EXPECT(wire_send(&cli_ss, send_buf, &slen));
 	T_EXPECT_EQ(slen, sizeof(send_buf) - 1);
-	/* The peer's ciphertext may not have reached fds[0] yet: AF_UNIX
-	 * socketpairs deliver synchronously on Linux but asynchronously over the
-	 * loopback emulation on Windows/msys2.  Retry wire_recv, waiting on
-	 * readability between attempts, until the payload arrives. */
+	/* AF_UNIX delivers synchronously on Linux but asynchronously on
+	 * Windows/msys2: retry wire_recv waiting for readability until the
+	 * payload arrives. */
 	size_t got = 0;
 	for (int i = 0; i < 20 && got == 0; i++) {
 		rlen = sizeof(recv_buf) - 1;
@@ -700,18 +697,18 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 {
 	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
 	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *origdir = wire_test_setup_cert_dir(
+	char *const origdir = wire_test_setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *srv_ctx =
+	struct tls_context *const srv_ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1 });
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -724,8 +721,8 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
 	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
 
-	struct tls_connection *srv_conn = tls_server(srv_ctx, fds[0]);
-	struct tls_connection *cli_conn = tls_client(cli_ctx, fds[1]);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
 	T_CHECK(srv_conn != NULL);
 	T_CHECK(cli_conn != NULL);
 	T_CHECK(wire_test_drive_handshake(srv_conn, cli_conn, 20));
@@ -777,18 +774,18 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 {
 	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
 	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *origdir = wire_test_setup_cert_dir(
+	char *const origdir = wire_test_setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *srv_ctx =
+	struct tls_context *const srv_ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1 });
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -802,8 +799,8 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
 
 	/* Buffered connections pass fd=-1; wire.c drives the socket. */
-	struct tls_connection *srv_conn = tls_server(srv_ctx, -1);
-	struct tls_connection *cli_conn = tls_client(cli_ctx, -1);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, -1);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, -1);
 	T_CHECK(srv_conn != NULL);
 	T_CHECK(cli_conn != NULL);
 
@@ -885,7 +882,8 @@ T_DECLARE_CASE(test_sendbuf_push_small_frame_by_reference)
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
-	struct mux_frame *f = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const f =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(f != NULL);
 	make_ctrl_frame(f, 1);
 
@@ -909,8 +907,10 @@ T_DECLARE_CASE(test_sendbuf_push_second_small_frame_packs_onto_tail)
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
-	struct mux_frame *f1 = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
-	struct mux_frame *f2 = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const f1 =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const f2 =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(f1 != NULL && f2 != NULL);
 	make_ctrl_frame(f1, 1);
 	make_ctrl_frame(f2, 2);
@@ -938,7 +938,8 @@ T_DECLARE_CASE(test_sendbuf_push_large_frame_by_reference)
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
-	struct mux_frame *f = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const f =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(f != NULL);
 	make_push_frame(f, 1000u);
 
@@ -962,8 +963,10 @@ T_DECLARE_CASE(test_sendbuf_push_corkable_packs_onto_large_tail)
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
-	struct mux_frame *large = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
-	struct mux_frame *small = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const large =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const small =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(large != NULL && small != NULL);
 	make_push_frame(large, 1000u); /* len 1008, opens the record */
 	make_ctrl_frame(small, 1); /* 8 B */
@@ -991,8 +994,10 @@ T_DECLARE_CASE(test_sendbuf_push_large_after_corkable_adds_entry)
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
-	struct mux_frame *small = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
-	struct mux_frame *large = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const small =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const large =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(small != NULL && large != NULL);
 	make_ctrl_frame(small, 1);
 	make_push_frame(large, MUX_MAX_RECORD); /* len > MUX_MAX_RECORD */
@@ -1015,8 +1020,10 @@ T_DECLARE_CASE(test_sendbuf_push_medium_frames_coalesce)
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
-	struct mux_frame *m1 = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
-	struct mux_frame *m2 = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const m1 =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const m2 =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(m1 != NULL && m2 != NULL);
 	/* Two 4 KiB frames: 2 * (header + 4096) is well within one record. */
 	make_push_frame(m1, 4096u);
@@ -1045,7 +1052,8 @@ T_DECLARE_CASE(test_sendbuf_push_full_frame_by_reference)
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
-	struct mux_frame *f = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const f =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(f != NULL);
 	make_push_frame(
 		f, MUX_MAX_PAYLOAD_SIZE); /* len == MUX_MAX_FRAME_SIZE */
@@ -1072,8 +1080,10 @@ T_DECLARE_CASE(test_sendbuf_discard_clears_staging)
 	T_CHECK(ss.wire.recvbuf != NULL);
 
 	/* One entry holding two packed corkable frames (f2 packed onto f1). */
-	struct mux_frame *f1 = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
-	struct mux_frame *f2 = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const f1 =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const f2 =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(f1 != NULL && f2 != NULL);
 	make_ctrl_frame(f1, 1);
 	make_ctrl_frame(f2, 2);
@@ -1100,7 +1110,8 @@ T_DECLARE_CASE(test_sendbuf_push_full_tail_starts_new_entry)
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
 	/* Open a tail and fill it artificially to capacity. */
-	struct mux_frame *seed = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const seed =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(seed != NULL);
 	make_ctrl_frame(seed, 1);
 	wire_sendbuf_push(&ss, seed); /* opens tail by reference */
@@ -1111,7 +1122,8 @@ T_DECLARE_CASE(test_sendbuf_push_full_tail_starts_new_entry)
 	pool_ctx.free_calls = 0;
 
 	/* Append a corkable frame — the tail is full, so a new entry is created. */
-	struct mux_frame *f2 = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const f2 =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(f2 != NULL);
 	make_ctrl_frame(f2, 2);
 	wire_sendbuf_push(&ss, f2);
@@ -1128,24 +1140,25 @@ T_DECLARE_CASE(test_sendbuf_push_full_tail_starts_new_entry)
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
 }
 
-/* Packing fills exactly up to one TLS record (MUX_MAX_RECORD) and no further: a
- * frame reaching the record boundary packs, but the next one opens a new entry
- * even though the tail's physical buffer (header + MUX_MAX_PAYLOAD_SIZE) still
- * has room. */
+/* Packing fills exactly one TLS record (MUX_MAX_RECORD); a frame at the
+ * boundary packs, but the next opens a new entry even though the tail's
+ * physical buffer still has room. */
 T_DECLARE_CASE(test_sendbuf_push_fills_record_then_new_entry)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
 	/* Open a tail and advance it to one header short of a full record. */
-	struct mux_frame *seed = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const seed =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(seed != NULL);
 	make_ctrl_frame(seed, 1);
 	wire_sendbuf_push(&ss, seed);
 	ss.wire.sendbuf.tail->len = MUX_MAX_RECORD - MUX_FRAME_HEADER_SIZE;
 
 	/* An 8 B control frame fits exactly to the record boundary: packs. */
-	struct mux_frame *fit = mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
+	struct mux_frame *const fit =
+		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(fit != NULL);
 	make_ctrl_frame(fit, 2);
 	wire_sendbuf_push(&ss, fit);
@@ -1154,7 +1167,7 @@ T_DECLARE_CASE(test_sendbuf_push_fills_record_then_new_entry)
 
 	/* The next frame would cross the record boundary: new entry, by reference,
 	 * even though the tail's buffer still has spare capacity. */
-	struct mux_frame *overflow =
+	struct mux_frame *const overflow =
 		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(overflow != NULL);
 	make_ctrl_frame(overflow, 3);
@@ -1165,38 +1178,41 @@ T_DECLARE_CASE(test_sendbuf_push_fills_record_then_new_entry)
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
 }
 
-int main(void)
-{
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_wire_send_plain_tcp_writes_bytes);
-	T_RUN_CASE(t, test_wire_recv_plain_tcp_reads_payload);
-	T_RUN_CASE(t, test_wire_recv_eof_clears_rx_open_and_sets_tx_pending);
-	T_RUN_CASE(t, test_ringbuf_consume_frame_preserves_remaining_bytes);
-	T_RUN_CASE(t, test_ringbuf_consume_advances_offset_without_copy);
-	T_RUN_CASE(t, test_ringbuf_shrink_reclaims_capacity);
-	T_RUN_CASE(t, test_ringbuf_shrink_keeps_live_bytes);
-	T_RUN_CASE(t, test_ringbuf_shrink_noop_when_small);
-	T_RUN_CASE(t, test_wire_discard_buffers_frees_all_pending_frames);
-	T_RUN_CASE(t, test_wire_shutdown_plain_tcp_returns_done);
-	T_RUN_CASE(t, test_wire_wait_eof_returns_true_on_clean_peer_close);
-	T_RUN_CASE(t, test_sendbuf_push_small_frame_by_reference);
-	T_RUN_CASE(t, test_sendbuf_push_second_small_frame_packs_onto_tail);
-	T_RUN_CASE(t, test_sendbuf_push_large_frame_by_reference);
-	T_RUN_CASE(t, test_sendbuf_push_corkable_packs_onto_large_tail);
-	T_RUN_CASE(t, test_sendbuf_push_large_after_corkable_adds_entry);
-	T_RUN_CASE(t, test_sendbuf_push_medium_frames_coalesce);
-	T_RUN_CASE(t, test_sendbuf_push_full_frame_by_reference);
-	T_RUN_CASE(t, test_sendbuf_discard_clears_staging);
-	T_RUN_CASE(t, test_sendbuf_push_full_tail_starts_new_entry);
-	T_RUN_CASE(t, test_sendbuf_push_fills_record_then_new_entry);
+static const struct testing_suite suite[] = {
+	T_CASE(test_wire_send_plain_tcp_writes_bytes),
+	T_CASE(test_wire_recv_plain_tcp_reads_payload),
+	T_CASE(test_wire_recv_eof_clears_rx_open_and_sets_tx_pending),
+	T_CASE(test_ringbuf_consume_frame_preserves_remaining_bytes),
+	T_CASE(test_ringbuf_consume_advances_offset_without_copy),
+	T_CASE(test_ringbuf_shrink_reclaims_capacity),
+	T_CASE(test_ringbuf_shrink_keeps_live_bytes),
+	T_CASE(test_ringbuf_shrink_noop_when_small),
+	T_CASE(test_wire_discard_buffers_frees_all_pending_frames),
+	T_CASE(test_wire_shutdown_plain_tcp_returns_done),
+	T_CASE(test_wire_wait_eof_returns_true_on_clean_peer_close),
+	T_CASE(test_sendbuf_push_small_frame_by_reference),
+	T_CASE(test_sendbuf_push_second_small_frame_packs_onto_tail),
+	T_CASE(test_sendbuf_push_large_frame_by_reference),
+	T_CASE(test_sendbuf_push_corkable_packs_onto_large_tail),
+	T_CASE(test_sendbuf_push_large_after_corkable_adds_entry),
+	T_CASE(test_sendbuf_push_medium_frames_coalesce),
+	T_CASE(test_sendbuf_push_full_frame_by_reference),
+	T_CASE(test_sendbuf_discard_clears_staging),
+	T_CASE(test_sendbuf_push_full_tail_starts_new_entry),
+	T_CASE(test_sendbuf_push_fills_record_then_new_entry),
 #if WITH_TLS
-	T_RUN_CASE(t, test_wire_set_tlsctx_updates_and_noop);
-	T_RUN_CASE(t, test_wire_tls_start_noop_when_no_context);
-	T_RUN_CASE(t, test_wire_tls_start_creates_outbound_conn);
-	T_RUN_CASE(t, test_wire_conn_free_clears_tlsconn);
-	T_RUN_CASE(t, test_wire_tls_send_recv_data);
-	T_RUN_CASE(t, test_wire_tls_shutdown_completes);
-	T_RUN_CASE(t, test_wire_tls_buffered_send_recv);
+	T_CASE(test_wire_set_tlsctx_updates_and_noop),
+	T_CASE(test_wire_tls_start_noop_when_no_context),
+	T_CASE(test_wire_tls_start_creates_outbound_conn),
+	T_CASE(test_wire_conn_free_clears_tlsconn),
+	T_CASE(test_wire_tls_send_recv_data),
+	T_CASE(test_wire_tls_shutdown_completes),
+	T_CASE(test_wire_tls_buffered_send_recv),
 #endif
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
+{
+	return testing_main(argc, argv, suite);
 }

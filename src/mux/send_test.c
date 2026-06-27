@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 /* mock - collaborator spies, frame pool, session fixture
@@ -414,8 +415,8 @@ static void si_noop_timer_cb(struct ev_loop *loop, ev_timer *w, int revents)
 }
 
 struct si_pool_ctx {
-	int alloc_calls;
-	int free_calls;
+	uint_least32_t alloc_calls;
+	uint_least32_t free_calls;
 	/* force allocation failure to exercise OOM paths */
 	bool fail;
 };
@@ -605,10 +606,9 @@ T_DECLARE_CASE(test_send_cb_resumes_lifecycle_drain_unconditionally)
 	si_teardown(&fx);
 }
 
-/* Frame producers: session_send_ctrl / _oob / _push, session_emit_ack, and
- * session_discard_stream_frames.  These are the egress entry points the flush
- * state machine drains; here the wire_sendbuf_push spy captures the produced
- * frame so its encoded header and the session accounting can be asserted. */
+/* Frame producers: session_send_ctrl/_oob/_push, session_emit_ack, and
+ * session_discard_stream_frames; wire_sendbuf_push spy captures produced
+ * frames so the encoded header and session accounting can be asserted. */
 
 static struct mux_frame *
 si_alloc_frame(struct si_fixture *restrict fx, const size_t payload_len)
@@ -727,6 +727,7 @@ T_DECLARE_CASE(test_send_oob_zero_fills)
 	const bool ok = session_send_oob(&fx.ss, MUX_CTRL_PROBE, NULL, 4);
 
 	T_EXPECT(ok);
+	T_CHECK(fx.ss.wire.oobbuf.head != NULL);
 	const unsigned char zeros[4] = { 0, 0, 0, 0 };
 	T_EXPECT_MEMEQ(
 		fx.ss.wire.oobbuf.head->data + MUX_FRAME_HEADER_SIZE, zeros,
@@ -1152,37 +1153,112 @@ T_DECLARE_CASE(test_send_handle_rx_closed_terminal)
 	si_teardown(&fx);
 }
 
-int main(void)
+/* Resume replay must skip a partially-acked coalesced head's already-acked
+ * leading sub-frames: send_queue_retransmit copies from partial_offset, so the
+ * peer never receives delivered data twice. */
+T_DECLARE_CASE(test_retransmit_skips_acked_head_prefix)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+
+	enum { P1 = 4, P2 = 8 };
+	const size_t sub1 = MUX_FRAME_HEADER_SIZE + P1;
+	const size_t sub2 = MUX_FRAME_HEADER_SIZE + P2;
+	struct mux_frame *const entry =
+		mux_frame_get(&fx.ss.pool, fx.ss.max_payload);
+	T_CHECK(entry != NULL);
+	mux_write_header(
+		entry->data,
+		&(struct mux_header){ .version = MUX_PROTOCOL_VERSION,
+				      .flags = MUX_FLAG_PUSH,
+				      .length = P1,
+				      .stream_id = 11 });
+	mux_write_header(
+		entry->data + sub1,
+		&(struct mux_header){ .version = MUX_PROTOCOL_VERSION,
+				      .flags = MUX_FLAG_PUSH,
+				      .length = P2,
+				      .stream_id = 22 });
+	for (size_t i = 0; i < P1; i++) {
+		entry->data[MUX_FRAME_HEADER_SIZE + i] =
+			(unsigned char)(0xA0 + i);
+	}
+	for (size_t i = 0; i < P2; i++) {
+		entry->data[sub1 + MUX_FRAME_HEADER_SIZE + i] =
+			(unsigned char)(0xB0 + i);
+	}
+	entry->len = sub1 + sub2;
+	entry->unacked_count =
+		1; /* sub-frame 1 already acked, only #2 unacked */
+
+	struct mux_frame_ring *const ring =
+		malloc(sizeof(struct mux_frame_ring) +
+		       MUX_FRAME_RING_MIN * sizeof(struct mux_frame *));
+	T_CHECK(ring != NULL);
+	*ring = (struct mux_frame_ring){
+		.capacity = MUX_FRAME_RING_MIN,
+		.count = 1,
+	};
+	ring->entries[0] = entry;
+	fx.ss.unacked.ring = ring;
+	fx.ss.unacked.partial_offset = (uint_least32_t)sub1;
+	fx.ss.unacked.retransmit_off = 0;
+
+	bool retransmitting = false;
+	T_CHECK(send_queue_retransmit(&fx.ss, &retransmitting));
+
+	struct mux_frame *const copy = fx.ss.wire.sendbuf.head;
+	T_CHECK(copy != NULL);
+	/* Only the unacked second sub-frame is replayed, byte-for-byte. */
+	T_EXPECT_EQ(copy->len, sub2);
+	T_EXPECT(memcmp(copy->data, entry->data + sub1, sub2) == 0);
+
+	fx.ss.unacked.retransmit_copy = NULL;
+	fx.ss.unacked.ring = NULL;
+	mux_frame_put(&fx.ss.pool, entry);
+	free(ring);
+	si_teardown(&fx); /* clears sendbuf, freeing the replay copy */
+}
+
+static const struct testing_suite suite[] = {
+	T_CASE(test_send_cb_defers_lp_drain_before_established),
+	T_CASE(test_send_cb_drains_lp_when_established),
+	T_CASE(test_session_flush_inline_when_pipe_clear),
+	T_CASE(test_send_cb_resumes_lifecycle_drain_unconditionally),
+	T_CASE(test_send_ctrl_encodes_and_clamps),
+	T_CASE(test_send_ctrl_oom),
+	T_CASE(test_send_oob_copies_payload),
+	T_CASE(test_send_oob_zero_fills),
+	T_CASE(test_send_oob_oom),
+	T_CASE(test_send_push_syn_on_init),
+	T_CASE(test_send_push_ack_fin),
+	T_CASE(test_emit_ack_sends_delta),
+	T_CASE(test_emit_ack_clamps_delta),
+	T_CASE(test_discard_stream_frames_selective),
+	T_CASE(test_notify_write_noop_before_established),
+	T_CASE(test_session_flush_defers_before_established),
+	T_CASE(test_flush_head_sends_fully),
+	T_CASE(test_flush_head_partial_write),
+	T_CASE(test_flush_head_blocked_closes_staging),
+	T_CASE(test_flush_head_error_suspends),
+	T_CASE(test_flush_head_error_resets),
+	T_CASE(test_update_send_timeout_rearms_while_pending),
+	T_CASE(test_flush_head_empty_sendbuf),
+	T_CASE(test_flush_head_error_suspends_in_handshake),
+	T_CASE(test_send_head_must_flush_partial_head),
+	T_CASE(test_send_handle_rx_closed_terminal),
+	T_CASE(test_retransmit_skips_acked_head_prefix),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
 	/* Surface the VERYVERBOSE frame-out diagnostics in the producers. */
 	slog_level_ = LOG_LEVEL_VERYVERBOSE;
 
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_send_cb_defers_lp_drain_before_established);
-	T_RUN_CASE(t, test_send_cb_drains_lp_when_established);
-	T_RUN_CASE(t, test_session_flush_inline_when_pipe_clear);
-	T_RUN_CASE(t, test_send_cb_resumes_lifecycle_drain_unconditionally);
-	T_RUN_CASE(t, test_send_ctrl_encodes_and_clamps);
-	T_RUN_CASE(t, test_send_ctrl_oom);
-	T_RUN_CASE(t, test_send_oob_copies_payload);
-	T_RUN_CASE(t, test_send_oob_zero_fills);
-	T_RUN_CASE(t, test_send_oob_oom);
-	T_RUN_CASE(t, test_send_push_syn_on_init);
-	T_RUN_CASE(t, test_send_push_ack_fin);
-	T_RUN_CASE(t, test_emit_ack_sends_delta);
-	T_RUN_CASE(t, test_emit_ack_clamps_delta);
-	T_RUN_CASE(t, test_discard_stream_frames_selective);
-	T_RUN_CASE(t, test_notify_write_noop_before_established);
-	T_RUN_CASE(t, test_session_flush_defers_before_established);
-	T_RUN_CASE(t, test_flush_head_sends_fully);
-	T_RUN_CASE(t, test_flush_head_partial_write);
-	T_RUN_CASE(t, test_flush_head_blocked_closes_staging);
-	T_RUN_CASE(t, test_flush_head_error_suspends);
-	T_RUN_CASE(t, test_flush_head_error_resets);
-	T_RUN_CASE(t, test_update_send_timeout_rearms_while_pending);
-	T_RUN_CASE(t, test_flush_head_empty_sendbuf);
-	T_RUN_CASE(t, test_flush_head_error_suspends_in_handshake);
-	T_RUN_CASE(t, test_send_head_must_flush_partial_head);
-	T_RUN_CASE(t, test_send_handle_rx_closed_terminal);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

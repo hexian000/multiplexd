@@ -5,20 +5,15 @@
  * its public API. Dependencies: links the real TLS backend + gencerts.c. */
 
 #include "tlsutil.h"
-#include <stdint.h>
-
-#define UTILS_MEASURE_H
-#include "os/clock.h"
-#include "utils/testing.h"
-
-#include <stdlib.h>
 
 #if WITH_TLS
 
 #if WITH_OPENSSL
 #include "gencerts.h"
 #endif
+
 #include "utils/slog.h"
+#include "utils/testing.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -26,7 +21,9 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -152,7 +149,7 @@ static char test_key_pem[] =
 #if !WITH_OPENSSL
 static bool write_pem_file(const char *path, const char *data)
 {
-	FILE *fp = fopen(path, "w");
+	FILE *const fp = fopen(path, "w");
 	if (fp == NULL) {
 		return false;
 	}
@@ -180,7 +177,7 @@ static char *setup_cert_dir(
 	char *restrict tmpl, char *restrict cert_out, const size_t cert_sz,
 	char *restrict key_out, const size_t key_sz)
 {
-	char *origdir = getcwd(NULL, 0);
+	char *const origdir = getcwd(NULL, 0);
 	if (origdir == NULL) {
 		return NULL;
 	}
@@ -218,7 +215,7 @@ static char *setup_cert_dir(
  * Returns NULL on failure. */
 static char *slurp_file(const char *path)
 {
-	FILE *fp = fopen(path, "r");
+	FILE *const fp = fopen(path, "r");
 	if (fp == NULL) {
 		return NULL;
 	}
@@ -235,7 +232,7 @@ static char *slurp_file(const char *path)
 		(void)fclose(fp);
 		return NULL;
 	}
-	char *buf = malloc((size_t)size + 1);
+	char *const buf = malloc((size_t)size + 1);
 	if (buf == NULL) {
 		(void)fclose(fp);
 		return NULL;
@@ -320,7 +317,7 @@ T_DECLARE_CASE(test_tls_ctx_server_null_cert_fails)
 {
 	char cert[] = "";
 	char key[] = "";
-	struct tls_context *ctx = tls_ctx_server(
+	struct tls_context *const ctx = tls_ctx_server(
 		&(struct tls_config){ .cert = cert, .key = key });
 	T_EXPECT(ctx == NULL);
 }
@@ -329,7 +326,7 @@ T_DECLARE_CASE(test_tls_ctx_bad_cert_fails)
 {
 	char cert[] = "this is not a PEM certificate at all";
 	char key[] = "this is not a PEM key at all";
-	struct tls_context *ctx = tls_ctx_server(
+	struct tls_context *const ctx = tls_ctx_server(
 		&(struct tls_config){ .cert = cert, .key = key });
 	T_EXPECT(ctx == NULL);
 }
@@ -339,13 +336,13 @@ T_DECLARE_CASE(test_tls_ctx_server_created)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -363,13 +360,13 @@ T_DECLARE_CASE(test_tls_ctx_client_created)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -388,13 +385,13 @@ T_DECLARE_CASE(test_tls_load_key_empty_fails)
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
 	char empty[] = "";
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -414,13 +411,13 @@ T_DECLARE_CASE(test_tls_load_cert_missing_file_fails)
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
 	char missing[] = "@/tmp/tlsutil_missing_cert.pem";
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -442,13 +439,13 @@ T_DECLARE_CASE(test_tls_load_authcerts_rejects_invalid_entries)
 	char empty[] = "";
 	char *authcerts_null[] = { NULL };
 	char *authcerts_empty[] = { empty };
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -470,7 +467,7 @@ T_DECLARE_CASE(test_tls_ctx_invalid_ciphersuites_are_ignored)
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
 	char ciphersuites[] = "TLS_NO_SUCH_CIPHERSUITE";
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
@@ -483,8 +480,8 @@ T_DECLARE_CASE(test_tls_ctx_invalid_ciphersuites_are_ignored)
 		.authcerts_count = 1,
 		.ciphersuites = ciphersuites,
 	};
-	struct tls_context *server = tls_ctx_server(&tls_conf);
-	struct tls_context *client = tls_ctx_client(&tls_conf);
+	struct tls_context *const server = tls_ctx_server(&tls_conf);
+	struct tls_context *const client = tls_ctx_client(&tls_conf);
 	T_EXPECT(server != NULL);
 	T_EXPECT(client != NULL);
 	if (server != NULL) {
@@ -503,19 +500,19 @@ T_DECLARE_CASE(test_tls_server_and_client_validate_inputs)
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
 	struct tls_connection *conn = NULL;
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1 });
 	T_CHECK(ctx != NULL);
-	/* A NULL context is rejected; fd=-1 is valid and selects buffered mode. */
+	/* A NULL context is rejected; fd=-1 is valid and selects memory-backed mode. */
 	T_EXPECT(tls_server(NULL, -1) == NULL);
 	T_EXPECT(tls_client(NULL, -1) == NULL);
 	conn = tls_server(ctx, -1);
@@ -535,13 +532,13 @@ T_DECLARE_CASE(test_tls_load_cert_from_memory_succeeds)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -551,7 +548,7 @@ T_DECLARE_CASE(test_tls_load_cert_from_memory_succeeds)
 	/* Read the certificate PEM directly from the file (cert_path + 1 strips
 	 * the '@' prefix to get the real path) and pass it without '@' to
 	 * exercise the in-memory load path of tls_load_cert. */
-	char *pem = slurp_file(cert_path + 1);
+	char *const pem = slurp_file(cert_path + 1);
 	T_CHECK(pem != NULL);
 	T_EXPECT(tls_load_cert(ctx, pem));
 	free(pem);
@@ -565,13 +562,13 @@ T_DECLARE_CASE(test_tls_load_key_from_memory_succeeds)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *ctx =
+	struct tls_context *const ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -580,7 +577,7 @@ T_DECLARE_CASE(test_tls_load_key_from_memory_succeeds)
 
 	/* Read the key PEM from the file (key_path + 1 strips '@') and pass it
 	 * without '@' to exercise the in-memory load path of tls_load_key. */
-	char *pem = slurp_file(key_path + 1);
+	char *const pem = slurp_file(key_path + 1);
 	T_CHECK(pem != NULL);
 	T_EXPECT(tls_load_key(ctx, pem));
 	free(pem);
@@ -594,18 +591,18 @@ T_DECLARE_CASE(test_tls_full_handshake_and_io)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *srv_ctx =
+	struct tls_context *const srv_ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1 });
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -619,8 +616,8 @@ T_DECLARE_CASE(test_tls_full_handshake_and_io)
 	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
 	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
 
-	struct tls_connection *srv_conn = tls_server(srv_ctx, fds[0]);
-	struct tls_connection *cli_conn = tls_client(cli_ctx, fds[1]);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
 	T_CHECK(srv_conn != NULL);
 	T_CHECK(cli_conn != NULL);
 	T_CHECK(drive_handshake(srv_conn, cli_conn, 20));
@@ -656,18 +653,18 @@ T_DECLARE_CASE(test_tls_shutdown_oneway)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *srv_ctx =
+	struct tls_context *const srv_ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1 });
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -680,8 +677,8 @@ T_DECLARE_CASE(test_tls_shutdown_oneway)
 	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
 	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
 
-	struct tls_connection *srv_conn = tls_server(srv_ctx, fds[0]);
-	struct tls_connection *cli_conn = tls_client(cli_ctx, fds[1]);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
 	T_CHECK(srv_conn != NULL);
 	T_CHECK(cli_conn != NULL);
 	T_CHECK(drive_handshake(srv_conn, cli_conn, 20));
@@ -722,13 +719,13 @@ static bool alpn_handshake(
 	char *const *restrict authcerts, const char *restrict srv_alpn,
 	const char *restrict cli_alpn)
 {
-	struct tls_context *srv_ctx =
+	struct tls_context *const srv_ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1,
 						     .alpn = srv_alpn });
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -770,7 +767,7 @@ T_DECLARE_CASE(test_tls_alpn_negotiation)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
@@ -799,18 +796,18 @@ T_DECLARE_CASE(test_tls_peer_cert_der_after_handshake)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *srv_ctx =
+	struct tls_context *const srv_ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1 });
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -823,8 +820,8 @@ T_DECLARE_CASE(test_tls_peer_cert_der_after_handshake)
 	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
 	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
 
-	struct tls_connection *srv_conn = tls_server(srv_ctx, fds[0]);
-	struct tls_connection *cli_conn = tls_client(cli_ctx, fds[1]);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
 	T_CHECK(srv_conn != NULL);
 	T_CHECK(cli_conn != NULL);
 	T_CHECK(drive_handshake(srv_conn, cli_conn, 20));
@@ -926,18 +923,18 @@ T_DECLARE_CASE(test_tls_buf_handshake_and_io)
 	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
 	char cert_path[PATH_MAX + 2];
 	char key_path[PATH_MAX + 2];
-	char *origdir = setup_cert_dir(
+	char *const origdir = setup_cert_dir(
 		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
 	T_CHECK(origdir != NULL);
 	free(origdir);
 
 	char *authcerts[] = { cert_path };
-	struct tls_context *srv_ctx =
+	struct tls_context *const srv_ctx =
 		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
 						     .authcerts_count = 1 });
-	struct tls_context *cli_ctx =
+	struct tls_context *const cli_ctx =
 		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
 						     .key = key_path,
 						     .authcerts = authcerts,
@@ -945,12 +942,11 @@ T_DECLARE_CASE(test_tls_buf_handshake_and_io)
 	T_CHECK(srv_ctx != NULL);
 	T_CHECK(cli_ctx != NULL);
 
-	/* fd=-1 selects buffered (memory-transport) mode.  The client carries an
-	 * on_send notifier so we can assert the library reported staged ciphertext
-	 * (replacing the former tls_dirty poll). */
+	/* fd=-1 selects memory-backed mode.  The client carries an on_send notifier
+	 * so we can assert the library reported staged ciphertext. */
 	int cli_send_events = 0;
-	struct tls_connection *srv_conn = tls_server(srv_ctx, -1);
-	struct tls_connection *cli_conn = tls_client(cli_ctx, -1);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, -1);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, -1);
 	T_CHECK(srv_conn != NULL);
 	T_CHECK(cli_conn != NULL);
 	tls_set_callback(
@@ -986,12 +982,106 @@ T_DECLARE_CASE(test_tls_buf_handshake_and_io)
 	rm_tmpdir(tmpl);
 }
 
+/* Regression (ISSUES.md #10): on_recv must stay set until all staged records
+ * are drained; mbedTLS buffered path missed this because check_pending
+ * cannot see conn->in. */
+T_DECLARE_CASE(test_tls_buf_recv_drains_stacked_records)
+{
+	char tmpl[] = "/tmp/tlsutil_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, -1);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, -1);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+	T_CHECK(drive_handshake_buf(srv_conn, cli_conn, 20));
+
+	/* Spans several TLS records (max ~16 KiB plaintext each), with a position-
+	 * dependent pattern so a dropped or reordered record is caught. */
+	static unsigned char payload[40000];
+	for (size_t i = 0; i < sizeof(payload); i++) {
+		payload[i] = (unsigned char)(i ^ (i >> 8));
+	}
+
+	/* Encrypt the whole payload into the client's staging buffer before moving
+	 * any ciphertext, so it lands in the server as one burst.  tls_send writes at
+	 * most one record per call, so loop until all plaintext is accepted. */
+	for (size_t off = 0; off < sizeof(payload);) {
+		size_t n = sizeof(payload) - off;
+		T_CHECK(tls_send(cli_conn, payload + off, &n) ==
+			TLS_ERROR_NONE);
+		T_CHECK(n > 0);
+		off += n;
+	}
+
+	/* The single shuttle is the "one socket_recv": every record's ciphertext is
+	 * now staged in the server's conn->in at once. */
+	int srv_recv_events = 0;
+	tls_set_callback(
+		srv_conn, &(struct tls_callback){ .ctx = &srv_recv_events,
+						  .on_recv = count_io_event });
+	T_CHECK(tls_pipe(cli_conn, srv_conn));
+
+	/* Drain exactly as session_on_recv does: one recv, then keep going while the
+	 * notifier reports more is readable without feeding further ciphertext. */
+	static unsigned char out[sizeof(payload)];
+	size_t got = 0;
+	int recv_calls = 0;
+	for (;;) {
+		const int before = srv_recv_events;
+		size_t n = sizeof(out) -
+			   got; /* >= one record while data remains */
+		T_CHECK(tls_recv(srv_conn, out + got, &n) == TLS_ERROR_NONE);
+		got += n;
+		recv_calls++;
+		const bool readable = (srv_recv_events > before);
+		if (recv_calls == 1) {
+			/* The decisive assertion: with records still staged behind the
+			 * first, on_recv must fire.  Pre-fix mbedTLS left this false. */
+			T_EXPECT(readable);
+		}
+		if (!readable) {
+			break;
+		}
+	}
+
+	/* Everything decrypted from the one burst (no second socket read), in order,
+	 * and it genuinely took multiple records (otherwise the test is vacuous). */
+	T_EXPECT_EQ(got, sizeof(payload));
+	T_EXPECT(recv_calls >= 2);
+	T_EXPECT(memcmp(out, payload, sizeof(payload)) == 0);
+
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	tls_ctx_free(cli_ctx);
+	tls_ctx_free(srv_ctx);
+	rm_tmpdir(tmpl);
+}
+
 /* ---- throughput benchmark: plain TCP baseline ---- */
 
-/* Establish a connected TCP socket pair over the loopback NIC (127.0.0.1) so
- * the throughput benches measure the real kernel TCP stack rather than an
- * AF_UNIX shortcut.  Returns two connected blocking fds (out[0] accepted,
- * out[1] connected) with TCP_NODELAY set, or false on failure. */
+/* Loopback TCP socket pair for throughput benches (real kernel TCP, not AF_UNIX).
+ * Returns two blocking fds with TCP_NODELAY (out[0]=accepted, out[1]=connected),
+ * or false on failure. */
 static bool bench_loopback_pair(int out[2])
 {
 	out[0] = out[1] = -1;
@@ -1058,6 +1148,16 @@ enum { BENCH_BUFSIZE = 16384 };
 
 T_DECLARE_BENCH(bench_tcp_throughput)
 {
+	/* One-time setup: the loopback pair persists across calibration rounds and
+	 * is reclaimed at process exit. */
+	static bool ready = false;
+	if (!ready) {
+		T_CHECK(tcp_bench_setup());
+		T_CHECK(atexit(tcp_bench_teardown) == 0);
+		ready = true;
+	}
+	T_BENCH_SET_BYTES(BENCH_BUFSIZE);
+
 	unsigned char send_buf[BENCH_BUFSIZE];
 	unsigned char recv_buf[BENCH_BUFSIZE];
 	memset(send_buf, 0xA5, sizeof(send_buf));
@@ -1161,6 +1261,18 @@ fail:
 
 T_DECLARE_BENCH(bench_tls_throughput)
 {
+	/* One-time setup: the TLS session (handshake done once) persists across
+	 * calibration rounds and is torn down at process exit. */
+	static bool ready = false;
+	if (!ready) {
+		(void)fprintf(stderr, "--- TLS library: %s\n", tls_version());
+		(void)fflush(stderr);
+		T_CHECK(bench_setup());
+		T_CHECK(atexit(bench_teardown) == 0);
+		ready = true;
+	}
+	T_BENCH_SET_BYTES(BENCH_BUFSIZE);
+
 	unsigned char send_buf[BENCH_BUFSIZE];
 	unsigned char recv_buf[BENCH_BUFSIZE];
 	memset(send_buf, 0xA5, sizeof(send_buf));
@@ -1184,76 +1296,39 @@ T_DECLARE_BENCH(bench_tls_throughput)
 	}
 }
 
-/* Local variant of T_RUN_BENCH that also reports throughput in IEC GiB/s.  The
- * throughput benches transfer BENCH_BUFSIZE bytes per op, so throughput is
- * derived from the same calibrated total used for ns/op.  Calibration mirrors
- * T_RUN_BENCH: N is doubled each round until at least one second has elapsed,
- * and the accumulated op count is (final N - 1). */
-#define RUN_THROUGHPUT_BENCH(ctx_, name_)                                      \
-	do {                                                                   \
-		(void)fprintf((ctx_).out, "=== RUN   %s\n", #name_);           \
-		(void)fflush((ctx_).out);                                      \
-		struct testing_bench _b_ = { 0 };                              \
-		const int_fast64_t _bstart_ = clock_monotonic_ns();            \
-		int_fast64_t _belapsed_;                                       \
-		uint_fast64_t _bN_ = 1;                                        \
-		do {                                                           \
-			_b_.N = _bN_;                                          \
-			_benchcase_##name_##_(&_b_);                           \
-			_bN_ <<= 1u;                                           \
-			_belapsed_ = clock_monotonic_ns() - _bstart_;          \
-		} while (_bN_ && _belapsed_ < 1000000000 /* 1s */);            \
-		const uint_fast64_t _bops_ = _bN_ - 1;                         \
-		const double _bnsop_ = (double)_belapsed_ / (double)_bops_;    \
-		const double _bgibps_ = (double)_bops_ *                       \
-					(double)BENCH_BUFSIZE * 1e9 /          \
-					((double)_belapsed_ * 1073741824.0);   \
-		(void)fprintf(                                                 \
-			(ctx_).out,                                            \
-			"--- BENCH %s\t%ju\t%.2f ns/op\t%.2f GiB/s\n", #name_, \
-			(uintmax_t)_bops_, _bnsop_, _bgibps_);                 \
-		(void)fflush((ctx_).out);                                      \
-		(ctx_).benched++;                                              \
-	} while (0)
+static const struct testing_suite suite[] = {
+	T_CASE(test_tls_ctx_server_null_cert_fails),
+	T_CASE(test_tls_ctx_bad_cert_fails),
+	T_CASE(test_tls_ctx_server_created),
+	T_CASE(test_tls_ctx_client_created),
+	T_CASE(test_tls_load_key_empty_fails),
+	T_CASE(test_tls_load_cert_missing_file_fails),
+	T_CASE(test_tls_load_authcerts_rejects_invalid_entries),
+	T_CASE(test_tls_ctx_invalid_ciphersuites_are_ignored),
+	T_CASE(test_tls_server_and_client_validate_inputs),
+	T_CASE(test_tls_load_cert_from_memory_succeeds),
+	T_CASE(test_tls_load_key_from_memory_succeeds),
+	T_CASE(test_tls_full_handshake_and_io),
+	T_CASE(test_tls_shutdown_oneway),
+	T_CASE(test_tls_alpn_negotiation),
+	T_CASE(test_tls_peer_cert_der_after_handshake),
+	T_CASE(test_tls_buf_handshake_and_io),
+	T_CASE(test_tls_buf_recv_drains_stacked_records),
+	/* Opt-in throughput benchmarks (16 KiB/op, AES-128-GCM); skipped by the
+	 * default run.  Select with `--run <ere>` or TESTING_FILTER. */
+	T_BENCH(bench_tcp_throughput),
+	T_BENCH(bench_tls_throughput),
+	T_SUITE_END,
+};
 
-int main(void)
+int main(int argc, char **argv)
 {
-	T_DECLARE_CTX(t);
-	if (getenv("BENCH") != NULL) {
-		/* Bench-only mode: skip the functional cases and run just the
-		 * throughput benches. */
-		(void)fprintf(t.out, "--- TLS library: %s\n", tls_version());
-		(void)fflush(t.out);
-		if (tcp_bench_setup()) {
-			RUN_THROUGHPUT_BENCH(t, bench_tcp_throughput);
-			tcp_bench_teardown();
-		}
-		if (bench_setup()) {
-			RUN_THROUGHPUT_BENCH(t, bench_tls_throughput);
-			bench_teardown();
-		}
-		return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
-	}
-	T_RUN_CASE(t, test_tls_ctx_server_null_cert_fails);
-	T_RUN_CASE(t, test_tls_ctx_bad_cert_fails);
-	T_RUN_CASE(t, test_tls_ctx_server_created);
-	T_RUN_CASE(t, test_tls_ctx_client_created);
-	T_RUN_CASE(t, test_tls_load_key_empty_fails);
-	T_RUN_CASE(t, test_tls_load_cert_missing_file_fails);
-	T_RUN_CASE(t, test_tls_load_authcerts_rejects_invalid_entries);
-	T_RUN_CASE(t, test_tls_ctx_invalid_ciphersuites_are_ignored);
-	T_RUN_CASE(t, test_tls_server_and_client_validate_inputs);
-	T_RUN_CASE(t, test_tls_load_cert_from_memory_succeeds);
-	T_RUN_CASE(t, test_tls_load_key_from_memory_succeeds);
-	T_RUN_CASE(t, test_tls_full_handshake_and_io);
-	T_RUN_CASE(t, test_tls_shutdown_oneway);
-	T_RUN_CASE(t, test_tls_alpn_negotiation);
-	T_RUN_CASE(t, test_tls_peer_cert_der_after_handshake);
-	T_RUN_CASE(t, test_tls_buf_handshake_and_io);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }
 
 #else /* !WITH_TLS */
+
+#include <stdlib.h>
 
 int main(void)
 {

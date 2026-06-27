@@ -28,9 +28,10 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ);
 
-	struct listener *restrict l = w->data;
-	const struct conf_socket_opts *restrict socket_opts = l->socket_opts;
-	uint_least64_t *restrict num_accepted = l->num_accepted;
+	struct listener *const restrict l = w->data;
+	const struct conf_socket_opts *const restrict socket_opts =
+		l->socket_opts;
+	uint_least64_t *const restrict num_accepted = l->num_accepted;
 
 	for (;;) {
 		union sockaddr_max addr;
@@ -91,7 +92,7 @@ timer_cb(struct ev_loop *restrict loop, ev_timer *watcher, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
 	ev_timer_stop(loop, watcher);
-	struct listener *restrict l = watcher->data;
+	struct listener *const restrict l = watcher->data;
 	ev_io_start(loop, &l->w_accept);
 }
 
@@ -126,7 +127,8 @@ bool listener_start(
 		return false;
 	}
 
-	const struct conf_socket_opts *restrict socket_opts = l->socket_opts;
+	const struct conf_socket_opts *const restrict socket_opts =
+		l->socket_opts;
 	socket_set_buffer(fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf);
 	socket_set_tcp(
 		fd, socket_opts->tcp_nodelay, socket_opts->tcp_keepalive);

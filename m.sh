@@ -65,6 +65,7 @@ case "$1" in
         -DCMAKE_C_COMPILER="clang" \
         -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld --rtlib=compiler-rt" \
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+        -DENABLE_THREADS=ON \
         ..
     cmake --build . -t multiplexd
     (cd bin && llvm-objdump -drwS multiplexd >multiplexd.S)

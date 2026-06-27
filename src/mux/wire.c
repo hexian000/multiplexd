@@ -11,8 +11,9 @@
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
+#if WITH_TLS
 #include "tlsutil.h"
-#include "util.h"
+#endif
 
 #include "io/io.h"
 #include "os/socket.h"
@@ -27,28 +28,26 @@
 #include <string.h>
 
 #if WITH_TLS
-/* on_send notifier: the library staged outbound ciphertext (replaces the former
- * tls_dirty() poll).  Mark the transport write side pending so the session
- * schedules a flush; the cleared-each-pass tx_pending makes an over-eager set
- * self-correcting. */
+/* on_send notifier: the library staged outbound ciphertext.  Mark the
+ * transport write side pending so the session schedules a flush; the
+ * cleared-each-pass tx_pending makes an over-eager set self-correcting. */
 static void wire_on_tls_send(void *ctx)
 {
-	struct mux_session *restrict ss = ctx;
+	struct mux_session *const restrict ss = ctx;
 	ss->wire.tx_pending = true;
 }
 
 /* on_recv notifier: the library holds buffered plaintext readable without
- * further I/O (replaces the former tls_has_pending() poll). */
+ * further I/O. */
 static void wire_on_tls_recv(void *ctx)
 {
-	struct mux_session *restrict ss = ctx;
+	struct mux_session *const restrict ss = ctx;
 	ss->wire.tls_readable = true;
 }
 
-/* Pull all ciphertext the buffered TLS library has produced into the rawbuf
- * ring and drain it to the socket, retaining what the socket cannot yet accept.
- * Returns 0 once everything is flushed, EAGAIN when the socket is full (residue
- * held for the next EV_WRITE), or another errno on a fatal error. */
+/* Drain buffered TLS ciphertext to the socket, retaining what cannot be
+ * accepted yet; returns 0 when done, EAGAIN when the socket is full,
+ * or another errno on a fatal error. */
 static int wire_cipher_push(struct mux_session *restrict ss)
 {
 	for (;;) {
@@ -102,10 +101,9 @@ static int wire_cipher_push(struct mux_session *restrict ss)
 	}
 }
 
-/* Buffered transport send: encrypt the plaintext in @p buf into the TLS library
- * and push the resulting ciphertext to the socket.  *len reports the plaintext
- * bytes accepted by the library (0 while a cross-direction stall or congested
- * socket blocks progress).  Returns false on an unrecoverable error. */
+/* Encrypt plaintext in buf and push ciphertext to the socket; *len is the
+ * plaintext bytes accepted (0 while stalled); returns false on an
+ * unrecoverable error. */
 static bool wire_send_buffered(
 	struct mux_session *restrict ss, const unsigned char *restrict buf,
 	size_t *restrict len)
@@ -218,7 +216,6 @@ static bool wire_recv_buffered(
 }
 #endif /* WITH_TLS */
 
-/* return false to indicate connection closed or error */
 bool wire_send(
 	struct mux_session *restrict ss, const unsigned char *restrict buf,
 	size_t *restrict len)
@@ -281,7 +278,6 @@ bool wire_send(
 	return true;
 }
 
-/* return false to indicate connection closed or error */
 bool wire_recv(
 	struct mux_session *restrict ss, unsigned char *restrict buf,
 	size_t *len)
@@ -351,8 +347,7 @@ bool wire_recv(
 bool wire_has_pending(const struct mux_session *restrict ss)
 {
 #if WITH_TLS
-	/* Set by the on_recv notifier during the last tls_recv; replaces the
-	 * former tls_has_pending() poll. */
+	/* Set by the on_recv notifier during the last tls_recv. */
 	return ss->wire.tls_readable;
 #else
 	(void)ss;
@@ -378,10 +373,9 @@ void wire_sendbuf_push(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
 	ASSERT(frame->len > 0);
-	/* Pack the frame onto the open tail to fill the current TLS record
-	 * (MUX_MAX_RECORD, bounded by the tail's physical buffer) before opening a
-	 * new one; a frame that fits neither limit falls through to the zero-copy
-	 * by-reference path below. */
+	/* Pack onto the open tail to fill the current TLS record (MUX_MAX_RECORD,
+	 * bounded by tail's physical buffer); a frame fitting neither falls
+	 * through to the zero-copy by-reference path below. */
 	if (frame->len <= MUX_MAX_RECORD && ss->wire.sendbuf_staging) {
 		struct mux_frame *const tail = ss->wire.sendbuf.tail;
 		ASSERT(tail->pos == 0);
@@ -472,7 +466,7 @@ void wire_tls_log_status(struct mux_session *restrict ss)
 	 * log and must return TLS_ERROR_NONE.  Debug builds only. */
 	const enum tls_error err = tls_handshake(ss->wire.tlsconn);
 	ASSERT(err == TLS_ERROR_NONE);
-	UNUSED(err);
+	(void)err;
 }
 #endif /* NDEBUG */
 
@@ -526,9 +520,8 @@ enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
 		switch (err) {
 		case TLS_ERROR_NONE:
 			/* Our close_notify is flushed (one-way); fall through to TCP
-			 * half-close.  The peer's close_notify is read later in the
-			 * CLOSE_WAIT phase via wire_wait_eof.  In memory-transport mode
-			 * the alert is staged in memory, so push it to the socket first. */
+			 * half-close; peer's close_notify is read later via
+			 * wire_wait_eof; memory-transport: push alert first. */
 			if (!ss->conf.tls_socket_offload) {
 				switch (wire_flush(ss)) {
 				case WIRE_FLUSH_DONE:
@@ -606,10 +599,9 @@ bool wire_wait_eof(struct mux_session *restrict ss)
 			tls_recv(ss->wire.tlsconn, buf, &nread);
 		switch (err) {
 		case TLS_ERROR_ZERO_RETURN:
-			/* Peer's close_notify received: clean close.  Or, since
-			 * tls_shutdown is one-way, WANT_READ/WANT_WRITE means the
-			 * peer's close_notify has not arrived yet — nothing
-			 * unexpected is pending, so finish like a plaintext EAGAIN. */
+			/* Peer's close_notify: clean close; or tls_shutdown is one-way
+			 * so WANT_READ/WANT_WRITE means it has not arrived yet;
+			 * treat like a plaintext EAGAIN. */
 		case TLS_ERROR_WANT_READ:
 		case TLS_ERROR_WANT_WRITE:
 			return true;

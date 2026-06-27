@@ -59,8 +59,8 @@ void socket_notsent_lowat(const int fd, const int bytes)
 
 void init(int argc, char *const *argv)
 {
-	UNUSED(argc);
-	UNUSED(argv);
+	(void)argc;
+	(void)argv;
 	(void)setlocale(LC_ALL, "");
 	(void)setvbuf(stdout, NULL, _IONBF, 0);
 	slog_setoutput(SLOG_OUTPUT_FILE, stdout);

@@ -2,10 +2,8 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* stream_test.c - white-box tests for stream.c (per-stream state machine,
- * window/credit accounting, half-close/RST).
- * Dependencies: stream.c #included; real leaf frame.c linked; its sched/send
- * collaborators (sched_init/add/free/delay/wake, session_send_ctrl/flush/
- * eager_flush/discard, wire_discard_buffers) are mocked below. */
+ * window/credit accounting, half-close/RST); stream.c #included, sched/send
+ * collaborators mocked below. */
 
 #include "mux/frame.h"
 #include "mux/mux.h"
@@ -17,6 +15,7 @@
 #include "utils/testing.h"
 
 #include <ev.h>
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,8 +164,8 @@ void wire_discard_buffers(struct mux_session *restrict ss)
 }
 
 struct frame_pool_ctx {
-	int alloc_calls;
-	int free_calls;
+	uint_least32_t alloc_calls;
+	uint_least32_t free_calls;
 };
 
 struct stream_fixture {
@@ -546,10 +545,9 @@ T_DECLARE_CASE(test_stream_recv_fin_with_rx_eof_shuts_down_write)
 	teardown_fixture(&fx);
 }
 
-/* When auto_stream_window is enabled and the session stream_window has been
- * reduced below a stream's recv_window, stream_check_ack must shrink
- * recv_window as soon as no outstanding peer credit remains and all buffered
- * bytes fit within the new target. */
+/* auto_stream_window: when stream_window is reduced below recv_window,
+ * stream_check_ack must shrink recv_window once no outstanding peer credit
+ * remains and all buffered bytes fit the new target. */
 T_DECLARE_CASE(test_stream_check_ack_shrinks_recv_window_when_safe)
 {
 	struct stream_fixture fx;
@@ -937,33 +935,37 @@ T_DECLARE_CASE(test_stream_close_idempotent_when_closed)
 	teardown_fixture(&fx);
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_stream_grant_inc_uses_available_window),
+	T_CASE(test_stream_grant_inc_scales_under_pressure),
+	T_CASE(test_stream_dequeue_send_updates_queue_counters),
+	T_CASE(test_stream_recv_window_grows_send_credit),
+	T_CASE(test_stream_recv_fin_advances_state),
+	T_CASE(test_stream_recv_rst_discards_buffered_data),
+	T_CASE(test_stream_close_with_unread_data_sends_rst),
+	T_CASE(test_stream_shutdown_marks_rx_eof),
+	T_CASE(test_stream_recv_fin_with_rx_eof_shuts_down_write),
+	T_CASE(test_stream_check_ack_shrinks_recv_window_when_safe),
+	T_CASE(test_stream_check_ack_does_not_shrink_while_outstanding),
+	T_CASE(test_stream_format_tag_formats_id_string),
+	T_CASE(test_stream_mark_syn_sent_advances_state),
+	T_CASE(test_syn_received_rst_before_attach),
+	T_CASE(test_halfopen_release_before_free),
+	T_CASE(test_stream_format_tag_endpoint_variants),
+	T_CASE(test_stream_pressure_scale_branches),
+	T_CASE(test_stream_recv_copy_closed_and_overflow),
+	T_CASE(test_stream_recv_window_excessive_and_exhausted),
+	T_CASE(test_stream_mark_fin_sent_unexpected_state),
+	T_CASE(test_stream_check_ack_early_returns),
+	T_CASE(test_stream_timeout_cb_aborts),
+	T_CASE(test_stream_tombstone_cb_decrements),
+	T_CASE(test_stream_close_idempotent_when_closed),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
 	slog_level_ = LOG_LEVEL_VERYVERBOSE;
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_stream_grant_inc_uses_available_window);
-	T_RUN_CASE(t, test_stream_grant_inc_scales_under_pressure);
-	T_RUN_CASE(t, test_stream_dequeue_send_updates_queue_counters);
-	T_RUN_CASE(t, test_stream_recv_window_grows_send_credit);
-	T_RUN_CASE(t, test_stream_recv_fin_advances_state);
-	T_RUN_CASE(t, test_stream_recv_rst_discards_buffered_data);
-	T_RUN_CASE(t, test_stream_close_with_unread_data_sends_rst);
-	T_RUN_CASE(t, test_stream_shutdown_marks_rx_eof);
-	T_RUN_CASE(t, test_stream_recv_fin_with_rx_eof_shuts_down_write);
-	T_RUN_CASE(t, test_stream_check_ack_shrinks_recv_window_when_safe);
-	T_RUN_CASE(t, test_stream_check_ack_does_not_shrink_while_outstanding);
-	T_RUN_CASE(t, test_stream_format_tag_formats_id_string);
-	T_RUN_CASE(t, test_stream_mark_syn_sent_advances_state);
-	T_RUN_CASE(t, test_syn_received_rst_before_attach);
-	T_RUN_CASE(t, test_halfopen_release_before_free);
-	T_RUN_CASE(t, test_stream_format_tag_endpoint_variants);
-	T_RUN_CASE(t, test_stream_pressure_scale_branches);
-	T_RUN_CASE(t, test_stream_recv_copy_closed_and_overflow);
-	T_RUN_CASE(t, test_stream_recv_window_excessive_and_exhausted);
-	T_RUN_CASE(t, test_stream_mark_fin_sent_unexpected_state);
-	T_RUN_CASE(t, test_stream_check_ack_early_returns);
-	T_RUN_CASE(t, test_stream_timeout_cb_aborts);
-	T_RUN_CASE(t, test_stream_tombstone_cb_decrements);
-	T_RUN_CASE(t, test_stream_close_idempotent_when_closed);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+
+	return testing_main(argc, argv, suite);
 }

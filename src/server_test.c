@@ -1,17 +1,15 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* server_test.c - black-box tests for the server forwarding path, exercised
- * end-to-end against the assembled stack with bounded waits.
- * Dependencies: links the real util/conf/listener/server/tunnel/api_server and
- * the mux library. */
+/* server_test.c - black-box tests for the server forwarding path; real
+ * util/conf/listener/server/tunnel/api_server + mux library linked;
+ * all waits are bounded. */
 
 #include "conf.h"
 #include "listener.h"
+#include "mux/session.h"
 #include "server.h"
 #include "util.h"
-
-#include "mux/session.h"
 
 #include "os/socket.h"
 #include "utils/slog.h"
@@ -21,7 +19,9 @@
 
 #include <errno.h>
 #include <netinet/in.h>
+#if WITH_THREADS
 #include <stdatomic.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,8 +50,6 @@ enum {
 	PAYLOAD_MEDIUM = 16384,
 	PAYLOAD_LARGE = 262144,
 };
-
-int exitcode = EXIT_SUCCESS;
 
 enum mock_mode {
 	MOCK_ECHO = 0,
@@ -122,7 +120,7 @@ static void drive_loop_once(const struct test_fixture *restrict fx)
 
 static void fd_waiter_io_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
-	struct fd_waiter *restrict waiter = w->data;
+	struct fd_waiter *const restrict waiter = w->data;
 	waiter->revents = revents;
 	waiter->done = true;
 	ev_io_stop(loop, &waiter->w_io);
@@ -132,8 +130,8 @@ static void fd_waiter_io_cb(struct ev_loop *loop, ev_io *w, const int revents)
 static void
 fd_waiter_timer_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
-	UNUSED(revents);
-	struct fd_waiter *restrict waiter = w->data;
+	(void)revents;
+	struct fd_waiter *const restrict waiter = w->data;
 	waiter->timed_out = true;
 	waiter->done = true;
 	ev_timer_stop(loop, &waiter->w_timer);
@@ -143,9 +141,9 @@ fd_waiter_timer_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void
 condition_waiter_timer_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
-	UNUSED(loop);
-	UNUSED(revents);
-	struct condition_waiter *restrict waiter = w->data;
+	(void)loop;
+	(void)revents;
+	struct condition_waiter *const restrict waiter = w->data;
 	waiter->timed_out = true;
 }
 
@@ -153,9 +151,9 @@ condition_waiter_timer_cb(struct ev_loop *loop, ev_timer *w, const int revents)
  * worker-thread progress (e.g., stream establishment on a background thread). */
 static void wait_poll_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
-	UNUSED(loop);
-	UNUSED(w);
-	UNUSED(revents);
+	(void)loop;
+	(void)w;
+	(void)revents;
 }
 
 /* Monotonic clock, in seconds.  Test deadlines must use this, not ev_time()
@@ -254,7 +252,7 @@ static int write_full(
 	struct test_fixture *restrict fx, const int fd, const void *buf,
 	const size_t len)
 {
-	const char *ptr = buf;
+	const char *const ptr = buf;
 	size_t sent = 0;
 	while (sent < len) {
 		const ssize_t n =
@@ -518,7 +516,7 @@ static void mock_conn_free(struct mock_conn *restrict conn)
 
 static void mock_server_drop_conn(struct mock_conn *restrict conn)
 {
-	struct mock_server *restrict mock = conn->mock;
+	struct mock_server *const restrict mock = conn->mock;
 	for (struct mock_conn **p = &mock->conns; *p != NULL; p = &(*p)->next) {
 		if (*p == conn) {
 			*p = conn->next;
@@ -532,7 +530,7 @@ static int mock_conn_queue(
 	struct mock_conn *restrict conn, const char *const restrict data,
 	const size_t len)
 {
-	char *new_buf = realloc(conn->out_buf, conn->out_len + len);
+	char *const new_buf = realloc(conn->out_buf, conn->out_len + len);
 	if (new_buf == NULL) {
 		return -1;
 	}
@@ -545,7 +543,7 @@ static int mock_conn_queue(
 static int mock_conn_flush(struct mock_conn *restrict conn)
 {
 	while (conn->out_off < conn->out_len) {
-		size_t remain = conn->out_len - conn->out_off;
+		const size_t remain = conn->out_len - conn->out_off;
 		const ssize_t n =
 			send(conn->fd, conn->out_buf + conn->out_off, remain,
 			     MSG_NOSIGNAL);
@@ -593,7 +591,7 @@ static void mock_conn_io_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	struct mock_conn *restrict conn = w->data;
 
 	if ((revents & EV_READ) != 0) {
-		while (true) {
+		for (;;) {
 			char buf[BUFFER_SIZE];
 			const ssize_t n = read(conn->fd, buf, sizeof(buf));
 			if (n < 0) {
@@ -640,14 +638,14 @@ static void mock_conn_io_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	}
 
 	mock_conn_update_events(conn);
-	UNUSED(loop);
+	(void)loop;
 }
 
 static void
 mock_server_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ);
-	struct mock_server *restrict mock = w->data;
+	struct mock_server *const restrict mock = w->data;
 
 	while (mock->running) {
 		const int fd = accept(mock->listen_fd, NULL, NULL);
@@ -667,7 +665,7 @@ mock_server_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 			continue;
 		}
 
-		struct mock_conn *conn = calloc(1, sizeof(*conn));
+		struct mock_conn *const conn = calloc(1, sizeof(*conn));
 		if (conn == NULL) {
 			SOCKET_CLOSE_FD(fd);
 			continue;
@@ -747,7 +745,7 @@ static struct config *make_config(
 	const char *const restrict listen,
 	const char *const restrict connect_to)
 {
-	struct config *conf = malloc(sizeof(*conf));
+	struct config *const conf = malloc(sizeof(*conf));
 	if (conf == NULL) {
 		return NULL;
 	}
@@ -848,7 +846,7 @@ static struct wait_stats wait_stats_snapshot(const struct server *restrict s)
 		(size_t)(session_connected - session_disconnected);
 	st.num_halfopen_sessions =
 		(size_t)(session_connect - session_connected);
-	struct server_stats *restrict snap = server_stats(s);
+	struct server_stats *const restrict snap = server_stats(s);
 	if (snap != NULL) {
 		st.num_streams = (size_t)((snap->num_stream_opened +
 					   snap->num_stream_accepted) -
@@ -885,7 +883,7 @@ static void log_stream_wait_stats(
 
 static int streams_ready_wait_predicate(void *ptr)
 {
-	struct streams_ready_wait_ctx *restrict ctx = ptr;
+	struct streams_ready_wait_ctx *const restrict ctx = ptr;
 	const struct wait_stats sa = wait_stats_snapshot(ctx->fx->srv_a);
 	const struct wait_stats sb = wait_stats_snapshot(ctx->fx->srv_b);
 	if (sa.num_streams >= ctx->expected &&
@@ -898,7 +896,7 @@ static int streams_ready_wait_predicate(void *ptr)
 
 static int sessions_ready_wait_predicate(void *ptr)
 {
-	struct test_fixture *restrict ctx = ptr;
+	struct test_fixture *const restrict ctx = ptr;
 	const struct wait_stats sa = wait_stats_snapshot(ctx->srv_a);
 	const struct wait_stats sb = wait_stats_snapshot(ctx->srv_b);
 	if (sa.num_established_sessions >= 1 &&
@@ -911,7 +909,7 @@ static int sessions_ready_wait_predicate(void *ptr)
 
 static int streams_exact_wait_predicate(void *ptr)
 {
-	struct streams_exact_wait_ctx *restrict ctx = ptr;
+	struct streams_exact_wait_ctx *const restrict ctx = ptr;
 	const struct wait_stats sa = wait_stats_snapshot(ctx->fx->srv_a);
 	const struct wait_stats sb = wait_stats_snapshot(ctx->fx->srv_b);
 	if (sa.num_streams == ctx->expected &&
@@ -924,7 +922,7 @@ static int streams_exact_wait_predicate(void *ptr)
 
 static int listener_port_wait_predicate(void *ptr)
 {
-	struct listener_port_wait_ctx *restrict ctx = ptr;
+	struct listener_port_wait_ctx *const restrict ctx = ptr;
 	const int port = get_listener_port(ctx->listener);
 	if (port <= 0) {
 		return 0;
@@ -1731,14 +1729,13 @@ struct reload_wait_ctx {
 
 static int reload_done_predicate(void *ptr)
 {
-	const struct reload_wait_ctx *restrict ctx = ptr;
+	const struct reload_wait_ctx *const restrict ctx = ptr;
 	return ctx->fx->srv_a->conf != ctx->old_conf ? 1 : 0;
 }
 
-/* test_server_config_reload – exercises the SIGHUP server_reload() path
- * (drain_tunnels, reload_listeners, reload_mux_tunnel, reload_identity_tunnels):
- * reload srv_a's config via its SIGHUP watcher, wait for srv_b to reconnect
- * after the drain, and verify echo still works. */
+/* test_server_config_reload: exercises SIGHUP server_reload() — drains
+ * tunnels, swaps config, waits for srv_b to reconnect, then verifies
+ * echo still works. */
 T_DECLARE_CASE(test_server_config_reload)
 {
 	struct test_fixture fx;
@@ -1783,11 +1780,11 @@ T_DECLARE_CASE(test_server_config_reload)
 	char *const saved_type = fx.conf_a->type;
 	fx.conf_a->type = NULL;
 	size_t dump_len;
-	char *dump_json = conf_dump(fx.conf_a, &dump_len);
+	char *const dump_json = conf_dump(fx.conf_a, &dump_len);
 	fx.conf_a->type = saved_type;
 	bool dump_ok = false;
 	if (dump_json != NULL) {
-		FILE *dump_fp = fopen(tmp_path, "w");
+		FILE *const dump_fp = fopen(tmp_path, "w");
 		if (dump_fp != NULL) {
 			dump_ok = fwrite(dump_json, 1, dump_len, dump_fp) ==
 				  dump_len;
@@ -1828,10 +1825,9 @@ T_DECLARE_CASE(test_server_config_reload)
 		T_FATAL("session not re-established after reload");
 	}
 
-	/* Post-reload echo – the server must still forward traffic.
-	 * Use connect_and_wait_echo which retries if the session is not
-	 * yet ready to accept streams (e.g. accepted_tunnels not yet
-	 * populated). */
+	/* Post-reload echo: server must still forward traffic.
+	 * connect_and_wait_echo retries if the session is not yet ready
+	 * to accept streams (accepted_tunnels may not yet be populated). */
 	int fd_after;
 	if (connect_and_wait_echo(&fx, fx.tcp_port_a, "post", &fd_after) != 0) {
 		(void)unlink(tmp_path);
@@ -1844,10 +1840,9 @@ T_DECLARE_CASE(test_server_config_reload)
 	fixture_teardown(&fx);
 }
 
-/* test_server_max_sessions_rejects – exercises the max_sessions branch of
- * is_startup_limited().  With one real session established, lower max_sessions
- * and bump num_sessions so the guard fires; the next inbound mux connection
- * must be closed immediately (read() returns 0). */
+/* test_server_max_sessions_rejects: exercises max_sessions via
+ * is_startup_limited(). Lowers limit and fakes num_sessions; the next
+ * inbound connection must be closed immediately. */
 T_DECLARE_CASE(test_server_max_sessions_rejects)
 {
 	struct test_fixture fx;
@@ -1875,10 +1870,9 @@ T_DECLARE_CASE(test_server_max_sessions_rejects)
 		T_FATAL("connect_local to mux port failed");
 	}
 
-	/* Drive until the connection is rejected and closed.  The server
-	 * increments num_rejected and closes the fd synchronously inside
-	 * mux_serve, so the rejection should appear within one event-loop
-	 * iteration. */
+	/* Drive until the connection is rejected and closed; server closes
+	 * the fd synchronously in mux_serve, so one event-loop iteration
+	 * is sufficient. */
 	const int revents = wait_fd_events(
 		&fx, raw, EV_READ, (double)CONNECT_WAIT_TIMEOUT_MS / 1000.0);
 	T_CHECK((revents & EV_READ) != 0);
@@ -1903,10 +1897,9 @@ T_DECLARE_CASE(test_server_max_sessions_rejects)
 	fixture_teardown(&fx);
 }
 
-/* test_server_graceful_shutdown_via_signal – exercises the SIGTERM branch of
- * signal_cb() (stop listeners, graceful session shutdown, 2s deadline timer):
- * fire srv_a's SIGTERM watcher, drive the loop until its listeners stop, and
- * verify teardown stays clean. */
+/* test_server_graceful_shutdown_via_signal: fires srv_a's SIGTERM watcher
+ * directly (bypassing srv_b), drives the loop until listeners stop, and
+ * verifies teardown stays clean. */
 T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
 {
 	struct test_fixture fx;
@@ -1937,25 +1930,27 @@ T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
 	fixture_teardown(&fx);
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_bidirectional_stream_and_forward),
+	T_CASE(test_half_close_b_to_a),
+	T_CASE(test_half_close_a_to_b),
+	T_CASE(test_multi_stream_churn_and_workload),
+	T_CASE(test_backend_close_after_echo),
+	T_CASE(test_client_abort_mid_payload),
+	T_CASE(test_listener_reuse_after_stream_churn),
+	T_CASE(test_cross_direction_overlap),
+	T_CASE(test_large_payload_then_half_close),
+	T_CASE(test_server_config_reload),
+	T_CASE(test_server_max_sessions_rejects),
+	T_CASE(test_server_graceful_shutdown_via_signal),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
 	init(0, NULL);
 	loadlibs();
-
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_bidirectional_stream_and_forward);
-	T_RUN_CASE(t, test_half_close_b_to_a);
-	T_RUN_CASE(t, test_half_close_a_to_b);
-	T_RUN_CASE(t, test_multi_stream_churn_and_workload);
-	T_RUN_CASE(t, test_backend_close_after_echo);
-	T_RUN_CASE(t, test_client_abort_mid_payload);
-	T_RUN_CASE(t, test_listener_reuse_after_stream_churn);
-	T_RUN_CASE(t, test_cross_direction_overlap);
-	T_RUN_CASE(t, test_large_payload_then_half_close);
-	T_RUN_CASE(t, test_server_config_reload);
-	T_RUN_CASE(t, test_server_max_sessions_rejects);
-	T_RUN_CASE(t, test_server_graceful_shutdown_via_signal);
-
+	const int ret = testing_main(argc, argv, suite);
 	unloadlibs();
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return ret;
 }

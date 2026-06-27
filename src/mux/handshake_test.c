@@ -1,10 +1,9 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* handshake_test.c - white-box tests for handshake.c (proto hello build/parse
- * and handshake_process_hello).
- * Dependencies: handshake.c #included; real frame.c and proto_schema.gen.c
- * linked (leaf serialization); session/unacked/sched collaborators mocked. */
+/* handshake_test.c - white-box tests for handshake.c (proto_hello build/parse
+ * and handshake_process_hello). Dependencies: handshake.c #included; real
+ * frame.c/proto_schema.gen.c linked; session/unacked/sched mocked. */
 
 #include "mux/frame.h"
 #include "mux/handshake.h"
@@ -163,7 +162,7 @@ static void setup_session(
 		.pool = make_pool(pool_ctx),
 		.max_payload =
 			(uint_least32_t)mux_conf_default.max_frame_payload,
-		.tag = (char *)"[test]:",
+		.tag = "[test]:",
 	};
 	ss->w_socket.fd = 11;
 }
@@ -549,14 +548,9 @@ T_DECLARE_CASE(test_handshake_process_hello_outside_handshake_resets)
 	T_EXPECT_EQ(g_reset_calls, 1);
 }
 
-/* fuzz - deterministic PRNG-driven fuzzer over proto_hello_parse and
- * handshake_process_hello.  Three randomly-chosen input modes per iteration:
- * random bytes, synthesized/bit-flipped JSON, and full hello frames with varied
- * headers.  After every call it checks: a true parse yields version > 0; ss is
- * always in a valid state; reset implies SESSION_CLOSED; a true
- * handshake_process_hello calls session_handshake_done exactly once, mutually
- * exclusive with reset.  Set MUX_FUZZ_SEED / MUX_FUZZ_ITERATIONS to reproduce;
- * the default seed is fixed for deterministic CI. */
+/* fuzz - proto_hello_parse and handshake_process_hello, three modes:
+ * random bytes, synthesized JSON, full frames with varied headers.
+ * Set MUX_FUZZ_SEED/MUX_FUZZ_ITERATIONS to reproduce; seed fixed for CI. */
 
 /* Splitmix64 PRNG */
 
@@ -685,11 +679,8 @@ static const int k_msgids[] = {
 		}                                                              \
 	} while (0)
 
-/*
- * Synthesize a structured hello JSON payload into buf (up to cap bytes).
- * Applies 0-4 random bit-flip mutations after building the JSON.
- * Returns the actual payload length written.
- */
+/* Synthesize a structured hello JSON payload into buf (up to cap bytes);
+ * applies 0-4 random bit-flip mutations.  Returns actual length written. */
 static size_t gen_structured_json(unsigned char *restrict buf, const size_t cap)
 {
 	char json[JBUF_SIZE];
@@ -769,11 +760,8 @@ static size_t gen_structured_json(unsigned char *restrict buf, const size_t cap)
 
 #undef JAPP
 
-/*
- * Build a structured hello using proto_hello_build with randomized field
- * values, then apply 0-4 bit-flip mutations to the JSON portion.
- * Returns the JSON length (bytes after the frame header).
- */
+/* Build a structured hello via proto_hello_build with randomized fields;
+ * apply 0-4 bit-flip mutations.  Returns JSON length (after frame header). */
 static size_t gen_hello_build(unsigned char *restrict buf, const size_t cap)
 {
 	static const uint32_t k_build_seqs[] = {
@@ -852,14 +840,14 @@ T_DECLARE_CASE(test_handshake_fuzz)
 	/* Seed: use a different default from dispatch_fuzz so CI catches
 	 * failures in different iteration orderings. */
 	uint64_t seed = UINT64_C(0xdeadbeefcafe0002);
-	const char *env_seed = getenv("MUX_FUZZ_SEED");
+	const char *const env_seed = getenv("MUX_FUZZ_SEED");
 	if (env_seed != NULL) {
 		seed = (uint64_t)strtoull(env_seed, NULL, 0);
 	}
 	g_prng = seed;
 
 	size_t iterations = 200000;
-	const char *env_iter = getenv("MUX_FUZZ_ITERATIONS");
+	const char *const env_iter = getenv("MUX_FUZZ_ITERATIONS");
 	if (env_iter != NULL) {
 		const unsigned long v = strtoul(env_iter, NULL, 10);
 		if (v > 0) {
@@ -937,10 +925,9 @@ T_DECLARE_CASE(test_handshake_fuzz)
 					FUZZ_JSON_CAP);
 			}
 
-			/* version=0 (hello); handshake_process_hello does not
-			 * validate it, so keep it 0 like the real call site.
-			 * flags/stream_id/extra are usually 0 (exercise JSON
-			 * parsing), sometimes corrupted (early-reject path). */
+			/* version=0 (hello) is not validated; keep 0 like the real
+			 * call site.  flags/stream_id/extra: usually 0, sometimes
+			 * corrupted to exercise the header-validation path. */
 			struct mux_header hdr = {
 				.version = 0,
 				.flags = 0,
@@ -1054,29 +1041,24 @@ T_DECLARE_CASE(test_handshake_fuzz)
 	}
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_proto_hello_build_and_parse_roundtrip),
+	T_CASE(test_proto_hello_parse_rejects_missing_type),
+	T_CASE(test_proto_hello_parse_rejects_bad_session_id),
+	T_CASE(test_proto_hello_parse_rejects_oversized_identity),
+	T_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume),
+	T_CASE(test_handshake_process_server_hello_assigns_peer_identity),
+	T_CASE(test_handshake_process_resume_hello_calls_on_resume_match),
+	T_CASE(test_handshake_process_confirmed_resume_calls_resume_ack_recv),
+	T_CASE(test_handshake_process_confirmed_resume_rearms_write_watcher),
+	T_CASE(test_handshake_process_invalid_version_resets_session),
+	T_CASE(test_proto_hello_parse_rejects_oversized_json),
+	T_CASE(test_handshake_process_hello_outside_handshake_resets),
+	T_CASE(test_handshake_fuzz),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_proto_hello_build_and_parse_roundtrip);
-	T_RUN_CASE(t, test_proto_hello_parse_rejects_missing_type);
-	T_RUN_CASE(t, test_proto_hello_parse_rejects_bad_session_id);
-	T_RUN_CASE(t, test_proto_hello_parse_rejects_oversized_identity);
-	T_RUN_CASE(
-		t,
-		test_handshake_enqueue_hello_includes_session_identity_and_resume);
-	T_RUN_CASE(
-		t, test_handshake_process_server_hello_assigns_peer_identity);
-	T_RUN_CASE(
-		t, test_handshake_process_resume_hello_calls_on_resume_match);
-	T_RUN_CASE(
-		t,
-		test_handshake_process_confirmed_resume_calls_resume_ack_recv);
-	T_RUN_CASE(
-		t,
-		test_handshake_process_confirmed_resume_rearms_write_watcher);
-	T_RUN_CASE(t, test_handshake_process_invalid_version_resets_session);
-	T_RUN_CASE(t, test_proto_hello_parse_rejects_oversized_json);
-	T_RUN_CASE(t, test_handshake_process_hello_outside_handshake_resets);
-	T_RUN_CASE(t, test_handshake_fuzz);
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

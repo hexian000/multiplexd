@@ -295,7 +295,22 @@ def compute_process_shutdown_budget(
     )
 
 
-def build_server_config(*, use_tls: bool, window: Optional[int] = None, max_frame_size: Optional[int] = None, tls_buffered: bool = False) -> Dict[str, object]:
+def apply_tls_options(
+        tls: Dict[str, object],
+        ciphersuites: Optional[str],
+        socket_offload: Optional[bool],
+        kernel_offload: Optional[bool],
+) -> None:
+    """Add optional tls.* knobs to a config dict, omitting any left as None."""
+    if ciphersuites is not None:
+        tls["ciphersuites"] = ciphersuites
+    if socket_offload is not None:
+        tls["socket_offload"] = socket_offload
+    if kernel_offload is not None:
+        tls["kernel_offload"] = kernel_offload
+
+
+def build_server_config(*, use_tls: bool, window: Optional[int] = None, max_frame_size: Optional[int] = None, ciphersuites: Optional[str] = None, socket_offload: Optional[bool] = None, kernel_offload: Optional[bool] = None) -> Dict[str, object]:
     mux: Dict[str, object] = {
         "tcp": {
             "notsent_lowat": 0,
@@ -318,16 +333,17 @@ def build_server_config(*, use_tls: bool, window: Optional[int] = None, max_fram
         "loglevel": 4,
     }
     if use_tls:
-        config["tls"] = {
+        tls: Dict[str, object] = {
             "cert": "@server-cert.pem",
             "key": "@server-key.pem",
             "authcerts": ["@client-cert.pem"],
-            "buffered": tls_buffered,
         }
+        apply_tls_options(tls, ciphersuites, socket_offload, kernel_offload)
+        config["tls"] = tls
     return config
 
 
-def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int] = None, max_frame_size: Optional[int] = None, tls_buffered: bool = False) -> Dict[str, object]:
+def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int] = None, max_frame_size: Optional[int] = None, ciphersuites: Optional[str] = None, socket_offload: Optional[bool] = None, kernel_offload: Optional[bool] = None) -> Dict[str, object]:
     mux: Dict[str, object] = {
         "tcp": {
             "notsent_lowat": 0,
@@ -349,12 +365,13 @@ def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int
         "loglevel": 4,
     }
     if use_tls:
-        config["tls"] = {
+        tls: Dict[str, object] = {
             "cert": "@client-cert.pem",
             "key": "@client-key.pem",
             "authcerts": ["@server-cert.pem"],
-            "buffered": tls_buffered,
         }
+        apply_tls_options(tls, ciphersuites, socket_offload, kernel_offload)
+        config["tls"] = tls
     return config
 
 
@@ -382,15 +399,17 @@ def prepare_runtime_assets(
         tunnels: int = 1,
         window: Optional[int] = None,
         max_frame_size: Optional[int] = None,
-        tls_buffered: bool = False,
+        ciphersuites: Optional[str] = None,
+        socket_offload: Optional[bool] = None,
+        kernel_offload: Optional[bool] = None,
 ) -> tuple[Path, Path]:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if use_tls:
         ensure_certificates(binary_path, runtime_dir)
     server_config_path = runtime_dir / "server.json"
     client_config_path = runtime_dir / "client.json"
-    write_config(server_config_path, build_server_config(use_tls=use_tls, window=window, max_frame_size=max_frame_size, tls_buffered=tls_buffered))
-    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels, window=window, max_frame_size=max_frame_size, tls_buffered=tls_buffered))
+    write_config(server_config_path, build_server_config(use_tls=use_tls, window=window, max_frame_size=max_frame_size, ciphersuites=ciphersuites, socket_offload=socket_offload, kernel_offload=kernel_offload))
+    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels, window=window, max_frame_size=max_frame_size, ciphersuites=ciphersuites, socket_offload=socket_offload, kernel_offload=kernel_offload))
     return server_config_path, client_config_path
 
 
@@ -802,7 +821,9 @@ def render_markdown_report(
     max_frame_size: Optional[int],
     command_timeout_seconds: float,
     shutdown_budget: ProcessShutdownBudget,
-    tls_buffered: bool = False,
+    ciphersuites: Optional[str] = None,
+    socket_offload: Optional[bool] = None,
+    kernel_offload: Optional[bool] = None,
 ) -> str:
     output_dir = output_path.parent
     lines = [
@@ -815,7 +836,11 @@ def render_markdown_report(
         "| Duration per run | %d s |" % duration,
         "| Parallel streams | %d |" % parallel,
         "| TLS | %s |" % ("on" if use_tls else "off"),
-        "| TLS buffered | %s |" % ("on" if tls_buffered else "off"),
+        "| TLS ciphersuites | %s |" % (ciphersuites or "default"),
+        "| TLS socket_offload | %s |"
+        % ("default" if socket_offload is None else ("on" if socket_offload else "off")),
+        "| TLS kernel_offload | %s |"
+        % ("default" if kernel_offload is None else ("on" if kernel_offload else "off")),
         "| Tunnels | %d |" % tunnels,
         "| Stream/session window | %s |" % (str(window) if window is not None else "default"),
         "| Max frame size | %s |" % (str(max_frame_size) if max_frame_size is not None else "default"),
@@ -955,10 +980,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="number of parallel mux tunnels (default: 1)",
     )
     parser.add_argument(
-        "--tls-buffered",
-        action="store_true",
-        default=False,
-        help="enable tls.buffered (memory-transport) mode (default: off)",
+        "--ciphersuites",
+        help="pin tls.ciphersuites, for example TLS_AES_128_GCM_SHA256 "
+             "(default: omit from config; OpenSSL negotiates AES-256-GCM)",
+    )
+    parser.add_argument(
+        "--socket-offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="set tls.socket_offload; pass --no-socket-offload for in-memory "
+             "record batching (default: omit from config, daemon default is on)",
+    )
+    parser.add_argument(
+        "--kernel-offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="set tls.kernel_offload / KTLS "
+             "(default: omit from config, daemon default is off)",
     )
     parser.add_argument(
         "-w",
@@ -1004,7 +1042,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tunnels=args.tunnels,
         window=args.window,
         max_frame_size=args.max_frame_size,
-        tls_buffered=args.tls_buffered,
+        ciphersuites=args.ciphersuites,
+        socket_offload=args.socket_offload,
+        kernel_offload=args.kernel_offload,
     )
     configure_netem(args.netem_delay)
     command_timeout_seconds = compute_command_timeout_seconds(
@@ -1165,7 +1205,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_frame_size=args.max_frame_size,
         command_timeout_seconds=command_timeout_seconds,
         shutdown_budget=shutdown_budget,
-        tls_buffered=args.tls_buffered,
+        ciphersuites=args.ciphersuites,
+        socket_offload=args.socket_offload,
+        kernel_offload=args.kernel_offload,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(report, encoding="utf-8")

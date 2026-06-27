@@ -10,7 +10,6 @@
 #define CONF_H
 
 #include "mux/mux.h"
-#include "util.h"
 
 #include <stdbool.h>
 #include <stddef.h>

@@ -4,6 +4,7 @@ target_sources(csnippets
     "${CMAKE_CURRENT_SOURCE_DIR}/debug.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/formats.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/slog.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/testing.c"
     PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/arraysize.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/ascii.h"

@@ -134,6 +134,18 @@ enum session_state {
 #define COUNTER_STORE(p, v) ((p) ? (void)(*(p) = (v)) : (void)0)
 #endif /* WITH_THREADS */
 
+/* PUB_STORE/PUB_LOAD publish session-thread-owned scalars to relaxed-atomic
+ * mirrors for race-free cross-thread reads; unlike COUNTER_*, they operate on
+ * field lvalues (never NULL), sidestepping the -Waddress check on &field. */
+#if WITH_THREADS
+#define PUB_STORE(field, v)                                                    \
+	atomic_store_explicit(&(field), (v), memory_order_relaxed)
+#define PUB_LOAD(field) atomic_load_explicit(&(field), memory_order_relaxed)
+#else
+#define PUB_STORE(field, v) ((void)((field) = (v)))
+#define PUB_LOAD(field) (field)
+#endif /* WITH_THREADS */
+
 /* All fields of mux_session are accessed only from the owning ev_loop thread. */
 struct mux_session {
 	struct ev_loop *loop;
@@ -145,7 +157,7 @@ struct mux_session {
 	 * physical buffer capacity is carried per frame as frame->cap (>= this). */
 	uint_least32_t max_payload;
 	/* Non-owning pointer to the session log tag buffer; set at creation time. */
-	char *tag;
+	const char *tag;
 	/* Pointer block into server_stats; NULL pointers are silently skipped. */
 	struct mux_session_counters cnt;
 	size_t num_halfopen;
@@ -193,6 +205,25 @@ struct mux_session {
 	/* Peer's per-stream receive window (frames); updated on each SYN/SYN|ACK. */
 	uint_least32_t peer_stream_window;
 
+	/* Relaxed-atomic mirrors of session-thread-owned gauges, published at their
+	 * write sites so mux_state()/mux_session_stats() can be read race-free from
+	 * the server thread (the /stats path).  Never read on the data path. */
+#if WITH_THREADS
+	atomic_int _pub_state; /* mirrors enum session_state */
+	atomic_size_t _pub_stream_window;
+	atomic_size_t _pub_peer_stream_window;
+	atomic_int_least64_t _pub_rtt;
+	atomic_size_t _pub_bdp_rx;
+	atomic_size_t _pub_bdp_tx;
+#else
+	enum session_state _pub_state;
+	size_t _pub_stream_window;
+	size_t _pub_peer_stream_window;
+	int_least64_t _pub_rtt;
+	size_t _pub_bdp_rx;
+	size_t _pub_bdp_tx;
+#endif
+
 	/* Transport I/O state (socket buffers, TLS connection, flow-control flags). */
 	struct wire_ctx wire;
 
@@ -232,6 +263,31 @@ static inline void session_emit(
 	}
 }
 
+/* Set the local per-stream receive window and publish its mirror. */
+static inline void session_set_stream_window(
+	struct mux_session *restrict ss, const uint_least32_t frames)
+{
+	ss->stream_window = frames;
+	PUB_STORE(ss->_pub_stream_window, (size_t)frames);
+}
+
+/* Set the peer's advertised per-stream window and publish its mirror. */
+static inline void session_set_peer_stream_window(
+	struct mux_session *restrict ss, const uint_least32_t frames)
+{
+	ss->peer_stream_window = frames;
+	PUB_STORE(ss->_pub_peer_stream_window, (size_t)frames);
+}
+
+/* Publish the estimator's rtt/bdp gauges to their mirrors; call after any
+ * estimator update (estimator_calculate / estimator_init). */
+static inline void session_publish_estimate(struct mux_session *restrict ss)
+{
+	PUB_STORE(ss->_pub_rtt, ss->estimator.rtt);
+	PUB_STORE(ss->_pub_bdp_rx, ss->estimator.rx.bdp);
+	PUB_STORE(ss->_pub_bdp_tx, ss->estimator.tx.bdp);
+}
+
 /* Recompute and apply the EV_READ/EV_WRITE mask for the mux socket watcher.
  * Shared by session.c and the send/recv pipelines. */
 void session_update_watcher(struct mux_session *restrict ss);
@@ -256,19 +312,17 @@ void session_set_config(
  * call mux_attach_fd() afterward to supply a connected fd. */
 void session_start(struct mux_session *restrict ss);
 
-/* Accept an already-connected fd and transition to SESSION_CONNECT.
- * Valid from SESSION_INIT (initial client connect), SESSION_SUSPENDED
- * (resume attempt), or SESSION_CLOSED (demand-triggered reconnect after
- * idle-close or resume-timeout expiry).  Takes ownership of fd. */
+/* Accept a connected fd and transition to SESSION_CONNECT.
+ * Valid from SESSION_INIT (initial connect), SESSION_SUSPENDED (resume),
+ * or SESSION_CLOSED (reconnect after idle/timeout).  Takes fd ownership. */
 void session_attach_fd(struct mux_session *restrict ss, int fd);
 
 /* Drop in-flight data, close all streams, and begin the transport close sequence. */
 void session_initiate_shutdown(struct mux_session *restrict ss);
 
-/* Signal the session to drain: reject new inbound streams and initiate a
- * graceful shutdown as soon as the last active stream closes.  If the session
- * is already idle (no streams), shutdown is initiated immediately.  Cleared
- * automatically when the session reconnects via session_attach_fd(). */
+/* Drain: reject new inbound streams and begin graceful shutdown when the last
+ * stream closes (or immediately if already idle); auto-clears on reconnect
+ * via session_attach_fd(). */
 void session_drain(struct mux_session *ss);
 
 /* Open a new locally-initiated stream; returns NULL when the session rejects it. */
@@ -281,10 +335,8 @@ void session_notify(struct mux_session *restrict ss);
  * Uses a 16-bit integer hash suitable for the stream-ID key space. */
 extern const struct table_opts mux_stream_table_opts;
 
-/* The frame producers (session_send_push/ctrl/oob), the flush entry points,
- * session_eager_flush, session_emit_ack, mux_notify_write, and
- * session_discard_stream_frames live in send.h.  Frame dispatch and the
- * receive-side window updates live in recv.h. */
+/* Frame producers and flush entry points live in send.h;
+ * frame dispatch and receive-side window updates live in recv.h. */
 
 /* Log a parsed frame header at VERYVERBOSE level. */
 void session_log_frame_header(

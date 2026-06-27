@@ -1,21 +1,16 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* unacked_test.c - white-box tests for the session reliability ring (spec §5.7).
- * Dependencies: unacked.c #included; real leaf frame.c linked (ring/allocator
- * exercised, not mocked); no sibling collaborators.
- * Benches (bench section) are opt-in: run with BENCH set in the env. */
+/* unacked_test.c - white-box tests for the session reliability ring (spec
+ * §5.7); unacked.c #included, real frame.c linked; benches opt-in via
+ * BENCH env. */
 
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/unacked.h"
 
-/* Unlock the testing.h bench macros (need a monotonic clock from os/clock.h). */
-#include "os/clock.h"
 #include "utils/slog.h"
-
-#define UTILS_MEASURE_H
 #include "utils/testing.h"
 
 #include <stddef.h>
@@ -29,8 +24,8 @@
  * Fixture: a minimal session carrying only the fields unacked.c touches. */
 
 struct frame_pool_ctx {
-	int alloc_calls;
-	int free_calls;
+	uint_least32_t alloc_calls;
+	uint_least32_t free_calls;
 };
 
 static struct mux_frame *unacked_test_alloc(void *data, const size_t size)
@@ -557,6 +552,28 @@ T_DECLARE_CASE(test_resume_ack_regress_rejected)
 	T_EXPECT(uf_teardown(&fx));
 }
 
+/* A peer_ack that is numerically below last_ack_recv but is ahead in 32-bit
+ * serial space (wrapped past UINT32_MAX) must be accepted, not rejected. */
+T_DECLARE_CASE(test_resume_ack_wrap_accepted)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+
+	/* Wind counters to the top of the 32-bit space before sending a frame,
+	 * so tracking one frame wraps send_seq from UINT32_MAX to 0. */
+	fx.ss.unacked.send_seq = UINT32_MAX;
+	fx.ss.unacked.last_ack_recv = UINT32_MAX;
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	/* Now: send_seq == 0 (wrapped), last_ack_recv == UINT32_MAX, frames == 1. */
+
+	/* peer_ack = 0: peer received the frame at seq UINT32_MAX (wrap).
+	 * In raw uint32: 0 < UINT32_MAX → old code falsely rejects.
+	 * serial_lt32(0, UINT32_MAX): d = UINT32_MAX > 2^31 → not lt → accepted. */
+	T_EXPECT(unacked_resume_ack_recv(&fx.ss, UINT32_C(0)));
+
+	T_EXPECT(uf_teardown(&fx));
+}
+
 /* A resume ack whose implied trim exceeds the ring is rejected (propagated from
  * the underlying trim overflow check). */
 T_DECLARE_CASE(test_resume_ack_overflow_rejected)
@@ -668,37 +685,40 @@ T_DECLARE_BENCH(bench_unacked_track_and_trim)
 	}
 }
 
-int main(void)
+static const struct testing_suite suite[] = {
+	T_CASE(test_track_sent_drops_hello),
+	T_CASE(test_track_sent_drops_single_ctrl),
+	T_CASE(test_track_sent_pushes_single_data),
+	T_CASE(test_track_sent_strips_ctrl_from_mixed),
+	T_CASE(test_track_sent_drops_all_ctrl_mixed),
+	T_CASE(test_track_sent_retransmit_copy_advances_cursor),
+	T_CASE(test_track_sent_rejects_truncated_trailer),
+	T_CASE(test_track_sent_rejects_overlong_header),
+	T_CASE(test_stall_gate_raise_and_clear),
+	T_CASE(test_ack_trim_overflow_rejected),
+	T_CASE(test_ack_trim_zero_noop),
+	T_CASE(test_ack_trim_full_pop),
+	T_CASE(test_ack_trim_partial_then_complete),
+	T_CASE(test_ack_trim_clamps_when_ring_underflows),
+	T_CASE(test_ack_trim_shifts_retransmit_cursor),
+	T_CASE(test_ack_trim_invalidates_cursor_past_end),
+	T_CASE(test_resume_ack_positions_cursor),
+	T_CASE(test_resume_ack_empties_ring),
+	T_CASE(test_resume_ack_regress_rejected),
+	T_CASE(test_resume_ack_wrap_accepted),
+	T_CASE(test_resume_ack_overflow_rejected),
+	T_CASE(test_ack_delta_and_emitted),
+	T_CASE(test_free_all_resets_state),
+	/* Opt-in micro-benchmark: ~1s, skipped by the default (unfiltered) run.
+	 * Select with `--run <ere>` or TESTING_FILTER. */
+	T_BENCH(bench_unacked_track_and_trim),
+	T_SUITE_END,
+};
+
+int main(int argc, char **argv)
 {
 	/* Exercise the DEBUG-level stall/unstall diagnostics in unacked.c. */
 	slog_level_ = LOG_LEVEL_DEBUG;
 
-	T_DECLARE_CTX(t);
-	T_RUN_CASE(t, test_track_sent_drops_hello);
-	T_RUN_CASE(t, test_track_sent_drops_single_ctrl);
-	T_RUN_CASE(t, test_track_sent_pushes_single_data);
-	T_RUN_CASE(t, test_track_sent_strips_ctrl_from_mixed);
-	T_RUN_CASE(t, test_track_sent_drops_all_ctrl_mixed);
-	T_RUN_CASE(t, test_track_sent_retransmit_copy_advances_cursor);
-	T_RUN_CASE(t, test_track_sent_rejects_truncated_trailer);
-	T_RUN_CASE(t, test_track_sent_rejects_overlong_header);
-	T_RUN_CASE(t, test_stall_gate_raise_and_clear);
-	T_RUN_CASE(t, test_ack_trim_overflow_rejected);
-	T_RUN_CASE(t, test_ack_trim_zero_noop);
-	T_RUN_CASE(t, test_ack_trim_full_pop);
-	T_RUN_CASE(t, test_ack_trim_partial_then_complete);
-	T_RUN_CASE(t, test_ack_trim_clamps_when_ring_underflows);
-	T_RUN_CASE(t, test_ack_trim_shifts_retransmit_cursor);
-	T_RUN_CASE(t, test_ack_trim_invalidates_cursor_past_end);
-	T_RUN_CASE(t, test_resume_ack_positions_cursor);
-	T_RUN_CASE(t, test_resume_ack_empties_ring);
-	T_RUN_CASE(t, test_resume_ack_regress_rejected);
-	T_RUN_CASE(t, test_resume_ack_overflow_rejected);
-	T_RUN_CASE(t, test_ack_delta_and_emitted);
-	T_RUN_CASE(t, test_free_all_resets_state);
-	/* Opt-in micro-benchmark: ~1s, kept out of the default ctest run. */
-	if (getenv("BENCH") != NULL) {
-		T_RUN_BENCH(t, bench_unacked_track_and_trim);
-	}
-	return T_RESULT(t) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return testing_main(argc, argv, suite);
 }

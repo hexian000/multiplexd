@@ -70,10 +70,10 @@ multiplexd is a TCP stream multiplexer with 0-RTT stream open, fair bandwidth sh
 ### Performance and Fairness
 
 - **Deficit round-robin (DRR) scheduler**: Fair byte-granular bandwidth sharing across active streams.
-- **BDP estimator**: Per-direction RTT/bandwidth measurement adaptively sizes windows.
+- **BDP estimator**: Bidirectional, two-phase estimation sizes the send and receive windows independently, accommodating asymmetric links (uplink ≠ downlink).
 - **Two-level flow control**: Per-stream receive window plus a session-wide unacknowledged-byte cap.
 - **Memory back-pressure**: Receive grants throttle between `mem_pressure.lo` and `mem_pressure.hi`.
-- **Multi-threaded offloading**: Per-session threads distribute load across CPU cores (`ENABLE_THREADS=ON`). With the default configuration and the OpenSSL backend, instances usually can be planned for about 1 Gbps per modern x86 core as a stable sustained load line.
+- **Multi-threaded offloading**: Per-session threads distribute load across CPU cores (`ENABLE_THREADS=ON`).
 
 ### Security and Operations
 
@@ -117,12 +117,12 @@ The wire format is a fixed 8-byte frame header followed by an optional payload; 
 | **New stream setup**       | SYN + first data in one flight; no per-stream round-trip                         | HEADERS frame; no per-stream round-trip                                        | `channel-open` + `channel-open-confirmation`; one RTT before first payload |
 | **TCP half-close**         | FIN end-to-end transparent                                                       | END_STREAM bound to RPC lifecycle; no general TCP half-close semantics         | Channel EOF maps to TCP FIN; half-close preserved                          |
 | **Session resumption**     | Transparent; unacknowledged frames replayed                                      | None                                                                           | None                                                                       |
-| **Inter-stream fairness**  | Deficit round-robin scheduler; byte-granularity fairness                         | Round-robin scheduler; frame-granularity fairness                              | No inter-stream scheduling; systematically skewed under load               |
+| **Inter-stream fairness**  | Deficit round-robin scheduler; byte-granularity fairness                         | Round-robin scheduler; frame-granularity fairness                              | No inter-stream scheduler; fairness not guaranteed                         |
 | **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)        | Per-channel byte window only                                               |
-| **Adaptive window tuning** | 2-phase BDP estimator                                                            | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
+| **Adaptive window tuning** | Per-direction 2-phase BDP estimator                                              | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
 | **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                           | None                                                                       |
 | **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                  | Re-execs the master process; existing child processes drain naturally      |
-| **Observability**          | Health check, plain-text stats, Prometheus metrics                               | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors | None                                                                       |
+| **Observability**          | Health check, plain-text stats, Prometheus metrics                               | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors | Logging only                                                               |
 
 See [doc/spec.md](doc/spec.md) for the full wire protocol and state-machine specification.
 

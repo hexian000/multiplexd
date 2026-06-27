@@ -32,51 +32,6 @@
 #include <string.h>
 #include <sys/socket.h>
 
-int stream_format_tag(
-	char *restrict buf, size_t buflen, const struct mux_stream *restrict s)
-{
-	const struct mux_session *const ss = s->session;
-	/* Peer-initiated: a server session sees odd IDs (its own are even). */
-	const bool peer_initiated = (bool)(s->id & 1u) == ss->accepted;
-	const char *const arrow = peer_initiated ? " <- " : " -> ";
-
-	char me[64];
-	if (ss->handshake.identity != NULL) {
-		(void)snprintf(me, sizeof(me), "%s", ss->handshake.identity);
-	} else {
-		union sockaddr_max addr;
-		if (socket_get_addr(ss->w_socket.fd, &addr) > 0) {
-			(void)sa_format(me, sizeof(me), &addr.sa);
-		} else {
-			const int ret = snprintf(
-				me, sizeof(me), "[fd:%d]", ss->w_socket.fd);
-			if (ret < 0) {
-				me[0] = '\0';
-			}
-		}
-	}
-
-	char peer[64];
-	if (ss->handshake.peer_identity != NULL) {
-		(void)snprintf(
-			peer, sizeof(peer), "%s", ss->handshake.peer_identity);
-	} else if (ss->handshake.peer_id != NULL) {
-		(void)snprintf(peer, sizeof(peer), "%s", ss->handshake.peer_id);
-	} else if (ss->peer_addr.sa.sa_family != AF_UNSPEC) {
-		(void)sa_format(peer, sizeof(peer), &ss->peer_addr.sa);
-	} else {
-		const int ret = snprintf(
-			peer, sizeof(peer), "[fd:%d]", ss->w_socket.fd);
-		if (ret < 0) {
-			peer[0] = '\0';
-		}
-	}
-
-	return snprintf(
-		buf, buflen, "[%" PRIuLEAST16 "] %s%s%s:", s->id, me, arrow,
-		peer);
-}
-
 #define STREAM_LOG_F(level, s, format, ...)                                    \
 	do {                                                                   \
 		if (!LOGLEVEL(level)) {                                        \
@@ -99,6 +54,67 @@ static const char *stream_state_str[] = {
 	[STREAM_CLOSING] = "CLOSING",
 	[STREAM_CLOSED] = "CLOSED",
 };
+
+/* Minimum window-grant scale at/above the high pressure watermark; grants
+ * decay linearly from 1.0 down to this floor across [lo, hi]. */
+#define MUX_PRESSURE_MIN_SCALE 0.125
+/* Default low watermark as a fraction of the high watermark. */
+#define MUX_PRESSURE_LO_FRACTION 0.5
+
+/* Scale window grants by session receive-buffer pressure: 1.0 below s_lo,
+ * linear decay to MUX_PRESSURE_MIN_SCALE across [s_lo, s_hi], floored beyond.
+ * Disabled (1.0) when mem_pressure_hi <= 0 or nothing is buffered. */
+static double session_pressure_scale(const struct mux_session *restrict ss)
+{
+	if (ss->conf.mem_pressure_hi <= 0) {
+		return 1.0;
+	}
+	if (ss->recv_buffered_bytes == 0) {
+		return 1.0;
+	}
+	const double buffered = (double)ss->recv_buffered_bytes;
+	const double s_high = (double)ss->conf.mem_pressure_hi;
+	const double s_low = ss->conf.mem_pressure_lo > 0 ?
+				     (double)ss->conf.mem_pressure_lo :
+				     s_high * MUX_PRESSURE_LO_FRACTION;
+	if (buffered <= s_low) {
+		return 1.0;
+	}
+	if (buffered >= s_high) {
+		return MUX_PRESSURE_MIN_SCALE;
+	}
+	return 1.0 - (buffered - s_low) / (s_high - s_low) *
+			     (1.0 - MUX_PRESSURE_MIN_SCALE);
+}
+
+/* Compute the window increment to grant the peer (in MUX_WINDOW_UNIT units).
+ * Scales by session_pressure_scale(); floors at one unit to avoid starvation. */
+uint_fast32_t stream_grant_inc(const struct mux_stream *restrict s)
+{
+	const uint_fast32_t grantable = stream_grantable_bytes(s);
+	/* Sub-unit grantable cannot be expressed on the wire (spec §6.4); the
+	 * safety floor below would over-grant past the window, violating §6.3. */
+	if (grantable < (uint_fast32_t)MUX_WINDOW_UNIT) {
+		return 0;
+	}
+	const double scale = session_pressure_scale(s->session);
+	const uint_fast32_t scaled = (uint_fast32_t)((double)grantable * scale);
+	/* Safety floor: always grant at least one unit when grantable allows
+	 * so no stream is starved and the flow-control loop cannot deadlock. */
+	const uint_fast32_t effective =
+		MAX(scaled, (uint_fast32_t)MUX_WINDOW_UNIT);
+	const uint_fast32_t grant =
+		MIN(effective / (uint_fast32_t)MUX_WINDOW_UNIT,
+		    (uint_fast32_t)UINT16_MAX);
+	if (scale < 1.0) {
+		STREAM_LOG_F(
+			VERBOSE, s,
+			"memory pressure: scale=%.3f grantable=%" PRIuFAST32
+			" grant=%" PRIuFAST32,
+			scale, grantable, grant);
+	}
+	return grant;
+}
 
 static void stream_set_state(
 	struct mux_stream *restrict s, const enum stream_state newstate)
@@ -140,7 +156,7 @@ static void stream_stop(struct mux_stream *s)
 	if (s->is_direct) {
 		return;
 	}
-	struct ev_loop *loop = s->session->loop;
+	struct ev_loop *const loop = s->session->loop;
 	ev_io_stop(loop, &s->socket.w_io);
 	ev_timer_stop(loop, &s->socket.w_timeout);
 }
@@ -363,21 +379,6 @@ stream_feed_user(struct mux_stream *restrict s, const int revents)
 	ev_feed_event(w->loop, w, filtered);
 }
 
-void stream_notify_recv(struct mux_stream *restrict s)
-{
-	/* A dequeued send_queue slot may restore read credit; re-evaluate the
-	 * socket-mode watcher to re-enable EV_READ. */
-	if (!s->is_direct) {
-		update_watcher(s);
-		return;
-	}
-	/* Notify the user that send credit is available; otherwise credit
-	 * would only be visible after the peer sends a window update. */
-	if (stream_read_credit_avail(s) > 0) {
-		stream_feed_user(s, EV_WRITE);
-	}
-}
-
 static inline void
 stream_queue_send(struct mux_stream *s, struct mux_frame *frame)
 {
@@ -401,21 +402,20 @@ static bool stream_on_recv(struct mux_stream *restrict s)
 		return false;
 	}
 
-	struct mux_frame *frame =
+	struct mux_frame *const frame =
 		mux_frame_get(&s->session->pool, s->session->max_payload);
 	if (frame == NULL) {
 		STREAM_LOG(WARNING, s, "out of memory for send frame");
 		return false;
 	}
 
-	unsigned char *buf = frame->data + MUX_FRAME_HEADER_SIZE;
+	unsigned char *const buf = frame->data + MUX_FRAME_HEADER_SIZE;
 	size_t nread;
 	{
 		const int fd = s->socket.w_io.fd;
-		/* Clamp the read to the available send credit so the framed payload
-		 * never exceeds it; a larger frame would never pass
-		 * stream_dequeue_send's payload <= credit gate and deadlock the
-		 * stream. */
+		/* Clamp to send credit: a payload exceeding credit would never
+		 * pass stream_dequeue_send's payload <= credit gate and would
+		 * deadlock the stream. */
 		size_t nrecv = frame->cap;
 		if ((size_t)read_credit < nrecv) {
 			nrecv = read_credit;
@@ -480,10 +480,10 @@ static void stream_on_send(struct mux_stream *restrict s)
 static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ | EV_WRITE);
-	struct mux_stream *restrict s = w->data;
+	struct mux_stream *const restrict s = w->data;
 	ASSERT(!s->is_direct);
 	ASSERT(loop == s->session->loop);
-	UNUSED(loop);
+	(void)loop;
 	ASSERT(s->state == STREAM_INIT || s->state == STREAM_ESTABLISHED ||
 	       s->state == STREAM_FIN_WAIT || s->state == STREAM_CLOSE_WAIT);
 	STREAM_LOG_F(
@@ -503,11 +503,11 @@ static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_stream *restrict s = w->data;
+	struct mux_stream *const restrict s = w->data;
 	ASSERT(loop == s->session->loop);
-	UNUSED(loop);
+	(void)loop;
 	ASSERT(!s->is_direct);
-	struct mux_session *restrict ss = s->session;
+	struct mux_session *const restrict ss = s->session;
 	STREAM_LOG(WARNING, s, "local socket timeout");
 	stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
 	session_flush(ss);
@@ -516,9 +516,9 @@ static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void tombstone_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_stream *restrict s = w->data;
+	struct mux_stream *const restrict s = w->data;
 	ASSERT(loop == s->session->loop);
-	UNUSED(loop);
+	(void)loop;
 	ASSERT(s->state == STREAM_CLOSED);
 	STREAM_LOG(DEBUG, s, "tombstone expired; scheduling cleanup");
 	ASSERT(s->session->sched.num_tombstones > 0);
@@ -532,11 +532,11 @@ struct mux_stream *stream_new(
 	struct mux_session *restrict ss, const uint_fast16_t id,
 	const bool active_open)
 {
-	struct mux_stream *s = malloc(sizeof(struct mux_stream));
+	struct mux_stream *const s = malloc(sizeof(struct mux_stream));
 	if (s == NULL) {
 		return NULL;
 	}
-	const struct mux_config *restrict conf = &ss->conf;
+	const struct mux_config *const restrict conf = &ss->conf;
 	*s = (struct mux_stream){
 		.id = id,
 		.state = STREAM_INIT,
@@ -624,7 +624,7 @@ void stream_attach_fd(struct mux_stream *s, const int fd)
 	       s->state == STREAM_SYN_SENT);
 	ASSERT(!s->is_direct);
 
-	struct ev_loop *loop = s->session->loop;
+	struct ev_loop *const loop = s->session->loop;
 	if (socket_user_timeout(fd, s->session->conf.send_timeout * 1000) ==
 	    0) {
 		s->socket.w_timeout.repeat = 0.0;
@@ -658,7 +658,7 @@ void stream_attach_fd(struct mux_stream *s, const int fd)
 
 void stream_io_start(struct ev_loop *loop, struct mux_stream_io *w)
 {
-	struct mux_stream *s = w->stream;
+	struct mux_stream *const s = w->stream;
 	ASSERT(s != NULL);
 	ASSERT(s->state == STREAM_SYN_RECEIVED || s->state == STREAM_INIT ||
 	       s->state == STREAM_SYN_SENT);
@@ -781,132 +781,18 @@ struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 	return frame;
 }
 
-/* Minimum window-grant scale at/above the high pressure watermark; grants
- * decay linearly from 1.0 down to this floor across [lo, hi]. */
-#define MUX_PRESSURE_MIN_SCALE 0.125
-/* Default low watermark as a fraction of the high watermark. */
-#define MUX_PRESSURE_LO_FRACTION 0.5
-
-/* Scale window grants by session receive-buffer pressure: 1.0 below s_lo,
- * linear decay to MUX_PRESSURE_MIN_SCALE across [s_lo, s_hi], floored beyond.
- * Disabled (1.0) when mem_pressure_hi <= 0 or nothing is buffered. */
-static double session_pressure_scale(const struct mux_session *restrict ss)
+void stream_notify_recv(struct mux_stream *restrict s)
 {
-	if (ss->conf.mem_pressure_hi <= 0) {
-		return 1.0;
-	}
-	if (ss->recv_buffered_bytes == 0) {
-		return 1.0;
-	}
-	const double buffered = (double)ss->recv_buffered_bytes;
-	const double s_high = (double)ss->conf.mem_pressure_hi;
-	const double s_low = ss->conf.mem_pressure_lo > 0 ?
-				     (double)ss->conf.mem_pressure_lo :
-				     s_high * MUX_PRESSURE_LO_FRACTION;
-	if (buffered <= s_low) {
-		return 1.0;
-	}
-	if (buffered >= s_high) {
-		return MUX_PRESSURE_MIN_SCALE;
-	}
-	return 1.0 - (buffered - s_low) / (s_high - s_low) *
-			     (1.0 - MUX_PRESSURE_MIN_SCALE);
-}
-
-/* Compute the window increment to grant the peer (in MUX_WINDOW_UNIT units).
- * Scales by session_pressure_scale(); floors at one unit to avoid starvation. */
-uint_fast32_t stream_grant_inc(const struct mux_stream *restrict s)
-{
-	const uint_fast32_t grantable = stream_grantable_bytes(s);
-	/* Sub-unit grantable cannot be expressed on the wire (spec §6.4); the
-	 * safety floor below would over-grant past the window, violating §6.3. */
-	if (grantable < (uint_fast32_t)MUX_WINDOW_UNIT) {
-		return 0;
-	}
-	const double scale = session_pressure_scale(s->session);
-	const uint_fast32_t scaled = (uint_fast32_t)((double)grantable * scale);
-	/* Safety floor: always grant at least one unit when grantable allows
-	 * so no stream is starved and the flow-control loop cannot deadlock. */
-	const uint_fast32_t effective =
-		MAX(scaled, (uint_fast32_t)MUX_WINDOW_UNIT);
-	const uint_fast32_t grant =
-		MIN(effective / (uint_fast32_t)MUX_WINDOW_UNIT,
-		    (uint_fast32_t)UINT16_MAX);
-	if (scale < 1.0) {
-		STREAM_LOG_F(
-			VERBOSE, s,
-			"memory pressure: scale=%.3f grantable=%" PRIuFAST32
-			" grant=%" PRIuFAST32,
-			scale, grantable, grant);
-	}
-	return grant;
-}
-
-/* In auto-window mode, lazily shrink recv_window to the session stream_window
- * target once it is safe (buffered + outstanding peer credit fits the target).
- * Called atop stream_check_ack so every grant sees the current window. */
-static void stream_try_shrink_recv_window(struct mux_stream *restrict s)
-{
-	if (!s->session->auto_stream_window) {
+	/* A dequeued send_queue slot may restore read credit; re-evaluate the
+	 * socket-mode watcher to re-enable EV_READ. */
+	if (!s->is_direct) {
+		update_watcher(s);
 		return;
 	}
-	const uint_fast32_t target =
-		(uint_fast32_t)s->session->stream_window * MUX_WINDOW_UNIT;
-	if (target >= s->recv_window) {
-		return;
-	}
-	/* outstanding = credit peer may still spend (wrapping subtraction). */
-	const uint_fast32_t outstanding =
-		(uint_fast32_t)(s->grant_sent - s->bytes_received);
-	if (s->buffered_bytes + outstanding > target) {
-		return;
-	}
-	STREAM_LOG_F(
-		DEBUG, s,
-		"recv_window shrink: %" PRIuLEAST32 " -> %" PRIuFAST32
-		" (buffered=%" PRIuLEAST32 " outstanding=%" PRIuFAST32 ")",
-		s->recv_window, target, s->buffered_bytes, outstanding);
-	s->recv_window = target;
-}
-
-void stream_check_ack(struct mux_stream *restrict s)
-{
-	if (s->state == STREAM_CLOSED) {
-		return;
-	}
-	stream_try_shrink_recv_window(s);
-	if (s->ack_pending) {
-		return;
-	}
-
-	const uint_fast32_t grantable = stream_grantable_bytes(s);
-	/* Sub-unit grantable cannot be sent; see stream_grant_inc(). */
-	if (grantable < (uint_fast32_t)MUX_WINDOW_UNIT) {
-		return;
-	}
-	/* Immediate ACK at the 2-frame batch threshold (avoids half-window
-	 * starvation at large windows); sub-threshold grants coalesce (§6.4, §7.1).
-	 * This tracks consumed *payload* (a data batch), not granted credit units,
-	 * so it tracks the frame size: a 2×MUX_WINDOW_UNIT threshold is
-	 * unreachable once a full frame carries fewer than MUX_WINDOW_UNIT bytes. */
-	const uint_fast32_t immediate =
-		2u * (uint_fast32_t)s->session->max_payload;
-	const bool immediate_ack = grantable >= immediate;
-	if (!immediate_ack) {
-		/* Sub-threshold: arm the coalescing timer so the grant is
-		 * conveyed on the next flush (spec §6.4, §7.1). */
-		STREAM_LOG_F(
-			VERBOSE, s, "ACK delayed: grantable=%" PRIuFAST32,
-			grantable);
-		sched_delay(s->session, s, MUX_DELAYED_ACK_TICKS);
-		return;
-	}
-	STREAM_LOG_F(
-		DEBUG, s, "ACK immediate: grantable=%" PRIuFAST32, grantable);
-	s->ack_pending = true;
-	if (s->sched_queue != SCHED_QUEUE_DRR &&
-	    s != s->session->sched.drr_active) {
-		sched_wake(s->session, s);
+	/* Notify the user that send credit is available; otherwise credit
+	 * would only be visible after the peer sends a window update. */
+	if (stream_read_credit_avail(s) > 0) {
+		stream_feed_user(s, EV_WRITE);
 	}
 }
 
@@ -1006,6 +892,72 @@ void stream_recv_copy(
 		payload_len, s->bytes_received, s->buffered_bytes);
 
 	stream_notify_readable(s);
+}
+
+/* In auto-window mode, lazily shrink recv_window to the session stream_window
+ * target once it is safe (buffered + outstanding peer credit fits the target).
+ * Called atop stream_check_ack so every grant sees the current window. */
+static void stream_try_shrink_recv_window(struct mux_stream *restrict s)
+{
+	if (!s->session->auto_stream_window) {
+		return;
+	}
+	const uint_fast32_t target =
+		(uint_fast32_t)s->session->stream_window * MUX_WINDOW_UNIT;
+	if (target >= s->recv_window) {
+		return;
+	}
+	/* outstanding = credit peer may still spend (wrapping subtraction). */
+	const uint_fast32_t outstanding =
+		(uint_fast32_t)(s->grant_sent - s->bytes_received);
+	if (s->buffered_bytes + outstanding > target) {
+		return;
+	}
+	STREAM_LOG_F(
+		DEBUG, s,
+		"recv_window shrink: %" PRIuLEAST32 " -> %" PRIuFAST32
+		" (buffered=%" PRIuLEAST32 " outstanding=%" PRIuFAST32 ")",
+		s->recv_window, target, s->buffered_bytes, outstanding);
+	s->recv_window = target;
+}
+
+void stream_check_ack(struct mux_stream *restrict s)
+{
+	if (s->state == STREAM_CLOSED) {
+		return;
+	}
+	stream_try_shrink_recv_window(s);
+	if (s->ack_pending) {
+		return;
+	}
+
+	const uint_fast32_t grantable = stream_grantable_bytes(s);
+	/* Sub-unit grantable cannot be sent; see stream_grant_inc(). */
+	if (grantable < (uint_fast32_t)MUX_WINDOW_UNIT) {
+		return;
+	}
+	/* Immediate ACK at 2-frame threshold (avoids half-window starvation);
+	 * sub-threshold grants coalesce (spec §6.4, §7.1).  Tracks consumed
+	 * payload bytes, not credit units. */
+	const uint_fast32_t immediate =
+		2u * (uint_fast32_t)s->session->max_payload;
+	const bool immediate_ack = grantable >= immediate;
+	if (!immediate_ack) {
+		/* Sub-threshold: arm the coalescing timer so the grant is
+		 * conveyed on the next flush (spec §6.4, §7.1). */
+		STREAM_LOG_F(
+			VERBOSE, s, "ACK delayed: grantable=%" PRIuFAST32,
+			grantable);
+		sched_delay(s->session, s, MUX_DELAYED_ACK_TICKS);
+		return;
+	}
+	STREAM_LOG_F(
+		DEBUG, s, "ACK immediate: grantable=%" PRIuFAST32, grantable);
+	s->ack_pending = true;
+	if (s->sched_queue != SCHED_QUEUE_DRR &&
+	    s != s->session->sched.drr_active) {
+		sched_wake(s->session, s);
+	}
 }
 
 void stream_recv_window(struct mux_stream *s, const uint_fast32_t window_inc)
@@ -1190,4 +1142,49 @@ void stream_shutdown(struct mux_stream *s)
 	STREAM_LOG(VERBOSE, s, "local shutdown (write-EOF)");
 	s->rx_eof = true;
 	sched_wake(s->session, s);
+}
+
+int stream_format_tag(
+	char *restrict buf, size_t buflen, const struct mux_stream *restrict s)
+{
+	const struct mux_session *const ss = s->session;
+	/* Peer-initiated: a server session sees odd IDs (its own are even). */
+	const bool peer_initiated = (bool)(s->id & 1u) == ss->accepted;
+	const char *const arrow = peer_initiated ? " <- " : " -> ";
+
+	char me[64];
+	if (ss->handshake.identity != NULL) {
+		(void)snprintf(me, sizeof(me), "%s", ss->handshake.identity);
+	} else {
+		union sockaddr_max addr;
+		if (socket_get_addr(ss->w_socket.fd, &addr) > 0) {
+			(void)sa_format(me, sizeof(me), &addr.sa);
+		} else {
+			const int ret = snprintf(
+				me, sizeof(me), "[fd:%d]", ss->w_socket.fd);
+			if (ret < 0) {
+				me[0] = '\0';
+			}
+		}
+	}
+
+	char peer[64];
+	if (ss->handshake.peer_identity != NULL) {
+		(void)snprintf(
+			peer, sizeof(peer), "%s", ss->handshake.peer_identity);
+	} else if (ss->handshake.peer_id != NULL) {
+		(void)snprintf(peer, sizeof(peer), "%s", ss->handshake.peer_id);
+	} else if (ss->peer_addr.sa.sa_family != AF_UNSPEC) {
+		(void)sa_format(peer, sizeof(peer), &ss->peer_addr.sa);
+	} else {
+		const int ret = snprintf(
+			peer, sizeof(peer), "[fd:%d]", ss->w_socket.fd);
+		if (ret < 0) {
+			peer[0] = '\0';
+		}
+	}
+
+	return snprintf(
+		buf, buflen, "[%" PRIuLEAST16 "] %s%s%s:", s->id, me, arrow,
+		peer);
 }

@@ -50,13 +50,9 @@ struct server_evlog {
 	size_t pos;
 };
 
-/*
- * server_stats() has two routes:
- *   counters route — struct server_counters; updated from any thread via
- *     mux_session_counters using COUNTER_* (memory_order_relaxed).
- *   stats route — server-thread-only diagnostic fields: event log,
- *     stream-establish latency ring, per-tunnel gauges from tunnel_stats().
- */
+/* server_stats() has two routes: counters (relaxed-atomic per-session
+ * COUNTER_* fields) and stats (per-tunnel diagnostics via tunnel_stats(),
+ * published under pub_mtx or written to relaxed-atomic mirrors). */
 
 /* Counters and gauges embedded in struct server (counters route).
  * uint_least64_t fields are monotonic Prometheus counters (wrap to 0). */

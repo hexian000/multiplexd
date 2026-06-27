@@ -8,8 +8,9 @@
 
 #include "mux/frame.h"
 
-#include "algo/hashtable.h"
 #include "mux/mux.h"
+
+#include "algo/hashtable.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -49,7 +50,7 @@ const struct mux_config mux_conf_default = {
 
 bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 {
-	struct ringbuf *rb = *rbp;
+	struct ringbuf *const rb = *rbp;
 	if (need == 0 || ringbuf_write_space(rb) >= need) {
 		return true;
 	}
@@ -86,7 +87,7 @@ bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 
 void ringbuf_shrink(struct ringbuf **restrict rbp, const size_t target_cap)
 {
-	struct ringbuf *rb = *rbp;
+	struct ringbuf *const rb = *rbp;
 	/* Keep whichever is larger: the requested floor or the live bytes. */
 	const size_t want = rb->len > target_cap ? rb->len : target_cap;
 	if (rb->cap <= want) {
@@ -108,7 +109,7 @@ void ringbuf_shrink(struct ringbuf **restrict rbp, const size_t target_cap)
 
 struct mux_frame_ring *mux_frame_ring_new(const size_t cap)
 {
-	struct mux_frame_ring *r =
+	struct mux_frame_ring *const r =
 		malloc(sizeof(*r) + cap * sizeof(struct mux_frame *));
 	if (r == NULL) {
 		return NULL;
@@ -129,7 +130,7 @@ struct mux_frame_ring *mux_frame_ring_grow(struct mux_frame_ring *r)
 	const size_t new_cap =
 		old_cap > 0 ? old_cap * 2 : (size_t)MUX_FRAME_RING_MIN;
 
-	struct mux_frame_ring *nr =
+	struct mux_frame_ring *const nr =
 		malloc(sizeof(*nr) + new_cap * sizeof(struct mux_frame *));
 	if (nr == NULL) {
 		return NULL;

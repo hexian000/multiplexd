@@ -11,12 +11,10 @@
 
 #include "algo/wndfilter.h"
 
-#include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-struct mux_frame;
 struct mux_session;
 
 enum estimator_phase {
@@ -34,10 +32,9 @@ struct estimator_dir_ctx {
 	uint_least32_t stable_rounds;
 };
 
-/* Estimator state, embedded by value in mux_session.  Both directions share one
- * PING/PONG probe cycle and the RTT filter (at most one PING outstanding).  rx
- * is fed by inbound PUSH bytes and sizes stream_window; tx is fed by peer-acked
- * bytes and sizes session_window. */
+/* Estimator state embedded in mux_session.  Both directions share one PING/PONG
+ * probe cycle and the RTT filter (one PING outstanding at most).  rx sizes
+ * stream_window (inbound PUSH bytes); tx sizes session_window (peer-acked). */
 struct estimator_ctx {
 	int_least64_t last_probe_ns;
 	struct wndfilter rtt_wnd;

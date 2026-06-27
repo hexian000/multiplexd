@@ -20,8 +20,6 @@
 #include <stdint.h>
 
 struct mux_session;
-struct mux_frame;
-struct mux_header;
 
 /* Session identity, resume, and peer capability state.  Embedded by value in
  * mux_session. */

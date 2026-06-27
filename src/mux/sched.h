@@ -49,10 +49,9 @@ struct sched_ctx {
 	uint_least16_t next_stream_id;
 };
 
-/* Send scheduler: round-robin DRR ready queue, low-priority lifecycle queue
- * (drained by session_on_send), coalescing delay queue (EV_TIMER), stream table,
- * stream-ID allocation, and per-stream send-event emission (SYN, ACK/FIN) at
- * scheduling time. */
+/* Send scheduler: DRR ready queue, low-priority lifecycle queue, coalescing
+ * delay queue, stream table, stream-ID allocation, and per-stream send-event
+ * emission (SYN, ACK/FIN) at scheduling time. */
 
 /* Free all streams; clear the ready queue, delay list, and stream table. */
 void sched_free_streams(struct mux_session *ss);
@@ -87,12 +86,9 @@ void sched_delay(
 	struct mux_session *restrict ss, struct mux_stream *restrict s,
 	const uint_fast8_t ticks);
 
-/* Scan the DRR ready queue and produce at most one PUSH frame into sendbuf,
- * skipping streams that cannot produce one (credit exhausted, queue empty,
- * Nagle-held, or non-ESTABLISHED).  A stream earns a one-frame DRR quantum on
- * its first visit and is served via drr_active until the deficit drains; a sole
- * ready stream drains its whole queue in one pass.  Returns true if a frame was
- * produced. */
+/* Scan the DRR ready queue and stage at most one PUSH frame into sendbuf,
+ * skipping streams that cannot produce (credit, queue empty, Nagle, or
+ * non-ESTABLISHED).  Returns true if a frame was produced. */
 bool sched_next_data(struct mux_session *restrict ss);
 
 /* Emit pending per-stream ACK/FIN control headers for all DRR-queued streams,

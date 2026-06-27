@@ -176,7 +176,7 @@ void stream_recv_copy(
 
 void stream_check_ack(struct mux_stream *restrict s);
 
-void stream_recv_window(struct mux_stream *restrict s, uint_fast32_t window_inc);
+void stream_recv_window(struct mux_stream *s, uint_fast32_t window_inc);
 
 void stream_mark_fin_sent(struct mux_stream *s);
 
@@ -184,10 +184,8 @@ void stream_recv_fin(struct mux_stream *s);
 
 void stream_recv_rst(struct mux_stream *s);
 
-/* Close the stream with close(fd) semantics.
- * If the receive buffer has unread data, discard it and send RST to the peer.
- * Otherwise, perform an immediate teardown without sending any control frame
- * (the caller is responsible for prior protocol actions such as RST or FIN). */
+/* close(fd) semantics: discard unread data and RST the peer; otherwise
+ * immediate teardown (caller responsible for prior RST/FIN actions). */
 void stream_close(struct mux_stream *s);
 
 /* Half-close the write side, equivalent to shutdown(fd, SHUT_WR).
@@ -195,10 +193,8 @@ void stream_close(struct mux_stream *s);
  * The stream remains readable until the peer FIN arrives. */
 void stream_shutdown(struct mux_stream *s);
 
-/* Format a stream log prefix into buf.
- * accepted stream (peer-initiated): "[N] me <- peer:"
- * connected stream (locally-initiated): "[N] me -> peer:"
- * me/peer use identity, fall back to IP, finally fall back to "[fd:N]".
+/* Format "[N] me <- peer:" (accepted) or "[N] me -> peer:" (connected)
+ * into buf; me/peer use identity, then IP, then "[fd:N]".
  * Returns the snprintf byte count. */
 int stream_format_tag(
 	char *restrict buf, size_t buflen, const struct mux_stream *restrict s);
