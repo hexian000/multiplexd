@@ -144,6 +144,23 @@ struct tls_context *tls_ctx_server(const struct tls_config *conf);
 struct tls_context *tls_ctx_client(const struct tls_config *conf);
 
 /**
+ * @brief Acquire an independently-owned handle that shares @p ctx's parsed
+ * credentials, avoiding a re-parse.
+ *
+ * Lets each caller own (and free) a separate handle to the same underlying
+ * credentials, so the lifetime is single-owner even though the parsed material
+ * is shared: the OpenSSL backend up-references the SSL_CTX and returns a fresh
+ * wrapper, while the mbedTLS backend reference-counts the shared context and
+ * returns an alias.  Either way the result is released with @c tls_ctx_free and
+ * the credentials live until the last owner frees its handle.
+ *
+ * @param ctx Context to share from; NULL returns NULL.
+ * @return An owned context handle to free with @c tls_ctx_free, or NULL on
+ *         failure.
+ */
+struct tls_context *tls_ctx_ref(struct tls_context *ctx);
+
+/**
  * @brief Free a TLS context.
  * @param ctx Context to free; NULL is safe.
  */

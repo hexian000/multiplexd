@@ -98,31 +98,21 @@ struct tunnel {
 	struct mcache *frame_cache;
 	ev_timer w_maintenance;
 
-	/* Relay: re-dispatch or pass-through mux callbacks. */
+	/* Relay: re-dispatch or pass-through mux callbacks.  relay.cb is set once
+	 * at creation and never mutated afterwards, so it is safe to read on both
+	 * threads; the relay is instead torn down via relay_disconnected below. */
 	struct {
 		struct server *srv;
 		struct tunnel_callbacks cb;
 	} relay;
-
-	/* Monotonic ns of the last transport state change.  Written on the session
-	 * thread, read on the server thread (tunnel_stats); relaxed-atomic. */
+	/* Relay disconnect flag, set by tunnel_close() on the server thread.  Once
+	 * set, the relay producer (session thread) stops enqueuing and the consumer
+	 * (server thread) skips invoking, so the close state is carried by this
+	 * atomic instead of by mutating relay.cb.  Relaxed-atomic; the final
+	 * lifetime fence is thrd_join(). */
 #if WITH_THREADS
-	atomic_int_least64_t last_changed;
-#else
-	int_least64_t last_changed;
+	atomic_bool relay_disconnected;
 #endif
-
-	/* Snapshot published by the session thread under pub_mtx and read by
-	 * the server thread; strings are not atomic so the mutex guards a coherent
-	 * copy; peer_identity is inlined to avoid touching a freeable heap pointer. */
-#if WITH_THREADS
-	mtx_t pub_mtx;
-#endif
-	struct {
-		char tag[256];
-		char peer_identity[256];
-		bool has_peer_identity;
-	} pub;
 
 	/* Callback data passed to wrapped callbacks. */
 	void *callback_data;
@@ -145,67 +135,102 @@ struct tunnel {
 	char *identity;
 	char *peer_id;
 	char *peer_identity;
-#if WITH_TLS
-	/* Peer's X.509 certificate in DER format, extracted after TLS
-	 * handshake completes.  Owned; NULL when TLS is not in use. */
-	unsigned char *peer_cert_der;
-	size_t peer_cert_der_len;
-#endif
 	/* Session log tag: "my <= peer" or "my => peer". */
 	char tag[256];
 	/* Socket options cached at creation; updated on reload. */
 	struct conf_socket_opts mux_socket;
 	struct conf_socket_opts local_socket;
-	/* Per-tunnel stream lifecycle counters; updated by the session thread
-	 * via mux_session_counters pointer-block. */
-	struct {
-#if WITH_THREADS
-		atomic_size_t num_streams;
-		atomic_size_t num_stream_halfopen;
-		atomic_uint_least64_t num_stream_opened;
-		atomic_uint_least64_t num_stream_accepted;
-		atomic_uint_least64_t num_stream_fastopen;
-		atomic_uint_least64_t num_stream_established;
-		atomic_uint_least64_t num_stream_succeeded;
-		atomic_uint_least64_t num_stream_failed;
-#else
-		size_t num_streams;
-		size_t num_stream_halfopen;
-		uint_least64_t num_stream_opened;
-		uint_least64_t num_stream_accepted;
-		uint_least64_t num_stream_fastopen;
-		uint_least64_t num_stream_established;
-		uint_least64_t num_stream_succeeded;
-		uint_least64_t num_stream_failed;
-#endif /* WITH_THREADS */
-	} stream_cnt;
-	/* Per-tunnel traffic byte counters; updated by the session thread
-	 * via mux_session_counters pointer-block. */
-	struct {
-#if WITH_THREADS
-		atomic_uint_least64_t byt_mux_recv;
-		atomic_uint_least64_t byt_mux_sent;
-		/* PUSH-frame payload bytes only */
-		atomic_uint_least64_t byt_push_recv;
-		atomic_uint_least64_t byt_push_sent;
-#else
-		uint_least64_t byt_mux_recv;
-		uint_least64_t byt_mux_sent;
-		/* PUSH-frame payload bytes only */
-		uint_least64_t byt_push_recv;
-		uint_least64_t byt_push_sent;
-#endif /* WITH_THREADS */
-	} traffic_cnt;
-	/* SYN->SYN|ACK latency ring; written per stream-established on the session
-	 * thread (handle_stream_established), read on the server thread
-	 * (tunnel_stats).  High-frequency, so relaxed-atomic rather than locked. */
-#if WITH_THREADS
-	atomic_size_t stream_establish_count;
-	atomic_int_least64_t stream_establish_ns[256];
-#else
-	size_t stream_establish_count;
-	int_least64_t stream_establish_ns[256];
+#if WITH_TLS
+	/* Per-tunnel TLS context (client role); owned.  Shares parsed credentials
+	 * with sibling tunnels via tls_ctx_ref() but each tunnel frees its own
+	 * handle, so the lifetime is single-owner: adopted at creation, replaced in
+	 * reload_task, and freed in tunnel_close -- all on this tunnel's thread (or
+	 * the server thread before start / after thrd_join).  The mux session
+	 * borrows it via ss->wire.tlsctx.  NULL for accepted tunnels (they hold a
+	 * tls_connection instead) and for plaintext. */
+	struct tls_context *tlsctx;
 #endif
+
+	/* Relaxed-atomic cross-thread block: every field below is written on the
+	 * session thread and read on the server thread (the /stats path).  Each is
+	 * an independent relaxed atomic, so the block needs no lock.  (Grouped only
+	 * for clarity; the fields are still accessed as t->last_changed etc.) */
+	struct {
+		/* Monotonic ns of the last transport state change. */
+#if WITH_THREADS
+		atomic_int_least64_t last_changed;
+#else
+		int_least64_t last_changed;
+#endif
+		/* Per-tunnel stream lifecycle counters; updated by the session
+		 * thread via the mux_session_counters pointer-block. */
+		struct {
+#if WITH_THREADS
+			atomic_size_t num_streams;
+			atomic_size_t num_stream_halfopen;
+			atomic_uint_least64_t num_stream_opened;
+			atomic_uint_least64_t num_stream_accepted;
+			atomic_uint_least64_t num_stream_fastopen;
+			atomic_uint_least64_t num_stream_established;
+			atomic_uint_least64_t num_stream_succeeded;
+			atomic_uint_least64_t num_stream_failed;
+#else
+			size_t num_streams;
+			size_t num_stream_halfopen;
+			uint_least64_t num_stream_opened;
+			uint_least64_t num_stream_accepted;
+			uint_least64_t num_stream_fastopen;
+			uint_least64_t num_stream_established;
+			uint_least64_t num_stream_succeeded;
+			uint_least64_t num_stream_failed;
+#endif /* WITH_THREADS */
+		} stream_cnt;
+		/* Per-tunnel traffic byte counters; updated by the session thread
+		 * via the mux_session_counters pointer-block. */
+		struct {
+#if WITH_THREADS
+			atomic_uint_least64_t byt_mux_recv;
+			atomic_uint_least64_t byt_mux_sent;
+			/* PUSH-frame payload bytes only */
+			atomic_uint_least64_t byt_push_recv;
+			atomic_uint_least64_t byt_push_sent;
+#else
+			uint_least64_t byt_mux_recv;
+			uint_least64_t byt_mux_sent;
+			/* PUSH-frame payload bytes only */
+			uint_least64_t byt_push_recv;
+			uint_least64_t byt_push_sent;
+#endif /* WITH_THREADS */
+		} traffic_cnt;
+		/* SYN->SYN|ACK latency ring; written per stream-established on the
+		 * session thread (handle_stream_established), read on the server
+		 * thread (tunnel_stats).  High-frequency, so relaxed-atomic. */
+#if WITH_THREADS
+		atomic_size_t stream_establish_count;
+		atomic_int_least64_t stream_establish_ns[256];
+#else
+		size_t stream_establish_count;
+		int_least64_t stream_establish_ns[256];
+#endif
+	};
+
+	/* pub.mu guards the rest of pub: a coherent diagnostic snapshot published
+	 * by the session thread and read by the server thread under the same lock.
+	 * Strings are not atomic so the mutex guards a consistent copy;
+	 * peer_identity is inlined to avoid touching a freeable heap pointer. */
+	struct {
+#if WITH_THREADS
+		mtx_t mu;
+#endif
+		char tag[256];
+		char peer_identity[256];
+		bool has_peer_identity;
+		/* Transport fd and peer address, snapshotted from the session on
+		 * each (re)connect. */
+		int fd;
+		union sockaddr_max peer_addr;
+		bool has_peer_addr;
+	} pub;
 };
 
 /* TPUB_STORE/TPUB_LOAD: relaxed-atomic access to a session-thread-owned scalar
@@ -226,7 +251,7 @@ struct tunnel {
 static void tunnel_pub_lock(const struct tunnel *restrict t)
 {
 #if WITH_THREADS
-	THRD_ASSERT(mtx_lock((mtx_t *)&t->pub_mtx));
+	THRD_ASSERT(mtx_lock((mtx_t *)&t->pub.mu));
 #else
 	(void)t;
 #endif
@@ -235,16 +260,19 @@ static void tunnel_pub_lock(const struct tunnel *restrict t)
 static void tunnel_pub_unlock(const struct tunnel *restrict t)
 {
 #if WITH_THREADS
-	THRD_ASSERT(mtx_unlock((mtx_t *)&t->pub_mtx));
+	THRD_ASSERT(mtx_unlock((mtx_t *)&t->pub.mu));
 #else
 	(void)t;
 #endif
 }
 
-/* Publish the coherent diagnostic snapshot (tag + peer_identity) under pub_mtx
- * so the server thread can read it race-free.  Runs on the session thread. */
+/* Publish the coherent diagnostic snapshot (tag, peer_identity, transport fd and
+ * peer address) under pub_mtx so the server thread can read it race-free.  Runs
+ * on the session thread. */
 static void tunnel_publish_pub(struct tunnel *restrict t)
 {
+	const int fd = mux_fd(t->ss);
+	const struct sockaddr *const peer_addr = mux_peer_addr(t->ss);
 	tunnel_pub_lock(t);
 	(void)memcpy(t->pub.tag, t->tag, sizeof(t->pub.tag));
 	if (t->peer_identity != NULL) {
@@ -255,6 +283,14 @@ static void tunnel_publish_pub(struct tunnel *restrict t)
 	} else {
 		t->pub.peer_identity[0] = '\0';
 		t->pub.has_peer_identity = false;
+	}
+	t->pub.fd = fd;
+	if (peer_addr != NULL) {
+		(void)memcpy(
+			&t->pub.peer_addr, peer_addr, sizeof(t->pub.peer_addr));
+		t->pub.has_peer_addr = true;
+	} else {
+		t->pub.has_peer_addr = false;
 	}
 	tunnel_pub_unlock(t);
 }
@@ -342,7 +378,9 @@ static void relay_dispatch_on_event(void *p)
 	const enum mux_event event = arg->event;
 	const union mux_event_data data = arg->data;
 	free(arg);
-	if (t->relay.cb.on_event != NULL) {
+	if (!atomic_load_explicit(
+		    &t->relay_disconnected, memory_order_relaxed) &&
+	    t->relay.cb.on_event != NULL) {
 		t->relay.cb.on_event(t->callback_data, t, event, data);
 	}
 }
@@ -361,7 +399,9 @@ static void relay_dispatch_connected(void *p)
 	const int_fast64_t lat_ns = arg->lat_ns;
 	void (*const cb)(void *, struct tunnel *, int_fast64_t) = arg->cb;
 	free(arg);
-	if (cb != NULL) {
+	if (cb != NULL &&
+	    !atomic_load_explicit(
+		    &t->relay_disconnected, memory_order_relaxed)) {
 		cb(t->callback_data, t, lat_ns);
 	}
 }
@@ -376,6 +416,9 @@ static void relay_connected(
 		return;
 	}
 #if WITH_THREADS
+	if (atomic_load_explicit(&t->relay_disconnected, memory_order_relaxed)) {
+		return;
+	}
 	struct relay_connected_arg *const restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
@@ -539,22 +582,6 @@ static void handle_connected(
 		LOGOOM();
 	}
 
-#if WITH_TLS
-	/* Extract the peer cert DER for identity validation (safe to read the
-	 * TLS connection on the tunnel thread). */
-	free(t->peer_cert_der);
-	t->peer_cert_der = NULL;
-	t->peer_cert_der_len = 0;
-	{
-		struct tls_connection *const tlsconn = mux_tls_conn(ss);
-		if (tlsconn != NULL) {
-			(void)tls_peer_cert_der(
-				tlsconn, &t->peer_cert_der,
-				&t->peer_cert_der_len);
-		}
-	}
-#endif /* WITH_TLS */
-
 	/* Rebuild the diagnostic tag once the peer identity is known; skipped when
 	 * the peer sent no identity (the connect-time "=> ?" tag is retained). */
 	if (peer_id != NULL) {
@@ -666,7 +693,9 @@ static void tunnel_on_event(
 	}
 
 #if WITH_THREADS
-	if (t->relay.cb.on_event != NULL) {
+	if (t->relay.cb.on_event != NULL &&
+	    !atomic_load_explicit(
+		    &t->relay_disconnected, memory_order_relaxed)) {
 		struct relay_event_arg *restrict arg = malloc(sizeof(*arg));
 		if (arg == NULL) {
 			LOGOOM();
@@ -878,6 +907,12 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 	t->tunnel_index = ++srv->next_tunnel_index;
 	t->mux_socket = opts->mux_socket;
 	t->local_socket = opts->local_socket;
+#if WITH_TLS
+	/* Adopt ownership of the client TLS context (NULL for accepted/plaintext);
+	 * the mux session below borrows it.  On a tunnel_new failure the caller
+	 * still owns opts->tlsctx and frees it (mirrors opts->conn). */
+	t->tlsctx = tlsctx;
+#endif
 	t->cb = (struct mux_callbacks){
 		.on_accept = tunnel_on_accept,
 		.on_event = tunnel_on_event,
@@ -1059,7 +1094,7 @@ tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts)
 #if WITH_THREADS
 	/* Init the stats-snapshot mutex last so the failure paths above need no
 	 * mtx_destroy; only tunnel_close pairs with this. */
-	if (mtx_init(&t->pub_mtx, mtx_plain) != thrd_success) {
+	if (mtx_init(&t->pub.mu, mtx_plain) != thrd_success) {
 		mux_close(ss);
 		ev_timer_stop(t->loop, &t->w_maintenance);
 		ev_async_stop(t->loop, &t->w_async);
@@ -1128,9 +1163,10 @@ static void task_tunnel_teardown(void *p)
 void tunnel_close(struct tunnel *t)
 {
 #if WITH_THREADS
-	/* Null relay callbacks so any queued relay tasks become no-ops.
-	 * Must precede the teardown dispatch to prevent new relay tasks. */
-	t->relay.cb = (struct tunnel_callbacks){ 0 };
+	/* Disconnect the relay so any queued or in-flight relay tasks become
+	 * no-ops.  Must precede the teardown dispatch to prevent new relay tasks. */
+	atomic_store_explicit(
+		&t->relay_disconnected, true, memory_order_relaxed);
 
 	if (t->started) {
 		/* Suppress mux callbacks, close session, stop event loop. */
@@ -1142,7 +1178,7 @@ void tunnel_close(struct tunnel *t)
 			mux_close(t->ss);
 		}
 		/* Flush relay tasks already queued in the server dispatcher.
-		 * Their callbacks are NULL, so they only free arg allocations. */
+		 * The relay is disconnected, so they only free arg allocations. */
 		dispatcher_tick(t->relay.srv->disp);
 	} else {
 		/* Thread never started; just release mux session resources. */
@@ -1163,10 +1199,11 @@ void tunnel_close(struct tunnel *t)
 	free(t->peer_id);
 	free(t->peer_identity);
 #if WITH_TLS
-	free(t->peer_cert_der);
+	/* Safe after mux_close above: the session no longer borrows it. */
+	tls_ctx_free(t->tlsctx);
 #endif
 #if WITH_THREADS
-	mtx_destroy(&t->pub_mtx);
+	mtx_destroy(&t->pub.mu);
 #endif
 	/* After mux_close: any frames released during teardown are now back in
 	 * the cache, so it is safe to drop. */
@@ -1216,7 +1253,10 @@ void tunnel_drop_transport(struct tunnel *t)
 
 int tunnel_fd(const struct tunnel *t)
 {
-	return mux_fd(t->ss);
+	tunnel_pub_lock(t);
+	const int fd = t->pub.fd;
+	tunnel_pub_unlock(t);
+	return fd;
 }
 
 enum mux_state tunnel_state(const struct tunnel *t)
@@ -1246,19 +1286,19 @@ bool tunnel_peer_identity_copy(
 	return has;
 }
 
-#if WITH_TLS
-const unsigned char *tunnel_peer_cert_der(const struct tunnel *t, size_t *len)
+bool tunnel_peer_addr_copy(
+	const struct tunnel *t, struct sockaddr *restrict buf,
+	const size_t buflen)
 {
-	if (len != NULL) {
-		*len = t->peer_cert_der_len;
+	tunnel_pub_lock(t);
+	const bool has = t->pub.has_peer_addr;
+	if (has && buflen > 0) {
+		(void)memcpy(
+			buf, &t->pub.peer_addr,
+			MIN(buflen, sizeof(t->pub.peer_addr)));
 	}
-	return t->peer_cert_der;
-}
-#endif
-
-const struct sockaddr *tunnel_peer_addr(const struct tunnel *t)
-{
-	return mux_peer_addr(t->ss);
+	tunnel_pub_unlock(t);
+	return has;
 }
 
 bool tunnel_is_accepted(const struct tunnel *t)
@@ -1423,7 +1463,20 @@ static void reload_task(void *p)
 		free(t->forward_addr);
 		t->forward_addr = arg->forward_addr;
 	}
+#if WITH_TLS
+	/* Adopt the new per-tunnel TLS context (ownership transferred via the
+	 * reload).  mux_set_config() below repoints the wire to it, after which the
+	 * old one is safe to free here on this (the owning) thread. */
+	struct tls_context *old_tlsctx = NULL;
+	if (arg->conf.tlsctx != NULL) {
+		old_tlsctx = t->tlsctx;
+		t->tlsctx = arg->conf.tlsctx;
+	}
+#endif
 	mux_set_config(arg->ss, &arg->conf);
+#if WITH_TLS
+	tls_ctx_free(old_tlsctx);
+#endif
 	if (arg->drain) {
 		mux_drain(arg->ss);
 	}
@@ -1437,6 +1490,10 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 	struct reload_arg *const restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
+#if WITH_TLS
+		/* Ownership of the new context transferred to us; release it. */
+		tls_ctx_free(opts->conf.tlsctx);
+#endif
 		return;
 	}
 	*arg = (struct reload_arg){
@@ -1455,6 +1512,9 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		if (arg->connect_addr == NULL) {
 			LOGOOM();
 			free(arg);
+#if WITH_TLS
+			tls_ctx_free(opts->conf.tlsctx);
+#endif
 			return;
 		}
 	}
@@ -1464,6 +1524,9 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 			LOGOOM();
 			free(arg->connect_addr);
 			free(arg);
+#if WITH_TLS
+			tls_ctx_free(opts->conf.tlsctx);
+#endif
 			return;
 		}
 	}

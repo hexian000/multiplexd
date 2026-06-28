@@ -37,21 +37,6 @@ struct identity_peer {
 	char *listen;
 };
 
-/* Per-identity authorized certificate entry.  certs[] are staging PEM strings
- * (consumed by conf_inline_pem); afterwards only certs_der[] is set. */
-struct conf_identity_authcert {
-	/* Peer identity string (owned). */
-	char *peer;
-	/* Staging: PEM certificate strings (owned; NULLed by conf_inline_pem). */
-	char **certs;
-	/* DER-encoded certificates (owned; populated by conf_inline_pem). */
-	unsigned char **certs_der;
-	/* Length of each DER entry in certs_der[]. */
-	size_t *certs_der_len;
-	/* Number of entries (same for certs[] and certs_der[]). */
-	size_t certs_count;
-};
-
 /* Mirrors the JSON "identity" object. */
 struct conf_identity {
 	char *claim;
@@ -60,9 +45,6 @@ struct conf_identity {
 	/* identity.listen entries, keyed by peer id. */
 	struct identity_peer *peers;
 	size_t peers_count;
-	/* identity.authcerts entries, keyed by peer identity. */
-	struct conf_identity_authcert *authcerts;
-	size_t authcerts_count;
 };
 
 struct config {

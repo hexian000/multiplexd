@@ -35,6 +35,9 @@
 #endif
 
 #include <errno.h>
+#if WITH_THREADS
+#include <stdatomic.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -44,6 +47,14 @@
 #include <sys/types.h>
 
 struct tls_ctx_impl {
+	/* Reference count: mbedTLS has no library-level refcount for the parsed
+	 * ssl_config, so siblings produced by tls_ctx_ref() share this struct and
+	 * the last tls_ctx_free() releases it.  Relaxed-atomic under threads. */
+#if WITH_THREADS
+	atomic_size_t refcount;
+#else
+	size_t refcount;
+#endif
 	bool is_server;
 	mbedtls_ssl_config conf;
 	mbedtls_x509_crt own_cert;
@@ -357,6 +368,11 @@ fail:
 
 static void tls_ctx_impl_init(struct tls_ctx_impl *restrict c)
 {
+#if WITH_THREADS
+	atomic_init(&c->refcount, (size_t)1);
+#else
+	c->refcount = 1;
+#endif
 	c->is_server = false;
 	mbedtls_ssl_config_init(&c->conf);
 	mbedtls_x509_crt_init(&c->own_cert);
@@ -548,11 +564,39 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf)
 	return tls_ctx_init(conf, false);
 }
 
+struct tls_context *tls_ctx_ref(struct tls_context *restrict ctx)
+{
+	if (ctx == NULL) {
+		return NULL;
+	}
+	struct tls_ctx_impl *const c = tls_ctx_raw(ctx);
+	/* Share this parsed config; the returned handle aliases ctx but is freed
+	 * independently via tls_ctx_free() (last owner releases the struct). */
+#if WITH_THREADS
+	(void)atomic_fetch_add_explicit(&c->refcount, 1, memory_order_relaxed);
+#else
+	c->refcount++;
+#endif
+	return ctx;
+}
+
 void tls_ctx_free(struct tls_context *restrict ctx)
 {
-	if (ctx != NULL) {
-		tls_ctx_impl_free(tls_ctx_raw(ctx));
+	if (ctx == NULL) {
+		return;
 	}
+	struct tls_ctx_impl *const c = tls_ctx_raw(ctx);
+#if WITH_THREADS
+	if (atomic_fetch_sub_explicit(&c->refcount, 1, memory_order_acq_rel) !=
+	    1) {
+		return;
+	}
+#else
+	if (--c->refcount != 0) {
+		return;
+	}
+#endif
+	tls_ctx_impl_free(c);
 }
 
 /* BIO callbacks: drive mbedtls over a non-blocking fd. */

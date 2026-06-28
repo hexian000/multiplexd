@@ -1073,20 +1073,6 @@ is that identity becomes a routing key.
 | Config role: `identity.listen`      | local listener keyed by peer identity                                                                          |
 | Inbound mux streams                 | always forward to the root `connect` target regardless of advertised peer identity                             |
 
-**Identity-bound certificate pinning (TLS).** Two trust layers combine. At the
-TLS handshake the context trusts the *union* of the global `tls.authcerts` and
-every per-identity `identity.authcerts.<peer>` certificate set, so any peer whose
-certificate is in the union passes the handshake regardless of which identity it
-later claims. After the session establishes, `server_on_established()` fetches
-the peer certificate DER (`tunnel_peer_cert_der`) and calls
-`server_check_identity_authcerts()`: when any `identity.authcerts` entries are
-configured, the claimed `peer_identity` must have an entry whose certificate set
-contains the presented certificate, otherwise the tunnel is closed (`"identity
-not authorized by identity.authcerts"`). With no `identity.authcerts` configured
-the check is a no-op and only the global union applies. This binds each
-certificate to an identity, so a stolen key that clears the union handshake still
-fails the post-handshake identity check (spec §10.1).
-
 In client mode, one mux session per `identity.mux_connect` entry is created at
 `server_start`; sessions are torn down in `server_stop` after the identity-based
 wiring has been removed.

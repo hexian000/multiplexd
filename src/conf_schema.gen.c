@@ -53,14 +53,12 @@ json_lookup_conf_identity(const char *str, size_t len)
 {
 	if (len < 1) { return -1; }
 	switch ((unsigned char)str[0]) {
-	case 'a':
-		return len == 9 && memcmp(str, "authcerts", 9) == 0 ? 0 : -1;
 	case 'c':
-		return len == 5 && memcmp(str, "claim", 5) == 0 ? 1 : -1;
+		return len == 5 && memcmp(str, "claim", 5) == 0 ? 0 : -1;
 	case 'l':
-		return len == 6 && memcmp(str, "listen", 6) == 0 ? 2 : -1;
+		return len == 6 && memcmp(str, "listen", 6) == 0 ? 1 : -1;
 	case 'm':
-		return len == 11 && memcmp(str, "mux_connect", 11) == 0 ? 3 : -1;
+		return len == 11 && memcmp(str, "mux_connect", 11) == 0 ? 2 : -1;
 	default: return -1;
 	}
 }
@@ -222,10 +220,9 @@ enum json_conf_key {
 };
 
 enum json_conf_identity_key {
-	JSON_CONF_IDENTITY_AUTHCERTS = 0,
-	JSON_CONF_IDENTITY_CLAIM = 1,
-	JSON_CONF_IDENTITY_LISTEN = 2,
-	JSON_CONF_IDENTITY_MUX_CONNECT = 3,
+	JSON_CONF_IDENTITY_CLAIM = 0,
+	JSON_CONF_IDENTITY_LISTEN = 1,
+	JSON_CONF_IDENTITY_MUX_CONNECT = 2,
 };
 
 enum json_conf_mux_key {
@@ -786,11 +783,6 @@ static bool json_unmarshal_conf_identity(
 			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
 		const int k_ = json_lookup_conf_identity(key_, key_len_);
 		switch (k_) {
-		case JSON_CONF_IDENTITY_AUTHCERTS: {
-			obj->authcerts_json.str = val_;
-			obj->authcerts_json.len = val_len_;
-			break;
-		}
 		case JSON_CONF_IDENTITY_CLAIM: {
 			if (!json_parse_string(val_, val_len_, &obj->claim.str, &obj->claim.len)) { goto fail_; }
 			break;
@@ -1487,15 +1479,6 @@ static int json_marshal_conf_identity_impl(
 	EMIT('{');
 	const int n_start_ = n_;
 
-	if (obj->authcerts_json.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("authcerts");
-		EMIT('"');
-		EMIT_COLON();
-		EMITF("%.*s", (int)obj->authcerts_json.len, obj->authcerts_json.str);
-		EMIT(',');
-	}
 	if (obj->claim.str != NULL) {
 		EMIT_INDENT(depth + 1);
 		EMIT('"');

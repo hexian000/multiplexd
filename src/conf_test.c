@@ -561,60 +561,6 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 	conf_free(orig);
 }
 
-T_DECLARE_CASE(test_identity_authcerts_parse_empty)
-{
-	/* Empty authcerts map is valid — no per-identity restrictions. */
-	const char *json = "{"
-			   "\"mux_connect\": \"127.0.0.1:9999\","
-			   "\"identity\": {"
-			   "  \"authcerts\": {}"
-			   "}"
-			   "}";
-	struct config *const conf = parse_tmpconf(json);
-	T_CHECK(conf != NULL);
-	T_EXPECT_EQ((int)conf->identity.authcerts_count, 0);
-	conf_free(conf);
-}
-
-T_DECLARE_CASE(test_identity_authcerts_free_without_inline_pem)
-{
-	/* Regression: conf_free must not index certs_der when authcerts
-	 * entries were parsed but conf_inline_pem never ran (certs_der is
-	 * only allocated there). */
-	const char *json = "{"
-			   "\"mux_listen\": \"127.0.0.1:9000\","
-			   "\"tls\": {"
-			   "  \"cert\": \"certdata\","
-			   "  \"key\": \"keydata\""
-			   "},"
-			   "\"identity\": {"
-			   "  \"authcerts\": {"
-			   "    \"peer1\": [\"certdata\"]"
-			   "  }"
-			   "}"
-			   "}";
-	struct config *const conf = parse_tmpconf(json);
-	T_CHECK(conf != NULL);
-	T_EXPECT_EQ((int)conf->identity.authcerts_count, 1);
-	T_EXPECT_EQ((int)conf->identity.authcerts[0].certs_count, 1);
-	T_EXPECT(conf->identity.authcerts[0].certs_der == NULL);
-	conf_free(conf);
-
-	/* Same scenario via the internal error path: conf_check rejects this
-	 * config (no transport) after conf_load populated authcerts, so
-	 * conf_parse frees the partially-built config itself. */
-	const char *invalid = "{"
-			      "\"identity\": {"
-			      "  \"claim\": \"me\","
-			      "  \"authcerts\": {"
-			      "    \"peer1\": [\"certdata\"]"
-			      "  }"
-			      "}"
-			      "}";
-	struct config *const rejected = parse_tmpconf(invalid);
-	T_EXPECT(rejected == NULL);
-}
-
 static const struct testing_suite suite[] = {
 	T_CASE(test_conf_new_default_fields),
 	T_CASE(test_conf_parsefile_nonexistent),
@@ -650,8 +596,6 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_parsefile_rejects_oversized_file),
 	T_CASE(test_conf_parsefile_stdin_success),
 	T_CASE(test_conf_parsefile_stdin_rejects_oversized),
-	T_CASE(test_identity_authcerts_parse_empty),
-	T_CASE(test_identity_authcerts_free_without_inline_pem),
 	T_SUITE_END,
 };
 

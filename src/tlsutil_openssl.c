@@ -645,6 +645,47 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf)
 	return ctx;
 }
 
+struct tls_context *tls_ctx_ref(struct tls_context *restrict ctx)
+{
+	if (ctx == NULL) {
+		return NULL;
+	}
+	const struct tls_ctx_impl *const src = tls_ctx_raw(ctx);
+	struct tls_ctx_impl *const c = calloc(1, sizeof(*c));
+	if (c == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	/* Share the parsed SSL_CTX via OpenSSL's own atomic reference count; the
+	 * wrapper below is per-owner so each owner frees independently. */
+	if (!SSL_CTX_up_ref(src->ssl_ctx)) {
+		LOG_SSLERROR(ERROR, "SSL_CTX_up_ref");
+		free(c);
+		return NULL;
+	}
+	c->ssl_ctx = src->ssl_ctx;
+	/* sni/alpn are owned per-wrapper (freed in tls_ctx_free), so copy them. */
+	if (src->sni != NULL) {
+		c->sni = OPENSSL_strdup(src->sni);
+		if (c->sni == NULL) {
+			LOGOOM();
+			tls_ctx_free((struct tls_context *)c);
+			return NULL;
+		}
+	}
+	if (src->alpn != NULL && src->alpn_len > 0) {
+		c->alpn = malloc(src->alpn_len);
+		if (c->alpn == NULL) {
+			LOGOOM();
+			tls_ctx_free((struct tls_context *)c);
+			return NULL;
+		}
+		memcpy(c->alpn, src->alpn, src->alpn_len);
+		c->alpn_len = src->alpn_len;
+	}
+	return (struct tls_context *)c;
+}
+
 void tls_ctx_free(struct tls_context *restrict ctx)
 {
 	if (ctx == NULL) {

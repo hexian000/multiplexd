@@ -192,10 +192,11 @@ static struct tunnel *tunnel_iter_next(
 			server_evlogf((srv), "`%s' " fmt, id_, __VA_ARGS__);   \
 			break;                                                 \
 		}                                                              \
-		const struct sockaddr *const peer_ = tunnel_peer_addr(t);      \
-		if (peer_ != NULL) {                                           \
+		union sockaddr_max peer_;                                      \
+		if (tunnel_peer_addr_copy(t, &peer_.sa, sizeof(peer_))) {      \
 			char addr_str[72];                                     \
-			(void)sa_format(addr_str, sizeof(addr_str), peer_);    \
+			(void)sa_format(                                       \
+				addr_str, sizeof(addr_str), &peer_.sa);        \
 			server_evlogf(                                         \
 				(srv), "%s " fmt, addr_str, __VA_ARGS__);      \
 			break;                                                 \
@@ -251,45 +252,6 @@ static void session_on_connected(
 	SESSION_EVLOGF(srv, t, "session %s (setup: %s)", verb, lat_str);
 }
 
-#if WITH_TLS
-/* Check the peer's TLS certificate against the cert set configured for the
- * claimed identity (pre-computed DER in conf_identity_authcert.certs_der). */
-static bool server_check_identity_authcerts(
-	const struct config *restrict conf, const char *restrict peer_identity,
-	const unsigned char *restrict peer_cert_der, size_t peer_cert_der_len)
-{
-	/* No per-identity restriction configured. */
-	if (conf->identity.authcerts_count == 0) {
-		return true;
-	}
-	if (peer_identity == NULL || peer_cert_der == NULL ||
-	    peer_cert_der_len == 0) {
-		return false;
-	}
-	/* Find the authcert entry for the claimed identity. */
-	const struct conf_identity_authcert *ac = NULL;
-	for (size_t i = 0; i < conf->identity.authcerts_count; i++) {
-		if (strcmp(conf->identity.authcerts[i].peer, peer_identity) ==
-		    0) {
-			ac = &conf->identity.authcerts[i];
-			break;
-		}
-	}
-	if (ac == NULL) {
-		return false;
-	}
-	/* Compare peer's DER cert against pre-computed DER. */
-	for (size_t i = 0; i < ac->certs_count; i++) {
-		if (ac->certs_der_len[i] == peer_cert_der_len &&
-		    memcmp(ac->certs_der[i], peer_cert_der,
-			   peer_cert_der_len) == 0) {
-			return true;
-		}
-	}
-	return false;
-}
-#endif /* WITH_TLS */
-
 static void server_on_established(
 	void *data, struct tunnel *restrict t, int_fast64_t lat_ns)
 {
@@ -298,31 +260,6 @@ static void server_on_established(
 	LOGN_F("[fd:%d] %s session established", tunnel_fd(t),
 	       is_server ? "server" : "client");
 	session_on_connected(srv, t, "established", lat_ns);
-
-#if WITH_TLS
-	/* The handshake accepted the cert from the union of all trusted certs;
-	 * now verify it matches the set configured for the claimed identity. */
-	{
-		size_t cert_der_len = 0;
-		const unsigned char *cert_der =
-			tunnel_peer_cert_der(t, &cert_der_len);
-		char peer_id_buf[256];
-		const char *const peer_id =
-			tunnel_peer_identity_copy(
-				t, peer_id_buf, sizeof(peer_id_buf)) ?
-				peer_id_buf :
-				NULL;
-		if (!server_check_identity_authcerts(
-			    srv->conf, peer_id, cert_der, cert_der_len)) {
-			SESSION_EVLOG(
-				srv, t,
-				"identity not authorized by"
-				" identity.authcerts, closing");
-			tunnel_close(t);
-			return;
-		}
-	}
-#endif /* WITH_TLS */
 
 	if (!is_server) {
 		/* Clear the identity_tunnels staging slot now the session is wired
@@ -900,10 +837,10 @@ static void server_drain_tunnels(
 {
 	const bool forward_changed =
 		!strnull_eq(old_conf->connect, new_conf->connect);
-	struct mux_config drain_conf = conf_get_mux(new_conf);
-#if WITH_TLS
-	drain_conf.tlsctx = new_client_tlsctx;
-#endif
+	/* drain_conf.tlsctx stays NULL here; each dialed tunnel gets its own
+	 * handle below, while accepted tunnels keep none (they hold a
+	 * tls_connection, not a client context). */
+	const struct mux_config drain_conf = conf_get_mux(new_conf);
 	const size_t old_ni = s->num_identity_tunnels;
 	const size_t new_ni = new_conf->identity.mux_connect_count;
 	struct tunnel_iter it = { 0 };
@@ -917,6 +854,13 @@ static void server_drain_tunnels(
 			.update_forward_addr = forward_changed,
 			.forward_addr = new_conf->connect,
 		};
+#if WITH_TLS
+		/* Per-dialed-tunnel TLS handle (ownership transferred to
+		 * tunnel_reload); on OOM the tunnel keeps its current context. */
+		if (!tunnel_is_accepted(t) && new_client_tlsctx != NULL) {
+			opts.conf.tlsctx = tls_ctx_ref(new_client_tlsctx);
+		}
+#endif
 		tunnel_set_reload_connect(
 			&opts, s, t, old_conf, new_conf, old_ni, new_ni);
 		tunnel_reload(t, &opts);
@@ -1180,6 +1124,18 @@ static struct tunnel *server_new_client_tunnel(
 	struct mux_config mux_conf = server_make_mux_config(s);
 	unsigned char sid[MUX_SESSION_ID_LEN];
 	proto_session_id_new(sid);
+#if WITH_TLS
+	/* Each dialed tunnel owns its own client TLS handle, sharing the parsed
+	 * base credentials via tls_ctx_ref(); the tunnel frees it at close. */
+	struct tls_context *tlsctx = NULL;
+	if (s->client_tlsctx != NULL) {
+		tlsctx = tls_ctx_ref(s->client_tlsctx);
+		if (tlsctx == NULL) {
+			LOGOOM();
+			return NULL;
+		}
+	}
+#endif
 	const struct tunnel_opts opts = {
 		.cb = &client_callbacks,
 		.data = s,
@@ -1193,11 +1149,18 @@ static struct tunnel *server_new_client_tunnel(
 		.identity = conf->identity.claim,
 		.peer_id = NULL,
 #if WITH_TLS
-		.tlsctx = s->client_tlsctx,
+		.tlsctx = tlsctx,
 		.conn = NULL,
 #endif
 	};
-	return tunnel_new(s, &opts);
+	struct tunnel *const t = tunnel_new(s, &opts);
+#if WITH_TLS
+	if (t == NULL) {
+		/* tunnel_new failed before adopting the handle; release it here. */
+		tls_ctx_free(tlsctx);
+	}
+#endif
+	return t;
 }
 
 /* Create a new mux_connect tunnel if one is configured but not yet live. */

@@ -106,10 +106,11 @@ const char *tunnel_peer_id(const struct tunnel *t);
  * thread while the tunnel's session thread runs. */
 bool tunnel_peer_identity_copy(
 	const struct tunnel *t, char *restrict buf, size_t buflen);
-#if WITH_TLS
-const unsigned char *tunnel_peer_cert_der(const struct tunnel *t, size_t *len);
-#endif
-const struct sockaddr *tunnel_peer_addr(const struct tunnel *t);
+/* Copy the peer transport address (from the session thread's published snapshot)
+ * into buf; returns whether an address is present.  Safe to call from the server
+ * thread while the tunnel's session thread runs. */
+bool tunnel_peer_addr_copy(
+	const struct tunnel *t, struct sockaddr *restrict buf, size_t buflen);
 bool tunnel_is_accepted(const struct tunnel *t);
 const unsigned char *tunnel_session_id(const struct tunnel *t);
 /* Server-wide monotonic index, never reused; a stable per-tunnel handle. */
@@ -171,6 +172,9 @@ void tunnel_open_stream(struct tunnel *t, int fd);
 /* Options for a single-pass reload dispatch, applied atomically in the tunnel
  * thread: address updates precede the drain config. */
 struct tunnel_reload_opts {
+	/* conf.tlsctx (when non-NULL) is the new per-tunnel TLS context, whose
+	 * ownership transfers to tunnel_reload(): the tunnel adopts it and frees
+	 * its previous one.  NULL leaves the current context in place. */
 	struct mux_config conf;
 	struct conf_socket_opts mux_socket;
 	struct conf_socket_opts local_socket;
@@ -192,7 +196,8 @@ struct tunnel_reload_opts {
 
 /* Dispatch a single-pass reload to the session's tunnel loop; address
  * updates, drain config, socket options, and TLS context applied atomically.
- * On OOM the dispatch is skipped and the error is logged. */
+ * Takes ownership of opts->conf.tlsctx either way: on OOM the dispatch is
+ * skipped, the context is freed, and the error is logged. */
 void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts);
 
 #endif /* TUNNEL_H */
