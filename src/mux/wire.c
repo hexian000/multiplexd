@@ -148,7 +148,25 @@ static bool wire_recv_buffered(
 	size_t *restrict len)
 {
 	ss->wire.tls_want = 0;
-	ss->wire.tls_readable = false;
+	if (ss->wire.tls_readable) {
+		ss->wire.tls_readable = false;
+		size_t n = *len;
+		const enum tls_error err = tls_recv(ss->wire.tlsconn, buf, &n);
+		if (err == TLS_ERROR_NONE && n > 0) {
+			*len = n;
+			LOGV_F("[fd:%d] tls_recv(drained): %zu bytes",
+			       ss->w_socket.fd, *len);
+			const int perr = wire_cipher_push(ss);
+			if (perr == EAGAIN) {
+				ss->wire.tx_pending = true;
+			} else if (perr != 0) {
+				ss->wire.rx_open = false;
+				*len = 0;
+				return false;
+			}
+			return true;
+		}
+	}
 	size_t clen = *len;
 	const int serr = socket_recv(ss->w_socket.fd, buf, &clen);
 	if (serr != 0) {
