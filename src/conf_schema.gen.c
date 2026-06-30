@@ -4,8 +4,9 @@
 
 #include "codec/json.h"
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -199,421 +200,231 @@ json_lookup_conf_tls(const char *str, size_t len)
 
 /** @} */
 
-/** @name Key indices
+/** @name Schema tables
  *  @{ */
 
-enum json_conf_key {
-	JSON_CONF_API_LISTEN = 0,
-	JSON_CONF_CONNECT = 1,
-	JSON_CONF_IDENTITY = 2,
-	JSON_CONF_LISTEN = 3,
-	JSON_CONF_LOG = 4,
-	JSON_CONF_LOGLEVEL = 5,
-	JSON_CONF_MAX_SESSIONS = 6,
-	JSON_CONF_MAX_STARTUPS = 7,
-	JSON_CONF_MUX = 8,
-	JSON_CONF_MUX_CONNECT = 9,
-	JSON_CONF_MUX_LISTEN = 10,
-	JSON_CONF_TCP = 11,
-	JSON_CONF_TLS = 12,
-	JSON_CONF_TYPE = 13,
+static const struct json_constraint json_conf_tls_authcerts_c = {
+	.flags = JSON_C_MIN_ITEMS,
+	.min_items = 1,
+};
+static const struct json_constraint json_conf_tls_readahead_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(16777216) },
+};
+static const struct json_conf_tls json_conf_tls_defaults = {
+	.kernel_offload = false,
+	.readahead = 131072u,
+	.sni = { .str = "example.com", .len = 11 },
+	.socket_offload = false,
+};
+static const struct json_field json_conf_tls_fields[] = {
+	{ .name = "alpn", .name_len = 4, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, alpn) },
+	{ .name = "authcerts", .name_len = 9, .kind = JSON_K_STRING, .is_array = true, .req_bit = -1, .offset = offsetof(struct json_conf_tls, authcerts), .count_offset = offsetof(struct json_conf_tls, authcerts_count), .constraint = &json_conf_tls_authcerts_c },
+	{ .name = "cert", .name_len = 4, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, cert) },
+	{ .name = "ciphersuites", .name_len = 12, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, ciphersuites) },
+	{ .name = "kernel_offload", .name_len = 14, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tls, kernel_offload) },
+	{ .name = "key", .name_len = 3, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, key) },
+	{ .name = "readahead", .name_len = 9, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_tls, readahead), .constraint = &json_conf_tls_readahead_c },
+	{ .name = "sni", .name_len = 3, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, sni) },
+	{ .name = "socket_offload", .name_len = 14, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tls, socket_offload) },
+};
+static const struct json_schema json_conf_tls_schema = {
+	.fields = json_conf_tls_fields,
+	.n_fields = 9,
+	.obj_size = sizeof(struct json_conf_tls),
+	.lookup = json_lookup_conf_tls,
+	.defaults = &json_conf_tls_defaults,
+	.present_field = -1,
 };
 
-enum json_conf_identity_key {
-	JSON_CONF_IDENTITY_CLAIM = 0,
-	JSON_CONF_IDENTITY_LISTEN = 1,
-	JSON_CONF_IDENTITY_MUX_CONNECT = 2,
+static const struct json_constraint json_conf_tcp_backlog_c = {
+	.flags = JSON_C_MIN | JSON_C_MAX,
+	.u = { .min = UINTMAX_C(1), .max = UINTMAX_C(4096) },
+};
+static const struct json_conf_tcp json_conf_tcp_defaults = {
+	.backlog = 16u,
+	.keepalive = true,
+	.nodelay = true,
+	.notsent_lowat = UINTMAX_C(0),
+	.reuseport = false,
+};
+static const struct json_field json_conf_tcp_fields[] = {
+	{ .name = "backlog", .name_len = 7, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_tcp, backlog), .constraint = &json_conf_tcp_backlog_c },
+	{ .name = "keepalive", .name_len = 9, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tcp, keepalive) },
+	{ .name = "nodelay", .name_len = 7, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tcp, nodelay) },
+	{ .name = "notsent_lowat", .name_len = 13, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_tcp, notsent_lowat) },
+	{ .name = "rcvbuf", .name_len = 6, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_tcp, rcvbuf) },
+	{ .name = "reuseport", .name_len = 9, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tcp, reuseport) },
+	{ .name = "sndbuf", .name_len = 6, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_tcp, sndbuf) },
+};
+static const struct json_schema json_conf_tcp_schema = {
+	.fields = json_conf_tcp_fields,
+	.n_fields = 7,
+	.obj_size = sizeof(struct json_conf_tcp),
+	.lookup = json_lookup_conf_tcp,
+	.defaults = &json_conf_tcp_defaults,
+	.present_field = -1,
 };
 
-enum json_conf_mux_key {
-	JSON_CONF_MUX_CONNECT_TIMEOUT = 0,
-	JSON_CONF_MUX_IDLE_TIMEOUT = 1,
-	JSON_CONF_MUX_KEEPALIVE = 2,
-	JSON_CONF_MUX_MAX_FRAME_SIZE = 3,
-	JSON_CONF_MUX_MAX_HALFOPEN = 4,
-	JSON_CONF_MUX_MAX_STREAMS = 5,
-	JSON_CONF_MUX_MEM_PRESSURE = 6,
-	JSON_CONF_MUX_NODELAY = 7,
-	JSON_CONF_MUX_RESUME_TIMEOUT = 8,
-	JSON_CONF_MUX_SEND_TIMEOUT = 9,
-	JSON_CONF_MUX_SESSION_WINDOW = 10,
-	JSON_CONF_MUX_STREAM_WINDOW = 11,
-	JSON_CONF_MUX_TCP = 12,
+static const struct json_constraint json_conf_mux_tcp_backlog_c = {
+	.flags = JSON_C_MIN | JSON_C_MAX,
+	.u = { .min = UINTMAX_C(1), .max = UINTMAX_C(4096) },
+};
+static const struct json_conf_mux_tcp json_conf_mux_tcp_defaults = {
+	.backlog = 16u,
+	.keepalive = false,
+	.nodelay = true,
+	.notsent_lowat = UINTMAX_C(131072),
+	.reuseport = false,
+};
+static const struct json_field json_conf_mux_tcp_fields[] = {
+	{ .name = "backlog", .name_len = 7, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux_tcp, backlog), .constraint = &json_conf_mux_tcp_backlog_c },
+	{ .name = "keepalive", .name_len = 9, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_mux_tcp, keepalive) },
+	{ .name = "nodelay", .name_len = 7, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_mux_tcp, nodelay) },
+	{ .name = "notsent_lowat", .name_len = 13, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux_tcp, notsent_lowat) },
+	{ .name = "rcvbuf", .name_len = 6, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux_tcp, rcvbuf) },
+	{ .name = "reuseport", .name_len = 9, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_mux_tcp, reuseport) },
+	{ .name = "sndbuf", .name_len = 6, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux_tcp, sndbuf) },
+};
+static const struct json_schema json_conf_mux_tcp_schema = {
+	.fields = json_conf_mux_tcp_fields,
+	.n_fields = 7,
+	.obj_size = sizeof(struct json_conf_mux_tcp),
+	.lookup = json_lookup_conf_mux_tcp,
+	.defaults = &json_conf_mux_tcp_defaults,
+	.present_field = -1,
 };
 
-enum json_conf_mux_mem_pressure_key {
-	JSON_CONF_MUX_MEM_PRESSURE_HI = 0,
-	JSON_CONF_MUX_MEM_PRESSURE_LO = 1,
+static const struct json_conf_mux_mem_pressure json_conf_mux_mem_pressure_defaults = {
+	.hi = UINTMAX_C(0),
+	.lo = UINTMAX_C(0),
+};
+static const struct json_field json_conf_mux_mem_pressure_fields[] = {
+	{ .name = "hi", .name_len = 2, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux_mem_pressure, hi) },
+	{ .name = "lo", .name_len = 2, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux_mem_pressure, lo) },
+};
+static const struct json_schema json_conf_mux_mem_pressure_schema = {
+	.fields = json_conf_mux_mem_pressure_fields,
+	.n_fields = 2,
+	.obj_size = sizeof(struct json_conf_mux_mem_pressure),
+	.lookup = json_lookup_conf_mux_mem_pressure,
+	.defaults = &json_conf_mux_mem_pressure_defaults,
+	.present_field = -1,
 };
 
-enum json_conf_mux_tcp_key {
-	JSON_CONF_MUX_TCP_BACKLOG = 0,
-	JSON_CONF_MUX_TCP_KEEPALIVE = 1,
-	JSON_CONF_MUX_TCP_NODELAY = 2,
-	JSON_CONF_MUX_TCP_NOTSENT_LOWAT = 3,
-	JSON_CONF_MUX_TCP_RCVBUF = 4,
-	JSON_CONF_MUX_TCP_REUSEPORT = 5,
-	JSON_CONF_MUX_TCP_SNDBUF = 6,
+static const struct json_constraint json_conf_mux_connect_timeout_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(86400) },
 };
-
-enum json_conf_tcp_key {
-	JSON_CONF_TCP_BACKLOG = 0,
-	JSON_CONF_TCP_KEEPALIVE = 1,
-	JSON_CONF_TCP_NODELAY = 2,
-	JSON_CONF_TCP_NOTSENT_LOWAT = 3,
-	JSON_CONF_TCP_RCVBUF = 4,
-	JSON_CONF_TCP_REUSEPORT = 5,
-	JSON_CONF_TCP_SNDBUF = 6,
+static const struct json_constraint json_conf_mux_idle_timeout_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(86400) },
 };
-
-enum json_conf_tls_key {
-	JSON_CONF_TLS_ALPN = 0,
-	JSON_CONF_TLS_AUTHCERTS = 1,
-	JSON_CONF_TLS_CERT = 2,
-	JSON_CONF_TLS_CIPHERSUITES = 3,
-	JSON_CONF_TLS_KERNEL_OFFLOAD = 4,
-	JSON_CONF_TLS_KEY = 5,
-	JSON_CONF_TLS_READAHEAD = 6,
-	JSON_CONF_TLS_SNI = 7,
-	JSON_CONF_TLS_SOCKET_OFFLOAD = 8,
+static const struct json_constraint json_conf_mux_keepalive_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(86400) },
 };
-
-/** @} */
-
-/** @name Free
- *  @{ */
-
-static void json_free_conf_tls(struct json_conf_tls *obj)
-{
-	free(obj->authcerts);
-}
-
-static void json_free_conf_tcp(struct json_conf_tcp *obj)
-{
-	(void)obj;
-}
-
-static void json_free_conf_mux_tcp(struct json_conf_mux_tcp *obj)
-{
-	(void)obj;
-}
-
-static void json_free_conf_mux_mem_pressure(struct json_conf_mux_mem_pressure *obj)
-{
-	(void)obj;
-}
-
-static void json_free_conf_mux(struct json_conf_mux *obj)
-{
-	json_free_conf_mux_mem_pressure(&obj->mem_pressure);
-	json_free_conf_mux_tcp(&obj->tcp);
-}
-
-static void json_free_conf_identity(struct json_conf_identity *obj)
-{
-	free(obj->mux_connect);
-}
-
-void json_free_conf(struct json_conf *obj)
-{
-	json_free_conf_identity(&obj->identity);
-	json_free_conf_mux(&obj->mux);
-	json_free_conf_tcp(&obj->tcp);
-	json_free_conf_tls(&obj->tls);
-}
-
-/** @} */
-
-/** @name Unmarshal
- *  @{ */
-
-static bool json_unmarshal_conf_tls_arr_authcerts(
-	struct json_conf_tls *obj, char *val_, size_t val_len_)
-{
-	const struct json_val arr_ = json_parse(val_, &(size_t){ val_len_ });
-	if (arr_.type != JSON_ARRAY) { return false; }
-	struct json_string *items_ = NULL;
-	size_t count_ = 0, cap_ = 0;
-	json_iter ait_ = arr_.iter;
-	char *av_; size_t alen_;
-	int next_;
-	while ((next_ = json_arr_next(val_, &val_len_, &ait_, &av_, &alen_)) == JSON_NEXT_ITEM) {
-		if (count_ >= cap_) {
-			const size_t nc_ = cap_ ? cap_ * 2 : 4;
-			struct json_string *na_ = realloc(items_, nc_ * sizeof(*na_));
-			if (na_ == NULL) {
-				free(items_);
-				return false;
-			}
-			items_ = na_; cap_ = nc_;
-		}
-		if (!json_parse_string(av_, alen_, &items_[count_].str, &items_[count_].len)) {
-			free(items_);
-			return false;
-		}
-		count_++;
-	}
-	if (next_ != JSON_NEXT_END) { free(items_); return false; }
-	for (; ait_ < val_len_; ait_++) {
-		if (!json_iswhitespace(val_[ait_])) { free(items_); return false; }
-	}
-	/* duplicate key: release any previous allocation */
-	free(obj->authcerts);
-	obj->authcerts = items_;
-	obj->authcerts_count = count_;
-	return true;
-}
-
-static bool json_unmarshal_conf_tls(
-	struct json_conf_tls *obj, char *json, size_t length)
-{
-	*obj = (struct json_conf_tls){
-		.kernel_offload = false,
-		.readahead = 131072u,
-		.sni = { .str = "example.com", .len = 11 },
-		.socket_offload = false,
-	};
-	const struct json_val root_ = json_parse(json, &(size_t){ length });
-	if (root_.type != JSON_OBJECT) { return false; }
-	json_iter iter_ = root_.iter;
-	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	int next_;
-
-	while ((next_ = json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
-		const int k_ = json_lookup_conf_tls(key_, key_len_);
-		switch (k_) {
-		case JSON_CONF_TLS_ALPN: {
-			if (!json_parse_string(val_, val_len_, &obj->alpn.str, &obj->alpn.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TLS_AUTHCERTS: {
-			if (!json_unmarshal_conf_tls_arr_authcerts(obj, val_, val_len_)) { goto fail_; }
-			if (obj->authcerts_count < 1u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TLS_CERT: {
-			if (!json_parse_string(val_, val_len_, &obj->cert.str, &obj->cert.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TLS_CIPHERSUITES: {
-			if (!json_parse_string(val_, val_len_, &obj->ciphersuites.str, &obj->ciphersuites.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TLS_KERNEL_OFFLOAD: {
-			if (!json_parse_bool(val_, val_len_, &obj->kernel_offload)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TLS_KEY: {
-			if (!json_parse_string(val_, val_len_, &obj->key.str, &obj->key.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TLS_READAHEAD: {
-			if (!json_parse_uint(val_, val_len_, &obj->readahead)) { goto fail_; }
-			if (obj->readahead > 16777216u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TLS_SNI: {
-			if (!json_parse_string(val_, val_len_, &obj->sni.str, &obj->sni.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TLS_SOCKET_OFFLOAD: {
-			if (!json_parse_bool(val_, val_len_, &obj->socket_offload)) { goto fail_; }
-			break;
-		}
-		default:
-			break;
-		}
-	}
-	if (next_ != JSON_NEXT_END) { goto fail_; }
-	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { goto fail_; }
-	}
-	return true;
-
-fail_:
-	json_free_conf_tls(obj);
-	*obj = (struct json_conf_tls){ 0 };
-	return false;
-}
-
-static bool json_unmarshal_conf_tcp(
-	struct json_conf_tcp *obj, char *json, size_t length)
-{
-	*obj = (struct json_conf_tcp){
-		.backlog = 16u,
-		.keepalive = true,
-		.nodelay = true,
-		.notsent_lowat = UINTMAX_C(0),
-		.reuseport = false,
-	};
-	const struct json_val root_ = json_parse(json, &(size_t){ length });
-	if (root_.type != JSON_OBJECT) { return false; }
-	json_iter iter_ = root_.iter;
-	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	int next_;
-
-	while ((next_ = json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
-		const int k_ = json_lookup_conf_tcp(key_, key_len_);
-		switch (k_) {
-		case JSON_CONF_TCP_BACKLOG: {
-			if (!json_parse_uint(val_, val_len_, &obj->backlog)) { goto fail_; }
-			if (obj->backlog < 1u) { goto fail_; }
-			if (obj->backlog > 4096u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TCP_KEEPALIVE: {
-			if (!json_parse_bool(val_, val_len_, &obj->keepalive)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TCP_NODELAY: {
-			if (!json_parse_bool(val_, val_len_, &obj->nodelay)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TCP_NOTSENT_LOWAT: {
-			if (!json_parse_umax(val_, val_len_, &obj->notsent_lowat)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TCP_RCVBUF: {
-			if (!json_parse_umax(val_, val_len_, &obj->rcvbuf)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TCP_REUSEPORT: {
-			if (!json_parse_bool(val_, val_len_, &obj->reuseport)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TCP_SNDBUF: {
-			if (!json_parse_umax(val_, val_len_, &obj->sndbuf)) { goto fail_; }
-			break;
-		}
-		default:
-			break;
-		}
-	}
-	if (next_ != JSON_NEXT_END) { goto fail_; }
-	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { goto fail_; }
-	}
-	return true;
-
-fail_:
-	json_free_conf_tcp(obj);
-	*obj = (struct json_conf_tcp){ 0 };
-	return false;
-}
-
-static bool json_unmarshal_conf_mux_tcp(
-	struct json_conf_mux_tcp *obj, char *json, size_t length)
-{
-	*obj = (struct json_conf_mux_tcp){
+static const struct json_constraint json_conf_mux_max_frame_size_c = {
+	.flags = JSON_C_MIN | JSON_C_MAX,
+	.u = { .min = UINTMAX_C(1024), .max = UINTMAX_C(65543) },
+};
+static const struct json_constraint json_conf_mux_max_halfopen_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(4096) },
+};
+static const struct json_constraint json_conf_mux_resume_timeout_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(86400) },
+};
+static const struct json_constraint json_conf_mux_send_timeout_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(86400) },
+};
+static const struct json_constraint json_conf_mux_session_window_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(1073725440) },
+};
+static const struct json_constraint json_conf_mux_stream_window_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(1073725440) },
+};
+static const struct json_conf_mux json_conf_mux_defaults = {
+	.connect_timeout = 15u,
+	.idle_timeout = 0u,
+	.keepalive = 7200u,
+	.max_frame_size = 16384u,
+	.max_halfopen = 256u,
+	.mem_pressure = {
+		.hi = UINTMAX_C(0),
+		.lo = UINTMAX_C(0),
+	},
+	.nodelay = true,
+	.resume_timeout = 600u,
+	.send_timeout = 15u,
+	.session_window = 0u,
+	.stream_window = 0u,
+	.tcp = {
 		.backlog = 16u,
 		.keepalive = false,
 		.nodelay = true,
 		.notsent_lowat = UINTMAX_C(131072),
 		.reuseport = false,
-	};
-	const struct json_val root_ = json_parse(json, &(size_t){ length });
-	if (root_.type != JSON_OBJECT) { return false; }
-	json_iter iter_ = root_.iter;
-	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	int next_;
+	},
+};
+static const struct json_field json_conf_mux_fields[] = {
+	{ .name = "connect_timeout", .name_len = 15, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, connect_timeout), .constraint = &json_conf_mux_connect_timeout_c },
+	{ .name = "idle_timeout", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, idle_timeout), .constraint = &json_conf_mux_idle_timeout_c },
+	{ .name = "keepalive", .name_len = 9, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, keepalive), .constraint = &json_conf_mux_keepalive_c },
+	{ .name = "max_frame_size", .name_len = 14, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, max_frame_size), .constraint = &json_conf_mux_max_frame_size_c },
+	{ .name = "max_halfopen", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, max_halfopen), .constraint = &json_conf_mux_max_halfopen_c },
+	{ .name = "max_streams", .name_len = 11, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux, max_streams) },
+	{ .name = "mem_pressure", .name_len = 12, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, mem_pressure), .child = &json_conf_mux_mem_pressure_schema },
+	{ .name = "nodelay", .name_len = 7, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_mux, nodelay) },
+	{ .name = "resume_timeout", .name_len = 14, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, resume_timeout), .constraint = &json_conf_mux_resume_timeout_c },
+	{ .name = "send_timeout", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, send_timeout), .constraint = &json_conf_mux_send_timeout_c },
+	{ .name = "session_window", .name_len = 14, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, session_window), .constraint = &json_conf_mux_session_window_c },
+	{ .name = "stream_window", .name_len = 13, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, stream_window), .constraint = &json_conf_mux_stream_window_c },
+	{ .name = "tcp", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, tcp), .child = &json_conf_mux_tcp_schema },
+};
+static const struct json_schema json_conf_mux_schema = {
+	.fields = json_conf_mux_fields,
+	.n_fields = 13,
+	.obj_size = sizeof(struct json_conf_mux),
+	.lookup = json_lookup_conf_mux,
+	.defaults = &json_conf_mux_defaults,
+	.present_field = -1,
+};
 
-	while ((next_ = json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
-		const int k_ = json_lookup_conf_mux_tcp(key_, key_len_);
-		switch (k_) {
-		case JSON_CONF_MUX_TCP_BACKLOG: {
-			if (!json_parse_uint(val_, val_len_, &obj->backlog)) { goto fail_; }
-			if (obj->backlog < 1u) { goto fail_; }
-			if (obj->backlog > 4096u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_TCP_KEEPALIVE: {
-			if (!json_parse_bool(val_, val_len_, &obj->keepalive)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_TCP_NODELAY: {
-			if (!json_parse_bool(val_, val_len_, &obj->nodelay)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_TCP_NOTSENT_LOWAT: {
-			if (!json_parse_umax(val_, val_len_, &obj->notsent_lowat)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_TCP_RCVBUF: {
-			if (!json_parse_umax(val_, val_len_, &obj->rcvbuf)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_TCP_REUSEPORT: {
-			if (!json_parse_bool(val_, val_len_, &obj->reuseport)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_TCP_SNDBUF: {
-			if (!json_parse_umax(val_, val_len_, &obj->sndbuf)) { goto fail_; }
-			break;
-		}
-		default:
-			break;
-		}
-	}
-	if (next_ != JSON_NEXT_END) { goto fail_; }
-	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { goto fail_; }
-	}
-	return true;
+static const struct json_field json_conf_identity_fields[] = {
+	{ .name = "claim", .name_len = 5, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_identity, claim) },
+	{ .name = "listen", .name_len = 6, .kind = JSON_K_DYNAMIC, .req_bit = -1, .offset = offsetof(struct json_conf_identity, listen_json) },
+	{ .name = "mux_connect", .name_len = 11, .kind = JSON_K_STRING, .is_array = true, .req_bit = -1, .offset = offsetof(struct json_conf_identity, mux_connect), .count_offset = offsetof(struct json_conf_identity, mux_connect_count) },
+};
+static const struct json_schema json_conf_identity_schema = {
+	.fields = json_conf_identity_fields,
+	.n_fields = 3,
+	.obj_size = sizeof(struct json_conf_identity),
+	.lookup = json_lookup_conf_identity,
+	.present_field = -1,
+};
 
-fail_:
-	json_free_conf_mux_tcp(obj);
-	*obj = (struct json_conf_mux_tcp){ 0 };
-	return false;
-}
-
-static bool json_unmarshal_conf_mux_mem_pressure(
-	struct json_conf_mux_mem_pressure *obj, char *json, size_t length)
-{
-	*obj = (struct json_conf_mux_mem_pressure){
-		.hi = UINTMAX_C(0),
-		.lo = UINTMAX_C(0),
-	};
-	const struct json_val root_ = json_parse(json, &(size_t){ length });
-	if (root_.type != JSON_OBJECT) { return false; }
-	json_iter iter_ = root_.iter;
-	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	int next_;
-
-	while ((next_ = json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
-		const int k_ = json_lookup_conf_mux_mem_pressure(key_, key_len_);
-		switch (k_) {
-		case JSON_CONF_MUX_MEM_PRESSURE_HI: {
-			if (!json_parse_umax(val_, val_len_, &obj->hi)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_MEM_PRESSURE_LO: {
-			if (!json_parse_umax(val_, val_len_, &obj->lo)) { goto fail_; }
-			break;
-		}
-		default:
-			break;
-		}
-	}
-	if (next_ != JSON_NEXT_END) { goto fail_; }
-	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { goto fail_; }
-	}
-	return true;
-
-fail_:
-	json_free_conf_mux_mem_pressure(obj);
-	*obj = (struct json_conf_mux_mem_pressure){ 0 };
-	return false;
-}
-
-static bool json_unmarshal_conf_mux(
-	struct json_conf_mux *obj, char *json, size_t length)
-{
-	*obj = (struct json_conf_mux){
+static const struct json_string json_conf_log_enum[] = {
+	{ .len = 6, .str = "stdout" },
+	{ .len = 6, .str = "stderr" },
+	{ .len = 6, .str = "syslog" },
+	{ .len = 7, .str = "discard" },
+};
+static const struct json_constraint json_conf_log_c = {
+	.flags = JSON_C_ENUM,
+	.str = { .enums = json_conf_log_enum, .n_enum = 4 },
+};
+static const struct json_constraint json_conf_type_c = {
+	.flags = JSON_C_CONST,
+	.str = { .konst = { .len = 42, .str = "application/x-multiplexd-config; version=1" } },
+};
+static const struct json_conf json_conf_defaults = {
+	.loglevel = UINTMAX_C(4),
+	.mux = {
 		.connect_timeout = 15u,
 		.idle_timeout = 0u,
 		.keepalive = 7200u,
@@ -635,1053 +446,66 @@ static bool json_unmarshal_conf_mux(
 			.notsent_lowat = UINTMAX_C(131072),
 			.reuseport = false,
 		},
-	};
-	const struct json_val root_ = json_parse(json, &(size_t){ length });
-	if (root_.type != JSON_OBJECT) { return false; }
-	json_iter iter_ = root_.iter;
-	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	int next_;
+	},
+	.tcp = {
+		.backlog = 16u,
+		.keepalive = true,
+		.nodelay = true,
+		.notsent_lowat = UINTMAX_C(0),
+		.reuseport = false,
+	},
+	.tls = {
+		.kernel_offload = false,
+		.readahead = 131072u,
+		.sni = { .str = "example.com", .len = 11 },
+		.socket_offload = false,
+	},
+};
+static const struct json_field json_conf_fields[] = {
+	{ .name = "api_listen", .name_len = 10, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, api_listen) },
+	{ .name = "connect", .name_len = 7, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, connect) },
+	{ .name = "identity", .name_len = 8, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf, identity), .child = &json_conf_identity_schema },
+	{ .name = "listen", .name_len = 6, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, listen) },
+	{ .name = "log", .name_len = 3, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, log), .constraint = &json_conf_log_c },
+	{ .name = "loglevel", .name_len = 8, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf, loglevel) },
+	{ .name = "max_sessions", .name_len = 12, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf, max_sessions) },
+	{ .name = "max_startups", .name_len = 12, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, max_startups) },
+	{ .name = "mux", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf, mux), .child = &json_conf_mux_schema },
+	{ .name = "mux_connect", .name_len = 11, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, mux_connect) },
+	{ .name = "mux_listen", .name_len = 10, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, mux_listen) },
+	{ .name = "tcp", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf, tcp), .child = &json_conf_tcp_schema },
+	{ .name = "tls", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf, tls), .child = &json_conf_tls_schema },
+	{ .name = "type", .name_len = 4, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, type), .constraint = &json_conf_type_c },
+};
+static const struct json_schema json_conf_schema = {
+	.fields = json_conf_fields,
+	.n_fields = 14,
+	.obj_size = sizeof(struct json_conf),
+	.lookup = json_lookup_conf,
+	.defaults = &json_conf_defaults,
+	.present_field = -1,
+};
 
-	while ((next_ = json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
-		const int k_ = json_lookup_conf_mux(key_, key_len_);
-		switch (k_) {
-		case JSON_CONF_MUX_CONNECT_TIMEOUT: {
-			if (!json_parse_uint(val_, val_len_, &obj->connect_timeout)) { goto fail_; }
-			if (obj->connect_timeout > 86400u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_IDLE_TIMEOUT: {
-			if (!json_parse_uint(val_, val_len_, &obj->idle_timeout)) { goto fail_; }
-			if (obj->idle_timeout > 86400u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_KEEPALIVE: {
-			if (!json_parse_uint(val_, val_len_, &obj->keepalive)) { goto fail_; }
-			if (obj->keepalive > 86400u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_MAX_FRAME_SIZE: {
-			if (!json_parse_uint(val_, val_len_, &obj->max_frame_size)) { goto fail_; }
-			if (obj->max_frame_size < 1024u) { goto fail_; }
-			if (obj->max_frame_size > 65543u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_MAX_HALFOPEN: {
-			if (!json_parse_uint(val_, val_len_, &obj->max_halfopen)) { goto fail_; }
-			if (obj->max_halfopen > 4096u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_MAX_STREAMS: {
-			if (!json_parse_umax(val_, val_len_, &obj->max_streams)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_MEM_PRESSURE: {
-			/* duplicate key: release the previous value first */
-			json_free_conf_mux_mem_pressure(&obj->mem_pressure);
-			if (!json_unmarshal_conf_mux_mem_pressure(&obj->mem_pressure, val_, val_len_)) {
-				goto fail_;
-			}
-			break;
-		}
-		case JSON_CONF_MUX_NODELAY: {
-			if (!json_parse_bool(val_, val_len_, &obj->nodelay)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_RESUME_TIMEOUT: {
-			if (!json_parse_uint(val_, val_len_, &obj->resume_timeout)) { goto fail_; }
-			if (obj->resume_timeout > 86400u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_SEND_TIMEOUT: {
-			if (!json_parse_uint(val_, val_len_, &obj->send_timeout)) { goto fail_; }
-			if (obj->send_timeout > 86400u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_SESSION_WINDOW: {
-			if (!json_parse_uint(val_, val_len_, &obj->session_window)) { goto fail_; }
-			if (obj->session_window > 1073725440u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_STREAM_WINDOW: {
-			if (!json_parse_uint(val_, val_len_, &obj->stream_window)) { goto fail_; }
-			if (obj->stream_window > 1073725440u) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_TCP: {
-			/* duplicate key: release the previous value first */
-			json_free_conf_mux_tcp(&obj->tcp);
-			if (!json_unmarshal_conf_mux_tcp(&obj->tcp, val_, val_len_)) {
-				goto fail_;
-			}
-			break;
-		}
-		default:
-			break;
-		}
-	}
-	if (next_ != JSON_NEXT_END) { goto fail_; }
-	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { goto fail_; }
-	}
-	return true;
+/** @} */
 
-fail_:
-	json_free_conf_mux(obj);
-	*obj = (struct json_conf_mux){ 0 };
-	return false;
-}
+/** @name Codec functions
+ *  @{ */
 
-static bool json_unmarshal_conf_identity_arr_mux_connect(
-	struct json_conf_identity *obj, char *val_, size_t val_len_)
+void json_free_conf(struct json_conf *obj)
 {
-	const struct json_val arr_ = json_parse(val_, &(size_t){ val_len_ });
-	if (arr_.type != JSON_ARRAY) { return false; }
-	struct json_string *items_ = NULL;
-	size_t count_ = 0, cap_ = 0;
-	json_iter ait_ = arr_.iter;
-	char *av_; size_t alen_;
-	int next_;
-	while ((next_ = json_arr_next(val_, &val_len_, &ait_, &av_, &alen_)) == JSON_NEXT_ITEM) {
-		if (count_ >= cap_) {
-			const size_t nc_ = cap_ ? cap_ * 2 : 4;
-			struct json_string *na_ = realloc(items_, nc_ * sizeof(*na_));
-			if (na_ == NULL) {
-				free(items_);
-				return false;
-			}
-			items_ = na_; cap_ = nc_;
-		}
-		if (!json_parse_string(av_, alen_, &items_[count_].str, &items_[count_].len)) {
-			free(items_);
-			return false;
-		}
-		count_++;
-	}
-	if (next_ != JSON_NEXT_END) { free(items_); return false; }
-	for (; ait_ < val_len_; ait_++) {
-		if (!json_iswhitespace(val_[ait_])) { free(items_); return false; }
-	}
-	/* duplicate key: release any previous allocation */
-	free(obj->mux_connect);
-	obj->mux_connect = items_;
-	obj->mux_connect_count = count_;
-	return true;
-}
-
-static bool json_unmarshal_conf_identity(
-	struct json_conf_identity *obj, char *json, size_t length)
-{
-	*obj = (struct json_conf_identity){ 0 };
-	const struct json_val root_ = json_parse(json, &(size_t){ length });
-	if (root_.type != JSON_OBJECT) { return false; }
-	json_iter iter_ = root_.iter;
-	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	int next_;
-
-	while ((next_ = json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
-		const int k_ = json_lookup_conf_identity(key_, key_len_);
-		switch (k_) {
-		case JSON_CONF_IDENTITY_CLAIM: {
-			if (!json_parse_string(val_, val_len_, &obj->claim.str, &obj->claim.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_IDENTITY_LISTEN: {
-			obj->listen_json.str = val_;
-			obj->listen_json.len = val_len_;
-			break;
-		}
-		case JSON_CONF_IDENTITY_MUX_CONNECT: {
-			if (!json_unmarshal_conf_identity_arr_mux_connect(obj, val_, val_len_)) { goto fail_; }
-			break;
-		}
-		default:
-			break;
-		}
-	}
-	if (next_ != JSON_NEXT_END) { goto fail_; }
-	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { goto fail_; }
-	}
-	return true;
-
-fail_:
-	json_free_conf_identity(obj);
-	*obj = (struct json_conf_identity){ 0 };
-	return false;
+	json_free(&json_conf_schema, obj);
 }
 
 bool json_unmarshal_conf(
 	struct json_conf *obj, char *json, size_t length)
 {
-	*obj = (struct json_conf){
-		.loglevel = UINTMAX_C(4),
-		.mux = {
-			.connect_timeout = 15u,
-			.idle_timeout = 0u,
-			.keepalive = 7200u,
-			.max_frame_size = 16384u,
-			.max_halfopen = 256u,
-			.mem_pressure = {
-				.hi = UINTMAX_C(0),
-				.lo = UINTMAX_C(0),
-			},
-			.nodelay = true,
-			.resume_timeout = 600u,
-			.send_timeout = 15u,
-			.session_window = 0u,
-			.stream_window = 0u,
-			.tcp = {
-				.backlog = 16u,
-				.keepalive = false,
-				.nodelay = true,
-				.notsent_lowat = UINTMAX_C(131072),
-				.reuseport = false,
-			},
-		},
-		.tcp = {
-			.backlog = 16u,
-			.keepalive = true,
-			.nodelay = true,
-			.notsent_lowat = UINTMAX_C(0),
-			.reuseport = false,
-		},
-		.tls = {
-			.kernel_offload = false,
-			.readahead = 131072u,
-			.sni = { .str = "example.com", .len = 11 },
-			.socket_offload = false,
-		},
-	};
-	const struct json_val root_ = json_parse(json, &(size_t){ length });
-	if (root_.type != JSON_OBJECT) { return false; }
-	json_iter iter_ = root_.iter;
-	char *key_; size_t key_len_; char *val_; size_t val_len_;
-	int next_;
-
-	while ((next_ = json_obj_next(json, &length, &iter_,
-			&key_, &key_len_, &val_, &val_len_)) == JSON_NEXT_ITEM) {
-		const int k_ = json_lookup_conf(key_, key_len_);
-		switch (k_) {
-		case JSON_CONF_API_LISTEN: {
-			if (!json_parse_string(val_, val_len_, &obj->api_listen.str, &obj->api_listen.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_CONNECT: {
-			if (!json_parse_string(val_, val_len_, &obj->connect.str, &obj->connect.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_IDENTITY: {
-			/* duplicate key: release the previous value first */
-			json_free_conf_identity(&obj->identity);
-			if (!json_unmarshal_conf_identity(&obj->identity, val_, val_len_)) {
-				goto fail_;
-			}
-			break;
-		}
-		case JSON_CONF_LISTEN: {
-			if (!json_parse_string(val_, val_len_, &obj->listen.str, &obj->listen.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_LOG: {
-			if (!json_parse_string(val_, val_len_, &obj->log.str, &obj->log.len)) { goto fail_; }
-			if (!((obj->log.len == 6u && memcmp(obj->log.str, "stdout", 6) == 0) || (obj->log.len == 6u && memcmp(obj->log.str, "stderr", 6) == 0) || (obj->log.len == 6u && memcmp(obj->log.str, "syslog", 6) == 0) || (obj->log.len == 7u && memcmp(obj->log.str, "discard", 7) == 0))) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_LOGLEVEL: {
-			if (!json_parse_umax(val_, val_len_, &obj->loglevel)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MAX_SESSIONS: {
-			if (!json_parse_umax(val_, val_len_, &obj->max_sessions)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MAX_STARTUPS: {
-			if (!json_parse_string(val_, val_len_, &obj->max_startups.str, &obj->max_startups.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX: {
-			/* duplicate key: release the previous value first */
-			json_free_conf_mux(&obj->mux);
-			if (!json_unmarshal_conf_mux(&obj->mux, val_, val_len_)) {
-				goto fail_;
-			}
-			break;
-		}
-		case JSON_CONF_MUX_CONNECT: {
-			if (!json_parse_string(val_, val_len_, &obj->mux_connect.str, &obj->mux_connect.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_MUX_LISTEN: {
-			if (!json_parse_string(val_, val_len_, &obj->mux_listen.str, &obj->mux_listen.len)) { goto fail_; }
-			break;
-		}
-		case JSON_CONF_TCP: {
-			/* duplicate key: release the previous value first */
-			json_free_conf_tcp(&obj->tcp);
-			if (!json_unmarshal_conf_tcp(&obj->tcp, val_, val_len_)) {
-				goto fail_;
-			}
-			break;
-		}
-		case JSON_CONF_TLS: {
-			/* duplicate key: release the previous value first */
-			json_free_conf_tls(&obj->tls);
-			if (!json_unmarshal_conf_tls(&obj->tls, val_, val_len_)) {
-				goto fail_;
-			}
-			break;
-		}
-		case JSON_CONF_TYPE: {
-			if (!json_parse_string(val_, val_len_, &obj->type.str, &obj->type.len)) { goto fail_; }
-			if (!(obj->type.len == 42u && memcmp(obj->type.str, "application/x-multiplexd-config; version=1", 42) == 0)) { goto fail_; }
-			break;
-		}
-		default:
-			break;
-		}
-	}
-	if (next_ != JSON_NEXT_END) { goto fail_; }
-	for (; iter_ < length; iter_++) {
-		if (!json_iswhitespace(json[iter_])) { goto fail_; }
-	}
-	return true;
-
-fail_:
-	json_free_conf(obj);
-	*obj = (struct json_conf){ 0 };
-	return false;
-}
-
-/** @} */
-
-/** @name Marshal
- *  @{ */
-
-#define EMIT(c) do { \
-	if (buf != NULL && (size_t)n_ < bufsz) { buf[n_] = (char)(c); } \
-	n_++; \
-} while (0)
-#define EMITF(fmt, ...) do { \
-	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
-	r_ = snprintf(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, fmt, __VA_ARGS__); \
-	if (r_ < 0) { return -1; } \
-	n_ += r_; \
-} while (0)
-#define EMIT_STR(s, len) do { \
-	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
-	r_ = json_marshal_string(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (s), (len)); \
-	if (r_ < 0) { return -1; } \
-	n_ += r_; \
-} while (0)
-#define EMIT_SUB(fn, arg, d) do { \
-	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
-	r_ = (fn)(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (arg), indent, (d)); \
-	if (r_ < 0) { return -1; } \
-	n_ += r_; \
-} while (0)
-#define EMIT_LIT(s) do { \
-	static const char lit_[] = s; \
-	const size_t l_ = sizeof(lit_) - 1; \
-	if (buf != NULL && (size_t)n_ < bufsz) { \
-		const size_t cap_ = bufsz - (size_t)n_; \
-		memcpy(buf + n_, lit_, l_ < cap_ ? l_ : cap_); \
-	} \
-	n_ += (int)l_; \
-} while (0)
-#define EMIT_RAW(s, len) do { \
-	const size_t rl_ = (len); \
-	if (buf != NULL && (size_t)n_ < bufsz) { \
-		const size_t cap_ = bufsz - (size_t)n_; \
-		memcpy(buf + n_, (s), rl_ < cap_ ? rl_ : cap_); \
-	} \
-	n_ += (int)rl_; \
-} while (0)
-#define EMIT_INDENT(d) do { \
-	if (indent != NULL) { \
-		EMIT('\n'); \
-		for (int id_ = 0; id_ < (d); id_++) { EMIT_RAW(indent, ind_len_); } \
-	} \
-} while (0)
-#define EMIT_COLON() do { \
-	EMIT(':'); \
-	if (indent != NULL) { EMIT(' '); } \
-} while (0)
-
-static int json_marshal_conf_tls_impl(
-	char *buf, size_t bufsz, const struct json_conf_tls *obj,
-	const char *indent, int depth)
-{
-	int n_ = 0;
-	int r_ = 0;
-	(void)r_;
-	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
-	(void)ind_len_;
-	(void)depth;
-
-	EMIT('{');
-	const int n_start_ = n_;
-
-	if (obj->alpn.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("alpn");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->alpn.str, obj->alpn.len);
-		EMIT(',');
-	}
-	if (obj->authcerts != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("authcerts");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT('[');
-		for (size_t i_ = 0; i_ < obj->authcerts_count; i_++) {
-			if (i_ > 0) EMIT(',');
-			EMIT_INDENT(depth + 2);
-			EMIT_STR(obj->authcerts[i_].str, obj->authcerts[i_].len);
-		}
-		if (obj->authcerts_count > 0) { EMIT_INDENT(depth + 1); }
-		EMIT(']');
-		EMIT(',');
-	}
-	if (obj->cert.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("cert");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->cert.str, obj->cert.len);
-		EMIT(',');
-	}
-	if (obj->ciphersuites.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("ciphersuites");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->ciphersuites.str, obj->ciphersuites.len);
-		EMIT(',');
-	}
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("kernel_offload");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->kernel_offload) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-	if (obj->key.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("key");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->key.str, obj->key.len);
-		EMIT(',');
-	}
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("readahead");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->readahead);
-	EMIT(',');
-	if (obj->sni.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("sni");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->sni.str, obj->sni.len);
-		EMIT(',');
-	}
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("socket_offload");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->socket_offload) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-
-	if (n_ > n_start_) {
-		n_--;
-		EMIT_INDENT(depth);
-	}
-	EMIT('}');
-	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
-	}
-
-	return n_;
-}
-
-static int json_marshal_conf_tcp_impl(
-	char *buf, size_t bufsz, const struct json_conf_tcp *obj,
-	const char *indent, int depth)
-{
-	int n_ = 0;
-	int r_ = 0;
-	(void)r_;
-	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
-	(void)ind_len_;
-	(void)depth;
-
-	EMIT('{');
-	const int n_start_ = n_;
-
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("backlog");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->backlog);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("keepalive");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->keepalive) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("nodelay");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->nodelay) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("notsent_lowat");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->notsent_lowat);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("rcvbuf");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->rcvbuf);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("reuseport");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->reuseport) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("sndbuf");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->sndbuf);
-	EMIT(',');
-
-	if (n_ > n_start_) {
-		n_--;
-		EMIT_INDENT(depth);
-	}
-	EMIT('}');
-	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
-	}
-
-	return n_;
-}
-
-static int json_marshal_conf_mux_tcp_impl(
-	char *buf, size_t bufsz, const struct json_conf_mux_tcp *obj,
-	const char *indent, int depth)
-{
-	int n_ = 0;
-	int r_ = 0;
-	(void)r_;
-	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
-	(void)ind_len_;
-	(void)depth;
-
-	EMIT('{');
-	const int n_start_ = n_;
-
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("backlog");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->backlog);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("keepalive");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->keepalive) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("nodelay");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->nodelay) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("notsent_lowat");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->notsent_lowat);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("rcvbuf");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->rcvbuf);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("reuseport");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->reuseport) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("sndbuf");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->sndbuf);
-	EMIT(',');
-
-	if (n_ > n_start_) {
-		n_--;
-		EMIT_INDENT(depth);
-	}
-	EMIT('}');
-	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
-	}
-
-	return n_;
-}
-
-static int json_marshal_conf_mux_mem_pressure_impl(
-	char *buf, size_t bufsz, const struct json_conf_mux_mem_pressure *obj,
-	const char *indent, int depth)
-{
-	int n_ = 0;
-	int r_ = 0;
-	(void)r_;
-	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
-	(void)ind_len_;
-	(void)depth;
-
-	EMIT('{');
-	const int n_start_ = n_;
-
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("hi");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->hi);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("lo");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->lo);
-	EMIT(',');
-
-	if (n_ > n_start_) {
-		n_--;
-		EMIT_INDENT(depth);
-	}
-	EMIT('}');
-	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
-	}
-
-	return n_;
-}
-
-static int json_marshal_conf_mux_impl(
-	char *buf, size_t bufsz, const struct json_conf_mux *obj,
-	const char *indent, int depth)
-{
-	int n_ = 0;
-	int r_ = 0;
-	(void)r_;
-	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
-	(void)ind_len_;
-	(void)depth;
-
-	EMIT('{');
-	const int n_start_ = n_;
-
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("connect_timeout");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->connect_timeout);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("idle_timeout");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->idle_timeout);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("keepalive");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->keepalive);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("max_frame_size");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->max_frame_size);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("max_halfopen");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->max_halfopen);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("max_streams");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->max_streams);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("mem_pressure");
-	EMIT('"');
-	EMIT_COLON();
-	EMIT_SUB(json_marshal_conf_mux_mem_pressure_impl, &obj->mem_pressure, depth + 1);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("nodelay");
-	EMIT('"');
-	EMIT_COLON();
-	if (obj->nodelay) {
-		EMIT_LIT("true");
-	} else {
-		EMIT_LIT("false");
-	}
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("resume_timeout");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->resume_timeout);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("send_timeout");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->send_timeout);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("session_window");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->session_window);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("stream_window");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%u", obj->stream_window);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("tcp");
-	EMIT('"');
-	EMIT_COLON();
-	EMIT_SUB(json_marshal_conf_mux_tcp_impl, &obj->tcp, depth + 1);
-	EMIT(',');
-
-	if (n_ > n_start_) {
-		n_--;
-		EMIT_INDENT(depth);
-	}
-	EMIT('}');
-	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
-	}
-
-	return n_;
-}
-
-static int json_marshal_conf_identity_impl(
-	char *buf, size_t bufsz, const struct json_conf_identity *obj,
-	const char *indent, int depth)
-{
-	int n_ = 0;
-	int r_ = 0;
-	(void)r_;
-	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
-	(void)ind_len_;
-	(void)depth;
-
-	EMIT('{');
-	const int n_start_ = n_;
-
-	if (obj->claim.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("claim");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->claim.str, obj->claim.len);
-		EMIT(',');
-	}
-	if (obj->listen_json.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("listen");
-		EMIT('"');
-		EMIT_COLON();
-		EMITF("%.*s", (int)obj->listen_json.len, obj->listen_json.str);
-		EMIT(',');
-	}
-	if (obj->mux_connect != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("mux_connect");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT('[');
-		for (size_t i_ = 0; i_ < obj->mux_connect_count; i_++) {
-			if (i_ > 0) EMIT(',');
-			EMIT_INDENT(depth + 2);
-			EMIT_STR(obj->mux_connect[i_].str, obj->mux_connect[i_].len);
-		}
-		if (obj->mux_connect_count > 0) { EMIT_INDENT(depth + 1); }
-		EMIT(']');
-		EMIT(',');
-	}
-
-	if (n_ > n_start_) {
-		n_--;
-		EMIT_INDENT(depth);
-	}
-	EMIT('}');
-	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
-	}
-
-	return n_;
-}
-
-static int json_marshal_conf_impl(
-	char *buf, size_t bufsz, const struct json_conf *obj,
-	const char *indent, int depth)
-{
-	int n_ = 0;
-	int r_ = 0;
-	(void)r_;
-	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
-	(void)ind_len_;
-	(void)depth;
-
-	EMIT('{');
-	const int n_start_ = n_;
-
-	if (obj->api_listen.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("api_listen");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->api_listen.str, obj->api_listen.len);
-		EMIT(',');
-	}
-	if (obj->connect.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("connect");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->connect.str, obj->connect.len);
-		EMIT(',');
-	}
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("identity");
-	EMIT('"');
-	EMIT_COLON();
-	EMIT_SUB(json_marshal_conf_identity_impl, &obj->identity, depth + 1);
-	EMIT(',');
-	if (obj->listen.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("listen");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->listen.str, obj->listen.len);
-		EMIT(',');
-	}
-	if (obj->log.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("log");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->log.str, obj->log.len);
-		EMIT(',');
-	}
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("loglevel");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->loglevel);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("max_sessions");
-	EMIT('"');
-	EMIT_COLON();
-	EMITF("%ju", (uintmax_t)obj->max_sessions);
-	EMIT(',');
-	if (obj->max_startups.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("max_startups");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->max_startups.str, obj->max_startups.len);
-		EMIT(',');
-	}
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("mux");
-	EMIT('"');
-	EMIT_COLON();
-	EMIT_SUB(json_marshal_conf_mux_impl, &obj->mux, depth + 1);
-	EMIT(',');
-	if (obj->mux_connect.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("mux_connect");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->mux_connect.str, obj->mux_connect.len);
-		EMIT(',');
-	}
-	if (obj->mux_listen.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("mux_listen");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->mux_listen.str, obj->mux_listen.len);
-		EMIT(',');
-	}
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("tcp");
-	EMIT('"');
-	EMIT_COLON();
-	EMIT_SUB(json_marshal_conf_tcp_impl, &obj->tcp, depth + 1);
-	EMIT(',');
-	EMIT_INDENT(depth + 1);
-	EMIT('"');
-	EMIT_LIT("tls");
-	EMIT('"');
-	EMIT_COLON();
-	EMIT_SUB(json_marshal_conf_tls_impl, &obj->tls, depth + 1);
-	EMIT(',');
-	if (obj->type.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("type");
-		EMIT('"');
-		EMIT_COLON();
-		EMIT_STR(obj->type.str, obj->type.len);
-		EMIT(',');
-	}
-
-	if (n_ > n_start_) {
-		n_--;
-		EMIT_INDENT(depth);
-	}
-	EMIT('}');
-	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
-	}
-
-	return n_;
+	return json_unmarshal(&json_conf_schema, obj, json, length);
 }
 
 int json_marshal_conf(
-	char *buf, size_t bufsz, const struct json_conf *obj,
-	const char *indent)
+	char *buf, size_t bufsz, const struct json_conf *obj, const char *indent)
 {
-	return json_marshal_conf_impl(buf, bufsz, obj, indent, 0);
+	return json_marshal(&json_conf_schema, buf, bufsz, obj, indent);
 }
-
-
-#undef EMIT
-#undef EMITF
-#undef EMIT_STR
-#undef EMIT_SUB
-#undef EMIT_LIT
-#undef EMIT_RAW
-#undef EMIT_INDENT
-#undef EMIT_COLON
 
 /** @} */

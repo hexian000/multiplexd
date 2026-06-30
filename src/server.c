@@ -2222,3 +2222,75 @@ struct server_stats *server_stats(const struct server *restrict s)
 
 	return out;
 }
+
+/* True if at least one tunnel in the pool is established and thus usable for
+ * forwarding right now. */
+static bool listener_has_live_tunnel(
+	struct tunnel *const *const restrict tunnels, const size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (tunnel_state(tunnels[i]) == MUX_STATE_ESTABLISHED) {
+			return true;
+		}
+	}
+	return false;
+}
+
+size_t server_offline_listeners(
+	const struct server *restrict s,
+	void (*cb)(void *data, const char *identifier), void *data)
+{
+	const struct config *const restrict conf = s->conf;
+	/* On-demand client tunnels (idle_timeout > 0) intentionally disconnect
+	 * when idle, so a missing tunnel is expected rather than an error. */
+	if (conf->mux.idle_timeout != 0) {
+		return 0;
+	}
+	size_t offline = 0;
+
+	/* The top-level local listener forwards over mux_tunnel, falling back to
+	 * any accepted tunnel (mirrors tcp_serve). */
+	if (conf->listen != NULL) {
+		bool live =
+			s->mux_tunnel != NULL &&
+			tunnel_state(s->mux_tunnel) == MUX_STATE_ESTABLISHED;
+		if (!live && s->accepted_tunnels != NULL) {
+			size_t cursor = 0;
+			void *elem;
+			while (table_next(
+				s->accepted_tunnels, &cursor, NULL, &elem)) {
+				if (tunnel_state(elem) ==
+				    MUX_STATE_ESTABLISHED) {
+					live = true;
+					break;
+				}
+			}
+		}
+		if (!live) {
+			offline++;
+			if (cb != NULL) {
+				cb(data, conf->listen);
+			}
+		}
+	}
+
+	/* Each identity listener forwards over its own tunnel pool (mirrors
+	 * identity_tcp_serve). */
+	if (s->identities != NULL) {
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(s->identities, &cursor, NULL, &elem)) {
+			const struct identity_listener *const restrict sl =
+				elem;
+			if (listener_has_live_tunnel(
+				    sl->tunnels, sl->num_tunnels)) {
+				continue;
+			}
+			offline++;
+			if (cb != NULL) {
+				cb(data, sl->peer_identity);
+			}
+		}
+	}
+	return offline;
+}

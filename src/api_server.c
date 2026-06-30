@@ -143,17 +143,19 @@ static void respond_status(struct api_ctx *restrict ctx, const int code)
 		ctx->keepalive ? "keep-alive" : "close");
 }
 
-/* Writes a 200 OK response with headers only; body is expected in cbuf. */
-static void respond_ok(
-	struct api_ctx *restrict ctx, const char *content_type,
+/* Writes a response with the given status code and headers only; the body is
+ * expected in cbuf. */
+static void respond_body(
+	struct api_ctx *restrict ctx, const int code, const char *content_type,
 	const size_t body_len)
 {
 	char date_str[32];
 	const size_t date_len = http_date(date_str, sizeof(date_str));
+	const char *const status = http_status((uint_fast16_t)code);
 	BUF_RESET(ctx->wbuf);
 	BUF_APPENDF(
 		ctx->wbuf,
-		"HTTP/1.1 200 OK\r\n"
+		"HTTP/1.1 %d %s\r\n"
 		"Date: %.*s\r\n"
 		"Connection: %s\r\n"
 		"Content-Type: %s\r\n"
@@ -161,15 +163,45 @@ static void respond_ok(
 		"Cache-Control: no-store\r\n"
 		"Content-Length: %zu\r\n"
 		"\r\n",
-		(int)date_len, date_str,
+		code, status ? status : "", (int)date_len, date_str,
 		ctx->keepalive ? "keep-alive" : "close", content_type,
 		body_len);
 }
 
-/* Handles GET /healthy */
+/* Writes a 200 OK response with headers only; body is expected in cbuf. */
+static void respond_ok(
+	struct api_ctx *restrict ctx, const char *content_type,
+	const size_t body_len)
+{
+	respond_body(ctx, HTTP_OK, content_type, body_len);
+}
+
+/* Appends one line per offline forwarding listener to the response body. */
+static void healthy_offline_cb(void *data, const char *identifier)
+{
+	struct api_ctx *const restrict ctx = data;
+	VBUF_APPENDF(ctx->cbuf, "offline: %s\n", identifier);
+}
+
+/* Handles GET /healthy.  Returns 200 with an empty body when every forwarding
+ * listener has a tunnel to forward over (or none are configured); 503 with the
+ * offline listeners listed otherwise. */
 static void handle_healthy(struct api_ctx *restrict ctx)
 {
-	respond_status(ctx, HTTP_OK);
+	VBUF_RESET(ctx->cbuf);
+	const size_t offline =
+		server_offline_listeners(ctx->s, healthy_offline_cb, ctx);
+	if (offline == 0) {
+		respond_status(ctx, HTTP_OK);
+		return;
+	}
+	if (VBUF_HAS_OOM(ctx->cbuf)) {
+		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
+		return;
+	}
+	respond_body(
+		ctx, HTTP_SERVICE_UNAVAILABLE, "text/plain; charset=utf-8",
+		ctx->cbuf->len);
 }
 
 /* Per-process CPU load since the previous call. */

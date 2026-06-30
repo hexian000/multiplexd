@@ -112,7 +112,7 @@ bool resolve_addr(
 	memcpy(buf, addrstr, addrlen);
 	buf[addrlen] = '\0';
 	char *hoststr, *portstr;
-	if (!addr_splithostport(buf, &hoststr, &portstr)) {
+	if (!splithostport(buf, &hoststr, &portstr)) {
 		return false;
 	}
 	return sa_resolve(addr, hoststr, portstr, type, PF_UNSPEC);
@@ -128,7 +128,7 @@ bool resolve_bindaddr(
 	memcpy(buf, addrstr, addrlen);
 	buf[addrlen] = '\0';
 	char *hoststr, *portstr;
-	if (!addr_splithostport(buf, &hoststr, &portstr)) {
+	if (!splithostport(buf, &hoststr, &portstr)) {
 		return false;
 	}
 	return sa_resolve_bind(addr, hoststr, portstr, type);

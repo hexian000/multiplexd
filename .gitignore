@@ -1,14 +1,13 @@
 /.cache
 /.clangd
 
-/.cursor
-/.idea
-/.vscode
+/.cursor/
+/.idea/
+/.vscode/
 
-/build
-/build-*
-/xbuild
-/cmake-build-*
+/build/
+/xbuild/
+/cmake-build-*/
 /compile_commands.json
 
 *.pem

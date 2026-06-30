@@ -795,6 +795,107 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	apifx_teardown(&fx);
 }
 
+T_DECLARE_CASE(test_healthy_offline)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
+	T_CHECK(fx.srv.identities != NULL);
+
+	/* An identity listener whose only tunnel is not established (peer
+	 * unreachable).  tunnel_state() reads the relaxed-atomic _pub_state
+	 * mirror, so the published state must be reset, not just ss->state. */
+	struct identity_listener *const sl_down = calloc(1, sizeof(*sl_down));
+	T_CHECK(sl_down != NULL);
+	sl_down->peer_identity = "peer-down";
+	struct tunnel *const t_down =
+		make_established_tunnel(&fx, "peer-down", 0);
+	T_CHECK(t_down != NULL);
+	struct mux_session *const ss_down = tunnel_session(t_down);
+	ss_down->state = SESSION_CONNECT;
+	PUB_STORE(ss_down->_pub_state, SESSION_CONNECT);
+	sl_down->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
+	T_CHECK(sl_down->tunnels != NULL);
+	sl_down->tunnels[0] = t_down;
+	sl_down->num_tunnels = 1;
+	{
+		void *slot = sl_down;
+		fx.srv.identities = table_set(
+			fx.srv.identities, sl_down->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
+
+	/* A second identity listener that is established stays healthy and must
+	 * not be reported. */
+	struct identity_listener *const sl_up = calloc(1, sizeof(*sl_up));
+	T_CHECK(sl_up != NULL);
+	sl_up->peer_identity = "peer-up";
+	struct tunnel *const t_up = make_established_tunnel(&fx, "peer-up", 1);
+	T_CHECK(t_up != NULL);
+	sl_up->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
+	T_CHECK(sl_up->tunnels != NULL);
+	sl_up->tunnels[0] = t_up;
+	sl_up->num_tunnels = 1;
+	{
+		void *slot = sl_up;
+		fx.srv.identities = table_set(
+			fx.srv.identities, sl_up->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_GET);
+	T_EXPECT_EQ(parse_status(rctx.buf), 503);
+	T_EXPECT(resp_contains(rctx.buf, "offline: peer-down"));
+	T_EXPECT(!resp_contains(rctx.buf, "offline: peer-up"));
+
+	apifx_teardown(&fx);
+}
+
+T_DECLARE_CASE(test_healthy_all_online)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
+	T_CHECK(fx.srv.identities != NULL);
+	struct identity_listener *const sl = calloc(1, sizeof(*sl));
+	T_CHECK(sl != NULL);
+	sl->peer_identity = "peer-up";
+	struct tunnel *const t = make_established_tunnel(&fx, "peer-up", 1);
+	T_CHECK(t != NULL);
+	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
+	T_CHECK(sl->tunnels != NULL);
+	sl->tunnels[0] = t;
+	sl->num_tunnels = 1;
+	{
+		void *slot = sl;
+		fx.srv.identities =
+			table_set(fx.srv.identities, sl->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_GET);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(rctx.buf, "Content-Length: 0"));
+
+	apifx_teardown(&fx);
+}
+
 T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 {
 	struct apifx fx;
@@ -1062,6 +1163,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_keepalive),
 	T_CASE(test_connection_close),
 	T_CASE(test_stats_get_includes_identity_rows),
+	T_CASE(test_healthy_offline),
+	T_CASE(test_healthy_all_online),
 	T_CASE(test_stats_identity_shows_window_when_rtt_known),
 	T_CASE(test_metrics_reports_identity_window_bytes),
 	T_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity),

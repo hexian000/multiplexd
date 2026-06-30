@@ -196,10 +196,42 @@ fail_:
 /** @name Marshal
  *  @{ */
 
-#define EMIT(c) do { \
-	if (buf != NULL && (size_t)n_ < bufsz) { buf[n_] = (char)(c); } \
-	n_++; \
-} while (0)
+static int json_emit_ch_(char *buf, size_t bufsz, int n_, char c)
+{
+	if (buf != NULL && (size_t)n_ < bufsz) { buf[n_] = c; }
+	return n_ + 1;
+}
+static int json_emit_raw_(
+	char *buf, size_t bufsz, int n_, const char *s, size_t len)
+{
+	if (buf != NULL && (size_t)n_ < bufsz) {
+		const size_t cap_ = bufsz - (size_t)n_;
+		memcpy(buf + n_, s, len < cap_ ? len : cap_);
+	}
+	return n_ + (int)len;
+}
+static int json_emit_str_(
+	char *buf, size_t bufsz, int n_, const char *s, size_t len)
+{
+	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL;
+	const int r_ =
+		json_marshal_string(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, s, len);
+	if (r_ < 0) { return -1; }
+	return n_ + r_;
+}
+static int json_emit_indent_(
+	char *buf, size_t bufsz, int n_, const char *indent,
+	size_t ind_len_, int d)
+{
+	if (indent == NULL) { return n_; }
+	n_ = json_emit_ch_(buf, bufsz, n_, '\n');
+	for (int id_ = 0; id_ < d; id_++) {
+		n_ = json_emit_raw_(buf, bufsz, n_, indent, ind_len_);
+	}
+	return n_;
+}
+
+#define EMIT(c) do { n_ = json_emit_ch_(buf, bufsz, n_, (char)(c)); } while (0)
 #define EMITF(fmt, ...) do { \
 	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
 	r_ = snprintf(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, fmt, __VA_ARGS__); \
@@ -207,10 +239,8 @@ fail_:
 	n_ += r_; \
 } while (0)
 #define EMIT_STR(s, len) do { \
-	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
-	r_ = json_marshal_string(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (s), (len)); \
-	if (r_ < 0) { return -1; } \
-	n_ += r_; \
+	n_ = json_emit_str_(buf, bufsz, n_, (s), (len)); \
+	if (n_ < 0) { return -1; } \
 } while (0)
 #define EMIT_SUB(fn, arg, d) do { \
 	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
@@ -220,26 +250,13 @@ fail_:
 } while (0)
 #define EMIT_LIT(s) do { \
 	static const char lit_[] = s; \
-	const size_t l_ = sizeof(lit_) - 1; \
-	if (buf != NULL && (size_t)n_ < bufsz) { \
-		const size_t cap_ = bufsz - (size_t)n_; \
-		memcpy(buf + n_, lit_, l_ < cap_ ? l_ : cap_); \
-	} \
-	n_ += (int)l_; \
+	n_ = json_emit_raw_(buf, bufsz, n_, lit_, sizeof(lit_) - 1); \
 } while (0)
 #define EMIT_RAW(s, len) do { \
-	const size_t rl_ = (len); \
-	if (buf != NULL && (size_t)n_ < bufsz) { \
-		const size_t cap_ = bufsz - (size_t)n_; \
-		memcpy(buf + n_, (s), rl_ < cap_ ? rl_ : cap_); \
-	} \
-	n_ += (int)rl_; \
+	n_ = json_emit_raw_(buf, bufsz, n_, (s), (len)); \
 } while (0)
 #define EMIT_INDENT(d) do { \
-	if (indent != NULL) { \
-		EMIT('\n'); \
-		for (int id_ = 0; id_ < (d); id_++) { EMIT_RAW(indent, ind_len_); } \
-	} \
+	n_ = json_emit_indent_(buf, bufsz, n_, indent, ind_len_, (d)); \
 } while (0)
 #define EMIT_COLON() do { \
 	EMIT(':'); \

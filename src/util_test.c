@@ -64,7 +64,7 @@ T_DECLARE_CASE(test_resolve_addr_ipv6_parses_correctly)
 T_DECLARE_CASE(test_resolve_addr_invalid_returns_false)
 {
 	union sockaddr_max addr;
-	/* No colon: addr_splithostport returns false, so resolve_addr returns false. */
+	/* No colon: splithostport returns false, so resolve_addr returns false. */
 	T_EXPECT(!resolve_addr(&addr, "127.0.0.1", SA_RESOLVE_TCP));
 }
 

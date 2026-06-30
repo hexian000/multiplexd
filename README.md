@@ -311,7 +311,9 @@ multiplexd exposes a minimal HTTP API for health checks and runtime statistics. 
 
 #### `GET /healthy`
 
-Returns `200 OK` with an empty body when the process is running. Suitable for load-balancer or container health probes.
+Returns `200 OK` with an empty body when every forwarding listener has a tunnel to forward over (or when none are configured). Returns `503 Service Unavailable` with a `text/plain` body listing the offline listeners (one `offline: <identity-or-listen-address>` line each) when any forwarding listener has no established tunnel — for example, a client tunnel whose peer is unreachable. Suitable for load-balancer or container health probes.
+
+On-demand client tunnels (`idle_timeout > 0`) disconnect when idle by design, so they are never reported offline. Because a persistent tunnel is briefly down during initial connect and reconnect, configure probes with a `failureThreshold` to ride out transient blips.
 
 ```bash
 curl http://127.0.0.1:9090/healthy

@@ -320,4 +320,16 @@ void server_free(struct server *s);
  * NULL on OOM (logged). */
 struct server_stats *server_stats(const struct server *restrict s);
 
+/* Report forwarding listeners that currently have no established tunnel to
+ * forward over (e.g. the peer is unreachable).  For each such listener @p cb is
+ * invoked with its identifier: the peer identity for identity listeners, or the
+ * configured local listen address for the top-level listener.  Returns the
+ * number of offline listeners (0 means healthy); @p cb may be NULL to only
+ * count.  On-demand mode (mux.idle_timeout > 0) always reports healthy, since
+ * tunnels disconnect when idle by design.  Must run on the server loop; per
+ * tunnel liveness is read from the relaxed-atomic mirror via tunnel_state(). */
+size_t server_offline_listeners(
+	const struct server *restrict s,
+	void (*cb)(void *data, const char *identifier), void *data);
+
 #endif /* SERVER_H */
