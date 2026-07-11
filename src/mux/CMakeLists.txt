@@ -34,16 +34,13 @@ else()
     target_compile_definitions(mux PRIVATE _GNU_SOURCE)
 endif()
 
-target_link_libraries(mux PUBLIC csnippets ${LIBEV_LIBRARY})
+target_link_libraries(mux PUBLIC csnippets shim ${LIBEV_LIBRARY})
 if(LIBM)
     target_link_libraries(mux PUBLIC m)
 endif()
 
 function(add_mux_test target_name)
-    add_executable(${target_name}
-        ${TLS_SOURCES}
-        ${ARGN}
-    )
+    add_executable(${target_name} ${ARGN})
 
     target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_include_directories(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/contrib/csnippets)
@@ -60,16 +57,11 @@ function(add_mux_test target_name)
     target_include_directories(${target_name} SYSTEM PRIVATE ${LIBEV_INCLUDE_DIR})
     target_link_libraries(${target_name} PRIVATE ${LIBEV_LIBRARY})
 
-    if(WITH_TLS)
-        target_include_directories(${target_name} SYSTEM PRIVATE ${TLS_INCLUDES})
-        target_link_libraries(${target_name} PRIVATE ${TLS_LIBS})
-    endif()
-
     if(LIBM)
         target_link_libraries(${target_name} PRIVATE m)
     endif()
 
-    target_link_libraries(${target_name} PRIVATE csnippets)
+    target_link_libraries(${target_name} PRIVATE csnippets shim)
     if(Threads_FOUND)
         target_link_libraries(${target_name} PRIVATE Threads::Threads)
     endif()

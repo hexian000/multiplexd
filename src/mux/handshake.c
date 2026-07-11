@@ -17,10 +17,10 @@
 #include "mux/wire.h"
 
 #include "algo/hashtable.h"
+#include "binary/serialize.h"
 #include "codec/base64.h"
 #include "net/mime.h"
 #include "utils/debug.h"
-#include "utils/serialize.h"
 #include "utils/slog.h"
 
 #include <errno.h>
@@ -92,13 +92,23 @@ static bool proto_hello_build(
 	return true;
 }
 
-static bool proto_parse_type(const char *type, int *const version_out)
+static bool proto_parse_type(
+	const char *type, const size_t type_len, int *const version_out)
 {
-	const size_t len = strlen(type);
-	if (len > MUX_MAX_PAYLOAD_SIZE) {
+	if (type_len > MUX_MAX_PAYLOAD_SIZE) {
 		LOGE("protocol type too large");
 		return false;
 	}
+	/* Use the JSON-decoded length, not strlen: a JSON u0000 escape decodes to a
+	 * literal embedded NUL, and validating only the strlen-truncated prefix
+	 * would silently accept the peer-supplied bytes after it (a parser
+	 * differential) instead of rejecting. Mirror the identity field, which
+	 * already validates against obj.extensions.identity.len. */
+	if (strlen(type) != type_len) {
+		LOGE("protocol type contains an embedded NUL");
+		return false;
+	}
+	const size_t len = type_len;
 	/* mime_parse tokenizes the buffer in place; copy onto the heap rather
 	 * than a peer-sized stack VLA (the ASSERT bound compiles out under
 	 * NDEBUG, leaving the stack at the mercy of the peer's type length). */
@@ -193,7 +203,7 @@ static bool proto_hello_parse(
 		LOGE("protocol hello: missing type");
 		goto done;
 	}
-	if (!proto_parse_type(obj.type.str, &out->version)) {
+	if (!proto_parse_type(obj.type.str, obj.type.len, &out->version)) {
 		goto done;
 	}
 	out->msgid = (int)obj.msgid;
@@ -207,7 +217,10 @@ static bool proto_hello_parse(
 	out->has_session_id = obj.session_id.str != NULL;
 
 	out->resume_seq = (uint_least32_t)obj.resume_seq;
-	out->has_resume_seq = (obj.resume_seq != 0);
+	/* has_resume_seq is only consulted on the outbound-build struct (to decide
+	 * whether to emit resume_seq); the resume discriminant on the inbound path
+	 * is has_session_id (resume_seq=0 is a valid value), so the parsed copy is
+	 * left at its zero-initialized false rather than populated write-only. */
 
 	out->has_identity = false;
 	if (obj.extensions.identity.str != NULL) {
@@ -251,6 +264,13 @@ bool handshake_enqueue_hello(
 			hello_msg.has_identity = true;
 			memcpy(hello_msg.identity, ss->handshake.identity,
 			       id_len + 1);
+		} else {
+			MUX_LOG_F(
+				WARNING, ss,
+				"identity.claim is %zu octets, exceeds the"
+				" %zu-octet hello limit; omitting identity"
+				" extension",
+				id_len, sizeof(hello_msg.identity) - 1);
 		}
 	}
 	if (ss->handshake.has_session_id) {
@@ -286,7 +306,9 @@ bool handshake_enqueue_hello(
 	mux_frame_list_push(&ss->wire.sendbuf, frame);
 	ss->wire.tx_pending = true;
 	if (include_resume_seq) {
-		ss->unacked.ack_seq = ss->unacked.recv_seq;
+		/* resume_seq conveys the full processed count, so nothing is
+		 * left to report in a session ACK. */
+		ss->unacked.unreported = 0;
 	}
 	return true;
 }
@@ -345,10 +367,18 @@ static bool handshake_client_fresh(
 	ss->unacked.retransmit_copy = NULL;
 	ss->unacked.send_seq = 0;
 	ss->unacked.recv_seq = 0;
-	ss->unacked.ack_seq = 0;
+	ss->unacked.unreported = 0;
 	ss->unacked.last_ack_recv = 0;
 	ss->unacked.ack_ticks = 0;
 	memset(&ss->peer_addr, 0, sizeof(ss->peer_addr));
+	if (!peer_hello->has_identity) {
+		/* The caller already applied a fresh peer_identity above when
+		 * has_identity is true; otherwise don't let the previous
+		 * (now-defunct) session's identity carry over into what's now
+		 * a new logical session. */
+		free(ss->handshake.peer_identity);
+		ss->handshake.peer_identity = NULL;
+	}
 	/* Adopt the server-assigned session id. */
 	if (peer_hello->has_session_id) {
 		memcpy(ss->handshake.session_id, peer_hello->session_id,
@@ -392,6 +422,11 @@ bool handshake_process_hello(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
+	/* Both guaranteed by the sole call site (dispatch_frame in recv.c):
+	 * it only reaches here for hdr->version == 0, and frame_size is always
+	 * MUX_FRAME_HEADER_SIZE + hdr->length for the same hdr. */
+	ASSERT(hdr->version == 0);
+	ASSERT(frame_size == MUX_FRAME_HEADER_SIZE + hdr->length);
 	if (ss->state != SESSION_HANDSHAKE) {
 		MUX_LOG(ERROR, ss, "unexpected hello frame outside handshake");
 		session_reset(ss);

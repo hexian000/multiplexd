@@ -14,11 +14,11 @@
  */
 
 /**
- * @brief Escape a CSV field in-place.
- * 
+ * @brief Escape a CSV field into a separate buffer.
+ *
  * The function always null-terminates the output buffer (if maxlen > 0),
  * similar to snprintf behavior.
- * 
+ *
  * @param[out] buf Output buffer to write the escaped field
  * @param maxlen Size of the output buffer (including space for null terminator)
  * @param field Input field to escape (null-terminated string)
@@ -33,7 +33,7 @@ int csv_escape(char *restrict buf, size_t maxlen, const char *restrict field);
  * @return true if the field is valid and successfully unescaped, false otherwise
  * @note On failure, the content may be partially modified.
  */
-bool csv_unescape(char *field);
+bool csv_unescape(char *restrict field);
 
 /**
  * @brief Scan and parse the next CSV field from the buffer.
@@ -41,12 +41,20 @@ bool csv_unescape(char *field);
  *          by null-terminating the field and unescaping it. No memory allocations are performed.
  *          The function handles both quoted and unquoted fields according to RFC 4180.
  * @param[inout] buf Pointer to the CSV data buffer. The buffer is modified in-place.
- * @param[out] field Pointer to store the parsed field string, or NULL if end of data is reached.
+ * @param[out] field Pointer to store the parsed field string, or NULL if end of
+ *             data is reached or more data is needed.
+ * @param[out] sep The delimiter that terminated the field, so the caller can tell
+ *             a field separator from a record separator: ',' for a field
+ *             separator, '\n' for a record separator (a lone LF or a CRLF, which
+ *             is consumed as a single unit), '\r' for a lone-CR record separator,
+ *             or '\0' when the field ran to the end of the buffer (the last
+ *             field) or no field was produced.
  * @return Pointer to the start of the next field for continued parsing, or NULL if parsing failed
  *         due to invalid data. If the return value equals the input buf, more data is needed
  *         for a complete quoted field.
  */
-char *csv_scanfield(char *buf, char **field);
+char *
+csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep);
 
 /** @} */
 

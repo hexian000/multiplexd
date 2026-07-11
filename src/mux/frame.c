@@ -11,6 +11,7 @@
 #include "mux/mux.h"
 
 #include "algo/hashtable.h"
+#include "utils/debug.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -42,11 +43,30 @@ const struct table_opts mux_stream_table_opts = {
 	.flags = TABLE_FAST,
 };
 
+const char *mux_status_str(const uint_fast16_t status)
+{
+	switch ((enum mux_status)status) {
+	case MUX_STATUS_NO_ERROR:
+		return "NO_ERROR";
+	case MUX_STATUS_PROTOCOL_ERROR:
+		return "PROTOCOL_ERROR";
+	case MUX_STATUS_FLOW_CONTROL_ERROR:
+		return "FLOW_CONTROL_ERROR";
+	case MUX_STATUS_INTERNAL_ERROR:
+		return "INTERNAL_ERROR";
+	case MUX_STATUS_REFUSED_STREAM:
+		return "REFUSED_STREAM";
+	case MUX_STATUS_CANCEL:
+		return "CANCEL";
+	}
+	return "UNKNOWN";
+}
+
 /* Defined here, with the leaf frame allocator, so it resolves in any TU that
  * links frame.c without the full session state machine. */
 const struct mux_config mux_conf_default = {
 	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
-	.tls_readahead = 128 * 1024,
+	.readahead = 128 * 1024,
 };
 
 bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
@@ -76,6 +96,9 @@ bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 		}
 	}
 
+	if (new_cap > SIZE_MAX - sizeof(struct ringbuf)) {
+		return false;
+	}
 	struct ringbuf *const new_rb =
 		realloc(rb, sizeof(struct ringbuf) + new_cap);
 	if (new_rb == NULL) {
@@ -110,6 +133,7 @@ void ringbuf_shrink(struct ringbuf **restrict rbp, const size_t target_cap)
 
 struct mux_frame_ring *mux_frame_ring_new(const size_t cap)
 {
+	ASSERT(cap == 0 || (cap & (cap - 1)) == 0);
 	struct mux_frame_ring *const r =
 		malloc(sizeof(*r) + cap * sizeof(struct mux_frame *));
 	if (r == NULL) {
@@ -126,6 +150,8 @@ struct mux_frame_ring *mux_frame_ring_new(const size_t cap)
 
 struct mux_frame_ring *mux_frame_ring_grow(struct mux_frame_ring *r)
 {
+	ASSERT(r == NULL || r->capacity == 0 ||
+	       (r->capacity & (r->capacity - 1)) == 0);
 	const size_t old_cap = r != NULL ? r->capacity : 0;
 	const size_t old_count = r != NULL ? r->count : 0;
 	const size_t new_cap =
@@ -141,6 +167,11 @@ struct mux_frame_ring *mux_frame_ring_grow(struct mux_frame_ring *r)
 	nr->count = old_count;
 	for (size_t i = 0; i < old_count; i++) {
 		nr->entries[i] = r->entries[(r->head + i) & (old_cap - 1)];
+	}
+	/* Slots beyond the linearised entries are raw malloc memory; clear them
+	 * so unused slots read as NULL like a freshly allocated ring. */
+	for (size_t i = old_count; i < new_cap; i++) {
+		nr->entries[i] = NULL;
 	}
 	free(r);
 	return nr;

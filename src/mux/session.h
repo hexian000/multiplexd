@@ -84,7 +84,7 @@ static inline int socket_user_timeout(const int fd, const int ms)
 		return -1;
 	}
 	return 0;
-#else
+#else /* WITH_TCP_USER_TIMEOUT */
 	(void)fd;
 	(void)ms;
 	return -1;
@@ -116,8 +116,8 @@ enum session_state {
 /* struct sched_ctx is defined in sched.h and struct handshake_ctx in
  * handshake.h; both are embedded by value in mux_session below. */
 
-/* COUNTER_ADD/SUB/LOAD/STORE operate on mux_session_counters pointer fields;
- * all are NULL-safe (skipped, returning 0, when the pointer is NULL). */
+/* COUNTER_ADD/SUB/LOAD operate on mux_session_counters pointer fields; all are
+ * NULL-safe (skipped, returning 0, when the pointer is NULL). */
 #if WITH_THREADS
 #define COUNTER_ADD(p, v)                                                      \
 	((p) ? atomic_fetch_add_explicit((p), (v), memory_order_relaxed) : 0)
@@ -125,13 +125,10 @@ enum session_state {
 	((p) ? atomic_fetch_sub_explicit((p), (v), memory_order_relaxed) : 0)
 #define COUNTER_LOAD(p)                                                        \
 	((p) ? atomic_load_explicit((p), memory_order_relaxed) : 0)
-#define COUNTER_STORE(p, v)                                                    \
-	((p) ? atomic_store_explicit((p), (v), memory_order_relaxed) : (void)0)
-#else
+#else /* WITH_THREADS */
 #define COUNTER_ADD(p, v) ((p) ? (*(p) += (uint_least64_t)(v)) : 0)
 #define COUNTER_SUB(p, v) ((p) ? (*(p) -= (uint_least64_t)(v)) : 0)
 #define COUNTER_LOAD(p) ((p) ? *(p) : 0)
-#define COUNTER_STORE(p, v) ((p) ? (void)(*(p) = (v)) : (void)0)
 #endif /* WITH_THREADS */
 
 /* PUB_STORE/PUB_LOAD publish session-thread-owned scalars to relaxed-atomic
@@ -158,7 +155,7 @@ struct mux_session {
 	uint_least32_t max_payload;
 	/* Receive read-ahead window in bytes, frozen from conf at creation; 0
 	 * disables read-ahead (recv falls back to a one-frame window). */
-	size_t tls_readahead;
+	size_t readahead;
 	/* Non-owning pointer to the session log tag buffer; set at creation time. */
 	const char *tag;
 	/* Pointer block into server_stats; NULL pointers are silently skipped. */
@@ -182,6 +179,9 @@ struct mux_session {
 
 	/* Event watchers */
 	struct {
+		/* fd is closed exactly once (guarded by != -1, reset to -1
+		 * after) by session_suspend/session_cleanup; never close it
+		 * directly elsewhere (e.g. tunnel.c's task_drop_transport). */
 		ev_io w_socket;
 		ev_timer w_timeout;
 		ev_timer w_keepalive;
@@ -218,14 +218,14 @@ struct mux_session {
 	atomic_int_least64_t _pub_rtt;
 	atomic_size_t _pub_bdp_rx;
 	atomic_size_t _pub_bdp_tx;
-#else
+#else /* WITH_THREADS */
 	enum session_state _pub_state;
 	size_t _pub_stream_window;
 	size_t _pub_peer_stream_window;
 	int_least64_t _pub_rtt;
 	size_t _pub_bdp_rx;
 	size_t _pub_bdp_tx;
-#endif
+#endif /* WITH_THREADS */
 
 	/* Transport I/O state (socket buffers, TLS connection, flow-control flags). */
 	struct wire_ctx wire;
@@ -324,9 +324,10 @@ void session_attach_fd(struct mux_session *restrict ss, int fd);
 void session_initiate_shutdown(struct mux_session *restrict ss);
 
 /* Drain: reject new inbound streams and begin graceful shutdown when the last
- * stream closes (or immediately if already idle); auto-clears on reconnect
- * via session_attach_fd(). */
-void session_drain(struct mux_session *ss);
+ * stream closes (or immediately if already idle); cleared by session_attach_fd()
+ * on a genuinely fresh (re)connect, but preserved across a resume from
+ * SUSPENDED so a transport blip can't silently cancel a pending drain. */
+void session_drain(struct mux_session *restrict ss);
 
 /* Open a new locally-initiated stream; returns NULL when the session rejects it. */
 struct mux_stream *session_open_stream(struct mux_session *restrict ss);
@@ -366,7 +367,7 @@ void session_reset(struct mux_session *ss);
 void session_notify_closed(struct mux_session *restrict ss, bool expired);
 
 /* Suspend the transport on error, preserving stream and unacked state for resume. */
-void session_suspend(struct mux_session *ss);
+void session_suspend(struct mux_session *restrict ss);
 
 /* Complete session establishment after a successful hello exchange. */
 void session_handshake_done(struct mux_session *ss);

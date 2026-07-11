@@ -12,10 +12,10 @@
 #include "mux/mux.h"
 
 #include "codec/json.h"
+#include "meta/minmax.h"
 #include "net/mime.h"
+#include "utils/ascii.h"
 #include "utils/buffer.h"
-#include "utils/debug.h"
-#include "utils/minmax.h"
 #include "utils/slog.h"
 
 #include <inttypes.h>
@@ -31,6 +31,32 @@
 #define CONF_VERSION "1"
 #define CONF_TYPE CONF_MIME_TYPE "; version=" CONF_VERSION
 
+/* strndup(), but rejects an embedded NUL instead of silently truncating
+ * there. The JSON escape for U+0000 is legal and decoded by
+ * scan_string_inplace into a literal NUL with a correctly-updated .len,
+ * but every downstream consumer of a config string (getaddrinfo, fopen,
+ * the strcmp/strlen-based identity dedup logic in this file, etc.) treats
+ * it as a plain C string -- so a survived embedded NUL would silently
+ * truncate here, letting a schema max/minLength check pass against the
+ * pre-truncation .len while the stored value is shorter (or, for two
+ * strings differing only after the NUL, identical) than what was
+ * actually validated. Logs and returns NULL for either failure (embedded
+ * NUL or OOM); callers already treat any NULL as fatal and don't need to
+ * distinguish the two. */
+static char *conf_strndup(
+	const char *restrict field, const char *restrict s, const size_t len)
+{
+	if (memchr(s, '\0', len) != NULL) {
+		LOGE_F("%s: contains an embedded NUL character", field);
+		return NULL;
+	}
+	char *const dst = strndup(s, len);
+	if (dst == NULL) {
+		LOGOOM();
+	}
+	return dst;
+}
+
 static bool
 conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 {
@@ -40,6 +66,14 @@ conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 	const char *nptr = s;
 	char *endptr = NULL;
 
+	/* strtoumax() alone would also accept a leading sign or whitespace;
+	 * the schema documents this field as the strictly digit-only
+	 * "^[0-9]+:[0-9]+:[0-9]+$", so reject anything else before each
+	 * conversion instead of relying on strtoumax()'s laxer parsing. */
+	if (!isdigit((unsigned char)*nptr)) {
+		LOGE_F("invalid max_startups format: \"%s\"", s);
+		return false;
+	}
 	const uintmax_t start = strtoumax(nptr, &endptr, 10);
 	if (endptr == nptr || *endptr != ':' || start > INT_MAX) {
 		LOGE_F("invalid max_startups format: \"%s\"", s);
@@ -47,6 +81,10 @@ conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 	}
 	nptr = endptr + 1;
 
+	if (!isdigit((unsigned char)*nptr)) {
+		LOGE_F("invalid max_startups format: \"%s\"", s);
+		return false;
+	}
 	const uintmax_t rate = strtoumax(nptr, &endptr, 10);
 	if (endptr == nptr || *endptr != ':' || rate > INT_MAX) {
 		LOGE_F("invalid max_startups format: \"%s\"", s);
@@ -54,6 +92,10 @@ conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 	}
 	nptr = endptr + 1;
 
+	if (!isdigit((unsigned char)*nptr)) {
+		LOGE_F("invalid max_startups format: \"%s\"", s);
+		return false;
+	}
 	const uintmax_t full = strtoumax(nptr, &endptr, 10);
 	if (endptr == nptr || *endptr != '\0' || full > INT_MAX) {
 		LOGE_F("invalid max_startups format: \"%s\"", s);
@@ -69,6 +111,17 @@ conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 static struct identity_peer *identity_listen_add(
 	struct config *restrict conf, const char *restrict id, size_t id_len)
 {
+	/* Last-value-wins on a duplicate id, matching every other field's
+	 * semantics: reuse an existing entry instead of appending a second
+	 * one with the same id. */
+	for (size_t i = 0; i < conf->identity.peers_count; i++) {
+		struct identity_peer *const restrict p =
+			&conf->identity.peers[i];
+		if (strlen(p->id) == id_len && memcmp(p->id, id, id_len) == 0) {
+			return p;
+		}
+	}
+
 	const size_t n = conf->identity.peers_count;
 	if (n >= SIZE_MAX / sizeof(*conf->identity.peers)) {
 		LOGOOM();
@@ -82,11 +135,10 @@ static struct identity_peer *identity_listen_add(
 	}
 	conf->identity.peers = entries;
 	entries[n] = (struct identity_peer){
-		.id = strndup(id, id_len),
+		.id = conf_strndup("identity.listen key", id, id_len),
 		.listen = NULL,
 	};
 	if (entries[n].id == NULL) {
-		LOGOOM();
 		return NULL;
 	}
 	conf->identity.peers_count = n + 1;
@@ -97,6 +149,16 @@ static bool identity_listen_cb(
 	struct config *restrict conf, const char *restrict key, size_t key_len,
 	char *restrict val, size_t val_len)
 {
+	if (key_len > 0 && key[0] == '-') {
+		/* Comment-only key: json_unmarshal already ignores any
+		 * unrecognized key generically (schema is non-strict), so
+		 * this "-" prefix is purely a human authoring convention for
+		 * marking a deliberately-disabled entry, not a rule the
+		 * dispatcher itself enforces -- but identity.listen has no
+		 * fixed key set for the generic dispatcher to apply that
+		 * tolerance to, so this map has to skip it explicitly. */
+		return true;
+	}
 	char *s;
 	size_t slen;
 	if (!json_parse_string(val, val_len, &s, &slen)) {
@@ -109,81 +171,38 @@ static bool identity_listen_cb(
 		return false;
 	}
 	free(p->listen);
-	p->listen = strndup(s, slen);
+	p->listen = conf_strndup("identity.listen value", s, slen);
 	if (p->listen == NULL) {
-		LOGOOM();
 		return false;
 	}
 	return true;
 }
 
-/* Load schema struct into config struct (strings strdup'd).  False on error. */
-static bool
-conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
-{
-	/* Root string fields: strndup zero-copy pointers using known lengths. */
-#define STRNDUP_FIELD(dst, jstr)                                               \
+/* Dup a json_string field into a config field, using the pointer/length
+ * the schema already parsed (no re-scanning); fails only when the source
+ * was present but conf_strndup itself failed (embedded NUL or OOM) -- an
+ * absent source yields NULL without failing. */
+#define STRNDUP_FIELD(name, dst, jstr)                                         \
 	do {                                                                   \
-		(dst) = (jstr).str != NULL ? strndup((jstr).str, (jstr).len) : \
-					     NULL;                             \
+		(dst) = (jstr).str != NULL ?                                   \
+				conf_strndup((name), (jstr).str, (jstr).len) : \
+				NULL;                                          \
 		if ((jstr).str != NULL && (dst) == NULL) {                     \
-			LOGOOM();                                              \
 			return false;                                          \
 		}                                                              \
 	} while (0)
-	STRNDUP_FIELD(cfg->type, obj->type);
-	STRNDUP_FIELD(cfg->api_listen, obj->api_listen);
-	STRNDUP_FIELD(cfg->mux_listen, obj->mux_listen);
-	STRNDUP_FIELD(cfg->mux_connect, obj->mux_connect);
-	STRNDUP_FIELD(cfg->listen, obj->listen);
-	STRNDUP_FIELD(cfg->connect, obj->connect);
-	STRNDUP_FIELD(cfg->log, obj->log);
-#undef STRNDUP_FIELD
-
-	cfg->loglevel = (int)obj->loglevel;
-	cfg->max_sessions = (int)obj->max_sessions;
-	if (!conf_parse_max_startups(cfg, obj->max_startups.str)) {
-		return false;
-	}
 
 #if WITH_TLS
-	cfg->tls_cert = obj->tls.cert.str != NULL ?
-				strndup(obj->tls.cert.str, obj->tls.cert.len) :
-				NULL;
-	if (obj->tls.cert.str != NULL && cfg->tls_cert == NULL) {
-		LOGOOM();
-		return false;
-	}
-	cfg->tls_key = obj->tls.key.str != NULL ?
-			       strndup(obj->tls.key.str, obj->tls.key.len) :
-			       NULL;
-	if (obj->tls.key.str != NULL && cfg->tls_key == NULL) {
-		LOGOOM();
-		return false;
-	}
-	cfg->tls_ciphersuites = obj->tls.ciphersuites.str != NULL ?
-					strndup(obj->tls.ciphersuites.str,
-						obj->tls.ciphersuites.len) :
-					NULL;
-	if (obj->tls.ciphersuites.str != NULL &&
-	    cfg->tls_ciphersuites == NULL) {
-		LOGOOM();
-		return false;
-	}
-	cfg->tls_sni = obj->tls.sni.str != NULL ?
-			       strndup(obj->tls.sni.str, obj->tls.sni.len) :
-			       NULL;
-	if (obj->tls.sni.str != NULL && cfg->tls_sni == NULL) {
-		LOGOOM();
-		return false;
-	}
-	cfg->tls_alpn = obj->tls.alpn.str != NULL ?
-				strndup(obj->tls.alpn.str, obj->tls.alpn.len) :
-				NULL;
-	if (obj->tls.alpn.str != NULL && cfg->tls_alpn == NULL) {
-		LOGOOM();
-		return false;
-	}
+static bool
+conf_load_tls(struct config *restrict cfg, const struct json_conf *restrict obj)
+{
+	STRNDUP_FIELD("tls.cert", cfg->tls_cert, obj->tls.cert);
+	STRNDUP_FIELD("tls.key", cfg->tls_key, obj->tls.key);
+	STRNDUP_FIELD(
+		"tls.ciphersuites", cfg->tls_ciphersuites,
+		obj->tls.ciphersuites);
+	STRNDUP_FIELD("tls.sni", cfg->tls_sni, obj->tls.sni);
+	STRNDUP_FIELD("tls.alpn", cfg->tls_alpn, obj->tls.alpn);
 	if (obj->tls.authcerts_count > 0) {
 		cfg->tls_authcerts = (char **)malloc(
 			obj->tls.authcerts_count * sizeof(*cfg->tls_authcerts));
@@ -193,26 +212,26 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		}
 		cfg->tls_authcerts_count = obj->tls.authcerts_count;
 		for (size_t i = 0; i < obj->tls.authcerts_count; i++) {
-			cfg->tls_authcerts[i] =
-				strndup(obj->tls.authcerts[i].str,
-					obj->tls.authcerts[i].len);
+			cfg->tls_authcerts[i] = conf_strndup(
+				"tls.authcerts[]", obj->tls.authcerts[i].str,
+				obj->tls.authcerts[i].len);
 			if (cfg->tls_authcerts[i] == NULL) {
-				LOGOOM();
 				cfg->tls_authcerts_count = i;
 				return false;
 			}
 		}
 	}
-	cfg->tls_kernel_offload = obj->tls.kernel_offload;
 	cfg->tls_socket_offload = obj->tls.socket_offload;
-	/* KTLS requires the library to own the socket fd */
-	if (cfg->tls_kernel_offload && !cfg->tls_socket_offload) {
-		LOGW("tls: 'kernel_offload' requires 'socket_offload'; "
-		     "KTLS offload disabled");
-		cfg->tls_kernel_offload = false;
-	}
+	/* KTLS requires the library to own the socket fd. */
+	cfg->tls_kernel_offload =
+		cfg->tls_socket_offload && obj->tls.kernel_offload;
+	return true;
+}
 #endif /* WITH_TLS */
 
+static bool
+conf_load_mux(struct config *restrict cfg, const struct json_conf *restrict obj)
+{
 	cfg->mux.nodelay = obj->mux.nodelay;
 	cfg->mux_tcp.tcp_reuseport = obj->mux.tcp.reuseport;
 	cfg->mux_tcp.tcp_keepalive = obj->mux.tcp.keepalive;
@@ -233,7 +252,10 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 #endif
 	cfg->mux_tcp.backlog = (int)obj->mux.tcp.backlog;
 	cfg->mux.max_halfopen = (int)obj->mux.max_halfopen;
-	cfg->mux.max_streams = (int)obj->mux.max_streams;
+	/* Clamp to INT_MAX: a value past it would wrap negative and silently
+	 * disable the "max_streams > 0" admission check. */
+	cfg->mux.max_streams =
+		(int)MIN(obj->mux.max_streams, (uintmax_t)INT_MAX);
 	cfg->mux.connect_timeout = (int)obj->mux.connect_timeout;
 	cfg->mux.keepalive = (int)obj->mux.keepalive;
 	cfg->mux.send_timeout = (int)obj->mux.send_timeout;
@@ -262,28 +284,26 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		}
 	}
 	{
-		/* knob is total wire frame size; mux wants payload bytes */
-		const uintmax_t max_frame_size = obj->mux.max_frame_size;
-		if (max_frame_size == 0) {
-			cfg->mux.max_frame_payload =
-				mux_conf_default.max_frame_payload;
-		} else {
-			const uintmax_t max_frame_payload =
-				max_frame_size > MUX_FRAME_HEADER_SIZE ?
-					max_frame_size - MUX_FRAME_HEADER_SIZE :
-					0;
-			cfg->mux.max_frame_payload = (int)CLAMP(
-				max_frame_payload, MUX_MIN_FRAME_PAYLOAD,
-				MUX_MAX_PAYLOAD_SIZE);
-		}
+		const uintmax_t max_frame_payload =
+			obj->mux.max_frame_size - MUX_FRAME_HEADER_SIZE;
+		cfg->mux.max_frame_payload = (int)CLAMP(
+			max_frame_payload, MUX_MIN_FRAME_PAYLOAD,
+			MUX_MAX_PAYLOAD_SIZE);
 	}
-	/* tls.readahead drives the mux receive window (and the TLS library
-	 * read-ahead under socket_offload); kept in mux_config so the no-TLS recv
-	 * path can use it too.  Schema-validated to [0, 16777216], fits int. */
-	cfg->mux.tls_readahead = (int)obj->tls.readahead;
-	cfg->mux.mem_pressure_hi = (int)obj->mux.mem_pressure.hi;
-	cfg->mux.mem_pressure_lo = (int)obj->mux.mem_pressure.lo;
+	/* Schema-validated to [0, 16777216], fits int. */
+	cfg->mux.readahead = (int)obj->mux.readahead;
+	/* Clamp to INT_MAX: a value past it would wrap negative, silently
+	 * disabling receive-buffer back-pressure ("mem_pressure_hi <= 0"). */
+	cfg->mux.mem_pressure_hi =
+		(int)MIN(obj->mux.mem_pressure.hi, (uintmax_t)INT_MAX);
+	cfg->mux.mem_pressure_lo =
+		(int)MIN(obj->mux.mem_pressure.lo, (uintmax_t)INT_MAX);
+	return true;
+}
 
+static bool
+conf_load_tcp(struct config *restrict cfg, const struct json_conf *restrict obj)
+{
 	cfg->tcp.tcp_reuseport = obj->tcp.reuseport;
 	cfg->tcp.tcp_keepalive = obj->tcp.keepalive;
 	cfg->tcp.tcp_nodelay = obj->tcp.nodelay;
@@ -298,15 +318,14 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	}
 #endif
 	cfg->tcp.backlog = (int)obj->tcp.backlog;
+	return true;
+}
 
-	cfg->identity.claim = obj->identity.claim.str != NULL ?
-				      strndup(obj->identity.claim.str,
-					      obj->identity.claim.len) :
-				      NULL;
-	if (obj->identity.claim.str != NULL && cfg->identity.claim == NULL) {
-		LOGOOM();
-		return false;
-	}
+static bool conf_load_identity(
+	struct config *restrict cfg, const struct json_conf *restrict obj)
+{
+	STRNDUP_FIELD(
+		"identity.claim", cfg->identity.claim, obj->identity.claim);
 	if (obj->identity.mux_connect_count > 0) {
 		cfg->identity.mux_connect = (char **)malloc(
 			obj->identity.mux_connect_count *
@@ -318,11 +337,11 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		cfg->identity.mux_connect_count =
 			obj->identity.mux_connect_count;
 		for (size_t i = 0; i < obj->identity.mux_connect_count; i++) {
-			cfg->identity.mux_connect[i] =
-				strndup(obj->identity.mux_connect[i].str,
-					obj->identity.mux_connect[i].len);
+			cfg->identity.mux_connect[i] = conf_strndup(
+				"identity.mux_connect[]",
+				obj->identity.mux_connect[i].str,
+				obj->identity.mux_connect[i].len);
 			if (cfg->identity.mux_connect[i] == NULL) {
-				LOGOOM();
 				cfg->identity.mux_connect_count = i;
 				return false;
 			}
@@ -357,57 +376,50 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 			LOGE("identity.listen: malformed object");
 			return false;
 		}
-		/* Reject trailing content after the closing '}' */
-		while (it < obj->identity.listen_json.len &&
-		       json_iswhitespace((unsigned char)obj->identity
-						 .listen_json.str[it])) {
-			it++;
-		}
-		if (it != obj->identity.listen_json.len) {
-			LOGE("identity.listen: unexpected trailing content"
-			     " after object");
-			return false;
-		}
 	}
-
 	return true;
 }
 
-static bool conf_check_type(const char *restrict type)
+/* Load schema struct into config struct (strings strdup'd).  False on error. */
+static bool
+conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 {
-	if (type == NULL) {
-		return true;
-	}
-	const size_t len = strlen(type);
-	ASSERT(len < CONF_MAXSIZE);
-	char buf[len + 1];
-	memcpy(buf, type, len + 1);
+	/* Root string fields: strndup zero-copy pointers using known lengths. */
+	STRNDUP_FIELD("type", cfg->type, obj->type);
+	STRNDUP_FIELD("api_listen", cfg->api_listen, obj->api_listen);
+	STRNDUP_FIELD("mux_listen", cfg->mux_listen, obj->mux_listen);
+	STRNDUP_FIELD("mux_connect", cfg->mux_connect, obj->mux_connect);
+	STRNDUP_FIELD("listen", cfg->listen, obj->listen);
+	STRNDUP_FIELD("connect", cfg->connect, obj->connect);
+	STRNDUP_FIELD("log", cfg->log, obj->log);
 
-	char *media_type, *media_subtype;
-	char *next = mime_parse(buf, &media_type, &media_subtype);
-	if (next == NULL || strcmp(media_type, "application") != 0 ||
-	    strcmp(media_subtype, "x-multiplexd-config") != 0) {
-		LOGE_F("unsupported config type: \"%s\"", type);
+	/* Clamp to INT_MAX: a narrowing cast of a larger value is
+	 * implementation-defined, and conf_check() re-clamps loglevel to a
+	 * valid range anyway, but the intermediate cast should still be
+	 * well-defined regardless of input. */
+	cfg->loglevel = (int)MIN(obj->loglevel, (uintmax_t)INT_MAX);
+	/* Clamp to INT_MAX: a value past it would wrap to a negative limit and
+	 * silently disable the "max_sessions > 0" admission check. */
+	cfg->max_sessions = (int)MIN(obj->max_sessions, (uintmax_t)INT_MAX);
+	if (!conf_parse_max_startups(cfg, obj->max_startups.str)) {
 		return false;
 	}
 
-	const char *version = NULL;
-	char *key, *value;
-	next = mime_parseparam(next, &key, &value);
-	while (next != NULL && key != NULL) {
-		if (strcmp(key, "version") == 0) {
-			version = value;
-		}
-		next = mime_parseparam(next, &key, &value);
-	}
-	if (version == NULL) {
-		LOGE_F("config version not specified in: \"%s\"", type);
+#if WITH_TLS
+	if (!conf_load_tls(cfg, obj)) {
 		return false;
 	}
-	if (strcmp(version, CONF_VERSION) != 0) {
-		LOGE_F("incompatible config version: %s", version);
+#endif /* WITH_TLS */
+	if (!conf_load_mux(cfg, obj)) {
 		return false;
 	}
+	if (!conf_load_tcp(cfg, obj)) {
+		return false;
+	}
+	if (!conf_load_identity(cfg, obj)) {
+		return false;
+	}
+
 	return true;
 }
 
@@ -424,11 +436,61 @@ static void conf_derive_mux_timeout(struct config *restrict conf)
 	}
 }
 
-static bool conf_check(struct config *restrict conf)
+/* Validate conf->type as a MIME media type (RFC 2045), mirroring
+ * proto_parse_type in mux/handshake.c: type/subtype compare
+ * case-insensitively, "version" may appear alongside other (ignored)
+ * parameters in any order, and surrounding whitespace is insignificant --
+ * none of which a literal string comparison (as the schema's old "const"
+ * constraint did) would tolerate. mime_parse tokenizes its input in place,
+ * so parse a private copy and keep conf->type intact for logging. */
+static bool conf_check_type(const struct config *restrict conf)
 {
-	if (!conf_check_type(conf->type)) {
+	if (conf->type == NULL) {
+		return true;
+	}
+	char *const buf = strdup(conf->type);
+	if (buf == NULL) {
+		LOGOOM();
 		return false;
 	}
+	bool ok = false;
+	char *media_type, *media_subtype;
+	char *next = mime_parse(buf, &media_type, &media_subtype);
+	if (next == NULL || strcmp(media_type, "application") != 0 ||
+	    strcmp(media_subtype, "x-multiplexd-config") != 0) {
+		LOGE_F("unsupported config type: \"%s\"", conf->type);
+		goto done;
+	}
+	const char *version = NULL;
+	char *key, *value;
+	next = mime_parseparam(next, &key, &value);
+	while (next != NULL && key != NULL) {
+		if (strcmp(key, "version") == 0) {
+			version = value;
+		}
+		next = mime_parseparam(next, &key, &value);
+	}
+	if (next == NULL) {
+		LOGE_F("malformed config type: \"%s\"", conf->type);
+		goto done;
+	}
+	if (version == NULL || strcmp(version, CONF_VERSION) != 0) {
+		LOGE_F("unsupported config version: \"%s\"",
+		       version != NULL ? version : "(missing)");
+		goto done;
+	}
+	ok = true;
+done:
+	free(buf);
+	return ok;
+}
+
+static bool conf_check(struct config *restrict conf)
+{
+	if (!conf_check_type(conf)) {
+		return false;
+	}
+
 	/* Require at least one transport: mux_listen, mux_connect, or an
 	 * identity.mux_connect entry. */
 	const bool has_mux_listen = (conf->mux_listen != NULL);
@@ -467,8 +529,14 @@ static bool conf_check(struct config *restrict conf)
 		conf->mux.send_timeout =
 			CLAMP(conf->mux.send_timeout, 10, 86400);
 	}
-	conf->mux.connect_timeout = CLAMP(conf->mux.connect_timeout, 10, 86400);
-	conf->mux.resume_timeout = CLAMP(conf->mux.resume_timeout, 10, 86400);
+	if (conf->mux.connect_timeout > 0) {
+		conf->mux.connect_timeout =
+			CLAMP(conf->mux.connect_timeout, 10, 86400);
+	}
+	if (conf->mux.resume_timeout > 0) {
+		conf->mux.resume_timeout =
+			CLAMP(conf->mux.resume_timeout, 10, 86400);
+	}
 	if (conf->mux.idle_timeout > 0) {
 		conf->mux.idle_timeout =
 			CLAMP(conf->mux.idle_timeout, 10, 86400);
@@ -491,6 +559,47 @@ static bool conf_check(struct config *restrict conf)
 		       conf->startup_limit_start, conf->startup_limit_full);
 		return false;
 	}
+	/* lo == 0 means "default to hi / 2", which is always < hi for hi > 0,
+	 * so only a positive, explicit lo can violate the ramp's ordering.
+	 * hi == 0 disables the whole mechanism. Equality is tolerated
+	 * (degenerate step function, e.g. from independently clamping both
+	 * fields to the same ceiling); only a clearly inverted range is
+	 * rejected. */
+	if (conf->mux.mem_pressure_hi > 0 && conf->mux.mem_pressure_lo > 0 &&
+	    conf->mux.mem_pressure_lo > conf->mux.mem_pressure_hi) {
+		LOGE_F("mem_pressure.lo (%d) > mem_pressure.hi (%d):"
+		       " throttle range is inverted",
+		       conf->mux.mem_pressure_lo, conf->mux.mem_pressure_hi);
+		return false;
+	}
+	/* Resolve "lo == 0" to its final value now, so every session reads an
+	 * already-concrete threshold instead of re-deriving it per grant. */
+	if (conf->mux.mem_pressure_hi > 0 && conf->mux.mem_pressure_lo == 0) {
+		conf->mux.mem_pressure_lo = conf->mux.mem_pressure_hi / 2;
+	}
+	/* identity.claim's 255-octet wire limit is already enforced by the
+	 * generated schema unmarshal (conf_schema.json maxLength:255, applied to
+	 * the decoded length before conf_check runs), and STRNDUP_FIELD rejects an
+	 * embedded NUL, so no re-check is needed here -- unlike identity.listen
+	 * below, whose map values bypass every generated per-field check. */
+	/* identity.listen values are a dynamic map, invisible to the schema's
+	 * generated per-field checks (see conf_schema.json); reject an
+	 * oversized one here instead, since the schema already enforces the
+	 * analogous length limit for claim above. */
+	for (size_t i = 0; i < conf->identity.peers_count; i++) {
+		const struct identity_peer *restrict p =
+			&conf->identity.peers[i];
+		if (p->listen == NULL) {
+			continue;
+		}
+		const size_t listen_len = strlen(p->listen);
+		if (listen_len > 261) {
+			LOGE_F("identity.listen.%s (%zu octets) exceeds the"
+			       " 261-octet address limit",
+			       p->id, listen_len);
+			return false;
+		}
+	}
 	/* Require identity.claim when identity entries are configured. */
 	if ((conf->identity.mux_connect_count > 0 ||
 	     conf->identity.peers_count > 0) &&
@@ -502,51 +611,36 @@ static bool conf_check(struct config *restrict conf)
 	return true;
 }
 
-static char *read_file(const char *restrict path, size_t *restrict lenp)
+/* Read an already-open stream (the caller retains ownership of @p fp) into a
+ * heap buffer.  The +1 allocation serves double duty: oversize detection and
+ * NUL termination. */
+static char *read_stream(
+	FILE *restrict fp, const char *restrict desc, const char *restrict path,
+	size_t *restrict lenp)
 {
-	FILE *fp;
-	if (strcmp(path, "-") == 0) {
-		fp = stdin;
-	} else {
-		fp = fopen(path, "r");
-		if (fp == NULL) {
-			LOGE_F("failed to open config file: %s", path);
-			return NULL;
-		}
-	}
-	/* The +1 allocation serves double duty: oversize detection and NUL
-	 * termination. Both regular files and stdin are read the same way. */
 	char *const buf = malloc(CONF_MAXSIZE + 1);
 	if (buf == NULL) {
 		LOGOOM();
-		if (fp != stdin) {
-			(void)fclose(fp);
-		}
 		return NULL;
 	}
 	size_t n = 0;
 	size_t rem = CONF_MAXSIZE + 1;
 	while (rem > 0) {
 		const size_t rd = fread(buf + n, 1, rem, fp);
-		if (rd == 0) {
+		n += rd;
+		if (rd < rem) {
+			/* Short read: EOF unless the error indicator is set. */
 			if (ferror(fp)) {
-				LOGE_F("failed to read config: %s", path);
+				LOGE_F("failed to read %s: %s", desc, path);
 				free(buf);
-				if (fp != stdin) {
-					(void)fclose(fp);
-				}
 				return NULL;
 			}
 			break;
 		}
-		n += rd;
 		rem -= rd;
 	}
-	if (fp != stdin) {
-		(void)fclose(fp);
-	}
 	if (n > CONF_MAXSIZE) {
-		LOGE_F("config exceeds maximum size of %d bytes: %s",
+		LOGE_F("%s exceeds maximum size of %d bytes: %s", desc,
 		       CONF_MAXSIZE, path);
 		free(buf);
 		return NULL;
@@ -555,6 +649,25 @@ static char *read_file(const char *restrict path, size_t *restrict lenp)
 	if (lenp != NULL) {
 		*lenp = n;
 	}
+	return buf;
+}
+
+static char *read_file(
+	const char *restrict desc, const char *restrict path,
+	size_t *restrict lenp)
+{
+	/* "-" reads stdin, which must not be closed; a named file is opened and
+	 * closed here so read_stream stays ownership-agnostic. */
+	if (strcmp(path, "-") == 0) {
+		return read_stream(stdin, desc, path, lenp);
+	}
+	FILE *const fp = fopen(path, "r");
+	if (fp == NULL) {
+		LOGE_F("failed to open %s: %s", desc, path);
+		return NULL;
+	}
+	char *const buf = read_stream(fp, desc, path, lenp);
+	(void)fclose(fp);
 	return buf;
 }
 
@@ -580,14 +693,21 @@ struct config *conf_new_default(void)
 		conf_free(conf);
 		return NULL;
 	}
-	/* conf_new_default skips conf_check (an empty default has no transport), so derive
-	 * the timeout here too; otherwise a default config would have timeout==0. */
+	/* conf_new_default skips conf_check (an empty default has no
+	 * transport), so derive the timeout here too; otherwise a default
+	 * config would have timeout==0. */
 	conf_derive_mux_timeout(conf);
 	return conf;
 }
 
 struct config *conf_parse(char *json, const size_t len)
 {
+	/* Same ceiling conf_parsefile enforces via read_stream, applied here too
+	 * so every caller (including PUT /config) sees one size limit. */
+	if (len > CONF_MAXSIZE) {
+		LOGE_F("config exceeds maximum size of %d bytes", CONF_MAXSIZE);
+		return NULL;
+	}
 	struct config *restrict conf = malloc(sizeof(struct config));
 	if (conf == NULL) {
 		LOGOOM();
@@ -619,7 +739,7 @@ struct config *conf_parse(char *json, const size_t len)
 struct config *conf_parsefile(const char *path)
 {
 	size_t len;
-	char *const buf = read_file(path, &len);
+	char *const buf = read_file("config file", path, &len);
 	if (buf == NULL) {
 		return NULL;
 	}
@@ -628,14 +748,17 @@ struct config *conf_parsefile(const char *path)
 	return conf;
 }
 
-/* Build a vbuffer containing the JSON object for the identity.listen map.
- * Returns NULL when no peers have listen addresses or on allocation failure. */
-static struct vbuffer *build_listen_json(const struct config *restrict conf)
+/* Build a vbuffer containing the JSON object for the identity.listen map
+ * into *out (left NULL if no peer has a listen address). Returns false
+ * only on an allocation/encoding failure. */
+static bool build_listen_json(
+	const struct config *restrict conf, struct vbuffer **restrict out)
 {
+	*out = NULL;
 	struct vbuffer *vbuf = VBUF_NEW(64);
 	if (vbuf == NULL) {
 		LOGOOM();
-		return NULL;
+		return false;
 	}
 	VBUF_APPEND(vbuf, "{", 1);
 	bool first = true;
@@ -655,14 +778,21 @@ static struct vbuffer *build_listen_json(const struct config *restrict conf)
 			json_marshal_string(NULL, 0, p->listen, listen_len);
 		if (r_id < 0 || r_val < 0) {
 			VBUF_FREE(vbuf);
-			return NULL;
+			LOGE_F("identity.listen.%s: value too large to encode",
+			       p->id);
+			return false;
 		}
 		const size_t need = (size_t)r_id + 1u + (size_t)r_val;
-		vbuf = vbuf_grow(vbuf, vbuf->len + need);
-		if (vbuf->cap < vbuf->len + need) {
+		/* 1 extra byte is reserved for detecting allocation failures,
+		 * matching vbuf_append/vbuf_vappendf's own convention -- without
+		 * it, an exact-fit grow leaves cap == len after this append,
+		 * which VBUF_HAS_OOM and a later VBUF_APPEND both read as "a
+		 * previous append already failed". */
+		vbuf = vbuf_grow(vbuf, vbuf->len + need + 1);
+		if (vbuf->cap < vbuf->len + need + 1) {
 			VBUF_FREE(vbuf);
 			LOGOOM();
-			return NULL;
+			return false;
 		}
 		char *wp = (char *)vbuf->data + vbuf->len;
 		wp += json_marshal_string(wp, (size_t)r_id + 1, p->id, id_len);
@@ -674,57 +804,78 @@ static struct vbuffer *build_listen_json(const struct config *restrict conf)
 	}
 	if (first) {
 		VBUF_FREE(vbuf);
-		return NULL; /* no peers with listen addresses */
+		return true; /* no peers with listen addresses; *out stays NULL */
 	}
 	VBUF_APPEND(vbuf, "}", 1);
 	if (VBUF_HAS_OOM(vbuf)) {
 		VBUF_FREE(vbuf);
 		LOGOOM();
-		return NULL;
+		return false;
 	}
 	/* The reserved byte provides NUL-termination for the caller. */
 	vbuf->data[vbuf->len] = '\0';
-	return vbuf;
+	*out = vbuf;
+	return true;
+}
+
+/* Build a struct json_string view of s (NULL-safe: NULL maps to {NULL, 0}). */
+static struct json_string json_str(char *s)
+{
+	return (struct json_string){
+		.str = s,
+		.len = s != NULL ? strlen(s) : 0,
+	};
+}
+
+/* Build an array of struct json_string views over strs[0..count) into *out
+ * (left NULL when count == 0). Returns false only on allocation failure. */
+static bool build_json_string_arr(
+	char *const *restrict strs, size_t count,
+	struct json_string **restrict out)
+{
+	*out = NULL;
+	if (count == 0) {
+		return true;
+	}
+	struct json_string *restrict arr = malloc(count * sizeof(*arr));
+	if (arr == NULL) {
+		LOGOOM();
+		return false;
+	}
+	for (size_t i = 0; i < count; i++) {
+		arr[i].str = strs[i];
+		arr[i].len = strlen(strs[i]);
+	}
+	*out = arr;
+	return true;
 }
 
 char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 {
-	struct vbuffer *listen_vbuf = build_listen_json(conf);
+	struct vbuffer *listen_vbuf = NULL;
+	if (!build_listen_json(conf, &listen_vbuf)) {
+		return NULL;
+	}
 	char *const listen_json =
 		listen_vbuf != NULL ? (char *)listen_vbuf->data : NULL;
 	const size_t listen_len = listen_vbuf != NULL ? listen_vbuf->len : 0;
 
 	struct json_string *id_mc_arr = NULL;
-	if (conf->identity.mux_connect_count > 0) {
-		id_mc_arr = malloc(
-			conf->identity.mux_connect_count * sizeof(*id_mc_arr));
-		if (id_mc_arr == NULL) {
-			VBUF_FREE(listen_vbuf);
-			LOGOOM();
-			return NULL;
-		}
-		for (size_t i = 0; i < conf->identity.mux_connect_count; i++) {
-			id_mc_arr[i].str = conf->identity.mux_connect[i];
-			id_mc_arr[i].len =
-				strlen(conf->identity.mux_connect[i]);
-		}
+	if (!build_json_string_arr(
+		    conf->identity.mux_connect,
+		    conf->identity.mux_connect_count, &id_mc_arr)) {
+		VBUF_FREE(listen_vbuf);
+		return NULL;
 	}
 
 #if WITH_TLS
 	struct json_string *authcerts_arr = NULL;
-	if (conf->tls_authcerts_count > 0) {
-		authcerts_arr = malloc(
-			conf->tls_authcerts_count * sizeof(*authcerts_arr));
-		if (authcerts_arr == NULL) {
-			free(id_mc_arr);
-			VBUF_FREE(listen_vbuf);
-			LOGOOM();
-			return NULL;
-		}
-		for (size_t i = 0; i < conf->tls_authcerts_count; i++) {
-			authcerts_arr[i].str = conf->tls_authcerts[i];
-			authcerts_arr[i].len = strlen(conf->tls_authcerts[i]);
-		}
+	if (!build_json_string_arr(
+		    conf->tls_authcerts, conf->tls_authcerts_count,
+		    &authcerts_arr)) {
+		free(id_mc_arr);
+		VBUF_FREE(listen_vbuf);
+		return NULL;
 	}
 #endif /* WITH_TLS */
 
@@ -741,49 +892,24 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		max_startups = startups_buf;
 	}
 
+	/* 0 * MUX_WINDOW_UNIT == 0, so "unset" needs no separate branch. */
 	const uintmax_t session_window_bytes =
-		conf->mux.session_window != 0 ?
-			(uintmax_t)conf->mux.session_window * MUX_WINDOW_UNIT :
-			0;
+		(uintmax_t)conf->mux.session_window * MUX_WINDOW_UNIT;
 	const uintmax_t stream_window_bytes =
-		conf->mux.stream_window != 0 ?
-			(uintmax_t)conf->mux.stream_window * MUX_WINDOW_UNIT :
-			0;
+		(uintmax_t)conf->mux.stream_window * MUX_WINDOW_UNIT;
 
-	const char *const type_str =
-		conf->type != NULL ? conf->type : CONF_TYPE;
 	const struct json_conf raw = {
-		.type = { .str = (char *)type_str, .len = strlen(type_str) },
-		.api_listen = {
-			.str = conf->api_listen,
-			.len = conf->api_listen != NULL ?
-				       strlen(conf->api_listen) :
-				       0,
-		},
-		.mux_listen = {
-			.str = conf->mux_listen,
-			.len = conf->mux_listen != NULL ?
-				       strlen(conf->mux_listen) :
-				       0,
-		},
-		.mux_connect = {
-			.str = conf->mux_connect,
-			.len = conf->mux_connect != NULL ?
-				       strlen(conf->mux_connect) :
-				       0,
-		},
-		.listen = {
-			.str = conf->listen,
-			.len = conf->listen != NULL ? strlen(conf->listen) : 0,
-		},
-		.connect = {
-			.str = conf->connect,
-			.len = conf->connect != NULL ? strlen(conf->connect) : 0,
-		},
-		.log = {
-			.str = conf->log,
-			.len = conf->log != NULL ? strlen(conf->log) : 0,
-		},
+		/* Always dump the canonical CONF_TYPE literal rather than
+		 * conf->type: conf_check_type accepts equivalent variants
+		 * (different case, whitespace, parameter order, or extra
+		 * parameters), so the original string need not match it. */
+		.type = { .str = CONF_TYPE, .len = sizeof(CONF_TYPE) - 1 },
+		.api_listen = json_str(conf->api_listen),
+		.mux_listen = json_str(conf->mux_listen),
+		.mux_connect = json_str(conf->mux_connect),
+		.listen = json_str(conf->listen),
+		.connect = json_str(conf->connect),
+		.log = json_str(conf->log),
 		.loglevel = (unsigned)conf->loglevel,
 		.max_sessions = (uintmax_t)conf->max_sessions,
 		.max_startups = {
@@ -792,41 +918,15 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		},
 #if WITH_TLS
 		.tls = {
-			.cert = {
-				.str = conf->tls_cert,
-				.len = conf->tls_cert != NULL ?
-					       strlen(conf->tls_cert) :
-					       0,
-			},
-			.key = {
-				.str = conf->tls_key,
-				.len = conf->tls_key != NULL ?
-					       strlen(conf->tls_key) :
-					       0,
-			},
-			.ciphersuites = {
-				.str = conf->tls_ciphersuites,
-				.len = conf->tls_ciphersuites != NULL ?
-					       strlen(conf->tls_ciphersuites) :
-					       0,
-			},
-			.sni = {
-				.str = conf->tls_sni,
-				.len = conf->tls_sni != NULL ?
-					       strlen(conf->tls_sni) :
-					       0,
-			},
-			.alpn = {
-				.str = conf->tls_alpn,
-				.len = conf->tls_alpn != NULL ?
-					       strlen(conf->tls_alpn) :
-					       0,
-			},
+			.cert = json_str(conf->tls_cert),
+			.key = json_str(conf->tls_key),
+			.ciphersuites = json_str(conf->tls_ciphersuites),
+			.sni = json_str(conf->tls_sni),
+			.alpn = json_str(conf->tls_alpn),
 			.authcerts = authcerts_arr,
 			.authcerts_count = conf->tls_authcerts_count,
 			.kernel_offload = conf->tls_kernel_offload,
 			.socket_offload = conf->tls_socket_offload,
-			.readahead = (unsigned)conf->mux.tls_readahead,
 		},
 #endif /* WITH_TLS */
 		.mux = {
@@ -853,12 +953,9 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 			.resume_timeout = (unsigned)conf->mux.resume_timeout,
 			.session_window = (unsigned)session_window_bytes,
 			.stream_window = (unsigned)stream_window_bytes,
+			.readahead = (unsigned)conf->mux.readahead,
 			.max_frame_size = (uintmax_t)(
-				(conf->mux.max_frame_payload > 0 ?
-					 (uint_least32_t)
-						 conf->mux.max_frame_payload :
-					 (uint_least32_t)mux_conf_default
-						 .max_frame_payload) +
+				(uint_least32_t)conf->mux.max_frame_payload +
 				MUX_FRAME_HEADER_SIZE),
 			.mem_pressure = {
 				.hi = (uintmax_t)conf->mux.mem_pressure_hi,
@@ -877,12 +974,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 			.backlog = (unsigned)conf->tcp.backlog,
 		},
 		.identity = {
-			.claim = {
-				.str = conf->identity.claim,
-				.len = conf->identity.claim != NULL ?
-					       strlen(conf->identity.claim) :
-					       0,
-			},
+			.claim = json_str(conf->identity.claim),
 			.mux_connect = id_mc_arr,
 			.mux_connect_count = conf->identity.mux_connect_count,
 			.listen_json = {
@@ -937,7 +1029,7 @@ static bool inline_field(char **restrict sp, const char *restrict name)
 	if (*sp == NULL || **sp != '@') {
 		return true;
 	}
-	char *const content = read_file(*sp + 1, NULL);
+	char *const content = read_file(name, *sp + 1, NULL);
 	if (content == NULL) {
 		LOGE_F("failed to inline PEM field: %s", name);
 		return false;

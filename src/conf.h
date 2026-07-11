@@ -14,7 +14,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Maximum configuration file size in bytes. */
+/* Maximum configuration size in bytes; enforced on both a loaded file and a
+ * conf_parse() buffer (e.g. a PUT /config body). */
 #define CONF_MAXSIZE 65535
 
 struct conf_socket_opts {

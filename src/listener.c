@@ -9,7 +9,7 @@
 #include "listener.h"
 
 #include "conf.h"
-#include "util.h"
+#include "shim/util.h"
 
 #include "os/socket.h"
 #include "utils/slog.h"
@@ -22,7 +22,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
 static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
@@ -45,6 +44,15 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 			if (err == EAGAIN || err == EWOULDBLOCK) {
 				break; /* no more pending connections */
 			}
+			/* Linux may pass through a pending per-connection network
+			 * error from accept() instead of discarding it; per
+			 * accept(2), treat these like EAGAIN. */
+			if (err == ENETDOWN || err == EPROTO ||
+			    err == ENOPROTOOPT || err == EHOSTDOWN ||
+			    err == ENONET || err == EHOSTUNREACH ||
+			    err == EOPNOTSUPP || err == ENETUNREACH) {
+				break; /* transient per-connection error */
+			}
 			if (err == ENOBUFS || err == ENOMEM) {
 				LOGW_F("accept: (%d) %s", err, strerror(err));
 			} else {
@@ -66,19 +74,19 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 				w->fd, fd, addr_str);
 		}
 
-		if (socket_set_cloexec(fd) != 0 ||
-		    socket_set_nonblock(fd) != 0) {
-			SOCKET_CLOSE_FD(fd);
+		(void)socket_set_cloexec(fd);
+		if (!socket_set_nonblock(fd)) {
+			socket_close(fd);
 			continue;
 		}
-		socket_set_buffer(
+		(void)socket_set_buffer(
 			fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf);
-		socket_set_tcp(
+		(void)socket_set_tcp(
 			fd, socket_opts->tcp_nodelay,
 			socket_opts->tcp_keepalive);
 #if WITH_TCP_NOTSENT_LOWAT
 		if (socket_opts->tcp_notsent_lowat > 0) {
-			socket_notsent_lowat(
+			(void)socket_notsent_lowat(
 				fd, socket_opts->tcp_notsent_lowat);
 		}
 #endif
@@ -122,34 +130,36 @@ bool listener_start(
 		return false;
 	}
 
-	if (socket_set_cloexec(fd) != 0 || socket_set_nonblock(fd) != 0) {
-		SOCKET_CLOSE_FD(fd);
+	(void)socket_set_cloexec(fd);
+	if (!socket_set_nonblock(fd)) {
+		socket_close(fd);
 		return false;
 	}
 
 	const struct conf_socket_opts *const restrict socket_opts =
 		l->socket_opts;
-	socket_set_buffer(fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf);
-	socket_set_tcp(
+	(void)socket_set_buffer(
+		fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf);
+	(void)socket_set_tcp(
 		fd, socket_opts->tcp_nodelay, socket_opts->tcp_keepalive);
-	socket_set_reuseport(fd, socket_opts->tcp_reuseport);
+	(void)socket_set_reuseport(fd, socket_opts->tcp_reuseport);
 
 	if (bind(fd, sa, sa_len(sa)) != 0) {
 		const int err = errno;
 		LOGE_F("bind: (%d) %s", err, strerror(err));
-		SOCKET_CLOSE_FD(fd);
+		socket_close(fd);
 		return false;
 	}
 
 	if (listen(fd, socket_opts->backlog) != 0) {
 		const int err = errno;
 		LOGE_F("listen: (%d) %s", err, strerror(err));
-		SOCKET_CLOSE_FD(fd);
+		socket_close(fd);
 		return false;
 	}
 
 #if WITH_TCP_FASTOPEN
-	socket_set_fastopen(fd, socket_opts->backlog);
+	(void)socket_set_fastopen(fd, socket_opts->backlog);
 #endif
 
 	ev_io_set(&l->w_accept, fd, EV_READ);
@@ -162,7 +172,7 @@ void listener_stop(struct listener *l, struct ev_loop *loop)
 	ev_timer_stop(loop, &l->w_timer);
 	ev_io_stop(loop, &l->w_accept);
 	if (l->w_accept.fd != -1) {
-		SOCKET_CLOSE_FD(l->w_accept.fd);
+		socket_close(l->w_accept.fd);
 		l->w_accept.fd = -1;
 	}
 }

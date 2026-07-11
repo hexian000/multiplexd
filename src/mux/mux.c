@@ -15,8 +15,8 @@
 #include "mux/stream.h"
 #include "mux/wire.h"
 
+#include "meta/minmax.h"
 #include "utils/debug.h"
-#include "utils/minmax.h"
 #include "utils/slog.h"
 
 #include <ev.h>
@@ -169,7 +169,7 @@ void mux_stream_io_modify(
 	if ((added & EV_READ) &&
 	    (ringbuf_readable(s->recvbuf) > 0 ||
 	     s->state == STREAM_CLOSE_WAIT || s->state == STREAM_CLOSING ||
-	     s->rst_received)) {
+	     s->rst_received || s->aborted)) {
 		ready |= EV_READ;
 	}
 	if ((added & EV_WRITE) &&
@@ -245,11 +245,12 @@ int mux_stream_send(
 		}
 		const size_t chunk = MIN(remaining, frame->cap);
 		frame->len = MUX_FRAME_HEADER_SIZE + chunk;
-		frame->pos = 0;
 		memcpy(frame->data + MUX_FRAME_HEADER_SIZE, p, chunk);
 
-		s->queued_send_bytes += (uint_least32_t)chunk;
-		mux_frame_list_push(&s->send_queue, frame);
+		/* Must go through the same bookkeeping every
+		 * dequeue/free path pays back, not a hand-rolled push that
+		 * skips send_buffered_frames. */
+		stream_queue_send(s, frame);
 
 		p += chunk;
 		remaining -= chunk;
@@ -266,7 +267,7 @@ int mux_stream_send(
 int mux_stream_recv(
 	struct mux_stream *restrict s, void *restrict buf, size_t *restrict len)
 {
-	if (s->rst_received) {
+	if (s->rst_received || s->aborted) {
 		errno = ECONNRESET;
 		return -1;
 	}
@@ -322,8 +323,10 @@ void mux_stream_close(struct mux_stream *s)
 	if (s->state == STREAM_CLOSED) {
 		return;
 	}
-	/* Detach user watcher first so it does not receive EV_ERROR from
-	 * stream_close() — the caller is the one initiating the close. */
+	/* Detach the user watcher first so the stream_shutdown()/stream_close()
+	 * below cannot feed it a re-entrant EV_READ/EV_WRITE callback while the
+	 * caller is in the middle of relinquishing it (the mux library only ever
+	 * feeds this watcher EV_READ/EV_WRITE, never EV_ERROR). */
 	if (s->is_direct && s->direct.w_io != NULL) {
 		mux_stream_io_stop(s->direct.w_io->loop, s->direct.w_io);
 	}

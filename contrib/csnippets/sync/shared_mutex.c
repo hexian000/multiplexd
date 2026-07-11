@@ -1,3 +1,6 @@
+/* csnippets (c) 2019-2026 He Xian <hexian000@outlook.com>
+ * This code is licensed under MIT license (see LICENSE for details) */
+
 #include "shared_mutex.h"
 
 #include <assert.h>
@@ -45,12 +48,13 @@ int smtx_lock(smtx_t *restrict mutex)
 	if (status != thrd_success) {
 		return status;
 	}
-	mutex->state.exclusive_waiting = true;
+	mutex->state.exclusive_waiting++;
 	while (mutex->state.exclusive || mutex->state.shared_count > 0) {
 		THRD_ASSERT(cnd_wait(&mutex->exclusive_cond, &mutex->state_mu));
 	}
+	assert(mutex->state.exclusive_waiting > 0);
+	mutex->state.exclusive_waiting--;
 	mutex->state.exclusive = true;
-	mutex->state.exclusive_waiting = false;
 	return mtx_unlock(&mutex->state_mu);
 }
 
@@ -60,7 +64,11 @@ int smtx_trylock(smtx_t *restrict mutex)
 	if (status != thrd_success) {
 		return status;
 	}
-	if (mutex->state.exclusive || mutex->state.shared_count > 0) {
+	if (mutex->state.exclusive || mutex->state.shared_count > 0 ||
+	    mutex->state.exclusive_waiting > 0) {
+		/* defer to a writer already blocked in smtx_lock(), matching
+		 * smtx_trysharedlock()'s writer-preference check, so a trylock
+		 * retry loop cannot starve the queued writer */
 		THRD_ASSERT(mtx_unlock(&mutex->state_mu));
 		return thrd_busy;
 	}
@@ -87,7 +95,7 @@ int smtx_sharedlock(smtx_t *restrict mutex)
 	if (status != thrd_success) {
 		return status;
 	}
-	while (mutex->state.exclusive || mutex->state.exclusive_waiting) {
+	while (mutex->state.exclusive || mutex->state.exclusive_waiting > 0) {
 		THRD_ASSERT(cnd_wait(&mutex->shared_cond, &mutex->state_mu));
 	}
 	mutex->state.shared_count++;
@@ -100,7 +108,7 @@ int smtx_trysharedlock(smtx_t *restrict mutex)
 	if (status != thrd_success) {
 		return status;
 	}
-	if (mutex->state.exclusive || mutex->state.exclusive_waiting) {
+	if (mutex->state.exclusive || mutex->state.exclusive_waiting > 0) {
 		THRD_ASSERT(mtx_unlock(&mutex->state_mu));
 		return thrd_busy;
 	}

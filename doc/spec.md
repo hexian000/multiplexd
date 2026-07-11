@@ -641,7 +641,6 @@ SESSION_ESTABLISHED         SESSION_ESTABLISHED
 | ----------------------------------------------- | ---------------- |
 | Version field is not 0                          | Close connection |
 | Flags, Stream ID, or Extra is non-zero          | Close connection |
-| Length field exceeds 65535 octets (Section 2.3) | Close connection |
 | Connection closed before hello received         | Close connection |
 | Invalid JSON or missing required field          | Close connection |
 | "type" media type mismatch                      | Close connection |
@@ -1188,6 +1187,7 @@ coalescing is implemented:
 | Sender exceeds advertised send window                                                                  | MAY send RST (FLOW_CONTROL_ERROR) |
 | Frame Version field is 0 outside of SESSION_HANDSHAKE                                                  | Close connection                  |
 | Frame Version field does not match negotiated version                                                  | Close connection                  |
+| Non-hello frame received before both sides reach SESSION_ESTABLISHED (Section 5.2)                     | Close connection                  |
 | PING payload too large for the receiver to echo (Section 5.3.2)                                        | Close connection                  |
 | Reserved flag bit set in any frame                                                                     | Close connection                  |
 | Transport read/write error                                                                             | Close connection                  |

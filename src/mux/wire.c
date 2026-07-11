@@ -12,7 +12,7 @@
 #include "mux/mux.h"
 #include "mux/session.h"
 #if WITH_TLS
-#include "tlsutil.h"
+#include "shim/tls.h"
 #endif
 
 #include "io/io.h"
@@ -22,7 +22,6 @@
 
 #include <ev.h>
 
-#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -212,7 +211,16 @@ static bool wire_recv_buffered(
 		ss->wire.tx_pending = true;
 		ss->wire.rx_eof = true;
 		*len = 0;
-		(void)wire_cipher_push(ss);
+		/* Flush any final ciphertext (e.g. our own close_notify)
+		 * before treating this as a clean close; a fatal push error
+		 * still fails the connection like the other wire_cipher_push
+		 * call sites above and below. */
+		{
+			const int perr = wire_cipher_push(ss);
+			if (perr != 0 && perr != EAGAIN) {
+				return false;
+			}
+		}
 		return true;
 	default:
 		ss->wire.rx_open = false;
@@ -428,7 +436,7 @@ enum wire_flush_result wire_flush(struct mux_session *restrict ss)
 			return WIRE_FLUSH_ERROR;
 		}
 	}
-#else
+#else /* WITH_TLS */
 	(void)ss;
 #endif /* WITH_TLS */
 	return WIRE_FLUSH_DONE;
@@ -510,7 +518,7 @@ void wire_adopt_tlsconn(
 
 /* Free a detached TLS connection not owned by any session (e.g. a resume
  * transport handoff that could not be installed).  Keeps session.c off a
- * direct tlsutil dependency; tls_conn_free is NULL-safe. */
+ * direct shim/tls.h dependency; tls_conn_free is NULL-safe. */
 void wire_tlsconn_free(struct tls_connection *restrict conn)
 {
 	tls_conn_free(conn);
@@ -567,11 +575,11 @@ enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
 	}
 #endif /* WITH_TLS */
 	LOGV_F("[fd:%d] shutdown: tcp", ss->w_socket.fd);
-	SOCKET_SHUTDOWN_FD(ss->w_socket.fd, WR);
+	(void)socket_shutdown(ss->w_socket.fd, SHUT_WR);
 	return WIRE_SHUTDOWN_DONE;
 }
 
-bool wire_wait_eof(struct mux_session *restrict ss)
+enum wire_eof_result wire_wait_eof(struct mux_session *restrict ss)
 {
 	unsigned char buf[256];
 #if WITH_TLS
@@ -583,32 +591,35 @@ bool wire_wait_eof(struct mux_session *restrict ss)
 		if (serr != 0) {
 			if (serr == EAGAIN || serr == EWOULDBLOCK ||
 			    serr == ENOBUFS || serr == ENOMEM) {
-				return true; /* nothing pending yet */
+				return WIRE_EOF_PENDING;
 			}
-			return false;
+			return WIRE_EOF_ERROR;
 		}
 		if (clen == 0) {
-			return true; /* peer closed (TCP FIN) */
+			return WIRE_EOF_CONFIRMED; /* peer closed (TCP FIN) */
 		}
 		if (!tls_input(ss->wire.tlsconn, buf, clen)) {
-			return false;
+			LOGOOM();
+			return WIRE_EOF_ERROR;
 		}
 		size_t nread = sizeof(buf);
 		const enum tls_error err =
 			tls_recv(ss->wire.tlsconn, buf, &nread);
 		switch (err) {
 		case TLS_ERROR_ZERO_RETURN:
+			return WIRE_EOF_CONFIRMED; /* peer's close_notify */
 		case TLS_ERROR_WANT_READ:
 		case TLS_ERROR_WANT_WRITE:
-			return true;
+			/* tls_shutdown is one-way: close_notify has not arrived yet. */
+			return WIRE_EOF_PENDING;
 		case TLS_ERROR_NONE:
 			LOGD_F("[fd:%d] unexpected data after shutdown",
 			       ss->w_socket.fd);
-			return false;
+			return WIRE_EOF_ERROR;
 		default:
 			LOGD_F("[fd:%d] TLS error after shutdown",
 			       ss->w_socket.fd);
-			return false;
+			return WIRE_EOF_ERROR;
 		}
 	}
 	if (ss->wire.tlsconn != NULL) {
@@ -617,33 +628,34 @@ bool wire_wait_eof(struct mux_session *restrict ss)
 			tls_recv(ss->wire.tlsconn, buf, &nread);
 		switch (err) {
 		case TLS_ERROR_ZERO_RETURN:
-			/* Peer's close_notify: clean close; or tls_shutdown is one-way
-			 * so WANT_READ/WANT_WRITE means it has not arrived yet;
-			 * treat like a plaintext EAGAIN. */
+			return WIRE_EOF_CONFIRMED; /* peer's close_notify */
 		case TLS_ERROR_WANT_READ:
 		case TLS_ERROR_WANT_WRITE:
-			return true;
+			/* tls_shutdown is one-way: close_notify has not arrived yet. */
+			return WIRE_EOF_PENDING;
 		case TLS_ERROR_NONE:
 			/* nread > 0: unexpected application data after shutdown. */
 			LOGD_F("[fd:%d] unexpected data after shutdown",
 			       ss->w_socket.fd);
-			return false;
+			return WIRE_EOF_ERROR;
 		default:
 			LOGD_F("[fd:%d] TLS error after shutdown",
 			       ss->w_socket.fd);
-			return false;
+			return WIRE_EOF_ERROR;
 		}
 	}
 #endif /* WITH_TLS */
 	size_t len = sizeof(buf);
+	bool eagain = false;
 	{
 		const int err = socket_recv(ss->w_socket.fd, buf, &len);
 		if (err != 0) {
 			if (err == EAGAIN || err == EWOULDBLOCK ||
 			    err == ENOBUFS || err == ENOMEM) {
+				eagain = true;
 				len = 0; /* no unexpected data yet */
 			} else {
-				return false;
+				return WIRE_EOF_ERROR;
 			}
 		}
 		/* err == 0: len holds bytes received; 0 means EOF */
@@ -651,7 +663,7 @@ bool wire_wait_eof(struct mux_session *restrict ss)
 	if (len > 0) {
 		LOGD_F("[fd:%d] unexpected data after shutdown",
 		       ss->w_socket.fd);
-		return false;
+		return WIRE_EOF_ERROR;
 	}
-	return true;
+	return eagain ? WIRE_EOF_PENDING : WIRE_EOF_CONFIRMED;
 }

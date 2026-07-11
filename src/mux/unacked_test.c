@@ -5,10 +5,12 @@
  * §5.7); unacked.c #included, real frame.c linked; benches opt-in via
  * BENCH env. */
 
+#include "mux/unacked.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
-#include "mux/unacked.h"
+#include "mux/unacked.c"
 
 #include "utils/slog.h"
 #include "utils/testing.h"
@@ -17,8 +19,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include "mux/unacked.c"
 
 /* mock - the test frame allocator and session fixture
  * Fixture: a minimal session carrying only the fields unacked.c touches. */
@@ -45,9 +45,27 @@ static void unacked_test_free(void *data, struct mux_frame *frame)
 	free(frame);
 }
 
+/* session.c is not linked; unacked_push calls session_reset directly on an
+ * unrecoverable ring OOM, so stub it to satisfy the link. Not exercised by
+ * a dedicated test: reliably forcing mux_frame_ring_push's malloc to fail
+ * has no seam here (a fault-injection allocator doesn't exist in this
+ * project's test style), and faking the ring's capacity/count to force an
+ * oversized grow request doesn't work under ASan either -- sizes near or
+ * above ASan's own allocation ceiling abort the process instead of
+ * returning NULL, and sizes safely below it aren't guaranteed to fail
+ * (overcommit). */
+void session_reset(struct mux_session *ss)
+{
+	(void)ss;
+}
+
 struct unacked_fixture {
 	struct mux_session ss;
 	struct frame_pool_ctx pool_ctx;
+	/* Backs ss.cnt.unacked_frames so the frames <-> gauge mirror invariant
+	 * (unacked.h) is observable; without it COUNTER_ADD/SUB are NULL no-ops
+	 * and the mirror can drift undetected. */
+	mux_gauge unacked_frames;
 };
 
 /* session_window is in MUX_WINDOW_UNIT units; 4 units = 65536 bytes keeps the
@@ -63,6 +81,7 @@ static void uf_setup(struct unacked_fixture *restrict fx)
 	fx->ss.max_payload = MUX_MAX_PAYLOAD_SIZE;
 	fx->ss.session_window = 4;
 	fx->ss.unacked.retransmit_off = SIZE_MAX;
+	fx->ss.cnt.unacked_frames = &fx->unacked_frames;
 }
 
 /* Drain any frames left in the ring; returns true when every allocation was
@@ -253,6 +272,9 @@ T_DECLARE_CASE(test_track_sent_retransmit_copy_advances_cursor)
 	T_EXPECT_EQ(fx.ss.unacked.retransmit_off, (size_t)1);
 	/* The copy was freed, not tracked: ring still holds the single entry. */
 	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)1);
+	/* spec §5.8.4: retransmission bumps send_seq by the retired frame's
+	 * unacked_count too, on top of the original send's bump (1 + 1). */
+	T_EXPECT_EQ(fx.ss.unacked.send_seq, (uint_least32_t)2);
 
 	T_EXPECT(uf_teardown(&fx));
 }
@@ -396,6 +418,9 @@ T_DECLARE_CASE(test_ack_trim_full_pop)
 	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)300);
 	T_EXPECT_EQ(fx.ss.unacked.last_ack_recv, (uint_least32_t)2);
 	T_EXPECT(mux_frame_ring_size(fx.ss.unacked.ring) == 1);
+	/* The server-wide gauge tracks unacked.frames through push and trim. */
+	T_EXPECT_EQ(
+		COUNTER_LOAD(fx.ss.cnt.unacked_frames), fx.ss.unacked.frames);
 
 	T_EXPECT(uf_teardown(&fx));
 }
@@ -499,6 +524,69 @@ T_DECLARE_CASE(test_ack_trim_invalidates_cursor_past_end)
 	T_EXPECT(uf_teardown(&fx));
 }
 
+/* unacked_ack_recv: bounds a peer ACK received mid-replay by what has
+ * actually been retransmitted, so a session_send_ctrl frame deferred behind
+ * replay can't be exploited by claiming credit for an entry still awaiting
+ * retransmission. */
+
+/* A count exceeding the retransmitted prefix is rejected even though it is
+ * within the overall unacked total. */
+T_DECLARE_CASE(test_ack_recv_rejects_past_retransmit_cursor)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	fx.ss.unacked.retransmit_off =
+		1; /* only the first entry retransmitted */
+
+	const struct unacked_ack_result r = unacked_ack_recv(&fx.ss, 2);
+	T_EXPECT(!r.ok);
+	/* Rejected before any state changed. */
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)3);
+	T_EXPECT_EQ(fx.ss.unacked.retransmit_off, (size_t)1);
+
+	T_EXPECT(uf_teardown(&fx));
+}
+
+/* A count exactly matching the retransmitted prefix is accepted. */
+T_DECLARE_CASE(test_ack_recv_accepts_within_retransmit_cursor)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	fx.ss.unacked.retransmit_off = 2; /* first two entries retransmitted */
+
+	const struct unacked_ack_result r = unacked_ack_recv(&fx.ss, 2);
+	T_EXPECT(r.ok);
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)1);
+
+	T_EXPECT(uf_teardown(&fx));
+}
+
+/* Outside replay (the common case) unacked_ack_recv behaves exactly like
+ * unacked_ack_trim: bounded only by the overall unacked total. */
+T_DECLARE_CASE(test_ack_recv_unbounded_when_not_replaying)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
+	T_CHECK(fx.ss.unacked.retransmit_off == SIZE_MAX);
+
+	const struct unacked_ack_result r = unacked_ack_recv(&fx.ss, 2);
+	T_EXPECT(r.ok);
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)0);
+
+	T_EXPECT(uf_teardown(&fx));
+}
+
 /* unacked_resume_ack_recv: resume-time trim and cursor positioning. */
 
 /* A resume hello acking some frames trims them and parks the replay cursor at
@@ -574,8 +662,9 @@ T_DECLARE_CASE(test_resume_ack_wrap_accepted)
 	T_EXPECT(uf_teardown(&fx));
 }
 
-/* A resume ack whose implied trim exceeds the ring is rejected (propagated from
- * the underlying trim overflow check). */
+/* A resume ack covering more frames than are outstanding is rejected once the
+ * ring runs dry; the frames it did cover stay trimmed (the caller must tear
+ * the session down). */
 T_DECLARE_CASE(test_resume_ack_overflow_rejected)
 {
 	struct unacked_fixture fx;
@@ -584,30 +673,40 @@ T_DECLARE_CASE(test_resume_ack_overflow_rejected)
 	unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 
 	T_EXPECT(!unacked_resume_ack_recv(&fx.ss, 5));
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)0);
 
 	T_EXPECT(uf_teardown(&fx));
 }
 
-/* Session-ACK delta accounting and teardown. */
+/* Session-ACK accounting and teardown. */
 
-/* ack_delta reports received-but-unacked frames; ack_emitted clears the debt. */
-T_DECLARE_CASE(test_ack_delta_and_emitted)
+/* ack_emitted subtracts the reported count and resets the emission timer. */
+T_DECLARE_CASE(test_ack_emitted_clears_unreported)
 {
 	struct unacked_fixture fx;
 	uf_setup(&fx);
 
-	fx.ss.unacked.recv_seq = 5;
-	fx.ss.unacked.ack_seq = 2;
+	fx.ss.unacked.unreported = 3;
 	fx.ss.unacked.ack_ticks = 3;
-	fx.ss.unacked.ack_pending = true;
-
-	T_EXPECT_EQ(unacked_ack_delta(&fx.ss), (uint_fast32_t)3);
 
 	unacked_ack_emitted(&fx.ss, 3);
-	T_EXPECT_EQ(fx.ss.unacked.ack_seq, (uint_least32_t)5);
-	T_EXPECT_EQ(unacked_ack_delta(&fx.ss), (uint_fast32_t)0);
+	T_EXPECT_EQ(fx.ss.unacked.unreported, (uint_least32_t)0);
 	T_EXPECT_EQ(fx.ss.unacked.ack_ticks, 0);
-	T_EXPECT(!fx.ss.unacked.ack_pending);
+
+	T_EXPECT(uf_teardown(&fx));
+}
+
+/* An emission clamped to the 16-bit Extra field leaves the remainder to be
+ * reported by a later session ACK (spec §5.7.3). */
+T_DECLARE_CASE(test_ack_emitted_partial_keeps_remainder)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+
+	fx.ss.unacked.unreported = 5;
+
+	unacked_ack_emitted(&fx.ss, 3);
+	T_EXPECT_EQ(fx.ss.unacked.unreported, (uint_least32_t)2);
 
 	T_EXPECT(uf_teardown(&fx));
 }
@@ -630,6 +729,10 @@ T_DECLARE_CASE(test_free_all_resets_state)
 	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)0);
 	T_EXPECT_EQ(fx.ss.unacked.partial_offset, (uint_least32_t)0);
 	T_EXPECT_EQ(fx.ss.unacked.retransmit_off, (size_t)SIZE_MAX);
+	/* unacked_free_all must decrement the gauge by the frames it drops, not
+	 * just zero the local mirror (regression: it left the server-wide gauge
+	 * permanently inflated). */
+	T_EXPECT_EQ(COUNTER_LOAD(fx.ss.cnt.unacked_frames), (size_t)0);
 
 	T_EXPECT(uf_teardown(&fx));
 }
@@ -702,12 +805,16 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_ack_trim_clamps_when_ring_underflows),
 	T_CASE(test_ack_trim_shifts_retransmit_cursor),
 	T_CASE(test_ack_trim_invalidates_cursor_past_end),
+	T_CASE(test_ack_recv_rejects_past_retransmit_cursor),
+	T_CASE(test_ack_recv_accepts_within_retransmit_cursor),
+	T_CASE(test_ack_recv_unbounded_when_not_replaying),
 	T_CASE(test_resume_ack_positions_cursor),
 	T_CASE(test_resume_ack_empties_ring),
 	T_CASE(test_resume_ack_regress_rejected),
 	T_CASE(test_resume_ack_wrap_accepted),
 	T_CASE(test_resume_ack_overflow_rejected),
-	T_CASE(test_ack_delta_and_emitted),
+	T_CASE(test_ack_emitted_clears_unreported),
+	T_CASE(test_ack_emitted_partial_keeps_remainder),
 	T_CASE(test_free_all_resets_state),
 	/* Opt-in micro-benchmark: ~1s, skipped by the default (unfiltered) run.
 	 * Select with `--run <ere>` or TESTING_FILTER. */

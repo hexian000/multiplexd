@@ -18,15 +18,16 @@
 
 #include "mux/frame.h"
 #include "mux/mux.h"
+#include "mux/recv.h"
 #include "mux/sched.h"
 #include "mux/session.h"
 #include "mux/stream.h"
 #include "mux/unacked.h"
 #include "mux/wire.h"
 
+#include "meta/minmax.h"
 #include "os/clock.h"
 #include "utils/debug.h"
-#include "utils/minmax.h"
 #include "utils/slog.h"
 
 #include <ev.h>
@@ -259,16 +260,43 @@ send_pump(struct mux_session *restrict ss, bool *restrict made_progress)
 	}
 }
 
+/* True when there is send-side work outstanding: queued bytes, a resume
+ * retransmit not yet fully replayed (including one stalled by a frame-pool
+ * OOM before any copy reached wire.sendbuf -- send_queue_retransmit()'s
+ * SEND_STAGE_DONE-on-failure path leaves retransmit_off set with sendbuf
+ * still empty), or scheduler-side data/control waiting to be staged. */
+static bool send_has_pending_work(const struct mux_session *restrict ss)
+{
+	return ss->wire.sendbuf.head != NULL || ss->wire.oobbuf.head != NULL ||
+	       ss->sched.sched_head != NULL ||
+	       ss->unacked.retransmit_off != SIZE_MAX;
+}
+
 static void
 update_send_timeout(struct mux_session *restrict ss, const bool progress)
 {
-	if (!(ss->w_send_timeout.repeat > 0.0) ||
-	    ss->state != SESSION_ESTABLISHED) {
+	if (ss->state != SESSION_ESTABLISHED) {
 		return;
 	}
-	if (ss->wire.sendbuf.head == NULL && ss->wire.oobbuf.head == NULL &&
-	    ss->sched.sched_head == NULL) {
+	if (!send_has_pending_work(ss)) {
 		ev_timer_stop(ss->loop, &ss->w_send_timeout);
+		return;
+	}
+	/* TCP_USER_TIMEOUT (repeat == 0.0 below) covers "peer stopped acking
+	 * data we already wrote to the socket" by making this timer redundant
+	 * -- but a resume retransmit stalled on a frame-pool OOM never reached
+	 * the socket at all, so the kernel mechanism has nothing to time out
+	 * on. Force a real interval so this one case still gets retried. */
+	const bool oom_stalled = ss->unacked.retransmit_off != SIZE_MAX &&
+				 ss->wire.sendbuf.head == NULL;
+	if (oom_stalled && !(ss->w_send_timeout.repeat > 0.0)) {
+		ev_timer_set(
+			&ss->w_send_timeout, 0.0,
+			(double)ss->conf.send_timeout);
+		ev_timer_again(ss->loop, &ss->w_send_timeout);
+		return;
+	}
+	if (!(ss->w_send_timeout.repeat > 0.0)) {
 		return;
 	}
 	if (!ev_is_active(&ss->w_send_timeout) || progress) {
@@ -352,7 +380,12 @@ void session_on_send(struct mux_session *restrict ss)
 			return;
 		}
 	}
-	if (residue || cipher_residue) {
+	/* send_has_pending_work also catches a resume retransmit stalled by a
+	 * frame-pool OOM on the very first replay copy: send_pump's priority
+	 * ladder returns before ever attempting oobbuf/sched_head in that
+	 * case, so neither residue nor cipher_residue would otherwise notice
+	 * that work is still queued there too. */
+	if (residue || cipher_residue || send_has_pending_work(ss)) {
 		ss->wire.tx_pending = true;
 	}
 	ss->wire.send_blocked = residue;
@@ -360,6 +393,15 @@ void session_on_send(struct mux_session *restrict ss)
 	 * may have cleared; sched_schedule no-ops while it is still occupied. */
 	sched_schedule(ss);
 	update_send_timeout(ss, made_progress);
+	/* dispatch_frame's post-hello early return (recv.c)
+	 * defers already-buffered frames behind tx_pending. If tx_pending has
+	 * now genuinely settled to false -- e.g. every queued scheduler entry
+	 * was non-sendable (tombstoned during suspension), so nothing was
+	 * ever written to the peer -- no peer ACK is coming to trigger the
+	 * EV_READ that would otherwise re-drive dispatch; redispatch directly. */
+	if (!ss->wire.tx_pending && ss->state == SESSION_ESTABLISHED) {
+		session_dispatch_pending(ss);
+	}
 }
 
 void mux_notify_write(struct mux_session *ss)
@@ -408,7 +450,6 @@ bool session_send_push(
 		s->send_queue.head == NULL;
 	if (want_fin) {
 		flags |= MUX_FLAG_FIN;
-		stream_mark_fin_sent(s);
 	}
 
 	const struct mux_header hdr = {
@@ -439,7 +480,6 @@ bool session_send_push(
 	s->grant_sent += raw_inc * MUX_WINDOW_UNIT;
 	if (flags & MUX_FLAG_ACK) {
 		s->ack_pending = false;
-		ss->unacked.ack_pending = true;
 	}
 	/* ACK piggybacked on PUSH: cancel any pending delay. */
 	if (s->delay_pending) {
@@ -449,6 +489,13 @@ bool session_send_push(
 	if (LOGLEVEL(VERYVERBOSE)) {
 		session_log_frame_header(ss, "frame out", p, &hdr);
 	}
+
+	/* Last use of s: stream_mark_fin_sent() may free it synchronously if
+	 * this is the last active stream during a drain (same hazard fixed for
+	 * stream_recv_fin() in recv.c's dispatch_by_stream()). */
+	if (want_fin) {
+		stream_mark_fin_sent(s);
+	}
 	return true;
 }
 
@@ -456,9 +503,6 @@ bool session_send_ctrl(
 	struct mux_session *ss, const uint_fast16_t stream_id,
 	const uint_fast8_t flags, const uint_fast32_t extra)
 {
-	if (flags & MUX_FLAG_RST) {
-		COUNTER_ADD(ss->cnt.num_rst_sent, 1);
-	}
 	struct mux_frame *const frame =
 		mux_frame_get(&ss->pool, ss->max_payload);
 	if (frame == NULL) {
@@ -482,7 +526,25 @@ bool session_send_ctrl(
 	if (LOGLEVEL(VERYVERBOSE)) {
 		session_log_frame_header(ss, "frame out", frame->data, &hdr);
 	}
-	wire_sendbuf_push(ss, frame);
+	/* unacked_track_sent ring-tracks every non-STREAMID_CTRL frame it sees
+	 * flushed, so wire order must match ring order or a peer's cumulative
+	 * ACK can trim an entry that was never actually retransmitted.
+	 * Defer such a frame behind oobbuf while replay is in
+	 * progress instead of jumping the sendbuf head, so it waits for
+	 * send_stage_next's step 1 like every other producer already does;
+	 * session_suspend() migrates a still-pending one into the resume log
+	 * instead of dropping it if a second suspend intervenes. */
+	if (stream_id != STREAMID_CTRL &&
+	    ss->unacked.retransmit_off != SIZE_MAX) {
+		mux_frame_list_push(&ss->wire.oobbuf, frame);
+	} else {
+		wire_sendbuf_push(ss, frame);
+	}
+	/* Counted only once the RST is actually enqueued, matching every other
+	 * traffic counter in this file (an OOM above returns before this). */
+	if (flags & MUX_FLAG_RST) {
+		COUNTER_ADD(ss->cnt.num_rst_sent, 1);
+	}
 	mux_notify_write(ss);
 	return true;
 }
@@ -529,15 +591,20 @@ bool session_send_oob(
 
 void session_emit_ack(struct mux_session *restrict ss)
 {
-	const uint_fast32_t delta = unacked_ack_delta(ss);
-	const uint_fast32_t emit = MIN(delta, (uint_fast32_t)UINT16_MAX);
+	const uint_least32_t emit =
+		MIN(ss->unacked.unreported, (uint_least32_t)UINT16_MAX);
 	if (session_send_ctrl(ss, STREAMID_CTRL, MUX_FLAG_ACK, emit)) {
 		unacked_ack_emitted(ss, emit);
 	}
 }
 
-/* RST frames are kept (never suppress a queued RST); partially-flushed frames
- * (pos > 0) must finish to preserve framing sync, so they are never discarded. */
+/* RST sub-frames are kept (never suppress a queued RST); partially-flushed
+ * frames (pos > 0) must finish to preserve framing sync, so they are never
+ * touched. wire_sendbuf_push coalesces logical frames from *different* streams
+ * into one physical entry, so each entry is walked header-by-header and only
+ * the sub-frames belonging to stream_id are stripped -- deciding from the first
+ * header alone would either free another stream's still-unsent data or leave
+ * this stream's stale data to arrive after the RST. */
 void session_discard_stream_frames(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id)
 {
@@ -545,29 +612,96 @@ void session_discard_stream_frames(
 	struct mux_frame *frame = ss->wire.sendbuf.head;
 	while (frame != NULL) {
 		struct mux_frame *const next = frame->next;
-		bool discard = false;
-		if (frame->pos == 0 && frame->len >= MUX_FRAME_HEADER_SIZE) {
-			struct mux_header hdr;
-			mux_read_header(frame->data, &hdr);
-			discard =
-				(hdr.stream_id == stream_id &&
-				 (hdr.flags & MUX_FLAG_RST) == 0);
+
+		if (frame->pos != 0 || frame->len < MUX_FRAME_HEADER_SIZE) {
+			prev = frame;
+			frame = next;
+			continue;
 		}
-		/* While send_blocked, sendbuf.head is in flight at the transport and
-		 * the next tls_send must re-present the identical bytes; keep it and
-		 * discard only the rest. */
-		if (discard && ss->wire.send_blocked &&
-		    frame == ss->wire.sendbuf.head) {
-			discard = false;
+#if WITH_TLS
+		/* While send_blocked, a TLS-buffered sendbuf.head may already be
+		 * in flight inside the library -- SSL_write's own contract
+		 * requires the next call to re-present the identical bytes -- so
+		 * keep it intact. Plain TCP's send(2) has no such requirement. */
+		if (ss->wire.send_blocked && frame == ss->wire.sendbuf.head &&
+		    ss->wire.tlsconn != NULL) {
+			prev = frame;
+			frame = next;
+			continue;
 		}
-		if (!discard) {
+#endif /* WITH_TLS */
+
+		/* Pass 1: validate the concatenated layout and measure the bytes
+		 * that survive (everything not belonging to stream_id, plus any
+		 * RST sub-frame for it). */
+		size_t kept = 0;
+		bool malformed = false;
+		{
+			const unsigned char *src = frame->data;
+			const unsigned char *const end =
+				frame->data + frame->len;
+			while ((size_t)(end - src) >= MUX_FRAME_HEADER_SIZE) {
+				struct mux_header hdr;
+				mux_read_header(src, &hdr);
+				const size_t entry_len = MUX_FRAME_HEADER_SIZE +
+							 (size_t)hdr.length;
+				if ((size_t)(end - src) < entry_len) {
+					malformed = true;
+					break;
+				}
+				if (!(hdr.stream_id == stream_id &&
+				      (hdr.flags & MUX_FLAG_RST) == 0)) {
+					kept += entry_len;
+				}
+				src += entry_len;
+			}
+		}
+
+		/* Nothing to strip, or an unexpected layout: leave as-is. */
+		if (malformed || kept == frame->len) {
 			prev = frame;
 			frame = next;
 			continue;
 		}
 
-		/* Capture before the remove; afterwards sendbuf.tail no longer
-		 * points at frame. */
+		if (kept > 0) {
+			/* A retransmit copy must replay its ring entry verbatim for
+			 * resume byte-accounting, so it is never partially rewritten:
+			 * in the rare resume+abort overlap its stale sub-frame trails
+			 * the RST, the safe trade against desyncing the replay. */
+			if (frame == ss->unacked.retransmit_copy) {
+				prev = frame;
+				frame = next;
+				continue;
+			}
+			/* Pass 2: compact the survivors down in place. */
+			const unsigned char *src = frame->data;
+			const unsigned char *const end =
+				frame->data + frame->len;
+			unsigned char *dst = frame->data;
+			while ((size_t)(end - src) >= MUX_FRAME_HEADER_SIZE) {
+				struct mux_header hdr;
+				mux_read_header(src, &hdr);
+				const size_t entry_len = MUX_FRAME_HEADER_SIZE +
+							 (size_t)hdr.length;
+				if (!(hdr.stream_id == stream_id &&
+				      (hdr.flags & MUX_FLAG_RST) == 0)) {
+					if (dst != src) {
+						memmove(dst, src, entry_len);
+					}
+					dst += entry_len;
+				}
+				src += entry_len;
+			}
+			frame->len = (size_t)(dst - frame->data);
+			prev = frame;
+			frame = next;
+			continue;
+		}
+
+		/* kept == 0: every sub-frame belonged to stream_id; drop the whole
+		 * physical node. Capture the open-tail flag before the remove;
+		 * afterwards sendbuf.tail no longer points at frame. */
 		const bool discarding_open_tail =
 			ss->wire.sendbuf_staging &&
 			frame == ss->wire.sendbuf.tail;

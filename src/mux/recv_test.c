@@ -17,8 +17,8 @@
 #include "mux/wire.h"
 
 #include "algo/hashtable.h"
+#include "binary/serialize.h"
 #include "os/clock.h"
-#include "utils/serialize.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
@@ -46,6 +46,7 @@ static struct spies {
 	int recv_copy_calls;
 	size_t recv_copy_len;
 	int recv_rst_calls;
+	uint_fast16_t recv_rst_status;
 	int recv_fin_calls;
 	int recv_window_calls;
 	uint_fast32_t recv_window_inc;
@@ -196,10 +197,11 @@ void stream_recv_copy(
 	g.recv_copy_len = payload_len;
 }
 
-void stream_recv_rst(struct mux_stream *s)
+void stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
 {
 	(void)s;
 	g.recv_rst_calls++;
+	g.recv_rst_status = status;
 }
 
 void stream_recv_fin(struct mux_stream *s)
@@ -277,14 +279,14 @@ void sched_coalesce_arm(struct mux_session *ss)
 	g.coalesce_arm_calls++;
 }
 
-void estimator_add(struct mux_session *ss, uint_least64_t bytes)
+void estimator_add(struct mux_session *ss, uint_fast64_t bytes)
 {
 	(void)ss;
 	g.est_add_calls++;
 	g.est_add_bytes = bytes;
 }
 
-void estimator_add_acked(struct mux_session *ss, uint_least64_t bytes)
+void estimator_add_acked(struct mux_session *ss, uint_fast64_t bytes)
 {
 	(void)ss;
 	g.est_add_acked_calls++;
@@ -311,7 +313,7 @@ size_t estimator_tx_window_size(const struct estimator_ctx *est)
 }
 
 struct unacked_ack_result
-unacked_ack_trim(struct mux_session *ss, uint_fast32_t count)
+unacked_ack_recv(struct mux_session *ss, uint_fast32_t count)
 {
 	(void)ss;
 	g.ack_trim_calls++;
@@ -395,7 +397,7 @@ const struct table_opts mux_stream_table_opts = {
  * since this white-box TU does not link frame.c. */
 const struct mux_config mux_conf_default = {
 	.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE,
-	.tls_readahead = 128 * 1024,
+	.readahead = 128 * 1024,
 };
 
 /* Pull in the unit under test after the stubs so its references bind here. */
@@ -429,7 +431,7 @@ static int rf_setup(struct recv_fixture *restrict fx)
 		.state = SESSION_ESTABLISHED,
 		.max_payload =
 			(uint_least32_t)mux_conf_default.max_frame_payload,
-		.tls_readahead = (size_t)mux_conf_default.tls_readahead,
+		.readahead = (size_t)mux_conf_default.readahead,
 		.session_window = 8,
 		.stream_window = 4,
 		.wire = { .rx_open = true },
@@ -509,16 +511,23 @@ T_DECLARE_CASE(test_validate_flags_established)
 
 T_DECLARE_CASE(test_validate_flags_closing_states)
 {
-	/* CLOSE_WAIT / CLOSING accept only ACK and/or FIN. */
+	/* CLOSE_WAIT / CLOSING accept ACK and/or FIN, plus a resume-replayed
+	 * SYN|ACK (SYN is idempotent once ACK is present, same carve-out as
+	 * ESTABLISHED/FIN_WAIT) -- but never a bare SYN with no ACK. */
 	struct mux_stream cw = make_stream(1, STREAM_CLOSE_WAIT);
 	T_EXPECT(validate_flags_by_stream(&cw, MUX_FLAG_ACK));
 	T_EXPECT(validate_flags_by_stream(&cw, MUX_FLAG_FIN));
 	T_EXPECT(validate_flags_by_stream(&cw, MUX_FLAG_ACK | MUX_FLAG_FIN));
+	T_EXPECT(validate_flags_by_stream(&cw, MUX_FLAG_SYN | MUX_FLAG_ACK));
+	T_EXPECT(validate_flags_by_stream(
+		&cw, MUX_FLAG_SYN | MUX_FLAG_ACK | MUX_FLAG_PUSH));
 	T_EXPECT(!validate_flags_by_stream(&cw, 0));
 	T_EXPECT(!validate_flags_by_stream(&cw, MUX_FLAG_PUSH));
+	T_EXPECT(!validate_flags_by_stream(&cw, MUX_FLAG_SYN));
 
 	struct mux_stream cl = make_stream(1, STREAM_CLOSING);
 	T_EXPECT(validate_flags_by_stream(&cl, MUX_FLAG_FIN));
+	T_EXPECT(validate_flags_by_stream(&cl, MUX_FLAG_SYN | MUX_FLAG_ACK));
 	T_EXPECT(!validate_flags_by_stream(&cl, MUX_FLAG_SYN));
 }
 
@@ -679,6 +688,36 @@ T_DECLARE_CASE(test_update_stream_window_grows_and_iterates)
 	rf_teardown(&fx);
 }
 
+T_DECLARE_CASE(test_update_stream_window_floors_to_initial)
+{
+	struct recv_fixture fx;
+	if (rf_setup(&fx) != 0) {
+		T_FATAL("rf_setup failed");
+		return;
+	}
+	/* window_bytes=0 must clamp up to the initial-frames floor, exactly
+	 * like session_update_session_window, not just to 1 frame. */
+	const uint_least32_t initial =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	fx.ss.stream_window = 1;
+	session_update_stream_window(&fx.ss, 0);
+	T_EXPECT_EQ(fx.ss.stream_window, initial);
+	T_EXPECT(fx.ss.stream_window > (uint_least32_t)1);
+
+	/* A small but nonzero request still below the floor clamps the same
+	 * way. */
+	fx.ss.stream_window = 1;
+	session_update_stream_window(&fx.ss, (size_t)MUX_WINDOW_UNIT);
+	T_EXPECT_EQ(fx.ss.stream_window, initial);
+
+	/* Idempotent at the floor: a second call with the same low target
+	 * changes nothing further. */
+	session_update_stream_window(&fx.ss, (size_t)MUX_WINDOW_UNIT);
+	T_EXPECT_EQ(fx.ss.stream_window, initial);
+
+	rf_teardown(&fx);
+}
+
 /* dispatch_by_stream: routing for a known stream. */
 
 T_DECLARE_CASE(test_dispatch_by_stream_rst)
@@ -691,12 +730,17 @@ T_DECLARE_CASE(test_dispatch_by_stream_rst)
 	struct mux_stream s = make_stream(1, STREAM_ESTABLISHED);
 	struct mux_header h = { .version = MUX_PROTOCOL_VERSION,
 				.flags = MUX_FLAG_RST,
-				.stream_id = 1 };
+				.stream_id = 1,
+				.extra = MUX_STATUS_REFUSED_STREAM };
 	push_frame(&fx, &h);
 
 	dispatch_by_stream(&fx.ss, &s, &h);
 
 	T_EXPECT_EQ(g.recv_rst_calls, 1);
+	/* The peer's status code must reach stream_recv_rst,
+	 * not just trigger the call. */
+	T_EXPECT_EQ(
+		g.recv_rst_status, (uint_fast16_t)MUX_STATUS_REFUSED_STREAM);
 	T_EXPECT_EQ(ringbuf_readable(fx.ss.wire.recvbuf), (size_t)0);
 
 	rf_teardown(&fx);
@@ -722,6 +766,11 @@ T_DECLARE_CASE(test_dispatch_by_stream_invalid_flags_sends_rst)
 	T_EXPECT_EQ(g.send_ctrl_flags, (uint_fast8_t)MUX_FLAG_RST);
 	T_EXPECT(s.rst_sent);
 	T_EXPECT_EQ(g.recv_rst_calls, 1);
+	/* Not an actual peer RST, so this must report the
+	 * locally-decided reason (matching the RST just sent above), not
+	 * hdr->extra, which belongs to the invalid frame instead. */
+	T_EXPECT_EQ(
+		g.recv_rst_status, (uint_fast16_t)MUX_STATUS_PROTOCOL_ERROR);
 	T_EXPECT_EQ(ringbuf_readable(fx.ss.wire.recvbuf), (size_t)0);
 
 	rf_teardown(&fx);
@@ -1093,6 +1142,8 @@ T_DECLARE_CASE(test_dispatch_no_stream_accept_ok)
 	static struct mux_stream newstream;
 	newstream = make_stream(3, STREAM_SYN_RECEIVED);
 	g.stream_new_ret = &newstream;
+	mux_counter push_recv = 0;
+	fx.ss.cnt.traffic.byt_push_recv = &push_recv;
 	/* SYN|PUSH delivers initial payload through process_syn_payload. */
 	struct mux_header h = { .version = MUX_PROTOCOL_VERSION,
 				.flags = MUX_FLAG_SYN | MUX_FLAG_PUSH,
@@ -1107,6 +1158,11 @@ T_DECLARE_CASE(test_dispatch_no_stream_accept_ok)
 	T_EXPECT_EQ(g.recv_copy_calls, 1);
 	T_EXPECT_EQ(g.recv_copy_len, (size_t)16);
 	T_EXPECT_EQ(ringbuf_readable(fx.ss.wire.recvbuf), (size_t)0);
+	/* The fast-open payload counts into byt_push_recv, same as an ordinary
+	 * PUSH frame. */
+	T_EXPECT_EQ(
+		COUNTER_LOAD(fx.ss.cnt.traffic.byt_push_recv),
+		(uint_least64_t)16);
 
 	rf_teardown(&fx);
 }
@@ -1130,6 +1186,14 @@ T_DECLARE_CASE(test_dispatch_no_stream_stream_new_oom)
 
 	T_EXPECT_EQ(g.stream_new_calls, 1);
 	T_EXPECT_EQ(g.reset_calls, 0);
+	/* The frame is already counted into recv_seq, so
+	 * silently dropping it here (unlike the draining/max_streams
+	 * branches) would leave the peer's opener hanging in SYN_SENT with
+	 * no error signal. */
+	T_EXPECT_EQ(g.send_ctrl_calls, 1);
+	T_EXPECT_EQ(g.send_ctrl_flags, (uint_fast8_t)MUX_FLAG_RST);
+	T_EXPECT_EQ(
+		g.send_ctrl_extra, (uint_fast32_t)MUX_STATUS_INTERNAL_ERROR);
 	T_EXPECT_EQ(ringbuf_readable(fx.ss.wire.recvbuf), (size_t)0);
 
 	rf_teardown(&fx);
@@ -1157,30 +1221,23 @@ T_DECLARE_CASE(test_dispatch_no_stream_add_stream_fails)
 
 	T_EXPECT_EQ(g.add_stream_calls, 1);
 	T_EXPECT_EQ(g.stream_free_calls, 1);
+	/* Same as the stream_new OOM branch above -- the
+	 * frame is already counted into recv_seq, so this must not drop
+	 * silently either. */
+	T_EXPECT_EQ(g.send_ctrl_calls, 1);
+	T_EXPECT_EQ(g.send_ctrl_flags, (uint_fast8_t)MUX_FLAG_RST);
+	T_EXPECT_EQ(
+		g.send_ctrl_extra, (uint_fast32_t)MUX_STATUS_INTERNAL_ERROR);
 	T_EXPECT_EQ(ringbuf_readable(fx.ss.wire.recvbuf), (size_t)0);
 
 	rf_teardown(&fx);
 }
 
-T_DECLARE_CASE(test_dispatch_no_stream_reserved_flags_resets)
-{
-	struct recv_fixture fx;
-	if (rf_setup(&fx) != 0) {
-		T_FATAL("rf_setup failed");
-		return;
-	}
-	/* A non-SYN frame carrying a reserved flag bit closes the connection. */
-	struct mux_header h = { .version = MUX_PROTOCOL_VERSION,
-				.flags = 0x80,
-				.stream_id = 7 };
-	push_frame(&fx, &h);
-
-	dispatch_no_stream(&fx.ss, &h);
-
-	T_EXPECT_EQ(g.reset_calls, 1);
-
-	rf_teardown(&fx);
-}
+/* Reserved-flag rejection is enforced upstream by dispatch_frame (covered by
+ * test_dispatch_frame_reserved_flags_resets), which resets the session before
+ * dispatch_no_stream is ever reached; dispatch_no_stream now ASSERTs that
+ * invariant rather than re-checking it, so there is no reserved-flag path to
+ * exercise here. */
 
 T_DECLARE_CASE(test_dispatch_no_stream_late_nonsyn_rst)
 {
@@ -1344,6 +1401,56 @@ T_DECLARE_CASE(test_dispatch_frame_hello_routed_to_handshake)
 	rf_teardown(&fx);
 }
 
+/* A hello frame (version=0) arriving while still SESSION_HANDSHAKE -- its
+ * ordinary arrival state -- must still reach handshake_process_hello
+ * unaffected by the pre-established gate below. */
+T_DECLARE_CASE(test_dispatch_frame_hello_during_handshake_unaffected)
+{
+	struct recv_fixture fx;
+	if (rf_setup(&fx) != 0) {
+		T_FATAL("rf_setup failed");
+		return;
+	}
+	fx.ss.state = SESSION_HANDSHAKE;
+	struct mux_header h = { .version = 0, .stream_id = 0, .length = 4 };
+	push_frame(&fx, &h);
+
+	dispatch_frame(&fx.ss);
+
+	T_EXPECT_EQ(g.hello_calls, 1);
+	T_EXPECT_EQ(g.reset_calls, 0);
+	T_EXPECT_EQ(ringbuf_readable(fx.ss.wire.recvbuf), (size_t)0);
+
+	rf_teardown(&fx);
+}
+
+/* A well-formed mux frame (version=MUX_PROTOCOL_VERSION) MUST NOT be
+ * processed before the session reaches SESSION_ESTABLISHED (spec §5.2): one
+ * arriving mid-handshake is a protocol violation, not an ordinary frame. */
+T_DECLARE_CASE(test_dispatch_frame_nonhello_during_handshake_resets)
+{
+	struct recv_fixture fx;
+	if (rf_setup(&fx) != 0) {
+		T_FATAL("rf_setup failed");
+		return;
+	}
+	fx.ss.state = SESSION_HANDSHAKE;
+	struct mux_header h = { .version = MUX_PROTOCOL_VERSION,
+				.flags = MUX_FLAG_PUSH,
+				.stream_id = 2,
+				.length = 8 };
+	push_frame(&fx, &h);
+
+	dispatch_frame(&fx.ss);
+
+	T_EXPECT_EQ(g.reset_calls, 1);
+	/* The frame must not have reached ordinary stream dispatch. */
+	T_EXPECT_EQ(g.find_stream_calls, 0);
+	T_EXPECT_EQ(g.recv_copy_calls, 0);
+
+	rf_teardown(&fx);
+}
+
 T_DECLARE_CASE(test_dispatch_frame_session_ack_trims)
 {
 	struct recv_fixture fx;
@@ -1451,6 +1558,7 @@ T_DECLARE_CASE(test_dispatch_frame_data_forces_session_ack)
 	dispatch_frame(&fx.ss);
 
 	T_EXPECT_EQ(fx.ss.unacked.recv_seq, (uint_least32_t)2);
+	T_EXPECT_EQ(fx.ss.unacked.unreported, (uint_least32_t)2);
 	T_EXPECT_EQ(g.emit_ack_calls, 1);
 	T_EXPECT_EQ(g.recv_copy_calls, 2);
 	T_EXPECT_EQ(ringbuf_readable(fx.ss.wire.recvbuf), (size_t)0);
@@ -1726,6 +1834,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_update_session_window_floors_and_noop),
 	T_CASE(test_update_session_window_clears_stall_on_growth),
 	T_CASE(test_update_stream_window_grows_and_iterates),
+	T_CASE(test_update_stream_window_floors_to_initial),
 	T_CASE(test_dispatch_by_stream_rst),
 	T_CASE(test_dispatch_by_stream_invalid_flags_sends_rst),
 	T_CASE(test_dispatch_by_stream_synack_establishes),
@@ -1744,7 +1853,6 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_dispatch_no_stream_accept_ok),
 	T_CASE(test_dispatch_no_stream_stream_new_oom),
 	T_CASE(test_dispatch_no_stream_add_stream_fails),
-	T_CASE(test_dispatch_no_stream_reserved_flags_resets),
 	T_CASE(test_dispatch_no_stream_late_nonsyn_rst),
 	T_CASE(test_dispatch_no_stream_ignorable_terminal),
 	T_CASE(test_dispatch_frame_accepts_oversized_length),
@@ -1752,6 +1860,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_dispatch_frame_unsupported_version_resets),
 	T_CASE(test_dispatch_frame_reserved_flags_resets),
 	T_CASE(test_dispatch_frame_hello_routed_to_handshake),
+	T_CASE(test_dispatch_frame_hello_during_handshake_unaffected),
+	T_CASE(test_dispatch_frame_nonhello_during_handshake_resets),
 	T_CASE(test_dispatch_frame_session_ack_trims),
 	T_CASE(test_dispatch_frame_session_ack_overflow_resets),
 	T_CASE(test_dispatch_frame_ctrl_ping_pong_probe),

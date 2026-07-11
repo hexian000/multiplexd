@@ -170,7 +170,7 @@ multiplexd --gencerts client1,client2,client3 --sign ca
 | `--sni`      | hostname            | Server name for certificates (default: example.com)                                                   |
 | `--sign`     | name                | Sign generated certificates with the named signer (uses `<name>-cert.pem` and `<name>-key.pem`)       |
 | `--keytype`  | rsa, ecdsa, ed25519 | Key algorithm (default: rsa)                                                                          |
-| `--keysize`  | bits                | Key size in bits: RSA 4096 (default); ECDSA NIST P-224/256/384/521. Ignored when `--keytype ed25519`. |
+| `--keysize`  | bits                | Key size in bits: RSA 4096 (default, range 2048-16384); ECDSA NIST P-224/256/384/521. Ignored when `--keytype ed25519`. |
 
 Generated files: `<name>-cert.pem` and `<name>-key.pem`.
 
@@ -216,7 +216,7 @@ Omit the `tls` object on trusted networks if the lower overhead outweighs the lo
 
 The `identity` block lets a node advertise its own identity and maintain simultaneous sessions with multiple named peers.
 
-- `identity.claim` is this node's identity string, sent in every mux hello.
+- `identity.claim` is this node's identity string, sent in every mux hello. Limited to 255 octets (UTF-8, NUL excluded), the wire limit of the hello's identity extension; a longer value is rejected at config load or reload time.
 - `identity.mux_connect` is a list of mux endpoint addresses to dial. One outbound session is created per address, and the peer's identity is learned from the `ServerHello`.
 - `identity.listen` maps peer identities to local TCP listen addresses. Each listener routes accepted connections over the session whose peer announced that identity.
 - All inbound mux streams, regardless of peer identity, are forwarded to the root `connect` target.
@@ -333,11 +333,11 @@ Returns metrics in Prometheus exposition format, including cumulative counters a
 
 #### `GET /config`
 
-Returns the currently active configuration as JSON. TLS private key material is **not** included: `tls.cert`, `tls.key`, and `tls.authcerts` are erased from memory once loaded into the TLS context at startup, so they come back as empty strings over the API. (This differs from `--dump-config`, which runs before that erase and does inline the PEM.) Consequently the body of a `GET /config` cannot be fed straight back to `PUT /config` for a TLS-enabled config — supply the certificate references (`@path`) or PEM yourself.
+Returns the currently active configuration as JSON. TLS private key material is **not** included: `tls.cert`, `tls.key`, and `tls.authcerts` are erased from memory once loaded into the TLS context, whether that happened at startup or at the most recent config reload, so they come back as empty strings over the API. (This differs from `--dump-config`, which runs before that erase and does inline the PEM.) Consequently the body of a `GET /config` cannot be fed straight back to `PUT /config` for a TLS-enabled config — supply the certificate references (`@path`) or PEM yourself.
 
 #### `PUT /config`
 
-Replaces the active configuration with the JSON body of the request and performs a hot reload, identical in effect to `SIGHUP` with a new config file. The body must carry the full configuration, including TLS credentials (as `@path` references or inline PEM). Returns `204 No Content` on success or `400 Bad Request` if the body fails to parse.
+Replaces the active configuration with the JSON body of the request and performs a hot reload, identical in effect to `SIGHUP` with a new config file. The body must carry the full configuration, including TLS credentials (as `@path` references or inline PEM), and is capped at the same 65535-byte maximum as a config file loaded from disk. Returns `204 No Content` on success or `400 Bad Request` if the body fails to parse.
 
 ## Usage
 
@@ -468,6 +468,7 @@ Operational requirements:
 - A CA certificate in `authcerts` authorizes every peer certificate issued by that CA; a leaf certificate entry authorizes only that specific peer.
 - Compromise of a trusted CA key or an endpoint private key compromises peer authentication.
 - `*-key.pem` files and `--dump-config` output contain private key material and must be protected accordingly.
+- The `identity` extension (`identity.claim`) is a self-declared routing key, not cryptographically bound to the presenting certificate. If `authcerts` is a shared CA, any peer holding a certificate issued by that CA can claim any identity string; use per-peer leaf certificates in `authcerts` instead of a shared CA where distinct peers must not be able to impersonate each other's identity.
 
 ### Connection Backoff
 
@@ -475,7 +476,7 @@ The `max_startups` option (`start:rate:full` format, where `rate` is a percentag
 
 ### API Server
 
-`api_listen` exposes unauthenticated runtime statistics. **Bind it to the loopback address** (`127.0.0.1` or `::1`); never expose it to untrusted networks. A warning is logged at startup if a non-local address is configured.
+`api_listen` exposes unauthenticated runtime statistics. **Bind it to the loopback address** (`127.0.0.1` or `::1`); never expose it to untrusted networks. A warning is logged if a non-local address is configured, both at startup and whenever a config reload changes `api_listen` to a new address.
 
 ### Configuration Reload
 

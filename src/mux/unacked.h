@@ -37,17 +37,15 @@ struct unacked_ctx {
 	uint_least32_t send_seq;
 	/* Count of non-stream-0 frames received. */
 	uint_least32_t recv_seq;
-	/* recv_seq value at the time of the last session ACK emission. */
-	uint_least32_t ack_seq;
+	/* Frames processed but not yet reported in a session ACK (spec §5.7.3);
+	 * a plain count, not a serial number. */
+	uint_least32_t unreported;
 	/* Cumulative send_seq acknowledged by the peer; 32-bit serial number
 	 * (RFC 1982) — resume comparison uses serial_lt32. */
 	uint_least32_t last_ack_recv;
 	/* Ticks since the last session ACK while frames are pending; reset on
-	 * emission or when recv_seq == ack_seq. */
+	 * emission or when unreported == 0. */
 	uint_least8_t ack_ticks;
-	/* A stream ACK was sent since the last session ACK; schedule a
-	 * session-level ACK piggyback. */
-	bool ack_pending : 1;
 	/* The unacked ring has reached the session window cap; data frame sends
 	 * are suspended until the peer acknowledges frames. */
 	bool stalled : 1;
@@ -72,17 +70,24 @@ struct unacked_ack_result {
  * push the rest for possible resume replay.  Takes ownership of frame. */
 void unacked_track_sent(struct mux_session *ss, struct mux_frame *frame);
 
-/* Trim count logical frames from the unacked ring after a session-level ACK
- * from the peer; see struct unacked_ack_result. */
+/* Trim count logical frames from the unacked ring; see struct
+ * unacked_ack_result.  Internal primitive shared by unacked_ack_recv and
+ * unacked_resume_ack_recv; callers processing a peer frame should use
+ * unacked_ack_recv instead (see below). */
 struct unacked_ack_result
 unacked_ack_trim(struct mux_session *ss, uint_fast32_t count);
 
-/* Apply the peer's resume_seq from a resume hello: trim the ring and position
- * the retransmit cursor.  Returns false on protocol violation. */
-bool unacked_resume_ack_recv(struct mux_session *ss, uint_least32_t peer_ack);
+/* Handle a session-level ACK from a peer frame received during normal
+ * operation (dispatch_ctrl_frame's MUX_FLAG_ACK path). Bounds count by what
+ * has actually been retransmitted so far when mid-replay, then trims via
+ * unacked_ack_trim; see struct unacked_ack_result. */
+struct unacked_ack_result
+unacked_ack_recv(struct mux_session *ss, uint_fast32_t count);
 
-/* recv_seq - ack_seq: the number of received frames awaiting a session ACK. */
-uint_fast32_t unacked_ack_delta(const struct mux_session *ss);
+/* Apply the peer's resume_seq from a resume hello: trim the ring and position
+ * the retransmit cursor.  Returns false on protocol violation; the ring may be
+ * partially trimmed by then, so the caller must tear the session down. */
+bool unacked_resume_ack_recv(struct mux_session *ss, uint_least32_t peer_ack);
 
 /* Record that a session ACK covering emit frames was emitted. */
 void unacked_ack_emitted(struct mux_session *ss, uint_fast32_t emit);

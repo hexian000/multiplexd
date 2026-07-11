@@ -15,14 +15,26 @@ void wndfilter_reset(
 	w->ready = true;
 }
 
+/* Elapsed time as an unsigned delta. The reference BBR filter subtracts u32
+ * timestamps, whose wraparound is well-defined; computing the delta in signed
+ * int_fast64_t here could instead reach signed-overflow UB for an extreme t
+ * gap. Window values are non-negative, so the unsigned comparisons below match
+ * the signed originals for any realistic (monotonic) timestamp. */
+static inline uint_fast64_t
+time_delta(const int_fast64_t now, const int_fast64_t then)
+{
+	return (uint_fast64_t)now - (uint_fast64_t)then;
+}
+
 /* As time advances, update the 1st, 2nd, and 3rd best slots. */
 static int_fast64_t subwin_update(
 	struct wndfilter *restrict w, const int_fast64_t wnd,
 	const struct wndfilter_sample *restrict val)
 {
-	const int_fast64_t dt = val->t - w->s[0].t;
+	const uint_fast64_t uwnd = (uint_fast64_t)wnd;
+	const uint_fast64_t dt = time_delta(val->t, w->s[0].t);
 
-	if (dt > wnd) {
+	if (dt > uwnd) {
 		/*
 		 * Passed the entire window without a new val so shift the
 		 * 2nd and 3rd choices forward.  Iterate once because the
@@ -31,18 +43,18 @@ static int_fast64_t subwin_update(
 		w->s[0] = w->s[1];
 		w->s[1] = w->s[2];
 		w->s[2] = *val;
-		if (val->t - w->s[0].t > wnd) {
+		if (time_delta(val->t, w->s[0].t) > uwnd) {
 			w->s[0] = w->s[1];
 			w->s[1] = w->s[2];
 			w->s[2] = *val;
 		}
-	} else if (w->s[1].t == w->s[0].t && dt > wnd / 4) {
+	} else if (w->s[1].t == w->s[0].t && dt > uwnd / 4) {
 		/*
 		 * A quarter-window passed without a new val so take a fresh
 		 * 2nd choice from the 2nd quarter of the window.
 		 */
 		w->s[2] = w->s[1] = *val;
-	} else if (w->s[2].t == w->s[1].t && dt > wnd / 2) {
+	} else if (w->s[2].t == w->s[1].t && dt > uwnd / 2) {
 		/*
 		 * Half the window passed without a new val so take a fresh
 		 * 3rd choice from the last half of the window.
@@ -62,7 +74,8 @@ int_fast64_t wndfilter_update_min(
 	}
 	const struct wndfilter_sample val = { .t = t, .v = v };
 
-	if (val.v <= w->s[0].v || val.t - w->s[2].t > wnd) {
+	if (val.v <= w->s[0].v ||
+	    time_delta(val.t, w->s[2].t) > (uint_fast64_t)wnd) {
 		wndfilter_reset(w, t, v);
 		return w->s[0].v;
 	}
@@ -84,7 +97,8 @@ int_fast64_t wndfilter_update_max(
 	}
 	const struct wndfilter_sample val = { .t = t, .v = v };
 
-	if (val.v >= w->s[0].v || val.t - w->s[2].t > wnd) {
+	if (val.v >= w->s[0].v ||
+	    time_delta(val.t, w->s[2].t) > (uint_fast64_t)wnd) {
 		wndfilter_reset(w, t, v);
 		return w->s[0].v;
 	}

@@ -39,7 +39,6 @@ static int g_sendbuf_push_calls;
 static uint_fast32_t g_grant_inc;
 static int g_mark_fin_sent_calls;
 static int g_delay_remove_calls;
-static uint_fast32_t g_unacked_delta;
 static int g_ack_emitted_calls;
 static uint_fast32_t g_ack_emitted_last;
 static bool g_wire_send_ret;
@@ -48,6 +47,7 @@ static int g_wire_send_calls;
 static int g_track_sent_calls;
 static int g_suspend_calls;
 static int g_reset_calls;
+static int g_dispatch_pending_calls;
 
 static void spies_reset(void)
 {
@@ -60,7 +60,6 @@ static void spies_reset(void)
 	g_grant_inc = 0;
 	g_mark_fin_sent_calls = 0;
 	g_delay_remove_calls = 0;
-	g_unacked_delta = 0;
 	g_ack_emitted_calls = 0;
 	g_ack_emitted_last = 0;
 	g_wire_send_ret = true;
@@ -69,6 +68,7 @@ static void spies_reset(void)
 	g_track_sent_calls = 0;
 	g_suspend_calls = 0;
 	g_reset_calls = 0;
+	g_dispatch_pending_calls = 0;
 }
 
 void sched_schedule(struct mux_session *ss)
@@ -98,12 +98,13 @@ bool sched_next_data(struct mux_session *restrict ss)
 
 /* Benign no-op stubs for the remaining session.c collaborators */
 
-void dispatch_frame(struct mux_session *ss)
+void session_dispatch_pending(struct mux_session *ss)
 {
 	(void)ss;
+	g_dispatch_pending_calls++;
 }
 
-void estimator_add_acked(struct mux_session *restrict ss, uint_least64_t bytes)
+void estimator_add_acked(struct mux_session *restrict ss, uint_fast64_t bytes)
 {
 	(void)ss;
 	(void)bytes;
@@ -273,10 +274,10 @@ enum wire_shutdown_state wire_shutdown(struct mux_session *ss)
 	return WIRE_SHUTDOWN_DONE;
 }
 
-bool wire_wait_eof(struct mux_session *ss)
+enum wire_eof_result wire_wait_eof(struct mux_session *ss)
 {
 	(void)ss;
-	return false;
+	return WIRE_EOF_ERROR;
 }
 
 #if WITH_TLS
@@ -324,7 +325,7 @@ const struct table_opts mux_stream_table_opts = { 0 };
  * since this white-box TU does not link frame.c. */
 const struct mux_config mux_conf_default = {
 	.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE,
-	.tls_readahead = 128 * 1024,
+	.readahead = 128 * 1024,
 };
 
 /* Session-core collaborators: send.c calls back into these for watcher/state
@@ -377,12 +378,6 @@ void unacked_track_sent(struct mux_session *ss, struct mux_frame *frame)
 	 * tests, which fully send a frame, do not leak it. */
 	g_track_sent_calls++;
 	mux_frame_put(&ss->pool, frame);
-}
-
-uint_fast32_t unacked_ack_delta(const struct mux_session *ss)
-{
-	(void)ss;
-	return g_unacked_delta;
 }
 
 void unacked_ack_emitted(struct mux_session *ss, uint_fast32_t emit)
@@ -472,6 +467,12 @@ static int si_setup(struct si_fixture *restrict fx)
 		.max_payload = MUX_MAX_PAYLOAD_SIZE,
 		.wire = {
 			.rx_open = true,
+		},
+		/* Matches session_new()'s real default: SIZE_MAX means "no resume
+		 * replay in progress", not the zero-init compound literal would
+		 * otherwise leave here. */
+		.unacked = {
+			.retransmit_off = SIZE_MAX,
 		},
 	};
 	ev_io_init(&fx->ss.w_socket, si_noop_io_cb, fx->pipefd[0], EV_READ);
@@ -638,6 +639,32 @@ static void si_queue_ctrl(
 	mux_frame_list_push(&fx->ss.wire.sendbuf, f);
 }
 
+/* Build one physical sendbuf entry that coalesces @n zero-payload sub-frames
+ * from the given (stream_id, flags) pairs -- mirroring wire_sendbuf_push's
+ * packing of multiple logical frames (possibly from different streams) into a
+ * single node -- append it, and return it. */
+static struct mux_frame *si_queue_coalesced(
+	struct si_fixture *restrict fx, const uint_least16_t *restrict ids,
+	const uint_least8_t *restrict flags, const size_t n)
+{
+	struct mux_frame *const f = si_alloc_frame(fx, 0);
+	if (f == NULL) {
+		return NULL;
+	}
+	for (size_t i = 0; i < n; i++) {
+		const struct mux_header h = {
+			.version = MUX_PROTOCOL_VERSION,
+			.flags = flags[i],
+			.length = 0,
+			.stream_id = ids[i],
+		};
+		mux_write_header(f->data + i * MUX_FRAME_HEADER_SIZE, &h);
+	}
+	f->len = n * MUX_FRAME_HEADER_SIZE;
+	mux_frame_list_push(&fx->ss.wire.sendbuf, f);
+	return f;
+}
+
 /* session_send_ctrl encodes the header, clamps Extra to 16 bits, queues the
  * frame, and wakes the writer. */
 T_DECLARE_CASE(test_send_ctrl_encodes_and_clamps)
@@ -675,12 +702,16 @@ T_DECLARE_CASE(test_send_ctrl_oom)
 	}
 	spies_reset();
 	fx.pool_ctx.fail = true;
+	mux_counter rst_sent = 0;
+	fx.ss.cnt.num_rst_sent = &rst_sent;
 
 	const bool ok = session_send_ctrl(&fx.ss, 5, MUX_FLAG_RST, 0);
 
 	T_EXPECT(!ok);
 	T_EXPECT_EQ(g_sendbuf_push_calls, 0);
 	T_EXPECT(fx.ss.wire.sendbuf.head == NULL);
+	/* The RST was never enqueued, so num_rst_sent must not have counted it. */
+	T_EXPECT_EQ(COUNTER_LOAD(fx.ss.cnt.num_rst_sent), (uint_least64_t)0);
 
 	si_teardown(&fx);
 }
@@ -809,15 +840,14 @@ T_DECLARE_CASE(test_send_push_ack_fin)
 	T_EXPECT_EQ((int)h.extra, 2);
 	T_EXPECT_EQ(g_mark_fin_sent_calls, 1);
 	T_EXPECT_EQ(g_delay_remove_calls, 1);
-	T_EXPECT(fx.ss.unacked.ack_pending);
 	T_EXPECT_EQ(s.grant_sent, (uint_least32_t)(2u * MUX_WINDOW_UNIT));
 
 	si_teardown(&fx);
 }
 
-/* session_emit_ack sends a session-level ACK carrying the unacked delta and
- * records the emission. */
-T_DECLARE_CASE(test_emit_ack_sends_delta)
+/* session_emit_ack sends a session-level ACK carrying the unreported count
+ * and records the emission. */
+T_DECLARE_CASE(test_emit_ack_sends_unreported)
 {
 	struct si_fixture fx;
 	if (si_setup(&fx) != 0) {
@@ -825,7 +855,7 @@ T_DECLARE_CASE(test_emit_ack_sends_delta)
 		return;
 	}
 	spies_reset();
-	g_unacked_delta = 3;
+	fx.ss.unacked.unreported = 3;
 
 	session_emit_ack(&fx.ss);
 
@@ -841,8 +871,8 @@ T_DECLARE_CASE(test_emit_ack_sends_delta)
 	si_teardown(&fx);
 }
 
-/* The session ACK delta is clamped to the 16-bit Extra field. */
-T_DECLARE_CASE(test_emit_ack_clamps_delta)
+/* The session ACK count is clamped to the 16-bit Extra field. */
+T_DECLARE_CASE(test_emit_ack_clamps_unreported)
 {
 	struct si_fixture fx;
 	if (si_setup(&fx) != 0) {
@@ -850,7 +880,7 @@ T_DECLARE_CASE(test_emit_ack_clamps_delta)
 		return;
 	}
 	spies_reset();
-	g_unacked_delta = 70000; /* > UINT16_MAX */
+	fx.ss.unacked.unreported = 70000; /* > UINT16_MAX */
 
 	session_emit_ack(&fx.ss);
 
@@ -884,6 +914,110 @@ T_DECLARE_CASE(test_discard_stream_frames_selective)
 			h.stream_id == 5 && (h.flags & MUX_FLAG_RST) == 0;
 		T_EXPECT(!is_unsent_stream5_data);
 	}
+
+	si_teardown(&fx);
+}
+
+/* A single physical entry coalescing frames from two streams: discarding one
+ * stream strips only its non-RST sub-frames in place and keeps the other
+ * stream's data (and the target's own RST) -- not an all-or-nothing decision
+ * from the first header, which would either free stream 7's data or leave
+ * stream 5's stale data behind. */
+T_DECLARE_CASE(test_discard_stream_frames_compacts_coalesced_entry)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	const uint_least16_t ids[4] = { 5, 7, 5, 5 };
+	const uint_least8_t flags[4] = { MUX_FLAG_PUSH, MUX_FLAG_PUSH,
+					 MUX_FLAG_RST, MUX_FLAG_PUSH };
+	struct mux_frame *const node = si_queue_coalesced(&fx, ids, flags, 4);
+	T_CHECK(node != NULL);
+
+	session_discard_stream_frames(&fx.ss, 5);
+
+	/* The node survives, compacted to [stream 7 PUSH | stream 5 RST]. */
+	T_EXPECT_EQ(fx.ss.wire.sendbuf.count, (size_t)1);
+	T_EXPECT(fx.ss.wire.sendbuf.head == node);
+	T_EXPECT_EQ(node->len, (size_t)(2 * MUX_FRAME_HEADER_SIZE));
+	struct mux_header h0;
+	struct mux_header h1;
+	mux_read_header(node->data, &h0);
+	mux_read_header(node->data + MUX_FRAME_HEADER_SIZE, &h1);
+	T_EXPECT_EQ((int)h0.stream_id, 7);
+	T_EXPECT_EQ((int)h0.flags, MUX_FLAG_PUSH);
+	T_EXPECT_EQ((int)h1.stream_id, 5);
+	T_EXPECT_EQ((int)(h1.flags & MUX_FLAG_RST), MUX_FLAG_RST);
+
+	si_teardown(&fx);
+}
+
+/* When every sub-frame of the entry belongs to the discarded stream and the
+ * entry is the in-flight retransmit copy, the whole node is removed and
+ * ss->unacked.retransmit_copy is cleared so unacked_track_sent's later identity
+ * check cannot match a freed pointer. */
+T_DECLARE_CASE(test_discard_stream_frames_clears_retransmit_copy)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	const uint_least16_t ids[2] = { 5, 5 };
+	const uint_least8_t flags[2] = { MUX_FLAG_PUSH, MUX_FLAG_PUSH };
+	struct mux_frame *const copy = si_queue_coalesced(&fx, ids, flags, 2);
+	T_CHECK(copy != NULL);
+	fx.ss.unacked.retransmit_copy = copy;
+
+	session_discard_stream_frames(&fx.ss, 5);
+
+	T_EXPECT_EQ(fx.ss.wire.sendbuf.count, (size_t)0);
+	T_EXPECT(fx.ss.unacked.retransmit_copy == NULL);
+
+	si_teardown(&fx);
+}
+
+/* A coalesced entry that survives partial stripping (kept > 0) but IS the
+ * in-flight retransmit copy is left byte-for-byte intact, not compacted: the
+ * copy must replay its ring entry verbatim so resume byte-accounting (send_seq
+ * advanced by the entry's unacked_count) stays exact, so its stripped-stream
+ * sub-frame is deliberately left trailing the RST. Contrast
+ * test_discard_stream_frames_compacts_coalesced_entry, which compacts the same
+ * layout when it is NOT the retransmit copy. */
+T_DECLARE_CASE(test_discard_stream_frames_keeps_retransmit_copy_verbatim)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	const uint_least16_t ids[4] = { 5, 7, 5, 5 };
+	const uint_least8_t flags[4] = { MUX_FLAG_PUSH, MUX_FLAG_PUSH,
+					 MUX_FLAG_RST, MUX_FLAG_PUSH };
+	struct mux_frame *const copy = si_queue_coalesced(&fx, ids, flags, 4);
+	T_CHECK(copy != NULL);
+	fx.ss.unacked.retransmit_copy = copy;
+
+	/* Snapshot the exact wire bytes before the discard. */
+	const size_t orig_len = copy->len;
+	unsigned char before[4 * MUX_FRAME_HEADER_SIZE];
+	T_CHECK(orig_len == sizeof(before));
+	memcpy(before, copy->data, orig_len);
+
+	session_discard_stream_frames(&fx.ss, 5);
+
+	/* The node is kept, uncompacted (all four sub-frames still present),
+	 * and remains the active retransmit copy. */
+	T_EXPECT_EQ(fx.ss.wire.sendbuf.count, (size_t)1);
+	T_EXPECT(fx.ss.wire.sendbuf.head == copy);
+	T_EXPECT(fx.ss.unacked.retransmit_copy == copy);
+	T_EXPECT_EQ(copy->len, orig_len);
+	T_EXPECT_MEMEQ(copy->data, before, orig_len);
 
 	si_teardown(&fx);
 }
@@ -1078,6 +1212,178 @@ T_DECLARE_CASE(test_update_send_timeout_rearms_while_pending)
 	si_teardown(&fx);
 }
 
+/* TCP_USER_TIMEOUT zeroes w_send_timeout.repeat, on the
+ * (correct, for every other case) assumption that the kernel mechanism
+ * covers "peer stopped acking data we already wrote to the socket". A resume
+ * retransmit stalled by a frame-pool OOM never reached the socket at all --
+ * retransmit_off stays set with sendbuf still empty -- so the kernel has
+ * nothing to time out on either. update_send_timeout must still arm a real
+ * interval for this one case, or #25's watchdog fix is unreachable dead code
+ * on every build where TCP_USER_TIMEOUT actually works (i.e. Linux). */
+T_DECLARE_CASE(
+	test_update_send_timeout_arms_despite_kernel_timeout_for_oom_stall)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	ev_timer_init(&fx.ss.w_send_timeout, si_noop_timer_cb, 0.0, 0.0);
+	fx.ss.w_send_timeout.data = &fx.ss;
+	fx.ss.conf.send_timeout = 5;
+	/* retransmit_off != SIZE_MAX with an empty sendbuf is exactly the
+	 * signature send_queue_retransmit's OOM path (send.c:147-150) leaves
+	 * behind: nothing to copy from was ever reached. */
+	fx.ss.unacked.retransmit_off = 0;
+
+	update_send_timeout(&fx.ss, false);
+
+	T_EXPECT(ev_is_active(&fx.ss.w_send_timeout));
+	T_EXPECT(fx.ss.w_send_timeout.repeat > 0.0);
+
+	ev_timer_stop(fx.ss.loop, &fx.ss.w_send_timeout);
+	fx.ss.unacked.retransmit_off = SIZE_MAX;
+	si_teardown(&fx);
+}
+
+/* Once the retransmit copy actually reaches sendbuf, the kernel mechanism
+ * covers it again like any other queued bytes -- oom_stalled in
+ * update_send_timeout must require an empty sendbuf, not just
+ * retransmit_off != SIZE_MAX, else it would keep forcing a redundant
+ * userspace re-arm for the entire remainder of a normal replay. */
+T_DECLARE_CASE(test_update_send_timeout_trusts_kernel_once_sendbuf_queued)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	ev_timer_init(&fx.ss.w_send_timeout, si_noop_timer_cb, 0.0, 0.0);
+	fx.ss.w_send_timeout.data = &fx.ss;
+	fx.ss.conf.send_timeout = 5;
+	fx.ss.unacked.retransmit_off = 0;
+	(void)si_queue_sendbuf(&fx, 16); /* replay copy already staged */
+
+	update_send_timeout(&fx.ss, false);
+
+	T_EXPECT(!ev_is_active(&fx.ss.w_send_timeout));
+	T_EXPECT(!(fx.ss.w_send_timeout.repeat > 0.0));
+
+	fx.ss.unacked.retransmit_off = SIZE_MAX;
+	si_teardown(&fx);
+}
+
+/* send_stage_next's priority ladder tries the resume
+ * retransmit first and, on a frame-pool OOM, returns SEND_STAGE_DONE
+ * immediately -- before ever attempting oobbuf/sched_head, even if either
+ * has independent work queued. session_on_send's old tx_pending computation
+ * (residue || cipher_residue, i.e. sendbuf non-empty or ciphertext blocked)
+ * missed this entirely: sendbuf stays empty since no copy was ever produced
+ * to push onto it, so tx_pending would incorrectly end up false with
+ * retransmit_off still != SIZE_MAX -- silently dropping EV_WRITE and
+ * tripping session_update_watcher's invariant ASSERT the next time it runs
+ * with sched_head/oobbuf non-empty. */
+T_DECLARE_CASE(test_session_on_send_sets_tx_pending_for_oom_stalled_retransmit)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	fx.ss.unacked.retransmit_off = 0; /* replay pending, ring left NULL:
+	                                    * send_queue_retransmit's OOM
+	                                    * check runs before ever
+	                                    * dereferencing it */
+	fx.pool_ctx.fail = true; /* every mux_frame_get() call fails */
+
+	session_on_send(&fx.ss);
+
+	T_EXPECT(fx.ss.wire.sendbuf.head == NULL);
+	T_EXPECT(fx.ss.unacked.retransmit_off != SIZE_MAX);
+	T_EXPECT(fx.ss.wire.tx_pending);
+
+	fx.ss.unacked.retransmit_off = SIZE_MAX;
+	si_teardown(&fx);
+}
+
+/* dispatch_frame's post-hello early return (recv.c) can
+ * strand already-buffered frames in wire.recvbuf when tx_pending was true
+ * only because of non-sendable work that resolves without ever writing a
+ * byte to the peer -- no peer ACK is then coming to trigger the EV_READ
+ * that would otherwise re-drive dispatch. session_on_send must redispatch
+ * directly once tx_pending has genuinely settled to false. */
+T_DECLARE_CASE(test_send_cb_redispatches_once_tx_pending_settles_false)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.unacked.retransmit_off = SIZE_MAX; /* no replay in progress */
+	fx.ss.wire.tx_pending = true;
+	/* sendbuf/oobbuf/sched_head all empty, sched_next_data mocked to
+	 * never produce: send_pump finds nothing sendable, tx_pending settles
+	 * to false with no bytes ever written. */
+
+	session_on_send(&fx.ss);
+
+	T_EXPECT(!fx.ss.wire.tx_pending);
+	T_EXPECT_EQ(g_dispatch_pending_calls, 1);
+
+	si_teardown(&fx);
+}
+
+/* Transport-blocked residue keeps tx_pending true; redispatching stranded
+ * frames now (before the blocked write even clears) would be premature. */
+T_DECLARE_CASE(test_send_cb_no_redispatch_while_tx_pending_true)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.unacked.retransmit_off = SIZE_MAX;
+	fx.ss.wire.tx_pending = true;
+	g_wire_send_nsend = 0; /* EAGAIN: leaves the staged frame as residue */
+	struct mux_frame *const f = si_queue_sendbuf(&fx, 16);
+	T_CHECK(f != NULL);
+
+	session_on_send(&fx.ss);
+
+	T_EXPECT(fx.ss.wire.tx_pending);
+	T_EXPECT_EQ(g_dispatch_pending_calls, 0);
+
+	si_teardown(&fx);
+}
+
+/* Redispatch is gated on SESSION_ESTABLISHED, mirroring dispatch_frame's own
+ * post-hello check: mid-handshake there is nothing to have stranded yet. */
+T_DECLARE_CASE(test_send_cb_no_redispatch_outside_established)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	fx.ss.state = SESSION_HANDSHAKE;
+	fx.ss.unacked.retransmit_off = SIZE_MAX;
+	fx.ss.wire.tx_pending = true;
+
+	session_on_send(&fx.ss);
+
+	T_EXPECT_EQ(g_dispatch_pending_calls, 0);
+
+	si_teardown(&fx);
+}
+
 /* flush_sendbuf_head returns "no work" when the sendbuf is empty. */
 T_DECLARE_CASE(test_flush_head_empty_sendbuf)
 {
@@ -1225,6 +1531,99 @@ T_DECLARE_CASE(test_retransmit_skips_acked_head_prefix)
 	si_teardown(&fx); /* clears sendbuf, freeing the replay copy */
 }
 
+/* A real-stream control frame (e.g. the RST recv.c sends for
+ * a late frame on a closed stream) must not jump ahead of not-yet-
+ * retransmitted ring entries while a resume replay is in progress, or a
+ * peer's cumulative ACK could trim an entry that was never actually
+ * transmitted. session_send_ctrl must defer such a frame behind oobbuf
+ * instead of pushing it straight onto the sendbuf head. */
+T_DECLARE_CASE(test_send_ctrl_defers_ring_tracked_frame_during_replay)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+
+	/* Two-entry unacked ring; only the first has been retransmitted so far
+	 * (retransmit_off=1), matching mid-replay progress with more to go. */
+	struct mux_frame *const e0 =
+		mux_frame_get(&fx.ss.pool, fx.ss.max_payload);
+	struct mux_frame *const e1 =
+		mux_frame_get(&fx.ss.pool, fx.ss.max_payload);
+	T_CHECK(e0 != NULL && e1 != NULL);
+	mux_write_header(
+		e0->data, &(struct mux_header){ .version = MUX_PROTOCOL_VERSION,
+						.flags = MUX_FLAG_PUSH,
+						.stream_id = 11 });
+	e0->len = MUX_FRAME_HEADER_SIZE;
+	e0->unacked_count = 1;
+	mux_write_header(
+		e1->data, &(struct mux_header){ .version = MUX_PROTOCOL_VERSION,
+						.flags = MUX_FLAG_PUSH,
+						.stream_id = 11 });
+	e1->len = MUX_FRAME_HEADER_SIZE;
+	e1->unacked_count = 1;
+
+	struct mux_frame_ring *const ring =
+		malloc(sizeof(struct mux_frame_ring) +
+		       MUX_FRAME_RING_MIN * sizeof(struct mux_frame *));
+	T_CHECK(ring != NULL);
+	*ring = (struct mux_frame_ring){
+		.capacity = MUX_FRAME_RING_MIN,
+		.count = 2,
+	};
+	ring->entries[0] = e0;
+	ring->entries[1] = e1;
+	fx.ss.unacked.ring = ring;
+	fx.ss.unacked.retransmit_off = 1; /* e0 retransmitted, e1 pending */
+
+	/* A late-frame RST for a real (unrelated) stream must not jump ahead
+	 * of e1, still awaiting replay. */
+	T_CHECK(session_send_ctrl(
+		&fx.ss, 33, MUX_FLAG_RST, MUX_STATUS_PROTOCOL_ERROR));
+
+	T_EXPECT(fx.ss.wire.sendbuf.head == NULL);
+	T_EXPECT(fx.ss.wire.oobbuf.head != NULL);
+	if (fx.ss.wire.oobbuf.head != NULL) {
+		struct mux_header h;
+		mux_read_header(fx.ss.wire.oobbuf.head->data, &h);
+		T_EXPECT_EQ((int)h.stream_id, 33);
+		T_EXPECT_EQ((int)h.flags, MUX_FLAG_RST);
+	}
+
+	/* A STREAMID_CTRL frame (e.g. a session ACK) never enters the unacked
+	 * ring, so it is unaffected and still flows immediately. */
+	T_CHECK(session_send_ctrl(&fx.ss, STREAMID_CTRL, MUX_FLAG_ACK, 0));
+	T_EXPECT(fx.ss.wire.sendbuf.head != NULL);
+
+	fx.ss.unacked.ring = NULL;
+	mux_frame_put(&fx.ss.pool, e0);
+	mux_frame_put(&fx.ss.pool, e1);
+	free(ring);
+	si_teardown(&fx); /* clears sendbuf and oobbuf */
+}
+
+/* Once replay finishes (retransmit_off == SIZE_MAX), session_send_ctrl goes
+ * straight to the sendbuf head again, matching pre-replay behavior. */
+T_DECLARE_CASE(test_send_ctrl_immediate_when_not_replaying)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+
+	T_CHECK(fx.ss.unacked.retransmit_off == SIZE_MAX);
+	T_CHECK(session_send_ctrl(&fx.ss, 5, MUX_FLAG_RST, 0));
+	T_EXPECT(fx.ss.wire.sendbuf.head != NULL);
+	T_EXPECT(fx.ss.wire.oobbuf.head == NULL);
+
+	si_teardown(&fx);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_send_cb_defers_lp_drain_before_established),
 	T_CASE(test_send_cb_drains_lp_when_established),
@@ -1237,9 +1636,12 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_send_oob_oom),
 	T_CASE(test_send_push_syn_on_init),
 	T_CASE(test_send_push_ack_fin),
-	T_CASE(test_emit_ack_sends_delta),
-	T_CASE(test_emit_ack_clamps_delta),
+	T_CASE(test_emit_ack_sends_unreported),
+	T_CASE(test_emit_ack_clamps_unreported),
 	T_CASE(test_discard_stream_frames_selective),
+	T_CASE(test_discard_stream_frames_compacts_coalesced_entry),
+	T_CASE(test_discard_stream_frames_clears_retransmit_copy),
+	T_CASE(test_discard_stream_frames_keeps_retransmit_copy_verbatim),
 	T_CASE(test_notify_write_noop_before_established),
 	T_CASE(test_session_flush_defers_before_established),
 	T_CASE(test_flush_head_sends_fully),
@@ -1248,11 +1650,19 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_flush_head_error_suspends),
 	T_CASE(test_flush_head_error_resets),
 	T_CASE(test_update_send_timeout_rearms_while_pending),
+	T_CASE(test_update_send_timeout_arms_despite_kernel_timeout_for_oom_stall),
+	T_CASE(test_update_send_timeout_trusts_kernel_once_sendbuf_queued),
+	T_CASE(test_session_on_send_sets_tx_pending_for_oom_stalled_retransmit),
+	T_CASE(test_send_cb_redispatches_once_tx_pending_settles_false),
+	T_CASE(test_send_cb_no_redispatch_while_tx_pending_true),
+	T_CASE(test_send_cb_no_redispatch_outside_established),
 	T_CASE(test_flush_head_empty_sendbuf),
 	T_CASE(test_flush_head_error_suspends_in_handshake),
 	T_CASE(test_send_head_must_flush_partial_head),
 	T_CASE(test_send_handle_rx_closed_terminal),
 	T_CASE(test_retransmit_skips_acked_head_prefix),
+	T_CASE(test_send_ctrl_defers_ring_tracked_frame_during_replay),
+	T_CASE(test_send_ctrl_immediate_when_not_replaying),
 	T_SUITE_END,
 };
 

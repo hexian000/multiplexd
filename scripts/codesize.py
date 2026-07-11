@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """Build the project with Release config and report per-file object file sizes.
 
-By default only the production ``multiplexd`` binary (a stripped Release build)
-is built and reported; the test targets are excluded.  Pass ``--tests`` to
-build and report them as well.
-
 Usage:
-  scripts/codesize.py                  # build then report (no tests)
-  scripts/codesize.py --tests          # also build & report test targets
+  scripts/codesize.py                  # build then report
   scripts/codesize.py -o PATH          # custom output file
   scripts/codesize.py --build DIR      # custom release build directory
   scripts/codesize.py --no-rebuild     # skip cmake configure and build steps
@@ -15,9 +10,7 @@ Usage:
 Output: build/codesize.md (Markdown table sorted by size, largest first)
 
 Source files are discovered from compile_commands.json; every source whose
-object file exists on disk is included (no regex filtering).  Restricting the
-build target therefore restricts the report: test sources whose objects are
-never built are skipped automatically.
+object file exists on disk is included (no regex filtering).
 """
 
 from __future__ import annotations
@@ -61,8 +54,8 @@ def ensure_tool(name: str) -> str:
 def ensure_project_root(root: Path) -> None:
     if not (root / "CMakeLists.txt").exists():
         sys.exit(
-            f"error: working directory does not look like the project root: {
-                root}"
+            "error: working directory does not look like the project "
+            f"root: {root}"
         )
 
 
@@ -94,16 +87,10 @@ def _human(n: int) -> str:
 # Build
 # ---------------------------------------------------------------------------
 
-def build_release(
-    cmake: str,
-    build_dir: Path,
-    base_cache: dict[str, str],
-    config: str,
-    build_target: str | None,
-) -> None:
+def build_release(cmake: str, build_dir: Path, base_cache: dict[str, str], config: str) -> None:
     if build_dir.exists():
         log(
-            f"Removing existing build directory {build_dir.relative_to(ROOT)} …")
+            f"Removing existing build directory {build_dir.relative_to(ROOT)} ...")
         shutil.rmtree(build_dir)
     build_dir.mkdir(parents=True)
 
@@ -127,8 +114,6 @@ def build_release(
 
     jobs = os.cpu_count() or 1
     build_cmd = [cmake, "--build", str(build_dir), f"-j{jobs}"]
-    if build_target is not None:
-        build_cmd += ["--target", build_target]
     log("+ " + " ".join(build_cmd))
     proc = subprocess.run(build_cmd)
     if proc.returncode != 0:
@@ -334,7 +319,6 @@ def write_report(
     output: Path,
     elapsed: float,
     config: str,
-    tests: bool,
 ) -> None:
     total_bytes = sum(sz for _, sz, _ in rows)
     total_sloc = sum(sl for _, _, sl in rows)
@@ -345,7 +329,6 @@ def write_report(
         "",
         f"**Date:** {date} &ensp;"
         f" **Config:** {config} &ensp;"
-        f" **Tests:** {'included' if tests else 'excluded'} &ensp;"
         f" **Elapsed:** {elapsed:.1f} s &ensp;"
         f" **Files:** {len(rows)} &ensp;"
         f" **SLOC:** {total_sloc:,} &ensp;"
@@ -423,11 +406,6 @@ def main() -> int:
         help="restrict report to sources compiled for cmake target TARGET",
     )
     ap.add_argument(
-        "--tests",
-        action="store_true",
-        help="also build and report test targets (default: excluded)",
-    )
-    ap.add_argument(
         "--no-rebuild",
         action="store_true",
         help="skip cmake configure and build steps",
@@ -448,36 +426,28 @@ def main() -> int:
     if not args.no_rebuild:
         cmake = ensure_tool("cmake")
         base_cache = parse_cmake_cache(DEFAULT_BUILD_DIR / "CMakeCache.txt")
-        # Build only what the report needs: an explicit --target, the whole
-        # tree when --tests is set, or just the production multiplexd binary.
-        # Unbuilt test objects are then skipped by the report automatically.
-        if args.target:
-            build_target = args.target
-        elif args.tests:
-            build_target = None
-        else:
-            build_target = "multiplexd"
         log(
-            f"Configuring and building {args.config} in {build_dir.relative_to(ROOT)} …")
-        build_release(cmake, build_dir, base_cache, args.config, build_target)
+            f"Configuring and building {args.config} in {build_dir.relative_to(ROOT)} ...")
+        build_release(cmake, build_dir, base_cache, args.config)
 
-    log("Collecting object file sizes …")
+    log("Collecting object file sizes ...")
     rows = collect_sizes(build_dir, target=args.target)
     if not rows:
         sys.exit(
             f"error: no compiled sources found via {build_dir / 'compile_commands.json'}")
 
-    log("Collecting symbols via nm …")
+    log("Collecting symbols via nm ...")
     symbols = collect_symbols(build_dir, target=args.target)
 
     elapsed = time.monotonic() - t0
-    log(f"{len(rows)} file(s), {sum(sl for _, _, sl in rows):,} SLOC, total {
-        _human(sum(sz for _, sz, _ in rows))}, {elapsed:.1f} s")
+    total_size = _human(sum(sz for _, sz, _ in rows))
+    log(f"{len(rows)} file(s), {sum(sl for _, _, sl in rows):,} SLOC, "
+        f"total {total_size}, {elapsed:.1f} s")
     if symbols:
-        log(f"{len(symbols):,} symbols, {
-            _human(sum(sz for _, sz, _, _ in symbols))} total")
+        symbols_size = _human(sum(sz for _, sz, _, _ in symbols))
+        log(f"{len(symbols):,} symbols, {symbols_size} total")
 
-    write_report(rows, symbols, output, elapsed, args.config, args.tests)
+    write_report(rows, symbols, output, elapsed, args.config)
     return 0
 
 

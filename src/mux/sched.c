@@ -20,10 +20,11 @@
 #include "mux/send.h"
 #include "mux/session.h"
 #include "mux/stream.h"
-#include "util.h"
+#include "mux/unacked.h"
+#include "shim/util.h"
 
 #include "algo/hashtable.h"
-#include "math/serial.h"
+#include "binary/serial.h"
 #include "os/clock.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
@@ -32,7 +33,6 @@
 
 #include <inttypes.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 /* Bulk teardown callback: frees each stream; non-tombstone streams are failed. */
@@ -82,35 +82,17 @@ bool sched_add_stream(
 	void *elem = s;
 	ss->sched.streams = table_set(
 		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
-	if (ss->sched.streams == NULL || elem == s) {
+	/* table_set's inout element (algo/hashtable.h): NULL on a fresh insert,
+	 * the previous element on a duplicate-ID collision, and unchanged (== s)
+	 * when the table was NULL or a grow allocation failed. Only a fresh
+	 * insert into a live table is success; any non-NULL elem means a
+	 * collision (different stream already at this ID) or a failure, so the
+	 * old `elem == s` check silently accepted a real collision. */
+	if (ss->sched.streams == NULL || elem != NULL) {
 		return false;
 	}
 	ev_timer_stop(ss->loop, &ss->w_idle_timeout);
 	return true;
-}
-
-static void sched_remove_stream(
-	struct mux_session *restrict ss, struct mux_stream *restrict s)
-{
-	void *elem = NULL;
-	ss->sched.streams = table_del(
-		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
-	if (elem == NULL) {
-		return;
-	}
-	/* CLOSED streams already counted; fail only live streams freed here. */
-	if (s->state != STREAM_CLOSED) {
-		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
-	}
-	if (table_size(ss->sched.streams) == 0) {
-		if (ss->draining && ss->state == SESSION_ESTABLISHED) {
-			session_initiate_shutdown(ss);
-			return;
-		}
-		if (!ss->accepted && ss->conf.idle_timeout > 0) {
-			ev_timer_again(ss->loop, &ss->w_idle_timeout);
-		}
-	}
 }
 
 struct mux_stream *sched_find_stream(
@@ -261,6 +243,31 @@ void sched_wake(struct mux_session *restrict ss, struct mux_stream *restrict s)
 	session_notify(ss);
 }
 
+/* React to the stream table's active (non-tombstone) count possibly having
+ * just reached zero: initiate drain-shutdown, or arm the idle timer.
+ * Tombstones (CLOSED streams lingering for late-frame suppression, not
+ * active) are subtracted, matching session_drain()/session_open_stream()'s
+ * own "active stream count" -- otherwise drain-shutdown/idle-timer-arm waits
+ * for every remaining tombstone to also expire and be swept. Safe to call
+ * whenever the table or tombstone count changes; a no-op when streams remain
+ * active or the session isn't ESTABLISHED. */
+void sched_check_no_active_streams(struct mux_session *restrict ss)
+{
+	if (table_size(ss->sched.streams) != ss->sched.num_tombstones) {
+		return;
+	}
+	if (ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
+	if (ss->draining) {
+		session_initiate_shutdown(ss);
+		return;
+	}
+	if (!ss->accepted && ss->conf.idle_timeout > 0) {
+		ev_timer_again(ss->loop, &ss->w_idle_timeout);
+	}
+}
+
 void sched_schedule(struct mux_session *restrict ss)
 {
 	/* Guarded centrally so callers can request the drain unconditionally: an
@@ -270,6 +277,114 @@ void sched_schedule(struct mux_session *restrict ss)
 	}
 	ss->sched.lp_pending = true;
 	session_notify(ss);
+}
+
+static void
+sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
+{
+	struct mux_frame *const frame = stream_dequeue_send(s);
+	if (frame != NULL) {
+		LOGVV_F("[fd:%d] sent SYN|PUSH for stream=%" PRIuLEAST16
+			" payload=%zu",
+			ss->w_socket.fd, s->id,
+			frame->len - MUX_FRAME_HEADER_SIZE);
+		session_send_push(ss, s, frame);
+		COUNTER_ADD(ss->cnt.num_stream_fastopen, 1);
+		stream_mark_syn_sent(s);
+		s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
+		return;
+	}
+	const uint_fast32_t inc = stream_grant_inc(s);
+	if (!session_send_ctrl(ss, s->id, MUX_FLAG_SYN, inc)) {
+		return;
+	}
+	LOGVV_F("[fd:%d] sent SYN for stream %" PRIuLEAST16, ss->w_socket.fd,
+		s->id);
+	s->grant_sent += inc * MUX_WINDOW_UNIT;
+	stream_mark_syn_sent(s);
+	s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
+}
+
+static void sched_remove_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
+{
+	void *elem = NULL;
+	ss->sched.streams = table_del(
+		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
+	if (elem == NULL) {
+		return;
+	}
+	/* CLOSED streams already counted; fail only live streams freed here. */
+	if (s->state != STREAM_CLOSED) {
+		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
+	}
+	sched_check_no_active_streams(ss);
+}
+
+/* Drain the low-priority lifecycle queue (INIT→SYN batching, CLOSED→
+ * cleanup); deferred to batch SYN flights for streams opened together,
+ * re-armed by session_on_send if sendbuf is still occupied. */
+void sched_drain_lp(struct mux_session *restrict ss)
+{
+	if (ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
+
+	while (ss->sched.lp_head != NULL) {
+		struct mux_stream *const s = ss->sched.lp_head;
+		ss->sched.lp_head = s->next;
+		if (ss->sched.lp_head == NULL) {
+			ss->sched.lp_tail = NULL;
+		} else {
+			ss->sched.lp_head->prev = NULL;
+		}
+		s->sched_queue = SCHED_QUEUE_NONE;
+		s->next = NULL;
+
+		if (s->state == STREAM_CLOSED) {
+			sched_remove_stream(ss, s);
+			stream_free(s);
+			continue;
+		}
+
+		if (s->state == STREAM_INIT) {
+			/* Defer SYN when a partially-written frame occupies
+			 * sendbuf head; staging entries (pos==0) are safe. */
+			if (ss->wire.sendbuf.head != NULL &&
+			    ss->wire.sendbuf.head->pos > 0) {
+				MUX_LOG_F(
+					DEBUG, ss,
+					"idle scheduler waiting for sendbuf drain before SYN"
+					" on stream %" PRIuLEAST16
+					" frame=%zu/%zu",
+					s->id, ss->wire.sendbuf.head->pos,
+					ss->wire.sendbuf.head->len);
+				sched_lp_enqueue(ss, s);
+				break;
+			}
+			sched_send_syn(ss, s);
+			if (s->state == STREAM_INIT) {
+				/* SYN send failed (OOM); no SYN reached the
+				 * peer, so close locally without sending RST. */
+				MUX_LOG_F(
+					WARNING, ss,
+					"SYN failed (OOM), closing stream %" PRIuLEAST16,
+					s->id);
+				stream_close(s);
+			}
+			/* SYN_SENT: data waits for SYN|ACK; continue batching
+			 * while the sendbuf tail is a staging entry; a SYN+PUSH
+			 * appended by reference closes the staging. */
+			if (ss->wire.sendbuf.head != NULL &&
+			    !ss->wire.sendbuf_staging) {
+				break;
+			}
+		}
+	}
+
+	if (ss->sched.sched_head != NULL) {
+		ss->wire.tx_pending = true;
+	}
 }
 
 void sched_delay(
@@ -336,7 +451,6 @@ static void sched_send_ctrl_flags(
 	if (flags & MUX_FLAG_ACK) {
 		s->grant_sent += inc * MUX_WINDOW_UNIT;
 		s->ack_pending = false;
-		ss->unacked.ack_pending = true;
 		/* Cancel the coalescing delay only when no Nagle-held data
 		 * remains; otherwise the tick must still fire to flush
 		 * the queued send frame. */
@@ -442,6 +556,11 @@ bool sched_next_data(struct mux_session *restrict ss)
 				s->deficit += ss->max_payload;
 			}
 			session_send_push(ss, s, frame);
+			if (ss->state != SESSION_ESTABLISHED) {
+				/* A piggybacked FIN may free s during a drain;
+				 * leaving ESTABLISHED is the signal used in recv.c too. */
+				return true;
+			}
 			s->deficit -= (uint_least32_t)payload;
 			stream_notify_recv(s);
 			sched_drr_continue(ss, s);
@@ -450,6 +569,9 @@ bool sched_next_data(struct mux_session *restrict ss)
 		}
 
 		ss->sched.drr_active = NULL;
+		/* Discard deficit unconditionally so a parked stream cannot bank
+		 * budget and jump ahead once sched_wake() re-admits it to DRR. */
+		s->deficit = 0;
 		/* Nagle may be holding a small frame; schedule a
 		 * delayed flush if credit is available. */
 		const struct mux_frame *const head = s->send_queue.head;
@@ -469,119 +591,37 @@ bool sched_next_data(struct mux_session *restrict ss)
 					s->unacked_bytes);
 				sched_delay(ss, s, MUX_NAGLE_TICKS);
 			}
-		} else {
-			/* No data pending: discard any accumulated
-			 * deficit so the stream does not jump ahead
-			 * when it re-enters DRR with new data. */
-			s->deficit = 0;
 		}
 
 		sched_send_ctrl_flags(ss, s);
 	}
 }
 
-/* Emit pending per-stream ACK/FIN headers for all DRR-queued streams; the
- * 8-byte control frames pack into one staging entry.  Never calls
- * stream_check_ack — ack_pending is set only by the receive path. */
+/* Emit pending per-stream ACK/FIN headers for all DRR-queued streams, plus
+ * drr_active: it is off-FIFO while spending its round budget (see the file
+ * header note) so sched_head's walk alone would skip it, delaying its
+ * ACK/FIN until the next round even during a session stall, when
+ * send_stage_next relies on this call to keep flowing regardless.
+ * The 8-byte control frames pack into one staging entry.
+ * Never calls stream_check_ack — ack_pending is set only by the receive
+ * path. */
 void sched_flush_ctrl(struct mux_session *restrict ss)
 {
-	for (struct mux_stream *s = ss->sched.sched_head; s != NULL;
-	     s = s->next) {
+	if (ss->sched.drr_active != NULL &&
+	    ss->sched.drr_active->state != STREAM_CLOSED) {
+		sched_send_ctrl_flags(ss, ss->sched.drr_active);
+	}
+	for (struct mux_stream *s = ss->sched.sched_head; s != NULL;) {
+		/* A piggybacked FIN may free this chain during a drain; keep
+		 * next only until the session leaves ESTABLISHED. */
+		struct mux_stream *const next = s->next;
 		if (s->state != STREAM_CLOSED) {
 			sched_send_ctrl_flags(ss, s);
-		}
-	}
-}
-
-static void
-sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
-{
-	struct mux_frame *const frame = stream_dequeue_send(s);
-	if (frame != NULL) {
-		LOGVV_F("[fd:%d] sent SYN|PUSH for stream=%" PRIuLEAST16
-			" payload=%zu",
-			ss->w_socket.fd, s->id,
-			frame->len - MUX_FRAME_HEADER_SIZE);
-		session_send_push(ss, s, frame);
-		COUNTER_ADD(ss->cnt.num_stream_fastopen, 1);
-		stream_mark_syn_sent(s);
-		s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
-		return;
-	}
-	const uint_fast32_t inc = stream_grant_inc(s);
-	if (!session_send_ctrl(ss, s->id, MUX_FLAG_SYN, inc)) {
-		return;
-	}
-	LOGVV_F("[fd:%d] sent SYN for stream %" PRIuLEAST16, ss->w_socket.fd,
-		s->id);
-	s->grant_sent += inc * MUX_WINDOW_UNIT;
-	stream_mark_syn_sent(s);
-	s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
-}
-
-/* Drain the low-priority lifecycle queue (INIT→SYN batching, CLOSED→
- * cleanup); deferred to batch SYN flights for streams opened together,
- * re-armed by session_on_send if sendbuf is still occupied. */
-void sched_drain_lp(struct mux_session *restrict ss)
-{
-	if (ss->state != SESSION_ESTABLISHED) {
-		return;
-	}
-
-	while (ss->sched.lp_head != NULL) {
-		struct mux_stream *const s = ss->sched.lp_head;
-		ss->sched.lp_head = s->next;
-		if (ss->sched.lp_head == NULL) {
-			ss->sched.lp_tail = NULL;
-		} else {
-			ss->sched.lp_head->prev = NULL;
-		}
-		s->sched_queue = SCHED_QUEUE_NONE;
-		s->next = NULL;
-
-		if (s->state == STREAM_CLOSED) {
-			sched_remove_stream(ss, s);
-			stream_free(s);
-			continue;
-		}
-
-		if (s->state == STREAM_INIT) {
-			/* Defer SYN when a partially-written frame occupies
-			 * sendbuf head; staging entries (pos==0) are safe. */
-			if (ss->wire.sendbuf.head != NULL &&
-			    ss->wire.sendbuf.head->pos > 0) {
-				MUX_LOG_F(
-					DEBUG, ss,
-					"idle scheduler waiting for sendbuf drain before SYN"
-					" on stream %" PRIuLEAST16
-					" frame=%zu/%zu",
-					s->id, ss->wire.sendbuf.head->pos,
-					ss->wire.sendbuf.head->len);
-				sched_lp_enqueue(ss, s);
-				break;
-			}
-			sched_send_syn(ss, s);
-			if (s->state == STREAM_INIT) {
-				/* SYN send failed (OOM); no SYN reached the
-				 * peer, so close locally without sending RST. */
-				MUX_LOG_F(
-					WARNING, ss,
-					"SYN failed (OOM), closing stream %" PRIuLEAST16,
-					s->id);
-				stream_close(s);
-			}
-			/* SYN_SENT: data waits for SYN|ACK; continue batching
-			 * while the sendbuf tail is a staging entry; a SYN+PUSH
-			 * appended by reference closes the staging. */
-			if (ss->wire.sendbuf.head != NULL &&
-			    !ss->wire.sendbuf_staging) {
-				break;
+			if (ss->state != SESSION_ESTABLISHED) {
+				return;
 			}
 		}
-	}
-
-	if (ss->sched.sched_head != NULL) {
-		ss->wire.tx_pending = true;
+		s = next;
 	}
 }
 
@@ -620,16 +660,15 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	}
 
 	/* Emit deferred session-level ACK (spec §5.7.3); this coalescing timer
-	 * covers the normal path; the force path (delta >= window/4) is handled
-	 * in recv.c immediately on receipt. */
-	if (ss->state == SESSION_ESTABLISHED &&
-	    ss->unacked.recv_seq != ss->unacked.ack_seq) {
+	 * covers the normal path; the force path (unreported >= window/4) is
+	 * handled in recv.c immediately on receipt. */
+	if (ss->state == SESSION_ESTABLISHED && ss->unacked.unreported > 0) {
 		ss->unacked.ack_ticks++;
 		if (ss->unacked.ack_ticks >= MUX_SESSION_ACK_MAX_TICKS) {
 			MUX_LOG_F(
 				DEBUG, ss,
-				"session ACK timer fired: delta=%" PRIuLEAST32,
-				ss->unacked.recv_seq - ss->unacked.ack_seq);
+				"session ACK timer fired: unreported=%" PRIuLEAST32,
+				ss->unacked.unreported);
 			session_emit_ack(ss);
 		}
 	} else {
@@ -638,8 +677,7 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	/* Stop the coalescing timer when both the delay list and the session-ACK
 	 * backlog are empty; sched_delay / sched_coalesce_arm will restart it
 	 * when new work arrives. */
-	if (ss->sched.delay_head == NULL &&
-	    ss->unacked.recv_seq == ss->unacked.ack_seq) {
+	if (ss->sched.delay_head == NULL && ss->unacked.unreported == 0) {
 		ev_timer_stop(ss->loop, &ss->sched.w_coalesce);
 	}
 }

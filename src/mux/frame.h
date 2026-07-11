@@ -11,9 +11,9 @@
 
 #include "mux/mux.h"
 
-#include "utils/serialize.h"
+#include "binary/serialize.h"
+#include "utils/debug.h"
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -32,11 +32,14 @@
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+- ......
 
    The 2-byte Extra field interpretation depends on frame flags:
-   - RST clear, SYN or ACK set: credit grant in units of MUX_WINDOW_UNIT
-     bytes (receiver adds extra * MUX_WINDOW_UNIT to cumulative send
-     credit).  This applies even when FIN is also set (e.g. ACK|FIN).
+   - RST clear, ACK set (FIN may also be set, e.g. ACK|FIN): credit grant
+     in units of MUX_WINDOW_UNIT bytes (receiver adds extra *
+     MUX_WINDOW_UNIT to cumulative send credit).
+   - RST clear, SYN set, ACK clear, FIN clear: credit grant, same units
+     as above (the opening SYN's own grant; SYN and FIN never coexist
+     without ACK).
    - RST set: status code (enum mux_status); all other flags are ignored.
-   - FIN set, ACK clear, RST clear: Extra MUST be zero.
+   - SYN clear, ACK clear, FIN set, RST clear: Extra MUST be zero.
    The initial per-stream credit is MUX_DEFAULT_SEND_WINDOW bytes
    (implicit, not transmitted).  In-memory send_window stores cumulative
    granted credit in bytes; unit conversion is applied only in
@@ -104,6 +107,12 @@
  * flexible array member, so a frame object is mux_frame_object_size(max_payload)
  * bytes, never plain sizeof(struct mux_frame). */
 struct mux_frame {
+	/* pos is live only while the frame sits on wire.sendbuf or as a
+	 * retransmit copy being staged for send; unacked_count becomes live
+	 * only after unacked_track_sent() hands the frame to the unacked
+	 * ring. The two phases never overlap for the same object: a
+	 * retransmit always allocates a fresh copy rather than reusing the
+	 * original ring entry (see send.c). */
 	union {
 		size_t pos;
 		size_t unacked_count;
@@ -140,6 +149,11 @@ enum mux_status {
 	MUX_STATUS_REFUSED_STREAM = 0x0004,
 	MUX_STATUS_CANCEL = 0x0005,
 };
+
+/* Name a status code for logging. @p status is peer-controlled (the Extra
+ * field of a received RST), so this never indexes by value -- an unknown
+ * code (a future extension, or a hostile peer) names as "UNKNOWN". */
+const char *mux_status_str(uint_fast16_t status);
 
 /* Allocate a frame whose payload buffer holds up to @p cap bytes.  The pool
  * allocator only returns a sized block; this function stamps frame->cap and
@@ -337,13 +351,13 @@ static inline unsigned char *ringbuf_write_ptr(struct ringbuf *restrict rb)
 
 static inline void ringbuf_produce(struct ringbuf *restrict rb, size_t n)
 {
-	assert(n <= ringbuf_write_space(rb));
+	ASSERT(n <= ringbuf_write_space(rb));
 	rb->len += n;
 }
 
 static inline void ringbuf_consume(struct ringbuf *restrict rb, size_t n)
 {
-	assert(n <= rb->len);
+	ASSERT(n <= rb->len);
 	rb->off += n;
 	rb->len -= n;
 	if (rb->len == 0) {
@@ -379,7 +393,8 @@ struct mux_frame_ring {
 };
 
 /* Allocate a new ring with initial @p cap (may be 0; grows on first push).
- * Returns NULL on OOM. */
+ * @p cap MUST be a power of two (0 counts): index arithmetic elsewhere masks
+ * with (capacity - 1) rather than using modulo. Returns NULL on OOM. */
 struct mux_frame_ring *mux_frame_ring_new(size_t cap);
 
 /* Grow capacity 2× (or to MUX_FRAME_RING_MIN on first alloc) and linearise.
@@ -400,6 +415,7 @@ mux_frame_ring_peek(const struct mux_frame_ring *restrict r, size_t offset)
 	if (r == NULL || r->count == 0 || r->capacity == 0) {
 		return NULL;
 	}
+	ASSERT(offset < r->count);
 	return r->entries[(r->head + offset) & (r->capacity - 1)];
 }
 

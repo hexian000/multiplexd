@@ -5,11 +5,13 @@
  * real util/conf/listener/server/tunnel/api_server + mux library linked;
  * exercised via the public API. */
 
+#include "tunnel.h"
+
 #include "conf.h"
 #include "mux/mux.h"
 #include "server.h"
-#include "tunnel.h"
 
+#include "meta/arraysize.h"
 #if WITH_THREADS
 #include "sync/dispatcher.h"
 #include "sync/shared_mutex.h"
@@ -45,12 +47,96 @@ static const struct mux_config g_conf = {
 	.max_streams = 8,
 	.stream_window = 2,
 	.session_window = 2,
+	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 };
 
 static const struct conf_socket_opts g_mux_socket = { .backlog = 1 };
 static const struct conf_socket_opts g_local_socket = { .backlog = 1 };
 
 static const struct tunnel_callbacks g_empty_cbs = { 0 };
+
+/* ── tunnel_context helpers for tests ────────────────────────────────── */
+
+#if WITH_THREADS
+static bool test_post_task(void *user, struct task task)
+{
+	struct server *const restrict s = user;
+	if (!dispatcher_invoke(s->disp, task)) {
+		return false;
+	}
+	ev_async_send(s->loop, &s->w_async);
+	return true;
+}
+
+static void test_flush_tasks(void *user)
+{
+	dispatcher_tick(((struct server *)user)->disp);
+}
+#endif /* WITH_THREADS */
+
+static bool test_verify_peer(void *user, const char *peer_id)
+{
+	(void)user;
+	(void)peer_id;
+	return false;
+}
+
+static uint_least64_t test_alloc_index(void *user)
+{
+	return ++((struct server *)user)->next_tunnel_index;
+}
+
+static void test_inc_reconnect(void *user)
+{
+#if WITH_THREADS
+	(void)atomic_fetch_add_explicit(
+		&((struct server *)user)->counters.num_reconnects,
+		(uint_least64_t)1, memory_order_relaxed);
+#else
+	((struct server *)user)->counters.num_reconnects++;
+#endif
+}
+
+static struct tunnel_session_counters
+test_make_tunnel_counters(struct server *restrict srv)
+{
+	return (struct tunnel_session_counters){
+		.num_session_created = &srv->counters.num_session_created,
+		.num_session_connect = &srv->counters.num_session_connect,
+		.num_session_connected = &srv->counters.num_session_connected,
+		.num_session_disconnected =
+			&srv->counters.num_session_disconnected,
+		.num_session_finalized = &srv->counters.num_session_finalized,
+		.num_sessions = &srv->counters.num_sessions,
+		.num_session_halfopen = &srv->counters.num_session_halfopen,
+		.num_rst_sent = &srv->counters.num_rst_sent,
+		.num_rst_recv = &srv->counters.num_rst_recv,
+		.num_stream_errors = &srv->counters.num_stream_errors,
+		.recv_buffered_bytes = &srv->counters.recv_buffered_bytes,
+		.send_buffered_frames = &srv->counters.send_buffered_frames,
+		.unacked_frames = &srv->counters.unacked_frames,
+	};
+}
+
+static struct tunnel_context
+test_make_tunnel_context(struct server *restrict srv)
+{
+	return (struct tunnel_context){
+#if WITH_THREADS
+		.post_task = test_post_task,
+		.flush_tasks = test_flush_tasks,
+#endif
+		.verify_peer = test_verify_peer,
+		.alloc_index = test_alloc_index,
+		.inc_reconnect = test_inc_reconnect,
+		.user = srv,
+#if !WITH_THREADS
+		.loop = srv->loop,
+#endif
+	};
+}
+
+/* ─────────────────────────────────────────────────────────────────────── */
 
 static const unsigned char g_zero_id[MUX_SESSION_ID_LEN];
 
@@ -88,7 +174,7 @@ static bool wait_for_reconnects(
 			&(struct timespec){ .tv_nsec = 10000000L }, NULL);
 	}
 	return test_num_reconnects(srv) >= minimum;
-#else
+#else /* WITH_THREADS */
 	/* Drive the shared event loop with EVRUN_ONCE so no sleep is needed;
 	 * a 10-second guard prevents an infinite hang if no reconnect fires. */
 	bool timed_out = false;
@@ -126,6 +212,10 @@ T_DECLARE_CASE(test_tunnel_new_close_no_start)
 	srv.loop = loop;
 #endif /* !WITH_THREADS */
 
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
 	const struct tunnel_opts opts = {
 		.cb = &g_empty_cbs,
 		.data = NULL,
@@ -134,9 +224,10 @@ T_DECLARE_CASE(test_tunnel_new_close_no_start)
 		.local_socket = g_local_socket,
 		.fd = fds[0],
 		.id = g_zero_id,
+		.cnt = &cnts,
 	};
 
-	struct tunnel *const t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 
 	/* fds[0] is owned by the tunnel; close only the other end. */
@@ -165,6 +256,10 @@ T_DECLARE_CASE(test_tunnel_accessors_after_new)
 	srv.loop = loop;
 #endif
 
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
 	const struct tunnel_opts opts = {
 		.cb = &g_empty_cbs,
 		.data = NULL,
@@ -173,9 +268,10 @@ T_DECLARE_CASE(test_tunnel_accessors_after_new)
 		.local_socket = g_local_socket,
 		.fd = fds[0],
 		.id = g_zero_id,
+		.cnt = &cnts,
 	};
 
-	struct tunnel *const t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 	(void)close(fds[1]);
 
@@ -207,6 +303,10 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 	srv.loop = loop;
 #endif
 
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
 	const struct tunnel_opts opts = {
 		.cb = &g_empty_cbs,
 		.data = NULL,
@@ -216,9 +316,10 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 		.fd = -1,
 		.id = g_zero_id,
 		.connect_addr = "invalid",
+		.cnt = &cnts,
 	};
 
-	struct tunnel *const t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 	tunnel_start(t);
 
@@ -266,6 +367,10 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 	srv.loop = loop;
 #endif
 
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
 	const struct tunnel_opts opts = {
 		.cb = &g_empty_cbs,
 		.data = NULL,
@@ -275,9 +380,10 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 		.fd = -1,
 		.id = g_zero_id,
 		.connect_addr = connect_addr,
+		.cnt = &cnts,
 	};
 
-	struct tunnel *const t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 	tunnel_start(t);
 
@@ -351,6 +457,10 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 	srv.loop = loop;
 #endif
 
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
 	const struct tunnel_opts opts = {
 		.cb = &g_empty_cbs,
 		.data = NULL,
@@ -360,9 +470,10 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 		.fd = -1,
 		.id = g_zero_id,
 		.connect_addr = connect_addr,
+		.cnt = &cnts,
 	};
 
-	struct tunnel *const t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 	tunnel_start(t);
 
@@ -375,8 +486,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 	for (int i = 0; i < 1000; i++) {
 		const int cfd = accept(lfd, NULL, NULL);
 		if (cfd >= 0) {
-			if (num_held <
-			    (int)(sizeof(held_fds) / sizeof(held_fds[0]))) {
+			if (num_held < (int)ARRAY_SIZE(held_fds)) {
 				held_fds[num_held++] = cfd;
 			} else {
 				(void)close(cfd);
@@ -403,8 +513,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 		while (!timed_out && test_num_reconnects(&srv) < 2) {
 			const int cfd = accept(lfd, NULL, NULL);
 			if (cfd >= 0) {
-				if (num_held < (int)(sizeof(held_fds) /
-						     sizeof(held_fds[0]))) {
+				if (num_held < (int)ARRAY_SIZE(held_fds)) {
 					held_fds[num_held++] = cfd;
 				} else {
 					(void)close(cfd);
@@ -445,6 +554,10 @@ T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
 	srv.loop = loop;
 #endif
 
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
 	const struct tunnel_opts opts = {
 		.cb = &g_empty_cbs,
 		.data = NULL,
@@ -453,9 +566,10 @@ T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
 		.local_socket = g_local_socket,
 		.fd = -1,
 		.id = g_zero_id,
+		.cnt = &cnts,
 	};
 
-	struct tunnel *const t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 
 	T_EXPECT_EQ(tunnel_state(t), (enum mux_state)MUX_STATE_CONNECT);
@@ -480,6 +594,10 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 	srv.loop = loop;
 #endif
 
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
 	const struct tunnel_opts opts = {
 		.cb = &g_empty_cbs,
 		.data = NULL,
@@ -488,9 +606,10 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 		.local_socket = g_local_socket,
 		.fd = -1,
 		.id = g_zero_id,
+		.cnt = &cnts,
 	};
 
-	struct tunnel *const t = tunnel_new(&srv, &opts);
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 
 	struct tunnel_stats stats;

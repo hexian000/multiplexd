@@ -22,8 +22,6 @@ struct json_conf_tls {
 	struct json_string *authcerts;
 	size_t authcerts_count;
 
-	unsigned readahead;
-
 	bool kernel_offload;
 	bool socket_offload;
 };
@@ -65,6 +63,7 @@ struct json_conf_mux {
 	unsigned max_frame_size;
 	unsigned max_halfopen;
 	uintmax_t max_streams;
+	unsigned readahead;
 	unsigned resume_timeout;
 	unsigned send_timeout;
 	unsigned session_window;

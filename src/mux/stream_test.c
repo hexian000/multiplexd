@@ -5,10 +5,12 @@
  * window/credit accounting, half-close/RST); stream.c #included, sched/send
  * collaborators mocked below. */
 
+#include "mux/stream.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
-#include "mux/stream.h"
+#include "mux/stream.c"
 
 #include "algo/hashtable.h"
 #include "utils/slog.h"
@@ -16,13 +18,14 @@
 
 #include <ev.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
-
-#include "mux/stream.c"
 
 /* mock - collaborator mocks, frame pool, session/stream fixtures */
 
@@ -110,13 +113,32 @@ void sched_wake(struct mux_session *ss, struct mux_stream *s)
 	(void)s;
 }
 
+static int g_sched_check_no_active_streams_calls;
+/* Opt-in cascade used to reproduce last-stream drain teardown with this
+ * file's sched_free_streams() mock. */
+static bool g_free_streams_on_check;
+
+void sched_check_no_active_streams(struct mux_session *ss)
+{
+	g_sched_check_no_active_streams_calls++;
+	if (g_free_streams_on_check) {
+		g_free_streams_on_check = false;
+		sched_free_streams(ss);
+	}
+}
+
 /* send.c: control-frame emission is reproduced just enough for callers that
  * inspect the resulting wire frame (e.g. the close-sends-RST case); the flush
  * entry points are inert. */
+static bool g_session_send_ctrl_fail = false;
+
 bool session_send_ctrl(
 	struct mux_session *ss, uint_fast16_t stream_id, uint_fast8_t flags,
 	uint_fast32_t extra)
 {
+	if (g_session_send_ctrl_fail) {
+		return false;
+	}
 	struct mux_frame *const frame =
 		mux_frame_get(&ss->pool, ss->max_payload);
 	if (frame == NULL) {
@@ -445,11 +467,90 @@ T_DECLARE_CASE(test_stream_recv_rst_discards_buffered_data)
 	stream_recv_copy(s, payload, sizeof(payload));
 	T_EXPECT_EQ(s->buffered_bytes, (uint_least32_t)sizeof(payload));
 
-	stream_recv_rst(s);
+	stream_recv_rst(s, MUX_STATUS_NO_ERROR);
 	T_EXPECT(s->rst_received);
 	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
 	T_EXPECT_EQ(s->buffered_bytes, (uint_least32_t)0);
 	T_EXPECT_EQ(ringbuf_readable(s->recvbuf), (size_t)0);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* A stream torn down while it holds the DRR round budget (drr_active) must not
+ * leave a stale self-reference behind, or the tombstone-driven sched_wake 10s
+ * later silently no-ops (sched_lp_enqueue treats "s == drr_active" as "already
+ * owned") and the stream is never freed. */
+T_DECLARE_CASE(test_stream_recv_rst_clears_stale_drr_active)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	fx.ss.sched.drr_active = s;
+
+	stream_recv_rst(s, MUX_STATUS_NO_ERROR);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(fx.ss.sched.drr_active == NULL);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* Socket-mode local write path: a hard write error (send(-1) -> EBADF) makes
+ * stream_local_write abort the stream (STREAM_CLOSED, send timer stopped), and
+ * stream_flush_local must NOT re-arm the send timeout on the torn-down stream.
+ * Regression for the timer re-arm bug in the nwrite==0 branch. */
+T_DECLARE_CASE(test_stream_flush_local_hard_error_leaves_timer_stopped)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	/* Socket mode, a write-failing fd, and a configured send timeout. */
+	s->is_direct = false;
+	s->socket.w_io.fd = -1;
+	s->socket.w_timeout.repeat = 5.0;
+	/* Buffer some recv data (with matching accounting for stream_free). */
+	unsigned char payload[16] = { 0 };
+	memcpy(ringbuf_write_ptr(s->recvbuf), payload, sizeof(payload));
+	ringbuf_produce(s->recvbuf, sizeof(payload));
+	s->buffered_bytes = (uint_least32_t)sizeof(payload);
+	s->session->recv_buffered_bytes = sizeof(payload);
+
+	stream_flush_local(s);
+
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	/* The abort stopped the send timer; the buggy path re-armed it here. */
+	T_EXPECT(!ev_is_active(&s->socket.w_timeout));
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+T_DECLARE_CASE(test_stream_abort_clears_stale_drr_active)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	fx.ss.sched.drr_active = s;
+
+	stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(fx.ss.sched.drr_active == NULL);
 
 	stream_free(s);
 	teardown_fixture(&fx);
@@ -542,6 +643,44 @@ T_DECLARE_CASE(test_stream_recv_fin_with_rx_eof_shuts_down_write)
 	/* fds[1] was transferred to the stream; do not double-close it. */
 	fx.fds[1] = -1;
 	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* Regression: stream_recv_fin() must not touch s after stream_mark_closed()
+ * because last-stream drain teardown can free it synchronously. */
+T_DECLARE_CASE(test_stream_recv_fin_survives_last_stream_freed_by_scheduler)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	/* Production registers an open stream into the session's table (stream_new
+	 * itself does not); sched_free_streams below only frees what is tracked. */
+	T_CHECK(sched_add_stream(&fx.ss, s));
+
+	/* Both FINs about to be exchanged, no buffered recv data, socket mode:
+	 * the exact preconditions that lead stream_recv_fin into
+	 * stream_mark_closed(). */
+	s->state = STREAM_FIN_WAIT;
+	ev_io_set(&s->socket.w_io, fx.fds[1], EV_NONE);
+	s->socket.connected = true;
+
+	g_sched_check_no_active_streams_calls = 0;
+	g_free_streams_on_check = true;
+	/* stream_mark_closed() closes fds[1] itself before s is freed below. */
+	fx.fds[1] = -1;
+
+	/* must not dereference s past stream_mark_closed() */
+	stream_recv_fin(s);
+
+	T_EXPECT_EQ(g_sched_check_no_active_streams_calls, 1);
+	/* sched_free_streams() ran and cleared the table; nothing left to free. */
+	T_EXPECT(fx.ss.sched.streams == NULL);
+
 	teardown_fixture(&fx);
 }
 
@@ -672,7 +811,7 @@ T_DECLARE_CASE(test_syn_received_rst_before_attach)
 	T_CHECK(sched_add_stream(&fx.ss, s));
 	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_SYN_RECEIVED);
 	T_EXPECT(s->halfopen_counted);
-	stream_recv_rst(s);
+	stream_recv_rst(s, MUX_STATUS_NO_ERROR);
 	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
 	T_EXPECT(s->rst_received);
 	T_EXPECT(!s->halfopen_counted);
@@ -935,6 +1074,185 @@ T_DECLARE_CASE(test_stream_close_idempotent_when_closed)
 	teardown_fixture(&fx);
 }
 
+/* stream_attach_fd: a SYN|ACK send failure (simulated OOM) must not
+ * transition to ESTABLISHED; the stream aborts locally and the fd (ownership
+ * already transferred in) is still closed rather than leaked. */
+T_DECLARE_CASE(test_stream_attach_fd_syn_ack_failure_aborts)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = stream_new(&fx.ss, 3, false);
+	T_CHECK(s != NULL);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_SYN_RECEIVED);
+
+	int local_fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, local_fds) == 0);
+
+	g_session_send_ctrl_fail = true;
+	stream_attach_fd(s, local_fds[0]);
+	g_session_send_ctrl_fail = false;
+
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(s->aborted);
+	/* stream_mark_closed() must have closed local_fds[0] already. */
+	T_EXPECT(fcntl(local_fds[0], F_GETFD) == -1 && errno == EBADF);
+
+	(void)close(local_fds[1]);
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* stream_mark_closed's tombstone branch must evaluate whether this was the last
+ * active stream right away, instead of only when sched_remove_stream eventually
+ * runs (previously up to MUX_TOMBSTONE_PERIOD_S later, at tombstone_cb). */
+T_DECLARE_CASE(test_stream_close_checks_no_active_streams_immediately)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s =
+		make_stream(&fx, 1); /* STREAM_ESTABLISHED */
+	T_CHECK(s != NULL);
+	g_sched_check_no_active_streams_calls = 0;
+
+	stream_close(s);
+
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT_EQ(fx.ss.sched.num_tombstones, (size_t)1);
+	T_EXPECT_EQ(g_sched_check_no_active_streams_calls, 1);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* A stream that never left STREAM_INIT has no peer-visible state to linger
+ * (no tombstone), so it takes the sched_wake path instead -- the immediate
+ * check above does not apply and must not run. */
+T_DECLARE_CASE(test_stream_close_from_init_skips_no_active_streams_check)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = stream_new(&fx.ss, 1, true);
+	T_CHECK(s != NULL);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_INIT);
+	g_sched_check_no_active_streams_calls = 0;
+
+	stream_close(s);
+
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT_EQ(fx.ss.sched.num_tombstones, (size_t)0);
+	T_EXPECT_EQ(g_sched_check_no_active_streams_calls, 0);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+static int g_stream_io_test_events;
+
+static void
+stream_io_test_cb(struct ev_loop *loop, struct mux_stream_io *w, int revents)
+{
+	(void)loop;
+	(void)w;
+	g_stream_io_test_events |= revents;
+}
+
+/* stream_io_start: a SYN|ACK send failure (simulated OOM) must not
+ * transition to ESTABLISHED; the watcher must still be notified (EV_READ)
+ * and detached rather than left attached with no event ever delivered. */
+T_DECLARE_CASE(test_stream_io_start_syn_ack_failure_notifies_and_detaches)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = stream_new(&fx.ss, 3, false);
+	T_CHECK(s != NULL);
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_SYN_RECEIVED);
+
+	struct mux_stream_io w = { 0 };
+	mux_stream_io_init(&w, stream_io_test_cb, s, EV_READ);
+
+	g_stream_io_test_events = 0;
+	g_session_send_ctrl_fail = true;
+	stream_io_start(fx.loop, &w);
+	g_session_send_ctrl_fail = false;
+
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(s->aborted);
+	T_EXPECT((g_stream_io_test_events & EV_READ) != 0);
+	T_EXPECT(w.stream == NULL);
+	T_EXPECT_EQ(w.active, 0);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+/* An application that defers attaching (e.g. a local connect() still pending)
+ * can find the stream already gone by the time it calls back -- a peer RST is
+ * enough to leave it in a state neither stream_attach_fd nor stream_io_start
+ * ever expected to see. Both must reject gracefully instead of asserting on a
+ * peer-triggerable condition. */
+T_DECLARE_CASE(test_stream_attach_fd_rejects_gracefully_after_close)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = stream_new(&fx.ss, 3, false);
+	T_CHECK(s != NULL);
+	s->state = STREAM_CLOSED; /* simulates a peer RST beating the attach */
+
+	int local_fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, local_fds) == 0);
+
+	stream_attach_fd(s, local_fds[0]);
+
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED); /* untouched */
+	/* Ownership of the fd was taken and it was closed, not leaked. */
+	T_EXPECT(fcntl(local_fds[0], F_GETFD) == -1 && errno == EBADF);
+
+	(void)close(local_fds[1]);
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
+T_DECLARE_CASE(test_stream_io_start_rejects_gracefully_after_close)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = stream_new(&fx.ss, 3, false);
+	T_CHECK(s != NULL);
+	s->state = STREAM_CLOSED; /* simulates a peer RST beating the attach */
+
+	struct mux_stream_io w = { 0 };
+	mux_stream_io_init(&w, stream_io_test_cb, s, EV_READ);
+
+	g_stream_io_test_events = 0;
+	stream_io_start(fx.loop, &w);
+
+	T_EXPECT_EQ(s->state, (enum stream_state)STREAM_CLOSED); /* untouched */
+	T_EXPECT(!s->is_direct); /* direct mode never activated */
+	T_EXPECT_EQ(w.active, 0);
+	T_EXPECT_EQ(g_stream_io_test_events, 0);
+
+	stream_free(s);
+	teardown_fixture(&fx);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_stream_grant_inc_uses_available_window),
 	T_CASE(test_stream_grant_inc_scales_under_pressure),
@@ -942,9 +1260,13 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_stream_recv_window_grows_send_credit),
 	T_CASE(test_stream_recv_fin_advances_state),
 	T_CASE(test_stream_recv_rst_discards_buffered_data),
+	T_CASE(test_stream_recv_rst_clears_stale_drr_active),
+	T_CASE(test_stream_flush_local_hard_error_leaves_timer_stopped),
+	T_CASE(test_stream_abort_clears_stale_drr_active),
 	T_CASE(test_stream_close_with_unread_data_sends_rst),
 	T_CASE(test_stream_shutdown_marks_rx_eof),
 	T_CASE(test_stream_recv_fin_with_rx_eof_shuts_down_write),
+	T_CASE(test_stream_recv_fin_survives_last_stream_freed_by_scheduler),
 	T_CASE(test_stream_check_ack_shrinks_recv_window_when_safe),
 	T_CASE(test_stream_check_ack_does_not_shrink_while_outstanding),
 	T_CASE(test_stream_format_tag_formats_id_string),
@@ -960,6 +1282,12 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_stream_timeout_cb_aborts),
 	T_CASE(test_stream_tombstone_cb_decrements),
 	T_CASE(test_stream_close_idempotent_when_closed),
+	T_CASE(test_stream_attach_fd_syn_ack_failure_aborts),
+	T_CASE(test_stream_close_checks_no_active_streams_immediately),
+	T_CASE(test_stream_close_from_init_skips_no_active_streams_check),
+	T_CASE(test_stream_io_start_syn_ack_failure_notifies_and_detaches),
+	T_CASE(test_stream_attach_fd_rejects_gracefully_after_close),
+	T_CASE(test_stream_io_start_rejects_gracefully_after_close),
 	T_SUITE_END,
 };
 

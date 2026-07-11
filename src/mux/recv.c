@@ -28,25 +28,26 @@
 #include "mux/wire.h"
 
 #include "algo/hashtable.h"
+#include "binary/serial.h"
+#include "binary/serialize.h"
+#include "meta/likely.h"
+#include "meta/minmax.h"
 #include "os/clock.h"
 #include "utils/debug.h"
 #include "utils/formats.h"
-#include "utils/likely.h"
-#include "utils/minmax.h"
-#include "utils/serialize.h"
-#include "math/serial.h"
 #include "utils/slog.h"
 
 #include <ev.h>
 
+#include <assert.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
-static inline bool
-is_valid_peer_stream_id(struct mux_session *ss, const uint_fast16_t stream_id)
+static inline bool is_valid_peer_stream_id(
+	const struct mux_session *ss, const uint_fast16_t stream_id)
 {
 	if (stream_id == STREAMID_CTRL) {
 		return false;
@@ -90,6 +91,16 @@ validate_flags_by_stream(const struct mux_stream *s, const uint_fast8_t flags)
 		if (non_rst_flags == 0) {
 			return false;
 		}
+		/* Resume replay may duplicate a prior SYN|ACK sent before the
+		 * stream progressed this far; same idempotent-SYN carve-out as
+		 * ESTABLISHED/FIN_WAIT above (including staying permissive
+		 * about PUSH, since a replayed fast-open SYN|ACK may carry a
+		 * payload), so it isn't rejected as an invalid flag
+		 * combination and RSTs a stream that should survive resume
+		 * transparently. */
+		if ((non_rst_flags & MUX_FLAG_SYN) != 0) {
+			return (non_rst_flags & MUX_FLAG_ACK) != 0;
+		}
 		return (non_rst_flags &
 			(uint_fast8_t) ~(MUX_FLAG_ACK | MUX_FLAG_FIN)) == 0;
 	case STREAM_INIT:
@@ -123,6 +134,12 @@ static void process_syn_payload(
 	if ((hdr->flags & MUX_FLAG_PUSH) && hdr->length > 0 &&
 	    (s->state == STREAM_ESTABLISHED ||
 	     s->state == STREAM_SYN_RECEIVED)) {
+		/* A fast-open payload is PUSH-frame payload like any other; count
+		 * it into byt_push_recv, matching the ordinary PUSH path in
+		 * dispatch_by_stream (mux.h documents no SYN exclusion). */
+		COUNTER_ADD(
+			ss->cnt.traffic.byt_push_recv,
+			(uint_least64_t)hdr->length);
 		stream_recv_copy(
 			s,
 			ringbuf_read_ptr(ss->wire.recvbuf) +
@@ -223,8 +240,11 @@ static void dispatch_by_stream(
 	}
 
 	if (UNLIKELY(hdr->flags & MUX_FLAG_RST)) {
-		stream_recv_rst(s);
+		/* Consume before stream_recv_rst(): closing the last active stream
+		 * during a drain cascades into session_initiate_shutdown() ->
+		 * wire_discard_buffers(), which resets this same recvbuf. */
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
+		stream_recv_rst(s, hdr->extra);
 		return;
 	}
 
@@ -232,17 +252,22 @@ static void dispatch_by_stream(
 	if (UNLIKELY(!validate_flags_by_stream(s, flags))) {
 		MUX_LOG_F(
 			DEBUG, ss,
-			"invalid flags 0x%02x for stream %" PRIuFAST16
-			" state=%d, sending RST",
-			flags, stream_id, s->state);
+			"invalid flags 0x%02" PRIxLEAST8
+			" for stream %" PRIuFAST16 " state=%d, sending RST",
+			(uint_least8_t)flags, stream_id, s->state);
 		if (!s->rst_sent) {
 			s->rst_sent = true;
 			session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_PROTOCOL_ERROR);
 		}
-		stream_recv_rst(s);
+		/* Not an actual peer RST -- hdr->extra belongs to the invalid
+		 * frame, not a status code -- so report the reason we are
+		 * locally tearing the stream down instead, matching the RST
+		 * just sent above. Consume first: see the comment on the RST
+		 * branch above. */
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
+		stream_recv_rst(s, MUX_STATUS_PROTOCOL_ERROR);
 		return;
 	}
 
@@ -327,11 +352,12 @@ static void dispatch_by_stream(
 		return;
 	}
 
+	/* Consume before stream_recv_fin(): see the comment on the RST branch
+	 * above. */
+	ringbuf_consume(ss->wire.recvbuf, frame_size);
 	if (flags & MUX_FLAG_FIN) {
 		stream_recv_fin(s);
 	}
-
-	ringbuf_consume(ss->wire.recvbuf, frame_size);
 }
 
 static void dispatch_no_stream(
@@ -340,8 +366,10 @@ static void dispatch_no_stream(
 	const uint_fast16_t stream_id = hdr->stream_id;
 	const size_t frame_size = MUX_FRAME_HEADER_SIZE + hdr->length;
 	const uint_fast8_t flags = hdr->flags;
-	const uint_fast8_t unknown_flags =
-		flags & (uint_fast8_t)(~MUX_FLAG_MASK);
+	/* dispatch_frame rejects any reserved flag bit (spec §3.3) and resets the
+	 * session before dispatch reaches here, so no reserved bit can be set at
+	 * this point -- the branches below need only consider MUX_FLAG_MASK bits. */
+	ASSERT((flags & (uint_fast8_t)(~MUX_FLAG_MASK)) == 0);
 
 	if (flags & MUX_FLAG_RST) {
 		MUX_LOG_F(
@@ -353,12 +381,14 @@ static void dispatch_no_stream(
 
 	if (flags & MUX_FLAG_SYN) {
 		const uint_fast8_t allowed = MUX_FLAG_SYN | MUX_FLAG_PUSH;
-		if (unknown_flags != 0 || (flags & ~allowed) != 0) {
+		if ((flags & ~allowed) != 0) {
 			MUX_LOG_F(
 				DEBUG, ss,
-				"invalid SYN flags 0x%02x for unknown stream %" PRIuFAST16
+				"invalid SYN flags 0x%02" PRIxLEAST8
+				" for unknown stream %" PRIuFAST16
 				", closing connection",
-				flags, stream_id);
+				(uint_least8_t)(flags & MUX_FLAG_MASK),
+				stream_id);
 			session_reset(ss);
 			return;
 		}
@@ -404,12 +434,24 @@ static void dispatch_no_stream(
 		struct mux_stream *const s = stream_new(ss, stream_id, false);
 		if (s == NULL) {
 			MUX_LOG(ERROR, ss, "stream allocation failed");
+			/* This frame is already counted into recv_seq,
+			 * so silently dropping it here (unlike the draining/max_streams
+			 * branches above) would leave the peer's opener waiting in
+			 * SYN_SENT with no error signal until an application timeout;
+			 * session_send_ctrl is itself OOM-tolerant, so this is safe to
+			 * attempt even here. */
+			session_send_ctrl(
+				ss, stream_id, MUX_FLAG_RST,
+				MUX_STATUS_INTERNAL_ERROR);
 			ringbuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
 		if (!sched_add_stream(ss, s)) {
 			MUX_LOG(ERROR, ss, "failed to add stream to table");
 			stream_free(s);
+			session_send_ctrl(
+				ss, stream_id, MUX_FLAG_RST,
+				MUX_STATUS_INTERNAL_ERROR);
 			ringbuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
@@ -473,36 +515,25 @@ static void dispatch_no_stream(
 		return;
 	}
 
-	if (unknown_flags == 0 && is_ignorable_unknown_terminal_frame(hdr)) {
+	if (is_ignorable_unknown_terminal_frame(hdr)) {
 		MUX_LOG_F(
 			VERBOSE, ss,
 			"ignoring terminal control frame for unknown stream "
-			"%" PRIuFAST16 ": flags=0x%02x",
-			stream_id, flags & MUX_FLAG_MASK);
+			"%" PRIuFAST16 ": flags=0x%02" PRIxLEAST8,
+			stream_id, (uint_least8_t)(flags & MUX_FLAG_MASK));
 		ringbuf_consume(ss->wire.recvbuf, frame_size);
 		return;
 	}
 
 	/* IDs are never reused, so a non-SYN frame for an unknown stream is
 	 * likely late data past the tombstone period: RST it, keep the session. */
-	if (unknown_flags == 0) {
-		MUX_LOG_F(
-			DEBUG, ss,
-			"non-SYN frame for unknown stream %" PRIuFAST16
-			", sending RST",
-			stream_id);
-		session_send_ctrl(
-			ss, stream_id, MUX_FLAG_RST, MUX_STATUS_PROTOCOL_ERROR);
-		ringbuf_consume(ss->wire.recvbuf, frame_size);
-		return;
-	}
-
 	MUX_LOG_F(
 		DEBUG, ss,
-		"unknown reserved flags 0x%02x for stream %" PRIuFAST16
-		", closing connection",
-		unknown_flags, stream_id);
-	session_reset(ss);
+		"non-SYN frame for unknown stream %" PRIuFAST16 ", sending RST",
+		stream_id);
+	session_send_ctrl(
+		ss, stream_id, MUX_FLAG_RST, MUX_STATUS_PROTOCOL_ERROR);
+	ringbuf_consume(ss->wire.recvbuf, frame_size);
 }
 
 /* Handle a control-stream frame.  Returns false if the session was reset and
@@ -518,7 +549,7 @@ static bool dispatch_ctrl_frame(
 			" unacked=%zu stalled=%d",
 			hdr->extra, ss->unacked.frames, ss->unacked.stalled);
 		const struct unacked_ack_result r =
-			unacked_ack_trim(ss, hdr->extra);
+			unacked_ack_recv(ss, hdr->extra);
 		if (!r.ok) {
 			/* Peer acked more frames than were sent. */
 			session_reset(ss);
@@ -586,6 +617,20 @@ static void dispatch_frame(struct mux_session *ss)
 			continue;
 		}
 
+		/* Mux frames MUST NOT be sent before both sides reach
+		 * SESSION_ESTABLISHED (spec §5.2); a non-hello frame while still
+		 * SESSION_HANDSHAKE is a protocol violation. */
+		if (ss->state != SESSION_ESTABLISHED) {
+			MUX_LOG_F(
+				ERROR, ss,
+				"mux frame (version=%" PRIuLEAST8
+				") received before session established (state=%d),"
+				" closing connection",
+				hdr.version, ss->state);
+			session_reset(ss);
+			return;
+		}
+
 		if (hdr.version != MUX_PROTOCOL_VERSION) {
 			MUX_LOG_F(
 				ERROR, ss,
@@ -599,8 +644,10 @@ static void dispatch_frame(struct mux_session *ss)
 		if (hdr.flags & (uint_fast8_t)(~MUX_FLAG_MASK)) {
 			MUX_LOG_F(
 				ERROR, ss,
-				"reserved flag bits set: 0x%02x, closing connection",
-				hdr.flags & (unsigned)(~MUX_FLAG_MASK));
+				"reserved flag bits set: 0x%02" PRIxLEAST8
+				", closing connection",
+				(uint_least8_t)(hdr.flags &
+						(uint_fast8_t)(~MUX_FLAG_MASK)));
 			session_reset(ss);
 			return;
 		}
@@ -615,18 +662,20 @@ static void dispatch_frame(struct mux_session *ss)
 		/* Count received non-stream-0 frames for session ACK. */
 		ss->unacked.recv_seq =
 			(uint_least32_t)serial_add32(ss->unacked.recv_seq, 1u);
-		/* Force a session ACK when the delta hits a fraction of
-		 * session_window (spec §5.7.3 MUST), skipping the coalesce timer. */
+		ss->unacked.unreported++;
+		/* Force a session ACK when the pending increment hits a fraction
+		 * of session_window (spec §5.7.3 MUST), skipping the coalesce
+		 * timer. */
 		const uint_fast32_t ack_thresh =
 			(uint_fast32_t)CLAMP(ss->session_window / 4u, 2u, 8u);
-		if (ss->unacked.recv_seq - ss->unacked.ack_seq >= ack_thresh) {
+		if (ss->unacked.unreported >= ack_thresh) {
 			MUX_LOG_F(
 				DEBUG, ss,
-				"forced session ACK: delta=%" PRIuLEAST32,
-				ss->unacked.recv_seq - ss->unacked.ack_seq);
+				"forced session ACK: unreported=%" PRIuLEAST32,
+				ss->unacked.unreported);
 			session_emit_ack(ss);
 		}
-		if (ss->unacked.recv_seq != ss->unacked.ack_seq) {
+		if (ss->unacked.unreported > 0) {
 			sched_coalesce_arm(ss);
 		}
 
@@ -647,8 +696,13 @@ static void dispatch_frame(struct mux_session *ss)
 	}
 }
 
+void session_dispatch_pending(struct mux_session *restrict ss)
+{
+	dispatch_frame(ss);
+}
+
 /* Contiguous recvbuf window offered to one transport read.  The floor is one
- * full frame; tls.readahead widens it so a single recv() drains several frames
+ * full frame; mux.readahead widens it so a single recv() drains several frames
  * per syscall.  With socket_offload the TLS library owns the socket reads (its
  * read-ahead is set via SSL_CTX_set_read_ahead), so the floor is enough here. */
 static size_t recv_window(const struct mux_session *restrict ss)
@@ -659,8 +713,8 @@ static size_t recv_window(const struct mux_session *restrict ss)
 		return frame;
 	}
 #endif
-	if (ss->tls_readahead > frame) {
-		return ss->tls_readahead;
+	if (ss->readahead > frame) {
+		return ss->readahead;
 	}
 	return frame;
 }
@@ -809,10 +863,14 @@ static bool update_stream_window_cb(
 static void session_update_stream_window(
 	struct mux_session *restrict ss, const size_t window_bytes)
 {
+	/* Never let the auto stream_window fall below the configured initial
+	 * window, mirroring session_update_session_window's floor below. */
+	const uint_least32_t initial_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
 	const size_t target_frames =
 		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
 	const uint_least32_t frames =
-		(uint_least32_t)MAX(target_frames, (size_t)1u);
+		(uint_least32_t)MAX(target_frames, (size_t)initial_frames);
 
 	if (ss->stream_window == frames) {
 		return;

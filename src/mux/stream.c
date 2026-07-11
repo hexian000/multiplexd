@@ -13,16 +13,15 @@
 #include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.h"
-#include "util.h"
+#include "shim/util.h"
 
+#include "meta/minmax.h"
 #include "os/socket.h"
 #include "utils/debug.h"
-#include "utils/minmax.h"
 #include "utils/slog.h"
 
 #include <ev.h>
 
-#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -58,8 +57,6 @@ static const char *stream_state_str[] = {
 /* Minimum window-grant scale at/above the high pressure watermark; grants
  * decay linearly from 1.0 down to this floor across [lo, hi]. */
 #define MUX_PRESSURE_MIN_SCALE 0.125
-/* Default low watermark as a fraction of the high watermark. */
-#define MUX_PRESSURE_LO_FRACTION 0.5
 
 /* Scale window grants by session receive-buffer pressure: 1.0 below s_lo,
  * linear decay to MUX_PRESSURE_MIN_SCALE across [s_lo, s_hi], floored beyond.
@@ -74,9 +71,8 @@ static double session_pressure_scale(const struct mux_session *restrict ss)
 	}
 	const double buffered = (double)ss->recv_buffered_bytes;
 	const double s_high = (double)ss->conf.mem_pressure_hi;
-	const double s_low = ss->conf.mem_pressure_lo > 0 ?
-				     (double)ss->conf.mem_pressure_lo :
-				     s_high * MUX_PRESSURE_LO_FRACTION;
+	/* conf_check() already resolved lo == 0 to hi / 2. */
+	const double s_low = (double)ss->conf.mem_pressure_lo;
 	if (buffered <= s_low) {
 		return 1.0;
 	}
@@ -153,6 +149,15 @@ static void stream_stop(struct mux_stream *s)
 	if (s->delay_pending) {
 		sched_delay_remove(s->session, s);
 	}
+	/* drr_active is off-FIFO while spending its round budget, so a teardown
+	 * reached from outside sched_next_data (RST/abort while this stream
+	 * held the budget) would otherwise leave a stale self-reference:
+	 * sched_wake's enqueue guards treat "s == drr_active" as "already
+	 * owned," so the eventual tombstone-driven sched_wake silently no-ops
+	 * instead of routing the stream to stream_free, stranding it. */
+	if (s->session->sched.drr_active == s) {
+		s->session->sched.drr_active = NULL;
+	}
 	if (s->is_direct) {
 		return;
 	}
@@ -167,7 +172,7 @@ static inline void stream_mark_closed(struct mux_stream *restrict s)
 	stream_stop(s);
 	/* The tombstone only needs the stream ID for late-frame suppression. */
 	if (!s->is_direct && s->socket.w_io.fd != -1) {
-		SOCKET_CLOSE_FD(s->socket.w_io.fd);
+		socket_close(s->socket.w_io.fd);
 		s->socket.w_io.fd = -1;
 	}
 	/* From the caller's perspective the stream is already dead. */
@@ -182,6 +187,11 @@ static inline void stream_mark_closed(struct mux_stream *restrict s)
 		s->session->sched.num_tombstones++;
 		ev_timer_set(&s->w_tombstone, MUX_TOMBSTONE_PERIOD_S, 0.0);
 		ev_timer_start(s->session->loop, &s->w_tombstone);
+		/* Evaluate right away whether this was the last active stream,
+		 * rather than waiting up to MUX_TOMBSTONE_PERIOD_S for
+		 * tombstone_cb -> sched_drain_lp -> sched_remove_stream to
+		 * notice the same condition on its own delayed schedule. */
+		sched_check_no_active_streams(s->session);
 	} else {
 		/* No SYN left the host, so there is no peer-visible state to linger. */
 		sched_wake(s->session, s);
@@ -200,7 +210,7 @@ static void stream_shutdown_local_write(struct mux_stream *restrict s)
 		return;
 	}
 	if (!s->is_direct) {
-		SOCKET_SHUTDOWN_FD(s->socket.w_io.fd, WR);
+		(void)socket_shutdown(s->socket.w_io.fd, SHUT_WR);
 	}
 	s->tx_shutdown = true;
 }
@@ -257,16 +267,33 @@ static void update_watcher(struct mux_stream *restrict s)
 	modify_io_events(s->session->loop, &s->socket.w_io, events);
 }
 
+/* Forward declarations: defined later in this file, needed by stream_abort. */
+static void stream_detach_user(struct mux_stream *restrict s);
+static void stream_rst_notify_direct(struct mux_stream *restrict s);
+
 /* Abort the stream locally and emit one peer-visible RST. */
 static void
 stream_abort(struct mux_stream *restrict s, const enum mux_status code)
 {
+	if (s->state == STREAM_CLOSED) {
+		return;
+	}
 	STREAM_LOG(DEBUG, s, "aborting (RST)");
 	COUNTER_ADD(s->session->cnt.num_stream_errors, 1);
+	s->aborted = true;
 	session_discard_stream_frames(s->session, s->id);
 	if (!s->rst_sent) {
 		s->rst_sent = true;
 		session_send_ctrl(s->session, s->id, MUX_FLAG_RST, code);
+	}
+	if (s->is_direct) {
+		/* Fire EV_READ before detach so the callback sees `aborted`;
+		 * it may call mux_stream_close() (-> CLOSED), guarded below. */
+		stream_rst_notify_direct(s);
+		if (s->state == STREAM_CLOSED) {
+			return;
+		}
+		stream_detach_user(s);
 	}
 	stream_mark_closed(s);
 }
@@ -326,7 +353,14 @@ static void stream_flush_local(struct mux_stream *s)
 		const unsigned char *const data = ringbuf_read_ptr(s->recvbuf);
 		const size_t nwrite = stream_local_write(s, data, len);
 		if (nwrite == 0) {
-			update_send_timeout(s, made_progress);
+			/* nwrite == 0 is either EAGAIN (re-arm the send timeout) or a
+			 * hard error that stream_local_write already turned into a
+			 * stream_abort (STREAM_CLOSED, fd closed, timer stopped). Don't
+			 * re-arm a torn-down stream's timer -- matching update_watcher's
+			 * own STREAM_CLOSED guard. */
+			if (s->state != STREAM_CLOSED) {
+				update_send_timeout(s, made_progress);
+			}
 			return;
 		}
 
@@ -377,17 +411,6 @@ stream_feed_user(struct mux_stream *restrict s, const int revents)
 		return;
 	}
 	ev_feed_event(w->loop, w, filtered);
-}
-
-static inline void
-stream_queue_send(struct mux_stream *s, struct mux_frame *frame)
-{
-	frame->pos = 0;
-	s->queued_send_bytes +=
-		(uint_least32_t)(frame->len - MUX_FRAME_HEADER_SIZE);
-	mux_frame_list_push(&s->send_queue, frame);
-	s->session->send_buffered_frames++;
-	COUNTER_ADD(s->session->cnt.send_buffered_frames, 1);
 }
 
 static bool stream_on_recv(struct mux_stream *restrict s)
@@ -613,15 +636,28 @@ void stream_free(struct mux_stream *s)
 	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, s->recvbuf->len);
 	ringbuf_free(s->recvbuf);
 	if (!s->is_direct && s->socket.w_io.fd != -1) {
-		SOCKET_CLOSE_FD(s->socket.w_io.fd);
+		socket_close(s->socket.w_io.fd);
 	}
 	free(s);
 }
 
 void stream_attach_fd(struct mux_stream *s, const int fd)
 {
-	ASSERT(s->state == STREAM_SYN_RECEIVED || s->state == STREAM_INIT ||
-	       s->state == STREAM_SYN_SENT);
+	if (s->state != STREAM_SYN_RECEIVED && s->state != STREAM_INIT &&
+	    s->state != STREAM_SYN_SENT) {
+		/* The application may defer attaching past the stream's own
+		 * lifecycle (e.g. a peer RST arrived first while a local
+		 * connect() was still in progress); there is nothing left to
+		 * attach to. Take ownership of the fd we were handed and close
+		 * it rather than leaking it, and reject gracefully instead of
+		 * asserting on a condition the peer can trigger. */
+		STREAM_LOG_F(
+			DEBUG, s,
+			"attach_fd: stream no longer attachable (state=%d), fd:%d closed",
+			s->state, fd);
+		socket_close(fd);
+		return;
+	}
 	ASSERT(!s->is_direct);
 
 	struct ev_loop *const loop = s->session->loop;
@@ -632,16 +668,26 @@ void stream_attach_fd(struct mux_stream *s, const int fd)
 	if (s->state == STREAM_SYN_RECEIVED) {
 		STREAM_LOG_F(
 			INFO, s, "stream accepted, local connect [fd:%d]", fd);
+		/* Assign the fd before attempting the SYN|ACK send so a failure
+		 * below still closes it via the normal stream_abort() -> fd-close
+		 * path instead of leaking it. */
+		ev_io_set(&s->socket.w_io, fd, EV_WRITE);
 		/* SYN|ACK now so the peer can send while local connect() is in
 		 * progress; received data buffers until the connection completes. */
 		const uint_fast32_t inc = stream_grant_inc(s);
-		session_send_ctrl(
-			s->session, s->id, MUX_FLAG_SYN | MUX_FLAG_ACK, inc);
+		if (!session_send_ctrl(
+			    s->session, s->id, MUX_FLAG_SYN | MUX_FLAG_ACK,
+			    inc)) {
+			STREAM_LOG(
+				WARNING, s,
+				"SYN|ACK failed (OOM), aborting stream");
+			stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
+			return;
+		}
 		s->grant_sent += inc * MUX_WINDOW_UNIT;
 		s->ack_pending = false;
 		stream_set_state(s, STREAM_ESTABLISHED);
 		s->socket.connected = false;
-		ev_io_set(&s->socket.w_io, fd, EV_WRITE);
 		if (s->socket.w_timeout.repeat > 0.0) {
 			ev_timer_again(loop, &s->socket.w_timeout);
 		}
@@ -660,27 +706,48 @@ void stream_io_start(struct ev_loop *loop, struct mux_stream_io *w)
 {
 	struct mux_stream *const s = w->stream;
 	ASSERT(s != NULL);
-	ASSERT(s->state == STREAM_SYN_RECEIVED || s->state == STREAM_INIT ||
-	       s->state == STREAM_SYN_SENT);
+	if (s->state != STREAM_SYN_RECEIVED && s->state != STREAM_INIT &&
+	    s->state != STREAM_SYN_SENT) {
+		/* Same race as stream_attach_fd -- the stream may have already
+		 * left every attachable state (e.g. a peer RST) by the time the
+		 * application starts direct I/O. w->active is untouched, so the
+		 * watcher stays inactive rather than the caller learning about
+		 * this via an assert. */
+		STREAM_LOG_F(
+			DEBUG, s,
+			"io_start: stream no longer attachable (state=%d)",
+			s->state);
+		return;
+	}
 	ASSERT(!s->is_direct); /* neither mode activated yet */
 
 	w->loop = loop;
+	/* Activate direct mode before attempting the SYN|ACK send below so a
+	 * failure can notify @p w through the normal stream_abort() path
+	 * instead of leaving it attached with no event ever delivered. */
+	s->is_direct = true;
+	s->direct.w_io = w;
+	w->active = 1;
+
 	if (s->state == STREAM_SYN_RECEIVED) {
 		/* Passive opener: local side is ready, complete the handshake. */
 		STREAM_LOG(INFO, s, "stream accepted (direct)");
 		const uint_fast32_t inc = stream_grant_inc(s);
-		session_send_ctrl(
-			s->session, s->id, MUX_FLAG_SYN | MUX_FLAG_ACK, inc);
+		if (!session_send_ctrl(
+			    s->session, s->id, MUX_FLAG_SYN | MUX_FLAG_ACK,
+			    inc)) {
+			STREAM_LOG(
+				WARNING, s,
+				"SYN|ACK failed (OOM), aborting stream");
+			stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
+			return;
+		}
 		s->grant_sent += inc * MUX_WINDOW_UNIT;
 		s->ack_pending = false;
 		stream_set_state(s, STREAM_ESTABLISHED);
 	} else {
 		STREAM_LOG(VERBOSE, s, "direct attach (active)");
 	}
-
-	s->is_direct = true;
-	s->direct.w_io = w;
-	w->active = 1;
 
 	if (ringbuf_readable(s->recvbuf) > 0 || s->state == STREAM_CLOSE_WAIT ||
 	    s->state == STREAM_CLOSING) {
@@ -696,8 +763,13 @@ void stream_mark_syn_sent(struct mux_stream *s)
 	ASSERT(s->state == STREAM_INIT);
 	stream_set_state(s, STREAM_SYN_SENT);
 	/* Fast-open path: fd is attached; stop watcher while SYN is in flight.
-	 * If fd == -1, the watcher was never started. */
-	if (s->socket.w_io.fd != -1) {
+	 * If fd == -1, the watcher was never started. Guard on !is_direct
+	 * first, matching every other touch point of this union: a direct-mode
+	 * stream (mux_stream_io_start, common for 0-RTT opens before the SYN
+	 * even leaves) has only written the union's direct.w_io arm, and
+	 * reading .socket.w_io.fd there is type-punning through the wrong
+	 * member. */
+	if (!s->is_direct && s->socket.w_io.fd != -1) {
 		update_watcher(s);
 	}
 }
@@ -715,13 +787,28 @@ void stream_start(struct mux_stream *s)
 	STREAM_LOG(VERBOSE, s, "starting");
 	ASSERT(s->state == STREAM_SYN_SENT);
 	stream_set_state(s, STREAM_ESTABLISHED);
-	if (s->rx_eof &&
-	    !(s->state == STREAM_FIN_WAIT || s->state == STREAM_CLOSING) &&
-	    s->send_queue.head == NULL) {
+	/* State is unconditionally ESTABLISHED here (asserted SYN_SENT on entry,
+	 * just transitioned, no reentrant state change), so schedule the early FIN
+	 * purely on a pending local EOF with an empty send queue. */
+	if (s->rx_eof && s->send_queue.head == NULL) {
 		STREAM_LOG(VERBOSE, s, "early local EOF, scheduling FIN");
 		sched_wake(s->session, s);
 	}
 	stream_notify_writable(s);
+}
+
+/* Queue @p frame (payload already filled in, frame->len set) on @p s's send
+ * queue, paying into the same send_buffered_frames/queued_send_bytes
+ * bookkeeping every dequeue/free path decrements out of. The sole place this
+ * must happen so socket-mode and direct-mode can't drift apart. */
+void stream_queue_send(struct mux_stream *s, struct mux_frame *frame)
+{
+	frame->pos = 0;
+	s->queued_send_bytes +=
+		(uint_least32_t)(frame->len - MUX_FRAME_HEADER_SIZE);
+	mux_frame_list_push(&s->send_queue, frame);
+	s->session->send_buffered_frames++;
+	COUNTER_ADD(s->session->cnt.send_buffered_frames, 1);
 }
 
 struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
@@ -843,7 +930,7 @@ void stream_recv_copy(
 	 * payload straight to the fd, skipping the recvbuf memcpy and flush
 	 * round-trip; only the unwritten remainder falls through to the ringbuf. */
 	if (payload_len > 0 && ringbuf_readable(s->recvbuf) == 0 &&
-	    s->socket.connected && !s->is_direct &&
+	    !s->is_direct && s->socket.connected &&
 	    (s->state == STREAM_ESTABLISHED || s->state == STREAM_CLOSE_WAIT)) {
 		const size_t nwrite =
 			stream_local_write(s, payload, payload_len);
@@ -1063,7 +1150,11 @@ void stream_recv_fin(struct mux_stream *s)
 		stream_shutdown_local_write(s);
 		/* CLOSING (set by the switch above) means both FINs done. */
 		if (s->state == STREAM_CLOSING) {
+			/* s may be freed here (last active stream + a drain in
+			 * progress cascades into session_initiate_shutdown ->
+			 * sched_free_streams) -- must not touch it again. */
 			stream_mark_closed(s);
+			return;
 		}
 	}
 	stream_feed_user(s, EV_READ);
@@ -1082,12 +1173,18 @@ static void stream_rst_notify_direct(struct mux_stream *restrict s)
 static void stream_rst_notify_socket(struct mux_stream *restrict s)
 {
 	/* Abortively close the local socket to propagate RST to the peer. */
-	socket_set_linger(s->socket.w_io.fd, true, 0);
+	(void)socket_set_linger(s->socket.w_io.fd, true, 0);
 }
 
-void stream_recv_rst(struct mux_stream *s)
+void stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
 {
-	STREAM_LOG(DEBUG, s, "received RST");
+	/* status is otherwise write-only -- the sender selects it
+	 * (PROTOCOL_ERROR/REFUSED_STREAM/CANCEL/...) but nothing on the receive
+	 * side ever surfaced it, so a peer's REFUSED_STREAM was
+	 * indistinguishable from FLOW_CONTROL_ERROR when debugging. */
+	STREAM_LOG_F(
+		DEBUG, s, "received RST: %s (%" PRIuFAST16 ")",
+		mux_status_str(status), status);
 	s->rst_received = true;
 	if (!s->is_direct) {
 		stream_rst_notify_socket(s);
@@ -1157,7 +1254,7 @@ int stream_format_tag(
 		(void)snprintf(me, sizeof(me), "%s", ss->handshake.identity);
 	} else {
 		union sockaddr_max addr;
-		if (socket_get_addr(ss->w_socket.fd, &addr) > 0) {
+		if (socket_get_addr(ss->w_socket.fd, &addr)) {
 			(void)sa_format(me, sizeof(me), &addr.sa);
 		} else {
 			const int ret = snprintf(

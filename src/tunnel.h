@@ -12,16 +12,50 @@
 #include "conf.h"
 #include "mux/mux.h"
 #if WITH_TLS
-#include "tlsutil.h"
+#include "shim/tls.h"
 #endif
-#include "util.h"
 
-#include <ev.h>
+#include "sync/task.h"
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
-struct server;
+struct sockaddr;
 struct tunnel;
+
+/* Server-level counter pointers for the mux session counters block.  The
+ * server pre-fills these; tunnel fills in the remaining per-tunnel fields. */
+struct tunnel_session_counters {
+	mux_counter *num_session_created;
+	mux_counter *num_session_connect;
+	mux_counter *num_session_connected;
+	mux_counter *num_session_disconnected;
+	mux_counter *num_session_finalized;
+	mux_gauge *num_sessions;
+	mux_gauge *num_session_halfopen;
+	mux_counter *num_rst_sent;
+	mux_counter *num_rst_recv;
+	mux_counter *num_stream_errors;
+	mux_gauge *recv_buffered_bytes;
+	mux_gauge *send_buffered_frames;
+	mux_gauge *unacked_frames;
+};
+
+/* Abstract parent context for tunnel-to-server upstream calls. */
+struct tunnel_context {
+#if WITH_THREADS
+	bool (*post_task)(void *user, struct task task);
+	void (*flush_tasks)(void *user);
+#endif
+	bool (*verify_peer)(void *user, const char *peer_id);
+	uint_least64_t (*alloc_index)(void *user);
+	void (*inc_reconnect)(void *user);
+	void *user;
+#if !WITH_THREADS
+	struct ev_loop *loop;
+#endif
+};
 
 /* Callbacks invoked on the server loop for session lifecycle events.
  * on_event fires for all mux events except ESTABLISHED and RESUMED, which are
@@ -64,17 +98,26 @@ struct tunnel_opts {
 	const char *forward_addr;
 	const char *identity;
 	const char *peer_id;
+	/* Server-level counter pointers; tunnel fills in per-tunnel fields. */
+	const struct tunnel_session_counters *cnt;
 #if WITH_TLS
+	/* Borrowed; the caller retains ownership on both success and failure
+	 * (may be a shared, ref-counted handle reused across tunnels). */
 	struct tls_context *tlsctx;
+	/* Owned; freed by tunnel_new itself on failure (see below). */
 	struct tls_connection *conn;
 #endif
 };
 
 /* Allocate a tunnel and create the underlying mux session; does NOT start
  * the tunnel thread (call tunnel_start() after registration).  Takes
- * ownership of opts->fd; returns NULL on allocation failure. */
-struct tunnel *
-tunnel_new(struct server *srv, const struct tunnel_opts *restrict opts);
+ * ownership of opts->fd (when fd >= 0) and opts->conn (when set) on both
+ * success and failure; the caller must not close fd or free conn itself,
+ * before or after the call.  opts->tlsctx is not owned; see struct
+ * tunnel_opts.  Returns NULL on allocation failure. */
+struct tunnel *tunnel_new(
+	const struct tunnel_context *parent,
+	const struct tunnel_opts *restrict opts);
 
 /* Start the tunnel thread and dispatch mux_start.  Must be called once after
  * tunnel_new() succeeds and the tunnel has been registered. */
@@ -166,7 +209,8 @@ struct tunnel_stats {
 void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out);
 
 /* Dispatch a new outbound stream opening to the session's tunnel loop.
- * On allocation failure fd is closed and the call returns silently. */
+ * On allocation or dispatch failure fd is closed and the call returns
+ * silently. */
 void tunnel_open_stream(struct tunnel *t, int fd);
 
 /* Options for a single-pass reload dispatch, applied atomically in the tunnel

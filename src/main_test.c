@@ -71,6 +71,71 @@ T_DECLARE_CASE(test_parse_args_user_identity)
 	T_EXPECT_STREQ(args.user_name, "nobody:nogroup");
 }
 
+/* drop_privileges_verified must only require the credential(s) the -u
+ * argument's [user][:[group]] form actually asks drop_privileges() to
+ * change, mirroring its colon-position parsing (contrib/csnippets/os/
+ * daemon.c) without duplicating its uid/gid *value* resolution. One case
+ * per form, matching this file's per-decision convention. */
+
+/* Plain "-u user": drop_privileges() never touches gid. */
+T_DECLARE_CASE(test_drop_privileges_requests_user_only)
+{
+	bool uid, gid;
+	drop_privileges_requests("nobody", &uid, &gid);
+	T_EXPECT(uid);
+	T_EXPECT(!gid);
+}
+
+/* Trailing colon derives the user's primary group: both change. */
+T_DECLARE_CASE(test_drop_privileges_requests_trailing_colon)
+{
+	bool uid, gid;
+	drop_privileges_requests("nobody:", &uid, &gid);
+	T_EXPECT(uid);
+	T_EXPECT(gid);
+}
+
+/* Explicit user:group: both change. */
+T_DECLARE_CASE(test_drop_privileges_requests_user_and_group)
+{
+	bool uid, gid;
+	drop_privileges_requests("nobody:nogroup", &uid, &gid);
+	T_EXPECT(uid);
+	T_EXPECT(gid);
+}
+
+/* Leading colon, group only: drop_privileges() never touches uid. */
+T_DECLARE_CASE(test_drop_privileges_requests_group_only)
+{
+	bool uid, gid;
+	drop_privileges_requests(":nogroup", &uid, &gid);
+	T_EXPECT(!uid);
+	T_EXPECT(gid);
+}
+
+/* A bare ":" resolves neither a user nor a group, so drop_privileges(":") is a
+ * no-op: neither uid nor gid changes. Regression -- gid was reported as
+ * changing, making the daemon spuriously fail drop_privileges_verified as root. */
+T_DECLARE_CASE(test_drop_privileges_requests_bare_colon)
+{
+	bool uid, gid;
+	drop_privileges_requests(":", &uid, &gid);
+	T_EXPECT(!uid);
+	T_EXPECT(!gid);
+}
+
+/* Numeric forms classify the same way as names. */
+T_DECLARE_CASE(test_drop_privileges_requests_numeric_forms)
+{
+	bool uid, gid;
+	drop_privileges_requests("0", &uid, &gid);
+	T_EXPECT(uid);
+	T_EXPECT(!gid);
+	drop_privileges_requests("0:0", &uid, &gid);
+	T_EXPECT(uid);
+	T_EXPECT(gid);
+}
+
 T_DECLARE_CASE(test_parse_args_double_dash_stops_parsing)
 {
 	reset_args();
@@ -87,13 +152,14 @@ T_DECLARE_CASE(test_parse_args_gencerts_options)
 	char *argv[] = {
 		"multiplexd",	"--gencerts", "node", "--sni",
 		"example.test", "--keytype",  "rsa",  "--keysize",
-		"2048",		NULL,
+		"2048",		"--sign",     "ca",   NULL,
 	};
-	parse_args(9, argv);
+	parse_args(11, argv);
 	T_EXPECT_STREQ(args.gencerts, "node");
 	T_EXPECT_STREQ(args.server_name, "example.test");
 	T_EXPECT_STREQ(args.keytype, "rsa");
 	T_EXPECT_EQ(args.keysize, 2048);
+	T_EXPECT_STREQ(args.sign, "ca");
 }
 #endif /* WITH_OPENSSL */
 
@@ -102,6 +168,12 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_parse_args_loglevel_parses_number),
 	T_CASE(test_parse_args_daemonize_and_dump_config_flags),
 	T_CASE(test_parse_args_user_identity),
+	T_CASE(test_drop_privileges_requests_user_only),
+	T_CASE(test_drop_privileges_requests_bare_colon),
+	T_CASE(test_drop_privileges_requests_trailing_colon),
+	T_CASE(test_drop_privileges_requests_user_and_group),
+	T_CASE(test_drop_privileges_requests_group_only),
+	T_CASE(test_drop_privileges_requests_numeric_forms),
 	T_CASE(test_parse_args_double_dash_stops_parsing),
 #if WITH_OPENSSL
 	T_CASE(test_parse_args_gencerts_options),

@@ -17,9 +17,12 @@ else()
 endif()
 
 add_subdirectory(algo)
+add_subdirectory(binary)
 add_subdirectory(codec)
+add_subdirectory(hash)
 add_subdirectory(io)
 add_subdirectory(math)
+add_subdirectory(meta)
 add_subdirectory(net)
 add_subdirectory(os)
 add_subdirectory(utils)
@@ -28,6 +31,12 @@ add_subdirectory(utils)
 set_source_files_properties(
     "${CMAKE_CURRENT_SOURCE_DIR}/utils/debug.c"
     PROPERTIES COMPILE_DEFINITIONS _XOPEN_SOURCE=700
+)
+
+# for setgroups()
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/os/daemon.c"
+    PROPERTIES COMPILE_DEFINITIONS _DEFAULT_SOURCE
 )
 
 include(CheckSymbolExists)

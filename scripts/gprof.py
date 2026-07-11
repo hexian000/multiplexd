@@ -106,7 +106,8 @@ def kill_leftover_on_ports(
             try:
                 os.kill(pid, signal.SIGTERM)
                 killed_pids.add(pid)
-                log("terminated leftover pid %d on port %d (%s)" % (pid, port, desc))
+                log("terminated leftover pid %d on port %d (%s)" %
+                    (pid, port, desc))
             except OSError:
                 pass
     if killed_pids:
@@ -878,7 +879,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if not check_port_available(port):
                     unavailable.append("%d (%s)" % (port, desc))
             if unavailable:
-                log("ports in use: %s — attempting cleanup" % ", ".join(unavailable))
+                log("ports in use: %s — attempting cleanup" %
+                    ", ".join(unavailable))
                 removed = kill_leftover_on_ports(required_ports)
                 if removed:
                     log("cleaned up %d leftover process(es); re-checking ports" % removed)

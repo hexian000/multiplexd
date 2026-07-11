@@ -9,9 +9,7 @@
 #ifndef SERVER_H
 #define SERVER_H
 
-#include "api_server.h"
 #include "listener.h"
-#include "mux/mux.h"
 #include "tunnel.h"
 
 #if WITH_THREADS
@@ -25,6 +23,7 @@
 #include <stdatomic.h>
 #endif
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -89,7 +88,7 @@ struct server_counters {
 		atomic_size_t num_sessions;
 		/* sessions currently in CONNECT or HANDSHAKE state */
 		atomic_size_t num_session_halfopen;
-#else
+#else /* WITH_THREADS */
 		uint_least64_t num_session_created;
 		uint_least64_t num_session_connect;
 		uint_least64_t num_session_connected;
@@ -113,7 +112,7 @@ struct server_counters {
 		atomic_uint_least64_t num_rst_recv;
 		/* stream_abort() calls (aggregated) */
 		atomic_uint_least64_t num_stream_errors;
-#else
+#else /* WITH_THREADS */
 		/* client-mode reconnect attempts */
 		uint_least64_t num_reconnects;
 		/* RST frames sent (aggregated) */
@@ -134,7 +133,7 @@ struct server_counters {
 		atomic_size_t send_buffered_frames;
 		/* frames held in the session unacked list (spec §5.7.2) */
 		atomic_size_t unacked_frames;
-#else
+#else /* WITH_THREADS */
 		/* bytes currently buffered in per-stream recvbuf rings */
 		size_t recv_buffered_bytes;
 		/* frames currently queued in per-stream send_queue */
@@ -250,6 +249,10 @@ struct server {
 
 	/* accepted_tunnels maps accepted session_id to tunnel pointer */
 	struct hashtable *accepted_tunnels;
+	/* Round-robin cursor into accepted_tunnels for tcp_serve()'s no-identity,
+	 * no-mux_tunnel fallback; an opaque table_next() cursor, not an index
+	 * (mirrors identity_listener.rr_next's role for the identity case). */
+	size_t accepted_rr_cursor;
 	/* Single dialed session for the top-level mux_connect entry, or NULL. */
 	struct tunnel *mux_tunnel;
 	/* identity_tunnels contains the dialed tunnels ptr */

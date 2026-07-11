@@ -9,21 +9,32 @@
 #include "conf.h"
 #include "gencerts.h"
 #include "server.h"
-#include "util.h"
+#if WITH_TLS
+#include "shim/tls.h"
+#endif
 
+#include "math/rand.h"
 #include "os/daemon.h"
+#if WITH_CRASH_HANDLER
+#include "os/signal.h"
+#endif
 #include "utils/slog.h"
 
 #include <ev.h>
 
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <locale.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 static struct {
 	const char *conf_path;
@@ -67,15 +78,14 @@ static void print_usage(const char *argv0)
 		"                             <name>-key.pem\n"
 		"  --keytype <type>           key type: rsa, ecdsa, or ed25519\n"
 		"                             (default: rsa)\n"
-		"  --keysize <bits>           key size (RSA: 4096, ECDSA: 224/256/384/521)\n"
+		"  --keysize <bits>           key size (RSA: 2048-16384, default 4096;\n"
+		"                             ECDSA: 224/256/384/521)\n"
 		"\n"
 #endif /* WITH_OPENSSL */
 	);
 	(void)fflush(stderr);
 }
 
-static void parse_args(const int argc, char *const *argv)
-{
 #define OPT_REQUIRE_ARG(argc, argv, i)                                         \
 	do {                                                                   \
 		if ((i) + 1 >= (argc)) {                                       \
@@ -92,6 +102,48 @@ static void parse_args(const int argc, char *const *argv)
 		exit(EXIT_FAILURE);                                            \
 	} while (false)
 
+#if WITH_OPENSSL
+/* Matches and consumes one --gencerts-family flag at argv[*i], advancing *i
+ * past its argument; false if argv[*i] is not one of these flags. */
+static bool parse_gencerts_arg(const int argc, char *const *argv, int *i)
+{
+	if (strcmp(argv[*i], "--gencerts") == 0) {
+		OPT_REQUIRE_ARG(argc, argv, *i);
+		args.gencerts = argv[++*i];
+		return true;
+	}
+	if (strcmp(argv[*i], "--sni") == 0) {
+		OPT_REQUIRE_ARG(argc, argv, *i);
+		args.server_name = argv[++*i];
+		return true;
+	}
+	if (strcmp(argv[*i], "--sign") == 0) {
+		OPT_REQUIRE_ARG(argc, argv, *i);
+		args.sign = argv[++*i];
+		return true;
+	}
+	if (strcmp(argv[*i], "--keytype") == 0) {
+		OPT_REQUIRE_ARG(argc, argv, *i);
+		args.keytype = argv[++*i];
+		return true;
+	}
+	if (strcmp(argv[*i], "--keysize") == 0) {
+		OPT_REQUIRE_ARG(argc, argv, *i);
+		char *endptr = NULL;
+		const uintmax_t val = strtoumax(argv[++*i], &endptr, 10);
+		if (endptr == argv[*i] || *endptr != '\0' || val > INT_MAX) {
+			LOGF_F("invalid keysize: %s", argv[*i]);
+			exit(EXIT_FAILURE);
+		}
+		args.keysize = (int)val;
+		return true;
+	}
+	return false;
+}
+#endif /* WITH_OPENSSL */
+
+static void parse_args(const int argc, char *const *argv)
+{
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-h") == 0 ||
 		    strcmp(argv[i], "--help") == 0) {
@@ -133,36 +185,7 @@ static void parse_args(const int argc, char *const *argv)
 			continue;
 		}
 #if WITH_OPENSSL
-		if (strcmp(argv[i], "--gencerts") == 0) {
-			OPT_REQUIRE_ARG(argc, argv, i);
-			args.gencerts = argv[++i];
-			continue;
-		}
-		if (strcmp(argv[i], "--sni") == 0) {
-			OPT_REQUIRE_ARG(argc, argv, i);
-			args.server_name = argv[++i];
-			continue;
-		}
-		if (strcmp(argv[i], "--sign") == 0) {
-			OPT_REQUIRE_ARG(argc, argv, i);
-			args.sign = argv[++i];
-			continue;
-		}
-		if (strcmp(argv[i], "--keytype") == 0) {
-			OPT_REQUIRE_ARG(argc, argv, i);
-			args.keytype = argv[++i];
-			continue;
-		}
-		if (strcmp(argv[i], "--keysize") == 0) {
-			OPT_REQUIRE_ARG(argc, argv, i);
-			char *endptr = NULL;
-			const uintmax_t val = strtoumax(argv[++i], &endptr, 10);
-			if (endptr == argv[i] || *endptr != '\0' ||
-			    val > INT_MAX) {
-				LOGF_F("invalid keysize: %s", argv[i]);
-				exit(EXIT_FAILURE);
-			}
-			args.keysize = (int)val;
+		if (parse_gencerts_arg(argc, argv, &i)) {
 			continue;
 		}
 #endif /* WITH_OPENSSL */
@@ -176,6 +199,102 @@ static void parse_args(const int argc, char *const *argv)
 
 #undef OPT_REQUIRE_ARG
 #undef OPT_ARG_ERROR
+}
+
+/* Release resources after a startup failure and report EXIT_FAILURE. */
+static int
+fail_startup(struct server *restrict server, struct config *restrict conf)
+{
+	server_stop(server);
+	server_free(server);
+	conf_free(conf);
+	return EXIT_FAILURE;
+}
+
+/* Whether identity (the -u argument) requests changing uid/gid, mirroring
+ * drop_privileges()'s own [user][:[group]] colon-position parsing
+ * (contrib/csnippets/os/daemon.c): uid changes unless identity starts with
+ * ':' (empty user part); gid changes whenever a colon is present at all (an
+ * explicit group, or a trailing colon that derives the user's primary
+ * group from the passwd database). */
+static void drop_privileges_requests(
+	const char *restrict identity, bool *restrict changes_uid,
+	bool *restrict changes_gid)
+{
+	*changes_uid = identity[0] != ':';
+	/* gid changes only for an explicit group (colon[1] != '\0') or a trailing
+	 * colon with a non-empty user (colon != identity, deriving the user's
+	 * primary group). A bare ":" resolves neither, so drop_privileges(":")
+	 * leaves gid untouched -- reporting a gid change there made the daemon
+	 * spuriously fail drop_privileges_verified when run as root. */
+	const char *const colon = strchr(identity, ':');
+	*changes_gid = colon != NULL && (colon[1] != '\0' || colon != identity);
+}
+
+/* drop_privileges() only logs a warning on failure; verify it actually left
+ * the process non-root instead of silently continuing with the original
+ * (possibly root) privileges, which would defeat the purpose of -u. Only
+ * verify the credential(s) user_name actually requests changing: a valid,
+ * documented single-credential -u (e.g. plain "nobody", or ":group") leaves
+ * the other credential at its original value by design. */
+static bool drop_privileges_verified(const char *restrict user_name)
+{
+	bool changes_uid;
+	bool changes_gid;
+	drop_privileges_requests(user_name, &changes_uid, &changes_gid);
+	drop_privileges(user_name);
+	return (!changes_uid || geteuid() != 0) &&
+	       (!changes_gid || getegid() != 0);
+}
+
+#if defined(WIN32)
+#define PATH_SEPARATOR '\\'
+#else
+#define PATH_SEPARATOR '/'
+#endif
+
+static void init(int argc, char *const *argv)
+{
+	(void)argc;
+	(void)argv;
+	(void)setlocale(LC_ALL, "");
+	(void)setvbuf(stdout, NULL, _IONBF, 0);
+	slog_setoutput(SLOG_OUTPUT_FILE, stdout);
+	{
+		static char prefix[] = __FILE__;
+		char *s = strrchr(prefix, PATH_SEPARATOR);
+		if (s != NULL) {
+			s[1] = '\0';
+		}
+		slog_setfileprefix(prefix);
+	}
+	slog_setlevel(LOG_LEVEL_VERBOSE);
+
+	struct sigaction ignore = { .sa_handler = SIG_IGN };
+	if (sigaction(SIGPIPE, &ignore, NULL) != 0) {
+		const int err = errno;
+		LOGF_F("sigaction: (%d) %s", err, strerror(err));
+		exit(EXIT_FAILURE);
+	}
+#if WITH_CRASH_HANDLER
+	crashhandler_install();
+#endif
+}
+
+static void loadlibs(void)
+{
+	srand64((uint_fast64_t)time(NULL));
+
+	LOGD_F("%s: %s", PROJECT_NAME, PROJECT_VER);
+	LOGD_F("libev: %d.%d", ev_version_major(), ev_version_minor());
+#if WITH_TLS
+	LOGD_F("%s", tls_version());
+#endif
+}
+
+static void unloadlibs(void)
+{
+	LOGD("library cleanup complete");
 }
 
 int main(int argc, char **argv)
@@ -261,15 +380,24 @@ int main(int argc, char **argv)
 
 	{
 		char extensions[128];
-		int pos = 0;
+		/* pos is clamped to sizeof(extensions) - 1 after every append:
+		 * snprintf's return can exceed the buffer, and an unclamped pos
+		 * would underflow "sizeof(extensions) - pos" on a later append. */
+		size_t pos = 0;
 		if (conf->identity.mux_connect_count > 0 ||
 		    conf->identity.peers_count > 0) {
-			pos += snprintf(
+			const int n = snprintf(
 				extensions + pos, sizeof(extensions) - pos,
 				"%sidentity (%zu connect, %zu listen)",
 				pos > 0 ? ", " : "",
 				conf->identity.mux_connect_count,
 				conf->identity.peers_count);
+			if (n > 0) {
+				pos += (size_t)n;
+				if (pos >= sizeof(extensions)) {
+					pos = sizeof(extensions) - 1;
+				}
+			}
 		}
 		if (pos == 0) {
 			(void)snprintf(
@@ -287,7 +415,22 @@ int main(int argc, char **argv)
 		conf_free(conf);
 		return EXIT_FAILURE;
 	}
+	/* Resolve to an absolute path before the possible daemonize() chdir("/")
+	 * below, so a later reload can still find a relative -c path; fall
+	 * back to the original string if realpath() fails. */
+	static char conf_path_abs[PATH_MAX];
 	server->conf_path = args.conf_path;
+	if (args.conf_path != NULL && strcmp(args.conf_path, "-") != 0) {
+		if (realpath(args.conf_path, conf_path_abs) != NULL) {
+			server->conf_path = conf_path_abs;
+		} else {
+			const int err = errno;
+			LOGW_F("realpath(\"%s\"): (%d) %s; a later SIGHUP reload"
+			       " after daemonize()'s chdir(\"/\") may look in the"
+			       " wrong directory",
+			       args.conf_path, err, strerror(err));
+		}
+	}
 
 	const char *const user_name = args.user_name;
 
@@ -300,14 +443,12 @@ int main(int argc, char **argv)
 
 	if (!server_start(server)) {
 		LOGF("failed to start server");
-		server_stop(server);
-		server_free(server);
-		conf_free(conf);
-		return EXIT_FAILURE;
+		return fail_startup(server, conf);
 	}
 
-	if (user_name != NULL) {
-		drop_privileges(user_name);
+	if (user_name != NULL && !drop_privileges_verified(user_name)) {
+		LOGF_F("failed to drop privileges to '%s'", user_name);
+		return fail_startup(server, conf);
 	}
 
 	LOGI("entering event loop");

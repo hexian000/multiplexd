@@ -47,7 +47,7 @@ bool session_send_oob(
 	const unsigned char *payload, size_t payload_len);
 
 /* Emit a session-level ACK for all unacknowledged non-stream-0 frames.
- * Caller must ensure recv_seq != ack_seq. */
+ * Caller must ensure unreported != 0. */
 void session_emit_ack(struct mux_session *ss);
 
 /* Remove all unsent non-RST frames for stream_id from the session send buffer.

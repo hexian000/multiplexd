@@ -70,6 +70,9 @@ struct mux_stream {
 	bool delay_pending : 1;
 	/* RST has already been sent to the peer; no further RST may be sent. */
 	bool rst_sent : 1;
+	/* Locally aborted (internal error); mux_stream_recv() will return
+	 * ECONNRESET, same as a peer-sent RST. */
+	bool aborted : 1;
 
 	uint_least8_t delay_ticks;
 	enum stream_state state;
@@ -166,6 +169,11 @@ void stream_mark_syn_sent(struct mux_stream *s);
 
 void stream_start(struct mux_stream *s);
 
+/* Queue @p frame (payload already filled in, frame->len set) on @p s's send
+ * queue, paying into the same send_buffered_frames/queued_send_bytes
+ * bookkeeping every dequeue/free path decrements out of. */
+void stream_queue_send(struct mux_stream *s, struct mux_frame *frame);
+
 struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s);
 
 void stream_notify_recv(struct mux_stream *restrict s);
@@ -182,7 +190,7 @@ void stream_mark_fin_sent(struct mux_stream *s);
 
 void stream_recv_fin(struct mux_stream *s);
 
-void stream_recv_rst(struct mux_stream *s);
+void stream_recv_rst(struct mux_stream *s, uint_fast16_t status);
 
 /* close(fd) semantics: discard unread data and RST the peer; otherwise
  * immediate teardown (caller responsible for prior RST/FIN actions). */

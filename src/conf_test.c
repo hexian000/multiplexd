@@ -10,11 +10,13 @@
 #include "utils/testing.h"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /* Write a string to a new temp file; return -1 on failure. */
@@ -100,6 +102,33 @@ T_DECLARE_CASE(test_conf_parsefile_invalid_json)
 	T_EXPECT(conf == NULL);
 }
 
+/* The shared JSON string decoder must reject malformed UTF-8 in the
+ * unescaped byte-copy path, not just within \uXXXX escapes. 0xC2 ('\xc2')
+ * is a valid two-byte lead requiring a continuation byte in 0x80-0xBF;
+ * '(' (0x28) is not one, so this is a classic invalid sequence.
+ * identity.claim is freeform (no format/pattern beyond maxLength), so a
+ * rejection here can only be the UTF-8 check, not some other field rule. */
+T_DECLARE_CASE(test_conf_parsefile_rejects_invalid_utf8)
+{
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"\xc2(\"}}");
+	T_EXPECT(conf == NULL);
+}
+
+/* Well-formed multi-byte UTF-8 (2/3/4-byte sequences) must still decode. */
+T_DECLARE_CASE(test_conf_parsefile_accepts_well_formed_utf8)
+{
+	/* U+00E9 (e-acute, 2 bytes), U+4E2D (CJK "middle", 3 bytes),
+	 * U+1F600 (grinning face, 4 bytes). */
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":"
+		"\"\xc3\xa9\xe4\xb8\xad\xf0\x9f\x98\x80\"}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_STREQ(
+		conf->identity.claim, "\xc3\xa9\xe4\xb8\xad\xf0\x9f\x98\x80");
+	conf_free(conf);
+}
+
 T_DECLARE_CASE(test_conf_parsefile_minimal_client)
 {
 	struct config *const conf =
@@ -140,7 +169,7 @@ T_DECLARE_CASE(test_conf_dump_roundtrip)
 	T_CHECK(reparsed != NULL);
 	T_CHECK(reparsed->mux_connect != NULL);
 	T_EXPECT_STREQ(reparsed->mux_connect, "127.0.0.1:7777");
-	/* type is set by conf_build_json when the original type is NULL */
+	/* type defaults to CONF_TYPE in conf_dump when unset */
 	T_EXPECT(reparsed->type != NULL);
 
 	conf_free(reparsed);
@@ -180,6 +209,74 @@ T_DECLARE_CASE(test_conf_parsefile_requires_claim_for_identity)
 	T_EXPECT(conf == NULL);
 }
 
+T_DECLARE_CASE(test_conf_parsefile_accepts_max_length_identity_claim)
+{
+	/* The hello extension's identity field is 256 bytes (255 octets +
+	 * NUL; handshake.h); the boundary value itself must still load. */
+	char claim[256];
+	memset(claim, 'a', sizeof(claim) - 1);
+	claim[sizeof(claim) - 1] = '\0';
+	char json[512];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"identity\":{\"claim\":\"%s\",\"mux_connect\":[\"127.0.0.1:9001\"]}}",
+		claim);
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)strlen(conf->identity.claim), 255);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_claim)
+{
+	/* One octet past the 255-octet wire limit must be rejected at
+	 * load/reload time instead of being silently dropped later, deep in
+	 * the handshake. */
+	char claim[257];
+	memset(claim, 'a', sizeof(claim) - 1);
+	claim[sizeof(claim) - 1] = '\0';
+	char json[512];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"identity\":{\"claim\":\"%s\",\"mux_connect\":[\"127.0.0.1:9001\"]}}",
+		claim);
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_accepts_max_length_listen_address)
+{
+	/* util.c's ADDR_MAX_LENGTH (255-octet FQDN + ":65535") caps a valid
+	 * address at 261 octets; the boundary value itself must still load. */
+	char addr[262];
+	memset(addr, 'a', sizeof(addr) - 1);
+	addr[sizeof(addr) - 1] = '\0';
+	char json[512];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"listen\":\"%s\"}", addr);
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)strlen(conf->listen), 261);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_listen_address)
+{
+	/* One octet past the schema's 261-octet maxLength must be rejected
+	 * at parse time instead of only failing later in resolve_bindaddr
+	 * (util.c's ADDR_MAX_LENGTH). */
+	char addr[263];
+	memset(addr, 'a', sizeof(addr) - 1);
+	addr[sizeof(addr) - 1] = '\0';
+	char json[512];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"listen\":\"%s\"}", addr);
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
 T_DECLARE_CASE(test_conf_parsefile_parses_identity_listen)
 {
 	const char *json =
@@ -195,12 +292,183 @@ T_DECLARE_CASE(test_conf_parsefile_parses_identity_listen)
 	conf_free(conf);
 }
 
+T_DECLARE_CASE(test_conf_parsefile_identity_listen_duplicate_key_last_wins)
+{
+	/* identity_listen_add reuses the existing peer entry on a duplicate
+	 * id instead of appending a second one, matching every other field's
+	 * last-value-wins semantics. */
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer1\":\"127.0.0.1:9002\",\"peer1\":\"127.0.0.1:9004\"}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->identity.peers_count, 1);
+	T_CHECK(find_peer(conf, "peer1") != NULL);
+	T_EXPECT_STREQ(find_peer(conf, "peer1")->listen, "127.0.0.1:9004");
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_listen_value)
+{
+	/* identity.listen values bypass the schema's generated checks;
+	 * conf_check's own length check must reject an oversized one
+	 * instead of resolve_bindaddr failing much later in server.c. */
+	char addr[263];
+	memset(addr, 'a', sizeof(addr) - 1);
+	addr[sizeof(addr) - 1] = '\0';
+	char json[512];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer1\":\"%s\"}}}",
+		addr);
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_mux_connect)
+{
+	/* identity.mux_connect is a plain array_string field, so the schema's
+	 * generated per-element check must reject an oversized entry, unlike
+	 * identity.listen's map values above (which need conf_check's own
+	 * check instead). */
+	char addr[263];
+	memset(addr, 'a', sizeof(addr) - 1);
+	addr[sizeof(addr) - 1] = '\0';
+	char json[512];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"%s\"]}}",
+		addr);
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+/* conf_load_identity's identity.listen fragment is parsed twice: once
+ * generically (as an opaque JSON_K_DYNAMIC fragment, by the schema
+ * unmarshaller) and once explicitly (by conf_load_identity itself, which
+ * must reject a fragment that isn't a JSON object). */
+T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_non_object)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"listen\":\"not-an-object\"}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+/* Unlike the schema-driven fields, identity.listen's own internal object
+ * structure is walked by conf_load_identity by hand (json_obj_next), so a
+ * malformed fragment (here: a key with no ':'/value) must be rejected
+ * there instead of being silently accepted or crashing. */
+T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_malformed_json)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"listen\":{\"peer1\"}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+/* identity.listen has no fixed key set, so identity_listen_cb must itself
+ * special-case a "-"-prefixed key as a comment and skip it -- unlike a
+ * known field name, the generic dispatcher's unknown-key tolerance never
+ * gets a chance to apply here. */
+T_DECLARE_CASE(test_conf_parsefile_identity_listen_skips_comment_key)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"-disabled\":\"127.0.0.1:9099\",\"peer1\":\"127.0.0.1:9002\"}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->identity.peers_count, 1);
+	T_CHECK(find_peer(conf, "peer1") != NULL);
+	T_EXPECT_STREQ(find_peer(conf, "peer1")->listen, "127.0.0.1:9002");
+	T_EXPECT(find_peer(conf, "-disabled") == NULL);
+	T_EXPECT(find_peer(conf, "disabled") == NULL);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_non_string_value)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"listen\":{\"peer1\":123}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+/* A JSON \u0000 escape is legal and decodes to a literal
+ * embedded NUL with a correct .len, but strndup() (used to materialize
+ * every config string) stops at the first NUL regardless of .len -- so a
+ * claim like "abc\u0000<200 more>" would silently truncate to "abc" after
+ * passing the full-length maxLength check, letting the 255-octet wire
+ * limit validate content that is never what actually gets stored or sent.
+ * conf_strndup() must reject this outright instead of truncating. */
+T_DECLARE_CASE(test_conf_parsefile_rejects_embedded_nul_in_identity_claim)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"abc\\u0000def\",\"mux_connect\":[\"127.0.0.1:9001\"]}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+/* Two identity.listen keys differing only after an embedded NUL must not
+ * be silently merged into the same peer entry by a truncating strndup();
+ * the whole config must be rejected instead. */
+T_DECLARE_CASE(test_conf_parsefile_rejects_embedded_nul_in_identity_listen_key)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer\\u0000a\":\"127.0.0.1:9002\"}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+/* The same hazard applies to an identity.listen *value* -- the fourth
+ * conf_strndup call site (identity_listen_cb's p->listen), distinct from the
+ * key-side call above -- so a value with an embedded NUL must be rejected too. */
+T_DECLARE_CASE(test_conf_parsefile_rejects_embedded_nul_in_identity_listen_value)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer\":\"127.0.0.1\\u00009002\"}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+/* The same hazard applies to every strndup'd config string, not just the
+ * identity fields -- covers the shared STRNDUP_FIELD macro path
+ * (conf_load), distinct from the identity-specific call sites above.
+ * mux_connect is freeform at parse time (address resolution is deferred to
+ * connect time, not done during conf parsing), unlike log which is
+ * enum-constrained and would reject this value for an unrelated reason. */
+T_DECLARE_CASE(test_conf_parsefile_rejects_embedded_nul_in_mux_connect_field)
+{
+	const char *json = "{\"mux_connect\":\"127.0.0.1\\u00009000\"}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
 T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_format)
 {
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"10:20\"}";
 	struct config *const conf = parse_tmpconf(json);
 	T_EXPECT(conf == NULL);
+}
+
+/* The schema documents max_startups as strictly "^[0-9]+:[0-9]+:[0-9]+$",
+ * but strtoumax() alone also accepts a leading sign or whitespace; each
+ * of these forms must be rejected, not silently parsed via strtoumax()'s
+ * laxer rules. */
+T_DECLARE_CASE(test_conf_parsefile_max_startups_rejects_non_strict_digits)
+{
+	static const char *const bad[] = {
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"+10:20:30\"}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\" 10:20:30\"}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"10:-0:30\"}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"10:20:-0\"}",
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		struct config *const conf = parse_tmpconf(bad[i]);
+		T_EXPECT(conf == NULL);
+		if (conf != NULL) {
+			conf_free(conf);
+		}
+	}
 }
 
 T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_rate)
@@ -239,6 +507,40 @@ T_DECLARE_CASE(test_conf_parsefile_clamps_timeout_fields)
 	conf_free(conf);
 }
 
+/* connect_timeout/resume_timeout must preserve an explicit 0
+ * (schema-legal: both have "minimum": 0) as "disabled", matching
+ * send_timeout/idle_timeout's existing behavior, instead of silently
+ * clamping it up to the floor of 10. */
+T_DECLARE_CASE(test_conf_parsefile_preserves_zero_connect_resume_timeout)
+{
+	const char *json =
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"connect_timeout\":0,\"resume_timeout\":0}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+
+	T_EXPECT_EQ(conf->mux.connect_timeout, 0);
+	T_EXPECT_EQ(conf->mux.resume_timeout, 0);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_clamps_int_overflow_fields)
+{
+	/* A value past INT_MAX must clamp, not wrap negative: every use site
+	 * gates a resource-exhaustion check behind "value > 0". */
+	const char *json =
+		"{\"mux_connect\":\"127.0.0.1:9000\","
+		"\"max_sessions\":9999999999,"
+		"\"mux\":{\"max_streams\":9999999999,"
+		"\"mem_pressure\":{\"hi\":9999999999,\"lo\":9999999999}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(conf->max_sessions, INT_MAX);
+	T_EXPECT_EQ(conf->mux.max_streams, INT_MAX);
+	T_EXPECT_EQ(conf->mux.mem_pressure_hi, INT_MAX);
+	T_EXPECT_EQ(conf->mux.mem_pressure_lo, INT_MAX);
+	conf_free(conf);
+}
+
 T_DECLARE_CASE(test_conf_parsefile_partial_window_config_accepted)
 {
 	/* stream_window set (manual), session_window absent (auto); each axis
@@ -260,6 +562,35 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_partial_tls_config)
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"cert\":\"dummy\"}}";
 	struct config *const conf = parse_tmpconf(json);
 	T_EXPECT(conf == NULL);
+}
+
+/* Builds "{"mux_listen":..., "tls": <tls_json>}" and expects rejection. */
+T_DECLARE_SUBCASE(assert_partial_tls_rejected, const char *restrict tls_json)
+{
+	char json[256];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":%s}", tls_json);
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_rejects_partial_tls_config_combinations)
+{
+	/* The remaining partial combinations among {cert, key, authcerts};
+	 * cert-only is covered by test_conf_parsefile_rejects_partial_tls_config. */
+	T_CALL_SUBCASE(assert_partial_tls_rejected, "{\"key\":\"dummy\"}");
+	T_CALL_SUBCASE(
+		assert_partial_tls_rejected, "{\"authcerts\":[\"dummy\"]}");
+	T_CALL_SUBCASE(
+		assert_partial_tls_rejected,
+		"{\"cert\":\"dummy\",\"key\":\"dummy\"}");
+	T_CALL_SUBCASE(
+		assert_partial_tls_rejected,
+		"{\"cert\":\"dummy\",\"authcerts\":[\"dummy\"]}");
+	T_CALL_SUBCASE(
+		assert_partial_tls_rejected,
+		"{\"key\":\"dummy\",\"authcerts\":[\"dummy\"]}");
 }
 
 T_DECLARE_CASE(test_conf_parsefile_authcerts_array)
@@ -314,6 +645,50 @@ T_DECLARE_CASE(test_conf_dump_tls_fields)
 
 	conf_free(reparsed);
 	conf_free(orig);
+}
+
+T_DECLARE_CASE(test_conf_load_tls_kernel_offload_defaults_with_socket_offload)
+{
+	/* kernel_offload's schema default is true; with socket_offload also on
+	 * (explicitly, here), the "requires socket_offload" clamp does not
+	 * apply and the default takes effect. */
+	const char *json =
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"cert\":\"certdata\",\"key\":\"keydata\",\"authcerts\":[\"ca1.pem\"],\"socket_offload\":true}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT(conf->tls_socket_offload);
+	T_EXPECT(conf->tls_kernel_offload);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_load_tls_kernel_offload_off_without_socket_offload)
+{
+	/* Neither field set: kernel_offload's own default is true, but
+	 * socket_offload defaults false, so the "requires socket_offload"
+	 * clamp silently forces kernel_offload back off -- the common case
+	 * (most configs never mention either field) must not end up with KTLS
+	 * "on" by accident. */
+	const char *json =
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"cert\":\"certdata\",\"key\":\"keydata\",\"authcerts\":[\"ca1.pem\"]}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT(!conf->tls_socket_offload);
+	T_EXPECT(!conf->tls_kernel_offload);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_load_tls_kernel_offload_explicit_override)
+{
+	/* socket_offload on, kernel_offload explicitly disabled: the explicit
+	 * `false` in the JSON must survive, not be overwritten back to the
+	 * schema default of true. */
+	const char *json =
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"cert\":\"certdata\",\"key\":\"keydata\",\"authcerts\":[\"ca1.pem\"],\"socket_offload\":true,\"kernel_offload\":false}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT(conf->tls_socket_offload);
+	T_EXPECT(!conf->tls_kernel_offload);
+	conf_free(conf);
 }
 
 T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
@@ -383,7 +758,7 @@ T_DECLARE_CASE(test_conf_parsefile_ignores_comment_keys)
 
 T_DECLARE_CASE(test_conf_parsefile_unknown_root_key)
 {
-	/* Unknown keys at the root level must be warned about but not fail. */
+	/* Unknown keys at the root level must not fail parsing. */
 	const char *json =
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"nosuchkey\":\"value\"}";
 	struct config *const conf = parse_tmpconf(json);
@@ -394,7 +769,7 @@ T_DECLARE_CASE(test_conf_parsefile_unknown_root_key)
 
 T_DECLARE_CASE(test_conf_parsefile_unknown_mux_key)
 {
-	/* Unknown keys inside a scope must be warned about but not fail. */
+	/* Unknown keys inside a scope must not fail parsing. */
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"nosuchfield\":1}}";
 	struct config *const conf = parse_tmpconf(json);
@@ -413,6 +788,30 @@ T_DECLARE_CASE(test_conf_parsefile_mem_pressure_config)
 	T_EXPECT_EQ(conf->mux.mem_pressure_hi, 1000);
 	T_EXPECT_EQ(conf->mux.mem_pressure_lo, 500);
 	conf_free(conf);
+}
+
+/* conf_check() must resolve "lo omitted" to hi/2 once at load time (an
+ * odd hi exercises the truncating division) so every session reads an
+ * already-concrete threshold instead of re-deriving it per grant. */
+T_DECLARE_CASE(test_conf_parsefile_mem_pressure_lo_defaults_to_half_hi)
+{
+	const char *json =
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"mem_pressure\":{\"hi\":1001}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(conf->mux.mem_pressure_hi, 1001);
+	T_EXPECT_EQ(conf->mux.mem_pressure_lo, 500);
+	conf_free(conf);
+}
+
+/* An explicitly inverted mem_pressure range (positive lo > positive hi) is
+ * rejected by conf_check. */
+T_DECLARE_CASE(test_conf_parsefile_rejects_inverted_mem_pressure)
+{
+	const char *json =
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"mem_pressure\":{\"hi\":500,\"lo\":1000}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_session_window_positive)
@@ -532,7 +931,7 @@ T_DECLARE_CASE(test_conf_parsefile_stdin_rejects_oversized)
 T_DECLARE_CASE(test_conf_dump_identity_fields)
 {
 	/* Verify that identity.claim and identity.mux_connect survive a
-	 * dump/parse round-trip, exercising dump_identity_scope. */
+	 * dump/parse round-trip. */
 	struct config *const orig = conf_new_default();
 	T_CHECK(orig != NULL);
 	orig->mux_connect = strdup("127.0.0.1:7777");
@@ -561,10 +960,150 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 	conf_free(orig);
 }
 
+/* Regression test: conf_dump must fail (return NULL) rather than silently
+ * dropping identity.listen when build_listen_json signals failure -- this
+ * pins the success path so a wrong-polarity failure signal never resurfaces. */
+T_DECLARE_CASE(test_conf_dump_identity_listen_roundtrip)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer1\":\"127.0.0.1:9002\"}}}";
+	struct config *const orig = parse_tmpconf(json);
+	T_CHECK(orig != NULL);
+	T_EXPECT_EQ((int)orig->identity.peers_count, 1);
+
+	char tmpl[] = "/tmp/conf_listen_dump_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(write_conf_file(orig, tmpl));
+
+	struct config *const reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT_EQ((int)reparsed->identity.peers_count, 1);
+	T_CHECK(find_peer(reparsed, "peer1") != NULL);
+	T_EXPECT_STREQ(find_peer(reparsed, "peer1")->listen, "127.0.0.1:9002");
+
+	conf_free(reparsed);
+	conf_free(orig);
+}
+
+T_DECLARE_CASE(test_conf_dump_identity_listen_exact_grow_boundary)
+{
+	/* A single peer whose id+listen json_marshal_string lengths sum so
+	 * build_listen_json's vbuf_grow request lands exactly on VBUF_NEW's
+	 * initial capacity (64): id "k" (1 byte) + listen (58 bytes) + 5
+	 * bytes of quote/colon overhead = 64. Without vbuf_grow's +1 headroom,
+	 * this landed exactly on the OOM sentinel (len == cap) and made
+	 * conf_dump spuriously fail (or, with 2+ peers, silently drop a
+	 * separating comma) for a perfectly valid config. */
+	char listen_val[59];
+	memset(listen_val, 'x', sizeof(listen_val) - 1);
+	listen_val[sizeof(listen_val) - 1] = '\0';
+	char json[256];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"k\":\"%s\"}}}",
+		listen_val);
+	struct config *const orig = parse_tmpconf(json);
+	T_CHECK(orig != NULL);
+	T_EXPECT_EQ((int)orig->identity.peers_count, 1);
+
+	char tmpl[] = "/tmp/conf_listen_boundary_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(write_conf_file(orig, tmpl));
+
+	struct config *const reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT_EQ((int)reparsed->identity.peers_count, 1);
+	T_CHECK(find_peer(reparsed, "k") != NULL);
+	T_EXPECT_STREQ(find_peer(reparsed, "k")->listen, listen_val);
+
+	conf_free(reparsed);
+	conf_free(orig);
+}
+
+T_DECLARE_CASE(test_conf_dump_readahead_roundtrip)
+{
+	const char *json =
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"readahead\":65536}}";
+	struct config *const orig = parse_tmpconf(json);
+	T_CHECK(orig != NULL);
+	T_EXPECT_EQ(orig->mux.readahead, 65536);
+
+	char tmpl[] = "/tmp/conf_readahead_dump_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(write_conf_file(orig, tmpl));
+
+	struct config *const reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT_EQ(reparsed->mux.readahead, 65536);
+
+	conf_free(reparsed);
+	conf_free(orig);
+}
+
+/* conf_check_type parses "type" as a MIME media type (RFC 2045), so these
+ * variants -- differing only in case, whitespace, parameter order, or
+ * carrying extra ignored parameters -- must all be accepted, unlike the
+ * byte-exact string the old schema "const" constraint required. */
+T_DECLARE_CASE(test_conf_parsefile_accepts_type_variants)
+{
+	static const char *const good[] = {
+		"application/x-multiplexd-config; version=1",
+		"Application/X-Multiplexd-Config; version=1",
+		"application/x-multiplexd-config;version=1",
+		"application/x-multiplexd-config ; version=1",
+		"application/x-multiplexd-config; charset=utf-8; version=1",
+		"application/x-multiplexd-config; version=1; extra=ignored",
+	};
+	for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+		char json[256];
+		(void)snprintf(
+			json, sizeof(json),
+			"{\"type\":\"%s\",\"mux_connect\":\"127.0.0.1:9000\"}",
+			good[i]);
+		struct config *const conf = parse_tmpconf(json);
+		T_EXPECT(conf != NULL);
+		conf_free(conf);
+	}
+}
+
+T_DECLARE_CASE(test_conf_parsefile_rejects_invalid_type)
+{
+	static const char *const bad[] = {
+		"text/plain; version=1",
+		"application/json; version=1",
+		"application/x-multiplexd-config",
+		"application/x-multiplexd-config; version=2",
+		"application/x-multiplexd-config; version=",
+		"not-a-mime-type",
+		"",
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		char json[256];
+		(void)snprintf(
+			json, sizeof(json),
+			"{\"type\":\"%s\",\"mux_connect\":\"127.0.0.1:9000\"}",
+			bad[i]);
+		struct config *const conf = parse_tmpconf(json);
+		T_EXPECT(conf == NULL);
+		conf_free(conf);
+	}
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_conf_new_default_fields),
 	T_CASE(test_conf_parsefile_nonexistent),
 	T_CASE(test_conf_parsefile_invalid_json),
+	T_CASE(test_conf_parsefile_rejects_invalid_utf8),
+	T_CASE(test_conf_parsefile_accepts_well_formed_utf8),
 	T_CASE(test_conf_parsefile_minimal_client),
 	T_CASE(test_conf_parsefile_minimal_server),
 	T_CASE(test_conf_dump_roundtrip),
@@ -572,27 +1111,56 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_loglevel_parsed),
 	T_CASE(test_conf_parsefile_requires_transport),
 	T_CASE(test_conf_parsefile_requires_claim_for_identity),
+	T_CASE(test_conf_parsefile_accepts_max_length_identity_claim),
+	T_CASE(test_conf_parsefile_rejects_oversized_identity_claim),
+	T_CASE(test_conf_parsefile_accepts_max_length_listen_address),
+	T_CASE(test_conf_parsefile_rejects_oversized_listen_address),
 	T_CASE(test_conf_parsefile_parses_identity_listen),
+	T_CASE(test_conf_parsefile_identity_listen_duplicate_key_last_wins),
+	T_CASE(test_conf_parsefile_rejects_oversized_identity_listen_value),
+	T_CASE(test_conf_parsefile_rejects_oversized_identity_mux_connect),
+	T_CASE(test_conf_parsefile_identity_listen_rejects_non_object),
+	T_CASE(test_conf_parsefile_identity_listen_rejects_malformed_json),
+	T_CASE(test_conf_parsefile_identity_listen_skips_comment_key),
+	T_CASE(test_conf_parsefile_identity_listen_rejects_non_string_value),
+	T_CASE(test_conf_parsefile_rejects_embedded_nul_in_identity_claim),
+	T_CASE(test_conf_parsefile_rejects_embedded_nul_in_identity_listen_key),
+	T_CASE(test_conf_parsefile_rejects_embedded_nul_in_mux_connect_field),
 	T_CASE(test_conf_parsefile_invalid_max_startups_format),
+	T_CASE(test_conf_parsefile_max_startups_rejects_non_strict_digits),
 	T_CASE(test_conf_parsefile_invalid_max_startups_rate),
 	T_CASE(test_conf_parsefile_invalid_max_startups_range),
 	T_CASE(test_conf_parsefile_clamps_timeout_fields),
+	T_CASE(test_conf_parsefile_preserves_zero_connect_resume_timeout),
+	T_CASE(test_conf_parsefile_clamps_int_overflow_fields),
 	T_CASE(test_conf_parsefile_partial_window_config_accepted),
+	T_CASE(test_conf_dump_readahead_roundtrip),
+	T_CASE(test_conf_parsefile_accepts_type_variants),
+	T_CASE(test_conf_parsefile_rejects_invalid_type),
 #if WITH_TLS
 	T_CASE(test_conf_parsefile_rejects_partial_tls_config),
+	T_CASE(test_conf_parsefile_rejects_partial_tls_config_combinations),
 	T_CASE(test_conf_parsefile_authcerts_array),
 	T_CASE(test_conf_dump_tls_fields),
+	T_CASE(test_conf_load_tls_kernel_offload_defaults_with_socket_offload),
+	T_CASE(test_conf_load_tls_kernel_offload_off_without_socket_offload),
+	T_CASE(test_conf_load_tls_kernel_offload_explicit_override),
 	T_CASE(test_conf_inline_pem_replaces_at_path),
 	T_CASE(test_conf_inline_pem_fails_for_missing_file),
-#endif
+#endif /* WITH_TLS */
 	T_CASE(test_conf_parsefile_ignores_comment_keys),
 	T_CASE(test_conf_parsefile_unknown_root_key),
 	T_CASE(test_conf_parsefile_unknown_mux_key),
 	T_CASE(test_conf_parsefile_mem_pressure_config),
+	T_CASE(test_conf_parsefile_mem_pressure_lo_defaults_to_half_hi),
+	T_CASE(test_conf_parsefile_rejects_inverted_mem_pressure),
+	T_CASE(test_conf_parsefile_rejects_embedded_nul_in_identity_listen_value),
 	T_CASE(test_conf_parsefile_session_window_positive),
 	T_CASE(test_conf_parsefile_both_windows_positive),
 	T_CASE(test_conf_parsefile_max_startups_valid),
 	T_CASE(test_conf_dump_identity_fields),
+	T_CASE(test_conf_dump_identity_listen_roundtrip),
+	T_CASE(test_conf_dump_identity_listen_exact_grow_boundary),
 	T_CASE(test_conf_parsefile_rejects_oversized_file),
 	T_CASE(test_conf_parsefile_stdin_success),
 	T_CASE(test_conf_parsefile_stdin_rejects_oversized),

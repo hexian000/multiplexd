@@ -6,11 +6,13 @@
  * session_send_oob is the only other mocked collaborator; no siblings linked. */
 
 #include "mux/estimator.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 
 #include "algo/wndfilter.h"
+
 /* Pre-include clock.h so its guard blocks the later clock_monotonic_ns-mocked
  * inclusion pulled in by estimator.c below. */
 #include "os/clock.h"
@@ -89,17 +91,6 @@ bool session_send_oob(
 	return g_send_oob_ok;
 }
 
-void session_suspend(struct mux_session *restrict ss)
-{
-	(void)ss;
-}
-
-void session_notify_closed(struct mux_session *restrict ss, const bool expired)
-{
-	(void)ss;
-	(void)expired;
-}
-
 static struct mux_session make_session(void)
 {
 	struct mux_session ss = {
@@ -159,6 +150,37 @@ T_DECLARE_CASE(test_estimator_init_resets_all_state)
 		T_EXPECT_EQ(dirs[i]->phase, ESTIMATOR_STARTUP);
 		T_EXPECT_EQ(dirs[i]->stable_rounds, (size_t)0);
 	}
+}
+
+/* estimator_suspend clears only in-flight probe/sample state; learned
+ * bw/RTT filters, effective_bdp, and phase must survive. */
+T_DECLARE_CASE(test_estimator_suspend_clears_probe_preserves_learned)
+{
+	struct mux_session ss = make_session();
+
+	ss.estimator.rx.effective_bdp = 65536;
+	ss.estimator.tx.effective_bdp = 131072;
+	ss.estimator.rx.phase = ESTIMATOR_TRACK;
+	ss.estimator.rx.stable_rounds = 7;
+	wndfilter_reset(&ss.estimator.rx.bw_wnd, 0, INT64_C(50000000));
+	wndfilter_reset(&ss.estimator.rtt_wnd, 0, INT64_C(1000000000));
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.rx.sample = 12345;
+	ss.estimator.tx.sample = 6789;
+	ss.estimator.last_probe_ns = 999;
+
+	estimator_suspend(&ss);
+
+	T_EXPECT(!ss.estimator.ping_in_flight);
+	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)0);
+	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)0);
+	T_EXPECT_EQ(ss.estimator.rx.effective_bdp, (size_t)65536);
+	T_EXPECT_EQ(ss.estimator.tx.effective_bdp, (size_t)131072);
+	T_EXPECT_EQ(ss.estimator.rx.phase, ESTIMATOR_TRACK);
+	T_EXPECT_EQ(ss.estimator.rx.stable_rounds, (size_t)7);
+	T_EXPECT(wndfilter_get(&ss.estimator.rx.bw_wnd) == 50000000);
+	T_EXPECT(wndfilter_get(&ss.estimator.rtt_wnd) == 1000000000);
+	T_EXPECT_EQ(ss.estimator.last_probe_ns, (int_fast64_t)999);
 }
 
 T_DECLARE_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight)
@@ -331,6 +353,40 @@ T_DECLARE_CASE(test_estimator_calculate_invalid_rtt_clears_cycle)
 	T_EXPECT(!ss.estimator.ping_in_flight);
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)0);
 	T_EXPECT_EQ(ss.estimator.last_probe_ns, now);
+}
+
+/* A pathologically tiny RTT (1 ns; never happens on a real link, but nothing
+ * rejects it) with an ordinary sample drives the raw bw_sample far past
+ * INT_FAST64_MAX / WND_FEEDBACK_FLOOR_NS, the bound window_size() needs to
+ * multiply bw_max by WND_FEEDBACK_FLOOR_NS without overflowing
+ * int_fast64_t. Checked directly against bw_wnd rather than the final
+ * window_size(): window_size()'s own clamp to WNDSIZE_MAX rescues an
+ * out-of-range floor either way (correctly saturated or UB-wrapped), so
+ * the final value alone can't distinguish a real fix from silent
+ * wraparound -- unlike bw_max, which is exactly what calc_dir clamps. */
+T_DECLARE_CASE(test_estimator_calculate_tiny_rtt_does_not_overflow_window)
+{
+	struct mux_session ss = make_session();
+	const int_fast64_t rtt_ns = 1;
+	const int_fast64_t now_ns = INT64_C(15) * INT64_C(1000000000) + rtt_ns;
+	const int_fast64_t sent_ns = now_ns - rtt_ns;
+
+	estimator_test_reset();
+	set_clock_sequence(&now_ns, 1);
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.last_probe_ns = sent_ns;
+	/* 10 MB in a single (1 ns!) cycle -> bw_sample_raw = 1e7 * 1e9 / 1 =
+	 * 1e16, far past INT_FAST64_MAX / WND_FEEDBACK_FLOOR_NS (~1.5e13). */
+	ss.estimator.rx.sample = 10000000u;
+
+	estimator_calculate(&ss, sent_ns);
+
+	const int_fast64_t bw_max = wndfilter_get(&ss.estimator.rx.bw_wnd);
+	T_EXPECT(bw_max <= INT_FAST64_MAX / WND_FEEDBACK_FLOOR_NS);
+
+	const size_t window = estimator_rx_window_size(&ss.estimator);
+	T_EXPECT(window >= (size_t)WNDSIZE_MIN);
+	T_EXPECT(window <= (size_t)WNDSIZE_MAX);
 }
 
 /* Window-limited cycle: sample > 2/3 of effective_bdp → triples effective_bdp. */
@@ -782,6 +838,7 @@ T_DECLARE_CASE(test_estimator_rtt_spike_does_not_inflate_window)
 static const struct testing_suite suite[] = {
 	T_CASE(test_estimator_init_seeds_effective_bdp),
 	T_CASE(test_estimator_init_resets_all_state),
+	T_CASE(test_estimator_suspend_clears_probe_preserves_learned),
 	T_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight),
 	T_CASE(test_estimator_add_starts_cycle_after_rate_limit),
 	T_CASE(test_estimator_add_track_enforces_rate_limit),
@@ -791,6 +848,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_estimator_add_acked_starts_cycle_after_rate_limit),
 	T_CASE(test_estimator_calculate_discards_stale_timestamp),
 	T_CASE(test_estimator_calculate_invalid_rtt_clears_cycle),
+	T_CASE(test_estimator_calculate_tiny_rtt_does_not_overflow_window),
 	T_CASE(test_estimator_calculate_updates_effective_bdp),
 	T_CASE(test_estimator_calculate_ack_sample_drives_tx),
 	T_CASE(test_estimator_startup_stable_rounds_exit_to_track),

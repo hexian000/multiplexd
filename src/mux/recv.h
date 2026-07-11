@@ -24,6 +24,15 @@ struct mux_header;
  * are available.  Entry point from session.c:socket_cb on EV_READ. */
 void session_on_recv(struct mux_session *ss);
 
+/* Dispatch whatever complete frames are already buffered in wire.recvbuf,
+ * without reading more from the transport.  Entry point from
+ * send.c:session_on_send, for the one case nothing else re-drives dispatch:
+ * a post-hello early return deferred already-buffered frames
+ * behind tx_pending, and tx_pending has now settled to false without ever
+ * writing a byte to the peer (e.g. every queued stream tombstoned during
+ * suspension), so no peer ACK is coming to trigger a fresh EV_READ. */
+void session_dispatch_pending(struct mux_session *ss);
+
 /* Process an inbound PING: send PONG if rate limit permits. */
 void session_recv_ping(
 	struct mux_session *ss, const struct mux_header *hdr,

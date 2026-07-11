@@ -5,8 +5,9 @@
  * and handshake_process_hello). Dependencies: handshake.c #included; real
  * frame.c/proto_schema.gen.c linked; session/unacked/sched mocked. */
 
-#include "mux/frame.h"
 #include "mux/handshake.h"
+
+#include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 
@@ -246,7 +247,8 @@ T_DECLARE_CASE(test_proto_hello_build_and_parse_roundtrip)
 	T_EXPECT_EQ(parsed.msgid, hello.msgid);
 	T_EXPECT(parsed.reject_inbound);
 	T_EXPECT(parsed.has_session_id);
-	T_EXPECT(parsed.has_resume_seq);
+	/* has_resume_seq is not populated on the parse side (has_session_id is
+	 * the resume discriminant); only the resume_seq value is read back. */
 	T_EXPECT_EQ(parsed.resume_seq, hello.resume_seq);
 	T_EXPECT(parsed.has_identity);
 	T_EXPECT(
@@ -259,6 +261,20 @@ T_DECLARE_CASE(test_proto_hello_build_and_parse_roundtrip)
 T_DECLARE_CASE(test_proto_hello_parse_rejects_missing_type)
 {
 	static const unsigned char json[] = "{\"msgid\":0}";
+	struct proto_hello parsed;
+
+	T_EXPECT(!proto_hello_parse(json, sizeof(json) - 1, &parsed));
+}
+
+/* A type field with an embedded NUL (a JSON u0000 escape) whose
+ * strlen-truncated prefix is itself a valid type ("...; version=1") must be
+ * rejected, not silently accepted with the post-NUL bytes dropped:
+ * proto_parse_type validates obj.type.len, not strlen. */
+T_DECLARE_CASE(test_proto_hello_parse_rejects_type_embedded_nul)
+{
+	static const unsigned char json[] =
+		"{\"type\":\"application/x-multiplexd-proto; version=1\\u0000x\","
+		"\"msgid\":0}";
 	struct proto_hello parsed;
 
 	T_EXPECT(!proto_hello_parse(json, sizeof(json) - 1, &parsed));
@@ -292,6 +308,34 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_oversized_identity)
 		(const unsigned char *)json, strlen(json), &parsed));
 }
 
+/* The identity extension is documented as UTF-8 on the wire
+ * (proto_schema.json); malformed UTF-8 must be rejected by the shared JSON
+ * string decoder proto_hello_parse relies on, not silently accepted. */
+T_DECLARE_CASE(test_proto_hello_parse_rejects_invalid_utf8_identity)
+{
+	static const char json[] =
+		"{\"type\":\"application/x-multiplexd-proto; version=1\","
+		"\"msgid\":0,\"extensions\":{\"identity\":\"\xc2(\"}}";
+	struct proto_hello parsed;
+
+	T_EXPECT(!proto_hello_parse(
+		(const unsigned char *)json, sizeof(json) - 1, &parsed));
+}
+
+/* Well-formed multi-byte UTF-8 in the identity extension must still parse. */
+T_DECLARE_CASE(test_proto_hello_parse_accepts_well_formed_utf8_identity)
+{
+	static const char json[] =
+		"{\"type\":\"application/x-multiplexd-proto; version=1\","
+		"\"msgid\":0,\"extensions\":{\"identity\":\"\xc3\xa9\xe4\xb8\xad\"}}";
+	struct proto_hello parsed;
+
+	T_CHECK(proto_hello_parse(
+		(const unsigned char *)json, sizeof(json) - 1, &parsed));
+	T_EXPECT(parsed.has_identity);
+	T_EXPECT_STREQ(parsed.identity, "\xc3\xa9\xe4\xb8\xad");
+}
+
 T_DECLARE_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
@@ -305,6 +349,7 @@ T_DECLARE_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume
 	ss.handshake.identity = (char *)"cli-service";
 	ss.conf.reject_inbound = true;
 	ss.unacked.recv_seq = 41;
+	ss.unacked.unreported = 7;
 	ss.unacked.last_ack_recv = 99;
 
 	T_EXPECT(handshake_enqueue_hello(&ss, PROTO_MSG_CLIENT_HELLO, true));
@@ -316,11 +361,38 @@ T_DECLARE_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume
 	T_EXPECT_EQ(parsed.msgid, PROTO_MSG_CLIENT_HELLO);
 	T_EXPECT(parsed.reject_inbound);
 	T_EXPECT(parsed.has_session_id);
-	T_EXPECT(parsed.has_resume_seq);
+	/* has_resume_seq is not populated on the parse side; only resume_seq is. */
 	T_EXPECT_EQ(parsed.resume_seq, (uint_least32_t)41);
-	T_EXPECT_EQ(ss.unacked.ack_seq, (uint_least32_t)41);
+	T_EXPECT_EQ(ss.unacked.unreported, (uint_least32_t)0);
 	T_EXPECT(parsed.has_identity);
 	T_EXPECT_STREQ(parsed.identity, "cli-service");
+
+	mux_frame_put(&ss.pool, ss.wire.sendbuf.head);
+}
+
+/* An identity.claim too long for the wire hello's identity field must be
+ * omitted rather than truncated, and the hello must still build and send. */
+T_DECLARE_CASE(test_handshake_enqueue_hello_omits_oversized_identity)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss;
+	struct proto_hello parsed;
+	char identity[257];
+
+	handshake_mock_reset();
+	setup_session(&ss, &pool_ctx, false);
+	memset(identity, 'a', sizeof(identity) - 1);
+	identity[sizeof(identity) - 1] = '\0';
+	T_CHECK(strlen(identity) == sizeof(parsed.identity));
+	ss.handshake.identity = identity;
+
+	T_EXPECT(handshake_enqueue_hello(&ss, PROTO_MSG_CLIENT_HELLO, false));
+	T_CHECK(ss.wire.sendbuf.head != NULL);
+	T_EXPECT(proto_hello_parse(
+		ss.wire.sendbuf.head->data + MUX_FRAME_HEADER_SIZE,
+		ss.wire.sendbuf.head->len - MUX_FRAME_HEADER_SIZE, &parsed));
+	T_EXPECT_EQ(parsed.msgid, PROTO_MSG_CLIENT_HELLO);
+	T_EXPECT(!parsed.has_identity);
 
 	mux_frame_put(&ss.pool, ss.wire.sendbuf.head);
 }
@@ -544,7 +616,9 @@ T_DECLARE_CASE(test_handshake_process_hello_outside_handshake_resets)
 	setup_session(&ss, &pool_ctx, false);
 	ss.state = SESSION_ESTABLISHED; /* not HANDSHAKE */
 
-	T_EXPECT(!handshake_process_hello(&ss, &hdr, 0));
+	/* hdr is zero-initialized (length=0); frame_size must match the
+	 * caller-guaranteed MUX_FRAME_HEADER_SIZE + hdr.length invariant. */
+	T_EXPECT(!handshake_process_hello(&ss, &hdr, MUX_FRAME_HEADER_SIZE));
 	T_EXPECT_EQ(g_reset_calls, 1);
 }
 
@@ -1044,9 +1118,13 @@ T_DECLARE_CASE(test_handshake_fuzz)
 static const struct testing_suite suite[] = {
 	T_CASE(test_proto_hello_build_and_parse_roundtrip),
 	T_CASE(test_proto_hello_parse_rejects_missing_type),
+	T_CASE(test_proto_hello_parse_rejects_type_embedded_nul),
 	T_CASE(test_proto_hello_parse_rejects_bad_session_id),
 	T_CASE(test_proto_hello_parse_rejects_oversized_identity),
+	T_CASE(test_proto_hello_parse_rejects_invalid_utf8_identity),
+	T_CASE(test_proto_hello_parse_accepts_well_formed_utf8_identity),
 	T_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume),
+	T_CASE(test_handshake_enqueue_hello_omits_oversized_identity),
 	T_CASE(test_handshake_process_server_hello_assigns_peer_identity),
 	T_CASE(test_handshake_process_resume_hello_calls_on_resume_match),
 	T_CASE(test_handshake_process_confirmed_resume_calls_resume_ack_recv),

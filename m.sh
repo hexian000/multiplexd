@@ -3,17 +3,16 @@
 cd "$(dirname "$0")"
 set -ex
 
-gen_schema() {
+case "$1" in
+"gen")
     # conf: parsed once at startup — optimize for binary size
     python3 scripts/gen_schema.py --prefix json_ --optimize size src/conf_schema.json
     # proto: parsed on every mux frame — optimize for speed
     python3 scripts/gen_schema.py --prefix json_ --optimize fast src/mux/proto_schema.json
-}
-
-case "$1" in
-"gen")
-    # generate code from schemas
-    gen_schema
+    ;;
+"fmt")
+    # format code
+    python3 scripts/format.py .
     ;;
 "c")
     # clean artifacts
@@ -126,10 +125,6 @@ case "$1" in
     ;;
 "d")
     # rebuild for debug
-    gen_schema
-    if command -v clang-format >/dev/null; then
-        find src -type f -regex '.*\.[hc]' -not -regex '.*\.gen\.[hc]' -exec clang-format -i {} +
-    fi
     rm -rf build && mkdir -p build && cd build
     cmake \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
@@ -141,14 +136,13 @@ case "$1" in
     cmake --build . -j"$(nproc)"
     ctest -j"$(nproc)"
     ;;
-*)
-    # default: incremental build
-    mkdir -p build
-    cd build
-    if [ ! -f Makefile ]; then
-        cmake ..
-    fi
-    cmake --build .
+"")
+    # incremental build
+    mkdir -p build && cd build
+    cmake .. && cmake --build .
     ls -lh bin/multiplexd
+    ;;
+*)
+    echo "Unknown option: $1"
     ;;
 esac

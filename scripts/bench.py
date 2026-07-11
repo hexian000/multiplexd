@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, TextIO
 
+# Sibling script, same scripts/ directory (Python puts a script's own directory
+# on sys.path[0]): reuse its builtin RSA-4096 pair instead of a third copy of
+# the same PEM data (the first two are smoke_test.py's own BUILTIN_CERT_PEM/
+# KEY_PEM doc comment and src/tlsutil_test.c's embedded fixture).
+from smoke_test import BUILTIN_CERT_PEM, BUILTIN_KEY_PEM
 
 ROOT = Path.cwd().resolve()
 DEFAULT_BUILD_DIR = ROOT / "build"
@@ -379,20 +384,24 @@ def write_config(path: Path, payload: Dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=4) + "\n", encoding="utf-8")
 
 
-def ensure_certificates(binary_path: Path, runtime_dir: Path) -> None:
+def ensure_certificates(runtime_dir: Path) -> None:
+    # Always the same builtin RSA-4096 pair ctest's tlsutil_test.c fixture
+    # uses, for both peers via mutual pinning: --gencerts would both spawn the
+    # binary just to key-generate on every fresh runtime_dir, and is
+    # OpenSSL-only (GENCERTS_SOURCES is empty for mbedTLS/no-TLS builds), so a
+    # backend-agnostic benchmark needs a backend-agnostic certificate anyway.
     server_cert = runtime_dir / "server-cert.pem"
     client_cert = runtime_dir / "client-cert.pem"
     if server_cert.exists() and client_cert.exists():
         return
-    run_command(
-        [str(binary_path), "--gencerts", "client,server"],
-        cwd=runtime_dir,
-        timeout=30.0,
-    )
+    for role in ("server", "client"):
+        (runtime_dir / ("%s-cert.pem" % role)).write_text(
+            BUILTIN_CERT_PEM, encoding="utf-8")
+        (runtime_dir / ("%s-key.pem" % role)).write_text(
+            BUILTIN_KEY_PEM, encoding="utf-8")
 
 
 def prepare_runtime_assets(
-        binary_path: Path,
         runtime_dir: Path,
         *,
         use_tls: bool,
@@ -405,11 +414,13 @@ def prepare_runtime_assets(
 ) -> tuple[Path, Path]:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if use_tls:
-        ensure_certificates(binary_path, runtime_dir)
+        ensure_certificates(runtime_dir)
     server_config_path = runtime_dir / "server.json"
     client_config_path = runtime_dir / "client.json"
-    write_config(server_config_path, build_server_config(use_tls=use_tls, window=window, max_frame_size=max_frame_size, ciphersuites=ciphersuites, socket_offload=socket_offload, kernel_offload=kernel_offload))
-    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels, window=window, max_frame_size=max_frame_size, ciphersuites=ciphersuites, socket_offload=socket_offload, kernel_offload=kernel_offload))
+    write_config(server_config_path, build_server_config(use_tls=use_tls, window=window, max_frame_size=max_frame_size,
+                 ciphersuites=ciphersuites, socket_offload=socket_offload, kernel_offload=kernel_offload))
+    write_config(client_config_path, build_client_config(use_tls=use_tls, tunnels=tunnels, window=window,
+                 max_frame_size=max_frame_size, ciphersuites=ciphersuites, socket_offload=socket_offload, kernel_offload=kernel_offload))
     return server_config_path, client_config_path
 
 
@@ -842,8 +853,10 @@ def render_markdown_report(
         "| TLS kernel_offload | %s |"
         % ("default" if kernel_offload is None else ("on" if kernel_offload else "off")),
         "| Tunnels | %d |" % tunnels,
-        "| Stream/session window | %s |" % (str(window) if window is not None else "default"),
-        "| Max frame size | %s |" % (str(max_frame_size) if max_frame_size is not None else "default"),
+        "| Stream/session window | %s |" % (str(window)
+                                            if window is not None else "default"),
+        "| Max frame size | %s |" % (
+            str(max_frame_size) if max_frame_size is not None else "default"),
         "| Netem delay | %s |" % (netem_delay or "off"),
         "| Benchmark timeout | %.1f s per scenario |" % command_timeout_seconds,
         "| Shutdown grace | SIGINT %.1f s, terminate %.1f s |"
@@ -929,7 +942,8 @@ def render_markdown_report(
             lines.append("| Second | Throughput |")
             lines.append("| ---: | ---: |")
             for index, bps in enumerate(result.interval_throughputs, start=1):
-                lines.append("| %d | %s |" % (index, format_bits_per_second(bps)))
+                lines.append("| %d | %s |" %
+                             (index, format_bits_per_second(bps)))
         lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -996,8 +1010,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--kernel-offload",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="set tls.kernel_offload / KTLS "
-             "(default: omit from config, daemon default is off)",
+        help="set tls.kernel_offload / KTLS (default: omit from config; "
+             "daemon default is on once socket_offload is also on, off "
+             "otherwise -- pass --no-kernel-offload to force it off)",
     )
     parser.add_argument(
         "-w",
@@ -1037,7 +1052,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             % build_dir
         )
     server_config_path, client_config_path = prepare_runtime_assets(
-        binary_path,
         build_dir,
         use_tls=args.tls,
         tunnels=args.tunnels,

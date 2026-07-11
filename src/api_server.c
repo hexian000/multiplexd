@@ -5,18 +5,20 @@
 
 #include "conf.h"
 #include "listener.h"
+#include "mux/mux.h"
 #include "server.h"
+#include "shim/util.h"
 #include "tunnel.h"
-#include "util.h"
 
+#include "meta/arraysize.h"
+#include "meta/minmax.h"
 #include "net/http.h"
 #include "net/url.h"
 #include "os/clock.h"
 #include "os/socket.h"
-#include "utils/arraysize.h"
+#include "utils/ascii.h"
 #include "utils/buffer.h"
 #include "utils/formats.h"
-#include "utils/minmax.h"
 #include "utils/slog.h"
 
 #include <ev.h>
@@ -33,7 +35,13 @@
 #include <sys/socket.h>
 #include <time.h>
 
-enum { HTTP_MAX_ENTITY = 8192 };
+enum {
+	/* rbuf must admit a CONF_MAXSIZE config body plus HTTP framing
+	 * headroom. */
+	HTTP_MAX_ENTITY = CONF_MAXSIZE + 4096,
+	/* wbuf only stages response headers; a body goes through cbuf. */
+	HTTP_MAX_RESPONSE_HDR = 1024,
+};
 
 #define API_TIMEOUT 30.0
 
@@ -46,6 +54,7 @@ struct api_ctx {
 	char *next;
 	bool hdr_done : 1;
 	bool keepalive : 1;
+	bool content_length_seen : 1;
 	/* Connection header value */
 	char connection[32];
 	size_t wpos;
@@ -57,7 +66,7 @@ struct api_ctx {
 	} rbuf;
 	struct {
 		BUFFER_HDR;
-		unsigned char data[HTTP_MAX_ENTITY];
+		unsigned char data[HTTP_MAX_RESPONSE_HDR];
 	} wbuf;
 	struct vbuffer *cbuf;
 };
@@ -68,7 +77,7 @@ static void api_ctx_free(struct ev_loop *loop, struct api_ctx *restrict ctx)
 	ev_io_stop(loop, &ctx->w_send);
 	ev_timer_stop(loop, &ctx->w_timeout);
 	if (ctx->fd != -1) {
-		SOCKET_CLOSE_FD(ctx->fd);
+		socket_close(ctx->fd);
 	}
 	VBUF_FREE(ctx->cbuf);
 	free(ctx);
@@ -83,6 +92,7 @@ static void api_ctx_reset(struct ev_loop *loop, struct api_ctx *restrict ctx)
 	ctx->msg = (struct http_message){ 0 };
 	ctx->hdr_done = false;
 	ctx->keepalive = false;
+	ctx->content_length_seen = false;
 	ctx->connection[0] = '\0';
 	ctx->content_length = 0;
 	BUF_RESET(ctx->wbuf);
@@ -125,13 +135,47 @@ static bool parse_bool(const char *s)
 			     strcmp(s, "t") == 0 || strcmp(s, "true") == 0);
 }
 
+/* RFC 7231 section 7.1.1.1 IMF-fixdate, built from a static English name
+ * table instead of contrib's http_date(), which formats via strftime's
+ * locale-dependent %a/%b -- under init()'s own setlocale(LC_ALL, ""), a
+ * non-English LC_TIME breaks the RFC-mandated English day/month names, and
+ * an overflowing localized expansion can even make strftime return 0
+ * (contrib is read-only, so the fix lives at the call site). Returns the
+ * formatted length, or 0 on failure (undersized buf or gmtime_r failure),
+ * matching http_date()'s own contract. */
+static size_t http_date_safe(char *restrict buf, const size_t buf_size)
+{
+	static const char *const wday_name[7] = { "Sun", "Mon", "Tue", "Wed",
+						  "Thu", "Fri", "Sat" };
+	static const char *const mon_name[12] = { "Jan", "Feb", "Mar", "Apr",
+						  "May", "Jun", "Jul", "Aug",
+						  "Sep", "Oct", "Nov", "Dec" };
+	const time_t now = time(NULL);
+	struct tm gmt;
+	if (gmtime_r(&now, &gmt) == NULL) {
+		return 0;
+	}
+	const int n = snprintf(
+		buf, buf_size, "%s, %02d %s %d %02d:%02d:%02d GMT",
+		wday_name[gmt.tm_wday % 7], gmt.tm_mday,
+		mon_name[gmt.tm_mon % 12], gmt.tm_year + 1900, gmt.tm_hour,
+		gmt.tm_min, gmt.tm_sec);
+	return (n > 0 && (size_t)n < buf_size) ? (size_t)n : 0;
+}
+
 /* Writes an HTTP response with the given status code and empty body. */
 static void respond_status(struct api_ctx *restrict ctx, const int code)
 {
 	char date_str[32];
-	const size_t date_len = http_date(date_str, sizeof(date_str));
+	const size_t date_len = http_date_safe(date_str, sizeof(date_str));
 	const char *const status = http_status((uint_fast16_t)code);
 	BUF_RESET(ctx->wbuf);
+	/* Guarantee the documented "empty body" contract even when called
+	 * after a partial cbuf append failed with OOM: send_cb() always
+	 * transmits wbuf then cbuf, so a stale/partial cbuf here would
+	 * otherwise desync the declared Content-Length: 0 from what's
+	 * actually sent. */
+	VBUF_RESET(ctx->cbuf);
 	BUF_APPENDF(
 		ctx->wbuf,
 		"HTTP/1.1 %d %s\r\n"
@@ -150,7 +194,7 @@ static void respond_body(
 	const size_t body_len)
 {
 	char date_str[32];
-	const size_t date_len = http_date(date_str, sizeof(date_str));
+	const size_t date_len = http_date_safe(date_str, sizeof(date_str));
 	const char *const status = http_status((uint_fast16_t)code);
 	BUF_RESET(ctx->wbuf);
 	BUF_APPENDF(
@@ -176,11 +220,96 @@ static void respond_ok(
 	respond_body(ctx, HTTP_OK, content_type, body_len);
 }
 
+/* A peer identity is peer-controlled (config or PUT /config) and only
+ * NUL-excluded per spec (doc/spec.md 5.2.3.2), so it may contain quotes,
+ * backslashes, newlines, or other control bytes. Escape those before
+ * interpolating into a Prometheus label value or a plaintext status line, or a
+ * crafted identity could corrupt the /metrics exposition or inject spoofed
+ * /stats /healthy lines. Max identity is 255 octets; a plaintext control byte
+ * escapes to \xNN (4 bytes, the worst case -- the metric context never exceeds
+ * 2x), plus a NUL. */
+enum { IDENTITY_ESCAPED_MAX = 4 * 255 + 1 };
+
+/* escape_identity target. The Prometheus 0.0.4 text format accepts only \\, \",
+ * and \n as backslash escapes inside a label value; any other escape (e.g. \t
+ * or \r) is an "invalid escape sequence" that makes the whole scrape
+ * unparseable, so TAB and CR are emitted literally there -- both are valid
+ * label-value bytes. A plaintext status line has no such grammar, so it escapes
+ * every control byte: TAB and CR as \t and \r, and any other C0 byte (e.g. ESC)
+ * as an inert \xNN -- denying a crafted identity the terminal cursor motion it
+ * could otherwise use to spoof a status row. */
+enum escape_ctx { ESCAPE_METRIC, ESCAPE_PLAIN };
+
+static void escape_identity(
+	char *restrict out, const size_t outsize, const char *restrict in,
+	const enum escape_ctx ctx)
+{
+	size_t o = 0;
+	for (size_t i = 0; in[i] != '\0'; i++) {
+		const unsigned char c = (unsigned char)in[i];
+		char esc = '\0';
+		switch (c) {
+		case '\\':
+		case '"':
+			esc = (char)c;
+			break;
+		case '\n':
+			esc = 'n';
+			break;
+		case '\t':
+			esc = ctx == ESCAPE_PLAIN ? 't' : '\0';
+			break;
+		case '\r':
+			esc = ctx == ESCAPE_PLAIN ? 'r' : '\0';
+			break;
+		default:
+			break;
+		}
+		if (esc != '\0') {
+			if (o + 2 >= outsize) {
+				break;
+			}
+			out[o++] = '\\';
+			out[o++] = esc;
+		} else if (ctx == ESCAPE_PLAIN && c < 0x20) {
+			/* Any remaining C0 control byte (e.g. ESC) would let a
+			 * crafted identity drive terminal cursor motion in the
+			 * plaintext status output; emit an inert \xNN escape. */
+			if (o + 4 >= outsize) {
+				break;
+			}
+			out[o++] = '\\';
+			out[o++] = 'x';
+			tohexlower(&out[o], c);
+			o += 2;
+		} else {
+			if (o + 1 >= outsize) {
+				break;
+			}
+			out[o++] = (char)c;
+		}
+	}
+	out[o] = '\0';
+}
+
+/* Active session count = created - finalized, clamped to 0. server_stats reads
+ * the two counters from independent relaxed atomics with no ordering between
+ * them, so under weak memory finalized can transiently exceed created and the
+ * unsigned subtraction would wrap near UINT64_MAX for one scrape. */
+static uint_least64_t sessions_active(const struct server_stats *restrict s)
+{
+	return s->num_session_created >= s->num_session_finalized ?
+		       s->num_session_created - s->num_session_finalized :
+		       0;
+}
+
 /* Appends one line per offline forwarding listener to the response body. */
 static void healthy_offline_cb(void *data, const char *identifier)
 {
 	struct api_ctx *const restrict ctx = data;
-	VBUF_APPENDF(ctx->cbuf, "offline: %s\n", identifier);
+	char esc[IDENTITY_ESCAPED_MAX];
+	escape_identity(esc, sizeof(esc), identifier, ESCAPE_PLAIN);
+	VBUF_APPENDF(ctx->cbuf, "offline: %s\n", esc);
 }
 
 /* Handles GET /healthy.  Returns 200 with an empty body when every forwarding
@@ -302,10 +431,10 @@ static void append_sessions(
 		if (t->peer_identity == NULL) {
 			continue;
 		}
+		char id[IDENTITY_ESCAPED_MAX];
+		escape_identity(id, sizeof(id), t->peer_identity, ESCAPE_PLAIN);
 		if (!t->established) {
-			VBUF_APPENDF(
-				ctx->cbuf, "%-20s: offline\n",
-				t->peer_identity);
+			VBUF_APPENDF(ctx->cbuf, "%-20s: offline\n", id);
 			continue;
 		}
 		if (t->rtt_ns > 0) {
@@ -315,13 +444,13 @@ static void append_sessions(
 				rtt_str, make_duration_nanos(t->rtt_ns));
 			VBUF_APPENDF(
 				ctx->cbuf, "%-20s: W=Rx %s, Tx %s; RTT %s\n",
-				t->peer_identity, rx_str, tx_str, rtt_str);
+				id, rx_str, tx_str, rtt_str);
 		} else {
 			FORMAT_BYTES(rx_str, t->rx_window);
 			FORMAT_BYTES(tx_str, t->tx_window);
 			VBUF_APPENDF(
-				ctx->cbuf, "%-20s: W=Rx %s, Tx %s\n",
-				t->peer_identity, rx_str, tx_str);
+				ctx->cbuf, "%-20s: W=Rx %s, Tx %s\n", id,
+				rx_str, tx_str);
 		}
 	}
 }
@@ -402,8 +531,7 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		server_modestr(conf));
 	VBUF_APPENDF(
 		ctx->cbuf, "%-20s: %zu / %" PRIuLEAST64 " (+%zu)\n", "Sessions",
-		stats->num_sessions,
-		stats->num_session_created - stats->num_session_finalized,
+		stats->num_sessions, sessions_active(stats),
 		stats->num_session_halfopen);
 	VBUF_APPENDF(
 		ctx->cbuf, "%-20s: %zu (+%zu)\n", "Streams", stats->num_streams,
@@ -465,7 +593,11 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		ctx->cbuf, "%-20s: %" PRIuLEAST64 "\n", "Stream Errors",
 		stats->num_stream_errors);
 	{
-		const size_t frame_size = 16384;
+		/* Wire size of one frame: header plus the configured payload
+		 * cap. conf_load_mux() always clamps this to at least
+		 * MUX_MIN_FRAME_PAYLOAD, so no fallback is needed here. */
+		const size_t frame_size = MUX_FRAME_HEADER_SIZE +
+					  (size_t)conf->mux.max_frame_payload;
 		FORMAT_BYTES(rx_buf, stats->recv_buffered_bytes);
 		FORMAT_BYTES(
 			tx_buf,
@@ -524,114 +656,7 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 		cbuf, "multiplexd_%s{" labels "} " fmt "\n", name,             \
 		__VA_ARGS__)
 
-/* Appends all per-tunnel Prometheus metrics. */
-static struct vbuffer *append_tunnel_metrics(
-	struct vbuffer *restrict cbuf,
-	const struct server_stats *restrict stats)
-{
-#define APPEND_TUNNEL_METRIC_F(name, help, type, line_fmt, keep_cond, ...)     \
-	do {                                                                   \
-		bool hdr = false;                                              \
-		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
-			const struct tunnel_stats *restrict t =                \
-				&stats->tunnels[i];                            \
-			if (!(keep_cond) || t->peer_identity == NULL) {        \
-				continue;                                      \
-			}                                                      \
-			if (!hdr) {                                            \
-				APPEND_METRIC_HDR(name, type, help);           \
-				hdr = true;                                    \
-			}                                                      \
-			VBUF_APPENDF(cbuf, line_fmt, __VA_ARGS__);             \
-		}                                                              \
-	} while (0)
-
-#define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val, keep_cond)      \
-	do {                                                                   \
-		bool hdr = false;                                              \
-		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
-			const struct tunnel_stats *restrict t =                \
-				&stats->tunnels[i];                            \
-			if (!(keep_cond) || t->peer_identity == NULL ||        \
-			    (extra_skip)) {                                    \
-				continue;                                      \
-			}                                                      \
-			if (!hdr) {                                            \
-				APPEND_METRIC_HDR(name, "gauge", help);        \
-				hdr = true;                                    \
-			}                                                      \
-			APPEND_METRIC_L(                                       \
-				name,                                          \
-				"identity=\"%s\",tunnel=\"%" PRIuLEAST64 "\"", \
-				fmt, t->peer_identity, t->tunnel_index,        \
-				(val));                                        \
-		}                                                              \
-	} while (0)
-
-	APPEND_TUNNEL_METRIC_F(
-		"session_bytes_total",
-		"Wire bytes on the mux link per identity session", "counter",
-		"multiplexd_session_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %" PRIuLEAST64 "\n"
-		"multiplexd_session_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %" PRIuLEAST64 "\n",
-		true, t->peer_identity, t->tunnel_index, t->byt_mux_recv,
-		t->peer_identity, t->tunnel_index, t->byt_mux_sent);
-	APPEND_TUNNEL_METRIC_F(
-		"session_payload_bytes_total",
-		"PUSH-frame payload bytes on the mux link per identity session",
-		"counter",
-		"multiplexd_session_payload_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %" PRIuLEAST64 "\n"
-		"multiplexd_session_payload_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %" PRIuLEAST64 "\n",
-		true, t->peer_identity, t->tunnel_index, t->byt_push_recv,
-		t->peer_identity, t->tunnel_index, t->byt_push_sent);
-	APPEND_TUNNEL_METRIC_F(
-		"session_window_bytes",
-		"Per-stream window size per identity session", "counter",
-		"multiplexd_session_window_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %zu\n"
-		"multiplexd_session_window_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %zu\n",
-		t->established, t->peer_identity, t->tunnel_index, t->rx_window,
-		t->peer_identity, t->tunnel_index, t->tx_window);
-	APPEND_TUNNEL_METRIC(
-		"session_rtt_seconds", "Round-trip time per identity session",
-		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9, t->established);
-	APPEND_TUNNEL_METRIC_F(
-		"session_bdp_bytes",
-		"Bandwidth-delay product per identity session", "gauge",
-		"multiplexd_session_bdp_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %zu\n"
-		"multiplexd_session_bdp_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %zu\n",
-		t->established && (t->bdp_rx != 0 || t->bdp_tx != 0),
-		t->peer_identity, t->tunnel_index, t->bdp_rx, t->peer_identity,
-		t->tunnel_index, t->bdp_tx);
-
-#undef APPEND_TUNNEL_METRIC_F
-#undef APPEND_TUNNEL_METRIC
-
-	return cbuf;
-}
-
-/* Handles GET /metrics — Prometheus text format (version 0.0.4). */
-static void handle_metrics(struct api_ctx *restrict ctx)
-{
-	struct server *const restrict s = ctx->s;
-	struct server_stats *const restrict stats = server_stats(s);
-	if (stats == NULL) {
-		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
-		return;
-	}
-	const int_fast64_t now = clock_monotonic_ns();
-	const double uptime = (double)(now - s->started) / 1e9;
-
-	VBUF_RESET(ctx->cbuf);
-	struct vbuffer *restrict cbuf = ctx->cbuf;
-
-	/* Emits # HELP and # TYPE lines, then one unlabeled sample. */
+/* Emits # HELP and # TYPE lines, then one unlabeled sample. */
 #define APPEND_METRIC(name, type, help, fmt, val)                              \
 	do {                                                                   \
 		APPEND_METRIC_HDR(name, type, help);                           \
@@ -652,14 +677,17 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 			api_val);                                              \
 	} while (0)
 
-	/* --- Gauges --- */
+/* Appends the point-in-time gauge metrics (session/stream counts, uptime). */
+static struct vbuffer *append_gauge_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats, const double uptime)
+{
 	APPEND_METRIC(
 		"uptime_seconds", "gauge", "Seconds since server start", "%.3f",
 		uptime);
 	APPEND_METRIC(
 		"sessions", "gauge", "Total mux session objects",
-		"%" PRIuLEAST64,
-		stats->num_session_created - stats->num_session_finalized);
+		"%" PRIuLEAST64, sessions_active(stats));
 	APPEND_METRIC(
 		"sessions_established", "gauge", "Established mux sessions",
 		"%zu", stats->num_sessions);
@@ -674,7 +702,14 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"streams_halfopen", "gauge",
 		"Half-open mux streams (SYN sent, before SYN-ACK)", "%zu",
 		stats->num_stream_halfopen);
+	return cbuf;
+}
 
+/* Appends stream lifecycle counters and the establishment-latency summary. */
+static struct vbuffer *append_stream_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats)
+{
 	APPEND_METRIC(
 		"stream_open_total", "counter",
 		"Total successful active-open stream creations",
@@ -714,8 +749,14 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 			"stream_establish_latency_seconds_count",
 			"%" PRIuLEAST64, stats->num_stream_established);
 	}
+	return cbuf;
+}
 
-	/* --- Counters --- */
+/* Appends connection-lifecycle and error/backlog counters. */
+static struct vbuffer *append_connection_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats)
+{
 	APPEND_METRIC_LISTENER(
 		"connections_accepted_total", "counter",
 		"Total accepted connections", stats->num_accepted,
@@ -759,7 +800,125 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		"unacked_frames", "gauge",
 		"Frames held in the session unacked list (spec §5.7.2)", "%zu",
 		stats->unacked_frames);
+	return cbuf;
+}
 
+/* Appends all per-tunnel Prometheus metrics. */
+static struct vbuffer *append_tunnel_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats)
+{
+#define APPEND_TUNNEL_METRIC_F(name, help, type, line_fmt, keep_cond, ...)     \
+	do {                                                                   \
+		bool hdr = false;                                              \
+		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
+			const struct tunnel_stats *restrict t =                \
+				&stats->tunnels[i];                            \
+			if (!(keep_cond) || t->peer_identity == NULL) {        \
+				continue;                                      \
+			}                                                      \
+			if (!hdr) {                                            \
+				APPEND_METRIC_HDR(name, type, help);           \
+				hdr = true;                                    \
+			}                                                      \
+			char esc_id[IDENTITY_ESCAPED_MAX];                     \
+			escape_identity(                                       \
+				esc_id, sizeof(esc_id), t->peer_identity,      \
+				ESCAPE_METRIC);                                \
+			VBUF_APPENDF(cbuf, line_fmt, __VA_ARGS__);             \
+		}                                                              \
+	} while (0)
+
+#define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val, keep_cond)      \
+	do {                                                                   \
+		bool hdr = false;                                              \
+		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
+			const struct tunnel_stats *restrict t =                \
+				&stats->tunnels[i];                            \
+			if (!(keep_cond) || t->peer_identity == NULL ||        \
+			    (extra_skip)) {                                    \
+				continue;                                      \
+			}                                                      \
+			if (!hdr) {                                            \
+				APPEND_METRIC_HDR(name, "gauge", help);        \
+				hdr = true;                                    \
+			}                                                      \
+			char esc_id[IDENTITY_ESCAPED_MAX];                     \
+			escape_identity(                                       \
+				esc_id, sizeof(esc_id), t->peer_identity,      \
+				ESCAPE_METRIC);                                \
+			APPEND_METRIC_L(                                       \
+				name,                                          \
+				"identity=\"%s\",tunnel=\"%" PRIuLEAST64 "\"", \
+				fmt, esc_id, t->tunnel_index, (val));          \
+		}                                                              \
+	} while (0)
+
+	APPEND_TUNNEL_METRIC_F(
+		"session_bytes_total",
+		"Wire bytes on the mux link per identity session", "counter",
+		"multiplexd_session_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
+		"\",direction=\"rx\"} %" PRIuLEAST64 "\n"
+		"multiplexd_session_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
+		"\",direction=\"tx\"} %" PRIuLEAST64 "\n",
+		true, esc_id, t->tunnel_index, t->byt_mux_recv, esc_id,
+		t->tunnel_index, t->byt_mux_sent);
+	APPEND_TUNNEL_METRIC_F(
+		"session_payload_bytes_total",
+		"PUSH-frame payload bytes on the mux link per identity session",
+		"counter",
+		"multiplexd_session_payload_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
+		"\",direction=\"rx\"} %" PRIuLEAST64 "\n"
+		"multiplexd_session_payload_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
+		"\",direction=\"tx\"} %" PRIuLEAST64 "\n",
+		true, esc_id, t->tunnel_index, t->byt_push_recv, esc_id,
+		t->tunnel_index, t->byt_push_sent);
+	APPEND_TUNNEL_METRIC_F(
+		"session_window_bytes",
+		"Per-stream window size per identity session", "counter",
+		"multiplexd_session_window_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
+		"\",direction=\"rx\"} %zu\n"
+		"multiplexd_session_window_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
+		"\",direction=\"tx\"} %zu\n",
+		t->established, esc_id, t->tunnel_index, t->rx_window, esc_id,
+		t->tunnel_index, t->tx_window);
+	APPEND_TUNNEL_METRIC(
+		"session_rtt_seconds", "Round-trip time per identity session",
+		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9, t->established);
+	APPEND_TUNNEL_METRIC_F(
+		"session_bdp_bytes",
+		"Bandwidth-delay product per identity session", "gauge",
+		"multiplexd_session_bdp_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
+		"\",direction=\"rx\"} %zu\n"
+		"multiplexd_session_bdp_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
+		"\",direction=\"tx\"} %zu\n",
+		t->established && (t->bdp_rx != 0 || t->bdp_tx != 0), esc_id,
+		t->tunnel_index, t->bdp_rx, esc_id, t->tunnel_index, t->bdp_tx);
+
+#undef APPEND_TUNNEL_METRIC_F
+#undef APPEND_TUNNEL_METRIC
+
+	return cbuf;
+}
+
+/* Handles GET /metrics — Prometheus text format (version 0.0.4). */
+static void handle_metrics(struct api_ctx *restrict ctx)
+{
+	struct server *const restrict s = ctx->s;
+	struct server_stats *const restrict stats = server_stats(s);
+	if (stats == NULL) {
+		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
+		return;
+	}
+	const int_fast64_t now = clock_monotonic_ns();
+	const double uptime = (double)(now - s->started) / 1e9;
+
+	VBUF_RESET(ctx->cbuf);
+	struct vbuffer *restrict cbuf = ctx->cbuf;
+
+	cbuf = append_gauge_metrics(cbuf, stats, uptime);
+	cbuf = append_stream_metrics(cbuf, stats);
+	cbuf = append_connection_metrics(cbuf, stats);
 	cbuf = append_tunnel_metrics(cbuf, stats);
 	{
 		struct timespec cpu_ts;
@@ -772,14 +931,16 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	}
 
 	ctx->cbuf = cbuf;
+	if (VBUF_HAS_OOM(ctx->cbuf)) {
+		free(stats);
+		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
+		return;
+	}
 	respond_ok(
 		ctx, "text/plain; version=0.0.4; charset=utf-8",
 		ctx->cbuf->len);
 	/* body is in cbuf; send_cb will follow up with cbuf after wbuf */
 	free(stats);
-
-#undef APPEND_METRIC
-#undef APPEND_METRIC_LISTENER
 }
 
 /* Handles GET /config — serializes the active configuration as JSON. */
@@ -804,8 +965,15 @@ static void handle_config_get(struct api_ctx *restrict ctx)
 /* Handles PUT /config — parse the request body as a new config and hot-reload. */
 static void handle_config_put(struct api_ctx *restrict ctx)
 {
-	if (ctx->content_length == 0) {
+	if (!ctx->content_length_seen) {
 		respond_status(ctx, HTTP_LENGTH_REQUIRED);
+		return;
+	}
+	if (ctx->content_length == 0) {
+		/* Content-Length was supplied, just zero: a well-formed framing
+		 * declaration, not a missing header -- a config body can never
+		 * legitimately be empty, so this is a parse error, not 411. */
+		respond_status(ctx, HTTP_BAD_REQUEST);
 		return;
 	}
 	struct config *const restrict new_conf =
@@ -832,6 +1000,11 @@ static void api_handle(struct api_ctx *restrict ctx)
 		return;
 	}
 	const char *const path = parsed_url.path;
+	if (path == NULL) {
+		/* "//", "//host" or "x" (no leading slash) */
+		respond_status(ctx, HTTP_BAD_REQUEST);
+		return;
+	}
 
 	if (strcmp(path, "config") == 0) {
 		if (strcmp(method, "GET") == 0) {
@@ -1004,13 +1177,33 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			(void)memcpy(ctx->connection, value, vlen);
 			ctx->connection[vlen] = '\0';
 		} else if (strcasecmp(key, "Content-Length") == 0) {
+			/* RFC 7230 3.3.3: a second Content-Length is an
+			 * unrecoverable framing ambiguity, not "last one wins". */
+			if (ctx->content_length_seen) {
+				recv_error(loop, ctx, HTTP_BAD_REQUEST);
+				return;
+			}
+			/* RFC 7230 3.3.2: Content-Length = 1*DIGIT. strtoul()
+			 * alone accepts leading whitespace, '+', or '-'. */
+			if (!isdigit((unsigned char)value[0])) {
+				recv_error(loop, ctx, HTTP_BAD_REQUEST);
+				return;
+			}
 			char *endptr;
+			errno = 0;
 			const unsigned long cl = strtoul(value, &endptr, 10);
-			if (endptr == value || *endptr != '\0') {
+			if (endptr == value || *endptr != '\0' ||
+			    errno == ERANGE) {
 				recv_error(loop, ctx, HTTP_BAD_REQUEST);
 				return;
 			}
 			ctx->content_length = (size_t)cl;
+			ctx->content_length_seen = true;
+		} else if (strcasecmp(key, "Transfer-Encoding") == 0) {
+			/* RFC 7230 3.3.3: reject a transfer-coding this server
+			 * cannot decode instead of misparsing the body. */
+			recv_error(loop, ctx, HTTP_NOT_IMPLEMENTED);
+			return;
 		}
 	}
 
@@ -1018,7 +1211,10 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	const size_t body_off =
 		(size_t)((unsigned char *)ctx->next - ctx->rbuf.data);
 	if (ctx->content_length > 0) {
-		if (ctx->content_length > ctx->rbuf.cap - body_off) {
+		/* rbuf.len can reach at most cap - 1 (recv_cb reserves one byte
+		 * for NUL-termination), so a Content-Length that would require
+		 * exactly cap - body_off bytes can never actually be satisfied. */
+		if (ctx->content_length > ctx->rbuf.cap - 1 - body_off) {
 			recv_error(loop, ctx, HTTP_ENTITY_TOO_LARGE);
 			return;
 		}
@@ -1091,7 +1287,7 @@ void api_serve(
 	struct server *const restrict s = l->srv;
 	struct api_ctx *const restrict ctx = api_ctx_new(s, accepted_fd);
 	if (ctx == NULL) {
-		SOCKET_CLOSE_FD(accepted_fd);
+		socket_close(accepted_fd);
 		return;
 	}
 	s->counters.num_served_api++;

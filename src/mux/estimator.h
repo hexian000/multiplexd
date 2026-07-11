@@ -47,8 +47,13 @@ struct estimator_ctx {
  * from bdp. */
 void estimator_init(struct mux_session *restrict ss, size_t bdp);
 
-void estimator_add(struct mux_session *restrict ss, uint_least64_t bytes);
-void estimator_add_acked(struct mux_session *restrict ss, uint_least64_t bytes);
+/* Clear in-flight probe/sample state on transport loss (ESTABLISHED ->
+ * SUSPENDED/CLOSED). Learned bw/RTT filters and effective_bdp survive so a
+ * resumed session keeps its window instead of re-probing from scratch. */
+void estimator_suspend(struct mux_session *restrict ss);
+
+void estimator_add(struct mux_session *restrict ss, uint_fast64_t bytes);
+void estimator_add_acked(struct mux_session *restrict ss, uint_fast64_t bytes);
 void estimator_calculate(struct mux_session *restrict ss, int_fast64_t sent_ns);
 
 size_t estimator_rx_window_size(const struct estimator_ctx *restrict est);

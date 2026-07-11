@@ -5,36 +5,41 @@
     "type": "object",
     "properties": {
         "type": {
-            "description": "Config format identifier. Must be 'application/x-multiplexd-config; version=1' when present.",
-            "type": "string",
-            "const": "application/x-multiplexd-config; version=1"
+            "description": "MIME media type string; must parse as application/x-multiplexd-config with parameter version=1 (validated by conf_check_type in conf.c, not by this schema).",
+            "type": "string"
         },
         "api_listen": {
             "description": "HTTP management API listen address, e.g. '127.0.0.1:9081'.",
-            "type": "string"
+            "type": "string",
+            "maxLength": 261
         },
         "mux_listen": {
             "description": "Address to listen for inbound mux connections (server mode).",
-            "type": "string"
+            "type": "string",
+            "maxLength": 261
         },
         "mux_connect": {
             "description": "Address to dial for the outbound mux connection (client mode).",
-            "type": "string"
+            "type": "string",
+            "maxLength": 261
         },
         "listen": {
             "description": "Local address to accept application connections.",
-            "type": "string"
+            "type": "string",
+            "maxLength": 261
         },
         "connect": {
             "description": "Target address to forward application connections to.",
-            "type": "string"
+            "type": "string",
+            "maxLength": 261
         },
         "log": {
-            "description": "Log destination. stdout and stderr write to the respective standard streams; syslog sends to the system logger; discard suppresses all output.",
+            "description": "Log destination. stdout and stderr write to the respective standard streams; terminal writes to stderr with ANSI colors; syslog sends to the system logger; discard suppresses all output.",
             "type": "string",
             "enum": [
                 "stdout",
                 "stderr",
+                "terminal",
                 "syslog",
                 "discard"
             ]
@@ -97,16 +102,9 @@
                     "default": false
                 },
                 "kernel_offload": {
-                    "description": "Enable kernel TLS (KTLS) offload so the kernel frames and encrypts records and can coalesce them into full segments. Ignored when unsupported or when 'socket_offload' is disabled.",
+                    "description": "Enable kernel TLS (KTLS) offload so the kernel frames and encrypts records and can coalesce them into full segments. Defaults to true, taking effect only once 'socket_offload' is also enabled; ignored (and forced back off) when unsupported or when 'socket_offload' is disabled.",
                     "type": "boolean",
-                    "default": false
-                },
-                "readahead": {
-                    "description": "Receive read-ahead window in bytes: contiguous buffer space offered to one transport read so a single recv() can drain several frames, amortizing the syscall and event-loop cost. Larger values raise throughput on loopback and low-latency links at the cost of receive buffer memory. With 'socket_offload' enabled only the on/off state matters (it drives the library read-ahead). 0 disables read-ahead. The wire frame size is unchanged.",
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 16777216,
-                    "default": 131072
+                    "default": true
                 }
             },
             "additionalProperties": false
@@ -178,7 +176,7 @@
                     "minimum": 0
                 },
                 "connect_timeout": {
-                    "description": "Time limit in seconds for each TCP connect and handshake attempt.",
+                    "description": "Time limit in seconds for each TCP connect and handshake attempt. 0 = disabled (wait indefinitely).",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 86400,
@@ -206,7 +204,7 @@
                     "default": 0
                 },
                 "resume_timeout": {
-                    "description": "Seconds a suspended session is held on the server waiting for the client to reconnect.",
+                    "description": "Seconds a suspended session is held on the server waiting for the client to reconnect. 0 = disabled (held indefinitely).",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 86400,
@@ -225,6 +223,13 @@
                     "minimum": 0,
                     "maximum": 1073725440,
                     "default": 0
+                },
+                "readahead": {
+                    "description": "Receive read-ahead window in bytes: contiguous buffer space offered to one transport read so a single recv() can drain several frames, amortizing the syscall and event-loop cost. Larger values raise throughput on loopback and low-latency links at the cost of receive buffer memory. With 'tls.socket_offload' enabled only the on/off state matters (it drives the library read-ahead). 0 disables read-ahead. The wire frame size is unchanged.",
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 16777216,
+                    "default": 131072
                 },
                 "max_frame_size": {
                     "description": "Maximum total bytes per outbound mux frame (8-byte header + payload). Larger frames raise single-stream throughput; omit to use the default.",
@@ -306,22 +311,25 @@
             "properties": {
                 "claim": {
                     "description": "This node's identity string, presented to peers during handshake. Required when routing by identity.",
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 255
                 },
                 "mux_connect": {
                     "description": "Mux endpoints to dial; one persistent outbound session is maintained per entry.",
                     "type": "array",
                     "items": {
                         "description": "Mux endpoint address to dial.",
-                        "type": "string"
+                        "type": "string",
+                        "maxLength": 261
                     }
                 },
                 "listen": {
                     "description": "Per-peer local listen addresses. Keys are peer identity strings; values are local TCP addresses.",
                     "type": "object",
                     "additionalProperties": {
-                        "description": "Local TCP address to accept traffic for this peer.",
-                        "type": "string"
+                        "description": "Local TCP address to accept traffic for this peer. A map value, so it bypasses generated per-field checks; maxLength is enforced by conf_check in conf.c instead.",
+                        "type": "string",
+                        "maxLength": 261
                     }
                 }
             },

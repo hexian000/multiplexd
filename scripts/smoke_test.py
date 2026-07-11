@@ -264,7 +264,8 @@ def connect(port: int, *, timeout: float = 5.0,
             except OSError:
                 pass
             time.sleep(0.1)
-    raise ConnectionError("could not connect to 127.0.0.1:%d: %s" % (port, last))
+    raise ConnectionError(
+        "could not connect to 127.0.0.1:%d: %s" % (port, last))
 
 
 def recv_exact(sock: socket.socket, n: int, *, deadline: float) -> bytes:
@@ -1472,7 +1473,8 @@ def run_resumption_topology(binary: Path, log_dir: Path, suite: Suite,
                             window: Optional[int], loglevel: int) -> None:
     (echo_f, echo_r, mux_real, relay_front, srv_api, cli_api, fwd_listen,
      rev_listen) = free_ports(8)
-    log("resumption topology: relay %d -> server mux %d" % (relay_front, mux_real))
+    log("resumption topology: relay %d -> server mux %d" %
+        (relay_front, mux_real))
     ef, er = EchoServer(echo_f, "r-echo-fwd"), EchoServer(echo_r, "r-echo-rev")
     ef.start()
     er.start()
@@ -1532,7 +1534,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="CMake build directory (default: build)")
     parser.add_argument("--log-dir",
                         help="logs/work dir (default: build/smoke_<timestamp>)")
-    parser.add_argument("--seed", type=int, help="random seed for reproducibility")
+    parser.add_argument("--seed", type=int,
+                        help="random seed for reproducibility")
     parser.add_argument("--duration", type=float, default=8.0,
                         help="time budget (s) for time-based scenarios")
     parser.add_argument("--quick", action="store_true",

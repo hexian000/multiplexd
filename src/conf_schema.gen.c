@@ -67,18 +67,19 @@ json_lookup_conf_identity(const char *str, size_t len)
 /* --- json_conf_mux --- */
 typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_mux_entry_;
 static const json_lookup_conf_mux_entry_ json_lookup_conf_mux_keys_[] = {
-	{"tcp", 3, 12},
+	{"tcp", 3, 13},
 	{"nodelay", 7, 7},
 	{"keepalive", 9, 2},
+	{"readahead", 9, 8},
 	{"max_streams", 11, 5},
 	{"idle_timeout", 12, 1},
 	{"max_halfopen", 12, 4},
 	{"mem_pressure", 12, 6},
-	{"send_timeout", 12, 9},
-	{"stream_window", 13, 11},
+	{"send_timeout", 12, 10},
+	{"stream_window", 13, 12},
 	{"max_frame_size", 14, 3},
-	{"resume_timeout", 14, 8},
-	{"session_window", 14, 10},
+	{"resume_timeout", 14, 9},
+	{"session_window", 14, 11},
 	{"connect_timeout", 15, 0},
 };
 static int json_lookup_conf_mux_cmp_(const void *key_, const void *entry_)
@@ -94,7 +95,7 @@ json_lookup_conf_mux(const char *str, size_t len)
 {
 	const json_lookup_conf_mux_entry_ key_ = {str, len, 0};
 	const json_lookup_conf_mux_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_mux_keys_, 13, sizeof(*json_lookup_conf_mux_keys_), json_lookup_conf_mux_cmp_);
+		bsearch(&key_, json_lookup_conf_mux_keys_, 14, sizeof(*json_lookup_conf_mux_keys_), json_lookup_conf_mux_cmp_);
 	return e_ ? e_->idx : -1;
 }
 
@@ -172,14 +173,13 @@ json_lookup_conf_tcp(const char *str, size_t len)
 typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_tls_entry_;
 static const json_lookup_conf_tls_entry_ json_lookup_conf_tls_keys_[] = {
 	{"key", 3, 5},
-	{"sni", 3, 7},
+	{"sni", 3, 6},
 	{"alpn", 4, 0},
 	{"cert", 4, 2},
 	{"authcerts", 9, 1},
-	{"readahead", 9, 6},
 	{"ciphersuites", 12, 3},
 	{"kernel_offload", 14, 4},
-	{"socket_offload", 14, 8},
+	{"socket_offload", 14, 7},
 };
 static int json_lookup_conf_tls_cmp_(const void *key_, const void *entry_)
 {
@@ -194,7 +194,7 @@ json_lookup_conf_tls(const char *str, size_t len)
 {
 	const json_lookup_conf_tls_entry_ key_ = {str, len, 0};
 	const json_lookup_conf_tls_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_tls_keys_, 9, sizeof(*json_lookup_conf_tls_keys_), json_lookup_conf_tls_cmp_);
+		bsearch(&key_, json_lookup_conf_tls_keys_, 8, sizeof(*json_lookup_conf_tls_keys_), json_lookup_conf_tls_cmp_);
 	return e_ ? e_->idx : -1;
 }
 
@@ -207,13 +207,8 @@ static const struct json_constraint json_conf_tls_authcerts_c = {
 	.flags = JSON_C_MIN_ITEMS,
 	.min_items = 1,
 };
-static const struct json_constraint json_conf_tls_readahead_c = {
-	.flags = JSON_C_MAX,
-	.u = { .max = UINTMAX_C(16777216) },
-};
 static const struct json_conf_tls json_conf_tls_defaults = {
-	.kernel_offload = false,
-	.readahead = 131072u,
+	.kernel_offload = true,
 	.sni = { .str = "example.com", .len = 11 },
 	.socket_offload = false,
 };
@@ -224,13 +219,12 @@ static const struct json_field json_conf_tls_fields[] = {
 	{ .name = "ciphersuites", .name_len = 12, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, ciphersuites) },
 	{ .name = "kernel_offload", .name_len = 14, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tls, kernel_offload) },
 	{ .name = "key", .name_len = 3, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, key) },
-	{ .name = "readahead", .name_len = 9, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_tls, readahead), .constraint = &json_conf_tls_readahead_c },
 	{ .name = "sni", .name_len = 3, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, sni) },
 	{ .name = "socket_offload", .name_len = 14, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tls, socket_offload) },
 };
 static const struct json_schema json_conf_tls_schema = {
 	.fields = json_conf_tls_fields,
-	.n_fields = 9,
+	.n_fields = 8,
 	.obj_size = sizeof(struct json_conf_tls),
 	.lookup = json_lookup_conf_tls,
 	.defaults = &json_conf_tls_defaults,
@@ -332,6 +326,10 @@ static const struct json_constraint json_conf_mux_max_halfopen_c = {
 	.flags = JSON_C_MAX,
 	.u = { .max = UINTMAX_C(4096) },
 };
+static const struct json_constraint json_conf_mux_readahead_c = {
+	.flags = JSON_C_MAX,
+	.u = { .max = UINTMAX_C(16777216) },
+};
 static const struct json_constraint json_conf_mux_resume_timeout_c = {
 	.flags = JSON_C_MAX,
 	.u = { .max = UINTMAX_C(86400) },
@@ -359,6 +357,7 @@ static const struct json_conf_mux json_conf_mux_defaults = {
 		.lo = UINTMAX_C(0),
 	},
 	.nodelay = true,
+	.readahead = 131072u,
 	.resume_timeout = 600u,
 	.send_timeout = 15u,
 	.session_window = 0u,
@@ -380,6 +379,7 @@ static const struct json_field json_conf_mux_fields[] = {
 	{ .name = "max_streams", .name_len = 11, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux, max_streams) },
 	{ .name = "mem_pressure", .name_len = 12, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, mem_pressure), .child = &json_conf_mux_mem_pressure_schema },
 	{ .name = "nodelay", .name_len = 7, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_mux, nodelay) },
+	{ .name = "readahead", .name_len = 9, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, readahead), .constraint = &json_conf_mux_readahead_c },
 	{ .name = "resume_timeout", .name_len = 14, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, resume_timeout), .constraint = &json_conf_mux_resume_timeout_c },
 	{ .name = "send_timeout", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, send_timeout), .constraint = &json_conf_mux_send_timeout_c },
 	{ .name = "session_window", .name_len = 14, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, session_window), .constraint = &json_conf_mux_session_window_c },
@@ -388,17 +388,25 @@ static const struct json_field json_conf_mux_fields[] = {
 };
 static const struct json_schema json_conf_mux_schema = {
 	.fields = json_conf_mux_fields,
-	.n_fields = 13,
+	.n_fields = 14,
 	.obj_size = sizeof(struct json_conf_mux),
 	.lookup = json_lookup_conf_mux,
 	.defaults = &json_conf_mux_defaults,
 	.present_field = -1,
 };
 
+static const struct json_constraint json_conf_identity_claim_c = {
+	.flags = JSON_C_MAX_LEN,
+	.str = { .max_len = 255 },
+};
+static const struct json_constraint json_conf_identity_mux_connect_c = {
+	.flags = JSON_C_MAX_LEN,
+	.str = { .max_len = 261 },
+};
 static const struct json_field json_conf_identity_fields[] = {
-	{ .name = "claim", .name_len = 5, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_identity, claim) },
+	{ .name = "claim", .name_len = 5, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_identity, claim), .constraint = &json_conf_identity_claim_c },
 	{ .name = "listen", .name_len = 6, .kind = JSON_K_DYNAMIC, .req_bit = -1, .offset = offsetof(struct json_conf_identity, listen_json) },
-	{ .name = "mux_connect", .name_len = 11, .kind = JSON_K_STRING, .is_array = true, .req_bit = -1, .offset = offsetof(struct json_conf_identity, mux_connect), .count_offset = offsetof(struct json_conf_identity, mux_connect_count) },
+	{ .name = "mux_connect", .name_len = 11, .kind = JSON_K_STRING, .is_array = true, .req_bit = -1, .offset = offsetof(struct json_conf_identity, mux_connect), .count_offset = offsetof(struct json_conf_identity, mux_connect_count), .constraint = &json_conf_identity_mux_connect_c },
 };
 static const struct json_schema json_conf_identity_schema = {
 	.fields = json_conf_identity_fields,
@@ -408,19 +416,36 @@ static const struct json_schema json_conf_identity_schema = {
 	.present_field = -1,
 };
 
+static const struct json_constraint json_conf_api_listen_c = {
+	.flags = JSON_C_MAX_LEN,
+	.str = { .max_len = 261 },
+};
+static const struct json_constraint json_conf_connect_c = {
+	.flags = JSON_C_MAX_LEN,
+	.str = { .max_len = 261 },
+};
+static const struct json_constraint json_conf_listen_c = {
+	.flags = JSON_C_MAX_LEN,
+	.str = { .max_len = 261 },
+};
 static const struct json_string json_conf_log_enum[] = {
 	{ .len = 6, .str = "stdout" },
 	{ .len = 6, .str = "stderr" },
+	{ .len = 8, .str = "terminal" },
 	{ .len = 6, .str = "syslog" },
 	{ .len = 7, .str = "discard" },
 };
 static const struct json_constraint json_conf_log_c = {
 	.flags = JSON_C_ENUM,
-	.str = { .enums = json_conf_log_enum, .n_enum = 4 },
+	.str = { .enums = json_conf_log_enum, .n_enum = 5 },
 };
-static const struct json_constraint json_conf_type_c = {
-	.flags = JSON_C_CONST,
-	.str = { .konst = { .len = 42, .str = "application/x-multiplexd-config; version=1" } },
+static const struct json_constraint json_conf_mux_connect_c = {
+	.flags = JSON_C_MAX_LEN,
+	.str = { .max_len = 261 },
+};
+static const struct json_constraint json_conf_mux_listen_c = {
+	.flags = JSON_C_MAX_LEN,
+	.str = { .max_len = 261 },
 };
 static const struct json_conf json_conf_defaults = {
 	.loglevel = UINTMAX_C(4),
@@ -435,6 +460,7 @@ static const struct json_conf json_conf_defaults = {
 			.lo = UINTMAX_C(0),
 		},
 		.nodelay = true,
+		.readahead = 131072u,
 		.resume_timeout = 600u,
 		.send_timeout = 15u,
 		.session_window = 0u,
@@ -455,27 +481,26 @@ static const struct json_conf json_conf_defaults = {
 		.reuseport = false,
 	},
 	.tls = {
-		.kernel_offload = false,
-		.readahead = 131072u,
+		.kernel_offload = true,
 		.sni = { .str = "example.com", .len = 11 },
 		.socket_offload = false,
 	},
 };
 static const struct json_field json_conf_fields[] = {
-	{ .name = "api_listen", .name_len = 10, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, api_listen) },
-	{ .name = "connect", .name_len = 7, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, connect) },
+	{ .name = "api_listen", .name_len = 10, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, api_listen), .constraint = &json_conf_api_listen_c },
+	{ .name = "connect", .name_len = 7, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, connect), .constraint = &json_conf_connect_c },
 	{ .name = "identity", .name_len = 8, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf, identity), .child = &json_conf_identity_schema },
-	{ .name = "listen", .name_len = 6, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, listen) },
+	{ .name = "listen", .name_len = 6, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, listen), .constraint = &json_conf_listen_c },
 	{ .name = "log", .name_len = 3, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, log), .constraint = &json_conf_log_c },
 	{ .name = "loglevel", .name_len = 8, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf, loglevel) },
 	{ .name = "max_sessions", .name_len = 12, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf, max_sessions) },
 	{ .name = "max_startups", .name_len = 12, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, max_startups) },
 	{ .name = "mux", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf, mux), .child = &json_conf_mux_schema },
-	{ .name = "mux_connect", .name_len = 11, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, mux_connect) },
-	{ .name = "mux_listen", .name_len = 10, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, mux_listen) },
+	{ .name = "mux_connect", .name_len = 11, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, mux_connect), .constraint = &json_conf_mux_connect_c },
+	{ .name = "mux_listen", .name_len = 10, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, mux_listen), .constraint = &json_conf_mux_listen_c },
 	{ .name = "tcp", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf, tcp), .child = &json_conf_tcp_schema },
 	{ .name = "tls", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf, tls), .child = &json_conf_tls_schema },
-	{ .name = "type", .name_len = 4, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, type), .constraint = &json_conf_type_c },
+	{ .name = "type", .name_len = 4, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf, type) },
 };
 static const struct json_schema json_conf_schema = {
 	.fields = json_conf_fields,

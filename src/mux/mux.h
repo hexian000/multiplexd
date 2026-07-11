@@ -176,12 +176,12 @@ struct mux_config {
 	 * takes effect only on a new session. */
 	int max_frame_payload;
 
-	/* tls.readahead: receive read-ahead window in bytes offered to one transport
+	/* mux.readahead: receive read-ahead window in bytes offered to one transport
 	 * read so a single recv() drains several frames, amortizing the recv() and
-	 * event-loop cost.  With socket_offload only its >0 state matters (it drives
-	 * the TLS library read-ahead).  0 disables read-ahead.  The wire frame size
-	 * is unchanged. */
-	int tls_readahead;
+	 * event-loop cost.  With tls.socket_offload only its >0 state matters (it
+	 * drives the TLS library read-ahead).  0 disables read-ahead.  The wire
+	 * frame size is unchanged. */
+	int readahead;
 
 	/* Receive-buffer level in bytes at which window grants are fully suppressed; 0 disables pressure scaling. */
 	int mem_pressure_hi;
@@ -207,7 +207,9 @@ extern const struct mux_config mux_conf_default;
 
 /* --- Session creation options --- */
 
-/* Options passed to mux_new().  Takes ownership of fd when fd >= 0.
+/* Options passed to mux_new().  Takes ownership of fd when fd >= 0 and of
+ * conn when set, on both success and failure; the caller must not close fd
+ * or free conn itself, before or after the call.
  * String pointers are copied if non-NULL.
  * cnt pointer fields may be NULL; skipped when updating server-level counters. */
 struct mux_session_opts {
@@ -239,7 +241,8 @@ struct mux_session_opts {
 /**
  * @brief Allocate a new session.
  * @param loop Event loop the session runs on.
- * @param[in] opts Session options; takes ownership of opts->fd.
+ * @param[in] opts Session options; takes ownership of opts->fd and
+ * opts->conn (see struct mux_session_opts), including on failure.
  * @return The new session, or NULL on failure.
  */
 struct mux_session *
@@ -255,7 +258,8 @@ void mux_close(struct mux_session *ss);
 /**
  * @brief Replace the session's callback table.
  * @param ss Target session.
- * @param[in] cb New callbacks (NULL clears them).
+ * @param[in] cb New callbacks; must not be NULL (it is copied by value). Pass a
+ * zeroed table (e.g. &(struct mux_callbacks){0}) to clear all callbacks.
  * @note Safe to call from any thread once the session's worker thread has been
  * joined.
  */
@@ -280,8 +284,9 @@ void mux_start(struct mux_session *ss);
 
 /**
  * @brief Attach an already-connected fd to a client session.
- * @param ss Target session; valid from SESSION_INIT (initial connect) or
- * SESSION_SUSPENDED (resume). Transitions it to SESSION_CONNECT.
+ * @param ss Target session; valid from SESSION_INIT (initial connect),
+ * SESSION_SUSPENDED (resume), or SESSION_CLOSED (reconnect after idle/timeout).
+ * Transitions it to SESSION_CONNECT.
  * @param fd Connected socket; takes ownership.
  * @note The caller creates the socket, calls connect(), and sets TCP options
  * before passing @p fd here.
@@ -294,6 +299,8 @@ void mux_attach_fd(struct mux_session *ss, int fd);
  * @brief The session's transport fd.
  * @param ss Target session.
  * @return The fd, or -1 when none is attached.
+ * @note Reads ss directly (no atomic mirror): call only from the owning
+ * ev_loop thread, per struct mux_session's threading invariant.
  */
 int mux_fd(const struct mux_session *ss);
 
@@ -303,14 +310,18 @@ int mux_fd(const struct mux_session *ss);
  * @param ss Target session.
  * @return The connection, owned by the session (do not free), or NULL when TLS
  * is not in use.
+ * @note Reads ss directly (no atomic mirror): call only from the owning
+ * ev_loop thread, per struct mux_session's threading invariant.
  */
 struct tls_connection *mux_tls_conn(const struct mux_session *ss);
-#endif
+#endif /* WITH_TLS */
 
 /**
  * @brief The peer's socket address.
  * @param ss Target session.
  * @return The peer address, or NULL before SESSION_ESTABLISHED.
+ * @note Reads ss directly (no atomic mirror): call only from the owning
+ * ev_loop thread, per struct mux_session's threading invariant.
  */
 const struct sockaddr *mux_peer_addr(const struct mux_session *ss);
 
@@ -325,6 +336,8 @@ enum mux_state {
  * @brief The session's coarse lifecycle state.
  * @param ss Target session.
  * @return The current ::mux_state.
+ * @note Reads a relaxed-atomic mirror: safe to call from any thread, unlike
+ * most other accessors in this section.
  */
 enum mux_state mux_state(const struct mux_session *ss);
 
@@ -334,6 +347,8 @@ enum mux_state mux_state(const struct mux_session *ss);
  * @return Pointer to the identity. For accepted sessions this equals the id
  * passed to mux_new(); for dialed sessions it starts as the local id and is
  * replaced by the server-assigned value when ServerHello arrives.
+ * @note Reads ss directly (no atomic mirror): call only from the owning
+ * ev_loop thread, per struct mux_session's threading invariant.
  */
 const unsigned char *mux_session_id(const struct mux_session *ss);
 
@@ -341,6 +356,8 @@ const unsigned char *mux_session_id(const struct mux_session *ss);
  * @brief The session's configuration snapshot.
  * @param ss Target session.
  * @return Read-only pointer to the config.
+ * @note Reads ss directly (no atomic mirror): call only from the owning
+ * ev_loop thread, per struct mux_session's threading invariant.
  */
 const struct mux_config *mux_conf(const struct mux_session *ss);
 
@@ -352,10 +369,11 @@ struct mux_session_stats {
 	size_t tx_window;
 	/* Nanoseconds; 0 before the first measurement. */
 	int_least64_t rtt;
-	/* Receive direction (inbound PUSH), bytes; 0 until estimated. */
+	/* Receive direction (inbound PUSH), bytes; 0 until estimated. Raw
+	 * estimator output, not clamped like rx_window; the two may differ. */
 	size_t bdp_rx;
 	/* Send direction (locally-sent bytes acked by peer), bytes; 0 until
-	 * estimated. */
+	 * estimated. Raw estimator output; see the bdp_rx note. */
 	size_t bdp_tx;
 };
 
@@ -363,6 +381,8 @@ struct mux_session_stats {
  * @brief Snapshot the session's estimator state.
  * @param ss Target session.
  * @param[out] out Receives a consistent snapshot.
+ * @note Reads relaxed-atomic mirrors: safe to call from any thread, unlike
+ * most other accessors in this section.
  */
 void mux_session_stats(
 	const struct mux_session *ss, struct mux_session_stats *restrict out);
@@ -382,7 +402,15 @@ void mux_set_config(
  * @brief Signal the session to drain: reject new inbound streams and shut down
  * gracefully once the last active stream closes.
  * @param ss Target session; if already idle, shutdown begins immediately.
- * @note Cleared automatically when the session reconnects (mux_attach_fd()).
+ * @note Cleared automatically on a genuinely fresh (re)connect via
+ * mux_attach_fd(). A client reconnect that resumes from SESSION_SUSPENDED
+ * deliberately preserves the pending drain (so a drained-then-suspended-then-
+ * resumed session keeps draining and does not accept new streams), lest a
+ * transport blip silently cancel a drain and leave the session running on stale
+ * pre-reload settings. A server-side resume of an accepted session (the peer
+ * reconnecting into it) instead cancels the drain: that path re-establishes the
+ * session and must accept new streams again. The asymmetry is deliberate at
+ * both sites.
  */
 void mux_drain(struct mux_session *ss);
 
@@ -515,8 +543,9 @@ void mux_transport_discard(struct mux_transport *transport);
 
 /**
  * @brief Per-stream I/O event watcher for direct (non-attach-fd) mode.
- * @note EV_READ fires on data available, peer FIN (recv returns 0), or RST
- * (recv returns -1/ECONNRESET); EV_WRITE fires when the send window opens.
+ * @note EV_READ fires on data available, peer FIN (recv returns 0), or a peer
+ * RST or local abort (recv returns -1/ECONNRESET); EV_WRITE fires when the
+ * send window opens.
  */
 typedef struct mux_stream_io mux_stream_io;
 struct mux_stream_io {
@@ -609,8 +638,8 @@ int mux_stream_send(
  * @param[out] buf Destination.
  * @param[inout] len In: buffer capacity. Out: bytes copied (zero means peer
  * FIN).
- * @return 0 on success; -1/ECONNRESET on RST, -1/EAGAIN when no data is
- * available.
+ * @return 0 on success; -1/ECONNRESET on a peer RST or local abort (e.g. a
+ * local I/O failure), -1/EAGAIN when no data is available.
  * @note If the local side has also sent FIN (CLOSING) and the buffer drains,
  * the stream closes inside this call — do not use @p s again after a zero
  * return. In CLOSE_WAIT (local FIN not yet sent) @p s stays valid; follow up

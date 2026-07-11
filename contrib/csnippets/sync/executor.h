@@ -19,8 +19,8 @@ struct executor;
 
 /**
  * @brief Create a new executor.
- * @param[in] nworkers Number of worker threads.
- * @return If malloc failed, returns NULL.
+ * @param[in] nworkers Number of worker threads; must be >= 1.
+ * @return The new executor, or NULL if nworkers is 0 or on allocation failure.
  */
 struct executor *executor_create(size_t nworkers);
 
@@ -28,7 +28,11 @@ struct executor *executor_create(size_t nworkers);
  * @brief Submit a task to executor.
  * @param[in] e The executor.
  * @param[in] task Task to be scheduled.
- * @return If malloc failed, returns false and no operation is performed.
+ * @return true on success, false if allocation fails or the executor is
+ * shutting down (executor_join/executor_detach has been called).
+ * @note Submitting concurrently with or after executor_join/executor_detach
+ * returns is not supported and may still crash; this only covers the
+ * case where exit_flag is already observably set.
  */
 bool executor_submit(struct executor *e, struct task task);
 

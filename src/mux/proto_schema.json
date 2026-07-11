@@ -22,10 +22,9 @@
         },
         "session_id": {
             "type": "string",
-            "description": "24-character Base64 (RFC 4648 standard alphabet, with padding) encoding of the 16-byte server-assigned session identity (spec §5.2.2).",
+            "description": "24-character Base64 (RFC 4648 standard alphabet, with padding) encoding of the 16-byte server-assigned session identity (spec §5.2.2). The alphabet/padding shape is enforced by handshake.c's base64 decode, not by this schema: the generator does not implement JSON Schema 'pattern' validation, so only minLength/maxLength are checked here.",
             "minLength": 24,
-            "maxLength": 24,
-            "pattern": "^[A-Za-z0-9+/]{22}==$"
+            "maxLength": 24
         },
         "resume_seq": {
             "type": "integer",

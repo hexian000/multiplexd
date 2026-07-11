@@ -13,7 +13,6 @@
     "-mux": {
         "stream_window": 16777216,
         "session_window": 16777216,
-        "timeout": 60,
         "keepalive": 25,
         "max_streams": 1000
     },

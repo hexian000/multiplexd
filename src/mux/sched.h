@@ -72,6 +72,12 @@ void sched_delay_remove(struct mux_session *ss, struct mux_stream *s);
 /* Enqueue a stream onto the ready queue and arm the appropriate watcher. */
 void sched_wake(struct mux_session *ss, struct mux_stream *s);
 
+/* React to the stream table's active (non-tombstone) count possibly having
+ * just reached zero: initiate drain-shutdown, or arm the idle timer. Safe to
+ * call whenever the table or tombstone count changes; a no-op when streams
+ * remain active or the session isn't ESTABLISHED. */
+void sched_check_no_active_streams(struct mux_session *ss);
+
 /* Request a drain of the low-priority lifecycle queue: arm EV_WRITE (via
  * session_notify) when there is queued work and the sendbuf is clear.  Safe to
  * call unconditionally (self-guards on an occupied sendbuf or empty queue). */

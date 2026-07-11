@@ -1,0 +1,9 @@
+target_sources(csnippets
+    PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/cityhash.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fnv1a.c"
+    PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/cityhash.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fnv1a.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/luahash.h"
+)

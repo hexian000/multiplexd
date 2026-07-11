@@ -6,8 +6,8 @@
  * @brief Common utilities, globals, and helpers.
  */
 
-#ifndef UTIL_H
-#define UTIL_H
+#ifndef SHIM_UTIL_H
+#define SHIM_UTIL_H
 
 #include "net/addr.h"
 #include "os/socket.h"
@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+
 #if WITH_THREADS
 #include <threads.h>
 
@@ -30,12 +31,9 @@
 		(void)status;                                                  \
 		assert(status == thrd_success);                                \
 	} while (0)
-#else
+#else /* WITH_THREADS */
 #define THRD_ASSERT(expr) ((void)(0))
 #endif /* WITH_THREADS */
-
-/* Set TCP_NOTSENT_LOWAT (@p bytes threshold); no-op on unsupported platforms. */
-void socket_notsent_lowat(int fd, int bytes);
 
 #define CHECK_REVENTS(revents, accept)                                         \
 	do {                                                                   \
@@ -49,9 +47,13 @@ void socket_notsent_lowat(int fd, int bytes);
 		}                                                              \
 	} while (0)
 
-void init(int argc, char *const *argv);
-void loadlibs(void);
-void unloadlibs(void);
+/**
+ * @brief Fill buf with len cryptographically secure random bytes, read from
+ * the OS entropy source (/dev/urandom). Unlike math/rand.h's rand64(), this
+ * is safe for security-sensitive uses such as session IDs.
+ * @return false if the entropy source could not be opened or read.
+ */
+bool csprng_bytes(unsigned char *buf, size_t len);
 
 bool resolve_addr(
 	union sockaddr_max *restrict addr, const char *restrict addrstr,
@@ -61,4 +63,4 @@ bool resolve_bindaddr(
 	union sockaddr_max *restrict addr, const char *restrict addrstr,
 	enum sa_resolve_type type);
 
-#endif /* UTIL_H */
+#endif /* SHIM_UTIL_H */

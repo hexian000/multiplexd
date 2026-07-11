@@ -1,10 +1,10 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-#ifndef TLSUTIL_H
-#define TLSUTIL_H
+#ifndef SHIM_TLS_H
+#define SHIM_TLS_H
 /**
- * @file tlsutil.h
+ * @file tls.h
  * @brief Backend-agnostic TLS compatibility layer.
  *
  * A minimal, non-blocking-friendly API to create TLS contexts (client/server),
@@ -69,7 +69,7 @@ struct tls_config {
 	const char *sni;
 	/* OpenSSL only: request KTLS offload (kernel frames+encrypts records). */
 	bool kernel_offload : 1;
-	/* tls.readahead > 0: enable the library read-ahead (SSL_CTX_set_read_ahead)
+	/* mux.readahead > 0: enable the library read-ahead (SSL_CTX_set_read_ahead)
 	 * so one socket read can buffer several records.  OpenSSL only. */
 	bool readahead : 1;
 };
@@ -175,6 +175,9 @@ void tls_ctx_free(struct tls_context *ctx);
  * @return The connection, or NULL on failure.
  * @note No notifier is installed; call tls_set_callback() before driving
  * memory-backed I/O.
+ * @note Exception to this header's NULL convention: both backends return
+ * NULL immediately when @p ctx is NULL, instead of it being undefined
+ * behavior.
  */
 struct tls_connection *tls_server(struct tls_context *ctx, int fd);
 
@@ -184,6 +187,9 @@ struct tls_connection *tls_server(struct tls_context *ctx, int fd);
  * @param ctx Client context.
  * @param fd Transport fd (see tls_server()).
  * @return The connection, or NULL on failure.
+ * @note Exception to this header's NULL convention: both backends return
+ * NULL immediately when @p ctx is NULL, instead of it being undefined
+ * behavior.
  */
 struct tls_connection *tls_client(struct tls_context *ctx, int fd);
 
@@ -266,6 +272,9 @@ void tls_conn_free(struct tls_connection *conn);
  * @param[out] out Receives a malloc'd buffer (caller frees).
  * @param[out] len Receives its length.
  * @return true on success; false when no peer certificate is available.
+ * @note Exception to this header's NULL convention: both backends check
+ * @p conn, @p out, and @p len defensively and return false if any is NULL,
+ * instead of it being undefined behavior.
  */
 bool tls_peer_cert_der(
 	struct tls_connection *conn, unsigned char **out, size_t *len);
@@ -274,4 +283,4 @@ bool tls_peer_cert_der(
 
 #endif /* WITH_TLS */
 
-#endif /* TLSUTIL_H */
+#endif /* SHIM_TLS_H */

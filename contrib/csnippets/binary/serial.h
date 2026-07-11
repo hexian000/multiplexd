@@ -1,8 +1,8 @@
 /* csnippets (c) 2019-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-#ifndef MATH_SERIAL_H
-#define MATH_SERIAL_H
+#ifndef BINARY_SERIAL_H
+#define BINARY_SERIAL_H
 
 /**
  * @defgroup serial
@@ -95,4 +95,4 @@ static inline bool serial_gt32(const uint_fast32_t i1, const uint_fast32_t i2)
 
 /** @} */
 
-#endif /* MATH_SERIAL_H */
+#endif /* BINARY_SERIAL_H */

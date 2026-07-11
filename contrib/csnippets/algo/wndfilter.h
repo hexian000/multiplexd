@@ -20,9 +20,9 @@
  */
 struct wndfilter_sample {
 	/* timestamp of the measurement */
-	int_fast64_t t;
+	int_least64_t t;
 	/* value measured */
-	int_fast64_t v;
+	int_least64_t v;
 };
 
 /**
@@ -37,17 +37,17 @@ struct wndfilter {
 
 /**
  * @brief Get the current tracked min/max value.
- * @param m Pointer to the tracker state.
+ * @param w Pointer to the tracker state.
  * @return The best value in the current window.
  */
-static inline int_fast64_t wndfilter_get(const struct wndfilter *w)
+static inline int_fast64_t wndfilter_get(const struct wndfilter *restrict w)
 {
 	return w->s[0].v;
 }
 
 /**
  * @brief Reset the tracker to a single initial measurement.
- * @param m Pointer to the tracker state.
+ * @param w Pointer to the tracker state.
  * @param t Timestamp of the measurement.
  * @param v The measured value.
  */
@@ -56,7 +56,7 @@ void wndfilter_reset(
 
 /**
  * @brief Update the tracker and return the running minimum.
- * @param m Pointer to the tracker state.
+ * @param w Pointer to the tracker state.
  * @param wnd Length of the tracking window (same units as t).
  * @param t Timestamp of the new measurement.
  * @param v The new measured value.
@@ -68,7 +68,7 @@ int_fast64_t wndfilter_update_min(
 
 /**
  * @brief Update the tracker and return the running maximum.
- * @param m Pointer to the tracker state.
+ * @param w Pointer to the tracker state.
  * @param wnd Length of the tracking window (same units as t).
  * @param t Timestamp of the new measurement.
  * @param v The new measured value.

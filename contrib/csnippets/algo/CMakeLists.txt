@@ -1,13 +1,8 @@
 target_sources(csnippets
     PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/cityhash.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/fnv1a.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/hashtable.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/wndfilter.c"
     PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/cityhash.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/fnv1a.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/hashtable.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/luahash.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/wndfilter.h"
 )

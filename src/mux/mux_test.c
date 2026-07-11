@@ -5,10 +5,11 @@
  * Uses the public mux API; local proto_hello_build crafts raw hello bytes
  * for the raw-peer driver. */
 
+#include "mux/mux.h"
+
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
-#include "mux/mux.h"
 #include "mux/proto_schema.gen.h"
 #include "mux/recv.h"
 #include "mux/sched.h"
@@ -18,16 +19,15 @@
 #include "mux/unacked.h"
 #include "mux/wire.h"
 #if WITH_TLS
-#include "tlsutil.h"
+#include "shim/tls.h"
 #endif
 
 #include "algo/hashtable.h"
 #include "algo/wndfilter.h"
+#include "binary/serialize.h"
 #include "codec/base64.h"
 #include "math/rand.h"
-#include "os/clock.h"
-#include "utils/minmax.h"
-#include "utils/serialize.h"
+#include "meta/minmax.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
@@ -47,6 +47,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /* Constants */
@@ -735,6 +736,7 @@ static void pending_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		.max_streams = 64,
 		.stream_window = 4,
 		.session_window = 256,
+		.max_frame_payload = mux_conf_default.max_frame_payload,
 		.nodelay = fx->nodelay,
 	};
 	unsigned char srv_sid[MUX_SESSION_ID_LEN];
@@ -783,6 +785,7 @@ static struct mux_config make_cli_conf(const bool nodelay)
 		.max_streams = 64,
 		.stream_window = 4,
 		.session_window = 256,
+		.max_frame_payload = mux_conf_default.max_frame_payload,
 	};
 }
 
@@ -2074,11 +2077,15 @@ static int raw_fixture_setup(
 			(void)fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
 		}
 	}
-	/* fds[1] = raw test socket (blocking with 2-second safety timeout) */
+	/* fds[1] = raw test socket (blocking with a 2-second safety timeout on
+	 * both directions, so raw_write_all cannot block forever if the server
+	 * ever stops draining its receive buffer) */
 	{
 		const struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
 		(void)setsockopt(
 			fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		(void)setsockopt(
+			fds[1], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	}
 	fx->raw_fd = fds[1];
 
@@ -2092,6 +2099,7 @@ static int raw_fixture_setup(
 		.max_streams = 64,
 		.stream_window = 4,
 		.session_window = 256,
+		.max_frame_payload = mux_conf_default.max_frame_payload,
 	};
 
 	unsigned char raw_sid[MUX_SESSION_ID_LEN];
@@ -3417,15 +3425,15 @@ T_DECLARE_CASE(test_resume_retransmit)
 	if (resume_ret != 0) {
 		T_LOGF("resume wait failed:"
 		       " cli(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-		       " ack_seq=%" PRIuLEAST32 " tx_pending=%d retrans=%d)"
+		       " unreported=%" PRIuLEAST32 " tx_pending=%d retrans=%d)"
 		       " srv(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-		       " ack_seq=%" PRIuLEAST32 " tx_pending=%d retrans=%d)",
+		       " unreported=%" PRIuLEAST32 " tx_pending=%d retrans=%d)",
 		       fx.cli->state, fx.cli->unacked.frames,
-		       fx.cli->unacked.recv_seq, fx.cli->unacked.ack_seq,
+		       fx.cli->unacked.recv_seq, fx.cli->unacked.unreported,
 		       fx.cli->wire.tx_pending,
 		       fx.cli->unacked.retransmit_off != SIZE_MAX,
 		       fx.srv->state, fx.srv->unacked.frames,
-		       fx.srv->unacked.recv_seq, fx.srv->unacked.ack_seq,
+		       fx.srv->unacked.recv_seq, fx.srv->unacked.unreported,
 		       fx.srv->wire.tx_pending,
 		       fx.srv->unacked.retransmit_off != SIZE_MAX);
 	}
@@ -3448,21 +3456,23 @@ T_DECLARE_CASE(test_resume_retransmit)
 		if (cli_echo_ret != 0) {
 			T_LOGF("client echo after resume failed:"
 			       " cli(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-			       " ack_seq=%" PRIuLEAST32
+			       " unreported=%" PRIuLEAST32
 			       " tx_pending=%d retrans=%d"
 			       " recv=%zu/%zu err=%d eof=%d)"
 			       " srv(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-			       " ack_seq=%" PRIuLEAST32
+			       " unreported=%" PRIuLEAST32
 			       " tx_pending=%d retrans=%d"
 			       " recv=%zu/%zu err=%d eof=%d)",
 			       fx.cli->state, fx.cli->unacked.frames,
 			       fx.cli->unacked.recv_seq,
-			       fx.cli->unacked.ack_seq, fx.cli->wire.tx_pending,
+			       fx.cli->unacked.unreported,
+			       fx.cli->wire.tx_pending,
 			       fx.cli->unacked.retransmit_off != SIZE_MAX,
 			       cli_ts->recv_len, cli_sent, cli_ts->got_error,
 			       cli_ts->got_eof, fx.srv->state,
 			       fx.srv->unacked.frames, fx.srv->unacked.recv_seq,
-			       fx.srv->unacked.ack_seq, fx.srv->wire.tx_pending,
+			       fx.srv->unacked.unreported,
+			       fx.srv->wire.tx_pending,
 			       fx.srv->unacked.retransmit_off != SIZE_MAX,
 			       srv_ts->recv_len, srv_sent, srv_ts->got_error,
 			       srv_ts->got_eof);
@@ -3481,21 +3491,23 @@ T_DECLARE_CASE(test_resume_retransmit)
 		if (srv_echo_ret != 0) {
 			T_LOGF("server echo after resume failed:"
 			       " cli(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-			       " ack_seq=%" PRIuLEAST32
+			       " unreported=%" PRIuLEAST32
 			       " tx_pending=%d retrans=%d"
 			       " recv=%zu/%zu err=%d eof=%d)"
 			       " srv(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-			       " ack_seq=%" PRIuLEAST32
+			       " unreported=%" PRIuLEAST32
 			       " tx_pending=%d retrans=%d"
 			       " recv=%zu/%zu err=%d eof=%d)",
 			       fx.cli->state, fx.cli->unacked.frames,
 			       fx.cli->unacked.recv_seq,
-			       fx.cli->unacked.ack_seq, fx.cli->wire.tx_pending,
+			       fx.cli->unacked.unreported,
+			       fx.cli->wire.tx_pending,
 			       fx.cli->unacked.retransmit_off != SIZE_MAX,
 			       cli_ts->recv_len, cli_sent, cli_ts->got_error,
 			       cli_ts->got_eof, fx.srv->state,
 			       fx.srv->unacked.frames, fx.srv->unacked.recv_seq,
-			       fx.srv->unacked.ack_seq, fx.srv->wire.tx_pending,
+			       fx.srv->unacked.unreported,
+			       fx.srv->wire.tx_pending,
 			       fx.srv->unacked.retransmit_off != SIZE_MAX,
 			       srv_ts->recv_len, srv_sent, srv_ts->got_error,
 			       srv_ts->got_eof);
@@ -4412,30 +4424,39 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 	T_EXPECT(cycle_ret == 0);
 	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
 
-	/* Clear last_probe_ns to bypass the send-side rate limit so that the
-	 * second estimator_add immediately queues a PING for the stop test. */
+	/* Arm an in-flight probe (bypass the send-side rate limit) so the
+	 * transition below can be shown to clear the transient probe. */
 	fx.cli->estimator.last_probe_ns = 0;
-	estimator_add(fx.cli, (uint_least64_t)MUX_MAX_PAYLOAD_SIZE);
+	estimator_add(fx.cli, (uint_fast64_t)MUX_MAX_PAYLOAD_SIZE);
 	T_EXPECT(fx.cli->estimator.ping_in_flight);
 
-	/* Simulate the stop-path: set window target to a known value; estimator
-	 * state (filters, probe) is intentionally preserved. */
+	/* Seed a known raw BDP window so the expected post-stop stream_window is
+	 * a constant, not re-derived from the formula under test. */
 	fx.cli->estimator.rx.effective_bdp =
 		3u * (size_t)MUX_INITIAL_SEND_WINDOW;
-	const uint_least32_t initial_frames =
-		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
-	fx.cli->stream_window = (uint_least32_t)MAX(
-		estimator_rx_window_size(&fx.cli->estimator) / 2 /
-			MUX_WINDOW_UNIT,
-		(size_t)initial_frames);
 	T_EXPECT_EQ(
 		estimator_rx_window_size(&fx.cli->estimator),
 		3u * (size_t)MUX_INITIAL_SEND_WINDOW);
+	const uint_least32_t initial_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+
+	/* Drive the real exit-from-ESTABLISHED transition rather than
+	 * hand-computing the window and asserting it against itself:
+	 * session_set_state(SUSPENDED) runs session_reset_stream_window_floor
+	 * (halve the raw BDP window, floored) and estimator_suspend. */
+	session_set_state(fx.cli, SESSION_SUSPENDED);
+
+	/* stream_window halved to the raw BDP floor: 3*INITIAL / 2 / UNIT ==
+	 * 3*initial_frames/2, above the initial-window floor. A regression in the
+	 * divisor or floor would diverge from this constant. */
 	T_EXPECT_EQ(fx.cli->stream_window, 3u * initial_frames / 2u);
-	/* Learned state is preserved after stop. */
+	/* Learned filter state survives the disconnect... */
 	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
-	T_EXPECT(fx.cli->estimator.ping_in_flight);
-	T_EXPECT(fx.cli->estimator.last_probe_ns != 0);
+	T_EXPECT_EQ(
+		fx.cli->estimator.rx.effective_bdp,
+		3u * (size_t)MUX_INITIAL_SEND_WINDOW);
+	/* ...while the transient in-flight probe is cleared (estimator_suspend). */
+	T_EXPECT(!fx.cli->estimator.ping_in_flight);
 
 cleanup:
 	free(payload);
@@ -4532,6 +4553,47 @@ T_DECLARE_CASE(test_send_queue_saturates_read_credit)
 	T_EXPECT(len3 > 0);
 
 	free(buf);
+cleanup:
+	fixture_teardown(&fx);
+}
+
+/* Direct-mode mux_stream_send must pay into the same
+ * send_buffered_frames bookkeeping stream_queue_send (the socket-mode
+ * path) already does -- every dequeue/free path decrements it
+ * unconditionally, so a direct-mode-only session that never pays in would
+ * underflow this session-scoped size_t gauge to SIZE_MAX the moment a
+ * frame it queued is dequeued or freed. */
+T_DECLARE_CASE(test_stream_send_direct_mode_updates_send_buffered_frames)
+{
+	struct mux_test_fixture fx;
+	if (fixture_setup(&fx) != 0) {
+		T_FATAL("fixture_setup failed");
+		return;
+	}
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
+		    &fx) != 0) {
+		T_FATAL("sessions did not establish");
+		goto cleanup;
+	}
+
+	struct mux_stream *s = mux_open_stream(fx.cli);
+	if (s == NULL) {
+		T_FATAL("mux_open_stream returned NULL");
+		goto cleanup;
+	}
+
+	const size_t before = s->session->send_buffered_frames;
+
+	unsigned char payload[10];
+	fill_payload(payload, sizeof(payload), 0x77);
+	size_t len = sizeof(payload);
+	T_EXPECT(mux_stream_send(s, payload, &len) == 0);
+	T_EXPECT_EQ(len, sizeof(payload));
+
+	/* One small payload fits in a single frame. */
+	T_EXPECT_EQ(s->session->send_buffered_frames, before + 1);
+
 cleanup:
 	fixture_teardown(&fx);
 }
@@ -4922,6 +4984,12 @@ static int xs_setup(struct xs_fixture *restrict fx)
 		.wire = {
 			.rx_open = true,
 		},
+		/* Matches session_new()'s real default: SIZE_MAX means "no resume
+		 * replay in progress", not the zero-init compound literal would
+		 * otherwise leave here. */
+		.unacked = {
+			.retransmit_off = SIZE_MAX,
+		},
 	};
 	fx->ss.sched.streams = table_new(&mux_stream_table_opts);
 	if (fx->ss.sched.streams == NULL) {
@@ -5213,9 +5281,47 @@ T_DECLARE_CASE(test_session_recv_pong_resets_keepalive_interval)
 }
 
 /* The sendbuf head is in-flight while send_blocked (TLS WANT_WRITE);
- * discarding it caused SSL bad-length on retry (bench.py -P 10 --bidir).
- * The blocked head must survive a discard call. */
+ * discarding it caused SSL bad-length on retry (bench.py -P 10 --bidir):
+ * SSL_write's own contract requires the next call to re-present the
+ * identical bytes. The blocked head must survive a discard call when there
+ * is a TLS connection to protect. This protection must not
+ * extend to plain TCP, which has no such retry contract -- see the sibling
+ * test_session_discard_drops_blocked_head_without_tls below. */
 T_DECLARE_CASE(test_session_discard_keeps_blocked_inflight_head)
+{
+#if WITH_TLS
+	struct xs_fixture fx;
+	if (xs_setup(&fx) != 0) {
+		T_FATAL("xs_setup failed");
+		return;
+	}
+
+	T_CHECK(session_send_ctrl(&fx.ss, 5, MUX_FLAG_ACK, 0));
+	T_CHECK(fx.ss.wire.sendbuf.head != NULL);
+
+	/* Opaque non-NULL: session_discard_stream_frames only tests tlsconn
+	 * for NULL, never dereferences it. */
+	fx.ss.wire.tlsconn = (struct tls_connection *)(uintptr_t)1;
+	/* Mark the head as in flight; it must survive the discard. */
+	fx.ss.wire.send_blocked = true;
+	session_discard_stream_frames(&fx.ss, 5);
+	T_EXPECT(fx.ss.wire.sendbuf.head != NULL);
+
+	fx.ss.wire.send_blocked = false;
+	fx.ss.wire.tlsconn = NULL;
+	xs_teardown(&fx);
+#else /* WITH_TLS */
+	T_SKIP();
+#endif /* WITH_TLS */
+}
+
+/* Without a TLS connection (plain TCP, or WITH_TLS=OFF), the
+ * send_blocked protection above must not apply -- send(2) has no
+ * SSL_write-style "retry with identical bytes" requirement, so a head that
+ * never had any bytes accepted (pos == 0) is always safe to drop and
+ * replace. Before the fix this frame reached the peer as a stale PUSH
+ * immediately ahead of the RST that should have superseded it. */
+T_DECLARE_CASE(test_session_discard_drops_blocked_head_without_tls)
 {
 	struct xs_fixture fx;
 	if (xs_setup(&fx) != 0) {
@@ -5226,10 +5332,9 @@ T_DECLARE_CASE(test_session_discard_keeps_blocked_inflight_head)
 	T_CHECK(session_send_ctrl(&fx.ss, 5, MUX_FLAG_ACK, 0));
 	T_CHECK(fx.ss.wire.sendbuf.head != NULL);
 
-	/* Mark the head as in flight; it must survive the discard. */
 	fx.ss.wire.send_blocked = true;
 	session_discard_stream_frames(&fx.ss, 5);
-	T_EXPECT(fx.ss.wire.sendbuf.head != NULL);
+	T_EXPECT(fx.ss.wire.sendbuf.head == NULL);
 
 	fx.ss.wire.send_blocked = false;
 	xs_teardown(&fx);
@@ -5240,7 +5345,7 @@ T_DECLARE_CASE(test_session_discard_keeps_blocked_inflight_head)
 #if WITH_TLS
 /* Self-signed RSA-4096 cert (CN=test.example) + key, in-memory for all
  * TLS backends.  Also the authorized peer cert (mutual auth).  Same as
- * tlsutil_test so the benches share an apples-to-apples TLS setup. */
+ * tls_test so the benches share an apples-to-apples TLS setup. */
 static char bench_cert_pem[] =
 	"-----BEGIN CERTIFICATE-----\n"
 	"MIIFKjCCAxKgAwIBAgIUM70vOlOUSVk9dQ7tbW/ih/8sKCwwDQYJKoZIhvcNAQEL\n"
@@ -5337,7 +5442,7 @@ enum {
 	BENCH_STREAM_TIMEOUT_MS = 60000,
 };
 
-/* Establish a TCP pair over loopback (matching the tlsutil benches).
+/* Establish a TCP pair over loopback (matching the tls_test benches).
  * Returns two connected blocking fds (out[0]=accepted, out[1]=connected)
  * with TCP_NODELAY, or false on failure. */
 static bool bench_loopback_pair(int out[2])
@@ -5384,7 +5489,7 @@ static bool bench_loopback_pair(int out[2])
 }
 
 /* Connect two mux sessions over loopback TCP with TLS (AES-128-GCM) when
- * WITH_TLS.  Transport and cipher match the tlsutil benches for comparable
+ * WITH_TLS.  Transport and cipher match the tls_test benches for comparable
  * GiB/s figures; teardown via fixture_teardown, TLS contexts freed after. */
 static int bench_fixture_setup(struct mux_test_fixture *restrict fx)
 {
@@ -5448,10 +5553,10 @@ static int bench_fixture_setup(struct mux_test_fixture *restrict fx)
 	/* Socket-offloaded TLS on both ends: the pre-wrapped server connection owns
 	 * fds[0] and the client's tlsctx is offloaded onto fds[1], so the mux wire
 	 * must not also do buffered I/O on those fds (doing so steals handshake bytes
-	 * from the TLS library).  tls_readahead matches the tlsctx read-ahead above
-	 * so the offloaded recv path measures the high-throughput config. */
+	 * from the TLS library).  readahead matches the tlsctx read-ahead above so
+	 * the offloaded recv path measures the high-throughput config. */
 	conf.tls_socket_offload = true;
-	conf.tls_readahead = 128 * 1024;
+	conf.readahead = 128 * 1024;
 #endif
 	unsigned char srv_sid[MUX_SESSION_ID_LEN];
 	unsigned char cli_sid[MUX_SESSION_ID_LEN];
@@ -5600,7 +5705,7 @@ static void bench_mux_setup(void)
 }
 
 /* One-directional single-stream throughput over mux-over-TLS (loopback NIC),
- * matching the tlsutil benches' transport and cipher so the figures are
+ * matching the tls_test benches' transport and cipher so the figures are
  * directly comparable.  Each op streams one CHUNK_SIZE payload that the server
  * drains and discards (set via T_BENCH_SET_BYTES for the throughput column). */
 T_DECLARE_BENCH(bench_mux_stream_throughput)
@@ -5675,6 +5780,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_bdp_ping_sent),
 	T_CASE(test_bdp_stop_halves_stream_window),
 	T_CASE(test_send_queue_saturates_read_credit),
+	T_CASE(test_stream_send_direct_mode_updates_send_buffered_frames),
 	T_CASE(test_drain_rejects_new_streams),
 	T_CASE(test_drain_refuses_peer_syn),
 
@@ -5691,6 +5797,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_session_recv_pong_clears_ping_in_flight),
 	T_CASE(test_session_recv_pong_resets_keepalive_interval),
 	T_CASE(test_session_discard_keeps_blocked_inflight_head),
+	T_CASE(test_session_discard_drops_blocked_head_without_tls),
 	/* Opt-in throughput benchmark (mux-over-TLS, loopback NIC); skipped by the
 	 * default run.  Select with `--run <ere>` or TESTING_FILTER. */
 	T_BENCH(bench_mux_stream_throughput),

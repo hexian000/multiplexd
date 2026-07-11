@@ -5,37 +5,44 @@
  * staging/coalescing); wire.c #included, real frame.c and TLS backend linked,
  * real socketpairs used; no sibling collaborators mocked. */
 
+#include "mux/wire.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
-#include "mux/wire.h"
+#include "mux/wire.c"
+#if WITH_TLS
+#include "shim/tls.h"
+#endif
 
+#if WITH_TLS
+#include "utils/slog.h"
+#endif
 #include "utils/testing.h"
 
+#if WITH_TLS
+#include <dirent.h>
+#include <errno.h>
+#endif
+#include <fcntl.h>
+#if WITH_TLS
+#include <limits.h>
+#endif
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#if WITH_TLS
+#include <stdio.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <unistd.h>
-
 #if WITH_TLS
-#if WITH_OPENSSL
-#include "gencerts.h"
-#endif
-#include "tlsutil.h"
-#include "utils/slog.h"
-
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <stdio.h>
 #include <sys/stat.h>
-#endif /* WITH_TLS */
-
-#include "mux/wire.c"
+#endif
+#include <sys/types.h>
+#include <unistd.h>
 
 /* mock - frame pool and session fixtures */
 
@@ -331,6 +338,43 @@ T_DECLARE_CASE(test_wire_discard_buffers_frees_all_pending_frames)
 	ringbuf_free(ss.wire.recvbuf);
 }
 
+/* wire_has_pending had zero test references. Its body is
+ * compiled entirely differently per WITH_TLS (a field read vs. an always-false
+ * stub), so exercise whichever variant this build actually has. */
+T_DECLARE_CASE(test_wire_has_pending_reflects_build_variant)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+
+#if WITH_TLS
+	ss.wire.tls_readable = false;
+	T_EXPECT(!wire_has_pending(&ss));
+	ss.wire.tls_readable = true;
+	T_EXPECT(wire_has_pending(&ss));
+#else
+	T_EXPECT(!wire_has_pending(&ss));
+#endif
+}
+
+/* wire_flush's WIRE_FLUSH_DONE outcome (no TLS, or TLS with
+ * socket offload so the library drives the fd directly) had no direct test;
+ * only the BLOCKED/ERROR memory-transport outcomes below did, indirectly. */
+T_DECLARE_CASE(test_wire_flush_done_without_memory_transport_tls)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+
+	T_EXPECT_EQ(wire_flush(&ss), WIRE_FLUSH_DONE);
+
+#if WITH_TLS
+	/* tls_socket_offload defaults true in make_session; a non-NULL tlsconn
+	 * must still resolve to DONE without ever touching wire_cipher_push. */
+	ss.wire.tlsconn = (struct tls_connection *)(uintptr_t)1;
+	T_EXPECT_EQ(wire_flush(&ss), WIRE_FLUSH_DONE);
+	ss.wire.tlsconn = NULL;
+#endif
+}
+
 T_DECLARE_CASE(test_wire_shutdown_plain_tcp_returns_done)
 {
 	int fds[2];
@@ -349,7 +393,7 @@ T_DECLARE_CASE(test_wire_shutdown_plain_tcp_returns_done)
 	(void)close(fds[1]);
 }
 
-T_DECLARE_CASE(test_wire_wait_eof_returns_true_on_clean_peer_close)
+T_DECLARE_CASE(test_wire_wait_eof_confirmed_on_clean_peer_close)
 {
 	int fds[2];
 	struct frame_pool_ctx pool_ctx = { 0 };
@@ -358,7 +402,47 @@ T_DECLARE_CASE(test_wire_wait_eof_returns_true_on_clean_peer_close)
 	struct mux_session ss = make_session(&pool_ctx, fds[0]);
 	T_CHECK(shutdown(fds[1], SHUT_WR) == 0);
 
-	T_EXPECT(wire_wait_eof(&ss));
+	T_EXPECT_EQ(wire_wait_eof(&ss), WIRE_EOF_CONFIRMED);
+
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+}
+
+/* A spurious wakeup with nothing pending yet (EAGAIN, no
+ * shutdown on the peer's side) must report WIRE_EOF_PENDING, distinguishable
+ * from a confirmed close -- previously both were the same boolean true. */
+T_DECLARE_CASE(test_wire_wait_eof_pending_on_eagain)
+{
+	int fds[2];
+	struct frame_pool_ctx pool_ctx = { 0 };
+
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	struct mux_session ss = make_session(&pool_ctx, fds[0]);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	/* Peer's socket left open and silent: fds[0] has nothing to read and no
+	 * FIN, so socket_recv reports EAGAIN rather than EOF. */
+
+	T_EXPECT_EQ(wire_wait_eof(&ss), WIRE_EOF_PENDING);
+
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+}
+
+/* Unexpected application data after the local shutdown must be reported as a
+ * hard error, not confused with either a confirmed close or a pending one. */
+T_DECLARE_CASE(test_wire_wait_eof_error_on_unexpected_data)
+{
+	int fds[2];
+	struct frame_pool_ctx pool_ctx = { 0 };
+	unsigned char stray[] = "oops";
+
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	struct mux_session ss = make_session(&pool_ctx, fds[0]);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(write(fds[1], stray, sizeof(stray) - 1) ==
+		(ssize_t)(sizeof(stray) - 1));
+
+	T_EXPECT_EQ(wire_wait_eof(&ss), WIRE_EOF_ERROR);
 
 	(void)close(fds[0]);
 	(void)close(fds[1]);
@@ -392,28 +476,94 @@ static void wire_test_rm_tmpdir(const char *path)
 	(void)rmdir(path);
 }
 
-#if !WITH_OPENSSL
-/* Self-signed Ed25519 certificate with subjectAltName=DNS:test.example.
- * Embedded fallback for non-OpenSSL backends (gencerts is OpenSSL-only). */
+/* Self-signed RSA-4096 certificate (CN/subjectAltName=DNS:test.example) and its
+ * private key, in memory so they work with every TLS backend; identical to the
+ * embedded cert in shim/tls_test.c. */
 static const char wire_test_cert_pem[] =
 	"-----BEGIN CERTIFICATE-----\n"
-	"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\n"
+	"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\n"
 	"-----END CERTIFICATE-----\n";
 
 static const char wire_test_key_pem[] =
-	"-----BEGIN EC PRIVATE KEY-----\n"
-	"MHcCAQEEIPdNKDBJJsEP+Wl1IXsrahoxn0MfEyCEzWHZP7akCMwMoAoGCCqGSM49\n"
-	"AwEHoUQDQgAEcQ5y3IRSymXph6BK3Tu1tRC86nmNrwt0/+lLaGTZYOkMjsyvzk7U\n"
-	"thoRJpe8V3Lade1ugGMFuKwK9f/UhRagzg==\n"
-	"-----END EC PRIVATE KEY-----\n";
+	"-----BEGIN PRIVATE KEY-----\n"
+	"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\n"
+	"NL+YLwobqSZhkl4iZWt2wGODitzp/aQ=\n"
+	"-----END PRIVATE KEY-----\n";
 
 static bool wire_test_write_pem(const char *path, const char *data)
 {
@@ -437,9 +587,8 @@ static bool wire_test_make_certs(void)
 	}
 	return true;
 }
-#endif /* !WITH_OPENSSL */
 
-/* Generate a self-signed Ed25519 cert pair in a fresh tmpdir.
+/* Write the embedded cert/key pair to a fresh tmpdir.
  * Returns the saved working directory (caller must free), or NULL on failure.
  * On success, cert_out and key_out hold absolute '@'-prefixed paths. */
 static char *wire_test_setup_cert_dir(
@@ -459,11 +608,7 @@ static char *wire_test_setup_cert_dir(
 		free(origdir);
 		return NULL;
 	}
-#if WITH_OPENSSL
-	if (!gencerts("t", "test.example", NULL, "ed25519", 0)) {
-#else
 	if (!wire_test_make_certs()) {
-#endif
 		if (chdir(origdir) != 0) {
 			LOGW_F("chdir: (%d) %s", errno, strerror(errno));
 		}
@@ -819,6 +964,21 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
 	unsigned char cli_rx[16384] = { 0 }, srv_rx[16384] = { 0 };
 	size_t cli_sent = 0, srv_sent = 0, srv_got = 0, cli_got = 0;
+
+	/* A send issued before the handshake completes stalls cross-direction:
+	 * the client has flushed its ClientHello but cannot encrypt app data
+	 * until it reads the server's flight, so wire_send takes 0 plaintext
+	 * bytes and records EV_READ (not EV_WRITE) in wire.tls_want for the
+	 * caller to arm. Asserting the direction here guards against an
+	 * EV_READ/EV_WRITE swap or a dropped assignment, which the convergent
+	 * exchange loop below would otherwise still succeed through. */
+	{
+		size_t probe = sizeof(cli_msg) - 1;
+		T_CHECK(wire_send(&cli_ss, cli_msg, &probe));
+		T_EXPECT_EQ(probe, (size_t)0);
+		T_EXPECT_EQ(cli_ss.wire.tls_want, EV_READ);
+	}
+
 	for (int i = 0; i < 100 && (srv_got == 0 || cli_got == 0); i++) {
 		if (cli_sent == 0) {
 			size_t n = sizeof(cli_msg) - 1;
@@ -858,6 +1018,310 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 		srv_eof = srv_ss.wire.rx_eof;
 	}
 	T_EXPECT(srv_eof);
+
+	srv_ss.wire.tlsconn = NULL;
+	cli_ss.wire.tlsconn = NULL;
+	tls_conn_free(srv_conn);
+	tls_conn_free(cli_conn);
+	ringbuf_free(srv_ss.wire.rawbuf);
+	ringbuf_free(cli_ss.wire.rawbuf);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	wire_test_rm_tmpdir(tmpl);
+}
+
+/* Regression: a wire_cipher_push failure landing in the TLS_ERROR_ZERO_RETURN
+ * branch (peer close_notify arriving as the transport can no longer send)
+ * must be reported as a hard failure, not swallowed into a clean-close. */
+T_DECLARE_CASE(test_wire_recv_buffered_zero_return_reports_push_failure)
+{
+	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
+	char *const origdir = wire_test_setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	/* Buffered connections pass fd=-1; wire.c drives the socket. */
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, -1);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, -1);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session srv_ss = make_session(&pool_ctx, fds[0]);
+	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
+	srv_ss.wire.tlsconn = srv_conn;
+	cli_ss.wire.tlsconn = cli_conn;
+	srv_ss.conf.tls_socket_offload = false;
+	cli_ss.conf.tls_socket_offload = false;
+
+	/* Complete the handshake (mirrors test_wire_tls_buffered_send_recv). */
+	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
+	unsigned char cli_rx[4096] = { 0 }, srv_rx[4096] = { 0 };
+	size_t cli_sent = 0, srv_sent = 0, srv_got = 0, cli_got = 0;
+	for (int i = 0; i < 100 && (srv_got == 0 || cli_got == 0); i++) {
+		if (cli_sent == 0) {
+			size_t n = sizeof(cli_msg) - 1;
+			T_CHECK(wire_send(&cli_ss, cli_msg, &n));
+			cli_sent = n;
+		}
+		if (srv_sent == 0) {
+			size_t n = sizeof(srv_msg) - 1;
+			T_CHECK(wire_send(&srv_ss, srv_msg, &n));
+			srv_sent = n;
+		}
+		size_t rn = sizeof(srv_rx);
+		T_CHECK(wire_recv(&srv_ss, srv_rx, &rn));
+		if (rn > 0) {
+			srv_got = rn;
+		}
+		rn = sizeof(cli_rx);
+		T_CHECK(wire_recv(&cli_ss, cli_rx, &rn));
+		if (rn > 0) {
+			cli_got = rn;
+		}
+	}
+	T_CHECK(srv_got > 0 && cli_got > 0);
+
+	/* Client sends its close_notify via wire_shutdown; wait until the
+	 * ciphertext is queued and readable on the server's socket, without
+	 * consuming it, so wire_recv_buffered itself decrypts the alert. */
+	T_EXPECT_EQ(wire_shutdown(&cli_ss), WIRE_SHUTDOWN_DONE);
+	bool readable = false;
+	for (int i = 0; i < 50 && !readable; i++) {
+		struct pollfd pfd = { .fd = fds[0], .events = POLLIN };
+		readable = poll(&pfd, 1, 20) > 0;
+	}
+	T_CHECK(readable);
+
+	/* Arm the failure: stage unflushed ciphertext residue and shut down
+	 * the server's own send direction, so the next wire_cipher_push
+	 * observes a hard EPIPE instead of EAGAIN. */
+	T_CHECK(srv_ss.wire.rawbuf != NULL);
+	T_CHECK(ringbuf_write_space(srv_ss.wire.rawbuf) >= 16);
+	memset(ringbuf_write_ptr(srv_ss.wire.rawbuf), 'x', 16);
+	ringbuf_produce(srv_ss.wire.rawbuf, 16);
+	T_CHECK(shutdown(fds[0], SHUT_WR) == 0);
+
+	srv_ss.wire.rx_open = true;
+	size_t rn = sizeof(srv_rx);
+	T_EXPECT(!wire_recv_buffered(&srv_ss, srv_rx, &rn));
+	T_EXPECT(!srv_ss.wire.rx_open);
+	T_EXPECT_EQ(rn, (size_t)0);
+
+	srv_ss.wire.tlsconn = NULL;
+	cli_ss.wire.tlsconn = NULL;
+	tls_conn_free(srv_conn);
+	tls_conn_free(cli_conn);
+	ringbuf_free(srv_ss.wire.rawbuf);
+	ringbuf_free(cli_ss.wire.rawbuf);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	wire_test_rm_tmpdir(tmpl);
+}
+
+/* wire_flush's WIRE_FLUSH_BLOCKED/WIRE_FLUSH_ERROR outcomes
+ * (memory-transport TLS only -- socket-offload bypasses wire_cipher_push
+ * entirely) had zero direct test references. */
+T_DECLARE_CASE(test_wire_flush_blocked_on_partial_socket_write)
+{
+	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
+	char *const origdir = wire_test_setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, -1);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, -1);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session srv_ss = make_session(&pool_ctx, fds[0]);
+	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
+	srv_ss.wire.tlsconn = srv_conn;
+	cli_ss.wire.tlsconn = cli_conn;
+	srv_ss.conf.tls_socket_offload = false;
+	cli_ss.conf.tls_socket_offload = false;
+
+	/* Complete the handshake (mirrors test_wire_tls_buffered_send_recv). */
+	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
+	unsigned char cli_rx[4096] = { 0 }, srv_rx[4096] = { 0 };
+	size_t cli_sent = 0, srv_sent = 0, srv_got = 0, cli_got = 0;
+	for (int i = 0; i < 100 && (srv_got == 0 || cli_got == 0); i++) {
+		if (cli_sent == 0) {
+			size_t n = sizeof(cli_msg) - 1;
+			T_CHECK(wire_send(&cli_ss, cli_msg, &n));
+			cli_sent = n;
+		}
+		if (srv_sent == 0) {
+			size_t n = sizeof(srv_msg) - 1;
+			T_CHECK(wire_send(&srv_ss, srv_msg, &n));
+			srv_sent = n;
+		}
+		size_t rn = sizeof(srv_rx);
+		T_CHECK(wire_recv(&srv_ss, srv_rx, &rn));
+		if (rn > 0) {
+			srv_got = rn;
+		}
+		rn = sizeof(cli_rx);
+		T_CHECK(wire_recv(&cli_ss, cli_rx, &rn));
+		if (rn > 0) {
+			cli_got = rn;
+		}
+	}
+	T_CHECK(srv_got > 0 && cli_got > 0);
+
+	/* Stage far more raw bytes than any realistic kernel socket buffer can
+	 * accept in one send(2): wire_cipher_push's own partial-write check
+	 * (wire.c: "nbytes < avail") reports this as EAGAIN without needing the
+	 * peer to stop reading or the buffer to already be completely full. */
+	enum { STAGE_BYTES = 8 * 1024 * 1024 };
+	T_CHECK(srv_ss.wire.rawbuf != NULL);
+	T_CHECK(ringbuf_reserve(&srv_ss.wire.rawbuf, STAGE_BYTES, true));
+	memset(ringbuf_write_ptr(srv_ss.wire.rawbuf), 'x', STAGE_BYTES);
+	ringbuf_produce(srv_ss.wire.rawbuf, STAGE_BYTES);
+
+	T_EXPECT_EQ(wire_flush(&srv_ss), WIRE_FLUSH_BLOCKED);
+	/* Residue must survive a BLOCKED outcome, to retry on the next wakeup. */
+	T_EXPECT(ringbuf_readable(srv_ss.wire.rawbuf) > 0);
+
+	srv_ss.wire.tlsconn = NULL;
+	cli_ss.wire.tlsconn = NULL;
+	tls_conn_free(srv_conn);
+	tls_conn_free(cli_conn);
+	ringbuf_free(srv_ss.wire.rawbuf);
+	ringbuf_free(cli_ss.wire.rawbuf);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	wire_test_rm_tmpdir(tmpl);
+}
+
+T_DECLARE_CASE(test_wire_flush_error_on_hard_send_failure)
+{
+	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
+	char *const origdir = wire_test_setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, -1);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, -1);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session srv_ss = make_session(&pool_ctx, fds[0]);
+	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
+	srv_ss.wire.tlsconn = srv_conn;
+	cli_ss.wire.tlsconn = cli_conn;
+	srv_ss.conf.tls_socket_offload = false;
+	cli_ss.conf.tls_socket_offload = false;
+
+	/* Complete the handshake (mirrors test_wire_tls_buffered_send_recv). */
+	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
+	unsigned char cli_rx[4096] = { 0 }, srv_rx[4096] = { 0 };
+	size_t cli_sent = 0, srv_sent = 0, srv_got = 0, cli_got = 0;
+	for (int i = 0; i < 100 && (srv_got == 0 || cli_got == 0); i++) {
+		if (cli_sent == 0) {
+			size_t n = sizeof(cli_msg) - 1;
+			T_CHECK(wire_send(&cli_ss, cli_msg, &n));
+			cli_sent = n;
+		}
+		if (srv_sent == 0) {
+			size_t n = sizeof(srv_msg) - 1;
+			T_CHECK(wire_send(&srv_ss, srv_msg, &n));
+			srv_sent = n;
+		}
+		size_t rn = sizeof(srv_rx);
+		T_CHECK(wire_recv(&srv_ss, srv_rx, &rn));
+		if (rn > 0) {
+			srv_got = rn;
+		}
+		rn = sizeof(cli_rx);
+		T_CHECK(wire_recv(&cli_ss, cli_rx, &rn));
+		if (rn > 0) {
+			cli_got = rn;
+		}
+	}
+	T_CHECK(srv_got > 0 && cli_got > 0);
+
+	/* Same technique as test_wire_recv_buffered_zero_return_reports_push_failure:
+	 * shut down the server's own send direction so the next attempt to write
+	 * staged residue observes a hard EPIPE instead of EAGAIN. */
+	T_CHECK(srv_ss.wire.rawbuf != NULL);
+	T_CHECK(ringbuf_write_space(srv_ss.wire.rawbuf) >= 16);
+	memset(ringbuf_write_ptr(srv_ss.wire.rawbuf), 'x', 16);
+	ringbuf_produce(srv_ss.wire.rawbuf, 16);
+	T_CHECK(shutdown(fds[0], SHUT_WR) == 0);
+
+	T_EXPECT_EQ(wire_flush(&srv_ss), WIRE_FLUSH_ERROR);
 
 	srv_ss.wire.tlsconn = NULL;
 	cli_ss.wire.tlsconn = NULL;
@@ -1188,8 +1652,12 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_ringbuf_shrink_keeps_live_bytes),
 	T_CASE(test_ringbuf_shrink_noop_when_small),
 	T_CASE(test_wire_discard_buffers_frees_all_pending_frames),
+	T_CASE(test_wire_has_pending_reflects_build_variant),
+	T_CASE(test_wire_flush_done_without_memory_transport_tls),
 	T_CASE(test_wire_shutdown_plain_tcp_returns_done),
-	T_CASE(test_wire_wait_eof_returns_true_on_clean_peer_close),
+	T_CASE(test_wire_wait_eof_confirmed_on_clean_peer_close),
+	T_CASE(test_wire_wait_eof_pending_on_eagain),
+	T_CASE(test_wire_wait_eof_error_on_unexpected_data),
 	T_CASE(test_sendbuf_push_small_frame_by_reference),
 	T_CASE(test_sendbuf_push_second_small_frame_packs_onto_tail),
 	T_CASE(test_sendbuf_push_large_frame_by_reference),
@@ -1208,11 +1676,17 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_wire_tls_send_recv_data),
 	T_CASE(test_wire_tls_shutdown_completes),
 	T_CASE(test_wire_tls_buffered_send_recv),
-#endif
+	T_CASE(test_wire_recv_buffered_zero_return_reports_push_failure),
+	T_CASE(test_wire_flush_blocked_on_partial_socket_write),
+	T_CASE(test_wire_flush_error_on_hard_send_failure),
+#endif /* WITH_TLS */
 	T_SUITE_END,
 };
 
 int main(int argc, char **argv)
 {
+	/* A broken send direction (used to force a hard wire_cipher_push
+	 * failure) raises SIGPIPE by default; the test process must survive it. */
+	T_CHECK(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
 	return testing_main(argc, argv, suite);
 }

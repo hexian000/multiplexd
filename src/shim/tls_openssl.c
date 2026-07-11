@@ -2,13 +2,13 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /**
- * @file tlsutil_openssl.c
+ * @file tls_openssl.c
  * @brief TLS utility functions implemented with OpenSSL.
  */
 
 #if WITH_TLS
 
-#include "tlsutil.h"
+#include "shim/tls.h"
 
 #include "codec/csv.h"
 #include "utils/slog.h"
@@ -17,16 +17,19 @@
 #include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/obj_mac.h>
+#include <openssl/objects.h>
 #include <openssl/opensslv.h>
 #include <openssl/pem.h>
+#include <openssl/pemerr.h>
 #include <openssl/prov_ssl.h>
 #include <openssl/ssl.h>
 #include <openssl/tls1.h>
 #include <openssl/types.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
-#include <openssl/x509err.h>
 
+#include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -48,6 +51,25 @@
 		}                                                              \
 	} while (0)
 
+/* Per SSL_get_error(3): SSL_ERROR_SYSCALL's ret==0 is a protocol-violating
+ * EOF (errno is stale); ret<0 is a genuine syscall failure worth logging. */
+#define LOG_SSL_SYSCALL(level, label, ret, saved_errno)                        \
+	do {                                                                   \
+		LOG_SSLERROR(level, label);                                    \
+		if (!LOGLEVEL(level)) {                                        \
+			break;                                                 \
+		}                                                              \
+		if ((ret) == 0) {                                              \
+			LOG_F(level,                                           \
+			      "%s: connection closed without a proper "        \
+			      "TLS shutdown",                                  \
+			      (label));                                        \
+		} else {                                                       \
+			LOG_F(level, "%s: syscall error: (%d) %s", (label),    \
+			      (saved_errno), strerror(saved_errno));           \
+		}                                                              \
+	} while (0)
+
 /* Wrapper around the OpenSSL context that retains the per-context runtime
  * extras (SNI string, ALPN wire buffer) the bare SSL_CTX cannot hold. */
 struct tls_ctx_impl {
@@ -58,6 +80,10 @@ struct tls_ctx_impl {
 	 * heap, owned).  Used to offer (client) or select (server). */
 	unsigned char *alpn;
 	size_t alpn_len;
+	/* true once SSL_CTX_set_alpn_select_cb() captured this wrapper's
+	 * address as the callback argument; guards tls_ctx_ref() against
+	 * handing out a second owner while the callback still points here. */
+	bool alpn_cb_registered;
 };
 
 static struct tls_ctx_impl *tls_ctx_raw(struct tls_context *restrict ctx)
@@ -144,7 +170,10 @@ static bool alpn_wire_from_list(
 	size_t w = 0;
 	for (char *p = work; p != NULL;) {
 		char *field = NULL;
-		char *const next = csv_scanfield(p, &field);
+		/* ALPN is a flat comma-separated list, so the delimiter kind
+		 * (field vs record separator) is irrelevant; discard it. */
+		char sep;
+		char *const next = csv_scanfield(p, &field, &sep);
 		if (next == p) {
 			/* unterminated quoted field with no more data */
 			LOGW_F("malformed ALPN list '%s'", list);
@@ -196,6 +225,74 @@ static int alpn_select_cb(
 	return SSL_TLSEXT_ERR_OK;
 }
 
+/* Below this, an RSA key is cryptographically weak regardless of intent;
+ * matches mbedtls_x509_crt_profile_default's rsa_min_bitlen (the mbedTLS
+ * backend's default certificate profile). */
+enum { TLS_RSA_MIN_BITS = 2048 };
+
+/* True if pkey is an EC key on a curve at or above the 128-bit security
+ * level, mirroring mbedtls_x509_crt_profile_default's curve allowlist
+ * (notably excluding P-224). */
+static bool tls_ec_curve_allowed(const EVP_PKEY *restrict pkey)
+{
+	char name[80];
+	if (EVP_PKEY_get_group_name(pkey, name, sizeof(name), NULL) != 1) {
+		return false;
+	}
+	switch (OBJ_sn2nid(name)) {
+	case NID_X9_62_prime256v1: /* P-256 */
+	case NID_secp384r1: /* P-384 */
+	case NID_secp521r1: /* P-521 */
+	case NID_brainpoolP256r1:
+	case NID_brainpoolP384r1:
+	case NID_brainpoolP512r1:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Verify callback applying a certificate-strength floor to the peer's chain
+ * (every depth), matching the mbedTLS backend's default certificate profile:
+ * RSA/RSA-PSS keys must be >= TLS_RSA_MIN_BITS and EC keys must use an
+ * allowed curve. Other key types (e.g. Ed25519) are left unrestricted, as
+ * mbedtls_x509_crt_profile_default itself permits any PK algorithm and only
+ * constrains RSA bit length and EC curve. Without this, the OpenSSL backend
+ * accepted certificates the mbedTLS backend rejected. */
+static int
+tls_verify_cert_strength_cb(int preverify_ok, X509_STORE_CTX *store_ctx)
+{
+	if (!preverify_ok) {
+		return preverify_ok;
+	}
+	X509 *const cert = X509_STORE_CTX_get_current_cert(store_ctx);
+	EVP_PKEY *const pkey = X509_get0_pubkey(cert);
+	if (pkey == NULL) {
+		return preverify_ok;
+	}
+	bool ok;
+	switch (EVP_PKEY_get_id(pkey)) {
+	case EVP_PKEY_RSA:
+	case EVP_PKEY_RSA_PSS:
+		ok = EVP_PKEY_get_bits(pkey) >= TLS_RSA_MIN_BITS;
+		break;
+	case EVP_PKEY_EC:
+		ok = tls_ec_curve_allowed(pkey);
+		break;
+	default:
+		ok = true;
+		break;
+	}
+	if (!ok) {
+		const int depth = X509_STORE_CTX_get_error_depth(store_ctx);
+		X509_STORE_CTX_set_error(
+			store_ctx, depth == 0 ? X509_V_ERR_EE_KEY_TOO_SMALL :
+						X509_V_ERR_CA_KEY_TOO_SMALL);
+		return 0;
+	}
+	return preverify_ok;
+}
+
 static void tls_ctx_tune(
 	SSL_CTX *restrict ssl_ctx, const bool kernel_offload,
 	const bool readahead)
@@ -207,7 +304,7 @@ static void tls_ctx_tune(
 		LOGW_F("SSL_CTX_set_mode: requested 0x%lx but active mode is 0x%lx",
 		       (unsigned long)want_mode, (unsigned long)got_mode);
 	}
-	/* tls.readahead: let one socket read buffer several records.  Disabled
+	/* mux.readahead: let one socket read buffer several records.  Disabled
 	 * makes the library read at most one record per socket read. */
 	const int want_read_ahead = readahead ? 1 : 0;
 	(void)SSL_CTX_set_read_ahead(ssl_ctx, want_read_ahead);
@@ -274,13 +371,16 @@ static bool tls_ctx_set_alpn(
 	}
 	if (is_server) {
 		SSL_CTX_set_alpn_select_cb(c->ssl_ctx, alpn_select_cb, c);
+		c->alpn_cb_registered = true;
 		return true;
 	}
 	/* SSL_CTX_set_alpn_protos copies the buffer and, unusually, returns 0
-	 * on success. */
+	 * on success. Fail closed (matching the mbedTLS backend) instead of
+	 * silently proceeding without the ALPN the caller configured. */
 	if (SSL_CTX_set_alpn_protos(
 		    c->ssl_ctx, c->alpn, (unsigned int)c->alpn_len) != 0) {
-		LOG_SSLERROR(WARNING, "SSL_CTX_set_alpn_protos");
+		LOG_SSLERROR(ERROR, "SSL_CTX_set_alpn_protos");
+		return false;
 	}
 	return true;
 }
@@ -288,6 +388,18 @@ static bool tls_ctx_set_alpn(
 const char *tls_version(void)
 {
 	return "OpenSSL " OPENSSL_VERSION_STR;
+}
+
+/* Distinguish clean PEM-scan EOF from parse errors after a NULL
+ * PEM_read_bio_X509() result. */
+static bool pem_scan_ended_cleanly(void)
+{
+	if (ERR_GET_REASON(ERR_peek_last_error()) != PEM_R_NO_START_LINE) {
+		LOG_SSLERROR(ERROR, "PEM_read_bio_X509");
+		return false;
+	}
+	ERR_clear_error();
+	return true;
 }
 
 static bool load_cert_from_bio(SSL_CTX *ctx, BIO *bio)
@@ -311,6 +423,9 @@ static bool load_cert_from_bio(SSL_CTX *ctx, BIO *bio)
 		}
 		X509_free(cert);
 		count++;
+	}
+	if (!pem_scan_ended_cleanly()) {
+		return false;
 	}
 	return (count > 0);
 }
@@ -341,10 +456,24 @@ static bool load_cert_from_file(SSL_CTX *ctx, const char *filename)
 	return ok;
 }
 
+/* Refuses to prompt: with no callback, PEM_read_bio_PrivateKey falls back to
+ * OpenSSL's default UI, which blocks reading a passphrase from the
+ * controlling terminal -- fatal for a single-threaded event loop, whether at
+ * startup or a SIGHUP reload. A password-protected key is not supported. */
+static int reject_password_cb(char *buf, int size, int rwflag, void *u)
+{
+	(void)buf;
+	(void)size;
+	(void)rwflag;
+	(void)u;
+	return -1;
+}
+
 static bool load_key_from_bio(SSL_CTX *ctx, BIO *bio)
 {
 	ERR_clear_error();
-	EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+	EVP_PKEY *pkey =
+		PEM_read_bio_PrivateKey(bio, NULL, reject_password_cb, NULL);
 	if (pkey == NULL) {
 		LOG_SSLERROR(ERROR, "PEM_read_bio_PrivateKey");
 		return false;
@@ -393,17 +522,26 @@ static bool load_authcert_from_bio(SSL_CTX *ctx, BIO *bio)
 		return false;
 	}
 	X509 *cert = NULL;
+	int count = 0;
 	while ((cert = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+		/* OpenSSL 3.x tolerates a duplicate cert as success (no
+		 * longer fails with X509_R_CERT_ALREADY_IN_HASH_TABLE, as
+		 * verified against the project's OpenSSL 3.0.2 baseline), so
+		 * any failure here is a genuine error. */
 		if (X509_STORE_add_cert(store, cert) != 1) {
-			const unsigned long err = ERR_peek_error();
-			if (ERR_GET_REASON(err) !=
-			    X509_R_CERT_ALREADY_IN_HASH_TABLE) {
-				LOG_SSLERROR(ERROR, "X509_STORE_add_cert");
-				X509_free(cert);
-				return false;
-			}
+			LOG_SSLERROR(ERROR, "X509_STORE_add_cert");
+			X509_free(cert);
+			return false;
 		}
 		X509_free(cert);
+		count++;
+	}
+	if (!pem_scan_ended_cleanly()) {
+		return false;
+	}
+	if (count == 0) {
+		LOGE("no certificates parsed from authorized certificate data");
+		return false;
 	}
 	return true;
 }
@@ -416,6 +554,11 @@ bool tls_load_cert(
 		return false;
 	}
 	SSL_CTX *const ssl_ctx = tls_ssl_ctx(ctx);
+	/* SSL_CTX_use_certificate() below only replaces the leaf; extra chain
+	 * certs are purely additive via SSL_CTX_add1_chain_cert(). Clear them
+	 * first so re-loading onto an existing context doesn't accumulate
+	 * stale intermediates from a previous load. */
+	(void)SSL_CTX_clear_chain_certs(ssl_ctx);
 	bool ok;
 	switch (*cert_data) {
 	case '\0':
@@ -552,12 +695,14 @@ struct tls_context *tls_ctx_server(const struct tls_config *conf)
 	}
 	SSL_CTX_set_verify(
 		ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-		NULL);
+		tls_verify_cert_strength_cb);
 
 	if (conf->ciphersuites != NULL) {
 		if (SSL_CTX_set_ciphersuites(ssl_ctx, conf->ciphersuites) !=
 		    1) {
-			LOG_SSLERROR(WARNING, "SSL_CTX_set_ciphersuites");
+			LOG_SSLERROR(ERROR, "SSL_CTX_set_ciphersuites");
+			tls_ctx_free(ctx);
+			return NULL;
 		}
 	}
 
@@ -617,12 +762,15 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf)
 	}
 	/* Verify the peer certificate against the pinned CA store; hostname check is
 	 * omitted (see "Deployment Notes" in README.md). */
-	SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+	SSL_CTX_set_verify(
+		ssl_ctx, SSL_VERIFY_PEER, tls_verify_cert_strength_cb);
 
 	if (conf->ciphersuites != NULL) {
 		if (SSL_CTX_set_ciphersuites(ssl_ctx, conf->ciphersuites) !=
 		    1) {
-			LOG_SSLERROR(WARNING, "SSL_CTX_set_ciphersuites");
+			LOG_SSLERROR(ERROR, "SSL_CTX_set_ciphersuites");
+			tls_ctx_free(ctx);
+			return NULL;
 		}
 	}
 
@@ -651,6 +799,13 @@ struct tls_context *tls_ctx_ref(struct tls_context *restrict ctx)
 		return NULL;
 	}
 	const struct tls_ctx_impl *const src = tls_ctx_raw(ctx);
+	if (src->alpn_cb_registered) {
+		/* The ALPN callback argument is src's own address; a second
+		 * owner could outlive src and leave it dangling. Refuse rather
+		 * than hand out an unsafe handle. */
+		LOGE("tls_ctx_ref: refusing to share an ALPN-enabled server context");
+		return NULL;
+	}
 	struct tls_ctx_impl *const c = calloc(1, sizeof(*c));
 	if (c == NULL) {
 		LOGOOM();
@@ -797,9 +952,18 @@ bool tls_input(
 		return true;
 	}
 	BIO *const rbio = SSL_get_rbio(tls_conn_ssl(conn));
-	const int ret =
-		BIO_write(rbio, data, (int)(len > INT_MAX ? INT_MAX : len));
-	return ret > 0;
+	const unsigned char *p = data;
+	size_t remain = len;
+	while (remain > 0) {
+		const int n = BIO_write(
+			rbio, p, (int)(remain > INT_MAX ? INT_MAX : remain));
+		if (n <= 0) {
+			return false;
+		}
+		p += (size_t)n;
+		remain -= (size_t)n;
+	}
+	return true;
 }
 
 size_t tls_output(
@@ -822,6 +986,7 @@ enum tls_error tls_handshake(struct tls_connection *restrict conn)
 	SSL *const ssl = c->ssl;
 
 	const int ret = SSL_do_handshake(ssl);
+	const int saved_errno = errno;
 	tls_fire_send(c);
 	if (ret == 1) {
 		/* Report whether KTLS engaged per direction (both macros expand to
@@ -841,7 +1006,7 @@ enum tls_error tls_handshake(struct tls_connection *restrict conn)
 	case SSL_ERROR_WANT_WRITE:
 		return TLS_ERROR_WANT_WRITE;
 	case SSL_ERROR_SYSCALL:
-		LOG_SSLERROR(ERROR, "SSL_do_handshake");
+		LOG_SSL_SYSCALL(ERROR, "SSL_do_handshake", ret, saved_errno);
 		return TLS_ERROR_SYSCALL;
 	default:
 		LOG_SSLERROR(ERROR, "SSL_do_handshake");
@@ -861,6 +1026,7 @@ enum tls_error tls_send(
 	ERR_clear_error();
 	const int req_len = (int)(*len > (size_t)INT_MAX ? INT_MAX : *len);
 	const int ret = SSL_write(ssl, buf, req_len);
+	const int saved_errno = errno;
 	tls_fire_send(c);
 	if (ret > 0) {
 		*len = (size_t)ret;
@@ -879,7 +1045,7 @@ enum tls_error tls_send(
 	case SSL_ERROR_WANT_WRITE:
 		return TLS_ERROR_WANT_WRITE;
 	case SSL_ERROR_SYSCALL:
-		LOG_SSLERROR(ERROR, "SSL_write");
+		LOG_SSL_SYSCALL(ERROR, "SSL_write", ret, saved_errno);
 		return TLS_ERROR_SYSCALL;
 	case SSL_ERROR_ZERO_RETURN:
 		return TLS_ERROR_ZERO_RETURN;
@@ -902,6 +1068,7 @@ enum tls_error tls_recv(
 	ERR_clear_error();
 	const int req_len = (int)(*len > (size_t)INT_MAX ? INT_MAX : *len);
 	const int ret = SSL_read(ssl, buf, req_len);
+	const int saved_errno = errno;
 	/* A read can drive the handshake and emit records (e.g. the client's
 	 * Finished); surface any staged ciphertext and buffered plaintext. */
 	tls_fire_send(c);
@@ -923,7 +1090,7 @@ enum tls_error tls_recv(
 	case SSL_ERROR_WANT_WRITE:
 		return TLS_ERROR_WANT_WRITE;
 	case SSL_ERROR_SYSCALL:
-		LOG_SSLERROR(ERROR, "SSL_read");
+		LOG_SSL_SYSCALL(ERROR, "SSL_read", ret, saved_errno);
 		return TLS_ERROR_SYSCALL;
 	case SSL_ERROR_ZERO_RETURN:
 		return TLS_ERROR_ZERO_RETURN;
@@ -941,6 +1108,7 @@ enum tls_error tls_shutdown(struct tls_connection *restrict conn)
 	SSL *const ssl = c->ssl;
 
 	const int ret = SSL_shutdown(ssl);
+	const int saved_errno = errno;
 	tls_fire_send(c);
 	if (ret >= 0) {
 		/* One-way: our close_notify is flushed (ret==0) or both exchanged
@@ -955,7 +1123,7 @@ enum tls_error tls_shutdown(struct tls_connection *restrict conn)
 	case SSL_ERROR_WANT_WRITE:
 		return TLS_ERROR_WANT_WRITE;
 	case SSL_ERROR_SYSCALL:
-		LOG_SSLERROR(DEBUG, "SSL_shutdown");
+		LOG_SSL_SYSCALL(DEBUG, "SSL_shutdown", ret, saved_errno);
 		return TLS_ERROR_SYSCALL;
 	default:
 		LOG_SSLERROR(DEBUG, "SSL_shutdown");
@@ -980,7 +1148,7 @@ bool tls_peer_cert_der(
 	}
 	SSL *const ssl = tls_conn_ssl(conn);
 	ERR_clear_error();
-	X509 *const cert = SSL_get_peer_certificate(ssl);
+	X509 *const cert = SSL_get1_peer_certificate(ssl);
 	if (cert == NULL) {
 		return false;
 	}

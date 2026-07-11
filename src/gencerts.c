@@ -10,7 +10,6 @@
 
 #if WITH_OPENSSL
 
-#include "utils/debug.h"
 #include "utils/slog.h"
 
 #include <openssl/asn1.h>
@@ -31,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -72,11 +72,24 @@ static bool format_subject_alt_name(
 	return true;
 }
 
+/* No real deployment needs more; RSA keygen time grows steeply with size,
+ * so anything past this is almost certainly a mistyped --keysize rather
+ * than a deliberate choice. */
+enum { RSA_KEYSIZE_MAX = 16384 };
+/* Below this, the key is cryptographically weak regardless of intent;
+ * matches the common 2048-bit industry floor. */
+enum { RSA_KEYSIZE_MIN = 2048 };
+
 static EVP_PKEY *generate_key(const char *type, int keysize)
 {
 	if (strcmp(type, "rsa") == 0) {
 		if (keysize == 0) {
 			keysize = 4096;
+		}
+		if (keysize < RSA_KEYSIZE_MIN || keysize > RSA_KEYSIZE_MAX) {
+			LOGE_F("invalid RSA key size: %d (must be %d-%d)",
+			       keysize, RSA_KEYSIZE_MIN, RSA_KEYSIZE_MAX);
+			return NULL;
 		}
 		LOGN_F("keytype=rsa keysize=%d", keysize);
 		EVP_PKEY *const pkey =
@@ -117,6 +130,10 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 		return pkey;
 	}
 	if (strcmp(type, "ed25519") == 0) {
+		if (keysize != 0) {
+			LOGE_F("ed25519 does not take a key size: %d", keysize);
+			return NULL;
+		}
 		LOGN("keytype=ed25519");
 		EVP_PKEY *const pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
 		if (pkey == NULL) {
@@ -126,6 +143,18 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 	}
 	LOGE_F("invalid key type: %s", type);
 	return NULL;
+}
+
+/* Refuses to prompt: a password-protected private key is not supported by
+ * this tool, so fail cleanly instead of blocking on an interactive stdin
+ * prompt in a scripted/non-interactive invocation. */
+static int reject_password_cb(char *buf, int size, int rwflag, void *u)
+{
+	(void)buf;
+	(void)size;
+	(void)rwflag;
+	(void)u;
+	return -1;
 }
 
 static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
@@ -156,7 +185,7 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 		*out_cert = NULL;
 		return false;
 	}
-	*out_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+	*out_key = PEM_read_PrivateKey(fp, NULL, reject_password_cb, NULL);
 	(void)fclose(fp);
 	if (*out_key == NULL) {
 		LOG_SSLERROR("PEM_read_PrivateKey");
@@ -169,9 +198,109 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 	return true;
 }
 
+/* RFC 5280 requires a positive serial number; use 128 random bits. On
+ * failure the caller still owns and frees `cert` itself. */
+static bool set_random_serial(X509 *restrict cert)
+{
+	BIGNUM *const bn = BN_new();
+	if (bn == NULL) {
+		LOG_SSLERROR("BN_new");
+		return false;
+	}
+	if (BN_rand(bn, 128, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) == 0) {
+		LOG_SSLERROR("BN_rand");
+		BN_free(bn);
+		return false;
+	}
+	ASN1_INTEGER *const serial = ASN1_INTEGER_new();
+	if (serial == NULL) {
+		LOG_SSLERROR("ASN1_INTEGER_new");
+		BN_free(bn);
+		return false;
+	}
+	if (BN_to_ASN1_INTEGER(bn, serial) == NULL) {
+		LOG_SSLERROR("BN_to_ASN1_INTEGER");
+		ASN1_INTEGER_free(serial);
+		BN_free(bn);
+		return false;
+	}
+	BN_free(bn);
+	if (X509_set_serialNumber(cert, serial) == 0) {
+		LOG_SSLERROR("X509_set_serialNumber");
+		ASN1_INTEGER_free(serial);
+		return false;
+	}
+	ASN1_INTEGER_free(serial);
+	return true;
+}
+
+/* Sets the subject CN to server_name. On failure the caller still owns and
+ * frees `cert` itself. */
+static bool
+set_subject_cn(X509 *restrict cert, const char *restrict server_name)
+{
+	X509_NAME *const name = X509_NAME_new();
+	if (name == NULL) {
+		LOG_SSLERROR("X509_NAME_new");
+		return false;
+	}
+	if (X509_NAME_add_entry_by_txt(
+		    name, "CN", MBSTRING_ASC,
+		    (const unsigned char *)server_name, -1, -1, 0) == 0) {
+		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
+		X509_NAME_free(name);
+		return false;
+	}
+	if (X509_set_subject_name(cert, name) == 0) {
+		LOG_SSLERROR("X509_set_subject_name");
+		X509_NAME_free(name);
+		return false;
+	}
+	X509_NAME_free(name);
+	return true;
+}
+
+/* Build and attach a single v3 extension; on failure the caller
+ * (create_certificate) still owns and frees `cert` itself. */
+static bool
+add_ext(X509 *restrict cert, X509V3_CTX *v3ctx, const int nid,
+	const char *restrict value)
+{
+	X509_EXTENSION *const ext =
+		X509V3_EXT_conf_nid(NULL, v3ctx, nid, value);
+	if (ext == NULL) {
+		LOG_SSLERROR("X509V3_EXT_conf_nid");
+		return false;
+	}
+	if (X509_add_ext(cert, ext, -1) == 0) {
+		LOG_SSLERROR("X509_add_ext");
+		X509_EXTENSION_free(ext);
+		return false;
+	}
+	X509_EXTENSION_free(ext);
+	return true;
+}
+
+static bool add_subject_alt_name_ext(
+	X509 *restrict cert, X509V3_CTX *v3ctx,
+	const char *restrict server_name)
+{
+	const size_t server_name_len = strlen(server_name);
+	if (server_name_len >= 256) {
+		LOGE_F("server name too long: %zu bytes", server_name_len);
+		return false;
+	}
+	char san_value[server_name_len + 5];
+	if (!format_subject_alt_name(
+		    san_value, sizeof(san_value), server_name)) {
+		return false;
+	}
+	return add_ext(cert, v3ctx, NID_subject_alt_name, san_value);
+}
+
 static bool create_certificate(
-	X509 **out_cert, X509 *parent, EVP_PKEY *sign_key,
-	const char *server_name, EVP_PKEY *pkey)
+	X509 *parent, EVP_PKEY *sign_key, const char *server_name,
+	EVP_PKEY *pkey, X509 **out_cert)
 {
 	X509 *const cert = X509_new();
 	if (cert == NULL) {
@@ -179,41 +308,10 @@ static bool create_certificate(
 		return false;
 	}
 
-	/* RFC 5280 requires a positive serial number; use 128 random bits. */
-	BIGNUM *const bn = BN_new();
-	if (bn == NULL) {
-		LOG_SSLERROR("BN_new");
+	if (!set_random_serial(cert)) {
 		X509_free(cert);
 		return false;
 	}
-	if (BN_rand(bn, 128, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) == 0) {
-		LOG_SSLERROR("BN_rand");
-		BN_free(bn);
-		X509_free(cert);
-		return false;
-	}
-	ASN1_INTEGER *const serial = ASN1_INTEGER_new();
-	if (serial == NULL) {
-		LOG_SSLERROR("ASN1_INTEGER_new");
-		BN_free(bn);
-		X509_free(cert);
-		return false;
-	}
-	if (BN_to_ASN1_INTEGER(bn, serial) == NULL) {
-		LOG_SSLERROR("BN_to_ASN1_INTEGER");
-		ASN1_INTEGER_free(serial);
-		BN_free(bn);
-		X509_free(cert);
-		return false;
-	}
-	BN_free(bn);
-	if (X509_set_serialNumber(cert, serial) == 0) {
-		LOG_SSLERROR("X509_set_serialNumber");
-		ASN1_INTEGER_free(serial);
-		X509_free(cert);
-		return false;
-	}
-	ASN1_INTEGER_free(serial);
 
 	/* Backdate notBefore by an hour to tolerate verifier clock skew. */
 	if (X509_time_adj_ex(X509_getm_notBefore(cert), 0, -3600, NULL) ==
@@ -229,27 +327,10 @@ static bool create_certificate(
 		return false;
 	}
 
-	X509_NAME *const name = X509_NAME_new();
-	if (name == NULL) {
-		LOG_SSLERROR("X509_NAME_new");
+	if (!set_subject_cn(cert, server_name)) {
 		X509_free(cert);
 		return false;
 	}
-	if (X509_NAME_add_entry_by_txt(
-		    name, "CN", MBSTRING_ASC,
-		    (const unsigned char *)server_name, -1, -1, 0) == 0) {
-		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
-		X509_NAME_free(name);
-		X509_free(cert);
-		return false;
-	}
-	if (X509_set_subject_name(cert, name) == 0) {
-		LOG_SSLERROR("X509_set_subject_name");
-		X509_NAME_free(name);
-		X509_free(cert);
-		return false;
-	}
-	X509_NAME_free(name);
 
 	X509V3_CTX v3ctx;
 	X509V3_set_ctx_nodb(&v3ctx);
@@ -277,94 +358,19 @@ static bool create_certificate(
 		return false;
 	}
 
-	X509_EXTENSION *ext = X509V3_EXT_conf_nid(
-		NULL, &v3ctx, NID_ext_key_usage, "serverAuth,clientAuth");
-	if (ext == NULL) {
-		LOG_SSLERROR("X509V3_EXT_conf_nid");
+	/* CA certs get critical basic constraints; leaf certs get an authority
+	 * key identifier pointing back at the issuer instead. */
+	const int ca_ext_nid =
+		ca ? NID_basic_constraints : NID_authority_key_identifier;
+	const char *const ca_ext_value =
+		ca ? "critical,CA:TRUE" : "keyid:always,issuer:always";
+	if (!add_ext(cert, &v3ctx, NID_ext_key_usage, "serverAuth,clientAuth") ||
+	    !add_ext(cert, &v3ctx, ca_ext_nid, ca_ext_value) ||
+	    !add_subject_alt_name_ext(cert, &v3ctx, server_name) ||
+	    !add_ext(cert, &v3ctx, NID_subject_key_identifier, "hash")) {
 		X509_free(cert);
 		return false;
 	}
-	if (X509_add_ext(cert, ext, -1) == 0) {
-		LOG_SSLERROR("X509_add_ext");
-		X509_EXTENSION_free(ext);
-		X509_free(cert);
-		return false;
-	}
-	X509_EXTENSION_free(ext);
-
-	if (ca) {
-		ext = X509V3_EXT_conf_nid(
-			NULL, &v3ctx, NID_basic_constraints,
-			"critical,CA:TRUE");
-		if (ext == NULL) {
-			LOG_SSLERROR("X509V3_EXT_conf_nid");
-			X509_free(cert);
-			return false;
-		}
-		if (X509_add_ext(cert, ext, -1) == 0) {
-			LOG_SSLERROR("X509_add_ext");
-			X509_EXTENSION_free(ext);
-			X509_free(cert);
-			return false;
-		}
-		X509_EXTENSION_free(ext);
-	} else {
-		ext = X509V3_EXT_conf_nid(
-			NULL, &v3ctx, NID_authority_key_identifier,
-			"keyid:always,issuer:always");
-		if (ext == NULL) {
-			LOG_SSLERROR("X509V3_EXT_conf_nid");
-			X509_free(cert);
-			return false;
-		}
-		if (X509_add_ext(cert, ext, -1) == 0) {
-			LOG_SSLERROR("X509_add_ext");
-			X509_EXTENSION_free(ext);
-			X509_free(cert);
-			return false;
-		}
-		X509_EXTENSION_free(ext);
-	}
-
-	{
-		const size_t server_name_len = strlen(server_name);
-		ASSERT(server_name_len < 256);
-		char san_value[server_name_len + 5];
-		if (!format_subject_alt_name(
-			    san_value, sizeof(san_value), server_name)) {
-			X509_free(cert);
-			return false;
-		}
-		ext = X509V3_EXT_conf_nid(
-			NULL, &v3ctx, NID_subject_alt_name, san_value);
-		if (ext == NULL) {
-			LOG_SSLERROR("X509V3_EXT_conf_nid");
-			X509_free(cert);
-			return false;
-		}
-		if (X509_add_ext(cert, ext, -1) == 0) {
-			LOG_SSLERROR("X509_add_ext");
-			X509_EXTENSION_free(ext);
-			X509_free(cert);
-			return false;
-		}
-		X509_EXTENSION_free(ext);
-	}
-
-	ext = X509V3_EXT_conf_nid(
-		NULL, &v3ctx, NID_subject_key_identifier, "hash");
-	if (ext == NULL) {
-		LOG_SSLERROR("X509V3_EXT_conf_nid");
-		X509_free(cert);
-		return false;
-	}
-	if (X509_add_ext(cert, ext, -1) == 0) {
-		LOG_SSLERROR("X509_add_ext");
-		X509_EXTENSION_free(ext);
-		X509_free(cert);
-		return false;
-	}
-	X509_EXTENSION_free(ext);
 
 	const EVP_MD *md = EVP_sha256();
 	const int pkey_type = EVP_PKEY_get_base_id(sign_key);
@@ -382,6 +388,39 @@ static bool create_certificate(
 	return true;
 }
 
+/* Best-effort cleanup after a later step fails; the caller is already
+ * returning an error, so a failed unlink here is only logged. */
+static void discard_file(const char *path)
+{
+	if (unlink(path) != 0) {
+		const int err = errno;
+		LOGW_F("failed to remove %s: (%d) %s", path, err,
+		       strerror(err));
+	}
+}
+
+/* Create `path` exclusively (O_EXCL refuses to overwrite an existing file)
+ * and wrap it in a stream, discarding the file if fdopen fails. mode is
+ * masked by umask (POSIX semantics): an upper bound, not a guarantee. */
+static FILE *create_exclusive(const char *path, mode_t mode)
+{
+	const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+	if (fd < 0) {
+		const int err = errno;
+		LOGE_F("failed to open %s: (%d) %s", path, err, strerror(err));
+		return NULL;
+	}
+	FILE *const fp = fdopen(fd, "w");
+	if (fp == NULL) {
+		const int err = errno;
+		LOGE_F("fdopen %s: (%d) %s", path, err, strerror(err));
+		(void)close(fd);
+		discard_file(path);
+		return NULL;
+	}
+	return fp;
+}
+
 static bool
 write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 {
@@ -392,25 +431,14 @@ write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 		return false;
 	}
 
-	/* Use O_EXCL to refuse overwriting an existing file, and set
-	 * explicit permissions independent of umask. */
-	int fd = open(cert_file, O_WRONLY | O_CREAT | O_TRUNC | O_EXCL, 0644);
-	if (fd < 0) {
-		const int err = errno;
-		LOGE_F("failed to open %s: (%d) %s", cert_file, err,
-		       strerror(err));
-		return false;
-	}
-	FILE *fp = fdopen(fd, "w");
+	FILE *fp = create_exclusive(cert_file, 0644);
 	if (fp == NULL) {
-		const int err = errno;
-		LOGE_F("fdopen %s: (%d) %s", cert_file, err, strerror(err));
-		(void)close(fd);
 		return false;
 	}
 	if (PEM_write_X509(fp, cert) == 0) {
 		LOG_SSLERROR("PEM_write_X509");
 		(void)fclose(fp);
+		discard_file(cert_file);
 		return false;
 	}
 	if (parent != NULL) {
@@ -418,32 +446,37 @@ write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 		if (PEM_write_X509(fp, parent) == 0) {
 			LOG_SSLERROR("PEM_write_X509");
 			(void)fclose(fp);
+			discard_file(cert_file);
 			return false;
 		}
 	}
-	(void)fclose(fp);
-
-	/* Private key must be owner-readable only (mode 0600). */
-	fd = open(key_file, O_WRONLY | O_CREAT | O_TRUNC | O_EXCL, 0600);
-	if (fd < 0) {
+	if (fclose(fp) != 0) {
 		const int err = errno;
-		LOGE_F("failed to open %s: (%d) %s", key_file, err,
-		       strerror(err));
+		LOGE_F("fclose %s: (%d) %s", cert_file, err, strerror(err));
+		discard_file(cert_file);
 		return false;
 	}
-	fp = fdopen(fd, "w");
+
+	/* Private key must be owner-readable only (mode 0600). */
+	fp = create_exclusive(key_file, 0600);
 	if (fp == NULL) {
-		const int err = errno;
-		LOGE_F("fdopen %s: (%d) %s", key_file, err, strerror(err));
-		(void)close(fd);
+		discard_file(cert_file);
 		return false;
 	}
 	if (PEM_write_PrivateKey(fp, pkey, NULL, NULL, 0, NULL, NULL) == 0) {
 		LOG_SSLERROR("PEM_write_PrivateKey");
 		(void)fclose(fp);
+		discard_file(key_file);
+		discard_file(cert_file);
 		return false;
 	}
-	(void)fclose(fp);
+	if (fclose(fp) != 0) {
+		const int err = errno;
+		LOGE_F("fclose %s: (%d) %s", key_file, err, strerror(err));
+		discard_file(key_file);
+		discard_file(cert_file);
+		return false;
+	}
 
 	LOGN_F("write %s, %s", cert_file, key_file);
 	return true;
@@ -465,6 +498,17 @@ bool gencerts(
 		if (!read_keypair(sign_cert, &parent_cert, &sign_key)) {
 			LOGE_F("failed to read signing certificate: %s",
 			       sign_cert);
+			return false;
+		}
+		if (X509_check_private_key(parent_cert, sign_key) != 1) {
+			LOGE_F("signing certificate and key do not match: %s",
+			       sign_cert);
+			/* Drain any error-queue entries this pushed, so they can't
+			 * bleed into a later, unrelated LOG_SSLERROR (gencerts() is a
+			 * reusable entry point invoked repeatedly in one process). */
+			LOG_SSLERROR("X509_check_private_key");
+			X509_free(parent_cert);
+			EVP_PKEY_free(sign_key);
 			return false;
 		}
 	}
@@ -491,14 +535,13 @@ bool gencerts(
 		while (*name == ' ') {
 			name++;
 		}
+		if (*name == '\0') {
+			continue;
+		}
 		char *end = name + strlen(name) - 1;
 		while (end > name && *end == ' ') {
 			*end = '\0';
 			end--;
-		}
-
-		if (*name == '\0') {
-			continue;
 		}
 
 		EVP_PKEY *const pkey = generate_key(keytype, keysize);
@@ -510,8 +553,8 @@ bool gencerts(
 
 		X509 *cert = NULL;
 		if (!create_certificate(
-			    &cert, parent_cert, sign_key, server_name_val,
-			    pkey)) {
+			    parent_cert, sign_key, server_name_val, pkey,
+			    &cert)) {
 			LOGE_F("failed to create certificate for %s", name);
 			EVP_PKEY_free(pkey);
 			success = false;

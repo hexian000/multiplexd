@@ -32,8 +32,6 @@ struct listener {
 	const struct conf_socket_opts *socket_opts;
 	listener_serve_fn serve;
 	struct server *srv;
-	/* Optional per-listener context. */
-	void *data;
 	uint_least64_t *num_accepted;
 };
 

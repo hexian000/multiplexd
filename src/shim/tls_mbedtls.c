@@ -2,13 +2,13 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /**
- * @file tlsutil_mbedtls.c
+ * @file tls_mbedtls.c
  * @brief TLS utility functions implemented with mbedTLS native API.
  */
 
 #if WITH_TLS
 
-#include "tlsutil.h"
+#include "shim/tls.h"
 
 #include "codec/csv.h"
 #include "utils/slog.h"
@@ -18,10 +18,12 @@
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/platform_util.h>
+#include <mbedtls/private_access.h>
 #include <mbedtls/ssl.h>
-#include <mbedtls/version.h>
+#include <mbedtls/ssl_ciphersuites.h>
 #include <mbedtls/x509.h>
 #include <mbedtls/x509_crt.h>
+
 /* mbedTLS < 4.0 uses an explicit CTR-DRBG/entropy RNG; 4.x uses PSA crypto
  * and removes those APIs. Derive a feature flag once to avoid repeating the
  * version number comparison throughout this file. */
@@ -258,10 +260,9 @@ bool tls_load_authcerts(
 	return true;
 }
 
-/* Parse an OpenSSL-style colon-separated list of ciphersuite names into a
- * mbedTLS id array, terminated by 0. Returns NULL on allocation failure or if
- * no names were resolved. */
-static int *parse_ciphersuites(const char *restrict list)
+/* Mutable copy for tokenizing; cap includes one terminator slot. */
+static char *dup_for_tokens(
+	const char *restrict list, const char delim, size_t *restrict cap)
 {
 	const size_t n = strlen(list);
 	char *const dup = malloc(n + 1);
@@ -269,18 +270,33 @@ static int *parse_ciphersuites(const char *restrict list)
 		return NULL;
 	}
 	memcpy(dup, list, n + 1);
-
-	/* Upper bound: number of tokens + 1 terminator. */
-	size_t cap = 1;
+	size_t count = 1;
 	for (size_t i = 0; i < n; i++) {
-		if (dup[i] == ':') {
-			cap++;
+		if (dup[i] == delim) {
+			count++;
 		}
 	}
-	cap++;
+	*cap = count + 1;
+	return dup;
+}
+
+/* Parse an OpenSSL-style colon-separated list of ciphersuite names into a
+ * mbedTLS id array, terminated by 0. Fails closed to match OpenSSL's
+ * SSL_CTX_set_ciphersuites(): returns NULL on allocation failure, an empty
+ * list, or if any single name fails to resolve or isn't usable with the
+ * pinned TLS-1.3-only context -- not just when every name is unusable. */
+static int *parse_ciphersuites(const char *restrict list)
+{
+	size_t cap = 0;
+	char *const dup = dup_for_tokens(list, ':', &cap);
+	if (dup == NULL) {
+		LOGOOM();
+		return NULL;
+	}
 
 	int *const ids = malloc(sizeof(int) * cap);
 	if (ids == NULL) {
+		LOGOOM();
 		free(dup);
 		return NULL;
 	}
@@ -288,12 +304,31 @@ static int *parse_ciphersuites(const char *restrict list)
 	char *save = NULL;
 	for (char *tok = strtok_r(dup, ":", &save); tok != NULL;
 	     tok = strtok_r(NULL, ":", &save)) {
-		const int id = mbedtls_ssl_get_ciphersuite_id(tok);
-		if (id == 0) {
-			LOGW_F("mbedtls: unknown ciphersuite '%s'", tok);
-			continue;
+		/* from_string(), not get_ciphersuite_id(), so the applicability
+		 * check below reuses this lookup instead of resolving twice. */
+		const mbedtls_ssl_ciphersuite_t *const info =
+			mbedtls_ssl_ciphersuite_from_string(tok);
+		if (info == NULL) {
+			LOGE_F("mbedtls: unknown ciphersuite '%s'", tok);
+			free(ids);
+			free(dup);
+			return NULL;
 		}
-		ids[k++] = id;
+		/* No applicability check against the pinned TLS-1.3-only
+		 * context (min=max=TLS1_3), unlike OpenSSL's
+		 * SSL_CTX_set_ciphersuites(); reject here instead of only
+		 * surfacing as an unnegotiable handshake failure later. */
+		if (info->MBEDTLS_PRIVATE(min_tls_version) >
+			    MBEDTLS_SSL_VERSION_TLS1_3 ||
+		    info->MBEDTLS_PRIVATE(max_tls_version) <
+			    MBEDTLS_SSL_VERSION_TLS1_3) {
+			LOGE_F("mbedtls: ciphersuite '%s' is not usable with TLS 1.3",
+			       tok);
+			free(ids);
+			free(dup);
+			return NULL;
+		}
+		ids[k++] = mbedtls_ssl_ciphersuite_get_id(info);
 	}
 	ids[k] = 0;
 	free(dup);
@@ -312,29 +347,26 @@ static char **parse_alpn(const char *restrict list)
 	if (list == NULL || list[0] == '\0') {
 		return NULL;
 	}
-	const size_t list_len = strlen(list);
 	/* csv_scanfield parses the buffer in-place, so work on a mutable copy. */
-	char *const work = malloc(list_len + 1);
+	size_t cap = 0;
+	char *const work = dup_for_tokens(list, ',', &cap);
 	if (work == NULL) {
+		LOGOOM();
 		return NULL;
-	}
-	memcpy(work, list, list_len + 1);
-	/* Upper bound: number of commas + 1 entries, plus the NULL terminator. */
-	size_t cap = 2;
-	for (const char *p = list; *p != '\0'; p++) {
-		if (*p == ',') {
-			cap++;
-		}
 	}
 	char **const out = calloc(cap, sizeof(*out));
 	if (out == NULL) {
+		LOGOOM();
 		free(work);
 		return NULL;
 	}
 	size_t k = 0;
 	for (char *p = work; p != NULL;) {
 		char *field = NULL;
-		char *const next = csv_scanfield(p, &field);
+		/* ALPN is a flat comma-separated list, so the delimiter kind
+		 * (field vs record separator) is irrelevant; discard it. */
+		char sep;
+		char *const next = csv_scanfield(p, &field, &sep);
 		if (next == p) {
 			/* unterminated quoted field with no more data */
 			LOGW_F("malformed ALPN list '%s'", list);
@@ -343,6 +375,7 @@ static char **parse_alpn(const char *restrict list)
 		if (field != NULL && field[0] != '\0') {
 			char *const s = strdup(field);
 			if (s == NULL) {
+				LOGOOM();
 				goto fail;
 			}
 			out[k++] = s;
@@ -422,6 +455,32 @@ static int tls_ca_verify(
 	return 0;
 }
 
+#ifndef MBEDTLS_LEGACY_RNG
+/* mbedTLS 4.1.0 leaves RSA PKCS8 pub_raw empty, breaking
+ * mbedtls_pk_check_pair(). DER-writing re-derives it through public API,
+ * so comparing canonical public-key DER sidesteps the upstream bug. */
+static bool tls_pk_pair_matches(
+	const mbedtls_pk_context *restrict cert_pk,
+	const mbedtls_pk_context *restrict key)
+{
+	unsigned char cert_der[MBEDTLS_PK_MAX_PUBKEY_RAW_LEN + 64];
+	unsigned char key_der[MBEDTLS_PK_MAX_PUBKEY_RAW_LEN + 64];
+	const int cert_len = mbedtls_pk_write_pubkey_der(
+		cert_pk, cert_der, sizeof(cert_der));
+	const int key_len =
+		mbedtls_pk_write_pubkey_der(key, key_der, sizeof(key_der));
+	if (cert_len <= 0 || key_len <= 0) {
+		return false;
+	}
+	/* Both writers fill from the end of their buffer; see each function's
+	 * own doc comment in mbedtls/pk.h. */
+	return cert_len == key_len &&
+	       memcmp(cert_der + sizeof(cert_der) - (size_t)cert_len,
+		      key_der + sizeof(key_der) - (size_t)key_len,
+		      (size_t)cert_len) == 0;
+}
+#endif /* MBEDTLS_LEGACY_RNG */
+
 static struct tls_context *
 tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 {
@@ -445,7 +504,7 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 			return NULL;
 		}
 	}
-#else
+#else /* MBEDTLS_LEGACY_RNG */
 	{
 		const psa_status_t psa_ret = psa_crypto_init();
 		if (psa_ret != PSA_SUCCESS) {
@@ -465,10 +524,20 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 		tls_ctx_free(ctx);
 		return NULL;
 	}
+	/* MBEDTLS_SSL_PRESET_DEFAULT leaves conf->cert_profile at
+	 * mbedtls_x509_crt_profile_default (RSA >= 2048 bits; curves at or above
+	 * the 128-bit security level, excluding e.g. P-224), applied to the
+	 * peer's chain during verification. tls_verify_cert_strength_cb() in the
+	 * OpenSSL backend mirrors this floor so both backends accept/reject the
+	 * same certificates; keep the two in sync. */
 	mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
 	mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
 	if (conf->kernel_offload) {
 		LOGW("tls.kernel_offload: not supported by the mbedTLS backend; "
+		     "ignored");
+	}
+	if (conf->readahead) {
+		LOGW("mux.readahead: not supported by the mbedTLS backend; "
 		     "ignored");
 	}
 #ifdef MBEDTLS_LEGACY_RNG
@@ -497,6 +566,24 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 		tls_ctx_free(ctx);
 		return NULL;
 	}
+	/* mbedtls_ssl_conf_own_cert() only fails on allocation failure; check
+	 * the cert/key pairing explicitly, mirroring the OpenSSL backend. */
+#ifdef MBEDTLS_LEGACY_RNG
+	ret = mbedtls_pk_check_pair(
+		&c->own_cert.pk, &c->own_key, mbedtls_ctr_drbg_random,
+		&c->ctr_drbg);
+	if (ret != 0) {
+		LOG_MBEDERROR(ERROR, "mbedtls_pk_check_pair", ret);
+		tls_ctx_free(ctx);
+		return NULL;
+	}
+#else /* MBEDTLS_LEGACY_RNG */
+	if (!tls_pk_pair_matches(&c->own_cert.pk, &c->own_key)) {
+		LOGE("certificate and private key do not match");
+		tls_ctx_free(ctx);
+		return NULL;
+	}
+#endif /* MBEDTLS_LEGACY_RNG */
 
 	if (!tls_load_authcerts(ctx, conf->authcerts, conf->authcerts_count)) {
 		LOGE("failed to load authorized certificates");
@@ -509,13 +596,13 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 
 	if (conf->ciphersuites != NULL) {
 		c->ciphersuites = parse_ciphersuites(conf->ciphersuites);
-		if (c->ciphersuites != NULL) {
-			mbedtls_ssl_conf_ciphersuites(
-				&c->conf, c->ciphersuites);
-		} else {
-			LOGW_F("mbedtls: no usable ciphersuites in '%s'",
+		if (c->ciphersuites == NULL) {
+			LOGE_F("mbedtls: no usable ciphersuites in '%s'",
 			       conf->ciphersuites);
+			tls_ctx_free(ctx);
+			return NULL;
 		}
+		mbedtls_ssl_conf_ciphersuites(&c->conf, c->ciphersuites);
 	}
 
 	/* ALPN list, shared by client (advertise) and server (select).  The
@@ -534,8 +621,10 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 	}
 
 	/* Record the client SNI; tls_client passes it to
-	 * mbedtls_ssl_set_hostname.  An empty string is treated as "no SNI". */
-	if (conf->sni != NULL && conf->sni[0] != '\0') {
+	 * mbedtls_ssl_set_hostname.  An empty string is treated as "no SNI".
+	 * Server-role contexts never read c->sni (see tls_conn_new), so skip
+	 * the allocation entirely for them. */
+	if (!is_server && conf->sni != NULL && conf->sni[0] != '\0') {
 		c->sni = strdup(conf->sni);
 		if (c->sni == NULL) {
 			LOGOOM();
@@ -591,11 +680,11 @@ void tls_ctx_free(struct tls_context *restrict ctx)
 	    1) {
 		return;
 	}
-#else
+#else /* WITH_THREADS */
 	if (--c->refcount != 0) {
 		return;
 	}
-#endif
+#endif /* WITH_THREADS */
 	tls_ctx_impl_free(c);
 }
 
@@ -798,6 +887,9 @@ size_t tls_output(
 	struct tls_connection *restrict conn, void *restrict buf,
 	const size_t len)
 {
+	if (len == 0) {
+		return 0;
+	}
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
 	const size_t n = c->out_len < len ? c->out_len : len;
 	if (n == 0) {
@@ -881,6 +973,20 @@ enum tls_error tls_recv(
 		return TLS_ERROR_NONE;
 	}
 	*len = 0;
+	if (ret == 0) {
+		/* mbedtls_ssl_read returns exactly 0 when the read end of the
+		 * underlying transport was closed without a CloseNotify (abrupt
+		 * TCP close/RST or a non-conformant peer): a protocol-violating
+		 * EOF, distinct from the orderly MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY
+		 * (which map_io_error handles as TLS_ERROR_ZERO_RETURN). Classify
+		 * it as TLS_ERROR_SYSCALL and log it, matching the OpenSSL
+		 * backend's SSL_ERROR_SYSCALL/ret==0 handling, so the caller tears
+		 * the session down instead of busy-looping on an always-readable
+		 * EOF fd. Not routed through map_io_error's generic case 0, which
+		 * is the handshake/write success case. */
+		LOGE("mbedtls_ssl_read: connection closed without a proper TLS shutdown");
+		return TLS_ERROR_SYSCALL;
+	}
 	return map_io_error(ret, "mbedtls_ssl_read");
 }
 

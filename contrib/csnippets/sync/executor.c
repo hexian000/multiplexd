@@ -2,12 +2,13 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 #include "sync/executor.h"
+
 #include "sync/task.h"
 
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <threads.h>
 
@@ -36,7 +37,7 @@ struct executor {
 	thrd_t workers[];
 };
 
-static void executor_free(struct executor *restrict e)
+static void free_executor(struct executor *restrict e)
 {
 	mtx_destroy(&e->mu);
 	cnd_destroy(&e->cond);
@@ -79,13 +80,22 @@ static int worker_main(void *p)
 	const bool detached = e->detached;
 	THRD_ASSERT(mtx_unlock(&e->mu));
 	if (detached && last) {
-		executor_free(e);
+		free_executor(e);
 	}
 	return 0;
 }
 
 struct executor *executor_create(const size_t nworkers)
 {
+	if (nworkers == 0) {
+		/* a 0-worker executor can never run a submitted task; reject it
+		 * rather than silently queue-drop (and leak) tasks, since with
+		 * no worker nothing ever drains the queue */
+		return NULL;
+	}
+	if (nworkers > (SIZE_MAX - sizeof(struct executor)) / sizeof(thrd_t)) {
+		return NULL;
+	}
 	struct executor *restrict e =
 		malloc(sizeof(struct executor) + nworkers * sizeof(thrd_t));
 	if (e == NULL) {
@@ -126,6 +136,11 @@ static bool enqueue(struct executor *e, const struct task *task)
 	}
 	*new_item = (struct task_item){ *task, NULL };
 	THRD_ASSERT(mtx_lock(&e->mu));
+	if (e->exit_flag) {
+		THRD_ASSERT(mtx_unlock(&e->mu));
+		free(new_item);
+		return false;
+	}
 	struct task_item *restrict item = e->queue.tail;
 	if (item != NULL) {
 		item->next = new_item;
@@ -153,15 +168,14 @@ void executor_join(struct executor *e)
 	for (size_t i = 0; i < nthreads; i++) {
 		THRD_ASSERT(thrd_join(e->workers[i], NULL));
 	}
-	executor_free(e);
+	free_executor(e);
 }
 
 void executor_detach(struct executor *e)
 {
-	/* Detach the workers while they are still blocked (the exit flag is
-	 * not set yet), so e->workers stays valid for this loop and no worker
-	 * can free the executor before we are done reading it. nthreads is
-	 * fixed after creation, so it is safe to read without the lock. */
+	/* Detach before setting exit_flag, so no worker can free the executor
+	 * while this loop reads e->workers. nthreads never changes after
+	 * creation, so reading it here without the lock is safe. */
 	const size_t nthreads = e->nthreads;
 	for (size_t i = 0; i < nthreads; i++) {
 		THRD_ASSERT(thrd_detach(e->workers[i]));
@@ -174,6 +188,6 @@ void executor_detach(struct executor *e)
 	/* With workers, the last one to exit frees the executor; with none,
 	 * there is nobody to do it, so free it here. */
 	if (nthreads == 0) {
-		executor_free(e);
+		free_executor(e);
 	}
 }

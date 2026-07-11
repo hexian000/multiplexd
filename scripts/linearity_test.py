@@ -85,7 +85,7 @@ def wait_port(port: int, timeout: float = 10.0) -> bool:
 # by a known wall-time interval gives the **average CPU utilisation** over
 # that interval:
 #
-#     cpu% = 100 × (ticks₂ − ticks₁) / ((t₂ − t₁) × CLK_TCK)
+#     cpu% = 100 × (ticks2 − ticks1) / ((t2 − t1) × CLK_TCK)
 # ---------------------------------------------------------------------------
 
 _CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
@@ -110,7 +110,7 @@ def _read_ticks(pid: int) -> int:
     if rp < 0:
         return 0
     suffix = raw[rp + 1:].split()
-    # suffix[0]=state, [1]=ppid, …, [11]=utime, [12]=stime
+    # suffix[0]=state, [1]=ppid, ..., [11]=utime, [12]=stime
     if len(suffix) < 13:
         return 0
     return int(suffix[11]) + int(suffix[12])
@@ -289,7 +289,8 @@ class LinearityTest:
         self.binary = self.build_dir / "bin" / "multiplexd"
         self.output = Path(args.output).resolve()
         self.duration = int(args.duration)
-        self.bw_list = [b.strip() for b in args.bw_list.split(",") if b.strip()]
+        self.bw_list = [b.strip()
+                        for b in args.bw_list.split(",") if b.strip()]
 
         self.work_dir = self.build_dir / "linearity_work"
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -420,7 +421,7 @@ class LinearityTest:
 
         for bw in self.bw_list:
             label = bw if bw != "0" else "unlimited"
-            log(f"testing bw={label} …")
+            log(f"testing bw={label} ...")
             d = self.run_one(bw)
             thr = d["thr"]
             srv_net = max(0.0, d["srv_dur"] - idle_srv)

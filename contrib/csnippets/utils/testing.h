@@ -20,7 +20,7 @@
  *     T_DECLARE_CASE(test_add)
  *     {
  *         T_EXPECT_EQ(1 + 1, 2);
- *         T_EXPECT_TRUE(3 > 0);
+ *         T_EXPECT(3 > 0);
  *     }
  *
  * SUBCASE FUNCTIONS
@@ -81,11 +81,21 @@
  *         return testing_main(argc, argv, suite);
  *     }
  *
- *   With no filter it runs every case and skips all benches.  A POSIX extended
- *   regular expression - given as `--run <ere>` (or the TESTING_FILTER
- *   environment variable when --run is absent) - selects entries by name
- *   (unanchored substring match): matching cases run first, then matching
- *   benches run last.  It returns EXIT_SUCCESS when no case failed.
+ *   Command-line flags (Go-like):
+ *     --run <ere>     run the test cases whose name matches; with no --run
+ *                     every case runs.  Falls back to the TESTING_FILTER
+ *                     environment variable when absent.
+ *     --bench <ere>   run the benchmarks whose name matches; with no --bench
+ *                     no benchmark runs (TESTING_BENCH is the env fallback).
+ *     --benchtime <d> per-benchmark wall-clock budget, e.g. 500ms, 2s, 1m
+ *                     (bare number means seconds); or "<n>x" to run a fixed
+ *                     count once instead of timing (e.g. 1x for a quick smoke).
+ *     --count <n>     repeat each benchmark n times, reporting the minimum
+ *                     ns/op (min-of-n).
+ *   The pattern is a POSIX extended regular expression matched as an unanchored
+ *   substring; where POSIX regex is unavailable it degrades to a literal
+ *   substring.  Matching cases run first, then matching benches.  Returns
+ *   EXIT_SUCCESS when no case failed (and no benchmark was optimized away).
  *
  * CASE OUTCOMES
  *   Each case has one of three outcomes printed by T_RUN_CASE:
@@ -99,32 +109,38 @@
  *   case body (i.e. under an active T_RUN_CASE).
  *
  * BENCH CASE DEFINITION
- *   Use T_DECLARE_BENCH(name) to begin a static benchmark function.
- *   The macro expands to a static function with a hidden parameter
- *   `struct testing_bench *_b_`.  The body must run the benchmarked
- *   operation exactly _b_->N times.
+ *   Use T_DECLARE_BENCH(name) to begin a static benchmark function with a
+ *   hidden parameter `struct testing_bench *_b_`.  The body runs the benchmarked
+ *   operation _b_->N times; write the loop with T_BENCH_LOOP() and wrap the
+ *   result in T_KEEP() so the optimizer cannot delete it (see those macros):
  *
  *     T_DECLARE_BENCH(bench_add)
  *     {
- *         for (uint_fast64_t i = 0; i < _b_->N; i++) {
- *             (void)add(1, 2);
+ *         T_BENCH_LOOP() {
+ *             T_KEEP(add(1, 2));
  *         }
  *     }
  *
+ *   Optional extras: T_BENCH_SET_BYTES for a throughput column, T_BENCH_MALLOC
+ *   and friends for B/op and allocs/op, and T_BENCH_RESET_TIMER / STOP / START
+ *   to exclude setup from the timing.
+ *
  * RUNNING BENCHMARKS
  *   Use T_RUN_BENCH(ctx, name) to run a benchmark.  It auto-calibrates the
- *   iteration count by doubling N each round until at least 1 second of wall
- *   time has elapsed, then reports the per-op time alongside the per-op heap
- *   footprint and allocation count, e.g.:
+ *   iteration count by doubling N each round until at least 1 second of active
+ *   time has elapsed, then reports per-op time, per-op heap use and allocations
+ *   in aligned columns, e.g.:
  *
- *     --- BENCH bench_add  73400320  13.6ns/op  0/op  0 allocs/op
+ *     --- BENCH bench_add        73400320     13.6ns/op          0/op  0 allocs/op
  *
- *   The time and byte columns are rendered with utils/formats.h (SI-prefixed
+ *   Times and byte counts are rendered with utils/formats.h (SI-prefixed
  *   durations like 13.6ns/op, IEC byte counts like 1.50KiB/op), so the runner
  *   pulls in libm.  Memory columns are zero unless the benchmark reports
- *   allocations (see T_BENCH_MALLOC and T_BENCH_REPORT below); a throughput
- *   column (e.g. 2.33GB/s) appears only when the benchmark calls
- *   T_BENCH_SET_BYTES.
+ *   allocations; a throughput column (e.g. 2.33GB/s) appears only when the
+ *   benchmark calls T_BENCH_SET_BYTES.  If the benchmarked work is optimized
+ *   away (no T_KEEP), the runner reports a hard failure instead of a bogus
+ *   number.  testing_main accepts --benchtime and --count to tune the budget
+ *   and report the minimum of repeated runs.
  *
  *     int main(void)
  *     {
@@ -136,17 +152,17 @@
  *
  *   T_DECLARE_BENCH and T_RUN_BENCH are always available; the monotonic clock
  *   lives in testing.c, so test files need not include measure.h.  testing_main()
- *   runs benches the same way.  Benchmarks do not affect the
- *   passed/failed/skipped counters; the benched counter in struct testing_ctx
- *   is incremented instead.
+ *   runs benches the same way.  Benchmarks do not affect the passed/failed/
+ *   skipped counters; the benched counter in struct testing_ctx is incremented
+ *   instead (an optimized-away benchmark counts as a failure).
  */
 
 #ifndef UTILS_TESTING_H
 #define UTILS_TESTING_H
 
-#include <inttypes.h>
 #include <setjmp.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -162,6 +178,16 @@ struct testing_ctx {
 	volatile bool case_failed : 1;
 	volatile bool case_skipped : 1;
 	jmp_buf case_jmp;
+	/*
+	 * Benchmark tuning, set by testing_main from CLI flags; zero selects the
+	 * default, so a T_DECLARE_CTX context needs no extra setup.
+	 *   bench_time_ns  min active time per run (--benchtime <dur>); default 1s
+	 *   bench_fixed_n  exact iters/run, untimed (--benchtime Nx); 0 = timed
+	 *   bench_count    repeats, reporting the minimum ns/op (--count); default 1
+	 */
+	int_fast64_t bench_time_ns;
+	uint_fast64_t bench_fixed_n;
+	int bench_count;
 };
 
 /*
@@ -187,6 +213,13 @@ struct testing_bench {
 	uint_fast64_t bytes;
 	uint_fast64_t allocs;
 	uint_fast64_t set_bytes;
+	/*
+	 * Internal timer state for T_BENCH_RESET_TIMER / STOP / START.  Managed by
+	 * the runner and those helpers; benchmark bodies must not touch it.
+	 */
+	int_fast64_t round_start; /* monotonic ns at round start or last reset */
+	int_fast64_t paused_ns; /* time excluded while the timer was stopped */
+	int_fast64_t pause_at; /* monotonic ns when stopped, -1 while running */
 };
 
 /*
@@ -274,6 +307,96 @@ struct testing_bench {
  */
 #define T_DECLARE_BENCH(name_)                                                 \
 	static void _benchcase_##name_##_(struct testing_bench *_b_)
+
+/*
+ * T_BENCH_LOOP()
+ *   The benchmark loop header, in the spirit of Go 1.24's `for b.Loop()`.  Use
+ *   it instead of a hand-written `for (i = 0; i < _b_->N; i++)` so the
+ *   iteration bound is never miswritten:
+ *
+ *     T_DECLARE_BENCH(bench_add)
+ *     {
+ *         T_BENCH_LOOP() {
+ *             T_KEEP(add(1, 2));
+ *         }
+ *     }
+ *
+ *   Unlike Go's form it cannot keep the operation's result alive by itself
+ *   (ISO C11 has no compiler barrier), so wrap the result in T_KEEP (below).
+ */
+#define T_BENCH_LOOP() for (uint_fast64_t _i_ = 0; _i_ < (_b_)->N; _i_++)
+
+/* -------------------------------------------------------------------------
+ * Defeating dead-code elimination - pure ISO C11.
+ *
+ * A microbenchmark whose result is never used may be deleted outright by the
+ * optimizer; the runner then doubles the iteration count until it overflows and
+ * reports a hard failure (see testing_bench_run).  ISO C11 makes every access
+ * to a `volatile` object an observable side effect the implementation may not
+ * elide (5.1.2.3), so routing a value through a volatile sink forces the
+ * computation behind it to be emitted - the portable equivalent of Google
+ * Benchmark's DoNotOptimize, with no compiler-specific inline assembly.
+ *
+ *     T_DECLARE_BENCH(bench_hash)
+ *     {
+ *         uint32_t h = 0;
+ *         T_BENCH_LOOP() {
+ *             h = hash(data, len, h);  // feed the previous result back as the
+ *         }                            // seed so the call cannot be hoisted
+ *         T_KEEP(h);                   // consume the final result
+ *     }
+ *
+ * T_KEEP accepts any scalar or object-pointer value; its only cost is one
+ * forced store.  Calling it once after the loop is enough when results
+ * accumulate into a single variable.  To stop the optimizer hoisting a
+ * loop-invariant input out of the loop, prefer feeding the loop index or the
+ * previous result as input, as above.
+ * ---------------------------------------------------------------------- */
+
+/* volatile sinks backing T_KEEP; defined once in testing.c. */
+extern volatile unsigned long long testing_keep_uint_;
+extern volatile long double testing_keep_flt_;
+extern const void *volatile testing_keep_ptr_;
+
+static inline void testing_keep_u_(unsigned long long v)
+{
+	testing_keep_uint_ = v;
+}
+static inline void testing_keep_f_(long double v)
+{
+	testing_keep_flt_ = v;
+}
+static inline void testing_keep_p_(const volatile void *v)
+{
+	testing_keep_ptr_ = (const void *)v;
+}
+
+/*
+ * T_KEEP(value)
+ *   Force `value` - and the computation that produced it - to be evaluated,
+ *   defeating dead-code elimination.  Accepts any scalar or object pointer.
+ *   The _Generic selects a sink function; only the selected branch is applied
+ *   to `value`, so the unselected branches need not type-check against it.
+ */
+#define T_KEEP(value_)                                                         \
+	(_Generic(                                                             \
+		(value_),                                                      \
+		 float: testing_keep_f_,                                       \
+		 double: testing_keep_f_,                                      \
+		 long double: testing_keep_f_,                                 \
+		 _Bool: testing_keep_u_,                                       \
+		 char: testing_keep_u_,                                        \
+		 signed char: testing_keep_u_,                                 \
+		 unsigned char: testing_keep_u_,                               \
+		 short: testing_keep_u_,                                       \
+		 unsigned short: testing_keep_u_,                              \
+		 int: testing_keep_u_,                                         \
+		 unsigned int: testing_keep_u_,                                \
+		 long: testing_keep_u_,                                        \
+		 unsigned long: testing_keep_u_,                               \
+		 long long: testing_keep_u_,                                   \
+		 unsigned long long: testing_keep_u_,                          \
+		 default: testing_keep_p_)((value_)))
 
 /* -------------------------------------------------------------------------
  * Benchmark memory reporting - opt-in, mirrors Go's `-benchmem`.
@@ -378,6 +501,49 @@ static inline void testing_bench_free(struct testing_bench *b, void *ptr)
 	((void)((_b_)->set_bytes = (uint_fast64_t)(nbytes_)))
 
 /* -------------------------------------------------------------------------
+ * Benchmark timer control - mirrors Go's b.ResetTimer/StopTimer/StartTimer.
+ *
+ * The runner times the whole benchmark body.  Stop the timer around expensive
+ * per-call setup to exclude it from the measurement, then start it again; or
+ * reset it to discard everything timed so far (e.g. after one-time
+ * initialisation).  These affect only the time measurement, not the
+ * bytes/allocs counters.  The helpers live in testing.c so the monotonic clock
+ * stays there and benchmark files need not include it.
+ *
+ *     T_DECLARE_BENCH(bench_lookup)
+ *     {
+ *         T_BENCH_STOP_TIMER();
+ *         struct table *tbl = build_table();   // not measured
+ *         T_BENCH_START_TIMER();
+ *         T_BENCH_LOOP() {
+ *             T_KEEP(lookup(tbl, key));
+ *         }
+ *     }
+ * ---------------------------------------------------------------------- */
+void testing_bench_reset_timer(struct testing_bench *b);
+void testing_bench_stop_timer(struct testing_bench *b);
+void testing_bench_start_timer(struct testing_bench *b);
+
+#define T_BENCH_RESET_TIMER() (testing_bench_reset_timer(_b_))
+#define T_BENCH_STOP_TIMER() (testing_bench_stop_timer(_b_))
+#define T_BENCH_START_TIMER() (testing_bench_start_timer(_b_))
+
+/*
+ * T_BENCH_LOGF(fmt, ...) / T_BENCH_LOG(msg)
+ *   Log a message from a benchmark body to stderr with file and line.  A bench
+ *   has `_b_`, not the `_t_` that T_LOGF requires, so this is its counterpart.
+ *   For hard assertions inside a benchmark, T_CHECK is also available.
+ */
+#define T_BENCH_LOGF(fmt_, ...)                                                \
+	do {                                                                   \
+		(void)fprintf(                                                 \
+			stderr, "    %s:%d " fmt_ "\n", __FILE__, __LINE__,    \
+			__VA_ARGS__);                                          \
+		(void)fflush(stderr);                                          \
+	} while (0)
+#define T_BENCH_LOG(msg_) T_BENCH_LOGF("%s", msg_)
+
+/* -------------------------------------------------------------------------
  * Test suite - a NUL-terminated array of cases and benches consumed by
  * testing_main().  Build entries with T_CASE / T_BENCH and terminate with
  * T_SUITE_END:
@@ -420,32 +586,32 @@ struct testing_suite {
 		.name = #name_, .kind = TESTING_BENCH,                         \
 		.fn = {.bench = _benchcase_##name_##_ }                        \
 	}
-#define T_SUITE_END                                                            \
-	{                                                                      \
-		0                                                              \
-	}
+#define T_SUITE_END { 0 }
 
 /*
  * testing_main(argc, argv, suite)
- *   Default test entry point.  Runs the NUL-terminated `suite`:
- *     - with no filter, every case runs and benches are skipped;
- *     - with a filter (the `--run <ere>` option, or the TESTING_FILTER
- *       environment variable when --run is absent), cases whose name matches
- *       run first, then matching benches run last.
- *   The filter is a POSIX extended regular expression matched as an unanchored
- *   substring.  Returns EXIT_SUCCESS when no case failed, else EXIT_FAILURE;
- *   a usage error or an invalid regex also returns EXIT_FAILURE.
+ *   Default test entry point.  Runs the NUL-terminated `suite`: cases selected
+ *   by --run (all of them when --run is absent) run first, then benchmarks
+ *   selected by --bench (none when --bench is absent) run last.  See the DEFAULT
+ *   MAIN overview for the flags (--run, --bench, --benchtime, --count) and the
+ *   TESTING_FILTER / TESTING_BENCH environment fallbacks.  The pattern is a
+ *   POSIX extended regular expression (a literal substring where regex is
+ *   unavailable), matched unanchored.  Returns EXIT_SUCCESS when no case failed
+ *   and no benchmark was optimized away; a usage error or invalid regex returns
+ *   EXIT_FAILURE.
  */
 int testing_main(int argc, char *const *argv, const struct testing_suite *suite);
 
 /*
  * testing_bench_run(ctx, name, bench)
- *   Runs benchmark function `bench` (reported under `name`), auto-calibrating
- *   by doubling N each round until at least 1 second of wall time has elapsed.
+ *   Runs benchmark function `bench` (reported under `name`), auto-calibrating by
+ *   doubling N each round until at least ctx->bench_time_ns of active time has
+ *   elapsed (default 1s), honoring ctx->bench_fixed_n and ctx->bench_count.
  *   Reports per-op time, per-op bytes/allocs and optional throughput (see the
- *   RUNNING BENCHMARKS notes), and increments ctx.benched.  Does not affect
- *   passed/failed/skipped.  Backs the T_RUN_BENCH macro; the monotonic clock
- *   lives in testing.c so callers need not include measure.h.
+ *   RUNNING BENCHMARKS notes), and increments ctx.benched; a benchmark whose
+ *   work is optimized away is reported as a failure instead.  Backs the
+ *   T_RUN_BENCH macro; the monotonic clock lives in testing.c so callers need
+ *   not include measure.h.
  */
 void testing_bench_run(
 	struct testing_ctx *ctx, const char *name,
@@ -560,67 +726,159 @@ void testing_bench_run(
 		}                                                              \
 	} while (0)
 
-/* Private helpers for T_EXPECT_EQ type-generic formatting. */
-#define T_EQ_FMT_(typ_)                                                        \
-	_Generic(                                                              \
-		(typ_),                                                        \
-		signed char: "expect %jd, got %jd",                            \
-		signed short: "expect %jd, got %jd",                           \
-		signed int: "expect %jd, got %jd",                             \
-		signed long: "expect %jd, got %jd",                            \
-		signed long long: "expect %jd, got %jd",                       \
-		unsigned char: "expect %ju, got %ju",                          \
-		unsigned short: "expect %ju, got %ju",                         \
-		unsigned int: "expect %ju, got %ju",                           \
-		unsigned long: "expect %ju, got %ju",                          \
-		unsigned long long: "expect %ju, got %ju",                     \
-		default: "expect 0x%" PRIxPTR ", got 0x%" PRIxPTR)
+/*
+ * Compare and, on mismatch, report "expect X, got Y" to `out`.  Each variant
+ * takes its category's widest natural type (any narrower signed/unsigned/
+ * float operand promotes to it losslessly, so equality is preserved exactly)
+ * except _p_, which takes `const void *` for pointers: comparing converted
+ * pointers is equality-preserving by definition, and every object pointer
+ * type converts to it implicitly, unlike the integer types.
+ *
+ * T_EXPECT_EQ below selects one of these through plain, ungenerated _Generic
+ * associations -- each association names only the function, never `value_`/
+ * `expect_` -- and calls it with the two arguments passed as-is.  A function
+ * reference type-checks regardless of which branch _Generic ends up
+ * selecting, so, unlike a macro that casts its argument inside every
+ * association (rejected: e.g. a pointer cannot cast to long double, which
+ * would break the moment any branch mentions a floating-point target), this
+ * never requires an operand to satisfy an unrelated branch's type.  The
+ * actual argument conversion happens once, in the ordinary function call,
+ * to the single selected function's parameter type -- which is exactly why
+ * each argument is evaluated exactly once no matter the outcome, fixing a
+ * prior double-evaluation of both `value_` and `expect_` in the failure
+ * branch (dangerous when either is a side-effecting expression, e.g. a
+ * blocking read()).
+ */
+static inline bool testing_eq_report_i_(
+	FILE *out, const char *file, int line, intmax_t value, intmax_t expect)
+{
+	if (value == expect) {
+		return true;
+	}
+	(void)fprintf(
+		out, "    %s:%d expect %jd, got %jd\n", file, line, expect,
+		value);
+	(void)fflush(out);
+	return false;
+}
 
-#define T_EQ_CAST_(v_, typ_)                                                   \
-	_Generic(                                                              \
-		(typ_),                                                        \
-		signed char: (intmax_t)(v_),                                   \
-		signed short: (intmax_t)(v_),                                  \
-		signed int: (intmax_t)(v_),                                    \
-		signed long: (intmax_t)(v_),                                   \
-		signed long long: (intmax_t)(v_),                              \
-		unsigned char: (uintmax_t)(v_),                                \
-		unsigned short: (uintmax_t)(v_),                               \
-		unsigned int: (uintmax_t)(v_),                                 \
-		unsigned long: (uintmax_t)(v_),                                \
-		unsigned long long: (uintmax_t)(v_),                           \
-		default: (uintptr_t)(v_))
+static inline bool testing_eq_report_u_(
+	FILE *out, const char *file, int line, uintmax_t value,
+	uintmax_t expect)
+{
+	if (value == expect) {
+		return true;
+	}
+	(void)fprintf(
+		out, "    %s:%d expect %ju, got %ju\n", file, line, expect,
+		value);
+	(void)fflush(out);
+	return false;
+}
+
+static inline bool testing_eq_report_f_(
+	FILE *out, const char *file, int line, long double value,
+	long double expect)
+{
+	if (value == expect) {
+		return true;
+	}
+	(void)fprintf(
+		out, "    %s:%d expect %Lg, got %Lg\n", file, line, expect,
+		value);
+	(void)fflush(out);
+	return false;
+}
+
+static inline bool testing_eq_report_p_(
+	FILE *out, const char *file, int line, const void *value,
+	const void *expect)
+{
+	if (value == expect) {
+		return true;
+	}
+	(void)fprintf(
+		out, "    %s:%d expect %p, got %p\n", file, line, expect,
+		value);
+	(void)fflush(out);
+	return false;
+}
 
 #define T_EXPECT_EQ(value_, expect_)                                           \
 	do {                                                                   \
-		if ((value_) != (expect_)) {                                   \
-			(void)fprintf(                                         \
-				(_t_)->out, "    %s:%d ", __FILE__, __LINE__); \
-			(void)fprintf(                                         \
-				(_t_)->out, T_EQ_FMT_(value_),                 \
-				T_EQ_CAST_(expect_, value_),                   \
-				T_EQ_CAST_(value_, value_));                   \
-			(void)fprintf((_t_)->out, "\n");                       \
-			(void)fflush((_t_)->out);                              \
+		if (!_Generic(                                                 \
+			    (value_),                                          \
+			    _Bool: testing_eq_report_u_,                       \
+			    char: testing_eq_report_i_,                        \
+			    signed char: testing_eq_report_i_,                 \
+			    signed short: testing_eq_report_i_,                \
+			    signed int: testing_eq_report_i_,                  \
+			    signed long: testing_eq_report_i_,                 \
+			    signed long long: testing_eq_report_i_,            \
+			    unsigned char: testing_eq_report_u_,               \
+			    unsigned short: testing_eq_report_u_,              \
+			    unsigned int: testing_eq_report_u_,                \
+			    unsigned long: testing_eq_report_u_,               \
+			    unsigned long long: testing_eq_report_u_,          \
+			    float: testing_eq_report_f_,                       \
+			    double: testing_eq_report_f_,                      \
+			    long double: testing_eq_report_f_,                 \
+			    default: testing_eq_report_p_)(                    \
+			    (_t_)->out, __FILE__, __LINE__, (value_),          \
+			    (expect_))) {                                      \
 			T_FAILNOW();                                           \
 		}                                                              \
 	} while (0)
 
+/*
+ * Unlike T_EXPECT_EQ, these two need no _Generic dispatch: their argument
+ * types are already fixed (const char * / const void *), so a single
+ * ordinary function per macro is enough to compare and conditionally report
+ * in one call, fixing the same class of failure-branch double-evaluation.
+ */
+static inline bool testing_streq_report_(
+	FILE *out, const char *file, int line, const char *value,
+	const char *expect)
+{
+	if (strcmp(value, expect) == 0) {
+		return true;
+	}
+	(void)fprintf(
+		out, "    %s:%d expect \"%s\", got \"%s\"\n", file, line,
+		expect, value);
+	(void)fflush(out);
+	return false;
+}
+
+static inline bool testing_memeq_report_(
+	FILE *out, const char *file, int line, const void *value,
+	const void *expect, size_t size)
+{
+	if (memcmp(value, expect, size) == 0) {
+		return true;
+	}
+	(void)fprintf(
+		out, "    %s:%d memory mismatch: %zu bytes differ\n", file,
+		line, size);
+	(void)fflush(out);
+	return false;
+}
+
 #define T_EXPECT_STREQ(value_, expect_)                                        \
 	do {                                                                   \
-		if (strcmp((value_), (expect_)) != 0) {                        \
-			T_FATALF(                                              \
-				"expect \"%s\", got \"%s\"", (expect_),        \
-				(value_));                                     \
+		if (!testing_streq_report_(                                    \
+			    (_t_)->out, __FILE__, __LINE__, (value_),          \
+			    (expect_))) {                                      \
+			T_FAILNOW();                                           \
 		}                                                              \
 	} while (0)
 
 #define T_EXPECT_MEMEQ(value_, expect_, size_)                                 \
 	do {                                                                   \
-		if (memcmp((value_), (expect_), (size_)) != 0) {               \
-			T_FATALF(                                              \
-				"memory mismatch: %zu bytes differ",           \
-				(size_t)(size_));                              \
+		if (!testing_memeq_report_(                                    \
+			    (_t_)->out, __FILE__, __LINE__, (value_),          \
+			    (expect_), (size_t)(size_))) {                     \
+			T_FAILNOW();                                           \
 		}                                                              \
 	} while (0)
 

@@ -9,9 +9,9 @@
 #include "mux/session.h"
 
 #include "algo/wndfilter.h"
+#include "binary/serialize.h"
+#include "meta/minmax.h"
 #include "os/clock.h"
-#include "utils/minmax.h"
-#include "utils/serialize.h"
 #include "utils/slog.h"
 
 #include <inttypes.h>
@@ -21,7 +21,7 @@
 
 /* WINDOW_UPDATE encodes grant as uint16 in MUX_WINDOW_UNIT units. */
 #define WNDSIZE_MAX ((size_t)UINT16_MAX * MUX_WINDOW_UNIT)
-#define WNDSIZE_MIN ((size_t)4 * MUX_WINDOW_UNIT)
+#define WNDSIZE_MIN ((size_t)MUX_INITIAL_SEND_WINDOW)
 
 /* Minimum per-window feedback latency floor.  On low-latency paths min-RTT
  * is dominated by this floor, so the window is raised to bw×floor to keep
@@ -51,6 +51,13 @@ static void reset_samples(struct estimator_ctx *restrict est)
 	est->tx.sample = 0;
 }
 
+void estimator_suspend(struct mux_session *restrict ss)
+{
+	struct estimator_ctx *const restrict est = &ss->estimator;
+	est->ping_in_flight = false;
+	reset_samples(est);
+}
+
 static bool
 send_ping(struct mux_session *restrict ss, const int_fast64_t now_ns)
 {
@@ -67,15 +74,17 @@ send_ping(struct mux_session *restrict ss, const int_fast64_t now_ns)
 
 /* Shared probe-start/rate-limit/accumulate logic for estimator_add and
  * estimator_add_acked, parameterized by direction. */
-static void estimator_probe(
+static void run_probe_cycle(
 	struct mux_session *restrict ss, struct estimator_dir_ctx *restrict d,
-	const char *restrict label, const uint_least64_t bytes)
+	const char *restrict label, const uint_fast64_t bytes)
 {
 	struct estimator_ctx *const restrict est = &ss->estimator;
 	if (est->ping_in_flight) {
 		/* No probe timeout: the ordered transport delivers the PONG
 		 * eventually, and abandoning early can't speed it up (a new PING only
-		 * queues behind it).  A dead link is caught by send_timeout/w_timeout. */
+		 * queues behind it).  A dead link is caught by send_timeout/w_timeout
+		 * instead, both of which route through
+		 * session_on_dead_link() (session.c). */
 		d->sample += (size_t)bytes;
 		LOGD_F("PING in flight; accumulating %s sample, %zu bytes",
 		       label, d->sample);
@@ -108,15 +117,15 @@ static void estimator_probe(
 	d->sample = (size_t)bytes;
 }
 
-void estimator_add(struct mux_session *restrict ss, const uint_least64_t bytes)
+void estimator_add(struct mux_session *restrict ss, const uint_fast64_t bytes)
 {
-	estimator_probe(ss, &ss->estimator.rx, "rx", bytes);
+	run_probe_cycle(ss, &ss->estimator.rx, "rx", bytes);
 }
 
 void estimator_add_acked(
-	struct mux_session *restrict ss, const uint_least64_t bytes)
+	struct mux_session *restrict ss, const uint_fast64_t bytes)
 {
-	estimator_probe(ss, &ss->estimator.tx, "tx", bytes);
+	run_probe_cycle(ss, &ss->estimator.tx, "tx", bytes);
 }
 
 static void phase_startup(
@@ -178,6 +187,23 @@ struct calc_cycle {
 	int_fast64_t now_ns;
 };
 
+/* Convert a non-negative bandwidth-delay-product double to size_t, clamping to
+ * [0, SIZE_MAX]. Converting an out-of-range double to an integer type is
+ * undefined behavior (C11 6.3.1.4p1), and bdp_sample can reach ~9e15 at the
+ * extremes of the bw_max and rtt_min_ns clamps -- within a 64-bit size_t but
+ * past a 32-bit one. SIZE_MAX may round up to SIZE_MAX+1 as a double, so the
+ * >= comparison keeps the in-range cast strictly below the destination's max. */
+static size_t bdp_to_size(const double v)
+{
+	if (v <= 0.0) {
+		return 0;
+	}
+	if (v >= (double)SIZE_MAX) {
+		return SIZE_MAX;
+	}
+	return (size_t)v;
+}
+
 /* Update one direction's bandwidth/BDP estimate and advance its growth
  * phase from this cycle's sample. */
 static void calc_dir(
@@ -185,24 +211,36 @@ static void calc_dir(
 	const char *restrict label, const struct calc_cycle *restrict c)
 {
 	/* Clamp the sample to prevent overflow: the value × 1e9 must fit in
-	 * int_fast64_t. */
-	const size_t clamp_max = (size_t)(INT_FAST64_MAX / INT64_C(1000000000));
+	 * int_fast64_t. Compare in uintmax_t first so a size_t narrower than
+	 * int_fast64_t (e.g. a 32-bit size_t) clamps to SIZE_MAX instead of
+	 * silently truncating the bound itself. */
+	const uintmax_t clamp_1e9 =
+		(uintmax_t)(INT_FAST64_MAX / INT64_C(1000000000));
+	const size_t clamp_max =
+		clamp_1e9 < SIZE_MAX ? (size_t)clamp_1e9 : SIZE_MAX;
 	const size_t sample_clamped = MIN(d->sample, clamp_max);
-	const int_fast64_t bw_sample =
+	const int_fast64_t bw_sample_raw =
 		(int_fast64_t)sample_clamped * INT64_C(1000000000) / c->rtt_ns;
+	/* Clamp so window_size()'s later bw_max * WND_FEEDBACK_FLOOR_NS cannot
+	 * overflow int_fast64_t, however small rtt_ns is: the product above is
+	 * only bounded by sample_clamped's *1e9 headroom, not by rtt_ns, which
+	 * can be tiny. This bound (~13.6 TB/s) exceeds any real link speed by
+	 * orders of magnitude, so it never affects a legitimate measurement. */
+	const int_fast64_t bw_sample =
+		MIN(bw_sample_raw, INT_FAST64_MAX / WND_FEEDBACK_FLOOR_NS);
 	(void)wndfilter_update_max(
 		&d->bw_wnd, WND_BW_MAX_NS, c->now_ns, bw_sample);
 
 	const int_fast64_t bw_max = wndfilter_get(&d->bw_wnd);
 	const double bdp_sample = (double)bw_max * (double)c->rtt_min_ns / 1e9;
-	d->bdp = (size_t)bdp_sample;
+	d->bdp = bdp_to_size(bdp_sample);
 
 	/* Demand normalized to one min-RTT: a transient RTT spike stretches
 	 * the cycle and inflates d->sample, which would otherwise trip
 	 * spurious STARTUP growth. */
 	const double demand_bdp =
 		(double)bw_sample * (double)c->rtt_min_ns / 1e9;
-	const size_t demand = (size_t)demand_bdp;
+	const size_t demand = bdp_to_size(demand_bdp);
 
 	switch (d->phase) {
 	case ESTIMATOR_STARTUP:
@@ -275,8 +313,9 @@ void estimator_calculate(
 static size_t window_size(const struct estimator_dir_ctx *restrict d)
 {
 	/* Raise the floor to cover inherent feedback latency (WND_FEEDBACK_FLOOR_NS).
-	 * The bw_max product cannot overflow: it is bounded by a real measurement
-	 * and capped at WNDSIZE_MAX. */
+	 * bw_max cannot exceed INT_FAST64_MAX / WND_FEEDBACK_FLOOR_NS: calc_dir
+	 * clamps every bw_sample fed into bw_wnd to that bound, specifically so
+	 * this product can't overflow int_fast64_t. */
 	size_t floor = WNDSIZE_MIN;
 	const int_fast64_t bw_max = wndfilter_get(&d->bw_wnd);
 	if (bw_max > 0) {

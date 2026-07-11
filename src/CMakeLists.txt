@@ -1,5 +1,4 @@
 add_executable(multiplexd
-    util.c util.h
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     listener.c listener.h
     server.c server.h
@@ -76,7 +75,6 @@ target_link_libraries(multiplexd PRIVATE ${LIBEV_LIBRARY})
 set(WITH_TLS FALSE)
 set(WITH_OPENSSL FALSE)
 set(WITH_MBEDTLS FALSE)
-set(TLS_SOURCES "")
 set(GENCERTS_SOURCES "")
 set(TLS_INCLUDES "")
 set(TLS_LIBS "")
@@ -137,9 +135,6 @@ if(_tls_lib_effective STREQUAL "openssl")
     message(STATUS "OpenSSL ${OPENSSL_VERSION}: ${OPENSSL_LIBRARIES}")
     set(WITH_TLS TRUE)
     set(WITH_OPENSSL TRUE)
-    set(TLS_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/tlsutil.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/tlsutil_openssl.c)
     set(GENCERTS_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gencerts.c
         ${CMAKE_CURRENT_SOURCE_DIR}/gencerts.h)
@@ -151,9 +146,6 @@ elseif(_tls_lib_effective STREQUAL "mbedtls")
     endif()
     set(WITH_TLS TRUE)
     set(WITH_MBEDTLS TRUE)
-    set(TLS_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/tlsutil.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/tlsutil_mbedtls.c)
     set(GENCERTS_SOURCES "")
     get_target_property(_tls_mbedtls_location ${_tls_mbedtls_target} LOCATION)
     if(NOT _tls_mbedtls_location)
@@ -170,11 +162,16 @@ else()
     message(FATAL_ERROR "Invalid USE_TLS_LIBRARY: ${USE_TLS_LIBRARY}")
 endif()
 
-if(WITH_TLS)
-    target_sources(multiplexd PRIVATE ${TLS_SOURCES} ${GENCERTS_SOURCES})
-    target_include_directories(multiplexd SYSTEM PRIVATE ${TLS_INCLUDES})
-    target_link_libraries(multiplexd PRIVATE ${TLS_LIBS})
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    set(WITH_CRASH_HANDLER TRUE)
 endif()
+
+if(WITH_TLS)
+    target_sources(multiplexd PRIVATE ${GENCERTS_SOURCES})
+endif()
+
+add_subdirectory(shim)
+target_link_libraries(multiplexd PRIVATE shim)
 
 install(TARGETS multiplexd DESTINATION bin)
 
@@ -219,16 +216,11 @@ function(add_src_test target_name)
     target_include_directories(${target_name} SYSTEM PRIVATE ${LIBEV_INCLUDE_DIR})
     target_link_libraries(${target_name} PRIVATE ${LIBEV_LIBRARY})
 
-    if(WITH_TLS)
-        target_include_directories(${target_name} SYSTEM PRIVATE ${TLS_INCLUDES})
-        target_link_libraries(${target_name} PRIVATE ${TLS_LIBS})
-    endif()
-
     if(LIBM)
         target_link_libraries(${target_name} PRIVATE m)
     endif()
 
-    target_link_libraries(${target_name} PRIVATE csnippets)
+    target_link_libraries(${target_name} PRIVATE csnippets shim)
     if(Threads_FOUND)
         target_link_libraries(${target_name} PRIVATE Threads::Threads)
     endif()
@@ -249,15 +241,7 @@ add_src_test(conf_test
     conf_test.c
 )
 
-add_src_test(util_test
-    util.c util.h
-    ${TLS_SOURCES}
-    util_test.c
-)
-
 add_src_test(listener_test
-    util.c util.h
-    ${TLS_SOURCES}
     listener.c listener.h
     listener_test.c
 )
@@ -265,21 +249,11 @@ add_src_test(listener_test
 # Always registered; no-op when TLS disabled.
 add_src_test(gencerts_test
     ${GENCERTS_SOURCES}
-    ${TLS_SOURCES}
     gencerts_test.c
 )
 
-# Always registered; no-op when TLS disabled.
-add_src_test(tlsutil_test
-    ${GENCERTS_SOURCES}
-    ${TLS_SOURCES}
-    tlsutil_test.c
-)
-
 add_src_test(tunnel_test
-    util.c util.h
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
-    ${TLS_SOURCES}
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
@@ -290,9 +264,7 @@ add_src_test(tunnel_test
 target_link_libraries(tunnel_test PRIVATE mux)
 
 add_src_test(server_test
-    util.c util.h
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
-    ${TLS_SOURCES}
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
@@ -303,9 +275,7 @@ add_src_test(server_test
 target_link_libraries(server_test PRIVATE mux)
 
 add_src_test(api_server_test
-    util.c util.h
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
-    ${TLS_SOURCES}
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
@@ -319,9 +289,7 @@ target_link_libraries(api_server_test PRIVATE mux)
 # static CLI parser; the daemon body's collaborators are linked real so it
 # resolves, but only parse_args/print_usage are exercised.
 add_src_test(main_test
-    util.c util.h
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
-    ${TLS_SOURCES}
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h

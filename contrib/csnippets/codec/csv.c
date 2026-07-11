@@ -57,90 +57,99 @@ int csv_escape(char *restrict buf, size_t maxlen, const char *restrict field)
 	return (int)w;
 }
 
-bool csv_unescape(char *field)
+/* Unescape a quoted CSV field in place. field[0] must be '"'. Surrounding
+ * quotes are removed and doubled internal quotes are collapsed to a single
+ * quote; the transformed content is NUL-terminated at the closing quote.
+ * Returns a pointer to the byte just after the closing quote in the original
+ * buffer (which the caller inspects for the following separator), or NULL if
+ * the closing quote is missing (an incomplete quoted field). */
+static char *csv_unescape_quoted(char *restrict field)
+{
+	size_t w = 0;
+	for (size_t r = 1; field[r] != '\0'; r++) {
+		if (field[r] == '"') {
+			if (field[r + 1] == '"') {
+				/* doubled quote -> single quote */
+				field[w++] = '"';
+				r++;
+				continue;
+			}
+			/* closing quote: terminate the transformed content and
+			 * report where the next field begins */
+			field[w] = '\0';
+			return &field[r + 1];
+		}
+		field[w++] = field[r];
+	}
+	return NULL; /* ran off the buffer without a closing quote */
+}
+
+bool csv_unescape(char *restrict field)
 {
 	/* Check if field is quoted (starts with double quote) */
 	if (field[0] != '"') {
 		/* Unquoted field - validate it contains no special characters */
 		return strpbrk(field, "\"\r\n,") == NULL;
 	}
-
-	/* Remove surrounding quotes and unescape doubled internal quotes */
-	size_t w = 0;
-	for (size_t r = 1; field[r] != '\0'; r++) {
-		switch (field[r]) {
-		case '"':
-			/* Check if this is a doubled quote or closing quote */
-			if (field[++r] == '"') {
-				/* Doubled quote - unescape to single quote */
-				field[w++] = '"';
-				continue;
-			}
-
-			/* Closing quote - finish unescaping */
-			field[w] = '\0';
-			/* Validate that nothing follows the closing quote */
-			return field[r] == '\0';
-		default:
-			/* Regular character - copy as-is */
-			field[w++] = field[r];
-			break;
-		}
-	}
-
-	return false;
+	/* Quoted field: unescape in place; the closing quote must be the last
+	 * character, i.e. nothing may follow it. */
+	const char *const end = csv_unescape_quoted(field);
+	return end != NULL && *end == '\0';
 }
 
-char *csv_scanfield(char *buf, char **field)
+char *
+csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep)
 {
 	if (!buf || !*buf) {
 		*field = NULL;
+		*sep = '\0';
 		return NULL;
 	}
 
-	char *start = buf;
-	char *p = buf;
-	bool quoted = (*p == '"');
-
+	const bool quoted = (*buf == '"');
+	char *p;
 	if (quoted) {
-		p++; /* skip opening quote */
-		while (*p) {
-			if (*p == '"') {
-				p++;
-				if (*p == '"') {
-					/* doubled quote, skip the second */
-					p++;
-				} else {
-					/* closing quote found */
-					break;
-				}
-			} else {
-				p++;
-			}
-		}
-		if (*p == '\0') {
+		/* unescape in place and locate the byte after the closing quote,
+		 * sharing the doubled-quote logic with csv_unescape */
+		p = csv_unescape_quoted(buf);
+		if (p == NULL) {
 			/* incomplete quoted field, need more data */
+			*field = NULL;
+			*sep = '\0';
 			return buf;
 		}
-		/* p now points after closing quote */
 	} else {
-		/* unquoted field */
+		/* unquoted field: stop at the first field/record separator */
+		p = buf;
 		while (*p && *p != ',' && *p != '\n' && *p != '\r') {
 			p++;
 		}
 	}
+	*field = buf;
 
-	/* remember the separator */
-	char sep = *p;
-	/* null-terminate the field */
-	*p = '\0';
-	*field = start;
+	/* Report the terminating delimiter and where the next field begins.
+	 * CRLF is a single record separator (reported as '\n'); a lone LF or CR
+	 * is a record separator; ',' is a field separator; '\0' is end of data. */
+	char *next;
+	if (*p == '\0') {
+		*sep = '\0';
+		next = NULL;
+	} else if (*p == '\r' && p[1] == '\n') {
+		*sep = '\n';
+		*p = '\0';
+		next = p + 2;
+	} else {
+		*sep = *p;
+		*p = '\0';
+		next = p + 1;
+	}
 
-	/* unescape the field */
-	if (!csv_unescape(*field)) {
+	/* A quoted field was already unescaped and validated above; an unquoted
+	 * field (now NUL-terminated at its separator) must contain no stray
+	 * special characters. */
+	if (!quoted && !csv_unescape(*field)) {
 		return NULL; /* invalid field */
 	}
 
-	/* return the start of next parsing */
-	return (sep == '\0') ? NULL : p + 1;
+	return next;
 }

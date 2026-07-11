@@ -5,5 +5,4 @@ target_sources(csnippets
     PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/intlog2.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/rand.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/serial.h"
 )

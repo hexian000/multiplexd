@@ -7,6 +7,7 @@
 
 #include "mux/frame.h"
 
+#include "mux/frame.c"
 #include "mux/mux.h"
 
 #include "utils/testing.h"
@@ -15,8 +16,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include "mux/frame.c"
 
 /* mock - the test frame allocator */
 
@@ -204,6 +203,78 @@ T_DECLARE_CASE(test_frame_list_drain_clears_head_tail_and_count)
 	T_EXPECT(list.tail == NULL);
 }
 
+/* push_front sets tail only when the list was previously empty; otherwise it
+ * re-heads and leaves tail alone. */
+T_DECLARE_CASE(test_frame_list_push_front_empty_and_nonempty)
+{
+	struct mux_frame_list list = { 0 };
+	struct mux_frame a = { 0 };
+	struct mux_frame b = { 0 };
+	struct mux_frame c = { 0 };
+
+	/* Into an empty list: head and tail both become the frame. */
+	mux_frame_list_push_front(&list, &a);
+	T_EXPECT_EQ(list.count, (size_t)1);
+	T_EXPECT(list.head == &a);
+	T_EXPECT(list.tail == &a);
+
+	/* Into a non-empty list: head updates, tail unchanged. */
+	mux_frame_list_push_front(&list, &b);
+	T_EXPECT_EQ(list.count, (size_t)2);
+	T_EXPECT(list.head == &b);
+	T_EXPECT(list.tail == &a);
+
+	mux_frame_list_push_front(&list, &c);
+	T_EXPECT_EQ(list.count, (size_t)3);
+	T_EXPECT(list.head == &c);
+	T_EXPECT(list.tail == &a);
+
+	/* Front insertions come back out head-first: c, b, a. */
+	T_EXPECT(mux_frame_list_pop(&list) == &c);
+	T_EXPECT(mux_frame_list_pop(&list) == &b);
+	T_EXPECT(mux_frame_list_pop(&list) == &a);
+	T_EXPECT_EQ(list.count, (size_t)0);
+	T_EXPECT(list.head == NULL);
+	T_EXPECT(list.tail == NULL);
+}
+
+/* remove_after must cover interior removal (head/tail untouched), tail removal
+ * (list->tail reset to prev), and head removal of the sole element (prev NULL,
+ * list empties and tail resets to NULL). */
+T_DECLARE_CASE(test_frame_list_remove_after_head_interior_tail)
+{
+	struct mux_frame_list list = { 0 };
+	struct mux_frame a = { 0 };
+	struct mux_frame b = { 0 };
+	struct mux_frame c = { 0 };
+
+	mux_frame_list_push(&list, &a);
+	mux_frame_list_push(&list, &b);
+	mux_frame_list_push(&list, &c);
+	/* list: a -> b -> c, head=a tail=c count=3 */
+
+	/* Interior removal (prev=a removes b); head and tail unchanged. */
+	T_EXPECT(mux_frame_list_remove_after(&list, &a) == &b);
+	T_EXPECT_EQ(list.count, (size_t)2);
+	T_EXPECT(list.head == &a);
+	T_EXPECT(list.tail == &c);
+	T_EXPECT(a.next == &c);
+
+	/* Tail removal (prev=a removes c, the tail): tail resets to a. */
+	T_EXPECT(mux_frame_list_remove_after(&list, &a) == &c);
+	T_EXPECT_EQ(list.count, (size_t)1);
+	T_EXPECT(list.head == &a);
+	T_EXPECT(list.tail == &a);
+	T_EXPECT(a.next == NULL);
+
+	/* Head removal of the sole remaining element (prev=NULL): list empties
+	 * and tail resets to NULL. */
+	T_EXPECT(mux_frame_list_remove_after(&list, NULL) == &a);
+	T_EXPECT_EQ(list.count, (size_t)0);
+	T_EXPECT(list.head == NULL);
+	T_EXPECT(list.tail == NULL);
+}
+
 T_DECLARE_CASE(test_frame_ring_null_and_empty_ops)
 {
 	struct frame_pool_ctx ctx = { 0 };
@@ -349,6 +420,40 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 	}
 }
 
+/* Slots past the live entries must read as NULL after a grow, exactly like a
+ * freshly allocated ring (mux_frame_ring_new), not leftover malloc bytes. */
+T_DECLARE_CASE(test_frame_ring_grow_zeroes_new_slots)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+
+	struct mux_frame_ring *r = NULL;
+	const int cap0 = MUX_FRAME_RING_MIN;
+
+	for (int i = 0; i < cap0; i++) {
+		struct mux_frame *const f =
+			mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
+		T_CHECK(f != NULL);
+		T_CHECK(mux_frame_ring_push(&r, f));
+	}
+	/* One more push fills the ring to capacity and forces the 2x grow. */
+	struct mux_frame *const last =
+		mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
+	T_CHECK(last != NULL);
+	T_CHECK(mux_frame_ring_push(&r, last));
+	T_EXPECT_EQ(r->capacity, (size_t)(cap0 * 2));
+	T_EXPECT_EQ(r->count, (size_t)(cap0 + 1));
+
+	for (size_t i = r->count; i < r->capacity; i++) {
+		T_EXPECT(r->entries[i] == NULL);
+	}
+	/* The last live slot must still be the frame that triggered the grow. */
+	T_EXPECT(mux_frame_ring_peek(r, r->count - 1) == last);
+
+	mux_frame_ring_free(&r, &pool);
+	T_EXPECT_EQ(ctx.free_calls, cap0 + 1);
+}
+
 T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 {
 	struct frame_pool_ctx ctx = { 0 };
@@ -370,6 +475,101 @@ T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 
 	T_EXPECT(r == NULL);
 	T_EXPECT_EQ(ctx.free_calls, n);
+}
+
+/* ringbuf_reserve: recv_test.c/send_test.c mock this
+ * function, and wire_test.c/mux_test.c exercise it only incidentally, so
+ * none of its four decision points (fast-path, compaction, doubling growth,
+ * overflow rejection) had a direct test. */
+
+T_DECLARE_CASE(test_ringbuf_reserve_noop_when_space_available)
+{
+	struct ringbuf *rb = ringbuf_new(16);
+	T_CHECK(rb != NULL);
+	ringbuf_produce(rb, 4);
+
+	T_EXPECT(ringbuf_reserve(&rb, 12, false));
+	T_EXPECT_EQ(rb->cap, (size_t)16);
+	T_EXPECT_EQ(rb->off, (size_t)0);
+
+	/* need == 0 is always satisfied too, even with zero space left. */
+	ringbuf_produce(rb, 12);
+	T_EXPECT_EQ(ringbuf_write_space(rb), (size_t)0);
+	T_EXPECT(ringbuf_reserve(&rb, 0, false));
+
+	ringbuf_free(rb);
+}
+
+/* A partially-consumed buffer (off > 0, len > 0) has write_space trapped
+ * behind already-read bytes; compaction alone must recover it without
+ * growing, proving can_grow=false does not spuriously fail here. */
+T_DECLARE_CASE(test_ringbuf_reserve_compaction_recovers_space)
+{
+	struct ringbuf *rb = ringbuf_new(10);
+	T_CHECK(rb != NULL);
+	ringbuf_produce(rb, 8);
+	ringbuf_consume(
+		rb, 5); /* off=5, len=3: partial consume, no off reset */
+	T_CHECK(rb->off == 5 && rb->len == 3);
+	T_EXPECT_EQ(ringbuf_write_space(rb), (size_t)2);
+
+	T_EXPECT(ringbuf_reserve(&rb, 5, false));
+	T_EXPECT_EQ(rb->off, (size_t)0);
+	T_EXPECT_EQ(rb->len, (size_t)3);
+	T_EXPECT_EQ(rb->cap, (size_t)10); /* compaction alone; no realloc */
+
+	ringbuf_free(rb);
+}
+
+/* can_grow=false with neither immediate space nor anything to compact must
+ * fail cleanly rather than attempt to grow. */
+T_DECLARE_CASE(test_ringbuf_reserve_returns_false_when_cannot_grow)
+{
+	struct ringbuf *rb = ringbuf_new(4);
+	T_CHECK(rb != NULL);
+	ringbuf_produce(rb, 4); /* off=0 already: compact is a no-op */
+
+	T_EXPECT(!ringbuf_reserve(&rb, 1, false));
+	T_EXPECT_EQ(rb->cap, (size_t)4);
+
+	ringbuf_free(rb);
+}
+
+/* A request well beyond one doubling forces the growth loop to iterate
+ * several times; cap must land on the first power-of-two multiple of the
+ * original capacity that is >= len+need, not merely >= need. */
+T_DECLARE_CASE(test_ringbuf_reserve_doubling_growth_loop)
+{
+	struct ringbuf *rb = ringbuf_new(4);
+	T_CHECK(rb != NULL);
+	ringbuf_produce(rb, 4);
+	ringbuf_consume(rb, 4); /* fully drained: off resets to 0, len=0 */
+	T_CHECK(rb->off == 0 && rb->len == 0);
+
+	/* min_cap = 0 + 20 = 20; doubling from 4: 4, 8, 16, 32 (first >= 20). */
+	T_EXPECT(ringbuf_reserve(&rb, 20, true));
+	T_EXPECT_EQ(rb->cap, (size_t)32);
+	T_EXPECT(ringbuf_write_space(rb) >= (size_t)20);
+
+	ringbuf_free(rb);
+}
+
+/* A need large enough that len+need lands exactly on SIZE_MAX forces the
+ * growth loop's overflow guard (new_cap > SIZE_MAX/2) to clamp directly to
+ * min_cap instead of doubling past it, and the subsequent header-overflow
+ * check must then reject it before ever attempting the allocation --
+ * sizeof(struct ringbuf) pushes the true request past SIZE_MAX. Exercises
+ * the #41 guard this issue named as untested by name. */
+T_DECLARE_CASE(test_ringbuf_reserve_overflow_clamp_rejects)
+{
+	struct ringbuf *rb = ringbuf_new(4);
+	T_CHECK(rb != NULL);
+
+	T_EXPECT(!ringbuf_reserve(&rb, SIZE_MAX - rb->len, true));
+	T_EXPECT_EQ(
+		rb->cap, (size_t)4); /* untouched: rejected before realloc */
+
+	ringbuf_free(rb);
 }
 
 /* bench - per-frame hot-path micro-benchmarks (opt-in: run with BENCH set) */
@@ -433,6 +633,33 @@ T_DECLARE_BENCH(bench_frame_get_put)
 	}
 }
 
+/* mux_status_str must name every known code distinctly (a
+ * peer's REFUSED_STREAM must not be reported the same as
+ * FLOW_CONTROL_ERROR) and must not index by an untrusted, peer-controlled
+ * value -- an unrecognized code (a future extension, or a hostile peer)
+ * must name safely as "UNKNOWN" rather than reading out of bounds. */
+T_DECLARE_CASE(test_mux_status_str_names_known_codes_distinctly)
+{
+	static const enum mux_status known[] = {
+		MUX_STATUS_NO_ERROR,	       MUX_STATUS_PROTOCOL_ERROR,
+		MUX_STATUS_FLOW_CONTROL_ERROR, MUX_STATUS_INTERNAL_ERROR,
+		MUX_STATUS_REFUSED_STREAM,     MUX_STATUS_CANCEL,
+	};
+	for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+		const char *const name =
+			mux_status_str((uint_fast16_t)known[i]);
+		T_CHECK(name != NULL);
+		T_EXPECT(strcmp(name, "UNKNOWN") != 0);
+		for (size_t j = 0; j < i; j++) {
+			const char *const other =
+				mux_status_str((uint_fast16_t)known[j]);
+			T_EXPECT(strcmp(name, other) != 0);
+		}
+	}
+
+	T_EXPECT_STREQ(mux_status_str((uint_fast16_t)0xFFFF), "UNKNOWN");
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_frame_get_resets_runtime_fields),
 	T_CASE(test_frame_put_calls_allocator_free),
@@ -440,11 +667,20 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_header_roundtrip_with_flag_combinations),
 	T_CASE(test_frame_list_push_pop_fifo),
 	T_CASE(test_frame_list_drain_clears_head_tail_and_count),
+	T_CASE(test_frame_list_push_front_empty_and_nonempty),
+	T_CASE(test_frame_list_remove_after_head_interior_tail),
 	T_CASE(test_frame_ring_null_and_empty_ops),
 	T_CASE(test_frame_ring_push_pop_fifo),
 	T_CASE(test_frame_ring_grow_contiguous),
 	T_CASE(test_frame_ring_grow_wrapped),
+	T_CASE(test_frame_ring_grow_zeroes_new_slots),
 	T_CASE(test_frame_ring_free_releases_all_frames),
+	T_CASE(test_ringbuf_reserve_noop_when_space_available),
+	T_CASE(test_ringbuf_reserve_compaction_recovers_space),
+	T_CASE(test_ringbuf_reserve_returns_false_when_cannot_grow),
+	T_CASE(test_ringbuf_reserve_doubling_growth_loop),
+	T_CASE(test_ringbuf_reserve_overflow_clamp_rejects),
+	T_CASE(test_mux_status_str_names_known_codes_distinctly),
 	/* Opt-in micro-benchmarks: each runs ~1s, so they are skipped by the
 	 * default (unfiltered) run.  Select with `--run <ere>` or TESTING_FILTER. */
 	T_BENCH(bench_header_roundtrip),
