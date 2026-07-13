@@ -755,12 +755,21 @@ static ptrdiff_t skip_raw_value(const char *restrict buf, const size_t len)
 	}
 	case '[':
 	case '{': {
-		const char open = buf[0];
-		const char close = (open == '[') ? ']' : '}';
+		/* Track nested brackets with a LIFO of expected closers so a '}'
+		 * can only close a '{' and a ']' only a '['.  A single depth
+		 * counter that ignores the other bracket type would accept
+		 * type-mismatched input such as "[}" or "{]" and mis-measure the
+		 * value's end (e.g. swallowing a sibling member).  The stack is a
+		 * fixed automatic array, so nesting is bounded; RFC 8259 §9
+		 * permits a maximum depth, and over-deep input is a syntax error. */
+		enum { max_depth = 256 };
+		char stack[max_depth];
+		stack[0] = (buf[0] == '[') ? ']' : '}';
 		size_t depth = 1;
 		size_t i = 1;
 		while (i < len && depth > 0) {
-			if (buf[i] == '"') {
+			const char c = buf[i];
+			if (c == '"') {
 				i++;
 				while (i < len) {
 					if (buf[i] == '\\') {
@@ -775,9 +784,15 @@ static ptrdiff_t skip_raw_value(const char *restrict buf, const size_t len)
 				}
 				continue;
 			}
-			if (buf[i] == open) {
-				depth++;
-			} else if (buf[i] == close) {
+			if (c == '[' || c == '{') {
+				if (depth >= max_depth) {
+					return -1;
+				}
+				stack[depth++] = (c == '[') ? ']' : '}';
+			} else if (c == ']' || c == '}') {
+				if (c != stack[depth - 1]) {
+					return -1;
+				}
 				depth--;
 			}
 			i++;

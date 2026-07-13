@@ -366,6 +366,20 @@ T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_malformed_json)
 	T_EXPECT(conf == NULL);
 }
 
+/* A "-"-prefixed comment key's value is accepted without being parsed as
+ * well-formed JSON, so it can carry a malformed fragment.  Here the value
+ * is an array holding an unmatched '{' ("[{]"): the raw-value scanner must
+ * reject it on its own bracket-type mismatch (']' cannot close '{') rather
+ * than mis-measuring the fragment and swallowing identity's own closing
+ * brace.  Must be rejected gracefully (conf_parse -> NULL), never abort. */
+T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_bracket_mismatch)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"listen\":{\"-old\":[{], \"ok\":\"1.2.3.4:1\"}}}}";
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
 /* identity.listen has no fixed key set, so identity_listen_cb must itself
  * special-case a "-"-prefixed key as a comment and skip it -- unlike a
  * known field name, the generic dispatcher's unknown-key tolerance never
@@ -1121,6 +1135,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_mux_connect),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_non_object),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_malformed_json),
+	T_CASE(test_conf_parsefile_identity_listen_rejects_bracket_mismatch),
 	T_CASE(test_conf_parsefile_identity_listen_skips_comment_key),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_non_string_value),
 	T_CASE(test_conf_parsefile_rejects_embedded_nul_in_identity_claim),

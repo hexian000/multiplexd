@@ -5,7 +5,7 @@
 [![Downloads](https://img.shields.io/github/downloads/hexian000/multiplexd/total.svg)](https://github.com/hexian000/multiplexd/releases)
 [![Release](https://img.shields.io/github/release/hexian000/multiplexd.svg?style=flat)](https://github.com/hexian000/multiplexd/releases)
 
-multiplexd is a TCP stream multiplexer with 0-RTT stream open, fair bandwidth sharing, flow-control with BDP estimation, transparent session resumption, and TLS 1.3 mutual authentication against a private trust store.
+multiplexd is a TCP stream multiplexer that solves most of the problems of tunneling TCP over TCP. By relaying application streams over a single, flow-controlled transport, it sidesteps the "TCP meltdown" of naive tunnels — and adds 0-RTT stream open, fair bandwidth sharing, flow-control with BDP estimation, transparent session resumption, and TLS 1.3 mutual authentication against a private trust store.
 
 **Table of Contents**
 - [Features](#features)
