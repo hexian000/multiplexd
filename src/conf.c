@@ -10,12 +10,14 @@
 
 #include "conf_schema.gen.h"
 #include "mux/mux.h"
+#include "shim/util.h"
 
 #include "codec/json.h"
 #include "meta/minmax.h"
 #include "net/mime.h"
 #include "utils/ascii.h"
 #include "utils/buffer.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
 #include <inttypes.h>
@@ -113,36 +115,52 @@ static struct identity_peer *identity_listen_add(
 {
 	/* Last-value-wins on a duplicate id, matching every other field's
 	 * semantics: reuse an existing entry instead of appending a second
-	 * one with the same id. */
+	 * one with the same id. The cached id_len keeps each comparison a plain
+	 * length check plus memcmp, without an strlen per existing peer. */
 	for (size_t i = 0; i < conf->identity.peers_count; i++) {
 		struct identity_peer *const restrict p =
 			&conf->identity.peers[i];
-		if (strlen(p->id) == id_len && memcmp(p->id, id, id_len) == 0) {
+		if (p->id_len == id_len && memcmp(p->id, id, id_len) == 0) {
 			return p;
 		}
 	}
 
 	const size_t n = conf->identity.peers_count;
-	if (n >= SIZE_MAX / sizeof(*conf->identity.peers)) {
-		LOGOOM();
-		return NULL;
+	/* Grow geometrically so parsing n peers costs O(log n) reallocations
+	 * rather than one per entry. */
+	if (n == conf->identity.peers_cap) {
+		const size_t max_cap = SIZE_MAX / sizeof(*conf->identity.peers);
+		if (n >= max_cap) {
+			LOGOOM();
+			return NULL;
+		}
+		size_t new_cap = conf->identity.peers_cap == 0 ?
+					 4 :
+					 conf->identity.peers_cap * 2;
+		if (new_cap > max_cap || new_cap < conf->identity.peers_cap) {
+			new_cap = max_cap;
+		}
+		struct identity_peer *const restrict entries =
+			realloc(conf->identity.peers,
+				new_cap * sizeof(*conf->identity.peers));
+		if (entries == NULL) {
+			LOGOOM();
+			return NULL;
+		}
+		conf->identity.peers = entries;
+		conf->identity.peers_cap = new_cap;
 	}
-	struct identity_peer *const restrict entries = realloc(
-		conf->identity.peers, (n + 1) * sizeof(*conf->identity.peers));
-	if (entries == NULL) {
-		LOGOOM();
-		return NULL;
-	}
-	conf->identity.peers = entries;
-	entries[n] = (struct identity_peer){
+	struct identity_peer *const restrict entry = &conf->identity.peers[n];
+	*entry = (struct identity_peer){
 		.id = conf_strndup("identity.listen key", id, id_len),
+		.id_len = id_len,
 		.listen = NULL,
 	};
-	if (entries[n].id == NULL) {
+	if (entry->id == NULL) {
 		return NULL;
 	}
 	conf->identity.peers_count = n + 1;
-	return &entries[n];
+	return entry;
 }
 
 static bool identity_listen_cb(
@@ -229,28 +247,41 @@ conf_load_tls(struct config *restrict cfg, const struct json_conf *restrict obj)
 }
 #endif /* WITH_TLS */
 
-static bool
+#if WITH_TCP_NOTSENT_LOWAT
+#define LOAD_NOTSENT_LOWAT(dst, val)                                           \
+	((dst)->tcp_notsent_lowat = (int)MIN((val), (uintmax_t)INT_MAX))
+#else
+/* No TCP_NOTSENT_LOWAT on this platform (non-Linux or FORCE_POSIX): the option
+ * is silently ignored. It is a valid, documented key -- not "unknown" -- and its
+ * schema default is non-zero for the mux transport, so a "did the user set it?"
+ * warning fires on every parse; drop it rather than mislead. */
+#define LOAD_NOTSENT_LOWAT(dst, val) ((void)(val))
+#endif /* WITH_TCP_NOTSENT_LOWAT */
+
+/* Load the shared TCP socket options into dst. The two JSON source objects
+ * (json_conf_tcp for tcp.*, json_conf_mux_tcp for mux.tcp.*) are distinct
+ * generated types with identical field names; one macro keeps both call sites
+ * from drifting (which previously hid the notsent_lowat default divergence). */
+#define LOAD_SOCKET_OPTS(dst, src)                                               \
+	do {                                                                     \
+		(dst)->tcp_reuseport = (src).reuseport;                          \
+		(dst)->tcp_keepalive = (src).keepalive;                          \
+		(dst)->tcp_nodelay = (src).nodelay;                              \
+		/* Clamp to INT_MAX: a value past it would wrap to a negative  \
+		 * socket option. */ \
+		(dst)->tcp_sndbuf =                                              \
+			(int)MIN((src).sndbuf, (uintmax_t)INT_MAX);              \
+		(dst)->tcp_rcvbuf =                                              \
+			(int)MIN((src).rcvbuf, (uintmax_t)INT_MAX);              \
+		LOAD_NOTSENT_LOWAT((dst), (src).notsent_lowat);                  \
+		(dst)->backlog = (int)(src).backlog;                             \
+	} while (0)
+
+static void
 conf_load_mux(struct config *restrict cfg, const struct json_conf *restrict obj)
 {
 	cfg->mux.nodelay = obj->mux.nodelay;
-	cfg->mux_tcp.tcp_reuseport = obj->mux.tcp.reuseport;
-	cfg->mux_tcp.tcp_keepalive = obj->mux.tcp.keepalive;
-	cfg->mux_tcp.tcp_nodelay = obj->mux.tcp.nodelay;
-	/* Clamp to INT_MAX: a value past it would wrap to a negative socket
-	 * option. */
-	cfg->mux_tcp.tcp_sndbuf =
-		(int)MIN(obj->mux.tcp.sndbuf, (uintmax_t)INT_MAX);
-	cfg->mux_tcp.tcp_rcvbuf =
-		(int)MIN(obj->mux.tcp.rcvbuf, (uintmax_t)INT_MAX);
-#if WITH_TCP_NOTSENT_LOWAT
-	cfg->mux_tcp.tcp_notsent_lowat =
-		(int)MIN(obj->mux.tcp.notsent_lowat, (uintmax_t)INT_MAX);
-#else
-	if (obj->mux.tcp.notsent_lowat != 0) {
-		LOGW("unknown config: \"mux.tcp.notsent_lowat\"");
-	}
-#endif
-	cfg->mux_tcp.backlog = (int)obj->mux.tcp.backlog;
+	LOAD_SOCKET_OPTS(&cfg->mux_tcp, obj->mux.tcp);
 	cfg->mux.max_halfopen = (int)obj->mux.max_halfopen;
 	/* Clamp to INT_MAX: a value past it would wrap negative and silently
 	 * disable the "max_streams > 0" admission check. */
@@ -298,28 +329,16 @@ conf_load_mux(struct config *restrict cfg, const struct json_conf *restrict obj)
 		(int)MIN(obj->mux.mem_pressure.hi, (uintmax_t)INT_MAX);
 	cfg->mux.mem_pressure_lo =
 		(int)MIN(obj->mux.mem_pressure.lo, (uintmax_t)INT_MAX);
-	return true;
 }
 
-static bool
+static void
 conf_load_tcp(struct config *restrict cfg, const struct json_conf *restrict obj)
 {
-	cfg->tcp.tcp_reuseport = obj->tcp.reuseport;
-	cfg->tcp.tcp_keepalive = obj->tcp.keepalive;
-	cfg->tcp.tcp_nodelay = obj->tcp.nodelay;
-	cfg->tcp.tcp_sndbuf = (int)MIN(obj->tcp.sndbuf, (uintmax_t)INT_MAX);
-	cfg->tcp.tcp_rcvbuf = (int)MIN(obj->tcp.rcvbuf, (uintmax_t)INT_MAX);
-#if WITH_TCP_NOTSENT_LOWAT
-	cfg->tcp.tcp_notsent_lowat =
-		(int)MIN(obj->tcp.notsent_lowat, (uintmax_t)INT_MAX);
-#else
-	if (obj->tcp.notsent_lowat != 0) {
-		LOGW("unknown config: \"tcp.notsent_lowat\"");
-	}
-#endif
-	cfg->tcp.backlog = (int)obj->tcp.backlog;
-	return true;
+	LOAD_SOCKET_OPTS(&cfg->tcp, obj->tcp);
 }
+
+#undef LOAD_SOCKET_OPTS
+#undef LOAD_NOTSENT_LOWAT
 
 static bool conf_load_identity(
 	struct config *restrict cfg, const struct json_conf *restrict obj)
@@ -410,18 +429,16 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 		return false;
 	}
 #endif /* WITH_TLS */
-	if (!conf_load_mux(cfg, obj)) {
-		return false;
-	}
-	if (!conf_load_tcp(cfg, obj)) {
-		return false;
-	}
+	conf_load_mux(cfg, obj);
+	conf_load_tcp(cfg, obj);
 	if (!conf_load_identity(cfg, obj)) {
 		return false;
 	}
 
 	return true;
 }
+
+#undef STRNDUP_FIELD
 
 /* Clamp keepalive and derive the inactivity deadline:
  * max(keepalive*1.1, keepalive+90s).  keepalive == 0 disables both. */
@@ -433,6 +450,43 @@ static void conf_derive_mux_timeout(struct config *restrict conf)
 			conf->mux.keepalive + MAX(conf->mux.keepalive / 10, 90);
 	} else {
 		conf->mux.timeout = 0;
+	}
+}
+
+/* Resolve all defaults and clamp fields to their valid ranges: derive the mux
+ * timeout, clamp the mux timeouts and loglevel, and resolve mem_pressure.lo's
+ * "0 means hi/2" default. Pure normalization (never fails), shared by
+ * conf_check and conf_new_default so both yield the identical default config.
+ * mem_pressure.lo is resolved here rather than after conf_check's inversion
+ * check: that check only rejects an explicit lo > hi, and hi/2 <= hi, so the
+ * order is immaterial. */
+static void conf_normalize(struct config *restrict conf)
+{
+	conf_derive_mux_timeout(conf);
+	if (conf->mux.send_timeout > 0) {
+		conf->mux.send_timeout =
+			CLAMP(conf->mux.send_timeout, 10, 86400);
+	}
+	if (conf->mux.connect_timeout > 0) {
+		conf->mux.connect_timeout =
+			CLAMP(conf->mux.connect_timeout, 10, 86400);
+	}
+	if (conf->mux.resume_timeout > 0) {
+		conf->mux.resume_timeout =
+			CLAMP(conf->mux.resume_timeout, 10, 86400);
+	}
+	if (conf->mux.idle_timeout > 0) {
+		conf->mux.idle_timeout =
+			CLAMP(conf->mux.idle_timeout, 10, 86400);
+	} else {
+		conf->mux.idle_timeout = 0;
+	}
+	conf->loglevel =
+		CLAMP(conf->loglevel, LOG_LEVEL_SILENCE, LOG_LEVEL_VERYVERBOSE);
+	/* Resolve "lo == 0" to its final value now, so every session reads an
+	 * already-concrete threshold instead of re-deriving it per grant. */
+	if (conf->mux.mem_pressure_hi > 0 && conf->mux.mem_pressure_lo == 0) {
+		conf->mux.mem_pressure_lo = conf->mux.mem_pressure_hi / 2;
 	}
 }
 
@@ -524,27 +578,7 @@ static bool conf_check(struct config *restrict conf)
 		return false;
 	}
 #endif /* WITH_TLS */
-	conf_derive_mux_timeout(conf);
-	if (conf->mux.send_timeout > 0) {
-		conf->mux.send_timeout =
-			CLAMP(conf->mux.send_timeout, 10, 86400);
-	}
-	if (conf->mux.connect_timeout > 0) {
-		conf->mux.connect_timeout =
-			CLAMP(conf->mux.connect_timeout, 10, 86400);
-	}
-	if (conf->mux.resume_timeout > 0) {
-		conf->mux.resume_timeout =
-			CLAMP(conf->mux.resume_timeout, 10, 86400);
-	}
-	if (conf->mux.idle_timeout > 0) {
-		conf->mux.idle_timeout =
-			CLAMP(conf->mux.idle_timeout, 10, 86400);
-	} else {
-		conf->mux.idle_timeout = 0;
-	}
-	conf->loglevel =
-		CLAMP(conf->loglevel, LOG_LEVEL_SILENCE, LOG_LEVEL_VERYVERBOSE);
+	conf_normalize(conf);
 	/* Validate max_startups throttle parameters. */
 	if (conf->startup_limit_rate > 100) {
 		LOGE_F("max_startups rate (%d) exceeds 100:"
@@ -572,11 +606,6 @@ static bool conf_check(struct config *restrict conf)
 		       conf->mux.mem_pressure_lo, conf->mux.mem_pressure_hi);
 		return false;
 	}
-	/* Resolve "lo == 0" to its final value now, so every session reads an
-	 * already-concrete threshold instead of re-deriving it per grant. */
-	if (conf->mux.mem_pressure_hi > 0 && conf->mux.mem_pressure_lo == 0) {
-		conf->mux.mem_pressure_lo = conf->mux.mem_pressure_hi / 2;
-	}
 	/* identity.claim's 255-octet wire limit is already enforced by the
 	 * generated schema unmarshal (conf_schema.json maxLength:255, applied to
 	 * the decoded length before conf_check runs), and STRNDUP_FIELD rejects an
@@ -589,14 +618,30 @@ static bool conf_check(struct config *restrict conf)
 	for (size_t i = 0; i < conf->identity.peers_count; i++) {
 		const struct identity_peer *restrict p =
 			&conf->identity.peers[i];
+		/* identity.listen keys are peer identity strings, and the mux
+		 * hello caps a received identity at 255 octets (identity.claim is
+		 * schema-capped at 255 for the same reason). A longer key could
+		 * never table_find a connecting peer -- a listener that binds and
+		 * accepts but is silently dead. The map keys bypass the schema's
+		 * generated per-field checks, so reject an oversized one here. */
+		if (p->id_len > 255) {
+			LOGE_F("identity.listen key \"%.64s\" (%zu octets) exceeds"
+			       " the 255-octet peer identity limit",
+			       p->id, p->id_len);
+			return false;
+		}
 		if (p->listen == NULL) {
 			continue;
 		}
+		/* identity.listen is a dynamic map value that bypasses the
+		 * generated per-field maxLength checks, so enforce the shared
+		 * address limit (shim/util.h ADDR_MAX_STRLEN, mirrored by
+		 * conf_schema.json's maxLength) here instead. */
 		const size_t listen_len = strlen(p->listen);
-		if (listen_len > 261) {
+		if (listen_len > ADDR_MAX_STRLEN) {
 			LOGE_F("identity.listen.%s (%zu octets) exceeds the"
-			       " 261-octet address limit",
-			       p->id, listen_len);
+			       " %zu-octet address limit",
+			       p->id, listen_len, (size_t)ADDR_MAX_STRLEN);
 			return false;
 		}
 	}
@@ -693,10 +738,10 @@ struct config *conf_new_default(void)
 		conf_free(conf);
 		return NULL;
 	}
-	/* conf_new_default skips conf_check (an empty default has no
-	 * transport), so derive the timeout here too; otherwise a default
-	 * config would have timeout==0. */
-	conf_derive_mux_timeout(conf);
+	/* conf_new_default skips conf_check (an empty default has no transport),
+	 * so run the shared normalization here so the default config resolves the
+	 * same defaults (timeout, clamps, mem_pressure.lo) conf_parse("{}") does. */
+	conf_normalize(conf);
 	return conf;
 }
 
@@ -852,43 +897,50 @@ static bool build_json_string_arr(
 
 char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 {
+	/* Three heap temporaries feed the `raw` literal below; they are released
+	 * once at the cleanup label so a future addition need only be freed there.
+	 * out is freed on the failure branch (NULL'd once handed to result). */
 	struct vbuffer *listen_vbuf = NULL;
+	struct json_string *id_mc_arr = NULL;
+#if WITH_TLS
+	struct json_string *authcerts_arr = NULL;
+#endif
+	char *out = NULL;
+	char *result = NULL;
+
 	if (!build_listen_json(conf, &listen_vbuf)) {
-		return NULL;
+		goto cleanup;
 	}
 	char *const listen_json =
 		listen_vbuf != NULL ? (char *)listen_vbuf->data : NULL;
 	const size_t listen_len = listen_vbuf != NULL ? listen_vbuf->len : 0;
 
-	struct json_string *id_mc_arr = NULL;
 	if (!build_json_string_arr(
 		    conf->identity.mux_connect,
 		    conf->identity.mux_connect_count, &id_mc_arr)) {
-		VBUF_FREE(listen_vbuf);
-		return NULL;
+		goto cleanup;
 	}
 
 #if WITH_TLS
-	struct json_string *authcerts_arr = NULL;
 	if (!build_json_string_arr(
 		    conf->tls_authcerts, conf->tls_authcerts_count,
 		    &authcerts_arr)) {
-		free(id_mc_arr);
-		VBUF_FREE(listen_vbuf);
-		return NULL;
+		goto cleanup;
 	}
 #endif /* WITH_TLS */
 
 	/* Format max_startups string when any throttle value is non-zero. */
 	char startups_buf[64];
-	const char *max_startups = NULL;
+	char *max_startups = NULL;
 	size_t max_startups_len = 0;
 	if (conf->startup_limit_start > 0 || conf->startup_limit_rate > 0 ||
 	    conf->startup_limit_full > 0) {
-		max_startups_len = (size_t)snprintf(
+		const int n = snprintf(
 			startups_buf, sizeof(startups_buf), "%d:%d:%d",
 			conf->startup_limit_start, conf->startup_limit_rate,
 			conf->startup_limit_full);
+		ASSERT(n > 0 && (size_t)n < sizeof(startups_buf));
+		max_startups_len = (size_t)n;
 		max_startups = startups_buf;
 	}
 
@@ -913,7 +965,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		.loglevel = (unsigned)conf->loglevel,
 		.max_sessions = (uintmax_t)conf->max_sessions,
 		.max_startups = {
-			.str = (char *)max_startups,
+			.str = max_startups,
 			.len = max_startups_len,
 		},
 #if WITH_TLS
@@ -986,41 +1038,34 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 
 	/* The dump is bounded by the same CONF_MAXSIZE limit applied when
 	 * reading, so a single allocation avoids a measuring pass. */
-	char *const out = malloc(CONF_MAXSIZE + 1);
+	out = malloc(CONF_MAXSIZE + 1);
 	if (out == NULL) {
-		VBUF_FREE(listen_vbuf);
-		free(id_mc_arr);
-#if WITH_TLS
-		free(authcerts_arr);
-#endif
 		LOGOOM();
-		return NULL;
+		goto cleanup;
 	}
 	const int json_sz =
 		json_marshal_conf(out, CONF_MAXSIZE + 1, &raw, NULL);
 	if (json_sz <= 0 || json_sz > CONF_MAXSIZE) {
-		VBUF_FREE(listen_vbuf);
-		free(id_mc_arr);
-#if WITH_TLS
-		free(authcerts_arr);
-#endif
-		free(out);
 		LOGE_F("config dump failed or exceeds maximum size of %d bytes",
 		       CONF_MAXSIZE);
-		return NULL;
+		goto cleanup;
 	}
 	out[json_sz] = '\0';
+	if (lenp != NULL) {
+		*lenp = (size_t)json_sz;
+	}
+	/* Success: hand out to the caller, then null it so cleanup leaves it. */
+	result = out;
+	out = NULL;
 
+cleanup:
 	VBUF_FREE(listen_vbuf);
 	free(id_mc_arr);
 #if WITH_TLS
 	free(authcerts_arr);
 #endif
-
-	if (lenp != NULL) {
-		*lenp = (size_t)json_sz;
-	}
-	return out;
+	free(out);
+	return result;
 }
 
 #if WITH_TLS

@@ -34,6 +34,8 @@ struct conf_socket_opts {
 struct identity_peer {
 	/* Peer-side identity used as routing key. */
 	char *id;
+	/* strlen(id), cached so the dedup scan need not recompute it. */
+	size_t id_len;
 	/* Local TCP address to accept application traffic on, or NULL. */
 	char *listen;
 };
@@ -46,6 +48,8 @@ struct conf_identity {
 	/* identity.listen entries, keyed by peer id. */
 	struct identity_peer *peers;
 	size_t peers_count;
+	/* Allocated capacity of peers[] (>= peers_count); grown geometrically. */
+	size_t peers_cap;
 };
 
 struct config {
@@ -65,7 +69,9 @@ struct config {
 	char *tls_sni;
 	/* Comma-separated list; NULL or empty string omits the ALPN extension. */
 	char *tls_alpn;
-	/* Staging: per-entry PEM strings (owned; NULLed by conf_inline_pem). */
+	/* Staging: per-entry PEM strings (owned). conf_inline_pem resolves any
+	 * @path refs in place and builds tls_authcerts_bundle; the entries stay
+	 * populated afterwards (freed by conf_free). */
 	char **tls_authcerts;
 	size_t tls_authcerts_count;
 	/* Concatenated PEM bundle of trusted certificates (owned); NULL when none. */

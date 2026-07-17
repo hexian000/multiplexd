@@ -89,6 +89,32 @@ T_DECLARE_CASE(test_conf_new_default_fields)
 	conf_free(conf);
 }
 
+/* conf_new_default() and a parsed minimal config must resolve the same
+ * defaults: both run the shared conf_normalize(), so every (transport-
+ * independent) normalized field agrees. A future default (e.g. a non-zero
+ * mem_pressure.hi) applied by only one path would diverge here. A bare "{}"
+ * cannot be used for the parse side because conf_check rejects a config with
+ * no transport, so add just a mux_connect, which does not affect these fields. */
+T_DECLARE_CASE(test_conf_new_default_matches_empty_parse)
+{
+	struct config *const a = conf_new_default();
+	T_CHECK(a != NULL);
+	struct config *const b =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\"}");
+	T_CHECK(b != NULL);
+	T_EXPECT_EQ(a->mux.keepalive, b->mux.keepalive);
+	T_EXPECT_EQ(a->mux.timeout, b->mux.timeout);
+	T_EXPECT_EQ(a->mux.send_timeout, b->mux.send_timeout);
+	T_EXPECT_EQ(a->mux.connect_timeout, b->mux.connect_timeout);
+	T_EXPECT_EQ(a->mux.resume_timeout, b->mux.resume_timeout);
+	T_EXPECT_EQ(a->mux.idle_timeout, b->mux.idle_timeout);
+	T_EXPECT_EQ(a->loglevel, b->loglevel);
+	T_EXPECT_EQ(a->mux.mem_pressure_hi, b->mux.mem_pressure_hi);
+	T_EXPECT_EQ(a->mux.mem_pressure_lo, b->mux.mem_pressure_lo);
+	conf_free(b);
+	conf_free(a);
+}
+
 T_DECLARE_CASE(test_conf_parsefile_nonexistent)
 {
 	struct config *const conf =
@@ -176,6 +202,38 @@ T_DECLARE_CASE(test_conf_dump_roundtrip)
 	conf_free(orig);
 }
 
+/* mux.max_frame_size is stored internally as max_frame_payload (the wire size
+ * minus the 8-byte header) on load and re-added on dump; the two conversions
+ * must stay exact inverses, or --dump-config / GET /config would report a
+ * different frame size than is actually in effect.  A non-default 32768 is used
+ * so the assertion fails on a dropped conversion rather than matching the
+ * 16384 default regardless of parsing. */
+T_DECLARE_CASE(test_conf_parsefile_mux_max_frame_size_roundtrip)
+{
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\","
+		"\"mux\":{\"max_frame_size\":32768}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(
+		conf->mux.max_frame_payload,
+		(int)(32768 - MUX_FRAME_HEADER_SIZE));
+
+	/* Dump and reparse: the re-added header must reproduce the same payload. */
+	char tmpl[] = "/tmp/conf_maxframe_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(write_conf_file(conf, tmpl));
+	struct config *const reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT_EQ(
+		reparsed->mux.max_frame_payload, conf->mux.max_frame_payload);
+
+	conf_free(reparsed);
+	conf_free(conf);
+}
+
 T_DECLARE_CASE(test_conf_identity_connect_count)
 {
 	/* Identity-client mode: mux_connect lists destinations; claim is
@@ -207,6 +265,35 @@ T_DECLARE_CASE(test_conf_parsefile_requires_claim_for_identity)
 	struct config *const conf = parse_tmpconf(
 		"{\"identity\":{\"mux_connect\":[\"127.0.0.1:9001\"]}}");
 	T_EXPECT(conf == NULL);
+}
+
+/* The claim-required check has two disjuncts; the sibling above covers
+ * identity.mux_connect. This covers the identity.listen (peers_count > 0)
+ * disjunct: a transport is present but the claim is missing, so it must be
+ * rejected -- with a positive control confirming the missing claim is the
+ * specific cause. */
+T_DECLARE_CASE(test_conf_parsefile_requires_claim_for_identity_listen)
+{
+	struct config *const rejected = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"identity\":{\"listen\":{\"peer1\":\"127.0.0.1:9002\"}}}");
+	T_EXPECT(rejected == NULL);
+
+	struct config *const accepted = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"mynode\",\"listen\":{\"peer1\":\"127.0.0.1:9002\"}}}");
+	T_CHECK(accepted != NULL);
+	conf_free(accepted);
+}
+
+/* mux_listen and mux_connect together are legal: server mode wins and
+ * mux_connect is ignored with a warning, not rejected. */
+T_DECLARE_CASE(test_conf_parsefile_accepts_mux_listen_and_mux_connect)
+{
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"mux_connect\":\"127.0.0.1:9001\"}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_STREQ(conf->mux_listen, "127.0.0.1:9000");
+	T_EXPECT_STREQ(conf->mux_connect, "127.0.0.1:9001");
+	conf_free(conf);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_accepts_max_length_identity_claim)
@@ -246,7 +333,7 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_claim)
 
 T_DECLARE_CASE(test_conf_parsefile_accepts_max_length_listen_address)
 {
-	/* util.c's ADDR_MAX_LENGTH (255-octet FQDN + ":65535") caps a valid
+	/* shim/util.h's ADDR_MAX_STRLEN (255-octet FQDN + ":65535") caps a valid
 	 * address at 261 octets; the boundary value itself must still load. */
 	char addr[262];
 	memset(addr, 'a', sizeof(addr) - 1);
@@ -265,7 +352,7 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_listen_address)
 {
 	/* One octet past the schema's 261-octet maxLength must be rejected
 	 * at parse time instead of only failing later in resolve_bindaddr
-	 * (util.c's ADDR_MAX_LENGTH). */
+	 * (shim/util.h's ADDR_MAX_STRLEN). */
 	char addr[263];
 	memset(addr, 'a', sizeof(addr) - 1);
 	addr[sizeof(addr) - 1] = '\0';
@@ -292,6 +379,36 @@ T_DECLARE_CASE(test_conf_parsefile_parses_identity_listen)
 	conf_free(conf);
 }
 
+/* build_listen_json's comma separator between identity.listen entries fires
+ * only when a config carries two or more listen peers; a dump/reparse round-trip
+ * of a two-peer config exercises it (a dropped comma emits invalid JSON that
+ * fails to reparse). */
+T_DECLARE_CASE(test_conf_dump_identity_listen_multi_peer_roundtrip)
+{
+	const char *json =
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer1\":\"127.0.0.1:9002\",\"peer2\":\"127.0.0.1:9003\"}}}";
+	struct config *const orig = parse_tmpconf(json);
+	T_CHECK(orig != NULL);
+	T_CHECK((int)orig->identity.peers_count == 2);
+
+	char tmpl[] = "/tmp/conf_listen_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(write_conf_file(orig, tmpl));
+	struct config *const reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT_EQ((int)reparsed->identity.peers_count, 2);
+	T_CHECK(find_peer(reparsed, "peer1") != NULL);
+	T_EXPECT_STREQ(find_peer(reparsed, "peer1")->listen, "127.0.0.1:9002");
+	T_CHECK(find_peer(reparsed, "peer2") != NULL);
+	T_EXPECT_STREQ(find_peer(reparsed, "peer2")->listen, "127.0.0.1:9003");
+
+	conf_free(reparsed);
+	conf_free(orig);
+}
+
 T_DECLARE_CASE(test_conf_parsefile_identity_listen_duplicate_key_last_wins)
 {
 	/* identity_listen_add reuses the existing peer entry on a duplicate
@@ -304,6 +421,39 @@ T_DECLARE_CASE(test_conf_parsefile_identity_listen_duplicate_key_last_wins)
 	T_EXPECT_EQ((int)conf->identity.peers_count, 1);
 	T_CHECK(find_peer(conf, "peer1") != NULL);
 	T_EXPECT_STREQ(find_peer(conf, "peer1")->listen, "127.0.0.1:9004");
+	conf_free(conf);
+}
+
+/* Parsing many identity.listen peers must grow peers[] correctly across several
+ * geometric reallocations (cap 0->4->8->16); every distinct peer must survive
+ * with its own value. */
+T_DECLARE_CASE(test_conf_parsefile_identity_listen_many_peers)
+{
+	enum { NPEERS = 10 };
+	char json[1024];
+	int off = snprintf(
+		json, sizeof(json),
+		"{\"identity\":{\"claim\":\"mynode\","
+		"\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{");
+	for (int i = 0; i < NPEERS; i++) {
+		off += snprintf(
+			json + off, sizeof(json) - (size_t)off,
+			"%s\"peer%d\":\"127.0.0.1:%d\"", i == 0 ? "" : ",", i,
+			9100 + i);
+	}
+	(void)snprintf(json + off, sizeof(json) - (size_t)off, "}}}");
+
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->identity.peers_count, NPEERS);
+	for (int i = 0; i < NPEERS; i++) {
+		char id[16], addr[24];
+		(void)snprintf(id, sizeof(id), "peer%d", i);
+		(void)snprintf(addr, sizeof(addr), "127.0.0.1:%d", 9100 + i);
+		const struct identity_peer *const p = find_peer(conf, id);
+		T_CHECK(p != NULL);
+		T_EXPECT_STREQ(p->listen, addr);
+	}
 	conf_free(conf);
 }
 
@@ -320,6 +470,23 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_listen_value)
 		json, sizeof(json),
 		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer1\":\"%s\"}}}",
 		addr);
+	struct config *const conf = parse_tmpconf(json);
+	T_EXPECT(conf == NULL);
+}
+
+/* identity.listen keys are peer identity strings capped at 255 octets on the
+ * wire; a longer key can never match a connecting peer, so conf_check must
+ * reject it (the map keys bypass the schema's generated per-field checks). */
+T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_listen_key)
+{
+	char key[257];
+	memset(key, 'k', sizeof(key) - 1);
+	key[sizeof(key) - 1] = '\0';
+	char json[512];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"%s\":\"127.0.0.1:9002\"}}}",
+		key);
 	struct config *const conf = parse_tmpconf(json);
 	T_EXPECT(conf == NULL);
 }
@@ -733,6 +900,41 @@ T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
 	conf_free(conf);
 }
 
+/* conf_inline_pem must build the trusted-cert bundle by concatenating every
+ * authcert (a mix of inline and @path entries) with a '\n' separator and exact
+ * sizing -- exercising bundle_append's per-cert len+1 accounting, which the
+ * @path replacement tests never touch. */
+T_DECLARE_CASE(test_conf_inline_pem_concatenates_authcerts_bundle)
+{
+	char ca_tmpl[] = "/tmp/conf_inline_ca_XXXXXX";
+	T_CHECK(write_tmpfile(ca_tmpl, "CA_FROM_FILE") == 0);
+
+	struct config *const conf = conf_new_default();
+	T_CHECK(conf != NULL);
+
+	conf->tls_authcerts = (char **)malloc(3 * sizeof(char *));
+	T_CHECK(conf->tls_authcerts != NULL);
+	conf->tls_authcerts_count = 3;
+	char ca_at[256];
+	(void)snprintf(ca_at, sizeof(ca_at), "@%s", ca_tmpl);
+	conf->tls_authcerts[0] = strdup("INLINE_CA_A");
+	conf->tls_authcerts[1] = strdup(ca_at); /* @path -> file content */
+	conf->tls_authcerts[2] = strdup("INLINE_CA_B");
+	T_CHECK(conf->tls_authcerts[0] != NULL &&
+		conf->tls_authcerts[1] != NULL &&
+		conf->tls_authcerts[2] != NULL);
+
+	T_EXPECT(conf_inline_pem(conf));
+	/* @path entry is inlined, then all three are joined with '\n' and
+	 * NUL-terminated. */
+	T_EXPECT_STREQ(
+		conf->tls_authcerts_bundle,
+		"INLINE_CA_A\nCA_FROM_FILE\nINLINE_CA_B\n");
+
+	(void)unlink(ca_tmpl);
+	conf_free(conf);
+}
+
 T_DECLARE_CASE(test_conf_inline_pem_fails_for_missing_file)
 {
 	/* conf_inline_pem must return false if an @path file does not exist. */
@@ -844,7 +1046,7 @@ T_DECLARE_CASE(test_conf_parsefile_session_window_positive)
 
 T_DECLARE_CASE(test_conf_parsefile_both_windows_positive)
 {
-	/* Both windows positive: stored as frame counts (/ MUX_MAX_PAYLOAD_SIZE),
+	/* Both windows positive: stored as frame counts (/ MUX_WINDOW_UNIT),
 	 * clamped to [4, max]. 32768/16384=2 → 4; 131072/16384=8 in range. */
 	const char *json =
 		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"stream_window\":32768,\"session_window\":131072}}";
@@ -1114,6 +1316,7 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_invalid_type)
 
 static const struct testing_suite suite[] = {
 	T_CASE(test_conf_new_default_fields),
+	T_CASE(test_conf_new_default_matches_empty_parse),
 	T_CASE(test_conf_parsefile_nonexistent),
 	T_CASE(test_conf_parsefile_invalid_json),
 	T_CASE(test_conf_parsefile_rejects_invalid_utf8),
@@ -1121,17 +1324,23 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_parsefile_minimal_client),
 	T_CASE(test_conf_parsefile_minimal_server),
 	T_CASE(test_conf_dump_roundtrip),
+	T_CASE(test_conf_parsefile_mux_max_frame_size_roundtrip),
 	T_CASE(test_conf_identity_connect_count),
 	T_CASE(test_conf_loglevel_parsed),
 	T_CASE(test_conf_parsefile_requires_transport),
 	T_CASE(test_conf_parsefile_requires_claim_for_identity),
+	T_CASE(test_conf_parsefile_requires_claim_for_identity_listen),
+	T_CASE(test_conf_parsefile_accepts_mux_listen_and_mux_connect),
 	T_CASE(test_conf_parsefile_accepts_max_length_identity_claim),
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_claim),
 	T_CASE(test_conf_parsefile_accepts_max_length_listen_address),
 	T_CASE(test_conf_parsefile_rejects_oversized_listen_address),
 	T_CASE(test_conf_parsefile_parses_identity_listen),
+	T_CASE(test_conf_dump_identity_listen_multi_peer_roundtrip),
 	T_CASE(test_conf_parsefile_identity_listen_duplicate_key_last_wins),
+	T_CASE(test_conf_parsefile_identity_listen_many_peers),
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_listen_value),
+	T_CASE(test_conf_parsefile_rejects_oversized_identity_listen_key),
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_mux_connect),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_non_object),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_malformed_json),
@@ -1161,6 +1370,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_load_tls_kernel_offload_off_without_socket_offload),
 	T_CASE(test_conf_load_tls_kernel_offload_explicit_override),
 	T_CASE(test_conf_inline_pem_replaces_at_path),
+	T_CASE(test_conf_inline_pem_concatenates_authcerts_bundle),
 	T_CASE(test_conf_inline_pem_fails_for_missing_file),
 #endif /* WITH_TLS */
 	T_CASE(test_conf_parsefile_ignores_comment_keys),

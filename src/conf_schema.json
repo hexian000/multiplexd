@@ -11,26 +11,31 @@
         "api_listen": {
             "description": "HTTP management API listen address, e.g. '127.0.0.1:9081'.",
             "type": "string",
+            "$comment": "maxLength must equal shim/util.h ADDR_MAX_STRLEN",
             "maxLength": 261
         },
         "mux_listen": {
             "description": "Address to listen for inbound mux connections (server mode).",
             "type": "string",
+            "$comment": "maxLength must equal shim/util.h ADDR_MAX_STRLEN",
             "maxLength": 261
         },
         "mux_connect": {
             "description": "Address to dial for the outbound mux connection (client mode).",
             "type": "string",
+            "$comment": "maxLength must equal shim/util.h ADDR_MAX_STRLEN",
             "maxLength": 261
         },
         "listen": {
             "description": "Local address to accept application connections.",
             "type": "string",
+            "$comment": "maxLength must equal shim/util.h ADDR_MAX_STRLEN",
             "maxLength": 261
         },
         "connect": {
             "description": "Target address to forward application connections to.",
             "type": "string",
+            "$comment": "maxLength must equal shim/util.h ADDR_MAX_STRLEN",
             "maxLength": 261
         },
         "log": {
@@ -320,6 +325,7 @@
                     "items": {
                         "description": "Mux endpoint address to dial.",
                         "type": "string",
+                        "$comment": "maxLength must equal shim/util.h ADDR_MAX_STRLEN",
                         "maxLength": 261
                     }
                 },
@@ -329,6 +335,7 @@
                     "additionalProperties": {
                         "description": "Local TCP address to accept traffic for this peer. A map value, so it bypasses generated per-field checks; maxLength is enforced by conf_check in conf.c instead.",
                         "type": "string",
+                        "$comment": "maxLength must equal shim/util.h ADDR_MAX_STRLEN",
                         "maxLength": 261
                     }
                 }
