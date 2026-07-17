@@ -24,11 +24,15 @@
 static void reset_args(void)
 {
 	memset(&args, 0, sizeof(args));
-	args.loglevel = LOG_LEVEL_NOTICE;
+	/* -1 is production's "not given" sentinel (see the args initializer in
+	 * main.c); NOTICE would masquerade as an explicit --loglevel. */
+	args.loglevel = -1;
 }
 
-/* regression - one CLI-parsing decision per case (happy paths only; the
- * error/--help branches call exit() and are exercised end-to-end elsewhere) */
+/* regression - one CLI-parsing decision per case (happy paths only; the error
+ * branches call exit(), so they cannot run in-process here and are exercised
+ * nowhere -- only --help is covered end-to-end, by smoke_test.py grepping its
+ * usage text) */
 
 T_DECLARE_CASE(test_parse_args_config_short_and_long)
 {
@@ -51,6 +55,31 @@ T_DECLARE_CASE(test_parse_args_loglevel_parses_number)
 	char *argv[] = { "multiplexd", "--loglevel", "6", NULL };
 	parse_args(3, argv);
 	T_EXPECT_EQ(args.loglevel, 6);
+
+	/* Omitting --loglevel leaves the "not given" sentinel (-1) so main() and
+	 * server_apply_config() fall back to the config's level instead of a CLI
+	 * override. */
+	reset_args();
+	char *no_flag[] = { "multiplexd", "-c", "cfg.json", NULL };
+	parse_args(3, no_flag);
+	T_EXPECT_EQ(args.loglevel, -1);
+}
+
+/* Both ends of the range print_usage documents (0-8) must be accepted; a level
+ * above LOG_LEVEL_VERYVERBOSE is an argument error, and like every other
+ * rejection here it exits (see this file's happy-paths-only note). Level 0 also
+ * pins that SILENCE stays distinct from the -1 "not given" sentinel. */
+T_DECLARE_CASE(test_parse_args_loglevel_accepts_documented_bounds)
+{
+	reset_args();
+	char *silence[] = { "multiplexd", "--loglevel", "0", NULL };
+	parse_args(3, silence);
+	T_EXPECT_EQ(args.loglevel, LOG_LEVEL_SILENCE);
+
+	reset_args();
+	char *veryverbose[] = { "multiplexd", "--loglevel", "8", NULL };
+	parse_args(3, veryverbose);
+	T_EXPECT_EQ(args.loglevel, LOG_LEVEL_VERYVERBOSE);
 }
 
 T_DECLARE_CASE(test_parse_args_daemonize_and_dump_config_flags)
@@ -166,6 +195,7 @@ T_DECLARE_CASE(test_parse_args_gencerts_options)
 static const struct testing_suite suite[] = {
 	T_CASE(test_parse_args_config_short_and_long),
 	T_CASE(test_parse_args_loglevel_parses_number),
+	T_CASE(test_parse_args_loglevel_accepts_documented_bounds),
 	T_CASE(test_parse_args_daemonize_and_dump_config_flags),
 	T_CASE(test_parse_args_user_identity),
 	T_CASE(test_drop_privileges_requests_user_only),

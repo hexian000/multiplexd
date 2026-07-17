@@ -49,7 +49,7 @@ static struct {
 	int loglevel;
 	bool daemonize : 1;
 	bool dump_config : 1;
-} args = { .loglevel = LOG_LEVEL_NOTICE };
+} args = { .loglevel = -1 }; /* -1: --loglevel not given on the CLI */
 static void print_usage(const char *argv0)
 {
 	(void)fprintf(
@@ -64,7 +64,8 @@ static void print_usage(const char *argv0)
 		"  -u, --user [user][:[group]]\n"
 		"                             run as the specified identity, e.g. `nobody:nogroup'\n"
 		"  --loglevel <level>         0-8 are Silence, Fatal, Error, Warning, Notice, Info,\n"
-		"                             Debug, Verbose, VeryVerbose respectively (default: 4)\n"
+		"                             Debug, Verbose, VeryVerbose respectively (default: 4);\n"
+		"                             overrides the config's loglevel when given\n"
 		"  --dump-config              dump resolved config with inlined PEM to stdout\n"
 		"\n"
 #if WITH_OPENSSL
@@ -102,6 +103,26 @@ static void print_usage(const char *argv0)
 		exit(EXIT_FAILURE);                                            \
 	} while (false)
 
+/* Parse a plain non-negative decimal integer in [0, max] from a CLI argument
+ * into *out, returning true on success. strtoumax() would skip leading
+ * whitespace and honor a sign -- negating a `-` literal into a huge in-range
+ * magnitude (e.g. `--keysize -...568` wrapping to 2048) -- so require the first
+ * character to be a digit and reject any trailing junk. An overflowing literal
+ * saturates to UINTMAX_MAX, which the `> max` bound rejects. */
+static bool parse_uint_arg(const char *arg, uintmax_t max, uintmax_t *out)
+{
+	if (arg[0] < '0' || arg[0] > '9') {
+		return false;
+	}
+	char *endptr = NULL;
+	const uintmax_t val = strtoumax(arg, &endptr, 10);
+	if (*endptr != '\0' || val > max) {
+		return false;
+	}
+	*out = val;
+	return true;
+}
+
 #if WITH_OPENSSL
 /* Matches and consumes one --gencerts-family flag at argv[*i], advancing *i
  * past its argument; false if argv[*i] is not one of these flags. */
@@ -129,9 +150,8 @@ static bool parse_gencerts_arg(const int argc, char *const *argv, int *i)
 	}
 	if (strcmp(argv[*i], "--keysize") == 0) {
 		OPT_REQUIRE_ARG(argc, argv, *i);
-		char *endptr = NULL;
-		const uintmax_t val = strtoumax(argv[++*i], &endptr, 10);
-		if (endptr == argv[*i] || *endptr != '\0' || val > INT_MAX) {
+		uintmax_t val;
+		if (!parse_uint_arg(argv[++*i], (uintmax_t)INT_MAX, &val)) {
 			LOGF_F("invalid keysize: %s", argv[*i]);
 			exit(EXIT_FAILURE);
 		}
@@ -166,10 +186,10 @@ static void parse_args(const int argc, char *const *argv)
 		if (strcmp(argv[i], "--loglevel") == 0) {
 			OPT_REQUIRE_ARG(argc, argv, i);
 			++i;
-			char *endptr = NULL;
-			const uintmax_t value = strtoumax(argv[i], &endptr, 10);
-			if (endptr == argv[i] || *endptr != '\0' ||
-			    value > INT_MAX) {
+			uintmax_t value;
+			if (!parse_uint_arg(
+				    argv[i], (uintmax_t)LOG_LEVEL_VERYVERBOSE,
+				    &value)) {
 				OPT_ARG_ERROR(argv, i);
 			}
 			args.loglevel = (int)value;
@@ -231,12 +251,16 @@ static void drop_privileges_requests(
 	*changes_gid = colon != NULL && (colon[1] != '\0' || colon != identity);
 }
 
-/* drop_privileges() only logs a warning on failure; verify it actually left
- * the process non-root instead of silently continuing with the original
- * (possibly root) privileges, which would defeat the purpose of -u. Only
- * verify the credential(s) user_name actually requests changing: a valid,
- * documented single-credential -u (e.g. plain "nobody", or ":group") leaves
- * the other credential at its original value by design. */
+/* drop_privileges() (contrib/csnippets/os/daemon.c) abort()s via FAILMSGF on
+ * every real failure -- a bad user/group or a failed set[e]gid/set[e]uid -- so a
+ * failed drop never returns here. What this re-check still catches is the
+ * degenerate case where the drop "succeeds" but the requested credentials
+ * themselves resolve to root (e.g. -u 0, -u 0:0, -u :0): the process would keep
+ * running as root, defeating the purpose of -u, so returning false routes the
+ * caller to a graceful startup failure. Only the credential(s) user_name
+ * actually requests changing are checked: a valid single-credential -u (e.g.
+ * plain "nobody", or ":group") leaves the other credential at its original value
+ * by design. */
 static bool drop_privileges_verified(const char *restrict user_name)
 {
 	bool changes_uid;
@@ -253,10 +277,8 @@ static bool drop_privileges_verified(const char *restrict user_name)
 #define PATH_SEPARATOR '/'
 #endif
 
-static void init(int argc, char *const *argv)
+static void init(void)
 {
-	(void)argc;
-	(void)argv;
 	(void)setlocale(LC_ALL, "");
 	(void)setvbuf(stdout, NULL, _IONBF, 0);
 	slog_setoutput(SLOG_OUTPUT_FILE, stdout);
@@ -299,17 +321,34 @@ static void unloadlibs(void)
 
 int main(int argc, char **argv)
 {
-	init(argc, argv);
+	init();
+	/* parse_args' fatal CLI diagnostics are errors and belong on stderr (as
+	 * print_usage already writes there); every error path exit()s, so a failure
+	 * simply keeps this stderr sink. Restore the stdout boot sink afterwards --
+	 * stdout is deliberate for the daemon body (the config's `log` defaults
+	 * there). */
+	slog_setoutput(SLOG_OUTPUT_FILE, stderr);
 	parse_args(argc, argv);
-	slog_setlevel(args.loglevel);
+	slog_setoutput(SLOG_OUTPUT_FILE, stdout);
+	/* --dump-config writes machine-readable JSON to stdout, so move the log
+	 * off that stream for the rest of the run: config parsing legitimately
+	 * warns (e.g. plaintext mode), and any such line would otherwise land on
+	 * stdout ahead of the JSON and make it unparseable. This branch returns
+	 * before the config's own `log` setting is applied, so nothing points the
+	 * sink back at stdout. */
+	if (args.dump_config) {
+		slog_setoutput(SLOG_OUTPUT_FILE, stderr);
+	}
+	/* Boot/parse-phase log level: the CLI --loglevel if given, else NOTICE.
+	 * Once a config is loaded, the effective runtime level is applied below. */
+	slog_setlevel(args.loglevel >= 0 ? args.loglevel : LOG_LEVEL_NOTICE);
 	loadlibs();
 
 #if WITH_OPENSSL
 	if (args.gencerts != NULL) {
-		const char *kt = (args.keytype != NULL) ? args.keytype : "rsa";
 		if (!gencerts(
-			    args.gencerts, args.server_name, args.sign, kt,
-			    args.keysize)) {
+			    args.gencerts, args.server_name, args.sign,
+			    args.keytype, args.keysize)) {
 			LOGF("failed to generate certificates");
 			return EXIT_FAILURE;
 		}
@@ -354,14 +393,24 @@ int main(int argc, char **argv)
 			conf_free(conf);
 			return EXIT_FAILURE;
 		}
-		(void)fwrite(dump_json, 1, dump_len, stdout);
-		(void)fputc('\n', stdout);
+		/* A short write would hand the caller truncated JSON, so report it
+		 * rather than exiting 0 on output nothing can parse. */
+		const bool written =
+			fwrite(dump_json, 1, dump_len, stdout) == dump_len &&
+			fputc('\n', stdout) != EOF;
 		free(dump_json);
 		conf_free(conf);
+		if (!written) {
+			LOGF_F("failed to write config: %s", strerror(errno));
+			return EXIT_FAILURE;
+		}
 		return EXIT_SUCCESS;
 	}
 
-	slog_setlevel(conf->loglevel);
+	/* An explicit --loglevel wins over the config's loglevel (which conf_check
+	 * always resolves to a value, so it cannot be distinguished from an
+	 * omitted one); otherwise the config's level applies for the daemon body. */
+	slog_setlevel(args.loglevel >= 0 ? args.loglevel : conf->loglevel);
 	if (conf->log != NULL) {
 		if (strcmp(conf->log, "stdout") == 0) {
 			slog_setoutput(SLOG_OUTPUT_FILE, stdout);
@@ -380,26 +429,14 @@ int main(int argc, char **argv)
 
 	{
 		char extensions[128];
-		/* pos is clamped to sizeof(extensions) - 1 after every append:
-		 * snprintf's return can exceed the buffer, and an unclamped pos
-		 * would underflow "sizeof(extensions) - pos" on a later append. */
-		size_t pos = 0;
 		if (conf->identity.mux_connect_count > 0 ||
 		    conf->identity.peers_count > 0) {
-			const int n = snprintf(
-				extensions + pos, sizeof(extensions) - pos,
-				"%sidentity (%zu connect, %zu listen)",
-				pos > 0 ? ", " : "",
+			(void)snprintf(
+				extensions, sizeof(extensions),
+				"identity (%zu connect, %zu listen)",
 				conf->identity.mux_connect_count,
 				conf->identity.peers_count);
-			if (n > 0) {
-				pos += (size_t)n;
-				if (pos >= sizeof(extensions)) {
-					pos = sizeof(extensions) - 1;
-				}
-			}
-		}
-		if (pos == 0) {
+		} else {
 			(void)snprintf(
 				extensions, sizeof(extensions), "%s", "none");
 		}
@@ -415,6 +452,9 @@ int main(int argc, char **argv)
 		conf_free(conf);
 		return EXIT_FAILURE;
 	}
+	/* Carry an explicit --loglevel into the server so SIGHUP reloads honor it
+	 * too (server_apply_config), instead of reverting to the config's level. */
+	server->loglevel_override = args.loglevel;
 	/* Resolve to an absolute path before the possible daemonize() chdir("/")
 	 * below, so a later reload can still find a relative -c path; fall
 	 * back to the original string if realpath() fails. */
