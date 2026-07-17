@@ -14,8 +14,11 @@
 #include <stdbool.h>
 
 /* Generate certificate and key pairs from a comma-separated @p names list.
- * @p sign_cert (optional) signs them; @p keytype is "rsa", "ecdsa", or
- * "ed25519". false on failure. */
+ * @p sign_cert (optional) signs them. The remaining parameters each take a
+ * default when omitted, so a caller can pass its unset options straight
+ * through: @p server_name NULL means "example.com", @p keytype NULL means
+ * "rsa" (otherwise "rsa", "ecdsa", or "ed25519"), and @p keysize 0 means the
+ * key type's own default. false on failure. */
 bool gencerts(
 	const char *names, const char *server_name, const char *sign_cert,
 	const char *keytype, int keysize);

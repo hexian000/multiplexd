@@ -12,9 +12,18 @@
 #include "utils/slog.h"
 #include "utils/testing.h"
 
+#include <openssl/asn1.h>
+#include <openssl/evp.h>
+#include <openssl/obj_mac.h>
+#include <openssl/pem.h>
+#include <openssl/types.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -262,6 +271,36 @@ T_DECLARE_CASE(test_gencerts_skips_all_space_name_token)
 	leave_tmpdir(origdir, tmpl);
 }
 
+/* A list that yields no usable token at all -- an empty string, or nothing but
+ * separators and blanks, as `--gencerts "$NAMES"` produces when NAMES is unset
+ * -- writes no files, so it must be reported as a failure. Reporting success
+ * would tell a provisioning script its certificates exist. Complements
+ * test_gencerts_skips_all_space_name_token, where real tokens remain. */
+T_DECLARE_CASE(test_gencerts_empty_name_list_fails)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool empty_ok = gencerts("", "none.example", NULL, "ed25519", 0);
+	const bool blank_ok =
+		gencerts(" , , ", "none.example", NULL, "ed25519", 0);
+
+	/* The false return alone would also be satisfied by a run that wrote a
+	 * file and then failed for some other reason, so pin the claim this case
+	 * actually makes: a blank token that slipped through would be written
+	 * under the empty name. Captured before teardown, like the X509 cases. */
+	const bool wrote_cert = access("-cert.pem", F_OK) == 0;
+	const bool wrote_key = access("-key.pem", F_OK) == 0;
+
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(!empty_ok);
+	T_EXPECT(!blank_ok);
+	T_EXPECT(!wrote_cert);
+	T_EXPECT(!wrote_key);
+}
+
 T_DECLARE_CASE(test_gencerts_with_signing_cert)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
@@ -444,7 +483,13 @@ T_DECLARE_CASE(test_gencerts_file_permissions)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
+	/* gencerts requests 0644/0600 but open(2) masks the mode by the ambient
+	 * umask, so a hardened inherited umask (0027/0077) would land the cert at
+	 * 0640/0600 and fail the exact assertions below. Clear the umask around
+	 * generation so the created modes are exactly what gencerts requested. */
+	const mode_t old_umask = umask(0);
 	const bool ok = gencerts("perms", "perms.example", NULL, "ed25519", 0);
+	(void)umask(old_umask);
 	T_EXPECT(ok);
 	if (ok) {
 		struct stat st;
@@ -455,6 +500,176 @@ T_DECLARE_CASE(test_gencerts_file_permissions)
 	}
 
 	leave_tmpdir(origdir, tmpl);
+}
+
+/* Read a PEM certificate file (cwd-relative); caller frees with X509_free. */
+static X509 *read_cert_file(const char *restrict path)
+{
+	FILE *const fp = fopen(path, "r");
+	if (fp == NULL) {
+		return NULL;
+	}
+	X509 *const cert = PEM_read_X509(fp, NULL, NULL, NULL);
+	(void)fclose(fp);
+	return cert;
+}
+
+static bool cert_cn_equals(X509 *restrict cert, const char *restrict expect)
+{
+	X509_NAME *const subj = X509_get_subject_name(cert);
+	char cn[256] = { 0 };
+	const int n = X509_NAME_get_text_by_NID(
+		subj, NID_commonName, cn, (int)sizeof(cn));
+	return n > 0 && strcmp(cn, expect) == 0;
+}
+
+static bool cert_has_dns_san(X509 *restrict cert, const char *restrict expect)
+{
+	GENERAL_NAMES *const san =
+		X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+	if (san == NULL) {
+		return false;
+	}
+	bool found = false;
+	const int count = sk_GENERAL_NAME_num(san);
+	for (int i = 0; i < count && !found; i++) {
+		const GENERAL_NAME *const gn = sk_GENERAL_NAME_value(san, i);
+		if (gn->type != GEN_DNS) {
+			continue;
+		}
+		const ASN1_IA5STRING *const dns = gn->d.dNSName;
+		const int len = ASN1_STRING_length(dns);
+		const unsigned char *const data = ASN1_STRING_get0_data(dns);
+		if (len == (int)strlen(expect) &&
+		    memcmp(data, expect, (size_t)len) == 0) {
+			found = true;
+		}
+	}
+	GENERAL_NAMES_free(san);
+	return found;
+}
+
+/* A generated cert must be a usable, correct certificate, not merely a file
+ * that exists: verify the leaf's CN and DNS SAN, that its issuer is the CA's
+ * subject, and that its signature verifies against the CA's public key. */
+T_DECLARE_CASE(test_gencerts_produces_verifiable_cert)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	bool ok = gencerts("ca", "ca.example", NULL, "ed25519", 0);
+	T_CHECK(ok);
+	ok = gencerts("server", "server.example", "ca", "ed25519", 0);
+	T_CHECK(ok);
+
+	X509 *const ca = read_cert_file("ca-cert.pem");
+	X509 *const server = read_cert_file("server-cert.pem");
+
+	/* Capture every result before freeing/teardown so a failing assertion
+	 * cannot leak the X509 objects (they are heap copies, unaffected by
+	 * leave_tmpdir removing the files). */
+	const bool ca_ok = ca != NULL;
+	const bool server_ok = server != NULL;
+	bool cn_ok = false, san_ok = false, issuer_ok = false;
+	int verify_rc = -1;
+	if (ca_ok && server_ok) {
+		cn_ok = cert_cn_equals(server, "server.example");
+		san_ok = cert_has_dns_san(server, "server.example");
+		issuer_ok = X509_NAME_cmp(
+				    X509_get_issuer_name(server),
+				    X509_get_subject_name(ca)) == 0;
+		EVP_PKEY *const ca_pubkey = X509_get_pubkey(ca);
+		verify_rc =
+			ca_pubkey != NULL ? X509_verify(server, ca_pubkey) : -1;
+		EVP_PKEY_free(ca_pubkey);
+	}
+	X509_free(server);
+	X509_free(ca);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ca_ok);
+	T_EXPECT(server_ok);
+	T_EXPECT(cn_ok);
+	T_EXPECT(san_ok);
+	T_EXPECT(issuer_ok);
+	T_EXPECT_EQ(verify_rc, 1);
+}
+
+/* A generated CA certificate must carry keyUsage with keyCertSign, critical,
+ * per RFC 5280 4.2.1.3 -- without it a strict verifier rejects every chain
+ * beneath it. digitalSignature must be asserted too: the same self-signed
+ * certificate is handed to tls.cert as the peer's own end-entity certificate,
+ * and TLS 1.3 signs the handshake with that key, so a keyCertSign-only
+ * keyUsage would break every certificate this tool generates. Presence is
+ * checked via the extension itself because X509_get_key_usage() reports all
+ * bits set when keyUsage is absent. */
+T_DECLARE_CASE(test_gencerts_ca_key_usage)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok = gencerts("kuca", "ku.example", NULL, "ed25519", 0);
+	X509 *const cert = ok ? read_cert_file("kuca-cert.pem") : NULL;
+
+	/* Capture before teardown so a failing assertion cannot leak the X509. */
+	const bool cert_ok = cert != NULL;
+	bool ku_present = false, ku_critical = false;
+	uint32_t ku = 0;
+	if (cert_ok) {
+		int crit = -1;
+		ASN1_BIT_STRING *const ku_ext =
+			X509_get_ext_d2i(cert, NID_key_usage, &crit, NULL);
+		ku_present = ku_ext != NULL;
+		ku_critical = crit > 0;
+		ASN1_BIT_STRING_free(ku_ext);
+		if (ku_present) {
+			ku = X509_get_key_usage(cert);
+		}
+	}
+	X509_free(cert);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ok);
+	T_EXPECT(cert_ok);
+	T_EXPECT(ku_present);
+	T_EXPECT(ku_critical);
+	T_EXPECT((ku & KU_KEY_CERT_SIGN) != 0);
+	T_EXPECT((ku & KU_CRL_SIGN) != 0);
+	T_EXPECT((ku & KU_DIGITAL_SIGNATURE) != 0);
+}
+
+/* keytype == NULL is the documented "use the default" form (gencerts.h), so
+ * main() can pass an omitted --keytype straight through: generate_key() must
+ * take its "rsa" branch rather than reach strcmp(NULL). Asserts the key the
+ * cert actually carries is RSA, not merely that a file appeared; 2048-bit to
+ * keep the test fast. */
+T_DECLARE_CASE(test_gencerts_default_keytype)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok = gencerts("rsadef", "rsa.example", NULL, NULL, 2048);
+	X509 *const cert = ok ? read_cert_file("rsadef-cert.pem") : NULL;
+
+	/* Capture before teardown so a failing assertion cannot leak the X509. */
+	const bool cert_ok = cert != NULL;
+	int key_type = EVP_PKEY_NONE;
+	if (cert_ok) {
+		EVP_PKEY *const pubkey = X509_get_pubkey(cert);
+		if (pubkey != NULL) {
+			key_type = EVP_PKEY_get_base_id(pubkey);
+			EVP_PKEY_free(pubkey);
+		}
+	}
+	X509_free(cert);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ok);
+	T_EXPECT(cert_ok);
+	T_EXPECT_EQ(key_type, EVP_PKEY_RSA);
 }
 
 static const struct testing_suite suite[] = {
@@ -468,6 +683,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_refuses_overwrite_existing_files),
 	T_CASE(test_gencerts_multiple_names),
 	T_CASE(test_gencerts_skips_all_space_name_token),
+	T_CASE(test_gencerts_empty_name_list_fails),
 	T_CASE(test_gencerts_with_signing_cert),
 	T_CASE(test_gencerts_ecdsa_p224),
 	T_CASE(test_gencerts_ecdsa_p384),
@@ -477,8 +693,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_rsa_keysize_too_large_rejected),
 	T_CASE(test_gencerts_rsa_keysize_too_small_rejected),
 	T_CASE(test_gencerts_ecdsa_default_keysize),
+	T_CASE(test_gencerts_default_keytype),
 	T_CASE(test_gencerts_signing_cert_key_mismatch_fails),
 	T_CASE(test_gencerts_file_permissions),
+	T_CASE(test_gencerts_produces_verifiable_cert),
+	T_CASE(test_gencerts_ca_key_usage),
 	T_SUITE_END,
 };
 

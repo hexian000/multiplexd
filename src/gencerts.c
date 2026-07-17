@@ -26,12 +26,10 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-#include <time.h>
 #include <unistd.h>
 
 #define LOG_SSLERROR(s)                                                        \
@@ -82,6 +80,9 @@ enum { RSA_KEYSIZE_MIN = 2048 };
 
 static EVP_PKEY *generate_key(const char *type, int keysize)
 {
+	if (type == NULL) {
+		type = "rsa";
+	}
 	if (strcmp(type, "rsa") == 0) {
 		if (keysize == 0) {
 			keysize = 4096;
@@ -372,6 +373,26 @@ static bool create_certificate(
 		return false;
 	}
 
+	/* RFC 5280 4.2.1.3 requires a conforming CA certificate to carry keyUsage
+	 * with keyCertSign; without it a strict verifier rejects the whole chain
+	 * ("openssl verify -x509_strict" fails with "CA cert does not include key
+	 * usage extension"). digitalSignature is asserted alongside it -- and the
+	 * extended key usage above kept -- because an unsigned `--gencerts <name>`
+	 * certificate is not only a CA: it is also handed straight to tls.cert as
+	 * the peer's own end-entity certificate, and TLS 1.3, the only version
+	 * either backend negotiates, signs the handshake with that key. A
+	 * keyCertSign-only keyUsage would therefore break every self-signed
+	 * certificate this tool generates, since the tool cannot know which of the
+	 * two roles a given one will be used in. Leaf certificates (--sign) assert
+	 * no keyUsage, which leaves them unconstrained -- permitted for end
+	 * entities, and why a narrower CA keyUsage would not affect them. */
+	if (ca && !add_ext(
+			  cert, &v3ctx, NID_key_usage,
+			  "critical,digitalSignature,keyCertSign,cRLSign")) {
+		X509_free(cert);
+		return false;
+	}
+
 	const EVP_MD *md = EVP_sha256();
 	const int pkey_type = EVP_PKEY_get_base_id(sign_key);
 	if (pkey_type == EVP_PKEY_ED25519 || pkey_type == EVP_PKEY_ED448) {
@@ -529,6 +550,7 @@ bool gencerts(
 	}
 
 	bool success = true;
+	size_t generated = 0;
 	char *saveptr = NULL;
 	for (char *name = strtok_r(names_copy, ",", &saveptr); name != NULL;
 	     name = strtok_r(NULL, ",", &saveptr)) {
@@ -571,6 +593,7 @@ bool gencerts(
 
 		X509_free(cert);
 		EVP_PKEY_free(pkey);
+		generated++;
 	}
 
 	free(names_copy);
@@ -580,6 +603,14 @@ bool gencerts(
 	}
 	if (sign_key != NULL) {
 		EVP_PKEY_free(sign_key);
+	}
+
+	/* Every token was empty or blank (e.g. `--gencerts ""` from an unset
+	 * shell variable): nothing was written, so reporting success would tell a
+	 * provisioning script its certificates exist. */
+	if (success && generated == 0) {
+		LOGE_F("no certificate name in list: \"%s\"", names);
+		success = false;
 	}
 
 	if (success) {
