@@ -63,8 +63,13 @@ def run(cmd: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def killall(*names: str) -> None:
+    # Match the process name, not the full command line. With -f, the repo path
+    # in this script's own argv -- and in a concurrent bench.py/smoke_test.py, a
+    # `cmake --build`, or an editor/tail -- matched too, so pkill would SIGKILL
+    # unrelated in-tree processes (dangerous on a shared worktree) and even this
+    # script when run by absolute path.
     for n in names:
-        subprocess.run(["pkill", "-9", "-f", n],
+        subprocess.run(["pkill", "-9", n],
                        stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
 
@@ -427,7 +432,10 @@ class LinearityTest:
             srv_net = max(0.0, d["srv_dur"] - idle_srv)
             cli_net = max(0.0, d["cli_dur"] - idle_cli)
             max_net = max(srv_net, cli_net)
-            eff = f"{max_net / thr:.3f}" if thr > 0 else "N/A"
+            # Store as a float (or None) so render_report's analysis, which
+            # filters rows on isinstance(cpu_per_mbps, float), can actually run;
+            # it is formatted for the table at render time.
+            eff = max_net / thr if thr > 0 else None
 
             row = {
                 "bw": label,
@@ -483,11 +491,13 @@ class LinearityTest:
         lines.append(sep)
 
         for r in rows:
+            eff = r['cpu_per_mbps']
+            eff_str = f"{eff:.3f}" if isinstance(eff, float) else "N/A"
             lines.append(
                 f"| {r['bw']} | {r['thr_mbps']:.1f} | "
                 f"{r['srv_dur_pct']:.1f} | {r['cli_dur_pct']:.1f} | "
                 f"{r['srv_aft_pct']:.1f} | {r['cli_aft_pct']:.1f} | "
-                f"{r['net_cpu_pct']:.1f} | {r['cpu_per_mbps']} |"
+                f"{r['net_cpu_pct']:.1f} | {eff_str} |"
             )
 
         lines.append("")

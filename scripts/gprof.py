@@ -47,8 +47,8 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def check_port_available(port: int, bind_addr: str = "127.0.0.1") -> bool:
-    """Return True if nothing is listening on *bind_addr:port*."""
+def _ss_listen_lines() -> List[str]:
+    """Return the rows of `ss -tlnp`, or [] if ss cannot be run."""
     try:
         proc = subprocess.run(
             ["ss", "-tlnp"],
@@ -57,51 +57,79 @@ def check_port_available(port: int, bind_addr: str = "127.0.0.1") -> bool:
             timeout=5.0,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return True  # cannot determine — assume available
-    needle = "%s:%d" % (bind_addr, port)
-    for line in proc.stdout.splitlines():
-        if needle in line:
-            return False
-    return True
+        return []
+    return proc.stdout.splitlines()
 
 
-def _parse_listening_pids(port: int, bind_addr: str = "127.0.0.1") -> List[int]:
-    """Return list of PIDs listening on *bind_addr:port*."""
+def _line_listen_port(line: str) -> Optional[int]:
+    """Parse the listening port from an `ss -tlnp` row, or None if it is not a
+    socket row. Matches on the port field of the Local Address:Port column so a
+    wildcard bind (``*:P``, ``0.0.0.0:P``, ``[::]:P``) is recognized, not just
+    a loopback one; the header row and IPs both split on the last colon."""
+    fields = line.split()
+    if len(fields) < 4:
+        return None
+    _addr, sep, port_str = fields[3].rpartition(":")
+    if not sep:
+        return None
+    try:
+        return int(port_str)
+    except ValueError:
+        return None
+
+
+def check_port_available(port: int) -> bool:
+    """Return True if nothing is listening on *port* (any bind address)."""
+    return all(_line_listen_port(line) != port for line in _ss_listen_lines())
+
+
+def _parse_listening_pids(port: int) -> List[int]:
+    """Return the PIDs listening on *port* (any bind address)."""
     pids: List[int] = []
-    try:
-        proc = subprocess.run(
-            ["ss", "-tlnp"],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return pids
-    needle = "%s:%d" % (bind_addr, port)
-    for line in proc.stdout.splitlines():
-        if needle not in line:
+    for line in _ss_listen_lines():
+        if _line_listen_port(line) != port:
             continue
-        for part in line.split():
-            if part.startswith("pid="):
-                pid_str = part.split("=", 1)[1].rstrip(",")
-                try:
-                    pids.append(int(pid_str))
-                except ValueError:
-                    pass
+        # The process column is a single ``users:(("name",pid=N,fd=M))`` token,
+        # so scan the whole row rather than expecting a bare ``pid=`` field.
+        pids.extend(int(m) for m in re.findall(r"pid=(\d+)", line))
     return pids
+
+
+def _proc_exe(pid: int) -> Optional[str]:
+    """Return *pid*'s executable path (canonical), or None if unreadable."""
+    try:
+        return os.path.realpath("/proc/%d/exe" % pid)
+    except OSError:
+        return None
 
 
 def kill_leftover_on_ports(
         ports: Sequence[tuple[int, str]],
+        allowed_exes: Sequence[Path],
 ) -> int:
-    """Kill processes holding any of the *ports* (port, description) pairs.
-    Returns count of processes terminated."""
+    """SIGTERM leftover processes holding any of the *ports* (port, desc)
+    pairs, but only when the process executable is one of *allowed_exes* (this
+    project's multiplexd or the iperf3 this script drives). Several of these
+    ports (e.g. 8443, 9081) commonly collide with unrelated local dev services,
+    so a process whose ownership cannot be positively confirmed is left alone
+    rather than killed. Returns the count of processes terminated."""
+    allowed = {os.path.realpath(str(exe)) for exe in allowed_exes}
     killed_pids: set[int] = set()
     for port, desc in ports:
         for pid in _parse_listening_pids(port):
             if pid == os.getpid():
                 continue
             if pid in killed_pids:
+                continue
+            exe = _proc_exe(pid)
+            if exe is None:
+                log("skipping pid %d on port %d (%s): cannot read "
+                    "/proc/%d/exe to confirm it belongs to this project"
+                    % (pid, port, desc, pid))
+                continue
+            if exe not in allowed:
+                log("skipping pid %d on port %d (%s): %s is not this "
+                    "project's multiplexd or iperf3" % (pid, port, desc, exe))
                 continue
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -881,7 +909,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if unavailable:
                 log("ports in use: %s — attempting cleanup" %
                     ", ".join(unavailable))
-                removed = kill_leftover_on_ports(required_ports)
+                removed = kill_leftover_on_ports(
+                    required_ports, [binary_path, Path(iperf3)])
                 if removed:
                     log("cleaned up %d leftover process(es); re-checking ports" % removed)
                     time.sleep(0.5)

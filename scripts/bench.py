@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Sequence, TextIO
 # on sys.path[0]): reuse its builtin RSA-4096 pair instead of a third copy of
 # the same PEM data (the first two are smoke_test.py's own BUILTIN_CERT_PEM/
 # KEY_PEM doc comment and src/tlsutil_test.c's embedded fixture).
-from smoke_test import BUILTIN_CERT_PEM, BUILTIN_KEY_PEM
+from smoke_test import BUILTIN_CERT_PEM, BUILTIN_KEY_PEM, build_has_tls
 
 ROOT = Path.cwd().resolve()
 DEFAULT_BUILD_DIR = ROOT / "build"
@@ -445,6 +445,37 @@ def terminate_process(
             proc.wait(timeout=max(2.0, shutdown_budget.terminate_wait_seconds))
 
 
+def _log_tail(log_path: Optional[Path], n: int = 20) -> str:
+    if log_path is None or not log_path.exists():
+        return "(no log)"
+    try:
+        lines = [
+            line.rstrip()
+            for line in log_path.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+    except OSError:
+        return "(log unreadable)"
+    return "\n".join(lines[-n:]) or "(log empty)"
+
+
+def ensure_process_alive(
+        proc: subprocess.Popen[str], name: str,
+        log_path: Optional[Path] = None) -> None:
+    """Raise SystemExit if *proc* has already exited. Without this a leftover
+    listener holding a port makes the new daemon bind-fail and exit while
+    iperf3 connects to the stale process, so the report measures a different
+    binary -- betrayed only by a 0% CPU / 0 B RSS sample of the dead pid."""
+    ret = proc.poll()
+    if ret is None:
+        return
+    raise SystemExit(
+        "%s exited early (status %d); refusing to record a benchmark that may "
+        "be measuring a different process. Last log lines:\n%s"
+        % (name, ret, _log_tail(log_path)))
+
+
 def open_log(path: Path) -> TextIO:
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.open("w", encoding="utf-8")
@@ -644,19 +675,25 @@ def extract_interval_throughputs(report: Dict[str, object]) -> List[float]:
         if not isinstance(interval, dict):
             continue
         total = 0.0
-        sum_obj = interval.get("sum")
-        if isinstance(sum_obj, dict):
-            bps = sum_obj.get("bits_per_second")
-            if isinstance(bps, (int, float)):
-                total = float(bps)
-        if total == 0.0:
-            streams = interval.get("streams")
-            if isinstance(streams, list):
-                for stream in streams:
-                    if isinstance(stream, dict):
-                        bps = stream.get("bits_per_second")
-                        if isinstance(bps, (int, float)):
-                            total += float(bps)
+        # Sum the per-stream values, which for --bidir/-P cover both
+        # directions. iperf3's interval["sum"] covers only one direction, so
+        # preferring it (and summing streams only when it was zero) understated
+        # bidir/parallel throughput ~8x versus the Total Throughput column and
+        # made the StdDev / Per-Second Throughput table measure a different
+        # quantity. sum is a fallback only when no per-stream breakdown exists.
+        streams = interval.get("streams")
+        if isinstance(streams, list) and streams:
+            for stream in streams:
+                if isinstance(stream, dict):
+                    bps = stream.get("bits_per_second")
+                    if isinstance(bps, (int, float)):
+                        total += float(bps)
+        else:
+            sum_obj = interval.get("sum")
+            if isinstance(sum_obj, dict):
+                bps = sum_obj.get("bits_per_second")
+                if isinstance(bps, (int, float)):
+                    total = float(bps)
         values.append(total)
     return values
 
@@ -1041,16 +1078,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     maybe_reexec_in_netns(args.netem_delay)
     iperf3 = ensure_tool(args.iperf3)
     build_dir = resolve_path(ROOT, args.build_dir)
-    build_cache = parse_cmake_cache(build_dir / "CMakeCache.txt")
     build_dir.mkdir(parents=True, exist_ok=True)
     binary_path = build_dir / "bin" / "multiplexd"
     if not binary_path.exists():
         raise SystemExit("expected binary not found: %s" % binary_path)
-    if args.tls and build_cache.get("USE_TLS_LIBRARY") == "none":
-        raise SystemExit(
-            "TLS requested, but %s was configured with USE_TLS_LIBRARY=none"
-            % build_dir
-        )
+    if args.tls:
+        has_tls = build_has_tls(build_dir)
+        if has_tls is None:
+            # config.h unreadable; fall back to the (less reliable) cache value.
+            build_cache = parse_cmake_cache(build_dir / "CMakeCache.txt")
+            has_tls = build_cache.get("USE_TLS_LIBRARY") != "none"
+        if not has_tls:
+            raise SystemExit(
+                "TLS requested, but %s was configured without TLS "
+                "support (WITH_TLS=0)" % build_dir
+            )
     server_config_path, client_config_path = prepare_runtime_assets(
         build_dir,
         use_tls=args.tls,
@@ -1119,7 +1161,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         time.sleep(args.startup_wait)
 
+        # Fail fast if any daemon died during startup (typically a port held by
+        # a stale listener), before iperf3 can connect to the wrong process.
+        daemons = (
+            (iperf_server_proc, "iperf3 server",
+             build_dir / "iperf3-server.log"),
+            (server_proc, "multiplexd server",
+             build_dir / "multiplexd-server.log"),
+            (client_proc, "multiplexd client",
+             build_dir / "multiplexd-client.log"),
+        )
+        for proc, name, lp in daemons:
+            ensure_process_alive(proc, name, lp)
+
         for scenario in SCENARIOS:
+            # Re-check before recording: a daemon that crashed mid-run would
+            # otherwise be sampled as a dead pid (0% CPU / 0 B RSS).
+            for proc, name, lp in daemons:
+                ensure_process_alive(proc, name, lp)
             commands = build_scenario_commands(
                 iperf3, scenario, args.duration, args.parallel)
             log_paths = [

@@ -214,6 +214,28 @@ def parse_cmake_cache(cache_path: Path) -> Dict[str, str]:
     return cache
 
 
+def build_has_tls(build_dir: Path) -> Optional[bool]:
+    """Return whether the build in *build_dir* has TLS compiled in.
+
+    Read from ``#define WITH_TLS 0|1`` in the generated src/config.h, which
+    records the *effective* backend even when USE_TLS_LIBRARY was left at its
+    "auto" default — CMake resolves "auto" into a local and never writes the
+    result back to CMakeCache.txt, so the cache is not a reliable source.
+    Returns None when it cannot be determined (config.h absent or malformed).
+    """
+    config_h = build_dir / "src" / "config.h"
+    try:
+        text = config_h.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        fields = raw.split()
+        if (len(fields) >= 3 and fields[0] == "#define"
+                and fields[1] == "WITH_TLS"):
+            return fields[2] != "0"
+    return None
+
+
 def write_config(path: Path, payload: Dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=4) + "\n", encoding="utf-8")
 
@@ -810,8 +832,12 @@ class ScenarioResult:
 class Suite:
     only: Optional[set] = None
     results: List[ScenarioResult] = field(default_factory=list)
+    # Every scenario name run() has been offered, whether or not --only ran it.
+    # main() validates --only against this so a typo can't silently skip all.
+    known: set = field(default_factory=set)
 
     def run(self, name: str, fn: Callable[[], Tuple[bool, str]]) -> ScenarioResult:
+        self.known.add(name)
         if self.only is not None and name not in self.only:
             return ScenarioResult(name, True, "skipped", 0.0, "SKIP")
         log("")
@@ -1273,9 +1299,12 @@ def scen_resumption(
     worker = threading.Thread(target=transfer, daemon=True, name="resume-xfer")
     worker.start()
 
-    # Space the drops through the middle of the transfer window.
+    # Space the drops evenly through the transfer window. Each sleep is a delay
+    # relative to the previous drop, so a constant interval places drop k at an
+    # absolute k * target_seconds / (drops + 1); scaling by (i + 1) instead made
+    # the offsets accumulate, landing the last drop at or past the window end.
     for i in range(drops):
-        time.sleep(target_seconds * (i + 1) / (drops + 1))
+        time.sleep(target_seconds / (drops + 1))
         dropped = relay.drop_all()
         log("  relay drop #%d: RST %d connection pair(s)" % (i + 1, dropped))
 
@@ -1517,6 +1546,82 @@ def run_resumption_topology(binary: Path, log_dir: Path, suite: Suite,
         er.stop()
 
 
+# A minimal config that parses cleanly but leaves the transport plaintext, so
+# conf_check emits its plaintext-mode warning while --dump-config runs. Shared
+# by the two scenarios below; each writes its own copy of it.
+PLAINTEXT_PROBE_CONFIG = {
+    "mux_listen": "127.0.0.1:1",
+    "connect": "127.0.0.1:1",
+}
+
+
+def scen_dump_config(binary: Path, log_dir: Path) -> Tuple[bool, str]:
+    """--dump-config must put machine-readable JSON on stdout, and nothing else.
+
+    The config is deliberately plaintext so conf_check warns while parsing it:
+    that diagnostic has to reach stderr, because on stdout it would prepend a
+    `W ...` line to the JSON and break every caller that pipes the output into
+    a parser.
+    """
+    cfg = log_dir / "dump_config.json"
+    write_config(cfg, PLAINTEXT_PROBE_CONFIG)
+    cmd = [str(binary), "-c", str(cfg), "--dump-config"]
+    log("+ %s" % quote_command(cmd))
+    result = subprocess.run(cmd, cwd=str(log_dir), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=30.0)
+    if result.returncode != 0:
+        return False, "exit %d: %s" % (
+            result.returncode, result.stderr.decode(errors="replace").strip())
+    try:
+        dumped = json.loads(result.stdout.decode("utf-8"))
+    except ValueError as exc:
+        return False, "stdout is not JSON (%s): %r" % (
+            exc, result.stdout[:160])
+    if not isinstance(dumped, dict) or "mux_listen" not in dumped:
+        return False, "dumped config lacks mux_listen: %r" % (dumped,)
+    # Without a diagnostic actually being emitted, the check above would pass
+    # even if the sink were still pointed at stdout.
+    stderr_text = result.stderr.decode(errors="replace")
+    if "plaintext" not in stderr_text:
+        return False, ("expected the plaintext-mode warning on stderr, "
+                       "got %r" % stderr_text[:160])
+    return True, "stdout parsed as JSON, warning on stderr"
+
+
+def scen_loglevel_range(binary: Path, log_dir: Path) -> Tuple[bool, str]:
+    """--loglevel must accept exactly the 0-8 the usage text documents.
+
+    The rejection calls exit(), so it is only observable from outside the
+    process; main_test.c covers the accepted bounds but cannot reach this.
+    """
+    cfg = log_dir / "loglevel_range.json"
+    write_config(cfg, PLAINTEXT_PROBE_CONFIG)
+    for level, want_ok in ((0, True), (8, True), (9, False), (99, False)):
+        cmd = [str(binary), "-c", str(cfg), "--loglevel", str(level),
+               "--dump-config"]
+        log("+ %s" % quote_command(cmd))
+        result = subprocess.run(cmd, cwd=str(log_dir), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=30.0)
+        if not want_ok:
+            if result.returncode == 0:
+                return False, ("--loglevel %d accepted, but the usage text "
+                               "documents 0-8" % level)
+            continue
+        if result.returncode != 0:
+            return False, "--loglevel %d rejected: exit %d: %s" % (
+                level, result.returncode,
+                result.stderr.decode(errors="replace").strip())
+        # An accepted level must not disturb the JSON on stdout: level 8 routes
+        # every debug line the boot path emits through the sink, so this is what
+        # pins those lines to stderr rather than ahead of the dump.
+        try:
+            json.loads(result.stdout.decode("utf-8"))
+        except ValueError as exc:
+            return False, "--loglevel %d: stdout is not JSON (%s): %r" % (
+                level, exc, result.stdout[:160])
+    return True, "0/8 accepted with JSON intact, 9/99 rejected"
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1572,10 +1677,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not binary.exists():
         raise SystemExit("multiplexd not found: %s" % binary)
 
-    cmake_cache = parse_cmake_cache(build_dir / "CMakeCache.txt")
-    if cmake_cache.get("USE_TLS_LIBRARY") == "none":
+    has_tls = build_has_tls(build_dir)
+    if has_tls is None:
+        # config.h unreadable; fall back to the (less reliable) cache value.
+        cmake_cache = parse_cmake_cache(build_dir / "CMakeCache.txt")
+        has_tls = cmake_cache.get("USE_TLS_LIBRARY") != "none"
+    if not has_tls:
         raise SystemExit(
-            "TLS not available in this build (USE_TLS_LIBRARY=none); "
+            "TLS not available in this build (WITH_TLS=0); "
             "smoke test requires TLS and --gencerts")
 
     if args.log_dir:
@@ -1620,6 +1729,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 BUILTIN_KEY_PEM, encoding="utf-8")
 
     suite = Suite(only=only)
+    suite.run("dump_config", lambda: scen_dump_config(binary, log_dir))
+    suite.run("loglevel_range", lambda: scen_loglevel_range(binary, log_dir))
     run_load_topology(binary, log_dir, suite, rng, sizes,
                       window=args.window, loglevel=args.loglevel)
     run_parallel_topology(binary, log_dir, suite, rng, sizes,
@@ -1659,6 +1770,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if xpass:
         extras.append("%d unexpectedly passing (xpass)" % xpass)
     suffix = (" [%s]" % ", ".join(extras)) if extras else ""
+    # A mistyped --only name would otherwise skip every scenario and still
+    # report [PASS]; reject any name that matched no registered scenario.
+    if suite.only is not None:
+        unknown = suite.only - suite.known
+        if unknown:
+            raise SystemExit(
+                "--only names no known scenario: %s\nknown scenarios: %s"
+                % (", ".join(sorted(unknown)),
+                   ", ".join(sorted(suite.known))))
     if gating_failures:
         log("[FAIL] %d/%d scenario(s) failed%s" %
             (gating_failures, total, suffix))
