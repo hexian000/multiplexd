@@ -40,13 +40,14 @@ struct listener {
 void listener_init(
 	struct listener *l, const struct conf_socket_opts *socket_opts,
 	listener_serve_fn serve, struct server *server,
-	uint_least64_t *restrict num_accepted);
+	uint_least64_t *num_accepted);
 
 /* Bind @p sa and start accepting; false on bind or setup failure. */
 bool listener_start(
 	struct listener *l, struct ev_loop *loop, const struct sockaddr *sa);
 
-/* Stop accepting and release the listening socket. */
+/* Stop accepting and release the listening socket. Idempotent: safe to call on
+ * an already-stopped (or never-started) listener, so callers need not guard it. */
 void listener_stop(struct listener *l, struct ev_loop *loop);
 
 #endif /* LISTENER_H */

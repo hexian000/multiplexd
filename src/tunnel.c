@@ -53,11 +53,6 @@
 /* Interval between frame_cache trims, in seconds. */
 #define TUNNEL_MAINTENANCE_INTERVAL 10.0
 
-static void task_mux_start(void *p)
-{
-	mux_start(p);
-}
-
 static void tunnel_set_tag_part(
 	char *restrict buf, const size_t buflen, const char *restrict text)
 {
@@ -131,7 +126,7 @@ struct tunnel {
 	char *peer_id;
 	char *peer_identity;
 	/* Session log tag: "my <= peer" or "my => peer". */
-	char tag[256];
+	char tag[TUNNEL_TAG_SIZE];
 	/* Socket options cached at creation; updated on reload. */
 	struct conf_socket_opts mux_socket;
 	struct conf_socket_opts local_socket;
@@ -202,10 +197,11 @@ struct tunnel {
 		 * thread (tunnel_stats).  High-frequency, so relaxed-atomic. */
 #if WITH_THREADS
 		atomic_size_t stream_establish_count;
-		atomic_int_least64_t stream_establish_ns[256];
+		atomic_int_least64_t
+			stream_establish_ns[TUNNEL_ESTABLISH_RING_SIZE];
 #else
 		size_t stream_establish_count;
-		int_least64_t stream_establish_ns[256];
+		int_least64_t stream_establish_ns[TUNNEL_ESTABLISH_RING_SIZE];
 #endif
 	};
 
@@ -217,7 +213,7 @@ struct tunnel {
 #if WITH_THREADS
 		mtx_t mu;
 #endif
-		char tag[256];
+		char tag[TUNNEL_TAG_SIZE];
 		char peer_identity[256];
 		bool has_peer_identity;
 		/* Transport fd and peer address, snapshotted from the session on
@@ -446,7 +442,7 @@ static const double tunnel_reconnect_delays[] = {
 
 static void tunnel_schedule_reconnect(struct tunnel *restrict t)
 {
-	if (t->connect_addr == NULL) {
+	if (t->connect_addr == NULL || t->shutting_down) {
 		return;
 	}
 	const int idx =
@@ -544,10 +540,12 @@ static const struct mux_config *tunnel_conf(const struct tunnel *t)
 }
 
 /* Dirty disconnect on a dialed tunnel: reconnect immediately (attempt 0)
- * before backoff, unless demand-triggered reconnect is in use. */
+ * before backoff, unless the tunnel is shutting down (a reload drained its
+ * removed slot) or demand-triggered reconnect is in use. */
 static void handle_transport_lost(struct tunnel *restrict t)
 {
-	if (t->connect_addr == NULL || tunnel_conf(t)->idle_timeout != 0) {
+	if (t->connect_addr == NULL || t->shutting_down ||
+	    tunnel_conf(t)->idle_timeout != 0) {
 		return;
 	}
 	TUNNEL_LOG(INFO, t, "transport lost, reconnecting");
@@ -583,7 +581,13 @@ static void handle_connected(
 			 * provides thread-safe identity table lookup. */
 			const bool matched = t->relay.parent.verify_peer(
 				t->relay.parent.user, peer_identity);
-			const char *const my = matched ? t->identity : "?";
+			/* t->identity is conf->identity.claim frozen at creation
+			 * and may be NULL (accepted before any identity was
+			 * configured, then a reload added one); guard it like the
+			 * dialed branch does -- passing NULL to "%s" is UB. */
+			const char *const my =
+				(matched && t->identity != NULL) ? t->identity :
+								   "?";
 			tunnel_set_tag(
 				t->tag, sizeof(t->tag), my,
 				" <= ", peer_identity);
@@ -730,6 +734,16 @@ static void tunnel_async_cb(struct ev_loop *loop, ev_async *w, int revents)
 static int tunnel_thread(void *arg)
 {
 	struct tunnel *const restrict t = arg;
+	/* Seed this thread's own PRNG. rand64()/frand() keep xoshiro256** state in
+	 * thread-local storage and only the main thread ever called srand64(), so
+	 * without this every tunnel thread would replay the identical frand()
+	 * sequence -- collapsing the reconnect-backoff jitter (and session.c's
+	 * keepalive jitter) that exists to de-correlate tunnels. Mix the unique
+	 * tunnel_index (via the golden-ratio odd constant) with a monotonic clock
+	 * so threads started at the same instant still get distinct seeds. */
+	srand64((uint_fast64_t)clock_monotonic_ns() ^
+		((uint_fast64_t)t->tunnel_index *
+		 UINT64_C(0x9E3779B97F4A7C15)));
 	ev_run(t->loop, 0);
 	/* If ev_run exits before task_tunnel_teardown is dispatched, drain it
 	 * here so mux_close/free(ss) always run on the allocating thread. */
@@ -741,7 +755,9 @@ static int tunnel_thread(void *arg)
 /* Enqueue a task on this tunnel's own loop/thread, reporting whether it was
  * accepted. The queue is unbounded (dispatcher_invoke falls back to malloc
  * once its inline pool is exhausted), so false means allocation failed, not
- * that a peer is slow to drain it. Runs inline without threads. */
+ * that a peer is slow to drain it; callers own the task's heap payload, if any,
+ * and must free it and report the failure rather than leak or assert. Runs
+ * inline without threads. */
 static bool tunnel_post(struct tunnel *restrict t, struct task task)
 {
 #if WITH_THREADS
@@ -768,8 +784,13 @@ struct resume_attach_arg {
 static void tunnel_resume_attach_task(void *p)
 {
 	struct resume_attach_arg *restrict arg = p;
-	/* Runs on old_t's loop; old_t is pinned alive by the accepted_mu lock the
-	 * server holds across the post. */
+	/* Runs on old_t's own loop/thread. old_t is NOT pinned while this runs --
+	 * on_resume_unpin releases the accepted_mu shared lock right after the post
+	 * that enqueued this task. Safety rests on FIFO ordering instead: tearing
+	 * old_t down first removes it from accepted_tunnels under accepted_mu
+	 * *exclusive*, which cannot proceed until the shared lock this post ran
+	 * under is released, so the teardown task is enqueued strictly after this
+	 * attach task in old_t's queue -- old_t->ss is still live here. */
 	mux_resume_attach(arg->old_t->ss, &arg->transport, arg->resume_seq);
 	free(arg);
 }
@@ -1121,12 +1142,9 @@ struct tunnel *tunnel_new(
 	return t;
 }
 
-/* Enqueue a control task on t's own loop/thread; false means genuine OOM.
- * Callers own the task's heap payload, if any, and must free it and report
- * the failure instead of leaking or asserting. */
-static bool tunnel_dispatch(struct tunnel *t, struct task task)
+static void task_mux_start(void *p)
 {
-	return tunnel_post(t, task);
+	mux_start(p);
 }
 
 static void tunnel_initial_connect_task(void *p)
@@ -1137,24 +1155,49 @@ static void tunnel_initial_connect_task(void *p)
 	}
 }
 
-void tunnel_start(struct tunnel *t)
+bool tunnel_start(struct tunnel *t)
 {
 #if WITH_THREADS
-	THRD_ASSERT(thrd_create(&t->thread, tunnel_thread, t));
+	/* thrd_create fails for real under load (thrd_nomem), so this cannot be a
+	 * THRD_ASSERT: that is a plain assert, compiled out of every shipped build
+	 * (-DNDEBUG), which would leave the tunnel marked started with no thread
+	 * behind it -- queued tasks never running while the server treats it as
+	 * live, and tunnel_close later joining a calloc-zeroed thrd_t. Leaving
+	 * started false instead routes tunnel_close to its "thread never started"
+	 * path, and there is no thread to run the startup dispatches below. The
+	 * false return lets the caller unregister and tunnel_close() the tunnel so
+	 * it is not left registered-but-dead for the life of the process. */
+	const int ret = thrd_create(&t->thread, tunnel_thread, t);
+	if (ret != thrd_success) {
+		/* thrd_nomem is the transient case worth naming; the bare
+		 * enumerator is implementation-defined and means nothing to an
+		 * operator reading the log. */
+		if (ret == thrd_nomem) {
+			TUNNEL_LOG(
+				ERROR, t,
+				"failed to create tunnel thread (OOM)");
+		} else {
+			TUNNEL_LOG_F(
+				ERROR, t,
+				"failed to create tunnel thread (thrd error %d)",
+				ret);
+		}
+		return false;
+	}
 	t->started = true;
-#endif
+#endif /* WITH_THREADS */
 	/* task_mux_start/tunnel_initial_connect_task carry no separate heap
 	 * payload (just t/t->ss), so a failed dispatch has nothing to free --
 	 * only report it. */
-	if (!tunnel_dispatch(t, (struct task){ task_mux_start, t->ss })) {
+	if (!tunnel_post(t, (struct task){ task_mux_start, t->ss })) {
 		TUNNEL_LOG(ERROR, t, "failed to dispatch startup (OOM)");
 	}
 	if (t->connect_addr != NULL &&
-	    !tunnel_dispatch(
-		    t, (struct task){ tunnel_initial_connect_task, t })) {
+	    !tunnel_post(t, (struct task){ tunnel_initial_connect_task, t })) {
 		TUNNEL_LOG(
 			ERROR, t, "failed to dispatch initial connect (OOM)");
 	}
+	return true;
 }
 
 #if WITH_THREADS
@@ -1183,10 +1226,10 @@ void tunnel_close(struct tunnel *t)
 	if (t->started) {
 		/* Suppress mux callbacks, close session, stop event loop. Retry
 		 * once: a concurrent free on another thread may let it succeed. */
-		bool teardown_posted = tunnel_dispatch(
+		bool teardown_posted = tunnel_post(
 			t, (struct task){ task_tunnel_teardown, t });
 		if (!teardown_posted) {
-			teardown_posted = tunnel_dispatch(
+			teardown_posted = tunnel_post(
 				t, (struct task){ task_tunnel_teardown, t });
 		}
 		if (!teardown_posted) {
@@ -1269,10 +1312,10 @@ void tunnel_shutdown(struct tunnel *t)
 	/* Both tasks carry no separate heap payload; attempt both regardless
 	 * of the first outcome (matching a plain no-throw dispatch) and report
 	 * each failure instead of leaking silently. */
-	if (!tunnel_dispatch(t, (struct task){ task_set_shutting_down, t })) {
+	if (!tunnel_post(t, (struct task){ task_set_shutting_down, t })) {
 		TUNNEL_LOG(ERROR, t, "failed to dispatch shutdown (OOM)");
 	}
-	if (!tunnel_dispatch(t, (struct task){ task_mux_shutdown, t->ss })) {
+	if (!tunnel_post(t, (struct task){ task_mux_shutdown, t->ss })) {
 		TUNNEL_LOG(ERROR, t, "failed to dispatch shutdown (OOM)");
 	}
 }
@@ -1297,7 +1340,7 @@ static void task_drop_transport(void *p)
 
 void tunnel_drop_transport(struct tunnel *t)
 {
-	if (!tunnel_dispatch(t, (struct task){ task_drop_transport, t })) {
+	if (!tunnel_post(t, (struct task){ task_drop_transport, t })) {
 		TUNNEL_LOG(ERROR, t, "failed to dispatch drop_transport (OOM)");
 	}
 }
@@ -1371,7 +1414,6 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 {
 	/* mux_state/mux_session_stats read relaxed-atomic mirrors; safe here. */
 	out->established = mux_state(t->ss) == MUX_STATE_ESTABLISHED;
-	out->accepted = t->accepted;
 	out->tunnel_index = t->tunnel_index;
 	/* tag is a string, so copy it from the published snapshot under the lock. */
 	tunnel_pub_lock(t);
@@ -1445,8 +1487,10 @@ static void open_stream_task(void *p)
 	struct mux_stream *const stream = mux_open_stream(arg->ss);
 	if (stream == NULL) {
 		/* Demand-triggered reconnect: when idle-closed/suspended with
-		 * idle_timeout set, reconnect so the next open_stream succeeds. */
-		if (t->connect_addr != NULL &&
+		 * idle_timeout set, reconnect so the next open_stream succeeds.
+		 * Suppressed once shutting_down: a reload that removed this slot
+		 * must not redial the now-stale connect_addr. */
+		if (!t->shutting_down && t->connect_addr != NULL &&
 		    tunnel_conf(t)->idle_timeout > 0 &&
 		    !ev_is_active(&t->w_reconnect) &&
 		    (mux_state(t->ss) == MUX_STATE_SUSPENDED ||
@@ -1479,7 +1523,7 @@ void tunnel_open_stream(struct tunnel *t, const int fd)
 		return;
 	}
 	*arg = (struct open_stream_arg){ .t = t, .ss = t->ss, .fd = fd };
-	if (!tunnel_dispatch(t, (struct task){ open_stream_task, arg })) {
+	if (!tunnel_post(t, (struct task){ open_stream_task, arg })) {
 		TUNNEL_LOG(ERROR, t, "failed to dispatch open_stream (OOM)");
 		free(arg);
 		socket_close(fd);
@@ -1585,7 +1629,7 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 			return;
 		}
 	}
-	if (!tunnel_dispatch(t, (struct task){ reload_task, arg })) {
+	if (!tunnel_post(t, (struct task){ reload_task, arg })) {
 		TUNNEL_LOG(ERROR, t, "failed to dispatch reload (OOM)");
 		free(arg->connect_addr);
 		free(arg->forward_addr);

@@ -173,7 +173,8 @@ struct tunnel_iter {
  * only clears the first match, so the second becomes a dangling pointer
  * identity_listener_pick can return after the tunnel is freed. */
 static bool identity_listener_contains(
-	struct identity_listener *restrict sl, struct tunnel *restrict t)
+	const struct identity_listener *restrict sl,
+	const struct tunnel *restrict t)
 {
 	for (size_t i = 0; i < sl->num_tunnels; i++) {
 		if (sl->tunnels[i] == t) {
@@ -267,9 +268,7 @@ static void fold_closed_tunnel_traffic(
 static void identity_listener_discard(
 	struct server *restrict srv, struct identity_listener *restrict sl)
 {
-	if (sl->listener.w_accept.fd != -1) {
-		listener_stop(&sl->listener, srv->loop);
-	}
+	listener_stop(&sl->listener, srv->loop);
 	for (size_t j = 0; j < sl->num_tunnels; j++) {
 		struct tunnel *const t = sl->tunnels[j];
 		if (tunnel_is_accepted(t)) {
@@ -335,7 +334,7 @@ static struct tunnel *tunnel_iter_next(
 		it->phase = 3;
 		it->sub = 0;
 	}
-	/* phase 3: accepted_sessions */
+	/* phase 3: accepted_tunnels */
 	void *elem = NULL;
 	if (table_next(s->accepted_tunnels, &it->sub, NULL, &elem)) {
 		return elem;
@@ -343,9 +342,51 @@ static struct tunnel *tunnel_iter_next(
 	return NULL;
 }
 
+/* Upper bound on the distinct tunnels server_snapshot_tunnels() can yield, for
+ * sizing its output buffer: the one dialed mux_tunnel (the +1), every
+ * identity_listener's whole tunnels[] pool (round-robin, more than one tunnel
+ * per peer -- so the sum of num_tunnels, not table_size(identities)), every
+ * identity_tunnels[] slot, and every accepted session. Single-sourced for all
+ * four snapshot call sites: a drift between copies previously undersized the
+ * buffer (the P0 fixed in f333738c). The ASSERT bounds one malloc() against the
+ * 16-bit stream-ID space. */
+static size_t server_snapshot_cap(const struct server *restrict s)
+{
+	size_t identity_pool_tunnels = 0;
+	size_t cursor = 0;
+	void *elem;
+	while (table_next(s->identities, &cursor, NULL, &elem)) {
+		const struct identity_listener *const restrict sl = elem;
+		identity_pool_tunnels += sl->num_tunnels;
+	}
+	const size_t n =
+		(s->accepted_tunnels != NULL ? table_size(s->accepted_tunnels) :
+					       0) +
+		1 + identity_pool_tunnels + s->num_identity_tunnels;
+	ASSERT(n <= 65536);
+	return n;
+}
+
+/* Total order on tunnel pointers for the snapshot dedup. Compares the
+ * converted uintptr_t values -- relational operators on pointers into distinct
+ * objects are not well defined, but the integer conversions are. */
+static int cmp_tunnel_ptr(const void *a, const void *b)
+{
+	const uintptr_t va = (uintptr_t)*(struct tunnel *const *)a;
+	const uintptr_t vb = (uintptr_t)*(struct tunnel *const *)b;
+	return (va > vb) - (va < vb);
+}
+
 /* Snapshot every distinct tunnel (accepted + identity-pooled), deduped since
- * tunnel_iter yields a multi-identity tunnel more than once. cap must be at
- * least the caller's precomputed upper bound. */
+ * tunnel_iter yields a pooled tunnel a second time via its identity_tunnels
+ * slot or accepted_tunnels. cap must be at least the caller's precomputed upper
+ * bound -- which equals the raw yield count (it sums every phase's size), so
+ * the with-duplicates sequence collected below always fits.
+ *
+ * Collect the raw sequence, then sort-and-dedup by pointer: O(n log n) instead
+ * of the previous O(n^2) membership scan (worst case ~2e9 comparisons on the
+ * server loop at the 65536-tunnel bound), and robust to any yield multiplicity
+ * without depending on which phases can overlap. */
 static size_t server_snapshot_tunnels(
 	struct server *restrict s, struct tunnel **restrict out,
 	const size_t cap)
@@ -354,16 +395,6 @@ static size_t server_snapshot_tunnels(
 	struct tunnel_iter it = { 0 };
 	struct tunnel *t;
 	while ((t = tunnel_iter_next(s, &it)) != NULL) {
-		bool seen = false;
-		for (size_t i = 0; i < count; i++) {
-			if (out[i] == t) {
-				seen = true;
-				break;
-			}
-		}
-		if (seen) {
-			continue;
-		}
 		ASSERT(count < cap);
 		if (count >= cap) {
 			/* Cannot happen: cap is derived from the same live tables
@@ -373,7 +404,14 @@ static size_t server_snapshot_tunnels(
 		}
 		out[count++] = t;
 	}
-	return count;
+	qsort((void *)out, count, sizeof(struct tunnel *), cmp_tunnel_ptr);
+	size_t distinct = 0;
+	for (size_t i = 0; i < count; i++) {
+		if (i == 0 || out[i] != out[i - 1]) {
+			out[distinct++] = out[i];
+		}
+	}
+	return distinct;
 }
 
 /* Log session establishment/close with peer address formatting */
@@ -472,8 +510,8 @@ static void server_on_established(
 	if (!is_server) {
 		/* Wire the dialed session into the matching identity pool (guard
 		 * against duplicate wiring on re-ESTABLISHED). The staging slot
-		 * is cleared only once reachable through the identity pool;
-		 * otherwise tunnel_iter_next() still yields it via the slot. */
+		 * is deliberately left pointing at the tunnel for its whole life
+		 * (see below), not cleared here. */
 		char peer_id_buf[256];
 		const char *const peer_id =
 			tunnel_peer_identity_copy(
@@ -488,27 +526,38 @@ static void server_on_established(
 			}
 		}
 		if (sl == NULL) {
-			LOGW_F("[fd:%d] dialed session identity \"%s\" matches"
-			       " no configured identity.listen entry; tunnel"
-			       " stays reachable only through its staging slot",
-			       tunnel_fd(t),
-			       peer_id != NULL ? peer_id : "(none)");
-			return;
-		}
-		if (!identity_listener_contains(sl, t) &&
-		    !identity_listener_add(sl, t)) {
-			/* OOM: leave the staging slot in place so the tunnel
-			 * gets a chance to be wired in on the next re-ESTABLISHED. */
-			return;
-		}
-		/* Reachable through the identity pool now; retire the staging
-		 * slot so tunnel_iter_next() does not yield it twice. */
-		for (size_t i = 0; i < srv->num_identity_tunnels; i++) {
-			if (srv->identity_tunnels[i] == t) {
-				srv->identity_tunnels[i] = NULL;
-				break;
+			/* s->mux_tunnel (plain client mode: mux_connect only, no
+			 * identity) is reached via tcp_serve, not an identity pool, so
+			 * having no matching identity.listen entry is normal for it --
+			 * warning would fire on every establishment and reconnect, and
+			 * its "staging slot" remediation is wrong for a tunnel that has
+			 * none. Restrict the warning to identity dial-outs, which are
+			 * the dialed tunnels that do occupy an identity_tunnels[] slot. */
+			if (t != srv->mux_tunnel) {
+				LOGW_F("[fd:%d] dialed session identity \"%s\" matches"
+				       " no configured identity.listen entry; tunnel"
+				       " stays reachable only through its staging slot",
+				       tunnel_fd(t),
+				       peer_id != NULL ? peer_id : "(none)");
 			}
+			return;
 		}
+		if (!identity_listener_contains(sl, t)) {
+			/* OOM here leaves the tunnel unpooled this pass; it
+			 * stays reachable through its staging slot and a later
+			 * re-ESTABLISHED retries the add. */
+			(void)identity_listener_add(sl, t);
+		}
+		/* Deliberately keep identity_tunnels[i] pointing at the tunnel
+		 * for its whole life. Config reload finds the live dialed tunnel
+		 * by slot (server_reload_identity_tunnels treats a NULL slot as
+		 * "closed" and tunnel_set_reload_connect matches by slot); nulling
+		 * it here on establishment made reload mistake the still-live
+		 * pooled tunnel for a closed slot and dial an unbounded stream of
+		 * duplicates. tunnel_iter_next now yields the tunnel via both its
+		 * pool and its slot, which every consumer already dedupes -- an
+		 * accepted tunnel likewise appears in both a pool and
+		 * accepted_tunnels. */
 		return;
 	}
 	char peer_identity_buf[256];
@@ -603,9 +652,10 @@ static void handle_closed(
 				}
 			}
 		}
-		/* identity.mux_connect dial-outs still handshaking live in the
-		 * identity_tunnels[] staging array, not yet wired into any pool;
-		 * they must keep the graceful-shutdown drain alive too. */
+		/* identity.mux_connect dial-outs live in the identity_tunnels[]
+		 * staging array for their whole lifetime (a non-NULL slot means a
+		 * live dial-out, handshaking or established); they must keep the
+		 * graceful-shutdown drain alive too. */
 		for (size_t i = 0; !any_peer && i < srv->num_identity_tunnels;
 		     i++) {
 			if (srv->identity_tunnels[i] != NULL) {
@@ -942,10 +992,28 @@ static void mux_serve(
 		return;
 	}
 
-	srv->counters.num_served++;
 	/* mux_start() starts libev watchers on the tunnel's loop; dispatch
 	 * to the tunnel thread. */
-	tunnel_start(t);
+	if (!tunnel_start(t)) {
+		/* Thread never started: unregister and tear down (tunnel_close
+		 * releases the mux session, closing fd) rather than leave a dead
+		 * tunnel in accepted_tunnels, and do not count it as served.
+		 * table_del can rehash/free, so it must hold accepted_mu against
+		 * concurrent shared-lock readers (server_on_resume_lookup), as
+		 * every other accepted_tunnels mutation does. */
+#if WITH_THREADS
+		THRD_ASSERT(smtx_lock(&srv->accepted_mu));
+#endif
+		srv->accepted_tunnels = table_del(
+			srv->accepted_tunnels, tunnel_session_id(t), NULL);
+#if WITH_THREADS
+		THRD_ASSERT(smtx_unlock(&srv->accepted_mu));
+#endif
+		tunnel_close(t);
+		LOGE_F("[fd:%d] failed to start accepted mux connection", fd);
+		return;
+	}
+	srv->counters.num_served++;
 	LOGI_F("[fd:%d] accepted mux connection", fd);
 }
 
@@ -1075,8 +1143,16 @@ static void tunnel_set_reload_connect(
 		if (s->identity_tunnels[i] != t) {
 			continue;
 		}
-		if (i >= new_ni) {
-			/* Slot removed: prevent reconnect after drain. */
+		/* old_ni is num_identity_tunnels, the identity_tunnels[] high-water
+		 * mark (it only grows), so a slot may outlive the config that
+		 * created it: a tunnel still draining from an earlier, larger
+		 * config occupies slot i >= old_conf's mux_connect_count. Guard the
+		 * old_conf array index by its own count -- old_conf->...[i] would
+		 * otherwise be a heap OOB read whose garbage feeds strnull_eq. */
+		if (i >= new_ni || i >= old_conf->identity.mux_connect_count) {
+			/* Slot removed in the new config, or a stale draining slot
+			 * past the old config's count: keep draining, never
+			 * repoint. */
 			opts->disable_reconnect = true;
 		} else if (!strnull_eq(
 				   old_conf->identity.mux_connect[i],
@@ -1109,25 +1185,7 @@ static void server_drain_tunnels(
 	/* Snapshot and dedupe first so each live tunnel is drained exactly
 	 * once. Heap-allocated (not a VLA): the live tunnel count is
 	 * unbounded in principle. */
-	/* tunnel_iter_next's phase 1 walks every identity_listener's whole
-	 * tunnels[] pool (round-robin, can hold more than one tunnel per
-	 * peer), not just one entry per listener, so the upper bound is the
-	 * sum of num_tunnels, not table_size. */
-	size_t identity_pool_tunnels = 0;
-	{
-		size_t cursor = 0;
-		void *elem;
-		while (table_next(s->identities, &cursor, NULL, &elem)) {
-			const struct identity_listener *const restrict sl =
-				elem;
-			identity_pool_tunnels += sl->num_tunnels;
-		}
-	}
-	const size_t n =
-		(s->accepted_tunnels != NULL ? table_size(s->accepted_tunnels) :
-					       0) +
-		1 + identity_pool_tunnels + s->num_identity_tunnels;
-	ASSERT(n <= 65536);
+	const size_t n = server_snapshot_cap(s);
 	struct tunnel **const snapshot =
 		(struct tunnel **)malloc(n * sizeof(struct tunnel *));
 	if (snapshot == NULL) {
@@ -1170,9 +1228,7 @@ static void server_restart_listener(
 	const char *new_addr, const char *conf_key, const char *kind,
 	const bool warn_if_public)
 {
-	if (l->w_accept.fd != -1) {
-		listener_stop(l, loop);
-	}
+	listener_stop(l, loop);
 	if (new_addr == NULL) {
 		return;
 	}
@@ -1263,9 +1319,7 @@ static void server_reload_identities_changed(
 		void *elem;
 		while (table_next(s->identities, &cursor, NULL, &elem)) {
 			struct identity_listener *restrict sl = elem;
-			if (sl->listener.w_accept.fd != -1) {
-				listener_stop(&sl->listener, s->loop);
-			}
+			listener_stop(&sl->listener, s->loop);
 		}
 	}
 
@@ -1505,7 +1559,35 @@ static void server_reload_mux_tunnel(
 		return;
 	}
 	s->mux_tunnel = t;
-	tunnel_start(t);
+	if (!tunnel_start(t)) {
+		/* Thread never started; drop the slot so a later reload can retry
+		 * (server_reload_mux_tunnel early-returns while mux_tunnel != NULL). */
+		s->mux_tunnel = NULL;
+		tunnel_close(t);
+	}
+}
+
+/* Dial a fresh identity tunnel for the (currently NULL) slot i and store it in
+ * identity_tunnels[i]. Best-effort: on create or start failure the slot is left
+ * NULL so a later reload or maintenance pass can retry. */
+static void server_start_identity_tunnel(
+	struct server *restrict s, const struct config *restrict conf,
+	const size_t i)
+{
+	struct tunnel *const t = server_new_client_tunnel(
+		s, conf, conf->identity.mux_connect[i]);
+	if (t == NULL) {
+		LOGE_F("failed to create identity tunnel[%zu]", i);
+		return;
+	}
+	s->identity_tunnels[i] = t;
+	if (!tunnel_start(t)) {
+		/* Thread never started; clear the slot so a later reload or
+		 * maintenance pass can recreate it (a NULL slot reads as
+		 * "closed"). */
+		s->identity_tunnels[i] = NULL;
+		tunnel_close(t);
+	}
 }
 
 /* Replace closed identity_connect slots and extend the array when the count
@@ -1517,24 +1599,20 @@ static void server_reload_identity_tunnels(
 	const size_t new_ni = new_conf->identity.mux_connect_count;
 	const size_t common_ni = old_ni < new_ni ? old_ni : new_ni;
 
-	/* Replace slots where the previous tunnel has already closed
-	 * (set to NULL by handle_closed via the identity_tunnels fix). */
+	/* Replace slots where the previous tunnel has already closed. Only
+	 * handle_closed nulls a slot (establishment keeps it pointing at the
+	 * live tunnel), so a NULL slot here unambiguously means "closed" -- a
+	 * live-but-established tunnel is never mistaken for one, which would
+	 * otherwise dial an unbounded stream of duplicates. A slot still held by
+	 * a draining orphan is skipped here; maintenance_cb re-dials it once the
+	 * orphan finally closes and frees the slot. */
 	for (size_t i = 0; i < common_ni; i++) {
 		if (s->identity_tunnels[i] != NULL) {
 			/* Tunnel is still live; connect_addr was already
 			 * updated in the pre-drain step above. */
 			continue;
 		}
-		struct tunnel *const t = server_new_client_tunnel(
-			s, new_conf, new_conf->identity.mux_connect[i]);
-		if (t == NULL) {
-			LOGE_F("failed to create identity tunnel[%zu]"
-			       " on reload",
-			       i);
-		} else {
-			s->identity_tunnels[i] = t;
-			tunnel_start(t);
-		}
+		server_start_identity_tunnel(s, new_conf, i);
 	}
 
 	/* Extend the array for new entries beyond the old count. */
@@ -1555,16 +1633,7 @@ static void server_reload_identity_tunnels(
 	}
 	s->num_identity_tunnels = new_ni;
 	for (size_t i = old_ni; i < new_ni; i++) {
-		struct tunnel *const t = server_new_client_tunnel(
-			s, new_conf, new_conf->identity.mux_connect[i]);
-		if (t == NULL) {
-			LOGE_F("failed to create identity tunnel[%zu]"
-			       " on reload",
-			       i);
-		} else {
-			s->identity_tunnels[i] = t;
-			tunnel_start(t);
-		}
+		server_start_identity_tunnel(s, new_conf, i);
 	}
 }
 
@@ -1632,7 +1701,12 @@ bool server_apply_config(struct server *restrict s, struct config *new_conf)
 	}
 #endif
 
-	slog_setlevel(new_conf->loglevel);
+	/* An explicit --loglevel (loglevel_override >= 0) wins over the config's
+	 * loglevel across reloads, matching main()'s boot-path choice; conf_check
+	 * always materializes conf->loglevel, so it cannot itself signal "unset". */
+	slog_setlevel(
+		s->loglevel_override >= 0 ? s->loglevel_override :
+					    new_conf->loglevel);
 	conf_free(old_conf);
 
 	LOGN("config reloaded");
@@ -1696,15 +1770,10 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 			/* Heap-allocated (not a VLA): the live tunnel count is
 			 * unbounded in principle. On OOM, skip this cycle; the
 			 * next tick re-evaluates the wall clock. */
-			const size_t n =
-				(srv->accepted_tunnels != NULL ?
-					 table_size(srv->accepted_tunnels) :
-					 0) +
-				1 + table_size(srv->identities) +
-				srv->num_identity_tunnels;
-			ASSERT(n <= 65536);
+			const size_t n = server_snapshot_cap(srv);
 			struct tunnel **const snapshot =
-				(struct tunnel **)malloc(n * sizeof(*snapshot));
+				(struct tunnel **)malloc(
+					n * sizeof(struct tunnel *));
 			if (snapshot == NULL) {
 				LOGOOM();
 			} else {
@@ -1718,6 +1787,25 @@ static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		}
 	} else {
 		LOGE("clock_unix failed");
+	}
+
+	/* Task 3: re-dial any configured identity slot left empty. A slot goes
+	 * NULL only when its tunnel permanently closes (handle_closed); if the
+	 * current config still wants a tunnel there -- e.g. a slot freed by a
+	 * drained orphan that had shadowed a reconfigured target, or a start that
+	 * failed on reload -- dial it now instead of waiting for the next reload.
+	 * The array high-water mark bounds the index; conf may configure fewer. */
+	{
+		const struct config *const restrict conf = srv->conf;
+		for (size_t i = 0; i < srv->num_identity_tunnels; i++) {
+			if (srv->identity_tunnels[i] != NULL) {
+				continue;
+			}
+			if (i < conf->identity.mux_connect_count &&
+			    conf->identity.mux_connect[i] != NULL) {
+				server_start_identity_tunnel(srv, conf, i);
+			}
+		}
 	}
 }
 
@@ -1752,15 +1840,9 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		ev_signal_stop(loop, &s->w_sigint);
 		ev_signal_stop(loop, &s->w_sigterm);
 
-		if (s->local_listener.w_accept.fd != -1) {
-			listener_stop(&s->local_listener, loop);
-		}
-		if (s->mux_listener.w_accept.fd != -1) {
-			listener_stop(&s->mux_listener, loop);
-		}
-		if (s->api_listener.w_accept.fd != -1) {
-			listener_stop(&s->api_listener, loop);
-		}
+		listener_stop(&s->local_listener, loop);
+		listener_stop(&s->mux_listener, loop);
+		listener_stop(&s->api_listener, loop);
 		{
 			size_t cursor = 0;
 			void *elem;
@@ -1768,9 +1850,7 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 				struct listener *restrict l =
 					&((struct identity_listener *)elem)
 						 ->listener;
-				if (l->w_accept.fd != -1) {
-					listener_stop(l, loop);
-				}
+				listener_stop(l, loop);
 			}
 		}
 
@@ -1778,15 +1858,10 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		 * CLOSED handling mutates accepted_tunnels/identities and would
 		 * invalidate a live iterator. */
 		{
-			const size_t n =
-				(s->accepted_tunnels != NULL ?
-					 table_size(s->accepted_tunnels) :
-					 0) +
-				1 + table_size(s->identities) +
-				s->num_identity_tunnels;
-			ASSERT(n <= 65536);
+			const size_t n = server_snapshot_cap(s);
 			struct tunnel **const snapshot =
-				(struct tunnel **)malloc(n * sizeof(*snapshot));
+				(struct tunnel **)malloc(
+					n * sizeof(struct tunnel *));
 			if (snapshot == NULL) {
 				/* Best-effort: skip graceful dispatch this pass;
 				 * server_stop()'s force-close loop still
@@ -1820,9 +1895,11 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 					}
 				}
 			}
-			/* identity.mux_connect dial-outs still handshaking sit in
-			 * the identity_tunnels[] staging array, not yet in any pool;
-			 * they must still get the graceful drain window. */
+			/* identity.mux_connect dial-outs sit in the
+			 * identity_tunnels[] staging array for their whole
+			 * lifetime (a non-NULL slot means a live dial-out,
+			 * handshaking or established); they must still get the
+			 * graceful drain window. */
 			for (size_t i = 0; !any && i < s->num_identity_tunnels;
 			     i++) {
 				if (s->identity_tunnels[i] != NULL) {
@@ -1856,6 +1933,8 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 		.loop = loop,
 		.conf = conf,
 		.identities = NULL,
+		/* -1 until main() plumbs an explicit --loglevel; see server.h. */
+		.loglevel_override = -1,
 	};
 	listener_init(
 		&srv->local_listener, &conf->tcp, tcp_serve, srv,
@@ -1995,7 +2074,11 @@ static bool server_start_mux_tunnel(struct server *restrict s)
 		return false;
 	}
 	s->mux_tunnel = t;
-	tunnel_start(t);
+	if (!tunnel_start(t)) {
+		s->mux_tunnel = NULL;
+		tunnel_close(t);
+		return false;
+	}
 	return true;
 }
 
@@ -2096,7 +2179,10 @@ static bool server_start_identity_tunnels(struct server *restrict s)
 			       i);
 			return false;
 		}
-		tunnel_start(t);
+		if (!tunnel_start(t)) {
+			tunnel_close(t);
+			return false;
+		}
 		s->identity_tunnels[i] = t;
 	}
 	return true;
@@ -2242,23 +2328,15 @@ void server_stop(struct server *srv)
 	dispatcher_tick(srv->disp);
 #endif
 
-	if (srv->local_listener.w_accept.fd != -1) {
-		listener_stop(&srv->local_listener, loop);
-	}
-	if (srv->mux_listener.w_accept.fd != -1) {
-		listener_stop(&srv->mux_listener, loop);
-	}
-	if (srv->api_listener.w_accept.fd != -1) {
-		listener_stop(&srv->api_listener, loop);
-	}
+	listener_stop(&srv->local_listener, loop);
+	listener_stop(&srv->mux_listener, loop);
+	listener_stop(&srv->api_listener, loop);
 	{
 		size_t cursor = 0;
 		void *elem;
 		while (table_next(srv->identities, &cursor, NULL, &elem)) {
 			struct identity_listener *restrict sl = elem;
-			if (sl->listener.w_accept.fd != -1) {
-				listener_stop(&sl->listener, loop);
-			}
+			listener_stop(&sl->listener, loop);
 		}
 	}
 
@@ -2272,27 +2350,7 @@ void server_stop(struct server *srv)
 	 * within the deadline.  tunnel_iter yields a pool-registered tunnel more
 	 * than once; dedupe so each is closed (and freed) exactly once. */
 	{
-		/* tunnel_iter_next's phase 1 walks every identity_listener's
-		 * whole tunnels[] pool (round-robin, can hold more than one
-		 * tunnel per peer), not just one entry per listener, so the
-		 * upper bound is the sum of num_tunnels, not table_size. */
-		size_t identity_pool_tunnels = 0;
-		{
-			size_t cursor = 0;
-			void *elem;
-			while (table_next(
-				srv->identities, &cursor, NULL, &elem)) {
-				const struct identity_listener *const restrict sl =
-					elem;
-				identity_pool_tunnels += sl->num_tunnels;
-			}
-		}
-		const size_t n = (srv->accepted_tunnels != NULL ?
-					  table_size(srv->accepted_tunnels) :
-					  0) +
-				 1 + identity_pool_tunnels +
-				 srv->num_identity_tunnels;
-		ASSERT(n <= 65536);
+		const size_t n = server_snapshot_cap(srv);
 		struct tunnel **const heap_snapshot =
 			(struct tunnel **)malloc(n * sizeof(struct tunnel *));
 		if (heap_snapshot != NULL) {
@@ -2379,42 +2437,19 @@ static int cmp_intfast64(const void *a, const void *b)
 	return 0;
 }
 
-/* Sum stream lifecycle counters from one accepted tunnel into *data. */
-static bool sum_accepted_stream_cnt(
-	const struct hashtable *table, const void *key, void *element,
-	void *data)
-{
-	(void)table;
-	(void)key;
-	struct server_stats *const restrict out = data;
-	struct tunnel_stats snap;
-	tunnel_stats(element, &snap);
-	out->num_streams += snap.num_streams;
-	out->num_stream_halfopen += snap.num_stream_halfopen;
-	out->num_stream_opened += snap.num_stream_opened;
-	out->num_stream_accepted += snap.num_stream_accepted;
-	out->num_stream_fastopen += snap.num_stream_fastopen;
-	out->num_stream_established += snap.num_stream_established;
-	out->num_stream_succeeded += snap.num_stream_succeeded;
-	out->num_stream_failed += snap.num_stream_failed;
-	out->traffic_byt_mux_recv += snap.byt_mux_recv;
-	out->traffic_byt_mux_sent += snap.byt_mux_sent;
-	out->traffic_byt_push_recv += snap.byt_push_recv;
-	out->traffic_byt_push_sent += snap.byt_push_sent;
-	return true;
-}
-
-/* Context for two-pass collection of accepted tunnels not in any identity pool. */
+/* Context for snapshotting accepted tunnels not in any identity pool. */
 struct unmatched_accepted_ctx {
 	const struct server *s;
-	/* NULL = count pass, non-NULL = populate pass */
 	struct server_stats *out;
-	/* count (count pass) or tunnels[] index (populate pass) */
-	size_t val;
+	size_t val; /* next out->tunnels[] write index */
+	size_t cap; /* out->tunnels[] capacity */
 };
 
-/* table_iterate callback: count or snapshot accepted tunnels that are not
- * wired into any identity pool (peer identity absent or not configured). */
+/* table_iterate callback: snapshot accepted tunnels that are not currently in
+ * any identity pool (peer identity absent, not configured, or a pool insertion
+ * that failed under memory pressure). Runs in a single pass bounded by cap, so a
+ * peer identity flipping mid-scan (the session thread can rewrite
+ * has_peer_identity) can never write past out->tunnels[]. */
 static bool collect_unmatched_accepted(
 	const struct hashtable *table, const void *key, void *element,
 	void *data)
@@ -2428,17 +2463,28 @@ static bool collect_unmatched_accepted(
 			element, peer_id_buf, sizeof(peer_id_buf)) ?
 			peer_id_buf :
 			NULL;
-	if (peer_id != NULL && table_find(ctx->s->identities, peer_id, NULL)) {
-		return true; /* already counted via identity pool */
+	if (peer_id != NULL) {
+		void *elem = NULL;
+		/* Skip only when this tunnel is actually pooled -- the identity
+		 * pool pass emits it there. A configured identity whose
+		 * identity_listener_add() OOM'd left the accepted tunnel matched
+		 * but unpooled; emit it here so the aggregate counters below do
+		 * not drop it. */
+		if (table_find(ctx->s->identities, peer_id, &elem) &&
+		    identity_listener_contains(elem, element)) {
+			return true;
+		}
 	}
-	if (ctx->out == NULL) {
-		ctx->val++;
-	} else {
-		struct tunnel_stats *ts = &ctx->out->tunnels[ctx->val++];
-		ts->peer_identity = NULL;
-		ts->num_tunnels = 1;
-		tunnel_stats(element, ts);
+	ASSERT(ctx->val < ctx->cap);
+	if (ctx->val >= ctx->cap) {
+		/* Cannot happen: cap counts every accepted tunnel. Guard anyway so
+		 * a future sizing mistake cannot become a buffer overflow. */
+		return true;
 	}
+	struct tunnel_stats *ts = &ctx->out->tunnels[ctx->val++];
+	ts->peer_identity = NULL;
+	ts->num_tunnels = 1;
+	tunnel_stats(element, ts);
 	return true;
 }
 
@@ -2485,8 +2531,13 @@ static size_t calc_stream_percentiles(struct server_stats *restrict out)
 
 struct server_stats *server_stats(const struct server *restrict s)
 {
-	/* Count tunnels: mux_tunnel (0 or 1) plus all identity pool members,
-	 * plus accepted tunnels not wired into any identity pool. */
+	/* Upper bound on tunnels[]: mux_tunnel (0 or 1) + every identity-pool
+	 * member + every accepted tunnel. Using table_size for the accepted side
+	 * rather than a classify pass avoids a two-pass race: the session thread
+	 * can flip a peer identity between a count pass and a populate pass,
+	 * reclassifying a tunnel as unmatched and overflowing tunnels[]. A few
+	 * over-allocated slots (pooled accepted tunnels never re-emitted here) are
+	 * harmless; num_tunnels below reflects the actual fill. */
 	size_t n = (s->mux_tunnel != NULL ? 1 : 0);
 	{
 		size_t cursor = 0;
@@ -2495,12 +2546,8 @@ struct server_stats *server_stats(const struct server *restrict s)
 			n += ((struct identity_listener *)elem)->num_tunnels;
 		}
 	}
-	struct unmatched_accepted_ctx unmatched_ctx = { .s = s };
 	if (s->accepted_tunnels != NULL) {
-		table_iterate(
-			s->accepted_tunnels, collect_unmatched_accepted,
-			&unmatched_ctx);
-		n += unmatched_ctx.val;
+		n += table_size(s->accepted_tunnels);
 	}
 
 	struct server_stats *out =
@@ -2592,6 +2639,14 @@ struct server_stats *server_stats(const struct server *restrict s)
 			const struct identity_listener *const restrict sl =
 				elem;
 			for (size_t j = 0; j < sl->num_tunnels; j++) {
+				/* mux_tunnel can also match a configured
+				 * identity.listen key and be pooled; it is
+				 * already emitted above as the standalone
+				 * mux_tunnel entry, so skip it here to avoid
+				 * double-counting its streams/traffic/latency. */
+				if (sl->tunnels[j] == s->mux_tunnel) {
+					continue;
+				}
 				struct tunnel_stats *ts = &out->tunnels[idx];
 				ts->peer_identity = sl->peer_identity;
 				ts->num_tunnels = sl->num_tunnels;
@@ -2600,11 +2655,11 @@ struct server_stats *server_stats(const struct server *restrict s)
 			}
 		}
 	}
-	out->num_tunnels = idx;
 	/* Append accepted tunnels not wired into any identity pool. */
-	if (s->accepted_tunnels != NULL && unmatched_ctx.val > 0) {
-		unmatched_ctx.out = out;
-		unmatched_ctx.val = idx;
+	if (s->accepted_tunnels != NULL) {
+		struct unmatched_accepted_ctx unmatched_ctx = {
+			.s = s, .out = out, .val = idx, .cap = n
+		};
 		table_iterate(
 			s->accepted_tunnels, collect_unmatched_accepted,
 			&unmatched_ctx);
@@ -2612,13 +2667,15 @@ struct server_stats *server_stats(const struct server *restrict s)
 	}
 	out->num_tunnels = idx;
 
-	/* Aggregate stream counters from dialed tunnels (accepted ones are summed
-	 * separately by sum_accepted_stream_cnt). */
+	/* Aggregate stream and traffic counters over every snapshotted tunnel.
+	 * Every accepted tunnel is already in out->tunnels[] (as a pool member or
+	 * an unmatched-accepted entry), so summing from it here -- rather than a
+	 * second table_iterate that re-ran tunnel_stats on each accepted tunnel,
+	 * taking the pub mutex and copying the ~2 KB snapshot incl. the 256-entry
+	 * latency ring -- avoids a redundant O(n) pass and keeps the totals
+	 * consistent with the per-tunnel rows. */
 	for (size_t i = 0; i < out->num_tunnels; i++) {
 		const struct tunnel_stats *const ts = &out->tunnels[i];
-		if (ts->accepted) {
-			continue;
-		}
 		out->num_streams += ts->num_streams;
 		out->num_stream_halfopen += ts->num_stream_halfopen;
 		out->num_stream_opened += ts->num_stream_opened;
@@ -2631,11 +2688,6 @@ struct server_stats *server_stats(const struct server *restrict s)
 		out->traffic_byt_mux_sent += ts->byt_mux_sent;
 		out->traffic_byt_push_recv += ts->byt_push_recv;
 		out->traffic_byt_push_sent += ts->byt_push_sent;
-	}
-	/* Aggregate stream counters from accepted (inbound) tunnels. */
-	if (s->accepted_tunnels != NULL) {
-		table_iterate(
-			s->accepted_tunnels, sum_accepted_stream_cnt, out);
 	}
 
 	out->stream_establish_count = calc_stream_percentiles(out);

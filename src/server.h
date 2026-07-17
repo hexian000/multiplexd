@@ -196,7 +196,8 @@ struct server_stats {
 	uint_least64_t traffic_byt_push_sent;
 
 	/* --- stats route snapshot --- */
-	/* number of latency samples in the ring (capped at 256); 0 = no data */
+	/* merged sample count across all tunnels (<=256 per tunnel, so up to
+	 * 256*num_tunnels); 0 = no data */
 	size_t stream_establish_count;
 	/* SYN->SYN|ACK latency percentiles (ns); valid when count > 0 */
 	int_least64_t stream_establish_p50;
@@ -232,6 +233,11 @@ struct server {
 	struct config *conf;
 	/* path to the config file, used for SIGHUP reload */
 	const char *conf_path;
+	/* Explicit --loglevel from the CLI, or -1 when not given. When set it
+	 * overrides the config's loglevel on every SIGHUP reload
+	 * (server_apply_config), mirroring main()'s boot-path choice so a reload
+	 * cannot silently revert the operator's override. */
+	int loglevel_override;
 #if WITH_TLS
 	/* TLS context for accepted mux connections (server role). */
 	struct tls_context *server_tlsctx;
@@ -266,8 +272,9 @@ struct server {
 	ev_signal w_sighup;
 	ev_signal w_sigint;
 	ev_signal w_sigterm;
-	/* Maintenance timer: runs every second for frame-pool release, system
-	 * suspend detection, and (when shutting_down) the 2 s force-exit deadline. */
+	/* Maintenance timer: runs every second for system suspend detection,
+	 * re-dialing drained identity slots, and (when shutting_down) the 2 s
+	 * force-exit deadline. */
 	ev_timer w_maintenance;
 	/* Set by signal_cb on SIGINT/SIGTERM; suppresses non-shutdown tasks in
 	 * maintenance_cb and gates the early-exit check in handle_closed. */
@@ -282,7 +289,7 @@ struct server {
 #if WITH_THREADS
 	ev_async w_async;
 	struct dispatcher *disp;
-	/* Shared mutex protecting accepted_sessions; exclusive on the server thread
+	/* Shared mutex protecting accepted_tunnels; exclusive on the server thread
 	 * for add/remove, shared on worker threads for lookups. */
 	smtx_t accepted_mu;
 #endif
@@ -306,8 +313,11 @@ struct server {
  * freed, the server keeps its current config, and this returns false. */
 bool server_apply_config(struct server *restrict s, struct config *new_conf);
 
-/* Allocate and initialize a server; takes ownership of @p conf.
- * NULL on allocation/setup failure. */
+/* Allocate and initialize a server; @p conf becomes s->conf on success but the
+ * caller retains ownership of it. NULL on allocation/setup failure, in which
+ * case conf is likewise left for the caller to free. Note that a later
+ * server_apply_config() reload frees the config passed here and installs a new
+ * one, so the caller must free the current s->conf, not the pointer it passed. */
 struct server *server_new(struct ev_loop *loop, struct config *conf);
 
 /* Start listeners, background workers, and outbound sessions; false on failure. */
@@ -316,7 +326,9 @@ bool server_start(struct server *s);
 /* Stop listeners and initiate shutdown of active sessions. */
 void server_stop(struct server *s);
 
-/* Free a stopped server and all owned resources; NULL is allowed. */
+/* Free a stopped server and all owned resources; NULL is allowed. Does not free
+ * s->conf -- the caller owns the config (see server_new) and must free it
+ * separately, using the current s->conf since a reload may have replaced it. */
 void server_free(struct server *s);
 
 /* Allocate a consistent snapshot of all server statistics (caller frees);

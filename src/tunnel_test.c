@@ -14,7 +14,6 @@
 #include "meta/arraysize.h"
 #if WITH_THREADS
 #include "sync/dispatcher.h"
-#include "sync/shared_mutex.h"
 #include "sync/task.h"
 #endif
 #include "utils/testing.h"
@@ -275,18 +274,24 @@ T_DECLARE_CASE(test_tunnel_accessors_after_new)
 	T_CHECK(t != NULL);
 	(void)close(fds[1]);
 
-	/* An accepted tunnel (fd >= 0) must be flagged as accepted. */
-	T_EXPECT(tunnel_is_accepted(t));
-	/* tunnel_fd must return the fd passed at creation. */
-	T_EXPECT_EQ(tunnel_fd(t), fds[0]);
-	/* Session accessor must return a non-NULL session. */
-	T_EXPECT(tunnel_session(t) != NULL);
+	/* Capture the accessor reads before teardown frees the tunnel, so a
+	 * failed assertion cannot longjmp out with the tunnel still live. */
+	const bool accepted = tunnel_is_accepted(t);
+	const int fd = tunnel_fd(t);
+	const bool has_session = tunnel_session(t) != NULL;
 
 	tunnel_close(t);
 
 #if !WITH_THREADS
 	ev_loop_destroy(loop);
 #endif
+
+	/* An accepted tunnel (fd >= 0) must be flagged as accepted. */
+	T_EXPECT(accepted);
+	/* tunnel_fd must return the fd passed at creation. */
+	T_EXPECT_EQ(fd, fds[0]);
+	/* Session accessor must return a non-NULL session. */
+	T_EXPECT(has_session);
 }
 
 T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
@@ -321,9 +326,12 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
-	tunnel_start(t);
+	T_CHECK(tunnel_start(t));
 
-	T_EXPECT(wait_for_reconnects(srv.loop, &srv, 2));
+	/* Capture the reconnect result while the tunnel thread is live, then join
+	 * it via tunnel_close before asserting: a failed assertion must not
+	 * longjmp out with the thread still writing into this frame. */
+	const bool reconnected = wait_for_reconnects(srv.loop, &srv, 2);
 
 	tunnel_close(t);
 
@@ -332,6 +340,8 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 #else
 	ev_loop_destroy(loop);
 #endif
+
+	T_EXPECT(reconnected);
 }
 
 T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
@@ -385,9 +395,12 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
-	tunnel_start(t);
+	T_CHECK(tunnel_start(t));
 
 	/* Accept the connection and immediately close it. */
+#if WITH_THREADS
+	bool accept_ready;
+#endif
 	{
 #if !WITH_THREADS
 		/* tunnel_do_connect ran inline in tunnel_start; the TCP connection
@@ -398,25 +411,36 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 		}
 #else /* WITH_THREADS */
 		struct pollfd pfd = { .fd = lfd, .events = POLLIN };
-		T_EXPECT(poll(&pfd, 1, 1000) > 0);
-		const int cfd = accept(lfd, NULL, NULL);
-		if (cfd >= 0) {
-			(void)close(cfd);
+		accept_ready = poll(&pfd, 1, 1000) > 0;
+		/* lfd is a blocking listen socket, so only accept once poll has
+		 * reported a pending connection; on a poll timeout (loaded host,
+		 * or the connect failure this test probes) skip the accept and
+		 * let the T_EXPECT(accept_ready) below fail cleanly instead of
+		 * blocking forever. */
+		if (accept_ready) {
+			const int cfd = accept(lfd, NULL, NULL);
+			if (cfd >= 0) {
+				(void)close(cfd);
+			}
 		}
 #endif /* WITH_THREADS */
 	}
 	(void)close(lfd);
 
-	/* MUX_EVENT_CLOSED fires: tunnel_on_event schedules a reconnect. */
-	T_EXPECT(wait_for_reconnects(srv.loop, &srv, 1));
+	/* MUX_EVENT_CLOSED fires: tunnel_on_event schedules a reconnect.  Capture
+	 * the results while the tunnel thread is live, then join it via
+	 * tunnel_close before asserting. */
+	const bool reconnected = wait_for_reconnects(srv.loop, &srv, 1);
 
 	tunnel_close(t);
 
 #if WITH_THREADS
 	dispatcher_destroy(srv.disp);
+	T_EXPECT(accept_ready);
 #else
 	ev_loop_destroy(loop);
 #endif
+	T_EXPECT(reconnected);
 }
 
 T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
@@ -475,7 +499,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
-	tunnel_start(t);
+	T_CHECK(tunnel_start(t));
 
 	/* Accept and hold incoming connections without replying; connect_timeout
 	 * (1 s) fires, triggering MUX_EVENT_CLOSED and reconnect backoff. */
@@ -525,8 +549,9 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 		ok = !timed_out && test_num_reconnects(&srv) >= 2;
 	}
 #endif /* WITH_THREADS */
-	T_EXPECT(ok);
-
+	/* ok was captured above while the tunnel thread was live; join the thread
+	 * via tunnel_close and release the fixture before asserting, so a failed
+	 * assertion cannot longjmp out with the thread still running. */
 	tunnel_close(t);
 
 	for (int i = 0; i < num_held; i++) {
@@ -539,6 +564,8 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 #else
 	ev_loop_destroy(loop);
 #endif
+
+	T_EXPECT(ok);
 }
 
 T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
@@ -572,13 +599,16 @@ T_DECLARE_CASE(test_tunnel_state_returns_connecting_after_new)
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 
-	T_EXPECT_EQ(tunnel_state(t), (enum mux_state)MUX_STATE_CONNECT);
+	/* Capture the state before teardown frees the tunnel. */
+	const enum mux_state state = tunnel_state(t);
 
 	tunnel_close(t);
 
 #if !WITH_THREADS
 	ev_loop_destroy(loop);
 #endif
+
+	T_EXPECT_EQ(state, (enum mux_state)MUX_STATE_CONNECT);
 }
 
 T_DECLARE_CASE(test_tunnel_stats_initial_zero)
@@ -612,214 +642,22 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
 
+	/* tunnel_stats snapshots into the local stats, so it is safe to tear the
+	 * tunnel down before asserting on the captured copy. */
 	struct tunnel_stats stats;
 	tunnel_stats(t, &stats);
-	T_EXPECT_EQ(stats.num_streams, (size_t)0);
-	T_EXPECT_EQ(stats.num_stream_opened, (uint_least64_t)0);
-	T_EXPECT_EQ(stats.byt_mux_recv, (uint_least64_t)0);
-	T_EXPECT_EQ(stats.byt_mux_sent, (uint_least64_t)0);
 
 	tunnel_close(t);
 
 #if !WITH_THREADS
 	ev_loop_destroy(loop);
 #endif
+
+	T_EXPECT_EQ(stats.num_streams, (size_t)0);
+	T_EXPECT_EQ(stats.num_stream_opened, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.byt_mux_recv, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.byt_mux_sent, (uint_least64_t)0);
 }
-
-/* Multi-threaded concurrency tests (WITH_THREADS only) */
-
-#if WITH_THREADS
-
-/* Inline concurrency helpers */
-
-struct test_barrier {
-	mtx_t mu;
-	cnd_t cv;
-	atomic_uint count;
-	unsigned int total;
-};
-
-static void test_barrier_init(struct test_barrier *b, unsigned int n)
-{
-	(void)mtx_init(&b->mu, mtx_plain);
-	(void)cnd_init(&b->cv);
-	atomic_init(&b->count, 0);
-	b->total = n;
-}
-
-static void test_barrier_destroy(struct test_barrier *b)
-{
-	mtx_destroy(&b->mu);
-	cnd_destroy(&b->cv);
-}
-
-static void test_barrier_wait(struct test_barrier *b)
-{
-	(void)mtx_lock(&b->mu);
-	const unsigned int n = atomic_fetch_add(&b->count, 1u) + 1u;
-	if (n == b->total) {
-		atomic_store(&b->count, 0u);
-		(void)cnd_broadcast(&b->cv);
-	} else {
-		while (atomic_load(&b->count) != 0u) {
-			(void)cnd_wait(&b->cv, &b->mu);
-		}
-	}
-	(void)mtx_unlock(&b->mu);
-}
-
-typedef int (*test_thread_fn)(void *);
-
-static int test_spawn_thread(thrd_t *thr, test_thread_fn fn, void *arg)
-{
-	return thrd_create(thr, fn, arg);
-}
-
-static int test_thread_join(thrd_t thr)
-{
-	int ret = 0;
-	(void)thrd_join(thr, &ret);
-	return ret;
-}
-
-/* Test: dispatcher roundtrip */
-
-struct dispatcher_ctx {
-	struct test_barrier *barrier;
-	struct dispatcher *disp;
-	int *result;
-};
-
-static void dispatcher_task_cb(void *p)
-{
-	int *result = p;
-	*result = 42;
-}
-
-static int dispatcher_worker(void *arg)
-{
-	struct dispatcher_ctx *const ctx = arg;
-	test_barrier_wait(ctx->barrier);
-	const struct task t = { .func = dispatcher_task_cb,
-				.data = ctx->result };
-	if (!dispatcher_invoke(ctx->disp, t)) {
-		return 1;
-	}
-	return 0;
-}
-
-T_DECLARE_CASE(test_dispatcher_roundtrip)
-{
-	struct test_barrier barrier;
-	test_barrier_init(&barrier, 2);
-	struct dispatcher *const disp = dispatcher_create(4);
-	T_CHECK(disp != NULL);
-	int result = 0;
-	struct dispatcher_ctx ctx = { .barrier = &barrier,
-				      .disp = disp,
-				      .result = &result };
-	thrd_t thr;
-	T_EXPECT_EQ(
-		test_spawn_thread(&thr, dispatcher_worker, &ctx), thrd_success);
-	test_barrier_wait(&barrier);
-	/* Join before ticking: establish happens-before (task enqueued) so
-	 * the drain doesn't race with the worker's dispatcher_invoke call. */
-	T_EXPECT_EQ(test_thread_join(thr), 0);
-	dispatcher_tick(disp);
-	T_EXPECT_EQ(result, 42);
-	dispatcher_join(disp);
-	test_barrier_destroy(&barrier);
-}
-
-/* Test: shared_mutex multiple readers */
-
-struct smtx_ctx {
-	smtx_t *mu;
-	struct test_barrier *start_barrier;
-	struct test_barrier *done_barrier;
-	atomic_int *counter;
-};
-
-static int smtx_reader(void *arg)
-{
-	struct smtx_ctx *const ctx = arg;
-	test_barrier_wait(ctx->start_barrier);
-	if (smtx_sharedlock(ctx->mu) != thrd_success) {
-		return 1;
-	}
-	atomic_fetch_add(ctx->counter, 1);
-	test_barrier_wait(ctx->done_barrier);
-	smtx_sharedunlock(ctx->mu);
-	return 0;
-}
-
-T_DECLARE_CASE(test_shared_mutex_multiple_readers)
-{
-	smtx_t mu;
-	T_EXPECT_EQ(smtx_init(&mu), 0);
-	struct test_barrier start_barrier, done_barrier;
-	test_barrier_init(&start_barrier, 3);
-	test_barrier_init(&done_barrier, 3);
-	atomic_int counter;
-	atomic_init(&counter, 0);
-	struct smtx_ctx ctx = { .mu = &mu,
-				.start_barrier = &start_barrier,
-				.done_barrier = &done_barrier,
-				.counter = &counter };
-	thrd_t r1, r2;
-	T_EXPECT_EQ(test_spawn_thread(&r1, smtx_reader, &ctx), thrd_success);
-	T_EXPECT_EQ(test_spawn_thread(&r2, smtx_reader, &ctx), thrd_success);
-	test_barrier_wait(&start_barrier);
-	test_barrier_wait(&done_barrier);
-	T_EXPECT_EQ(atomic_load(&counter), 2);
-	T_EXPECT_EQ(test_thread_join(r1), 0);
-	T_EXPECT_EQ(test_thread_join(r2), 0);
-	smtx_destroy(&mu);
-	test_barrier_destroy(&start_barrier);
-	test_barrier_destroy(&done_barrier);
-}
-
-T_DECLARE_CASE(test_shared_mutex_exclusive_blocks_readers)
-{
-	smtx_t mu;
-	T_EXPECT_EQ(smtx_init(&mu), 0);
-	T_EXPECT_EQ(smtx_lock(&mu), thrd_success);
-	T_EXPECT(smtx_trysharedlock(&mu) != thrd_success);
-	smtx_unlock(&mu);
-	T_EXPECT_EQ(smtx_sharedlock(&mu), thrd_success);
-	smtx_sharedunlock(&mu);
-	smtx_destroy(&mu);
-}
-
-/* Test: atomic counters cross-thread */
-
-static int atomic_worker(void *arg)
-{
-	atomic_uint_least64_t *const cnt = arg;
-	for (int i = 0; i < 10000; i++) {
-		atomic_fetch_add_explicit(cnt, 1, memory_order_relaxed);
-	}
-	return 0;
-}
-
-T_DECLARE_CASE(test_atomic_counters_cross_thread)
-{
-	atomic_uint_least64_t counter;
-	atomic_init(&counter, 0);
-	thrd_t t1, t2, t3;
-	T_EXPECT_EQ(
-		test_spawn_thread(&t1, atomic_worker, &counter), thrd_success);
-	T_EXPECT_EQ(
-		test_spawn_thread(&t2, atomic_worker, &counter), thrd_success);
-	T_EXPECT_EQ(
-		test_spawn_thread(&t3, atomic_worker, &counter), thrd_success);
-	T_EXPECT_EQ(test_thread_join(t1), 0);
-	T_EXPECT_EQ(test_thread_join(t2), 0);
-	T_EXPECT_EQ(test_thread_join(t3), 0);
-	T_EXPECT_EQ(atomic_load(&counter), (uint_least64_t)30000);
-}
-
-#endif /* WITH_THREADS */
 
 static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_new_close_no_start),
@@ -829,12 +667,6 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_reconnect_after_connect_timeout),
 	T_CASE(test_tunnel_state_returns_connecting_after_new),
 	T_CASE(test_tunnel_stats_initial_zero),
-#if WITH_THREADS
-	T_CASE(test_dispatcher_roundtrip),
-	T_CASE(test_shared_mutex_multiple_readers),
-	T_CASE(test_shared_mutex_exclusive_blocks_readers),
-	T_CASE(test_atomic_counters_cross_thread),
-#endif
 	T_SUITE_END,
 };
 

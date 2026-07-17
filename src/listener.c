@@ -53,7 +53,10 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 			    err == EOPNOTSUPP || err == ENETUNREACH) {
 				break; /* transient per-connection error */
 			}
-			if (err == ENOBUFS || err == ENOMEM) {
+			if (err == ENOBUFS || err == ENOMEM || err == EMFILE ||
+			    err == ENFILE) {
+				/* Transient resource exhaustion, recovered by the
+				 * retry timer below; not a permanent fault. */
 				LOGW_F("accept: (%d) %s", err, strerror(err));
 			} else {
 				LOGE_F("accept: (%d) %s", err, strerror(err));
@@ -95,19 +98,18 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	}
 }
 
-static void
-timer_cb(struct ev_loop *restrict loop, ev_timer *watcher, const int revents)
+static void timer_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	ev_timer_stop(loop, watcher);
-	struct listener *const restrict l = watcher->data;
+	ev_timer_stop(loop, w);
+	struct listener *const restrict l = w->data;
 	ev_io_start(loop, &l->w_accept);
 }
 
 void listener_init(
 	struct listener *l, const struct conf_socket_opts *socket_opts,
 	listener_serve_fn serve, struct server *server,
-	uint_least64_t *restrict num_accepted)
+	uint_least64_t *num_accepted)
 {
 	l->serve = serve;
 	l->srv = server;

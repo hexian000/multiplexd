@@ -58,8 +58,9 @@ struct tunnel_context {
 };
 
 /* Callbacks invoked on the server loop for session lifecycle events.
- * on_event fires for all mux events except ESTABLISHED and RESUMED, which are
- * routed to on_established and on_resumed. */
+ * on_event fires for all mux events except ESTABLISHED and RESUMED (routed to
+ * on_established and on_resumed) and STREAM_ESTABLISHED (consumed by the tunnel
+ * layer for latency stats and never relayed). */
 struct tunnel_callbacks {
 	void (*on_event)(
 		void *data, struct tunnel *t, enum mux_event,
@@ -120,8 +121,11 @@ struct tunnel *tunnel_new(
 	const struct tunnel_opts *restrict opts);
 
 /* Start the tunnel thread and dispatch mux_start.  Must be called once after
- * tunnel_new() succeeds and the tunnel has been registered. */
-void tunnel_start(struct tunnel *t);
+ * tunnel_new() succeeds and the tunnel has been registered.  Returns false if
+ * the tunnel thread could not be created (thrd_nomem under load): the tunnel is
+ * left un-started, and the caller must unregister it and tunnel_close() it
+ * rather than treat it as live.  Always returns true without threads. */
+bool tunnel_start(struct tunnel *t);
 
 /* Force-close: disconnect relay callbacks, suppress mux callbacks, close
  * the session, join the tunnel thread, and free the struct.  Safe even if
@@ -159,6 +163,16 @@ const unsigned char *tunnel_session_id(const struct tunnel *t);
 /* Server-wide monotonic index, never reused; a stable per-tunnel handle. */
 uint_least64_t tunnel_index(const struct tunnel *t);
 
+/* Fixed capacity of a tunnel's diagnostic-tag buffer, shared by struct tunnel
+ * (its private working tag and its published snapshot) and by struct
+ * tunnel_stats below, so the cross-struct tag copies in tunnel_stats() are
+ * provably in bounds. Shrinking one alone would otherwise risk an OOB access. */
+enum { TUNNEL_TAG_SIZE = 256 };
+
+/* Fixed capacity of the SYN->SYN|ACK latency ring, shared by struct tunnel and
+ * struct tunnel_stats below for the same reason. */
+enum { TUNNEL_ESTABLISH_RING_SIZE = 256 };
+
 /* Snapshot of per-tunnel statistics. */
 struct tunnel_stats {
 	/* borrowed pointer to the identity string for this tunnel's pool;
@@ -168,10 +182,7 @@ struct tunnel_stats {
 	uint_least64_t tunnel_index;
 	/* the tunnel's diagnostic tag ("my <= peer"), copied from the session
 	 * thread's published snapshot */
-	char tag[256];
-	/* true for passively-accepted (server-role) tunnels; used by
-	 * server_stats() to avoid double-counting stream counters. */
-	bool accepted;
+	char tag[TUNNEL_TAG_SIZE];
 	/* total tunnels in this identity's pool (1 for mux_tunnel) */
 	size_t num_tunnels;
 	bool established;
@@ -202,10 +213,13 @@ struct tunnel_stats {
 	/* SYN->SYN|ACK latency ring (ns); stream_establish_count is the monotonic
 	 * write index.  Populated only for dialed tunnels. */
 	size_t stream_establish_count;
-	int_least64_t stream_establish_ns[256];
+	int_least64_t stream_establish_ns[TUNNEL_ESTABLISH_RING_SIZE];
 };
 
-/* Populate *out with a consistent snapshot of tunnel statistics. */
+/* Populate *out with a consistent snapshot of this tunnel's own statistics.
+ * out->peer_identity and out->num_tunnels are server-level facts this function
+ * does not touch -- the caller owns them and sets them around this call; every
+ * other field is written here. */
 void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out);
 
 /* Dispatch a new outbound stream opening to the session's tunnel loop.
