@@ -22,28 +22,12 @@
 
 #include <ev.h>
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 
 #if WITH_TLS
-/* on_send notifier: the library staged outbound ciphertext.  Mark the
- * transport write side pending so the session schedules a flush; the
- * cleared-each-pass tx_pending makes an over-eager set self-correcting. */
-static void wire_on_tls_send(void *ctx)
-{
-	struct mux_session *const restrict ss = ctx;
-	ss->wire.tx_pending = true;
-}
-
-/* on_recv notifier: the library holds buffered plaintext readable without
- * further I/O. */
-static void wire_on_tls_recv(void *ctx)
-{
-	struct mux_session *const restrict ss = ctx;
-	ss->wire.tls_readable = true;
-}
-
 /* Drain buffered TLS ciphertext to the socket, retaining what cannot be
  * accepted yet; returns 0 when done, EAGAIN when the socket is full,
  * or another errno on a fatal error. */
@@ -55,35 +39,35 @@ static int wire_cipher_push(struct mux_session *restrict ss)
 		 * on_send notifier reports when more becomes available). */
 		for (;;) {
 			if (ss->wire.rawbuf == NULL) {
-				ss->wire.rawbuf = ringbuf_new(IO_BUFSIZE);
+				ss->wire.rawbuf = bytebuf_new(IO_BUFSIZE);
 				if (ss->wire.rawbuf == NULL) {
 					LOGOOM();
 					return ENOMEM;
 				}
 			}
-			if (ringbuf_write_space(ss->wire.rawbuf) == 0 &&
-			    !ringbuf_reserve(
+			if (bytebuf_write_space(ss->wire.rawbuf) == 0 &&
+			    !bytebuf_reserve(
 				    &ss->wire.rawbuf, IO_BUFSIZE, true)) {
 				LOGOOM();
 				return ENOMEM;
 			}
-			struct ringbuf *const rb = ss->wire.rawbuf;
+			struct bytebuf *const rb = ss->wire.rawbuf;
 			const size_t n = tls_output(
-				ss->wire.tlsconn, ringbuf_write_ptr(rb),
-				ringbuf_write_space(rb));
+				ss->wire.tlsconn, bytebuf_write_ptr(rb),
+				bytebuf_write_space(rb));
 			if (n == 0) {
 				break;
 			}
-			ringbuf_produce(rb, n);
+			bytebuf_produce(rb, n);
 		}
-		struct ringbuf *const rb = ss->wire.rawbuf;
-		const size_t avail = ringbuf_readable(rb);
+		struct bytebuf *const rb = ss->wire.rawbuf;
+		const size_t avail = bytebuf_readable(rb);
 		if (avail == 0) {
 			return 0; /* fully drained */
 		}
 		size_t nbytes = avail;
 		const int err = socket_send(
-			ss->w_socket.fd, ringbuf_read_ptr(rb), &nbytes);
+			ss->w_socket.fd, bytebuf_read_ptr(rb), &nbytes);
 		if (err != 0) {
 			if (err == EAGAIN || err == EWOULDBLOCK ||
 			    err == ENOBUFS || err == ENOMEM) {
@@ -93,7 +77,7 @@ static int wire_cipher_push(struct mux_session *restrict ss)
 			       strerror(err));
 			return err;
 		}
-		ringbuf_consume(rb, nbytes);
+		bytebuf_consume(rb, nbytes);
 		if (nbytes < avail) {
 			return EAGAIN; /* partial write; socket full */
 		}
@@ -306,7 +290,7 @@ bool wire_send(
 
 bool wire_recv(
 	struct mux_session *restrict ss, unsigned char *restrict buf,
-	size_t *len)
+	size_t *restrict len)
 {
 #if WITH_TLS
 	if (ss->wire.tlsconn != NULL) {
@@ -386,11 +370,11 @@ void wire_discard_buffers(struct mux_session *restrict ss)
 	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
 	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
 	ss->wire.sendbuf_staging = false;
-	ringbuf_reset(ss->wire.recvbuf);
+	bytebuf_reset(ss->wire.recvbuf);
 #if WITH_TLS
 	/* Drop any outbound ciphertext staged for the (now torn-down) connection. */
 	if (ss->wire.rawbuf != NULL) {
-		ringbuf_reset(ss->wire.rawbuf);
+		bytebuf_reset(ss->wire.rawbuf);
 	}
 #endif
 }
@@ -446,10 +430,24 @@ enum wire_flush_result wire_flush(struct mux_session *restrict ss)
 void wire_set_tlsctx(
 	struct mux_session *restrict ss, struct tls_context *restrict tlsctx)
 {
-	if (ss->wire.tlsctx == tlsctx) {
-		return;
-	}
 	ss->wire.tlsctx = tlsctx;
+}
+
+/* on_send notifier: the library staged outbound ciphertext.  Mark the
+ * transport write side pending so the session schedules a flush; the
+ * cleared-each-pass tx_pending makes an over-eager set self-correcting. */
+static void wire_on_tls_send(void *ctx)
+{
+	struct mux_session *const restrict ss = ctx;
+	ss->wire.tx_pending = true;
+}
+
+/* on_recv notifier: the library holds buffered plaintext readable without
+ * further I/O. */
+static void wire_on_tls_recv(void *ctx)
+{
+	struct mux_session *const restrict ss = ctx;
+	ss->wire.tls_readable = true;
 }
 
 bool wire_tls_start(struct mux_session *restrict ss)
@@ -579,6 +577,37 @@ enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
 	return WIRE_SHUTDOWN_DONE;
 }
 
+#if WITH_TLS
+/* Map a post-shutdown tls_recv() result to a wire_eof outcome. Shared by
+ * wire_wait_eof's memory-transport and fd-backed branches so the four-way
+ * mapping cannot drift between them. */
+static enum wire_eof_result eof_from_tls_recv(
+	const struct mux_session *restrict ss, const enum tls_error err,
+	const size_t nread)
+{
+	switch (err) {
+	case TLS_ERROR_ZERO_RETURN:
+		return WIRE_EOF_CONFIRMED; /* peer's close_notify */
+	case TLS_ERROR_WANT_READ:
+	case TLS_ERROR_WANT_WRITE:
+		/* tls_shutdown is one-way: close_notify has not arrived yet. */
+		return WIRE_EOF_PENDING;
+	case TLS_ERROR_NONE:
+		if (nread == 0) {
+			/* close_notify not yet arrived, no stray data. */
+			return WIRE_EOF_PENDING;
+		}
+		/* nread > 0: unexpected application data after shutdown. */
+		LOGD_F("[fd:%d] unexpected data after shutdown",
+		       ss->w_socket.fd);
+		return WIRE_EOF_ERROR;
+	default:
+		LOGD_F("[fd:%d] TLS error after shutdown", ss->w_socket.fd);
+		return WIRE_EOF_ERROR;
+	}
+}
+#endif /* WITH_TLS */
+
 enum wire_eof_result wire_wait_eof(struct mux_session *restrict ss)
 {
 	unsigned char buf[256];
@@ -605,44 +634,13 @@ enum wire_eof_result wire_wait_eof(struct mux_session *restrict ss)
 		size_t nread = sizeof(buf);
 		const enum tls_error err =
 			tls_recv(ss->wire.tlsconn, buf, &nread);
-		switch (err) {
-		case TLS_ERROR_ZERO_RETURN:
-			return WIRE_EOF_CONFIRMED; /* peer's close_notify */
-		case TLS_ERROR_WANT_READ:
-		case TLS_ERROR_WANT_WRITE:
-			/* tls_shutdown is one-way: close_notify has not arrived yet. */
-			return WIRE_EOF_PENDING;
-		case TLS_ERROR_NONE:
-			LOGD_F("[fd:%d] unexpected data after shutdown",
-			       ss->w_socket.fd);
-			return WIRE_EOF_ERROR;
-		default:
-			LOGD_F("[fd:%d] TLS error after shutdown",
-			       ss->w_socket.fd);
-			return WIRE_EOF_ERROR;
-		}
+		return eof_from_tls_recv(ss, err, nread);
 	}
 	if (ss->wire.tlsconn != NULL) {
 		size_t nread = sizeof(buf);
 		const enum tls_error err =
 			tls_recv(ss->wire.tlsconn, buf, &nread);
-		switch (err) {
-		case TLS_ERROR_ZERO_RETURN:
-			return WIRE_EOF_CONFIRMED; /* peer's close_notify */
-		case TLS_ERROR_WANT_READ:
-		case TLS_ERROR_WANT_WRITE:
-			/* tls_shutdown is one-way: close_notify has not arrived yet. */
-			return WIRE_EOF_PENDING;
-		case TLS_ERROR_NONE:
-			/* nread > 0: unexpected application data after shutdown. */
-			LOGD_F("[fd:%d] unexpected data after shutdown",
-			       ss->w_socket.fd);
-			return WIRE_EOF_ERROR;
-		default:
-			LOGD_F("[fd:%d] TLS error after shutdown",
-			       ss->w_socket.fd);
-			return WIRE_EOF_ERROR;
-		}
+		return eof_from_tls_recv(ss, err, nread);
 	}
 #endif /* WITH_TLS */
 	size_t len = sizeof(buf);

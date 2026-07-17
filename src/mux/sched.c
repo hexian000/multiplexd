@@ -10,8 +10,9 @@
  */
 
 /* Local scheduler invariants; full model in doc/impl.md.
- * ready FIFO and lp queue share prev/next (mutually exclusive); delay list
- * uses delay_prev/next; drr_active is off-FIFO while spending its budget. */
+ * ready FIFO and lp queue share the singly-linked next (mutually exclusive);
+ * delay list uses delay_prev/next; drr_active is off-FIFO while spending its
+ * budget. */
 
 #include "mux/sched.h"
 
@@ -25,7 +26,6 @@
 
 #include "algo/hashtable.h"
 #include "binary/serial.h"
-#include "os/clock.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
 
@@ -36,7 +36,7 @@
 #include <string.h>
 
 /* Bulk teardown callback: frees each stream; non-tombstone streams are failed. */
-static bool stream_free_and_decount_cb(
+static bool fail_and_free_cb(
 	const struct hashtable *table, const void *key, void *element,
 	void *data)
 {
@@ -65,12 +65,10 @@ void sched_free_streams(struct mux_session *restrict ss)
 		d->delay_pending = false;
 	}
 	ss->sched.delay_head = NULL;
-	ss->unacked.stalled = false;
 	ss->sched.num_tombstones = 0;
 	ss->sched.next_stream_id = 0;
 	if (ss->sched.streams != NULL) {
-		table_iterate(
-			ss->sched.streams, stream_free_and_decount_cb, ss);
+		table_iterate(ss->sched.streams, fail_and_free_cb, ss);
 		table_free(ss->sched.streams);
 		ss->sched.streams = NULL;
 	}
@@ -79,15 +77,24 @@ void sched_free_streams(struct mux_session *restrict ss)
 bool sched_add_stream(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
+	/* Reject a duplicate ID *before* touching the table: table_set would
+	 * replace the existing mapping with s and return the old element, but the
+	 * callers respond to a false return by stream_free(s) -- which would leave
+	 * the table holding a freed pointer and orphan the original stream. */
+	if (ss->sched.streams != NULL) {
+		void *found = NULL;
+		if (table_find(
+			    ss->sched.streams, (const void *)(uintptr_t)s->id,
+			    &found)) {
+			return false;
+		}
+	}
 	void *elem = s;
 	ss->sched.streams = table_set(
 		ss->sched.streams, (const void *)(uintptr_t)s->id, &elem);
-	/* table_set's inout element (algo/hashtable.h): NULL on a fresh insert,
-	 * the previous element on a duplicate-ID collision, and unchanged (== s)
-	 * when the table was NULL or a grow allocation failed. Only a fresh
-	 * insert into a live table is success; any non-NULL elem means a
-	 * collision (different stream already at this ID) or a failure, so the
-	 * old `elem == s` check silently accepted a real collision. */
+	/* elem is NULL on a fresh insert; it stays == s (mapping not created) when
+	 * the table was NULL or a grow allocation failed -- the only non-NULL cases
+	 * left now that a duplicate is rejected above. */
 	if (ss->sched.streams == NULL || elem != NULL) {
 		return false;
 	}
@@ -145,22 +152,6 @@ uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss)
 	return STREAMID_CTRL;
 }
 
-static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
-{
-	struct mux_stream *const s = ss->sched.sched_head;
-	if (s != NULL) {
-		ss->sched.sched_head = s->next;
-		if (ss->sched.sched_head == NULL) {
-			ss->sched.sched_tail = NULL;
-		} else {
-			ss->sched.sched_head->prev = NULL;
-		}
-		s->next = NULL;
-		s->sched_queue = SCHED_QUEUE_NONE;
-	}
-	return s;
-}
-
 void sched_delay_remove(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
@@ -186,7 +177,6 @@ sched_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 	    !ev_is_active(&s->w_tombstone)) {
 		s->sched_queue = SCHED_QUEUE_DRR;
 		s->next = NULL;
-		s->prev = ss->sched.sched_tail;
 		if (ss->sched.sched_tail != NULL) {
 			ss->sched.sched_tail->next = s;
 		} else {
@@ -210,7 +200,6 @@ sched_lp_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 	if (s->sched_queue == SCHED_QUEUE_NONE) {
 		s->sched_queue = SCHED_QUEUE_LP;
 		s->next = NULL;
-		s->prev = ss->sched.lp_tail;
 		if (ss->sched.lp_tail != NULL) {
 			ss->sched.lp_tail->next = s;
 		} else {
@@ -291,7 +280,6 @@ sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 		session_send_push(ss, s, frame);
 		COUNTER_ADD(ss->cnt.num_stream_fastopen, 1);
 		stream_mark_syn_sent(s);
-		s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
 		return;
 	}
 	const uint_fast32_t inc = stream_grant_inc(s);
@@ -302,7 +290,6 @@ sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 		s->id);
 	s->grant_sent += inc * MUX_WINDOW_UNIT;
 	stream_mark_syn_sent(s);
-	s->syn_sent_ns = (int_least64_t)clock_monotonic_ns();
 }
 
 static void sched_remove_stream(
@@ -332,11 +319,24 @@ void sched_drain_lp(struct mux_session *restrict ss)
 
 	while (ss->sched.lp_head != NULL) {
 		struct mux_stream *const s = ss->sched.lp_head;
+		/* Defer an INIT SYN *before* popping when a partially-written frame
+		 * occupies the sendbuf head (staging entries, pos==0, are safe), so s
+		 * stays at the FIFO head and the open-order SYN batch is preserved --
+		 * re-enqueuing it at the tail would rotate the queue every pass. CLOSED
+		 * cleanup below never defers. */
+		if (s->state == STREAM_INIT && ss->wire.sendbuf.head != NULL &&
+		    ss->wire.sendbuf.head->pos > 0) {
+			MUX_LOG_F(
+				DEBUG, ss,
+				"idle scheduler waiting for sendbuf drain before SYN"
+				" on stream %" PRIuLEAST16 " frame=%zu/%zu",
+				s->id, ss->wire.sendbuf.head->pos,
+				ss->wire.sendbuf.head->len);
+			break;
+		}
 		ss->sched.lp_head = s->next;
 		if (ss->sched.lp_head == NULL) {
 			ss->sched.lp_tail = NULL;
-		} else {
-			ss->sched.lp_head->prev = NULL;
 		}
 		s->sched_queue = SCHED_QUEUE_NONE;
 		s->next = NULL;
@@ -348,20 +348,6 @@ void sched_drain_lp(struct mux_session *restrict ss)
 		}
 
 		if (s->state == STREAM_INIT) {
-			/* Defer SYN when a partially-written frame occupies
-			 * sendbuf head; staging entries (pos==0) are safe. */
-			if (ss->wire.sendbuf.head != NULL &&
-			    ss->wire.sendbuf.head->pos > 0) {
-				MUX_LOG_F(
-					DEBUG, ss,
-					"idle scheduler waiting for sendbuf drain before SYN"
-					" on stream %" PRIuLEAST16
-					" frame=%zu/%zu",
-					s->id, ss->wire.sendbuf.head->pos,
-					ss->wire.sendbuf.head->len);
-				sched_lp_enqueue(ss, s);
-				break;
-			}
 			sched_send_syn(ss, s);
 			if (s->state == STREAM_INIT) {
 				/* SYN send failed (OOM); no SYN reached the
@@ -416,12 +402,7 @@ static void sched_send_ctrl_flags(
 	const bool has_ack_pending =
 		(s->state != STREAM_INIT && s->state != STREAM_SYN_SENT &&
 		 s->state != STREAM_SYN_RECEIVED && s->ack_pending);
-	const bool has_fin_pending =
-		(s->rx_eof &&
-		 !(s->state == STREAM_FIN_WAIT || s->state == STREAM_CLOSING) &&
-		 s->send_queue.head == NULL &&
-		 (s->state == STREAM_ESTABLISHED ||
-		  s->state == STREAM_CLOSE_WAIT));
+	const bool has_fin_pending = stream_fin_pending(s);
 
 	if (!has_ack_pending && !has_fin_pending) {
 		return;
@@ -494,6 +475,20 @@ static void sched_drr_continue(
 	 * preserving leftover deficit. */
 	ss->sched.drr_active = NULL;
 	sched_wake(ss, s);
+}
+
+static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
+{
+	struct mux_stream *const s = ss->sched.sched_head;
+	if (s != NULL) {
+		ss->sched.sched_head = s->next;
+		if (ss->sched.sched_head == NULL) {
+			ss->sched.sched_tail = NULL;
+		}
+		s->next = NULL;
+		s->sched_queue = SCHED_QUEUE_NONE;
+	}
+	return s;
 }
 
 /* Scan the DRR ready queue and stage at most one PUSH frame; skips streams
@@ -603,8 +598,8 @@ bool sched_next_data(struct mux_session *restrict ss)
  * ACK/FIN until the next round even during a session stall, when
  * send_stage_next relies on this call to keep flowing regardless.
  * The 8-byte control frames pack into one staging entry.
- * Never calls stream_check_ack — ack_pending is set only by the receive
- * path. */
+ * Never calls stream_check_ack — ack_pending is set by the receive path and by
+ * sched_coalesce_cb (which arms it for a stream with a pending grant). */
 void sched_flush_ctrl(struct mux_session *restrict ss)
 {
 	if (ss->sched.drr_active != NULL &&

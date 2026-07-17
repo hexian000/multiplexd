@@ -3,7 +3,7 @@
 
 /**
  * @file frame.h
- * @brief Mux frame layout, constants, serialization helpers, and ring buffer.
+ * @brief Mux frame layout, constants, serialization helpers, and byte buffer.
  */
 
 #ifndef MUX_FRAME_H
@@ -28,7 +28,7 @@
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
    |           Stream ID           |             Extra             |
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |              Payload (0-16384 octets)
+   |              Payload (0-65535 octets)
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+- ......
 
    The 2-byte Extra field interpretation depends on frame flags:
@@ -65,8 +65,8 @@
 #define MUX_NAGLE_TICKS 1
 
 /* Number of ticks before a sub-threshold delayed-ACK grant is flushed.
- * 1 tick × 40 ms = 40 ms, halving the ACK latency relative to the common
- * 200 ms TCP delayed-ACK limit while still coalescing within a tick. */
+ * 1 tick × 40 ms = 40 ms, one fifth of the common 200 ms TCP delayed-ACK limit,
+ * while still coalescing within a tick. */
 #define MUX_DELAYED_ACK_TICKS 1
 
 /* Maximum coalescing ticks before a pending session ACK is forced out.
@@ -291,23 +291,26 @@ static inline void mux_read_header(
 	header->extra = read_uint16(buf + 6);
 }
 
-/* --- Ring buffer --- */
+/* --- Byte buffer --- */
 
-struct ringbuf {
+/* Linear (not circular) byte FIFO: readable bytes are the contiguous region
+ * [off, off+len); it recovers space by memmove-compacting toward off==0, not by
+ * wrapping, so bytebuf_reserve can cost an O(len) copy. */
+struct bytebuf {
 	size_t off, len, cap;
 	unsigned char data[];
 };
 
-bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow);
+bool bytebuf_reserve(struct bytebuf **restrict rbp, size_t need, bool can_grow);
 
-/* Shrink the ring's capacity back toward target_cap, reclaiming memory grown to
- * assemble an oversized inbound frame.  Never shrinks below the live byte count,
- * and is a no-op when the capacity is already at or below target_cap. */
-void ringbuf_shrink(struct ringbuf **restrict rbp, size_t target_cap);
+/* Shrink the buffer's capacity back toward target_cap, reclaiming memory grown
+ * to assemble an oversized inbound frame.  Never shrinks below the live byte
+ * count, and is a no-op when the capacity is already at or below target_cap. */
+void bytebuf_shrink(struct bytebuf **restrict rbp, size_t target_cap);
 
-static inline struct ringbuf *ringbuf_new(const size_t cap)
+static inline struct bytebuf *bytebuf_new(const size_t cap)
 {
-	struct ringbuf *const rb = malloc(sizeof(struct ringbuf) + cap);
+	struct bytebuf *const rb = malloc(sizeof(struct bytebuf) + cap);
 	if (rb == NULL) {
 		return NULL;
 	}
@@ -317,45 +320,45 @@ static inline struct ringbuf *ringbuf_new(const size_t cap)
 	return rb;
 }
 
-static inline void ringbuf_free(struct ringbuf *restrict rb)
+static inline void bytebuf_free(struct bytebuf *restrict rb)
 {
 	free(rb);
 }
 
-static inline void ringbuf_reset(struct ringbuf *restrict rb)
+static inline void bytebuf_reset(struct bytebuf *restrict rb)
 {
 	rb->off = 0;
 	rb->len = 0;
 }
 
-static inline size_t ringbuf_readable(const struct ringbuf *restrict rb)
+static inline size_t bytebuf_readable(const struct bytebuf *restrict rb)
 {
 	return rb->len;
 }
 
-static inline size_t ringbuf_write_space(const struct ringbuf *restrict rb)
+static inline size_t bytebuf_write_space(const struct bytebuf *restrict rb)
 {
 	return rb->cap - rb->off - rb->len;
 }
 
 static inline const unsigned char *
-ringbuf_read_ptr(const struct ringbuf *restrict rb)
+bytebuf_read_ptr(const struct bytebuf *restrict rb)
 {
 	return rb->data + rb->off;
 }
 
-static inline unsigned char *ringbuf_write_ptr(struct ringbuf *restrict rb)
+static inline unsigned char *bytebuf_write_ptr(struct bytebuf *restrict rb)
 {
 	return rb->data + rb->off + rb->len;
 }
 
-static inline void ringbuf_produce(struct ringbuf *restrict rb, size_t n)
+static inline void bytebuf_produce(struct bytebuf *restrict rb, size_t n)
 {
-	ASSERT(n <= ringbuf_write_space(rb));
+	ASSERT(n <= bytebuf_write_space(rb));
 	rb->len += n;
 }
 
-static inline void ringbuf_consume(struct ringbuf *restrict rb, size_t n)
+static inline void bytebuf_consume(struct bytebuf *restrict rb, size_t n)
 {
 	ASSERT(n <= rb->len);
 	rb->off += n;
@@ -365,7 +368,7 @@ static inline void ringbuf_consume(struct ringbuf *restrict rb, size_t n)
 	}
 }
 
-static inline void ringbuf_compact(struct ringbuf *restrict rb)
+static inline void bytebuf_compact(struct bytebuf *restrict rb)
 {
 	if (rb->off == 0 || rb->len == 0) {
 		if (rb->len == 0) {
@@ -381,7 +384,7 @@ static inline void ringbuf_compact(struct ringbuf *restrict rb)
  * Dynamic circular array of struct mux_frame * pointers: O(1) tail push, O(k)
  * head trim, heap-allocated as a single block (entries[] is a FAM). */
 
-#define MUX_FRAME_RING_MIN 16
+#define MUX_FRAME_RING_MIN 16u
 
 struct mux_frame_ring {
 	size_t capacity;

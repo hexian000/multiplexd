@@ -3,7 +3,7 @@
 
 /* sched_test.c - white-box tests for sched.c (DRR/LP queues, stream-id
  * allocation, coalescing, control-frame emission); sched.c #included, its
- * collaborators mocked; benches opt-in via BENCH env. */
+ * collaborators mocked; benches opt-in via TESTING_BENCH env. */
 
 #include "mux/frame.h"
 #include "mux/mux.h"
@@ -23,9 +23,12 @@
 #include <string.h>
 
 /* frame.c data global the header-inline framing helpers reference; defined here
- * since this white-box TU does not link frame.c. */
+ * since this white-box TU does not link frame.c. Keep max_frame_payload in step
+ * with the real definition in frame.c (16384 - MUX_FRAME_HEADER_SIZE): it feeds
+ * make_session's ss.max_payload, the DRR quantum, so the fairness tests must run
+ * against the same quantum the daemon uses. */
 const struct mux_config mux_conf_default = {
-	.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE,
+	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 	.readahead = 128 * 1024,
 };
 
@@ -90,7 +93,7 @@ int stream_format_tag(
 	return snprintf(buf, buflen, "[stream]:");
 }
 
-void update_watcher(struct mux_session *ss)
+static void update_watcher(struct mux_session *ss)
 {
 	(void)ss;
 	g_update_watcher_calls++;
@@ -128,14 +131,14 @@ void stream_mark_fin_sent(struct mux_stream *s)
 	g_mark_fin_sent_calls++;
 }
 
-bool session_send_push(
-	struct mux_session *ss, struct mux_stream *s, struct mux_frame *frame)
+void session_send_push(
+	struct mux_session *ss, struct mux_stream *restrict s,
+	struct mux_frame *restrict frame)
 {
 	(void)ss;
 	g_send_push_calls++;
 	g_last_sent_frame = frame;
 	g_last_push_stream_id = s->id;
-	return true;
 }
 
 struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
@@ -356,9 +359,12 @@ T_DECLARE_CASE(test_sched_add_stream_rejects_duplicate_id)
 	T_EXPECT(sched_add_stream(&ss, &first));
 	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)1);
 
-	/* Same ID, different object: rejected, and no new table entry created. */
+	/* Same ID, different object: rejected, no new entry, and the table still
+	 * maps the ID to the ORIGINAL stream -- a replace-then-free would have left
+	 * it holding a dangling pointer to the caller-freed duplicate. */
 	T_EXPECT(!sched_add_stream(&ss, &second));
 	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)1);
+	T_EXPECT(sched_find_stream(&ss, 7) == &first);
 
 	cleanup_session(&ss);
 }
@@ -383,7 +389,13 @@ T_DECLARE_CASE(test_sched_free_streams_clears_stream_counter)
 	T_EXPECT(ss.cnt.num_stream_failed == NULL);
 	T_EXPECT_EQ(g_stream_free_calls, 2);
 	T_EXPECT(ss.sched.streams == NULL);
-	T_EXPECT(!ss.unacked.stalled);
+	/* The send-stall gate is not the scheduler's to clear: it belongs to the
+	 * reliability module and falls with the unacked bytes in
+	 * unacked_free_all(), which every teardown caller pairs with this. Assert
+	 * the gate is left alone rather than merely saying so, since this suite
+	 * compiles the real sched.c and would otherwise not notice the
+	 * cross-module poke coming back. */
+	T_EXPECT(ss.unacked.stalled);
 
 	cleanup_session(&ss);
 }
@@ -685,7 +697,7 @@ T_DECLARE_CASE(test_sched_sole_stream_drains_without_requeue)
 	cleanup_session(&ss);
 }
 
-T_DECLARE_CASE(test_sched_cb_sends_syn_for_init_stream)
+T_DECLARE_CASE(test_sched_drain_lp_sends_syn_for_init_stream)
 {
 	struct mux_session ss;
 	make_session(&ss);
@@ -905,7 +917,7 @@ T_DECLARE_CASE(test_lp_queue_double_enqueue_prevented)
 	cleanup_session(&ss);
 }
 
-T_DECLARE_CASE(test_sched_next_data_skips_blocked_stream)
+T_DECLARE_CASE(test_sched_next_data_skips_empty_queue_stream)
 {
 	struct mux_session ss;
 	make_session(&ss);
@@ -1139,7 +1151,7 @@ T_DECLARE_CASE(test_sched_schedule_self_guards_on_queue_and_sendbuf)
 	cleanup_session(&ss);
 }
 
-/* bench - DRR ready-queue churn (opt-in: run with BENCH set in the env) */
+/* bench - DRR ready-queue churn (opt-in: run with TESTING_BENCH set in the env) */
 
 T_DECLARE_BENCH(bench_sched_enqueue_dequeue)
 {
@@ -1307,9 +1319,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_sched_next_data_reroutes_closed_stream_to_lp),
 	T_CASE(test_sched_next_data_sends_frame_and_resets_deficit_on_drain),
 	T_CASE(test_sched_sole_stream_drains_without_requeue),
-	T_CASE(test_sched_cb_sends_syn_for_init_stream),
+	T_CASE(test_sched_drain_lp_sends_syn_for_init_stream),
 	T_CASE(test_sched_coalesce_forces_session_ack_after_tick_budget),
-	T_CASE(test_sched_next_data_skips_blocked_stream),
+	T_CASE(test_sched_next_data_skips_empty_queue_stream),
 	T_CASE(test_sched_next_data_exhausts_queue_returns_false),
 	T_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit),
 	T_CASE(test_sched_schedule_self_guards_on_queue_and_sendbuf),
@@ -1328,7 +1340,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_sched_drain_lp_frees_closed_stream),
 	T_CASE(test_sched_coalesce_cb_decrements_multi_tick),
 	/* Opt-in micro-benchmark: ~1s, skipped by the default (unfiltered) run.
-	 * Select with `--run <ere>` or TESTING_FILTER. */
+	 * Select with `--bench <ere>` or TESTING_BENCH. */
 	T_BENCH(bench_sched_enqueue_dequeue),
 	T_SUITE_END,
 };

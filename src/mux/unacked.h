@@ -32,16 +32,13 @@ struct unacked_ctx {
 	/* Byte offset into the ring head entry while it is partially trimmed
 	 * across unacked_ack_trim calls; 0 once the head is fully popped. */
 	uint_least32_t partial_offset;
-	/* Count of non-stream-0 frames sent (advanced on each ring push);
-	 * 32-bit serial number (RFC 1982). */
-	uint_least32_t send_seq;
 	/* Count of non-stream-0 frames received. */
 	uint_least32_t recv_seq;
 	/* Frames processed but not yet reported in a session ACK (spec §5.7.3);
 	 * a plain count, not a serial number. */
 	uint_least32_t unreported;
-	/* Cumulative send_seq acknowledged by the peer; 32-bit serial number
-	 * (RFC 1982) — resume comparison uses serial_lt32. */
+	/* Cumulative count of non-stream-0 frames acknowledged by the peer;
+	 * 32-bit serial number (RFC 1982) — resume comparison uses serial_lt32. */
 	uint_least32_t last_ack_recv;
 	/* Ticks since the last session ACK while frames are pending; reset on
 	 * emission or when unreported == 0. */
@@ -92,8 +89,10 @@ bool unacked_resume_ack_recv(struct mux_session *ss, uint_least32_t peer_ack);
 /* Record that a session ACK covering emit frames was emitted. */
 void unacked_ack_emitted(struct mux_session *ss, uint_fast32_t emit);
 
-/* Discard all frames in the unacked ring, free the ring array, and reset
- * counters and the retransmit cursor. */
+/* Discard all frames in the unacked ring, free the ring array, and reset the
+ * ring's derived state (frame/byte totals, the send-stall gate, the retransmit
+ * cursor and copy). The sequence counters (recv_seq, unreported,
+ * last_ack_recv, ack_ticks) are left untouched for the caller to reset. */
 void unacked_free_all(struct mux_session *ss);
 
 #endif /* MUX_UNACKED_H */

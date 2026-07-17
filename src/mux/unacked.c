@@ -22,9 +22,9 @@
 #include <stdint.h>
 #include <string.h>
 
-static bool unacked_ring_push(
+static bool ring_push(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame,
-	size_t count)
+	const size_t count)
 {
 	frame->unacked_count = count;
 	if (!mux_frame_ring_push(&ss->unacked.ring, frame)) {
@@ -35,23 +35,22 @@ static bool unacked_ring_push(
 	ss->unacked.frames += count;
 	COUNTER_ADD(ss->cnt.unacked_frames, count);
 	ss->unacked.bytes += frame->len - count * MUX_FRAME_HEADER_SIZE;
-	ss->unacked.send_seq = (uint_least32_t)serial_add32(
-		ss->unacked.send_seq, (uint_fast32_t)count);
 	return true;
 }
 
 /* Add one ring entry worth @p count logical seqnums.  Hitting the session cap
  * only stalls new data dequeues; ACK/oob paths still run. The frame is
- * already flushed to the peer by this point, so an OOM here is an
- * unrecoverable send_seq/peer desync, not a transient failure to retry. */
+ * already flushed to the peer by this point, so an OOM here means the resume
+ * log can no longer reconstruct what the peer received -- an unrecoverable
+ * desync, not a transient failure to retry. */
 static void unacked_push(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame,
 	const size_t count)
 {
-	if (!unacked_ring_push(ss, frame, count)) {
+	if (!ring_push(ss, frame, count)) {
 		mux_frame_put(&ss->pool, frame);
 		MUX_LOG(ERROR, ss,
-			"unacked ring OOM after flush: send_seq desynced"
+			"unacked ring OOM after flush: resume log desynced"
 			" from peer, resetting session");
 		session_reset(ss);
 		return;
@@ -88,19 +87,13 @@ void unacked_track_sent(
 		return;
 	}
 
-	/* Each retransmit copy corresponds to one original unacked entry. */
+	/* Each retransmit copy corresponds to one original unacked entry; advance
+	 * the replay cursor past it and free the copy (the original stays in the
+	 * ring until the peer ACKs it). */
 	if (ss->unacked.retransmit_copy == frame) {
 		ss->unacked.retransmit_copy = NULL;
 		ASSERT(ss->unacked.ring != NULL &&
 		       ss->unacked.retransmit_off < ss->unacked.ring->count);
-		/* spec §5.8.4: the transmit count is incremented for each
-		 * retransmitted frame upon transmission too, not just the
-		 * original send. */
-		const struct mux_frame *const orig = mux_frame_ring_peek(
-			ss->unacked.ring, ss->unacked.retransmit_off);
-		ss->unacked.send_seq = (uint_least32_t)serial_add32(
-			ss->unacked.send_seq,
-			(uint_fast32_t)orig->unacked_count);
 		ss->unacked.retransmit_off++;
 		mux_frame_put(&ss->pool, frame);
 		return;
@@ -123,15 +116,29 @@ void unacked_track_sent(
 	size_t n = 0;
 	while (src < end) {
 		if ((size_t)(end - src) < MUX_FRAME_HEADER_SIZE) {
-			MUX_LOG(ERROR, ss, "invalid internal frame layout");
+			/* This frame is already on the wire, so dropping it now
+			 * without tracking its sub-frames would leave the peer
+			 * counting them into recv_seq while our ring never does --
+			 * a later session ACK would then overflow unacked.frames
+			 * and be misdiagnosed. Treat it as unrecoverable, like
+			 * unacked_push's post-flush OOM. */
 			mux_frame_put(&ss->pool, frame);
+			MUX_LOG(ERROR, ss,
+				"invalid internal frame layout (truncated"
+				" header) after flush: resume log desynced from"
+				" peer, resetting session");
+			session_reset(ss);
 			return;
 		}
 		mux_read_header(src, &hdr);
 		const size_t entry_len = MUX_FRAME_HEADER_SIZE + hdr.length;
 		if ((size_t)(end - src) < entry_len) {
-			MUX_LOG(ERROR, ss, "invalid internal frame layout");
 			mux_frame_put(&ss->pool, frame);
+			MUX_LOG(ERROR, ss,
+				"invalid internal frame layout (truncated"
+				" payload) after flush: resume log desynced from"
+				" peer, resetting session");
+			session_reset(ss);
 			return;
 		}
 		if (hdr.stream_id != STREAMID_CTRL) {
@@ -151,29 +158,6 @@ void unacked_track_sent(
 	unacked_push(ss, frame, n);
 }
 
-/* Logical frame count actually retransmitted so far this replay pass (ring
- * positions [0, retransmit_off)). Used by unacked_ack_recv to bound a
- * peer-supplied ACK received mid-replay so it can never trim an entry that has
- * not actually been retransmitted yet on this connection -- a coordinating
- * send-side safeguard is what keeps a conformant peer from ever reaching this
- * bound in the first place. Not applicable to unacked_resume_ack_recv's own
- * trim call below: that one reconciles the peer's resume_seq against deliveries
- * on the *old* connection, and session_suspend() pre-arms retransmit_off=0 in
- * anticipation of the upcoming replay before that call ever runs. */
-static size_t
-unacked_retransmitted_frames(const struct mux_session *restrict ss)
-{
-	if (ss->unacked.ring == NULL) {
-		return 0;
-	}
-	size_t total = 0;
-	for (size_t i = 0; i < ss->unacked.retransmit_off; i++) {
-		total +=
-			mux_frame_ring_peek(ss->unacked.ring, i)->unacked_count;
-	}
-	return total;
-}
-
 /* Sum the payload bytes of @p count concatenated frame headers starting at
  * @p offset within @p f, advancing *offset past them.  Used by
  * unacked_ack_trim; only called on frames known to hold count headers. */
@@ -184,13 +168,20 @@ static size_t frame_payload_bytes_from(
 	const unsigned char *src = f->data + *offset;
 	const unsigned char *const frame_end = f->data + f->len;
 	size_t total = 0;
-	while (count > 0 && src + MUX_FRAME_HEADER_SIZE <= frame_end) {
+	/* Difference form, not `src + MUX_FRAME_HEADER_SIZE <= frame_end`: the
+	 * latter forms a pointer up to 8 bytes past one-past-the-end on a
+	 * malformed frame (pointer-overflow UB). */
+	while (count > 0 &&
+	       (size_t)(frame_end - src) >= MUX_FRAME_HEADER_SIZE) {
 		struct mux_header hdr;
 		mux_read_header(src, &hdr);
 		total += hdr.length;
 		src += MUX_FRAME_HEADER_SIZE + (size_t)hdr.length;
 		count--;
 	}
+	/* The caller only passes frames known to hold @p count headers; a leftover
+	 * count would under-count bytes and latch unacked_ack_trim's stall gate. */
+	ASSERT(count == 0);
 	*offset = (size_t)(src - f->data);
 	return total;
 }
@@ -295,11 +286,33 @@ unacked_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
 	};
 }
 
+/* Logical frame count actually retransmitted so far this replay pass (ring
+ * positions [0, retransmit_off)). Used by unacked_ack_recv to bound a
+ * peer-supplied ACK received mid-replay so it can never trim an entry that has
+ * not actually been retransmitted yet on this connection -- a coordinating
+ * send-side safeguard is what keeps a conformant peer from ever reaching this
+ * bound in the first place. Not applicable to unacked_resume_ack_recv's own
+ * trim call below: that one reconciles the peer's resume_seq against deliveries
+ * on the *old* connection, and session_suspend() pre-arms retransmit_off=0 in
+ * anticipation of the upcoming replay before that call ever runs. */
+static size_t retransmitted_frames(const struct mux_session *restrict ss)
+{
+	if (ss->unacked.ring == NULL) {
+		return 0;
+	}
+	size_t total = 0;
+	for (size_t i = 0; i < ss->unacked.retransmit_off; i++) {
+		total +=
+			mux_frame_ring_peek(ss->unacked.ring, i)->unacked_count;
+	}
+	return total;
+}
+
 struct unacked_ack_result
 unacked_ack_recv(struct mux_session *restrict ss, const uint_fast32_t count)
 {
 	if (ss->unacked.retransmit_off != SIZE_MAX) {
-		const size_t retransmitted = unacked_retransmitted_frames(ss);
+		const size_t retransmitted = retransmitted_frames(ss);
 		if (count > retransmitted) {
 			MUX_LOG_F(
 				ERROR, ss,
@@ -372,4 +385,15 @@ void unacked_free_all(struct mux_session *restrict ss)
 	ss->unacked.bytes = 0;
 	ss->unacked.partial_offset = 0;
 	ss->unacked.retransmit_off = SIZE_MAX;
+	/* The replay copy belonged to the ring just freed (or to the send buffer
+	 * a caller discarded alongside it). Leaving the pointer set lets a frame
+	 * the pool later hands back at the same address false-match the identity
+	 * check in unacked_track_sent, whose branch then peeks the freed ring --
+	 * NULL here, with the guarding ASSERT compiled out of every shipped
+	 * build. */
+	ss->unacked.retransmit_copy = NULL;
+	/* stalled is a pure function of bytes against the session window, so it
+	 * falls with them: a session left holding the gate over an empty ring
+	 * would never send another data frame. */
+	ss->unacked.stalled = false;
 }

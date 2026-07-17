@@ -510,15 +510,20 @@ identity shared by both endpoints.  The server always includes `session_id` in
 its ServerHello.  The client omits `session_id` in an initial ClientHello, and
 includes it (echoing the server-assigned value) in a resume ClientHello.
 Receivers MUST close the connection if `session_id` is present but malformed.
+The presence of `session_id` is the sole discriminant for resumption: a
+ClientHello carrying `session_id` requests resumption, one omitting it does
+not.
 
 The `resume_seq` field carries the sender's processed prefix of the peer's
 non-stream-0 frame sequence: the number of such frames this endpoint has
 processed (see Section 5.7).  Frames strictly before this point have
 already taken effect at the sender and MUST NOT be retransmitted on resume.
 On an initial connection it is 0.  On a resume attempt it tells the peer from
-which point retransmission should begin.  When this field is absent, the
-sender is not requesting session resumption; the receiver MUST treat the
-connection as a fresh session and MUST NOT attempt to resume.
+which point retransmission should begin.  Senders always emit `resume_seq` on
+the wire (0 when not resuming); it is meaningful only alongside a `session_id`.
+Receivers MUST NOT infer resumption from the presence or absence of
+`resume_seq` — that is determined solely by `session_id` — and MUST tolerate its
+absence by treating it as 0.
 
 The following JSON Schema (draft 2020-12) defines the normative structure of
 the hello message object:
@@ -620,7 +625,8 @@ SESSION_ESTABLISHED         SESSION_ESTABLISHED
 ```
 
 1.  The client enters SESSION_HANDSHAKE and sends ClientHello (msgid = 0)
-    without a `session_id` field and without `resume_seq`.
+    without a `session_id` field (`resume_seq`, always present on the wire, is
+    0 and carries no meaning absent a `session_id`).
 
 2.  The client then awaits a ServerHello.
 
@@ -935,18 +941,16 @@ NOT retransmit them.
         in the unacked list before transmitting new frames.
 
 3.  The client validates that the ServerHello `session_id` matches the stored
-    shared identity and that `resume_seq` is present.  On confirmation: trim
-    from the head of the client's unacked list all frames strictly before
-    `resume_seq`, then transition to SESSION_ESTABLISHED and retransmit
-    remaining unacked frames.
+    shared identity.  On confirmation: trim from the head of the client's
+    unacked list all frames strictly before `resume_seq`, then transition to
+    SESSION_ESTABLISHED and retransmit remaining unacked frames.
 
 4.  If the server finds no matching suspended session, it treats the connection
-    as a new session: it generates a fresh `session_id`, omits `resume_seq`,
-    and proceeds with the normal handshake.  The client detects this because
-    either `resume_seq` is absent in the ServerHello, or the `session_id` does
-    not match the previously stored shared identity.  In either case the client
-    MUST reset all existing streams, adopt the new `session_id` as the shared
-    identity, and continue as a fresh session.
+    as a new session: it generates a fresh `session_id` and proceeds with the
+    normal handshake.  The client detects this because the ServerHello
+    `session_id` does not match the previously stored shared identity.  In that
+    case the client MUST reset all existing streams, adopt the new `session_id`
+    as the shared identity, and continue as a fresh session.
 
 #### 5.8.4.  Retransmission
 

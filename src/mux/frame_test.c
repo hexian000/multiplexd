@@ -3,13 +3,14 @@
 
 /* frame_test.c - white-box tests for frame.c.
  * Dependencies: frame.c #included (leaf module, no collaborators to mock).
- * Benches (bench section) are opt-in: run with BENCH set in the env. */
+ * Benches (bench section) are opt-in: run with TESTING_BENCH set in the env. */
 
 #include "mux/frame.h"
 
 #include "mux/frame.c"
 #include "mux/mux.h"
 
+#include "meta/arraysize.h"
 #include "utils/testing.h"
 
 #include <stdbool.h>
@@ -38,6 +39,7 @@ static struct mux_frame *frame_test_alloc(void *data, const size_t size)
 		frame->pos = 99;
 		frame->len = 77;
 		frame->next = frame;
+		frame->cap = 12345;
 	}
 	return frame;
 }
@@ -75,6 +77,10 @@ T_DECLARE_CASE(test_frame_get_resets_runtime_fields)
 	T_EXPECT_EQ(frame->pos, (size_t)0);
 	T_EXPECT_EQ(frame->len, (size_t)0);
 	T_EXPECT(frame->next == NULL);
+	/* cap must be stamped from the requested size: it bounds payload writes
+	 * at mux.c/stream.c/handshake.c, so a dropped `frame->cap = cap;` would
+	 * ship silently. */
+	T_EXPECT_EQ(frame->cap, (size_t)MUX_MAX_PAYLOAD_SIZE);
 
 	mux_frame_put(&pool, frame);
 }
@@ -303,23 +309,23 @@ T_DECLARE_CASE(test_frame_ring_push_pop_fifo)
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
 	struct mux_frame_ring *r = NULL;
-	const int n = 8;
 	struct mux_frame *pushed[8];
+	const size_t n = ARRAY_SIZE(pushed);
 
-	for (int i = 0; i < n; i++) {
+	for (size_t i = 0; i < n; i++) {
 		pushed[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(pushed[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, pushed[i]));
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)n);
+	T_EXPECT_EQ(mux_frame_ring_size(r), n);
 
 	/* peek should return items in push order */
-	for (int i = 0; i < n; i++) {
-		T_EXPECT(mux_frame_ring_peek(r, (size_t)i) == pushed[i]);
+	for (size_t i = 0; i < n; i++) {
+		T_EXPECT(mux_frame_ring_peek(r, i) == pushed[i]);
 	}
 
 	/* pop should return items in FIFO order */
-	for (int i = 0; i < n; i++) {
+	for (size_t i = 0; i < n; i++) {
 		T_EXPECT(mux_frame_ring_pop(r) == pushed[i]);
 	}
 	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
@@ -329,10 +335,10 @@ T_DECLARE_CASE(test_frame_ring_push_pop_fifo)
 	T_EXPECT_EQ(ctx.free_calls, 0);
 
 	/* Free the popped frames manually. */
-	for (int i = 0; i < n; i++) {
+	for (size_t i = 0; i < n; i++) {
 		mux_frame_put(&pool, pushed[i]);
 	}
-	T_EXPECT_EQ(ctx.free_calls, n);
+	T_EXPECT_EQ(ctx.free_calls, (int)n);
 }
 
 T_DECLARE_CASE(test_frame_ring_grow_contiguous)
@@ -420,6 +426,55 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 	}
 }
 
+/* mux_frame_ring_peek and mux_frame_ring_free both re-implement the wrap
+ * arithmetic (head + i) & (capacity - 1), yet every other ring case runs
+ * against head == 0 (grow linearizes head, and grow_wrapped pops empty before
+ * freeing). Push MIN, pop 10 so head advances to 10, then push 4 more (still
+ * <= capacity, so no grow: the ring stays wrapped) and exercise peek over the
+ * wrap and free with live entries. */
+T_DECLARE_CASE(test_frame_ring_peek_and_free_wrapped)
+{
+	struct frame_pool_ctx ctx = { 0 };
+	const struct mux_frame_allocator pool = make_pool(&ctx);
+
+	struct mux_frame_ring *r = NULL;
+	const int cap0 = MUX_FRAME_RING_MIN; /* 16 */
+	const int pop_n = 10;
+	const int push2 = 4; /* 6 + 4 = 10 <= 16: stays wrapped, no grow */
+	const int held = cap0 - pop_n + push2; /* 10 */
+	struct mux_frame *pushed[MUX_FRAME_RING_MIN + 4]; /* 20 */
+
+	for (int i = 0; i < cap0; i++) {
+		pushed[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
+		T_CHECK(pushed[i] != NULL);
+		T_CHECK(mux_frame_ring_push(&r, pushed[i]));
+	}
+	/* Pop 10 (head advances to 10); free the popped frames now. */
+	for (int i = 0; i < pop_n; i++) {
+		T_EXPECT(mux_frame_ring_pop(r) == pushed[i]);
+		mux_frame_put(&pool, pushed[i]);
+	}
+	/* Push 4 more; they wrap into slots 0..3 while head stays at 10. */
+	for (int i = cap0; i < cap0 + push2; i++) {
+		pushed[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
+		T_CHECK(pushed[i] != NULL);
+		T_CHECK(mux_frame_ring_push(&r, pushed[i]));
+	}
+	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)held);
+
+	/* Peek must walk the wrapped ring in FIFO order: pushed[10..19]. */
+	for (int i = 0; i < held; i++) {
+		T_EXPECT(
+			mux_frame_ring_peek(r, (size_t)i) == pushed[pop_n + i]);
+	}
+
+	/* Free the wrapped ring holding 10 live entries: exactly those are freed. */
+	const int freed_before = ctx.free_calls;
+	mux_frame_ring_free(&r, &pool);
+	T_EXPECT(r == NULL);
+	T_EXPECT_EQ(ctx.free_calls - freed_before, held);
+}
+
 /* Slots past the live entries must read as NULL after a grow, exactly like a
  * freshly allocated ring (mux_frame_ring_new), not leftover malloc bytes. */
 T_DECLARE_CASE(test_frame_ring_grow_zeroes_new_slots)
@@ -477,102 +532,116 @@ T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 	T_EXPECT_EQ(ctx.free_calls, n);
 }
 
-/* ringbuf_reserve: recv_test.c/send_test.c mock this
- * function, and wire_test.c/mux_test.c exercise it only incidentally, so
- * none of its four decision points (fast-path, compaction, doubling growth,
- * overflow rejection) had a direct test. */
+/* Direct coverage of bytebuf_reserve's four decision points: fast-path (space
+ * already available), compaction, doubling growth, and overflow rejection. */
 
-T_DECLARE_CASE(test_ringbuf_reserve_noop_when_space_available)
+T_DECLARE_CASE(test_bytebuf_reserve_noop_when_space_available)
 {
-	struct ringbuf *rb = ringbuf_new(16);
+	struct bytebuf *rb = bytebuf_new(16);
 	T_CHECK(rb != NULL);
-	ringbuf_produce(rb, 4);
+	bytebuf_produce(rb, 4);
 
-	T_EXPECT(ringbuf_reserve(&rb, 12, false));
+	T_EXPECT(bytebuf_reserve(&rb, 12, false));
 	T_EXPECT_EQ(rb->cap, (size_t)16);
 	T_EXPECT_EQ(rb->off, (size_t)0);
 
 	/* need == 0 is always satisfied too, even with zero space left. */
-	ringbuf_produce(rb, 12);
-	T_EXPECT_EQ(ringbuf_write_space(rb), (size_t)0);
-	T_EXPECT(ringbuf_reserve(&rb, 0, false));
+	bytebuf_produce(rb, 12);
+	T_EXPECT_EQ(bytebuf_write_space(rb), (size_t)0);
+	T_EXPECT(bytebuf_reserve(&rb, 0, false));
 
-	ringbuf_free(rb);
+	bytebuf_free(rb);
 }
 
 /* A partially-consumed buffer (off > 0, len > 0) has write_space trapped
  * behind already-read bytes; compaction alone must recover it without
  * growing, proving can_grow=false does not spuriously fail here. */
-T_DECLARE_CASE(test_ringbuf_reserve_compaction_recovers_space)
+T_DECLARE_CASE(test_bytebuf_reserve_compaction_recovers_space)
 {
-	struct ringbuf *rb = ringbuf_new(10);
+	struct bytebuf *rb = bytebuf_new(10);
 	T_CHECK(rb != NULL);
-	ringbuf_produce(rb, 8);
-	ringbuf_consume(
+	bytebuf_produce(rb, 8);
+	bytebuf_consume(
 		rb, 5); /* off=5, len=3: partial consume, no off reset */
 	T_CHECK(rb->off == 5 && rb->len == 3);
-	T_EXPECT_EQ(ringbuf_write_space(rb), (size_t)2);
+	T_EXPECT_EQ(bytebuf_write_space(rb), (size_t)2);
 
-	T_EXPECT(ringbuf_reserve(&rb, 5, false));
+	T_EXPECT(bytebuf_reserve(&rb, 5, false));
 	T_EXPECT_EQ(rb->off, (size_t)0);
 	T_EXPECT_EQ(rb->len, (size_t)3);
 	T_EXPECT_EQ(rb->cap, (size_t)10); /* compaction alone; no realloc */
 
-	ringbuf_free(rb);
+	bytebuf_free(rb);
 }
 
 /* can_grow=false with neither immediate space nor anything to compact must
  * fail cleanly rather than attempt to grow. */
-T_DECLARE_CASE(test_ringbuf_reserve_returns_false_when_cannot_grow)
+T_DECLARE_CASE(test_bytebuf_reserve_returns_false_when_cannot_grow)
 {
-	struct ringbuf *rb = ringbuf_new(4);
+	struct bytebuf *rb = bytebuf_new(4);
 	T_CHECK(rb != NULL);
-	ringbuf_produce(rb, 4); /* off=0 already: compact is a no-op */
+	bytebuf_produce(rb, 4); /* off=0 already: compact is a no-op */
 
-	T_EXPECT(!ringbuf_reserve(&rb, 1, false));
+	T_EXPECT(!bytebuf_reserve(&rb, 1, false));
 	T_EXPECT_EQ(rb->cap, (size_t)4);
 
-	ringbuf_free(rb);
+	bytebuf_free(rb);
 }
 
 /* A request well beyond one doubling forces the growth loop to iterate
  * several times; cap must land on the first power-of-two multiple of the
  * original capacity that is >= len+need, not merely >= need. */
-T_DECLARE_CASE(test_ringbuf_reserve_doubling_growth_loop)
+T_DECLARE_CASE(test_bytebuf_reserve_doubling_growth_loop)
 {
-	struct ringbuf *rb = ringbuf_new(4);
+	struct bytebuf *rb = bytebuf_new(4);
 	T_CHECK(rb != NULL);
-	ringbuf_produce(rb, 4);
-	ringbuf_consume(rb, 4); /* fully drained: off resets to 0, len=0 */
+	bytebuf_produce(rb, 4);
+	bytebuf_consume(rb, 4); /* fully drained: off resets to 0, len=0 */
 	T_CHECK(rb->off == 0 && rb->len == 0);
 
 	/* min_cap = 0 + 20 = 20; doubling from 4: 4, 8, 16, 32 (first >= 20). */
-	T_EXPECT(ringbuf_reserve(&rb, 20, true));
+	T_EXPECT(bytebuf_reserve(&rb, 20, true));
 	T_EXPECT_EQ(rb->cap, (size_t)32);
-	T_EXPECT(ringbuf_write_space(rb) >= (size_t)20);
+	T_EXPECT(bytebuf_write_space(rb) >= (size_t)20);
 
-	ringbuf_free(rb);
+	bytebuf_free(rb);
 }
 
-/* A need large enough that len+need lands exactly on SIZE_MAX forces the
- * growth loop's overflow guard (new_cap > SIZE_MAX/2) to clamp directly to
- * min_cap instead of doubling past it, and the subsequent header-overflow
- * check must then reject it before ever attempting the allocation --
- * sizeof(struct ringbuf) pushes the true request past SIZE_MAX. Exercises
- * the #41 guard this issue named as untested by name. */
-T_DECLARE_CASE(test_ringbuf_reserve_overflow_clamp_rejects)
+/* A need large enough that len+need lands exactly on SIZE_MAX forces the growth
+ * loop's overflow guard (new_cap > SIZE_MAX/2) to clamp to min_cap instead of
+ * doubling past it; the subsequent header-overflow check (sizeof(struct bytebuf)
+ * pushes the true request past SIZE_MAX) must then reject it before allocating. */
+T_DECLARE_CASE(test_bytebuf_reserve_overflow_clamp_rejects)
 {
-	struct ringbuf *rb = ringbuf_new(4);
+	struct bytebuf *rb = bytebuf_new(4);
 	T_CHECK(rb != NULL);
 
-	T_EXPECT(!ringbuf_reserve(&rb, SIZE_MAX - rb->len, true));
+	T_EXPECT(!bytebuf_reserve(&rb, SIZE_MAX - rb->len, true));
 	T_EXPECT_EQ(
 		rb->cap, (size_t)4); /* untouched: rejected before realloc */
 
-	ringbuf_free(rb);
+	bytebuf_free(rb);
 }
 
-/* bench - per-frame hot-path micro-benchmarks (opt-in: run with BENCH set) */
+/* The sibling above starts from len == 0, so `need > SIZE_MAX - rb->len` is
+ * false and the later header-size guard rejects.  With a non-zero len the first
+ * guard (len + need would overflow SIZE_MAX) is the one that must reject,
+ * before any doubling or allocation. */
+T_DECLARE_CASE(test_bytebuf_reserve_len_plus_need_overflow_rejects)
+{
+	struct bytebuf *rb = bytebuf_new(4);
+	T_CHECK(rb != NULL);
+	bytebuf_produce(rb, 4); /* len = 4 so len + need can overflow */
+	T_CHECK(rb->len == 4);
+
+	T_EXPECT(!bytebuf_reserve(&rb, SIZE_MAX - 3, true));
+	T_EXPECT_EQ(
+		rb->cap, (size_t)4); /* untouched: rejected before realloc */
+
+	bytebuf_free(rb);
+}
+
+/* bench - per-frame hot-path micro-benchmarks (opt-in: run with TESTING_BENCH set) */
 
 /* Opaque source/sink (volatile) to keep the optimizer from constant-folding the
  * benched header round-trip; without it the loop folds to a closed form and
@@ -673,16 +742,18 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_frame_ring_push_pop_fifo),
 	T_CASE(test_frame_ring_grow_contiguous),
 	T_CASE(test_frame_ring_grow_wrapped),
+	T_CASE(test_frame_ring_peek_and_free_wrapped),
 	T_CASE(test_frame_ring_grow_zeroes_new_slots),
 	T_CASE(test_frame_ring_free_releases_all_frames),
-	T_CASE(test_ringbuf_reserve_noop_when_space_available),
-	T_CASE(test_ringbuf_reserve_compaction_recovers_space),
-	T_CASE(test_ringbuf_reserve_returns_false_when_cannot_grow),
-	T_CASE(test_ringbuf_reserve_doubling_growth_loop),
-	T_CASE(test_ringbuf_reserve_overflow_clamp_rejects),
+	T_CASE(test_bytebuf_reserve_noop_when_space_available),
+	T_CASE(test_bytebuf_reserve_compaction_recovers_space),
+	T_CASE(test_bytebuf_reserve_returns_false_when_cannot_grow),
+	T_CASE(test_bytebuf_reserve_doubling_growth_loop),
+	T_CASE(test_bytebuf_reserve_overflow_clamp_rejects),
+	T_CASE(test_bytebuf_reserve_len_plus_need_overflow_rejects),
 	T_CASE(test_mux_status_str_names_known_codes_distinctly),
 	/* Opt-in micro-benchmarks: each runs ~1s, so they are skipped by the
-	 * default (unfiltered) run.  Select with `--run <ere>` or TESTING_FILTER. */
+	 * default (unfiltered) run.  Select with `--bench <ere>` or TESTING_BENCH. */
 	T_BENCH(bench_header_roundtrip),
 	T_BENCH(bench_frame_ring_push_pop),
 	T_BENCH(bench_frame_get_put),

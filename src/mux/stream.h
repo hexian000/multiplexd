@@ -55,6 +55,15 @@ struct mux_stream {
 	uint_least8_t sched_queue : 2;
 	/* true = direct I/O mode; false = socket mode */
 	bool is_direct : 1;
+	/* Direct mode only: the application has relinquished the stream via
+	 * mux_stream_close() (close(fd) semantics), so it will never call
+	 * mux_stream_recv() again. The library normally defers a direct-mode
+	 * stream's final CLOSED transition to that call -- it must not free a
+	 * stream the application still holds -- but once this is set there is no
+	 * owner left to drive it, so the close paths complete it themselves.
+	 * Distinct from direct.w_io == NULL, which merely means the watcher is
+	 * currently stopped and says nothing about ownership. */
+	bool user_closed : 1;
 	/* Receive window update pending; a credit-bearing ACK must be sent to the peer. */
 	bool ack_pending : 1;
 	/* true when the local socket has sent EOF (or application called stream_shutdown) */
@@ -77,7 +86,9 @@ struct mux_stream {
 	uint_least8_t delay_ticks;
 	enum stream_state state;
 	struct mux_session *session;
-	struct mux_stream *prev, *next;
+	/* Singly-linked next pointer, shared by the DRR ready queue and the
+	 * low-priority lifecycle queue (mutually exclusive; both strict FIFO). */
+	struct mux_stream *next;
 	struct mux_stream *delay_prev;
 	struct mux_stream *delay_next;
 
@@ -98,7 +109,7 @@ struct mux_stream {
 	struct mux_frame_list send_queue;
 
 	/* Receive buffer (data waiting to be sent to local socket) */
-	struct ringbuf *recvbuf;
+	struct bytebuf *recvbuf;
 
 	/* Flow control - sender side */
 	uint_least32_t bytes_sent;
@@ -143,6 +154,28 @@ static inline uint_fast32_t stream_read_credit_avail(const struct mux_stream *s)
 		       0u;
 }
 
+/* True when a FIN is due: the app has half-closed (rx_eof) and its data has
+ * drained (send_queue empty), from a state that can still send one. Restricting
+ * to ESTABLISHED/CLOSE_WAIT already excludes FIN_WAIT/CLOSING (so no separate
+ * guard is needed) and the INIT/SYN_SENT/SYN_RECEIVED/CLOSED states that would
+ * otherwise trip stream_mark_fin_sent's unexpected-state warning. */
+static inline bool stream_fin_pending(const struct mux_stream *restrict s)
+{
+	return s->rx_eof && s->send_queue.head == NULL &&
+	       (s->state == STREAM_ESTABLISHED ||
+		s->state == STREAM_CLOSE_WAIT);
+}
+
+/* True in the states from which the stream may still originate application
+ * data: before its SYN has left (INIT), while established, or after the peer's
+ * FIN with the local send side still open (CLOSE_WAIT). The single source of
+ * truth for this flow-control predicate, shared by stream.c and mux.c. */
+static inline bool stream_can_send_data(const struct mux_stream *restrict s)
+{
+	return s->state == STREAM_INIT || s->state == STREAM_ESTABLISHED ||
+	       s->state == STREAM_CLOSE_WAIT;
+}
+
 /* Remaining receive space after subtracting credit the peer may still spend. */
 static inline uint_fast32_t stream_grantable_bytes(const struct mux_stream *s)
 {
@@ -154,7 +187,7 @@ static inline uint_fast32_t stream_grantable_bytes(const struct mux_stream *s)
 
 /* Compute the window increment (in MUX_WINDOW_UNIT units) to grant the peer.
  * Applies session-level receive-pressure scaling; defined in stream.c. */
-uint_fast32_t stream_grant_inc(const struct mux_stream *s);
+uint_fast32_t stream_grant_inc(const struct mux_stream *restrict s);
 
 struct mux_stream *
 stream_new(struct mux_session *restrict ss, uint_fast16_t id, bool active_open);
@@ -163,7 +196,7 @@ void stream_free(struct mux_stream *s);
 
 void stream_attach_fd(struct mux_stream *s, int fd);
 
-void stream_io_start(struct ev_loop *loop, struct mux_stream_io *w);
+bool stream_io_start(struct ev_loop *loop, struct mux_stream_io *w);
 
 void stream_mark_syn_sent(struct mux_stream *s);
 
@@ -177,6 +210,11 @@ void stream_queue_send(struct mux_stream *s, struct mux_frame *frame);
 struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s);
 
 void stream_notify_recv(struct mux_stream *restrict s);
+
+/* Abort the stream locally and emit one peer-visible RST carrying @p code.
+ * May free s when it is the last active stream of a draining session (the
+ * shutdown cascade), so callers must re-check before touching it again. */
+void stream_abort(struct mux_stream *restrict s, enum mux_status code);
 
 void stream_recv_copy(
 	struct mux_stream *restrict s, const unsigned char *restrict payload,

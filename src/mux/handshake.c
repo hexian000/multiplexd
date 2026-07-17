@@ -23,6 +23,7 @@
 #include "utils/debug.h"
 #include "utils/slog.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stddef.h>
@@ -36,8 +37,14 @@
 #define PROTO_VERSION "1"
 #define PROTO_TYPE PROTO_MIME_TYPE "; version=" PROTO_VERSION
 
-/* Base64 length of MUX_SESSION_ID_LEN bytes (with padding). */
+/* Base64 length of MUX_SESSION_ID_LEN bytes (with padding). Tied to
+ * MUX_SESSION_ID_LEN so a change to the id length is a build error rather than a
+ * silent mis-encode: base64_encode into an exactly-sized buffer then cannot fail
+ * (which is why its return below is safely discarded). */
 enum { SESSION_ID_B64 = 24u };
+static_assert(
+	SESSION_ID_B64 == 4u * ((MUX_SESSION_ID_LEN + 2u) / 3u),
+	"SESSION_ID_B64 must equal the base64 length of MUX_SESSION_ID_LEN");
 
 static bool proto_hello_build(
 	struct mux_frame *const frame, const size_t payload_cap,
@@ -93,10 +100,11 @@ static bool proto_hello_build(
 }
 
 static bool proto_parse_type(
-	const char *type, const size_t type_len, int *const version_out)
+	const struct mux_session *restrict ss, const char *type,
+	const size_t type_len, int *const version_out)
 {
 	if (type_len > MUX_MAX_PAYLOAD_SIZE) {
-		LOGE("protocol type too large");
+		MUX_LOG(ERROR, ss, "protocol type too large");
 		return false;
 	}
 	/* Use the JSON-decoded length, not strlen: a JSON u0000 escape decodes to a
@@ -105,7 +113,7 @@ static bool proto_parse_type(
 	 * differential) instead of rejecting. Mirror the identity field, which
 	 * already validates against obj.extensions.identity.len. */
 	if (strlen(type) != type_len) {
-		LOGE("protocol type contains an embedded NUL");
+		MUX_LOG(ERROR, ss, "protocol type contains an embedded NUL");
 		return false;
 	}
 	const size_t len = type_len;
@@ -124,21 +132,36 @@ static bool proto_parse_type(
 	char *next = mime_parse(buf, &media_type, &media_subtype);
 	if (next == NULL || strcmp(media_type, "application") != 0 ||
 	    strcmp(media_subtype, "x-multiplexd-proto") != 0) {
-		LOGE_F("unsupported protocol: \"%s\"", type);
+		/* type is attacker-controlled (only known NUL-free, up to ~64 KiB
+		 * and can carry decoded ESC/LF); bound the logged length so a peer
+		 * cannot push kilobytes of arbitrary bytes into an ERROR line. */
+		MUX_LOG_F(ERROR, ss, "unsupported protocol: \"%.64s\"", type);
 		goto done;
 	}
 
 	const char *version = NULL;
 	char *key, *value;
-	next = mime_parseparam(next, &key, &value);
-	while (next != NULL && key != NULL) {
+	for (;;) {
+		next = mime_parseparam(next, &key, &value);
+		if (next == NULL) {
+			/* mime_parseparam returns NULL only on a parse error (a
+			 * clean end sets *key = NULL with a non-NULL return), so
+			 * reject rather than silently accept the valid prefix. */
+			MUX_LOG_F(
+				ERROR, ss,
+				"malformed protocol type parameter: \"%.64s\"",
+				type);
+			goto done;
+		}
+		if (key == NULL) {
+			break; /* clean end of parameters */
+		}
 		if (strcmp(key, "version") == 0) {
 			version = value;
 		}
-		next = mime_parseparam(next, &key, &value);
 	}
 	if (version == NULL) {
-		LOGE("protocol version not specified");
+		MUX_LOG(ERROR, ss, "protocol version not specified");
 		goto done;
 	}
 	errno = 0;
@@ -146,7 +169,8 @@ static bool proto_parse_type(
 	const uintmax_t parsed = strtoumax(version, &end, 10);
 	if (errno != 0 || end == version || *end != '\0' || parsed == 0 ||
 	    parsed > (uintmax_t)UINT8_MAX) {
-		LOGE_F("invalid protocol version: %s", version);
+		MUX_LOG_F(
+			ERROR, ss, "invalid protocol version: %.64s", version);
 		goto done;
 	}
 	*version_out = (int)parsed;
@@ -158,9 +182,13 @@ done:
 
 /* Decode a Base64-encoded session_id string into a binary buffer.
  * Returns true on success; out receives MUX_SESSION_ID_LEN bytes. */
-static bool proto_parse_session_id(const char *str, unsigned char *out)
+static bool proto_parse_session_id(
+	const char *str, const size_t str_len, unsigned char *out)
 {
-	if (strlen(str) != SESSION_ID_B64) {
+	/* Validate the JSON-decoded length (str_len), not just strlen: a u0000
+	 * escape decodes to an embedded NUL, and trusting strlen alone would accept
+	 * post-NUL bytes (a parser differential). Mirror proto_parse_type/identity. */
+	if (str_len != SESSION_ID_B64 || strlen(str) != SESSION_ID_B64) {
 		return false;
 	}
 	size_t len = MUX_SESSION_ID_LEN;
@@ -173,14 +201,14 @@ static bool proto_parse_session_id(const char *str, unsigned char *out)
 }
 
 static bool proto_hello_parse(
-	const unsigned char *const json, const size_t json_len,
-	struct proto_hello *const out)
+	const struct mux_session *restrict ss, const unsigned char *const json,
+	const size_t json_len, struct proto_hello *const out)
 {
 	/* A hello may legally be up to MUX_MAX_PAYLOAD_SIZE (the JSON tolerates
 	 * unknown keys and extensions).  Copy into a heap buffer rather than a
 	 * stack VLA to keep the large hello off the handshake thread's stack. */
 	if (json_len > MUX_MAX_PAYLOAD_SIZE) {
-		LOGE("failed to parse protocol hello: too large");
+		MUX_LOG(ERROR, ss, "failed to parse protocol hello: too large");
 		return false;
 	}
 	char *const json_buf = malloc(json_len + 1);
@@ -196,37 +224,50 @@ static bool proto_hello_parse(
 	struct json_proto obj = { 0 };
 	bool ok = false;
 	if (!json_unmarshal_proto(&obj, json_buf, json_len)) {
-		LOGE("malformed protocol hello");
+		MUX_LOG(ERROR, ss, "malformed protocol hello");
 		goto done;
 	}
 	if (obj.type.str == NULL) {
-		LOGE("protocol hello: missing type");
+		MUX_LOG(ERROR, ss, "protocol hello: missing type");
 		goto done;
 	}
-	if (!proto_parse_type(obj.type.str, obj.type.len, &out->version)) {
+	if (!proto_parse_type(ss, obj.type.str, obj.type.len, &out->version)) {
 		goto done;
 	}
 	out->msgid = (int)obj.msgid;
 	out->reject_inbound = obj.extensions.reject_inbound;
 
 	if (obj.session_id.str != NULL &&
-	    !proto_parse_session_id(obj.session_id.str, out->session_id)) {
-		LOGE("protocol hello: invalid session_id");
+	    !proto_parse_session_id(
+		    obj.session_id.str, obj.session_id.len, out->session_id)) {
+		MUX_LOG(ERROR, ss, "protocol hello: invalid session_id");
 		goto done;
 	}
 	out->has_session_id = obj.session_id.str != NULL;
 
 	out->resume_seq = (uint_least32_t)obj.resume_seq;
-	/* has_resume_seq is only consulted on the outbound-build struct (to decide
-	 * whether to emit resume_seq); the resume discriminant on the inbound path
-	 * is has_session_id (resume_seq=0 is a valid value), so the parsed copy is
-	 * left at its zero-initialized false rather than populated write-only. */
+	/* has_resume_seq is only consulted on the outbound-build struct, and only to
+	 * select the resume_seq *value* (recv_seq vs 0) -- the marshaller emits the
+	 * resume_seq field unconditionally. The resume discriminant on the inbound
+	 * path is has_session_id (resume_seq=0 is a valid value), so the parsed copy
+	 * is left at its zero-initialized false rather than populated write-only. */
 
 	out->has_identity = false;
 	if (obj.extensions.identity.str != NULL) {
 		const size_t id_len = obj.extensions.identity.len;
 		if (id_len >= sizeof(out->identity)) {
-			LOGE("protocol hello: identity too long");
+			MUX_LOG(ERROR, ss, "protocol hello: identity too long");
+			goto done;
+		}
+		/* Reject an embedded NUL: a JSON u0000 escape decodes to a NUL,
+		 * so the JSON-decoded length and strlen disagree. Every
+		 * downstream consumer treats identity as a C string, so trusting
+		 * id_len alone would let a peer's wire identity and its effective
+		 * (pre-NUL) value diverge -- the same parser differential
+		 * proto_parse_type/proto_parse_session_id reject. */
+		if (strlen(obj.extensions.identity.str) != id_len) {
+			MUX_LOG(ERROR, ss,
+				"protocol hello: identity contains an embedded NUL");
 			goto done;
 		}
 		out->has_identity = true;
@@ -364,8 +405,6 @@ static bool handshake_client_fresh(
 		return false;
 	}
 	unacked_free_all(ss);
-	ss->unacked.retransmit_copy = NULL;
-	ss->unacked.send_seq = 0;
 	ss->unacked.recv_seq = 0;
 	ss->unacked.unreported = 0;
 	ss->unacked.last_ack_recv = 0;
@@ -379,12 +418,15 @@ static bool handshake_client_fresh(
 		free(ss->handshake.peer_identity);
 		ss->handshake.peer_identity = NULL;
 	}
-	/* Adopt the server-assigned session id. */
-	if (peer_hello->has_session_id) {
-		memcpy(ss->handshake.session_id, peer_hello->session_id,
-		       MUX_SESSION_ID_LEN);
-		ss->handshake.has_session_id = true;
-	}
+	/* Adopt the server-assigned session id; the sole caller has already
+	 * rejected a ServerHello that carries none. Asserted rather than
+	 * re-checked: a second caller that skipped that rejection would silently
+	 * adopt the zero id proto_hello was initialized with and offer it in the
+	 * next resume ClientHello -- the ghost resume this guard exists to stop. */
+	ASSERT(peer_hello->has_session_id);
+	memcpy(ss->handshake.session_id, peer_hello->session_id,
+	       MUX_SESSION_ID_LEN);
+	ss->handshake.has_session_id = true;
 	return true;
 }
 
@@ -395,8 +437,20 @@ static bool process_hello_client(
 	struct mux_session *restrict ss,
 	const struct proto_hello *restrict peer_hello)
 {
+	/* Spec §5.2.2: the server always includes session_id in its ServerHello.
+	 * Without one there is nothing to adopt, and continuing would leave this
+	 * client ESTABLISHED still flagged has_session_id but holding the
+	 * previous, now-defunct id while handshake_client_fresh has already wiped
+	 * every piece of state behind it -- the ghost resume session_reset exists
+	 * to prevent. The next reconnect would then offer that dead id in a resume
+	 * ClientHello. */
+	if (!peer_hello->has_session_id) {
+		MUX_LOG(ERROR, ss, "ServerHello without session_id");
+		session_reset(ss);
+		return false;
+	}
 	const bool is_confirmed_resume =
-		ss->handshake.has_session_id && peer_hello->has_session_id &&
+		ss->handshake.has_session_id &&
 		memcmp(peer_hello->session_id, ss->handshake.session_id,
 		       MUX_SESSION_ID_LEN) == 0;
 	if (is_confirmed_resume) {
@@ -441,7 +495,7 @@ bool handshake_process_hello(
 		session_reset(ss);
 		return false;
 	}
-	const unsigned char *const p = ringbuf_read_ptr(ss->wire.recvbuf);
+	const unsigned char *const p = bytebuf_read_ptr(ss->wire.recvbuf);
 	LOG_BIN_F(
 		VERYVERBOSE, p, frame_size, 0,
 		"[fd:%d] hello recv:", ss->w_socket.fd);
@@ -449,7 +503,7 @@ bool handshake_process_hello(
 		ss->accepted ? PROTO_MSG_CLIENT_HELLO : PROTO_MSG_SERVER_HELLO;
 	struct proto_hello peer_hello = { 0 };
 	if (!proto_hello_parse(
-		    p + MUX_FRAME_HEADER_SIZE, (size_t)hdr->length,
+		    ss, p + MUX_FRAME_HEADER_SIZE, (size_t)hdr->length,
 		    &peer_hello)) {
 		session_reset(ss);
 		return false;
@@ -494,7 +548,7 @@ bool handshake_process_hello(
 		free(ss->handshake.peer_identity);
 		ss->handshake.peer_identity = dup;
 	}
-	ringbuf_consume(ss->wire.recvbuf, frame_size);
+	bytebuf_consume(ss->wire.recvbuf, frame_size);
 
 	const bool ok = ss->accepted ? process_hello_server(ss, &peer_hello) :
 				       process_hello_client(ss, &peer_hello);

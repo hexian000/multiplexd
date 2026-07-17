@@ -97,7 +97,6 @@ add_mux_test(estimator_test
 # White-box: compiles wire.c into the TU.  wire.c is self-contained (TLS +
 # real socket I/O); only the leaf frame.c is linked, no collaborators mocked.
 add_mux_test(wire_test
-    ${GENCERTS_SOURCES}
     frame.c frame.h
     wire_test.c
 )

@@ -15,33 +15,18 @@
 #include "shim/tls.h"
 #endif
 
-#if WITH_TLS
-#include "utils/slog.h"
-#endif
 #include "utils/testing.h"
 
-#if WITH_TLS
-#include <dirent.h>
-#include <errno.h>
-#endif
+#include <ev.h>
+
 #include <fcntl.h>
-#if WITH_TLS
-#include <limits.h>
-#endif
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
-#if WITH_TLS
-#include <stdio.h>
-#endif
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#if WITH_TLS
-#include <sys/stat.h>
-#endif
-#include <sys/types.h>
 #include <unistd.h>
 
 /* mock - frame pool and session fixtures */
@@ -150,6 +135,71 @@ T_DECLARE_CASE(test_wire_send_plain_tcp_writes_bytes)
 	(void)close(fds[1]);
 }
 
+/* wire_send's plain-TCP EAGAIN branch: on a nonblocking socket with a tiny send
+ * buffer and no reader, a buffer larger than the socket can hold is accepted
+ * only in part -- wire_send must return true with 0 <= *len < total (partial
+ * write, wait for EV_WRITE), and a second call must return true with *len == 0
+ * once the socket is fully congested.  The blocking single-shot send test never
+ * reaches this branch. */
+T_DECLARE_CASE(test_wire_send_plain_tcp_partial_then_blocked)
+{
+	int fds[2];
+	struct frame_pool_ctx pool_ctx = { 0 };
+	/* Larger than any plausible socket send buffer; static to keep it off the
+	 * stack, zero-initialised (contents are irrelevant, nothing reads them). */
+	static unsigned char payload[1 << 20];
+
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	/* Shrink the send buffer so the large write cannot be accepted at once; the
+	 * peer never reads, so once it fills, send(2) reports EAGAIN. */
+	const int sndbuf = 4096;
+	T_CHECK(setsockopt(
+			fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf,
+			sizeof(sndbuf)) == 0);
+	struct mux_session ss = make_session(&pool_ctx, fds[0]);
+
+	/* First call: some bytes go out, then EAGAIN -> partial write, still true. */
+	size_t len1 = sizeof(payload);
+	const bool ok1 = wire_send(&ss, payload, &len1);
+	const bool partial = (len1 < sizeof(payload));
+
+	/* Second call: the buffer is already full, so nothing is accepted. */
+	size_t len2 = sizeof(payload);
+	const bool ok2 = wire_send(&ss, payload, &len2);
+
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	T_EXPECT(ok1);
+	T_EXPECT(partial);
+	T_EXPECT(ok2);
+	T_EXPECT_EQ(len2, (size_t)0);
+}
+
+/* wire_send's plain-TCP hard-error branch: a send on a write-shut socket fails
+ * with EPIPE (SIGPIPE is ignored process-wide in main), so wire_send must
+ * return false with *len reporting the bytes sent before the error (0 here). */
+T_DECLARE_CASE(test_wire_send_plain_tcp_hard_error_returns_false)
+{
+	int fds[2];
+	struct frame_pool_ctx pool_ctx = { 0 };
+	unsigned char payload[] = "data";
+
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	struct mux_session ss = make_session(&pool_ctx, fds[0]);
+	/* Half-close our own write side: subsequent sends fail hard with EPIPE. */
+	T_CHECK(shutdown(fds[0], SHUT_WR) == 0);
+
+	size_t len = sizeof(payload) - 1;
+	const bool ok = wire_send(&ss, payload, &len);
+
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(len, (size_t)0);
+}
+
 T_DECLARE_CASE(test_wire_recv_plain_tcp_reads_payload)
 {
 	int fds[2];
@@ -192,7 +242,7 @@ T_DECLARE_CASE(test_wire_recv_eof_clears_rx_open_and_sets_tx_pending)
 	(void)close(fds[1]);
 }
 
-T_DECLARE_CASE(test_ringbuf_consume_frame_preserves_remaining_bytes)
+T_DECLARE_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
@@ -210,91 +260,91 @@ T_DECLARE_CASE(test_ringbuf_consume_frame_preserves_remaining_bytes)
 	hdr.stream_id = 4;
 	mux_write_header(bytes + MUX_FRAME_HEADER_SIZE + 1, &hdr);
 	bytes[2 * MUX_FRAME_HEADER_SIZE + 1] = 'B';
-	ss.wire.recvbuf = ringbuf_new(sizeof(bytes));
+	ss.wire.recvbuf = bytebuf_new(sizeof(bytes));
 	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(ringbuf_write_ptr(ss.wire.recvbuf), bytes, sizeof(bytes));
-	ringbuf_produce(ss.wire.recvbuf, sizeof(bytes));
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), bytes, sizeof(bytes));
+	bytebuf_produce(ss.wire.recvbuf, sizeof(bytes));
 
-	ringbuf_consume(ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE + 1);
+	bytebuf_consume(ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE + 1);
 	T_EXPECT_EQ(
-		ringbuf_readable(ss.wire.recvbuf),
+		bytebuf_readable(ss.wire.recvbuf),
 		sizeof(bytes) - ((size_t)MUX_FRAME_HEADER_SIZE + 1));
 	T_EXPECT(
-		ringbuf_read_ptr(ss.wire.recvbuf)[MUX_FRAME_HEADER_SIZE] ==
+		bytebuf_read_ptr(ss.wire.recvbuf)[MUX_FRAME_HEADER_SIZE] ==
 		'B');
-	ringbuf_free(ss.wire.recvbuf);
+	bytebuf_free(ss.wire.recvbuf);
 }
 
-T_DECLARE_CASE(test_ringbuf_consume_advances_offset_without_copy)
+T_DECLARE_CASE(test_bytebuf_consume_advances_offset_without_copy)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 	unsigned char bytes[2 * MUX_FRAME_HEADER_SIZE] = { 0 };
 
-	ss.wire.recvbuf = ringbuf_new(sizeof(bytes));
+	ss.wire.recvbuf = bytebuf_new(sizeof(bytes));
 	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(ringbuf_write_ptr(ss.wire.recvbuf), bytes, sizeof(bytes));
-	ringbuf_produce(ss.wire.recvbuf, sizeof(bytes));
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), bytes, sizeof(bytes));
+	bytebuf_produce(ss.wire.recvbuf, sizeof(bytes));
 
-	ringbuf_consume(ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE);
+	bytebuf_consume(ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE);
 	T_EXPECT_EQ(ss.wire.recvbuf->off, (size_t)MUX_FRAME_HEADER_SIZE);
 	T_EXPECT_EQ(
-		ringbuf_readable(ss.wire.recvbuf),
+		bytebuf_readable(ss.wire.recvbuf),
 		sizeof(bytes) - (size_t)MUX_FRAME_HEADER_SIZE);
-	ringbuf_free(ss.wire.recvbuf);
+	bytebuf_free(ss.wire.recvbuf);
 }
 
-/* ringbuf_shrink reclaims a grown buffer down to the target, compacting the
+/* bytebuf_shrink reclaims a grown buffer down to the target, compacting the
  * live bytes to the front and preserving them. */
-T_DECLARE_CASE(test_ringbuf_shrink_reclaims_capacity)
+T_DECLARE_CASE(test_bytebuf_shrink_reclaims_capacity)
 {
-	struct ringbuf *rb = ringbuf_new(4096);
+	struct bytebuf *rb = bytebuf_new(4096);
 	T_CHECK(rb != NULL);
-	memset(ringbuf_write_ptr(rb), 'X', 100);
-	ringbuf_produce(rb, 100);
-	ringbuf_consume(rb, 10); /* off=10, len=90: forces compaction */
+	memset(bytebuf_write_ptr(rb), 'X', 100);
+	bytebuf_produce(rb, 100);
+	bytebuf_consume(rb, 10); /* off=10, len=90: forces compaction */
 	T_EXPECT_EQ(rb->cap, (size_t)4096);
 
-	ringbuf_shrink(&rb, 256);
+	bytebuf_shrink(&rb, 256);
 
 	T_EXPECT_EQ(rb->cap, (size_t)256);
 	T_EXPECT_EQ(rb->off, (size_t)0);
-	T_EXPECT_EQ(ringbuf_readable(rb), (size_t)90);
-	const unsigned char *const p = ringbuf_read_ptr(rb);
+	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)90);
+	const unsigned char *const p = bytebuf_read_ptr(rb);
 	bool intact = true;
 	for (size_t i = 0; i < 90; i++) {
 		intact = intact && (p[i] == 'X');
 	}
 	T_EXPECT(intact);
-	ringbuf_free(rb);
+	bytebuf_free(rb);
 }
 
-/* ringbuf_shrink never drops below the live byte count, even when the target is
+/* bytebuf_shrink never drops below the live byte count, even when the target is
  * smaller. */
-T_DECLARE_CASE(test_ringbuf_shrink_keeps_live_bytes)
+T_DECLARE_CASE(test_bytebuf_shrink_keeps_live_bytes)
 {
-	struct ringbuf *rb = ringbuf_new(4096);
+	struct bytebuf *rb = bytebuf_new(4096);
 	T_CHECK(rb != NULL);
-	memset(ringbuf_write_ptr(rb), 'Y', 500);
-	ringbuf_produce(rb, 500); /* len=500 > target */
+	memset(bytebuf_write_ptr(rb), 'Y', 500);
+	bytebuf_produce(rb, 500); /* len=500 > target */
 
-	ringbuf_shrink(&rb, 256);
+	bytebuf_shrink(&rb, 256);
 
 	T_EXPECT_EQ(rb->cap, (size_t)500);
-	T_EXPECT_EQ(ringbuf_readable(rb), (size_t)500);
-	ringbuf_free(rb);
+	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)500);
+	bytebuf_free(rb);
 }
 
-/* ringbuf_shrink is a no-op when the capacity is already at or below target. */
-T_DECLARE_CASE(test_ringbuf_shrink_noop_when_small)
+/* bytebuf_shrink is a no-op when the capacity is already at or below target. */
+T_DECLARE_CASE(test_bytebuf_shrink_noop_when_small)
 {
-	struct ringbuf *rb = ringbuf_new(128);
+	struct bytebuf *rb = bytebuf_new(128);
 	T_CHECK(rb != NULL);
 
-	ringbuf_shrink(&rb, 256);
+	bytebuf_shrink(&rb, 256);
 
 	T_EXPECT_EQ(rb->cap, (size_t)128);
-	ringbuf_free(rb);
+	bytebuf_free(rb);
 }
 
 T_DECLARE_CASE(test_wire_discard_buffers_frees_all_pending_frames)
@@ -310,7 +360,7 @@ T_DECLARE_CASE(test_wire_discard_buffers_frees_all_pending_frames)
 		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
 	struct mux_frame *const ob2 =
 		mux_frame_get(&ss.pool, MUX_MAX_PAYLOAD_SIZE);
-	ss.wire.recvbuf = ringbuf_new(32);
+	ss.wire.recvbuf = bytebuf_new(32);
 	T_CHECK(ss.wire.recvbuf != NULL);
 	ss.wire.recvbuf->off = 7;
 	ss.wire.recvbuf->len = 11;
@@ -335,7 +385,7 @@ T_DECLARE_CASE(test_wire_discard_buffers_frees_all_pending_frames)
 	T_EXPECT_EQ(ss.wire.recvbuf->cap, (size_t)32);
 	T_EXPECT_EQ(ss.wire.recvbuf->len, (size_t)0);
 	T_EXPECT_EQ(ss.wire.recvbuf->off, (size_t)0);
-	ringbuf_free(ss.wire.recvbuf);
+	bytebuf_free(ss.wire.recvbuf);
 }
 
 /* wire_has_pending had zero test references. Its body is
@@ -368,8 +418,11 @@ T_DECLARE_CASE(test_wire_flush_done_without_memory_transport_tls)
 
 #if WITH_TLS
 	/* tls_socket_offload defaults true in make_session; a non-NULL tlsconn
-	 * must still resolve to DONE without ever touching wire_cipher_push. */
-	ss.wire.tlsconn = (struct tls_connection *)(uintptr_t)1;
+	 * must still resolve to DONE without ever touching wire_cipher_push.
+	 * Use the address of a local as a type-safe non-NULL sentinel; this path
+	 * never dereferences tlsconn. */
+	unsigned char sentinel;
+	ss.wire.tlsconn = (struct tls_connection *)&sentinel;
 	T_EXPECT_EQ(wire_flush(&ss), WIRE_FLUSH_DONE);
 	ss.wire.tlsconn = NULL;
 #endif
@@ -449,32 +502,6 @@ T_DECLARE_CASE(test_wire_wait_eof_error_on_unexpected_data)
 }
 
 #if WITH_TLS
-
-static void wire_test_rm_tmpdir(const char *path)
-{
-	DIR *const dir = opendir(path);
-	if (dir == NULL) {
-		return;
-	}
-	struct dirent *ent;
-	while ((ent = readdir(dir)) != NULL) {
-		if (strcmp(ent->d_name, ".") == 0 ||
-		    strcmp(ent->d_name, "..") == 0) {
-			continue;
-		}
-		char subpath[PATH_MAX];
-		(void)snprintf(
-			subpath, sizeof(subpath), "%s/%s", path, ent->d_name);
-		struct stat st;
-		if (lstat(subpath, &st) == 0 && S_ISDIR(st.st_mode)) {
-			wire_test_rm_tmpdir(subpath);
-		} else {
-			(void)unlink(subpath);
-		}
-	}
-	(void)closedir(dir);
-	(void)rmdir(path);
-}
 
 /* Self-signed RSA-4096 certificate (CN/subjectAltName=DNS:test.example) and its
  * private key, in memory so they work with every TLS backend; identical to the
@@ -565,63 +592,32 @@ static const char wire_test_key_pem[] =
 	"NL+YLwobqSZhkl4iZWt2wGODitzp/aQ=\n"
 	"-----END PRIVATE KEY-----\n";
 
-static bool wire_test_write_pem(const char *path, const char *data)
+/* Build a mutual-auth TLS server context from the embedded self-signed cert/key,
+ * passed inline as PEM (tls_config accepts PEM data directly); the same
+ * self-signed cert is trusted as the authorized peer.  Returns NULL on failure.
+ * No temp files, no process-global chdir. */
+static struct tls_context *wire_test_server_ctx(void)
 {
-	FILE *const fp = fopen(path, "w");
-	if (fp == NULL) {
-		return false;
-	}
-	const size_t len = strlen(data);
-	const size_t n = fwrite(data, 1, len, fp);
-	const int closed = fclose(fp);
-	return n == len && closed == 0;
+	char *authcerts[] = { (char *)wire_test_cert_pem };
+	return tls_ctx_server(&(struct tls_config){
+		.cert = wire_test_cert_pem,
+		.key = wire_test_key_pem,
+		.authcerts = authcerts,
+		.authcerts_count = 1,
+	});
 }
 
-static bool wire_test_make_certs(void)
+/* As wire_test_server_ctx, but a client context (verifies the peer against the
+ * same embedded cert). */
+static struct tls_context *wire_test_client_ctx(void)
 {
-	if (!wire_test_write_pem("t-cert.pem", wire_test_cert_pem)) {
-		return false;
-	}
-	if (!wire_test_write_pem("t-key.pem", wire_test_key_pem)) {
-		return false;
-	}
-	return true;
-}
-
-/* Write the embedded cert/key pair to a fresh tmpdir.
- * Returns the saved working directory (caller must free), or NULL on failure.
- * On success, cert_out and key_out hold absolute '@'-prefixed paths. */
-static char *wire_test_setup_cert_dir(
-	char *restrict tmpl, char *restrict cert_out, const size_t cert_sz,
-	char *restrict key_out, const size_t key_sz)
-{
-	char *const origdir = getcwd(NULL, 0);
-	if (origdir == NULL) {
-		return NULL;
-	}
-	if (mkdtemp(tmpl) == NULL) {
-		free(origdir);
-		return NULL;
-	}
-	if (chdir(tmpl) != 0) {
-		wire_test_rm_tmpdir(tmpl);
-		free(origdir);
-		return NULL;
-	}
-	if (!wire_test_make_certs()) {
-		if (chdir(origdir) != 0) {
-			LOGW_F("chdir: (%d) %s", errno, strerror(errno));
-		}
-		wire_test_rm_tmpdir(tmpl);
-		free(origdir);
-		return NULL;
-	}
-	(void)snprintf(cert_out, cert_sz, "@%s/t-cert.pem", tmpl);
-	(void)snprintf(key_out, key_sz, "@%s/t-key.pem", tmpl);
-	if (chdir(origdir) != 0) {
-		LOGW_F("chdir: (%d) %s", errno, strerror(errno));
-	}
-	return origdir;
+	char *authcerts[] = { (char *)wire_test_cert_pem };
+	return tls_ctx_client(&(struct tls_config){
+		.cert = wire_test_cert_pem,
+		.key = wire_test_key_pem,
+		.authcerts = authcerts,
+		.authcerts_count = 1,
+	});
 }
 
 /* Drive TLS handshake on both connections alternately until both complete.
@@ -661,21 +657,17 @@ static bool wire_test_drive_handshake(
 	return false;
 }
 
-T_DECLARE_CASE(test_wire_set_tlsctx_updates_and_noop)
+T_DECLARE_CASE(test_wire_set_tlsctx_updates)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
 	/* Use the address of a local variable as a type-safe non-NULL sentinel.
-	 * wire_set_tlsctx only compares pointers and never dereferences tlsctx. */
+	 * wire_set_tlsctx only stores the pointer and never dereferences it. */
 	unsigned char sentinel;
 	struct tls_context *const fake = (struct tls_context *)&sentinel;
 
 	/* NULL -> fake: must update. */
-	wire_set_tlsctx(&ss, fake);
-	T_EXPECT_EQ(ss.wire.tlsctx, fake);
-
-	/* fake -> fake: must be a no-op (same pointer). */
 	wire_set_tlsctx(&ss, fake);
 	T_EXPECT_EQ(ss.wire.tlsctx, fake);
 
@@ -695,19 +687,7 @@ T_DECLARE_CASE(test_wire_tls_start_noop_when_no_context)
 
 T_DECLARE_CASE(test_wire_tls_start_creates_outbound_conn)
 {
-	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *const origdir = wire_test_setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *const cli_ctx =
-		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
 	T_CHECK(cli_ctx != NULL);
 
 	int fds[2];
@@ -719,31 +699,20 @@ T_DECLARE_CASE(test_wire_tls_start_creates_outbound_conn)
 	struct mux_session ss = make_session(&pool_ctx, fds[1]);
 	/* Set only tlsctx; wire_tls_start must create tlsconn via tls_client. */
 	ss.wire.tlsctx = cli_ctx;
-	T_EXPECT(wire_tls_start(&ss));
-	T_EXPECT(ss.wire.tlsconn != NULL);
+	const bool started = wire_tls_start(&ss);
+	const bool has_conn = (ss.wire.tlsconn != NULL);
 
 	wire_conn_free(&ss);
 	tls_ctx_free(cli_ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
-	wire_test_rm_tmpdir(tmpl);
+	T_EXPECT(started);
+	T_EXPECT(has_conn);
 }
 
 T_DECLARE_CASE(test_wire_conn_free_clears_tlsconn)
 {
-	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *const origdir = wire_test_setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *const ctx =
-		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
+	struct tls_context *const ctx = wire_test_server_ctx();
 	T_CHECK(ctx != NULL);
 
 	int fds[2];
@@ -756,34 +725,18 @@ T_DECLARE_CASE(test_wire_conn_free_clears_tlsconn)
 	struct mux_session ss = make_session(&pool_ctx, fds[0]);
 	ss.wire.tlsconn = conn;
 	wire_conn_free(&ss);
-	T_EXPECT(ss.wire.tlsconn == NULL);
+	const bool cleared = (ss.wire.tlsconn == NULL);
 
 	tls_ctx_free(ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
-	wire_test_rm_tmpdir(tmpl);
+	T_EXPECT(cleared);
 }
 
 T_DECLARE_CASE(test_wire_tls_send_recv_data)
 {
-	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *const origdir = wire_test_setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *const srv_ctx =
-		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
-	struct tls_context *const cli_ctx =
-		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
 	T_CHECK(srv_ctx != NULL);
 	T_CHECK(cli_ctx != NULL);
 
@@ -808,23 +761,27 @@ T_DECLARE_CASE(test_wire_tls_send_recv_data)
 	unsigned char recv_buf[sizeof(send_buf)] = { 0 };
 	size_t slen = sizeof(send_buf) - 1;
 	size_t rlen = sizeof(recv_buf) - 1;
-	T_EXPECT(wire_send(&cli_ss, send_buf, &slen));
-	T_EXPECT_EQ(slen, sizeof(send_buf) - 1);
+	const bool send_ok = wire_send(&cli_ss, send_buf, &slen);
 	/* AF_UNIX delivers synchronously on Linux but asynchronously on
 	 * Windows/msys2: retry wire_recv waiting for readability until the
 	 * payload arrives. */
+	bool recv_ok = true;
 	size_t got = 0;
 	for (int i = 0; i < 20 && got == 0; i++) {
 		rlen = sizeof(recv_buf) - 1;
-		T_EXPECT(wire_recv(&srv_ss, recv_buf, &rlen));
+		if (!wire_recv(&srv_ss, recv_buf, &rlen)) {
+			recv_ok = false;
+			break;
+		}
 		got = rlen;
 		if (got == 0) {
 			struct pollfd pfd = { .fd = fds[0], .events = POLLIN };
 			(void)poll(&pfd, 1, 100);
 		}
 	}
-	T_EXPECT_EQ(got, sizeof(send_buf) - 1);
-	T_EXPECT(memcmp(recv_buf, send_buf, got) == 0);
+	const bool payload_ok =
+		(got == sizeof(send_buf) - 1 &&
+		 memcmp(recv_buf, send_buf, got) == 0);
 
 	/* Prevent double-free: clear wire pointers before explicit conn_free. */
 	srv_ss.wire.tlsconn = NULL;
@@ -835,29 +792,16 @@ T_DECLARE_CASE(test_wire_tls_send_recv_data)
 	tls_ctx_free(cli_ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
-	wire_test_rm_tmpdir(tmpl);
+	T_EXPECT(send_ok);
+	T_EXPECT_EQ(slen, sizeof(send_buf) - 1);
+	T_EXPECT(recv_ok);
+	T_EXPECT(payload_ok);
 }
 
 T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 {
-	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *const origdir = wire_test_setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *const srv_ctx =
-		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
-	struct tls_context *const cli_ctx =
-		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
 	T_CHECK(srv_ctx != NULL);
 	T_CHECK(cli_ctx != NULL);
 
@@ -879,12 +823,15 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 	cli_ss.wire.tlsconn = cli_conn;
 
 	/* Drive TLS shutdown cooperatively until both sides complete. */
-	bool cli_done = false, srv_done = false;
+	bool cli_done = false, srv_done = false, no_error = true;
 	for (int i = 0; i < 10 && !(cli_done && srv_done); i++) {
 		if (!cli_done) {
 			const enum wire_shutdown_state s =
 				wire_shutdown(&cli_ss);
-			T_EXPECT(s != WIRE_SHUTDOWN_ERROR);
+			if (s == WIRE_SHUTDOWN_ERROR) {
+				no_error = false;
+				break;
+			}
 			if (s == WIRE_SHUTDOWN_DONE) {
 				cli_done = true;
 			}
@@ -892,14 +839,15 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 		if (!srv_done) {
 			const enum wire_shutdown_state s =
 				wire_shutdown(&srv_ss);
-			T_EXPECT(s != WIRE_SHUTDOWN_ERROR);
+			if (s == WIRE_SHUTDOWN_ERROR) {
+				no_error = false;
+				break;
+			}
 			if (s == WIRE_SHUTDOWN_DONE) {
 				srv_done = true;
 			}
 		}
 	}
-	T_EXPECT(cli_done);
-	T_EXPECT(srv_done);
 
 	srv_ss.wire.tlsconn = NULL;
 	cli_ss.wire.tlsconn = NULL;
@@ -909,7 +857,9 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
 	tls_ctx_free(cli_ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
-	wire_test_rm_tmpdir(tmpl);
+	T_EXPECT(no_error);
+	T_EXPECT(cli_done);
+	T_EXPECT(srv_done);
 }
 
 /* End-to-end memory transport (tls.socket_offload disabled): wire_send/wire_recv
@@ -917,24 +867,8 @@ T_DECLARE_CASE(test_wire_tls_shutdown_completes)
  * mutual-auth handshake and a bidirectional payload exchange through the wire API. */
 T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 {
-	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *const origdir = wire_test_setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *const srv_ctx =
-		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
-	struct tls_context *const cli_ctx =
-		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
 	T_CHECK(srv_ctx != NULL);
 	T_CHECK(cli_ctx != NULL);
 
@@ -972,12 +906,10 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 	 * caller to arm. Asserting the direction here guards against an
 	 * EV_READ/EV_WRITE swap or a dropped assignment, which the convergent
 	 * exchange loop below would otherwise still succeed through. */
-	{
-		size_t probe = sizeof(cli_msg) - 1;
-		T_CHECK(wire_send(&cli_ss, cli_msg, &probe));
-		T_EXPECT_EQ(probe, (size_t)0);
-		T_EXPECT_EQ(cli_ss.wire.tls_want, EV_READ);
-	}
+	size_t probe = sizeof(cli_msg) - 1;
+	T_CHECK(wire_send(&cli_ss, cli_msg, &probe));
+	const bool probe_zero = (probe == 0);
+	const bool probe_want_read = (cli_ss.wire.tls_want == EV_READ);
 
 	for (int i = 0; i < 100 && (srv_got == 0 || cli_got == 0); i++) {
 		if (cli_sent == 0) {
@@ -1002,14 +934,17 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 		}
 	}
 
-	T_EXPECT_EQ(srv_got, sizeof(cli_msg) - 1);
-	T_EXPECT(memcmp(srv_rx, cli_msg, srv_got) == 0);
-	T_EXPECT_EQ(cli_got, sizeof(srv_msg) - 1);
-	T_EXPECT(memcmp(cli_rx, srv_msg, cli_got) == 0);
+	const bool srv_payload_ok =
+		(srv_got == sizeof(cli_msg) - 1 &&
+		 memcmp(srv_rx, cli_msg, srv_got) == 0);
+	const bool cli_payload_ok =
+		(cli_got == sizeof(srv_msg) - 1 &&
+		 memcmp(cli_rx, srv_msg, cli_got) == 0);
 
 	/* Buffered close: the client's close_notify must reach the socket and the
 	 * server must observe a clean EOF through the buffered recv path. */
-	T_EXPECT_EQ(wire_shutdown(&cli_ss), WIRE_SHUTDOWN_DONE);
+	const bool shutdown_done =
+		(wire_shutdown(&cli_ss) == WIRE_SHUTDOWN_DONE);
 	srv_ss.wire.rx_open = true;
 	bool srv_eof = false;
 	for (int i = 0; i < 20 && !srv_eof; i++) {
@@ -1017,19 +952,23 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 		T_CHECK(wire_recv(&srv_ss, srv_rx, &rn));
 		srv_eof = srv_ss.wire.rx_eof;
 	}
-	T_EXPECT(srv_eof);
 
 	srv_ss.wire.tlsconn = NULL;
 	cli_ss.wire.tlsconn = NULL;
 	tls_conn_free(srv_conn);
 	tls_conn_free(cli_conn);
-	ringbuf_free(srv_ss.wire.rawbuf);
-	ringbuf_free(cli_ss.wire.rawbuf);
+	bytebuf_free(srv_ss.wire.rawbuf);
+	bytebuf_free(cli_ss.wire.rawbuf);
 	tls_ctx_free(srv_ctx);
 	tls_ctx_free(cli_ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
-	wire_test_rm_tmpdir(tmpl);
+	T_EXPECT(probe_zero);
+	T_EXPECT(probe_want_read);
+	T_EXPECT(srv_payload_ok);
+	T_EXPECT(cli_payload_ok);
+	T_EXPECT(shutdown_done);
+	T_EXPECT(srv_eof);
 }
 
 /* Regression: a wire_cipher_push failure landing in the TLS_ERROR_ZERO_RETURN
@@ -1037,24 +976,8 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
  * must be reported as a hard failure, not swallowed into a clean-close. */
 T_DECLARE_CASE(test_wire_recv_buffered_zero_return_reports_push_failure)
 {
-	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *const origdir = wire_test_setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *const srv_ctx =
-		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
-	struct tls_context *const cli_ctx =
-		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
 	T_CHECK(srv_ctx != NULL);
 	T_CHECK(cli_ctx != NULL);
 
@@ -1108,7 +1031,8 @@ T_DECLARE_CASE(test_wire_recv_buffered_zero_return_reports_push_failure)
 	/* Client sends its close_notify via wire_shutdown; wait until the
 	 * ciphertext is queued and readable on the server's socket, without
 	 * consuming it, so wire_recv_buffered itself decrypts the alert. */
-	T_EXPECT_EQ(wire_shutdown(&cli_ss), WIRE_SHUTDOWN_DONE);
+	const bool shutdown_done =
+		(wire_shutdown(&cli_ss) == WIRE_SHUTDOWN_DONE);
 	bool readable = false;
 	for (int i = 0; i < 50 && !readable; i++) {
 		struct pollfd pfd = { .fd = fds[0], .events = POLLIN };
@@ -1120,28 +1044,30 @@ T_DECLARE_CASE(test_wire_recv_buffered_zero_return_reports_push_failure)
 	 * the server's own send direction, so the next wire_cipher_push
 	 * observes a hard EPIPE instead of EAGAIN. */
 	T_CHECK(srv_ss.wire.rawbuf != NULL);
-	T_CHECK(ringbuf_write_space(srv_ss.wire.rawbuf) >= 16);
-	memset(ringbuf_write_ptr(srv_ss.wire.rawbuf), 'x', 16);
-	ringbuf_produce(srv_ss.wire.rawbuf, 16);
+	T_CHECK(bytebuf_write_space(srv_ss.wire.rawbuf) >= 16);
+	memset(bytebuf_write_ptr(srv_ss.wire.rawbuf), 'x', 16);
+	bytebuf_produce(srv_ss.wire.rawbuf, 16);
 	T_CHECK(shutdown(fds[0], SHUT_WR) == 0);
 
 	srv_ss.wire.rx_open = true;
 	size_t rn = sizeof(srv_rx);
-	T_EXPECT(!wire_recv_buffered(&srv_ss, srv_rx, &rn));
-	T_EXPECT(!srv_ss.wire.rx_open);
-	T_EXPECT_EQ(rn, (size_t)0);
+	const bool recv_failed = !wire_recv_buffered(&srv_ss, srv_rx, &rn);
+	const bool rx_closed = !srv_ss.wire.rx_open;
 
 	srv_ss.wire.tlsconn = NULL;
 	cli_ss.wire.tlsconn = NULL;
 	tls_conn_free(srv_conn);
 	tls_conn_free(cli_conn);
-	ringbuf_free(srv_ss.wire.rawbuf);
-	ringbuf_free(cli_ss.wire.rawbuf);
+	bytebuf_free(srv_ss.wire.rawbuf);
+	bytebuf_free(cli_ss.wire.rawbuf);
 	tls_ctx_free(srv_ctx);
 	tls_ctx_free(cli_ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
-	wire_test_rm_tmpdir(tmpl);
+	T_EXPECT(shutdown_done);
+	T_EXPECT(recv_failed);
+	T_EXPECT(rx_closed);
+	T_EXPECT_EQ(rn, (size_t)0);
 }
 
 /* wire_flush's WIRE_FLUSH_BLOCKED/WIRE_FLUSH_ERROR outcomes
@@ -1149,24 +1075,8 @@ T_DECLARE_CASE(test_wire_recv_buffered_zero_return_reports_push_failure)
  * entirely) had zero direct test references. */
 T_DECLARE_CASE(test_wire_flush_blocked_on_partial_socket_write)
 {
-	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *const origdir = wire_test_setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *const srv_ctx =
-		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
-	struct tls_context *const cli_ctx =
-		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
 	T_CHECK(srv_ctx != NULL);
 	T_CHECK(cli_ctx != NULL);
 
@@ -1222,47 +1132,32 @@ T_DECLARE_CASE(test_wire_flush_blocked_on_partial_socket_write)
 	 * peer to stop reading or the buffer to already be completely full. */
 	enum { STAGE_BYTES = 8 * 1024 * 1024 };
 	T_CHECK(srv_ss.wire.rawbuf != NULL);
-	T_CHECK(ringbuf_reserve(&srv_ss.wire.rawbuf, STAGE_BYTES, true));
-	memset(ringbuf_write_ptr(srv_ss.wire.rawbuf), 'x', STAGE_BYTES);
-	ringbuf_produce(srv_ss.wire.rawbuf, STAGE_BYTES);
+	T_CHECK(bytebuf_reserve(&srv_ss.wire.rawbuf, STAGE_BYTES, true));
+	memset(bytebuf_write_ptr(srv_ss.wire.rawbuf), 'x', STAGE_BYTES);
+	bytebuf_produce(srv_ss.wire.rawbuf, STAGE_BYTES);
 
-	T_EXPECT_EQ(wire_flush(&srv_ss), WIRE_FLUSH_BLOCKED);
+	const bool flush_blocked = (wire_flush(&srv_ss) == WIRE_FLUSH_BLOCKED);
 	/* Residue must survive a BLOCKED outcome, to retry on the next wakeup. */
-	T_EXPECT(ringbuf_readable(srv_ss.wire.rawbuf) > 0);
+	const bool residue_kept = (bytebuf_readable(srv_ss.wire.rawbuf) > 0);
 
 	srv_ss.wire.tlsconn = NULL;
 	cli_ss.wire.tlsconn = NULL;
 	tls_conn_free(srv_conn);
 	tls_conn_free(cli_conn);
-	ringbuf_free(srv_ss.wire.rawbuf);
-	ringbuf_free(cli_ss.wire.rawbuf);
+	bytebuf_free(srv_ss.wire.rawbuf);
+	bytebuf_free(cli_ss.wire.rawbuf);
 	tls_ctx_free(srv_ctx);
 	tls_ctx_free(cli_ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
-	wire_test_rm_tmpdir(tmpl);
+	T_EXPECT(flush_blocked);
+	T_EXPECT(residue_kept);
 }
 
 T_DECLARE_CASE(test_wire_flush_error_on_hard_send_failure)
 {
-	char tmpl[] = "/tmp/wire_tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2], key_path[PATH_MAX + 2];
-	char *const origdir = wire_test_setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
-	struct tls_context *const srv_ctx =
-		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
-	struct tls_context *const cli_ctx =
-		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
-						     .authcerts_count = 1 });
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
 	T_CHECK(srv_ctx != NULL);
 	T_CHECK(cli_ctx != NULL);
 
@@ -1316,24 +1211,222 @@ T_DECLARE_CASE(test_wire_flush_error_on_hard_send_failure)
 	 * shut down the server's own send direction so the next attempt to write
 	 * staged residue observes a hard EPIPE instead of EAGAIN. */
 	T_CHECK(srv_ss.wire.rawbuf != NULL);
-	T_CHECK(ringbuf_write_space(srv_ss.wire.rawbuf) >= 16);
-	memset(ringbuf_write_ptr(srv_ss.wire.rawbuf), 'x', 16);
-	ringbuf_produce(srv_ss.wire.rawbuf, 16);
+	T_CHECK(bytebuf_write_space(srv_ss.wire.rawbuf) >= 16);
+	memset(bytebuf_write_ptr(srv_ss.wire.rawbuf), 'x', 16);
+	bytebuf_produce(srv_ss.wire.rawbuf, 16);
 	T_CHECK(shutdown(fds[0], SHUT_WR) == 0);
 
-	T_EXPECT_EQ(wire_flush(&srv_ss), WIRE_FLUSH_ERROR);
+	const bool flush_error = (wire_flush(&srv_ss) == WIRE_FLUSH_ERROR);
 
 	srv_ss.wire.tlsconn = NULL;
 	cli_ss.wire.tlsconn = NULL;
 	tls_conn_free(srv_conn);
 	tls_conn_free(cli_conn);
-	ringbuf_free(srv_ss.wire.rawbuf);
-	ringbuf_free(cli_ss.wire.rawbuf);
+	bytebuf_free(srv_ss.wire.rawbuf);
+	bytebuf_free(cli_ss.wire.rawbuf);
 	tls_ctx_free(srv_ctx);
 	tls_ctx_free(cli_ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
-	wire_test_rm_tmpdir(tmpl);
+	T_EXPECT(flush_error);
+}
+
+/* wire_adopt_tlsconn (resume-handoff hook) has two obligations: free any
+ * pre-existing tlsconn on the target, and rebind the TLS I/O notifier to ss so
+ * it never fires on the transient session that carried the resume hello.  This
+ * installs conn_old on ss, binds a second memory-backed client conn's notifier
+ * to a *different* (transient) session, then adopts it onto ss.  After the swap,
+ * driving conn's handshake stages its ClientHello, firing on_send: it must set
+ * ss's tx_pending (the rebound target), never the transient session's.  A
+ * missed rebind is a use-after-free once the transient session is torn down. */
+T_DECLARE_CASE(test_wire_adopt_tlsconn_swaps_and_rebinds_notifier)
+{
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	/* Pre-existing connection on ss that adopt must free. */
+	struct tls_connection *const conn_old = tls_server(srv_ctx, -1);
+	/* Memory-backed client that will produce a ClientHello when driven. */
+	struct tls_connection *const conn_new = tls_client(cli_ctx, -1);
+	T_CHECK(conn_old != NULL);
+	T_CHECK(conn_new != NULL);
+
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx, -1);
+	struct mux_session transient_ss = make_session(&pool_ctx, -1);
+	ss.wire.tlsconn = conn_old;
+
+	/* Bind conn_new's notifier to the transient session, mirroring how a
+	 * resume hello's connection is created before ss exists. */
+	const struct tls_callback transient_cb = {
+		.ctx = &transient_ss,
+		.on_send = wire_on_tls_send,
+		.on_recv = wire_on_tls_recv,
+	};
+	tls_set_callback(conn_new, &transient_cb);
+
+	wire_adopt_tlsconn(&ss, conn_new);
+	const bool swapped = (ss.wire.tlsconn == conn_new);
+
+	/* Fire the notifier: a memory-backed client's first handshake stages the
+	 * ClientHello, which the backend reports via on_send. */
+	const enum tls_error herr = tls_handshake(conn_new);
+	const bool handshake_progressing =
+		(herr == TLS_ERROR_WANT_READ || herr == TLS_ERROR_WANT_WRITE ||
+		 herr == TLS_ERROR_NONE);
+	const bool fired_on_ss = ss.wire.tx_pending;
+	const bool not_fired_on_transient = !transient_ss.wire.tx_pending;
+
+	ss.wire.tlsconn = NULL;
+	tls_conn_free(conn_new);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
+	T_EXPECT(swapped);
+	T_EXPECT(handshake_progressing);
+	T_EXPECT(fired_on_ss);
+	T_EXPECT(not_fired_on_transient);
+}
+
+/* wire_wait_eof memory-transport branch (tlsconn != NULL, socket_offload
+ * disabled): it must drain the socket itself, feed the ciphertext to tls_input,
+ * and map the peer's close_notify (tls_recv -> TLS_ERROR_ZERO_RETURN) to
+ * WIRE_EOF_CONFIRMED.  Only the plain-TCP tail was covered before. */
+T_DECLARE_CASE(test_wire_wait_eof_tls_buffered_confirmed)
+{
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, -1);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, -1);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session srv_ss = make_session(&pool_ctx, fds[0]);
+	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
+	srv_ss.wire.tlsconn = srv_conn;
+	cli_ss.wire.tlsconn = cli_conn;
+	srv_ss.conf.tls_socket_offload = false;
+	cli_ss.conf.tls_socket_offload = false;
+
+	/* Complete the handshake (mirrors test_wire_tls_buffered_send_recv). */
+	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
+	unsigned char cli_rx[4096] = { 0 }, srv_rx[4096] = { 0 };
+	size_t cli_sent = 0, srv_sent = 0, srv_got = 0, cli_got = 0;
+	for (int i = 0; i < 100 && (srv_got == 0 || cli_got == 0); i++) {
+		if (cli_sent == 0) {
+			size_t n = sizeof(cli_msg) - 1;
+			T_CHECK(wire_send(&cli_ss, cli_msg, &n));
+			cli_sent = n;
+		}
+		if (srv_sent == 0) {
+			size_t n = sizeof(srv_msg) - 1;
+			T_CHECK(wire_send(&srv_ss, srv_msg, &n));
+			srv_sent = n;
+		}
+		size_t rn = sizeof(srv_rx);
+		T_CHECK(wire_recv(&srv_ss, srv_rx, &rn));
+		if (rn > 0) {
+			srv_got = rn;
+		}
+		rn = sizeof(cli_rx);
+		T_CHECK(wire_recv(&cli_ss, cli_rx, &rn));
+		if (rn > 0) {
+			cli_got = rn;
+		}
+	}
+	T_CHECK(srv_got > 0 && cli_got > 0);
+
+	/* Send ONLY the client's close_notify record, with no TCP FIN, so the
+	 * server's sole route to a confirmed EOF is wire_wait_eof decrypting the
+	 * alert to TLS_ERROR_ZERO_RETURN -- not the clen==0 TCP-FIN shortcut.
+	 * wire_shutdown would also half-close the socket and mask that mapping. */
+	T_CHECK(tls_shutdown(cli_conn) == TLS_ERROR_NONE);
+	T_CHECK(wire_flush(&cli_ss) == WIRE_FLUSH_DONE);
+	enum wire_eof_result eof = WIRE_EOF_PENDING;
+	for (int i = 0; i < 50 && eof == WIRE_EOF_PENDING; i++) {
+		struct pollfd pfd = { .fd = fds[0], .events = POLLIN };
+		(void)poll(&pfd, 1, 20);
+		eof = wire_wait_eof(&srv_ss);
+	}
+	const bool confirmed = (eof == WIRE_EOF_CONFIRMED);
+
+	srv_ss.wire.tlsconn = NULL;
+	cli_ss.wire.tlsconn = NULL;
+	tls_conn_free(srv_conn);
+	tls_conn_free(cli_conn);
+	bytebuf_free(srv_ss.wire.rawbuf);
+	bytebuf_free(cli_ss.wire.rawbuf);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	T_EXPECT(confirmed);
+}
+
+/* wire_wait_eof socket-offload branch (tlsconn != NULL, socket_offload
+ * enabled): tls_recv drives the fd directly; unexpected application data
+ * arriving after the local shutdown (TLS_ERROR_NONE with nread > 0) must map to
+ * WIRE_EOF_ERROR, not a confirmed or pending close. */
+T_DECLARE_CASE(test_wire_wait_eof_tls_offload_error_on_appdata)
+{
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	/* fd-backed connections: the library drives the socket (socket offload). */
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+	T_CHECK(wire_test_drive_handshake(srv_conn, cli_conn, 20));
+
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session srv_ss = make_session(&pool_ctx, fds[0]);
+	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
+	srv_ss.wire.tlsconn = srv_conn;
+	cli_ss.wire.tlsconn = cli_conn;
+	/* socket offload stays enabled (the make_session default). */
+
+	/* Client sends application data instead of a close_notify. */
+	unsigned char stray[] = "surprise";
+	size_t slen = sizeof(stray) - 1;
+	T_CHECK(wire_send(&cli_ss, stray, &slen));
+
+	/* Server treats this as post-shutdown data: wait for it to arrive, then
+	 * wire_wait_eof (offload path) must report ERROR, not PENDING/CONFIRMED. */
+	enum wire_eof_result eof = WIRE_EOF_PENDING;
+	for (int i = 0; i < 50 && eof == WIRE_EOF_PENDING; i++) {
+		struct pollfd pfd = { .fd = fds[0], .events = POLLIN };
+		(void)poll(&pfd, 1, 20);
+		eof = wire_wait_eof(&srv_ss);
+	}
+	const bool is_error = (eof == WIRE_EOF_ERROR);
+
+	srv_ss.wire.tlsconn = NULL;
+	cli_ss.wire.tlsconn = NULL;
+	tls_conn_free(srv_conn);
+	tls_conn_free(cli_conn);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	T_EXPECT(is_error);
 }
 
 #endif /* WITH_TLS */
@@ -1540,7 +1633,7 @@ T_DECLARE_CASE(test_sendbuf_discard_clears_staging)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
-	ss.wire.recvbuf = ringbuf_new(32);
+	ss.wire.recvbuf = bytebuf_new(32);
 	T_CHECK(ss.wire.recvbuf != NULL);
 
 	/* One entry holding two packed corkable frames (f2 packed onto f1). */
@@ -1563,7 +1656,7 @@ T_DECLARE_CASE(test_sendbuf_discard_clears_staging)
 	/* pool: 2 allocs (f1 + f2); both freed: f2 when packed, f1 on discard. */
 	T_EXPECT_EQ(pool_ctx.free_calls, 2);
 
-	ringbuf_free(ss.wire.recvbuf);
+	bytebuf_free(ss.wire.recvbuf);
 }
 
 /* When the open tail already spans more than one record (len == MUX_MAX_FRAME_SIZE)
@@ -1644,13 +1737,15 @@ T_DECLARE_CASE(test_sendbuf_push_fills_record_then_new_entry)
 
 static const struct testing_suite suite[] = {
 	T_CASE(test_wire_send_plain_tcp_writes_bytes),
+	T_CASE(test_wire_send_plain_tcp_partial_then_blocked),
+	T_CASE(test_wire_send_plain_tcp_hard_error_returns_false),
 	T_CASE(test_wire_recv_plain_tcp_reads_payload),
 	T_CASE(test_wire_recv_eof_clears_rx_open_and_sets_tx_pending),
-	T_CASE(test_ringbuf_consume_frame_preserves_remaining_bytes),
-	T_CASE(test_ringbuf_consume_advances_offset_without_copy),
-	T_CASE(test_ringbuf_shrink_reclaims_capacity),
-	T_CASE(test_ringbuf_shrink_keeps_live_bytes),
-	T_CASE(test_ringbuf_shrink_noop_when_small),
+	T_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes),
+	T_CASE(test_bytebuf_consume_advances_offset_without_copy),
+	T_CASE(test_bytebuf_shrink_reclaims_capacity),
+	T_CASE(test_bytebuf_shrink_keeps_live_bytes),
+	T_CASE(test_bytebuf_shrink_noop_when_small),
 	T_CASE(test_wire_discard_buffers_frees_all_pending_frames),
 	T_CASE(test_wire_has_pending_reflects_build_variant),
 	T_CASE(test_wire_flush_done_without_memory_transport_tls),
@@ -1669,7 +1764,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_sendbuf_push_full_tail_starts_new_entry),
 	T_CASE(test_sendbuf_push_fills_record_then_new_entry),
 #if WITH_TLS
-	T_CASE(test_wire_set_tlsctx_updates_and_noop),
+	T_CASE(test_wire_set_tlsctx_updates),
 	T_CASE(test_wire_tls_start_noop_when_no_context),
 	T_CASE(test_wire_tls_start_creates_outbound_conn),
 	T_CASE(test_wire_conn_free_clears_tlsconn),
@@ -1679,6 +1774,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_wire_recv_buffered_zero_return_reports_push_failure),
 	T_CASE(test_wire_flush_blocked_on_partial_socket_write),
 	T_CASE(test_wire_flush_error_on_hard_send_failure),
+	T_CASE(test_wire_adopt_tlsconn_swaps_and_rebinds_notifier),
+	T_CASE(test_wire_wait_eof_tls_buffered_confirmed),
+	T_CASE(test_wire_wait_eof_tls_offload_error_on_appdata),
 #endif /* WITH_TLS */
 	T_SUITE_END,
 };

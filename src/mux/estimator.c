@@ -40,8 +40,13 @@
 void estimator_init(struct mux_session *restrict ss, const size_t bdp)
 {
 	ss->estimator = (struct estimator_ctx){ 0 };
-	ss->estimator.rx.effective_bdp = bdp;
-	ss->estimator.tx.effective_bdp = bdp;
+	/* Clamp the seed to at least WNDSIZE_MIN: effective_bdp == 0 is an
+	 * absorbing fixed point for phase_startup's multiplicative growth
+	 * (0 * factor == 0), and demand + demand/2 > 0 always fires, so STARTUP
+	 * would never exit and the BDP estimate would never feed the window. */
+	const size_t seed = MAX(bdp, WNDSIZE_MIN);
+	ss->estimator.rx.effective_bdp = seed;
+	ss->estimator.tx.effective_bdp = seed;
 	session_publish_estimate(ss);
 }
 
@@ -95,11 +100,10 @@ static void run_probe_cycle(
 	/* The probe cycle is shared by both directions but the growth phase is
 	 * per-direction: probe at the faster STARTUP rate until both directions
 	 * reach TRACK, so a fresh window converges quickly. */
-	const int_fast64_t min_interval =
-		(ss->estimator.rx.phase == ESTIMATOR_STARTUP ||
-		 ss->estimator.tx.phase == ESTIMATOR_STARTUP) ?
-			MUX_PING_STARTUP_INTERVAL_NS :
-			MUX_PING_RATE_LIMIT_NS;
+	const int_fast64_t min_interval = (est->rx.phase == ESTIMATOR_STARTUP ||
+					   est->tx.phase == ESTIMATOR_STARTUP) ?
+						  MUX_PING_STARTUP_INTERVAL_NS :
+						  MUX_PING_RATE_LIMIT_NS;
 	if (est->last_probe_ns != 0 &&
 	    sent_ns - est->last_probe_ns < min_interval) {
 		LOGD_F("rate-limited, %" PRIdFAST64 " ms remaining",
@@ -164,7 +168,9 @@ static void phase_track(
 {
 	/* Re-enter STARTUP only when measured BDP outgrows the window.  Keying
 	 * on d->bdp (spike-immune) rather than the raw byte count avoids
-	 * re-ramping on RTT jitter; the != 0 guard skips the first seeded cycle. */
+	 * re-ramping on RTT jitter; the != 0 guard is defensive against an unseeded
+	 * effective_bdp -- estimator_init always seeds a non-zero window, so it only
+	 * matters to white-box tests that skip it. */
 	if (d->effective_bdp != 0 && d->bdp > d->effective_bdp) {
 		d->phase = ESTIMATOR_STARTUP;
 		d->stable_rounds = 0;
@@ -192,13 +198,17 @@ struct calc_cycle {
  * undefined behavior (C11 6.3.1.4p1), and bdp_sample can reach ~9e15 at the
  * extremes of the bw_max and rtt_min_ns clamps -- within a 64-bit size_t but
  * past a 32-bit one. SIZE_MAX may round up to SIZE_MAX+1 as a double, so the
- * >= comparison keeps the in-range cast strictly below the destination's max. */
+ * `v < (double)SIZE_MAX` test below keeps the in-range cast strictly below the
+ * destination's max. */
 static size_t bdp_to_size(const double v)
 {
 	if (v <= 0.0) {
 		return 0;
 	}
-	if (v >= (double)SIZE_MAX) {
+	/* Inverted comparison so a NaN -- for which every ordered comparison is
+	 * false, so `v <= 0.0` above does not catch it -- saturates to SIZE_MAX
+	 * instead of reaching the out-of-range (size_t)v cast (UB, C11 6.3.1.4p1). */
+	if (!(v < (double)SIZE_MAX)) {
 		return SIZE_MAX;
 	}
 	return (size_t)v;
@@ -321,8 +331,12 @@ static size_t window_size(const struct estimator_dir_ctx *restrict d)
 	if (bw_max > 0) {
 		const int_fast64_t bw_floor =
 			bw_max * WND_FEEDBACK_FLOOR_NS / INT64_C(1000000000);
-		if ((size_t)bw_floor > floor) {
-			floor = (size_t)bw_floor > WNDSIZE_MAX ?
+		/* Compare in int_fast64_t before narrowing: bw_floor can reach
+		 * ~9.22e9, past a 32-bit size_t, so a premature (size_t) cast would
+		 * wrap a large value below WNDSIZE_MAX and yield too small a floor.
+		 * Once bounded by WNDSIZE_MAX (~1.07e9) the cast is exact everywhere. */
+		if (bw_floor > (int_fast64_t)floor) {
+			floor = bw_floor > (int_fast64_t)WNDSIZE_MAX ?
 					WNDSIZE_MAX :
 					(size_t)bw_floor;
 		}

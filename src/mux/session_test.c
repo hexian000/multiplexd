@@ -101,12 +101,31 @@ void sched_free_streams(struct mux_session *restrict ss)
 	ss->sched.lp_head = NULL;
 	ss->sched.lp_tail = NULL;
 	ss->sched.delay_head = NULL;
-	ss->unacked.stalled = false;
 	ss->sched.num_tombstones = 0;
 	ss->sched.next_stream_id = 0;
 	if (ss->sched.streams != NULL) {
 		table_free(ss->sched.streams);
 		ss->sched.streams = NULL;
+	}
+}
+
+/* Mirror the real sched.c helper (session_initiate_shutdown is the linked
+ * session.c one) so the handshake_done drain/idle-arm cases keep observing its
+ * effect without pulling in the rest of sched.c. */
+void sched_check_no_active_streams(struct mux_session *restrict ss)
+{
+	if (table_size(ss->sched.streams) != ss->sched.num_tombstones) {
+		return;
+	}
+	if (ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
+	if (ss->draining) {
+		session_initiate_shutdown(ss);
+		return;
+	}
+	if (!ss->accepted && ss->conf.idle_timeout > 0) {
+		ev_timer_again(ss->loop, &ss->w_idle_timeout);
 	}
 }
 
@@ -116,7 +135,7 @@ void wire_discard_buffers(struct mux_session *restrict ss)
 	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
 	ss->wire.sendbuf_staging = false;
 	if (ss->wire.recvbuf != NULL) {
-		ringbuf_reset(ss->wire.recvbuf);
+		bytebuf_reset(ss->wire.recvbuf);
 	}
 }
 
@@ -127,6 +146,11 @@ void unacked_free_all(struct mux_session *ss)
 	ss->unacked.bytes = 0;
 	ss->unacked.partial_offset = 0;
 	ss->unacked.retransmit_off = SIZE_MAX;
+	/* The real one owns clearing these two (unacked.c); session_cleanup and
+	 * session_initiate_shutdown rely on it rather than doing it themselves, so
+	 * a double that skipped them would model the pre-fix contract. */
+	ss->unacked.retransmit_copy = NULL;
+	ss->unacked.stalled = false;
 }
 
 void wire_conn_free(struct mux_session *ss)
@@ -396,7 +420,7 @@ static int setup_fixture(struct session_fixture *restrict fx)
 	ev_timer_init(&fx->ss.w_idle_timeout, session_test_timer_cb, 1.0, 0.0);
 	fx->ss.w_idle_timeout.data = &fx->ss;
 	sched_init(&fx->ss);
-	fx->ss.wire.recvbuf = ringbuf_new(4u * (size_t)MUX_MAX_FRAME_SIZE);
+	fx->ss.wire.recvbuf = bytebuf_new(4u * (size_t)MUX_MAX_FRAME_SIZE);
 	if (fx->ss.wire.recvbuf == NULL) {
 		table_free(fx->ss.sched.streams);
 		(void)close(fx->fds[0]);
@@ -407,7 +431,7 @@ static int setup_fixture(struct session_fixture *restrict fx)
 	}
 	fx->ss.unacked.ring = mux_frame_ring_new(MUX_FRAME_RING_MIN);
 	if (fx->ss.unacked.ring == NULL) {
-		ringbuf_free(fx->ss.wire.recvbuf);
+		bytebuf_free(fx->ss.wire.recvbuf);
 		fx->ss.wire.recvbuf = NULL;
 		table_free(fx->ss.sched.streams);
 		(void)close(fx->fds[0]);
@@ -446,11 +470,11 @@ static void teardown_fixture(struct session_fixture *restrict fx)
 		sched_free_streams(&fx->ss);
 	}
 	if (fx->ss.wire.oobbuf.head != NULL ||
-	    ringbuf_readable(fx->ss.wire.recvbuf) > 0 ||
+	    bytebuf_readable(fx->ss.wire.recvbuf) > 0 ||
 	    fx->ss.wire.sendbuf.head != NULL) {
 		wire_discard_buffers(&fx->ss);
 	}
-	ringbuf_free(fx->ss.wire.recvbuf);
+	bytebuf_free(fx->ss.wire.recvbuf);
 	fx->ss.wire.recvbuf = NULL;
 	mux_frame_ring_free(&fx->ss.unacked.ring, &fx->ss.pool);
 	fx->ss.unacked.frames = 0;
@@ -891,11 +915,7 @@ T_DECLARE_CASE(test_connect_cb_tls_paths)
 			return;
 		}
 		fx.ss.state = SESSION_CONNECT;
-		/* Opaque non-NULL: connect_cb only tests tlsconn for NULL, and the
-		 * mocked wire/handshake paths never dereference it. */
-		fx.ss.wire.tlsconn = (struct tls_connection *)(uintptr_t)1;
 		connect_cb(&fx.ss);
-		fx.ss.wire.tlsconn = NULL;
 		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_HANDSHAKE);
 		teardown_fixture(&fx);
 	}
@@ -1092,6 +1112,73 @@ T_DECLARE_CASE(test_established_exit_suspends_estimator)
 
 	fx.fds[0] = -1;
 	teardown_fixture(&fx);
+}
+
+/* Leaving ESTABLISHED must stop w_idle_timeout together with the other liveness
+ * timers.  Regression: send.c's send_handle_rx_closed moves ESTABLISHED ->
+ * CLOSING directly and stops nothing itself, so a still-armed idle deadline
+ * firing in CLOSING would abort() on idle_cb's ESTABLISHED precondition. */
+T_DECLARE_CASE(test_established_exit_stops_idle_timeout)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	ev_timer_start(fx.ss.loop, &fx.ss.w_idle_timeout);
+	const bool idle_armed_before = ev_is_active(&fx.ss.w_idle_timeout);
+
+	/* CLOSING keeps the socket, so the fd is not closed here; teardown owns it. */
+	session_set_state(&fx.ss, SESSION_CLOSING);
+
+	const bool state_closing = (fx.ss.state == SESSION_CLOSING);
+	const bool idle_active_after = ev_is_active(&fx.ss.w_idle_timeout);
+	teardown_fixture(&fx);
+	T_EXPECT(idle_armed_before);
+	T_EXPECT(state_closing);
+	T_EXPECT(!idle_active_after);
+}
+
+/* session_reset_stream_window_floor re-probes only in auto mode: a manually
+ * configured mux.stream_window must survive an ESTABLISHED exit unchanged (only
+ * session_set_config, which runs on reload, would ever restore it), while an
+ * auto window is floored back down.  estimator_rx_window_size is mocked to 0
+ * here, so the auto floor is exactly MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT. */
+T_DECLARE_CASE(test_established_exit_stream_window_floor_respects_mode)
+{
+	const uint_least32_t floor_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	/* Manual mode: the configured value is preserved. */
+	{
+		struct session_fixture fx;
+		if (setup_fixture(&fx) != 0) {
+			T_FATAL("setup_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_ESTABLISHED;
+		fx.ss.auto_stream_window = false;
+		session_set_stream_window(&fx.ss, floor_frames + 100u);
+		session_set_state(&fx.ss, SESSION_CLOSING);
+		const uint_least32_t window_after = fx.ss.stream_window;
+		teardown_fixture(&fx);
+		T_EXPECT_EQ(window_after, floor_frames + 100u);
+	}
+	/* Auto mode: the window is re-floored on exit. */
+	{
+		struct session_fixture fx;
+		if (setup_fixture(&fx) != 0) {
+			T_FATAL("setup_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_ESTABLISHED;
+		fx.ss.auto_stream_window = true;
+		session_set_stream_window(&fx.ss, floor_frames + 100u);
+		session_set_state(&fx.ss, SESSION_CLOSING);
+		const uint_least32_t window_after = fx.ss.stream_window;
+		teardown_fixture(&fx);
+		T_EXPECT_EQ(window_after, floor_frames);
+	}
 }
 
 /* Liveness timer callbacks all funnel into session_on_dead_link. */
@@ -1339,6 +1426,44 @@ T_DECLARE_CASE(test_session_attach_fd_captures_pending_sendbuf_frame)
 	/* The mock frees the frame it receives, so a leak-free teardown below
 	 * is itself proof the deferred frame reached unacked_track_sent rather
 	 * than being dropped or left dangling in sendbuf. */
+	T_EXPECT_EQ(g_unacked_track_sent_calls, 1);
+
+	teardown_fixture(&fx);
+}
+
+/* The sibling of the case above for wire.oobbuf: a stream RST that aborts during
+ * the suspension window lands in wire.oobbuf rather than wire.sendbuf once a
+ * replay is pending (session_send_ctrl routes real-stream-id frames there). The
+ * re-attach path must capture that list too, or wire_discard_buffers silently
+ * frees the RST -- and with rst_sent already latched, the stream never re-emits
+ * it, stranding the peer's half-open stream. */
+T_DECLARE_CASE(test_session_attach_fd_captures_pending_oobbuf_frame)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_SUSPENDED;
+
+	struct mux_frame *const deferred =
+		mux_frame_get(&fx.ss.pool, fx.ss.max_payload);
+	T_CHECK(deferred != NULL);
+	mux_write_header(
+		deferred->data,
+		&(struct mux_header){ .version = MUX_PROTOCOL_VERSION,
+				      .flags = MUX_FLAG_RST,
+				      .stream_id = 33 });
+	deferred->len = MUX_FRAME_HEADER_SIZE;
+	mux_frame_list_push(&fx.ss.wire.oobbuf, deferred);
+
+	g_unacked_track_sent_calls = 0;
+	session_attach_fd(&fx.ss, fx.fds[1]);
+
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CONNECT);
+	T_EXPECT(fx.ss.wire.oobbuf.head == NULL);
+	/* Captured into the retransmit ring (mock frees it), not dropped by
+	 * wire_discard_buffers: without the oobbuf capture this stays 0. */
 	T_EXPECT_EQ(g_unacked_track_sent_calls, 1);
 
 	teardown_fixture(&fx);
@@ -1605,6 +1730,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_session_reset_preserves_has_session_id_for_server),
 	T_CASE(test_notify_closed_on_already_closed_session_does_not_reemit),
 	T_CASE(test_established_exit_suspends_estimator),
+	T_CASE(test_established_exit_stops_idle_timeout),
+	T_CASE(test_established_exit_stream_window_floor_respects_mode),
 	T_CASE(test_timeout_and_send_timeout_callbacks),
 	T_CASE(test_keepalive_cb_emits_and_rearms),
 	T_CASE(test_connect_timeout_cb_states),
@@ -1612,6 +1739,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_session_suspend_skips_resume_deadline_when_disabled),
 	T_CASE(test_session_suspend_migrates_pending_oobbuf_frame),
 	T_CASE(test_session_attach_fd_captures_pending_sendbuf_frame),
+	T_CASE(test_session_attach_fd_captures_pending_oobbuf_frame),
 	T_CASE(test_dead_link_reentrant_reconnect_reaches_connect),
 	T_CASE(test_connect_timeout_cb_reentrant_reconnect_reaches_connect),
 	T_CASE(test_open_stream_rejections),

@@ -38,6 +38,12 @@ struct wire_ctx {
 	/* true when sendbuf.tail is the open entry (pos == 0) that can still
 	 * absorb packed small frames on its tail; false when frozen or empty. */
 	bool sendbuf_staging : 1;
+	/* true when the kernel's TCP_USER_TIMEOUT is installed on the socket, so
+	 * it -- not w_send_timeout -- covers "peer stopped acking". Persistent per
+	 * connection; distinguishes "kernel handles the watchdog" from the timer's
+	 * repeat, which update_send_timeout temporarily raises for an OOM stall the
+	 * kernel cannot see and must be able to restore afterward. */
+	bool kernel_send_timeout : 1;
 	/* Outbound frame list; the head is the current transport write target.
 	 * A frame that still fits the open tail within one TLS record
 	 * (MUX_MAX_RECORD) is packed onto it; others are appended by reference. */
@@ -46,7 +52,7 @@ struct wire_ctx {
 	 * non-retransmit regular frame; bypasses the send-stall gate (spec §6.2). */
 	struct mux_frame_list oobbuf;
 	/* Receive byte ring for parsing inbound frames. */
-	struct ringbuf *recvbuf;
+	struct bytebuf *recvbuf;
 #if WITH_TLS
 	struct tls_connection *tlsconn;
 	/* Pending I/O direction required by the TLS layer (0, EV_READ, or
@@ -57,7 +63,7 @@ struct wire_ctx {
 	struct tls_context *tlsctx;
 	/* Memory transport (socket_offload disabled) only: outbound ciphertext the
 	 * socket could not yet accept.  Lazily allocated; NULL otherwise. */
-	struct ringbuf *rawbuf;
+	struct bytebuf *rawbuf;
 #endif /* WITH_TLS */
 };
 
@@ -73,8 +79,7 @@ enum wire_shutdown_state {
 };
 
 /* Write buf[0..*len) to the transport.  On return *len is the number of bytes
- * actually sent.  Returns false on unrecoverable error; the caller must not
- * access the session afterwards. */
+ * actually sent.  Returns false on unrecoverable error. */
 bool wire_send(
 	struct mux_session *restrict ss, const unsigned char *restrict buf,
 	size_t *restrict len);
@@ -83,7 +88,7 @@ bool wire_send(
  * number of bytes actually received.  Returns false on unrecoverable error. */
 bool wire_recv(
 	struct mux_session *restrict ss, unsigned char *restrict buf,
-	size_t *len);
+	size_t *restrict len);
 
 /* Return true when the TLS layer has data buffered that can be read by
  * wire_recv without going back to the OS socket; always false for
@@ -113,12 +118,12 @@ enum wire_flush_result {
 /* Memory-transport TLS only: push outbound ciphertext to the socket,
  * retaining what cannot yet be accepted.  No-op for plaintext and
  * fd-backed TLS (returns WIRE_FLUSH_DONE). */
-enum wire_flush_result wire_flush(struct mux_session *ss);
+enum wire_flush_result wire_flush(struct mux_session *restrict ss);
 
 #if WITH_TLS
-/* Update the TLS context used for future outbound reconnects.
- * No-op when the new context is the same as the current one. */
-void wire_set_tlsctx(struct mux_session *ss, struct tls_context *tlsctx);
+/* Update the TLS context used for future outbound reconnects. */
+void wire_set_tlsctx(
+	struct mux_session *restrict ss, struct tls_context *restrict tlsctx);
 
 /* Set up TLS over the connected socket; outbound creates wire.tlsconn from
  * wire.tlsctx; accepted is a no-op (already attached).  Handshake is driven
@@ -129,7 +134,7 @@ bool wire_tls_start(struct mux_session *restrict ss);
 /* Debug-only: trigger the TLS backend's KTLS-status log once the mux handshake
  * has completed.  No-op when the session is not using TLS.  Implemented by an
  * idempotent tls_handshake() call; compiled out entirely in release builds. */
-void wire_tls_log_status(struct mux_session *ss);
+void wire_tls_log_status(struct mux_session *restrict ss);
 #endif
 
 /* Install a TLS connection onto ss during session resume and rebind its I/O
@@ -149,7 +154,7 @@ void wire_conn_free(struct mux_session *restrict ss);
 /* Drive TLS close_notify (WITH_TLS) or issue TCP SHUT_WR; returns
  * WIRE_SHUTDOWN_PENDING when more I/O is needed, WIRE_SHUTDOWN_DONE
  * when shut down, or WIRE_SHUTDOWN_ERROR on error. */
-enum wire_shutdown_state wire_shutdown(struct mux_session *ss);
+enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss);
 
 /* Result of wire_wait_eof. */
 enum wire_eof_result {
@@ -164,6 +169,6 @@ enum wire_eof_result {
 
 /* Drain the read side waiting for peer's TCP FIN or TLS close_notify.
  * Does not modify wire.rx_open or wire.tls_want. */
-enum wire_eof_result wire_wait_eof(struct mux_session *ss);
+enum wire_eof_result wire_wait_eof(struct mux_session *restrict ss);
 
 #endif /* MUX_WIRE_H */

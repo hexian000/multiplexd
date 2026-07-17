@@ -181,10 +181,12 @@ static enum send_stage send_stage_next(
 		    flush_sendbuf_head(ss, made_progress)) {
 			return SEND_STAGE_BLOCKED;
 		}
-		if (ss->unacked.ring != NULL &&
+		if (ss->unacked.ring == NULL ||
 		    ss->unacked.retransmit_off >= ss->unacked.ring->count) {
 			ss->unacked.retransmit_off = SIZE_MAX;
-			/* Replay drained: fall through to OOB/data this round. */
+			/* Replay drained (or there was never a ring to replay): fall
+			 * through to OOB/data this round instead of peeking a NULL
+			 * ring in send_queue_retransmit. */
 		} else if (send_queue_retransmit(ss, retransmitting)) {
 			return SEND_STAGE_PRODUCED;
 		} else {
@@ -282,23 +284,33 @@ update_send_timeout(struct mux_session *restrict ss, const bool progress)
 		ev_timer_stop(ss->loop, &ss->w_send_timeout);
 		return;
 	}
-	/* TCP_USER_TIMEOUT (repeat == 0.0 below) covers "peer stopped acking
-	 * data we already wrote to the socket" by making this timer redundant
-	 * -- but a resume retransmit stalled on a frame-pool OOM never reached
-	 * the socket at all, so the kernel mechanism has nothing to time out
-	 * on. Force a real interval so this one case still gets retried. */
+	/* When the kernel's TCP_USER_TIMEOUT is installed it covers "peer stopped
+	 * acking data we already wrote to the socket", so this timer stays off
+	 * (repeat == 0.0). The exception is a resume retransmit stalled on a
+	 * frame-pool OOM: it never reached the socket, so the kernel has nothing
+	 * to time out on -- raise a real userspace interval to retry that one
+	 * case, then restore repeat == 0.0 (handing the watchdog back to the
+	 * kernel) once the stall clears, so a redundant userspace watchdog does
+	 * not persist for the rest of the connection. */
 	const bool oom_stalled = ss->unacked.retransmit_off != SIZE_MAX &&
 				 ss->wire.sendbuf.head == NULL;
-	if (oom_stalled && !(ss->w_send_timeout.repeat > 0.0)) {
-		ev_timer_set(
-			&ss->w_send_timeout, 0.0,
-			(double)ss->conf.send_timeout);
-		ev_timer_again(ss->loop, &ss->w_send_timeout);
+	if (ss->wire.kernel_send_timeout) {
+		if (oom_stalled) {
+			if (ss->w_send_timeout.repeat == 0.0) {
+				ev_timer_set(
+					&ss->w_send_timeout, 0.0,
+					(double)ss->conf.send_timeout);
+				ev_timer_again(ss->loop, &ss->w_send_timeout);
+			} else if (!ev_is_active(&ss->w_send_timeout) || progress) {
+				ev_timer_again(ss->loop, &ss->w_send_timeout);
+			}
+		} else if (ss->w_send_timeout.repeat != 0.0) {
+			ev_timer_stop(ss->loop, &ss->w_send_timeout);
+			ev_timer_set(&ss->w_send_timeout, 0.0, 0.0);
+		}
 		return;
 	}
-	if (!(ss->w_send_timeout.repeat > 0.0)) {
-		return;
-	}
+	/* No kernel timeout: the userspace watchdog always covers egress. */
 	if (!ev_is_active(&ss->w_send_timeout) || progress) {
 		ev_timer_again(ss->loop, &ss->w_send_timeout);
 	}
@@ -323,13 +335,17 @@ static bool send_handle_rx_closed(struct mux_session *restrict ss)
 		session_suspend(ss);
 		return true;
 	}
+	/* wire_discard_buffers frees the live replay copy back to the pool;
+	 * unacked_free_all must then clear unacked.retransmit_copy (and
+	 * retransmit_off + the ring) so a recycled frame cannot false-match the
+	 * dangling pointer -- exactly as session_initiate_shutdown pairs them. */
 	wire_discard_buffers(ss);
+	unacked_free_all(ss);
 	if (!ss->accepted) {
 		ss->handshake.has_session_id = false;
 	}
 	session_set_state(ss, SESSION_CLOSING);
 	ss->wire.tx_pending = true;
-	update_send_timeout(ss, false);
 	return true;
 }
 
@@ -351,6 +367,14 @@ void session_on_send(struct mux_session *restrict ss)
 
 	bool made_progress = false;
 	send_pump(ss, &made_progress);
+	if (ss->state == SESSION_SUSPENDED || ss->state == SESSION_CLOSED) {
+		/* flush_sendbuf_head suspended or reset the session mid-pump;
+		 * session_suspend/reset already settled the watchers and cleared
+		 * tx_pending/lp_pending, so the epilogue below must not re-dirty
+		 * them (send_has_pending_work would see the pre-armed
+		 * retransmit_off = 0, sched_schedule would re-set lp_pending). */
+		return;
+	}
 
 	/* Residue means the transport blocked: keep EV_WRITE armed and set
 	 * send_blocked so the discard path knows the sendbuf head is in flight. */
@@ -404,7 +428,7 @@ void session_on_send(struct mux_session *restrict ss)
 	}
 }
 
-void mux_notify_write(struct mux_session *ss)
+void mux_notify_write(struct mux_session *restrict ss)
 {
 	if (ss->state != SESSION_ESTABLISHED) {
 		return;
@@ -422,8 +446,14 @@ void mux_notify_write(struct mux_session *ss)
 	session_notify(ss);
 }
 
-bool session_send_push(
-	struct mux_session *ss, struct mux_stream *s, struct mux_frame *frame)
+/* ss is deliberately not restrict: s->session aliases it at both call sites,
+ * and the block reaches the session through both (stream_grant_inc(s) ->
+ * session_pressure_scale(s->session) on every call, and stream_mark_fin_sent(s)
+ * on the FIN path) while also modifying it through ss -- same reason
+ * process_syn_payload leaves it unqualified. */
+void session_send_push(
+	struct mux_session *ss, struct mux_stream *restrict s,
+	struct mux_frame *restrict frame)
 {
 	ASSERT(frame->len > MUX_FRAME_HEADER_SIZE);
 	const size_t payload_len = frame->len - MUX_FRAME_HEADER_SIZE;
@@ -444,10 +474,7 @@ bool session_send_push(
 
 	/* Piggyback FIN on last data frame.  Extra always carries the credit
 	 * grant (raw_inc); ACK|FIN is a valid combination per spec §2.4.1. */
-	const bool want_fin =
-		!send_syn && s->rx_eof &&
-		!(s->state == STREAM_FIN_WAIT || s->state == STREAM_CLOSING) &&
-		s->send_queue.head == NULL;
+	const bool want_fin = !send_syn && stream_fin_pending(s);
 	if (want_fin) {
 		flags |= MUX_FLAG_FIN;
 	}
@@ -464,7 +491,14 @@ bool session_send_push(
 	mux_write_header(p, &hdr);
 
 	frame->pos = 0;
-	frame->len = MUX_FRAME_HEADER_SIZE + payload_len;
+
+	/* Log before pushing, as session_send_ctrl does: wire_sendbuf_push takes
+	 * ownership, and its coalescing path copies the frame into the staging
+	 * tail and returns it to the pool, so neither `frame` nor `p` may be read
+	 * afterwards. */
+	if (LOGLEVEL(VERYVERBOSE)) {
+		session_log_frame_header(ss, "frame out", p, &hdr);
+	}
 
 	wire_sendbuf_push(ss, frame);
 
@@ -486,21 +520,16 @@ bool session_send_push(
 		sched_delay_remove(ss, s);
 	}
 
-	if (LOGLEVEL(VERYVERBOSE)) {
-		session_log_frame_header(ss, "frame out", p, &hdr);
-	}
-
 	/* Last use of s: stream_mark_fin_sent() may free it synchronously if
 	 * this is the last active stream during a drain (same hazard fixed for
 	 * stream_recv_fin() in recv.c's dispatch_by_stream()). */
 	if (want_fin) {
 		stream_mark_fin_sent(s);
 	}
-	return true;
 }
 
 bool session_send_ctrl(
-	struct mux_session *ss, const uint_fast16_t stream_id,
+	struct mux_session *restrict ss, const uint_fast16_t stream_id,
 	const uint_fast8_t flags, const uint_fast32_t extra)
 {
 	struct mux_frame *const frame =
@@ -598,18 +627,24 @@ void session_emit_ack(struct mux_session *restrict ss)
 	}
 }
 
-/* RST sub-frames are kept (never suppress a queued RST); partially-flushed
+/* Strip sub-frames belonging to stream_id (but not its RST) from every eligible
+ * node of @p list. @p is_sendbuf gates the sendbuf-only concerns: the TLS
+ * send-blocked in-flight head, the verbatim retransmit copy, and the staging
+ * open-tail flag -- none of which apply to the oob queue.
+ *
+ * RST sub-frames are kept (never suppress a queued RST); partially-flushed
  * frames (pos > 0) must finish to preserve framing sync, so they are never
  * touched. wire_sendbuf_push coalesces logical frames from *different* streams
  * into one physical entry, so each entry is walked header-by-header and only
  * the sub-frames belonging to stream_id are stripped -- deciding from the first
  * header alone would either free another stream's still-unsent data or leave
  * this stream's stale data to arrive after the RST. */
-void session_discard_stream_frames(
-	struct mux_session *restrict ss, const uint_fast16_t stream_id)
+static void discard_stream_frames_from(
+	struct mux_session *restrict ss, struct mux_frame_list *restrict list,
+	const uint_fast16_t stream_id, const bool is_sendbuf)
 {
 	struct mux_frame *prev = NULL;
-	struct mux_frame *frame = ss->wire.sendbuf.head;
+	struct mux_frame *frame = list->head;
 	while (frame != NULL) {
 		struct mux_frame *const next = frame->next;
 
@@ -623,13 +658,25 @@ void session_discard_stream_frames(
 		 * in flight inside the library -- SSL_write's own contract
 		 * requires the next call to re-present the identical bytes -- so
 		 * keep it intact. Plain TCP's send(2) has no such requirement. */
-		if (ss->wire.send_blocked && frame == ss->wire.sendbuf.head &&
-		    ss->wire.tlsconn != NULL) {
+		if (is_sendbuf && ss->wire.send_blocked &&
+		    frame == list->head && ss->wire.tlsconn != NULL) {
 			prev = frame;
 			frame = next;
 			continue;
 		}
 #endif /* WITH_TLS */
+		/* A retransmit copy must replay its ring entry verbatim for resume
+		 * byte-accounting, so it is never partially rewritten *or* removed:
+		 * removing it would not advance retransmit_off, so send_stage_next
+		 * would just re-copy the same ring entry (pure churn). In the rare
+		 * resume+abort overlap its stale sub-frame still precedes the RST
+		 * (the copy sits at the sendbuf head, the RST is enqueued later at
+		 * the tail) -- the safe trade against desyncing the replay. */
+		if (is_sendbuf && frame == ss->unacked.retransmit_copy) {
+			prev = frame;
+			frame = next;
+			continue;
+		}
 
 		/* Pass 1: validate the concatenated layout and measure the bytes
 		 * that survive (everything not belonging to stream_id, plus any
@@ -665,15 +712,6 @@ void session_discard_stream_frames(
 		}
 
 		if (kept > 0) {
-			/* A retransmit copy must replay its ring entry verbatim for
-			 * resume byte-accounting, so it is never partially rewritten:
-			 * in the rare resume+abort overlap its stale sub-frame trails
-			 * the RST, the safe trade against desyncing the replay. */
-			if (frame == ss->unacked.retransmit_copy) {
-				prev = frame;
-				frame = next;
-				continue;
-			}
 			/* Pass 2: compact the survivors down in place. */
 			const unsigned char *src = frame->data;
 			const unsigned char *const end =
@@ -701,23 +739,30 @@ void session_discard_stream_frames(
 
 		/* kept == 0: every sub-frame belonged to stream_id; drop the whole
 		 * physical node. Capture the open-tail flag before the remove;
-		 * afterwards sendbuf.tail no longer points at frame. */
-		const bool discarding_open_tail =
-			ss->wire.sendbuf_staging &&
-			frame == ss->wire.sendbuf.tail;
+		 * afterwards list->tail no longer points at frame. */
+		const bool discarding_open_tail = is_sendbuf &&
+						  ss->wire.sendbuf_staging &&
+						  frame == list->tail;
 		struct mux_frame *const removed =
-			mux_frame_list_remove_after(&ss->wire.sendbuf, prev);
+			mux_frame_list_remove_after(list, prev);
 		ASSERT(removed == frame);
 		(void)removed;
-		if (ss->unacked.retransmit_copy == frame) {
-			ss->unacked.retransmit_copy = NULL;
-		}
 		if (discarding_open_tail) {
 			ss->wire.sendbuf_staging = false;
 		}
 		mux_frame_put(&ss->pool, frame);
 		frame = next;
 	}
+}
+
+/* Strip a reset stream's still-queued frames from both egress lists so its
+ * stale data cannot arrive ahead of the RST. Walks wire.oobbuf too, where
+ * session_send_ctrl parks real-stream control frames during resume replay. */
+void session_discard_stream_frames(
+	struct mux_session *restrict ss, const uint_fast16_t stream_id)
+{
+	discard_stream_frames_from(ss, &ss->wire.sendbuf, stream_id, true);
+	discard_stream_frames_from(ss, &ss->wire.oobbuf, stream_id, false);
 }
 
 /* Run the send pump inline and settle the aftermath: emit CLOSED on teardown,
@@ -740,6 +785,19 @@ static void session_flush_inline(struct mux_session *restrict ss)
 	session_update_watcher(ss);
 }
 
+/* True when the transport pipe is clear: nothing staged in the send buffer and
+ * (with TLS) no cross-direction want outstanding, so a flush may run inline
+ * instead of deferring to the armed EV_WRITE drain. The one place the #if
+ * WITH_TLS meaning of "clear" lives. */
+static inline bool session_pipe_clear(const struct mux_session *restrict ss)
+{
+	return ss->wire.sendbuf.head == NULL
+#if WITH_TLS
+	       && ss->wire.tls_want == 0
+#endif
+		;
+}
+
 void session_flush(struct mux_session *restrict ss)
 {
 	if (ss->state != SESSION_ESTABLISHED) {
@@ -751,11 +809,7 @@ void session_flush(struct mux_session *restrict ss)
 	/* Low-load fast path: empty sendbuf means transport is idle with nothing
 	 * to coalesce against — flush inline rather than waiting a loop turn for
 	 * EV_WRITE; under load fall through to the coalescing drain. */
-	if (ss->wire.sendbuf.head == NULL
-#if WITH_TLS
-	    && ss->wire.tls_want == 0
-#endif
-	) {
+	if (session_pipe_clear(ss)) {
 		session_flush_inline(ss);
 		return;
 	}
@@ -775,14 +829,10 @@ void session_flush_resp(struct mux_session *restrict ss)
 		return;
 	}
 	sched_schedule(ss);
-	/* Inline only when the pipe is clear (mirrors session_flush); under load
-	 * the occupied sendbuf defers to the armed EV_WRITE drain.  Call
-	 * session_on_send directly so teardown stays with the socket_cb epilogue. */
-	if (ss->wire.sendbuf.head == NULL
-#if WITH_TLS
-	    && ss->wire.tls_want == 0
-#endif
-	) {
+	/* Inline only when the pipe is clear; under load the occupied sendbuf
+	 * defers to the armed EV_WRITE drain.  Call session_on_send directly so
+	 * teardown stays with the socket_cb epilogue. */
+	if (session_pipe_clear(ss)) {
 		session_on_send(ss);
 	}
 }

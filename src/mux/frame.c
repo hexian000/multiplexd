@@ -3,33 +3,34 @@
 
 /**
  * @file frame.c
- * @brief Mux frame serialization and parsing helpers.
+ * @brief Out-of-line mux frame support: the stream-table hash options,
+ *        mux_status_str, mux_conf_default, and the bytebuf / frame-ring bodies.
+ *        (The frame serialization/parsing helpers are static inline in frame.h.)
  */
 
 #include "mux/frame.h"
 
 #include "mux/mux.h"
+#include "mux/session.h"
 
 #include "algo/hashtable.h"
+#include "hash/fnv1a.h"
 #include "utils/debug.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 
 /* Prebuilt stream-table config, so tests can link frame.c without the full
  * session state machine. */
 static uint_fast32_t stream_id_hash(const void *key, const uint_fast32_t seed)
 {
-	const uint_least16_t id = (uint_least16_t)(uintptr_t)key;
-	uint_fast32_t hash = seed;
-	hash ^= (uint_fast32_t)(id & 0xffu);
-	hash *= (uint_fast32_t)0x01000193u;
-	hash ^= (uint_fast32_t)((id >> 8) & 0xffu);
-	hash *= (uint_fast32_t)0x01000193u;
-	return hash;
+	/* FNV-1a over the 16-bit stream id via csnippets' shared implementation
+	 * (the same fnv1a_32 its own ptr_hash uses), rather than hand-rolling the
+	 * rounds and the FNV prime a second time. */
+	const uint16_t id = (uint16_t)(uintptr_t)key;
+	return fnv1a_32(&id, sizeof(id), seed);
 }
 
 static bool stream_id_eq(const void *a, const void *b)
@@ -69,15 +70,16 @@ const struct mux_config mux_conf_default = {
 	.readahead = 128 * 1024,
 };
 
-bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
+bool bytebuf_reserve(
+	struct bytebuf **restrict rbp, const size_t need, const bool can_grow)
 {
-	struct ringbuf *const rb = *rbp;
-	if (need == 0 || ringbuf_write_space(rb) >= need) {
+	struct bytebuf *const rb = *rbp;
+	if (need == 0 || bytebuf_write_space(rb) >= need) {
 		return true;
 	}
 
-	ringbuf_compact(rb);
-	if (ringbuf_write_space(rb) >= need) {
+	bytebuf_compact(rb);
+	if (bytebuf_write_space(rb) >= need) {
 		return true;
 	}
 	if (!can_grow) {
@@ -96,11 +98,11 @@ bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 		}
 	}
 
-	if (new_cap > SIZE_MAX - sizeof(struct ringbuf)) {
+	if (new_cap > SIZE_MAX - sizeof(struct bytebuf)) {
 		return false;
 	}
-	struct ringbuf *const new_rb =
-		realloc(rb, sizeof(struct ringbuf) + new_cap);
+	struct bytebuf *const new_rb =
+		realloc(rb, sizeof(struct bytebuf) + new_cap);
 	if (new_rb == NULL) {
 		return false;
 	}
@@ -109,18 +111,18 @@ bool ringbuf_reserve(struct ringbuf **restrict rbp, size_t need, bool can_grow)
 	return true;
 }
 
-void ringbuf_shrink(struct ringbuf **restrict rbp, const size_t target_cap)
+void bytebuf_shrink(struct bytebuf **restrict rbp, const size_t target_cap)
 {
-	struct ringbuf *const rb = *rbp;
+	struct bytebuf *const rb = *rbp;
 	/* Keep whichever is larger: the requested floor or the live bytes. */
 	const size_t want = rb->len > target_cap ? rb->len : target_cap;
 	if (rb->cap <= want) {
 		return;
 	}
 	/* Move the live bytes to the front so realloc preserves them. */
-	ringbuf_compact(rb);
-	struct ringbuf *const new_rb =
-		realloc(rb, sizeof(struct ringbuf) + want);
+	bytebuf_compact(rb);
+	struct bytebuf *const new_rb =
+		realloc(rb, sizeof(struct bytebuf) + want);
 	if (new_rb == NULL) {
 		/* Realloc-smaller failed: keep the larger buffer (non-fatal). */
 		return;

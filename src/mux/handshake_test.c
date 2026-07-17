@@ -44,6 +44,11 @@ static int g_update_watcher_calls;
 static bool g_resume_ack_result;
 static bool g_resume_handled;
 
+/* proto_hello_parse only reads ss->tag to prefix its log lines; a zeroed
+ * session (tag == NULL, so MUX_LOG falls back to "[?]:") is all the pure-parse
+ * cases need, and spares them a full setup_session fixture. */
+static const struct mux_session k_parse_test_session;
+
 static void handshake_mock_reset(void)
 {
 	g_resume_seq = 0;
@@ -121,6 +126,11 @@ void unacked_free_all(struct mux_session *ss)
 	ss->unacked.bytes = 0;
 	ss->unacked.partial_offset = 0;
 	ss->unacked.retransmit_off = SIZE_MAX;
+	/* The real one owns clearing these two (unacked.c); handshake_client_fresh
+	 * relies on it rather than doing it itself, so a double that skipped them
+	 * would model the pre-fix contract. */
+	ss->unacked.retransmit_copy = NULL;
+	ss->unacked.stalled = false;
 }
 
 void sched_free_streams(struct mux_session *restrict ss)
@@ -132,7 +142,6 @@ void sched_free_streams(struct mux_session *restrict ss)
 	ss->sched.lp_head = NULL;
 	ss->sched.lp_tail = NULL;
 	ss->sched.delay_head = NULL;
-	ss->unacked.stalled = false;
 	ss->sched.num_tombstones = 0;
 	ss->sched.next_stream_id = 0;
 	if (ss->sched.streams != NULL) {
@@ -183,7 +192,7 @@ static void teardown_session(struct mux_session *restrict ss)
 		table_free(ss->sched.streams);
 		ss->sched.streams = NULL;
 	}
-	ringbuf_free(ss->wire.recvbuf);
+	bytebuf_free(ss->wire.recvbuf);
 	ss->wire.recvbuf = NULL;
 }
 
@@ -238,11 +247,20 @@ T_DECLARE_CASE(test_proto_hello_build_and_parse_roundtrip)
 	memset(hello.session_id, 0x5A, sizeof(hello.session_id));
 	memcpy(hello.identity, "svc-a", sizeof("svc-a"));
 
-	T_EXPECT(proto_hello_build(frame, MUX_MAX_PAYLOAD_SIZE, &hello));
-	T_EXPECT(frame->len > MUX_FRAME_HEADER_SIZE);
-	T_EXPECT(proto_hello_parse(
-		frame->data + MUX_FRAME_HEADER_SIZE,
-		frame->len - MUX_FRAME_HEADER_SIZE, &parsed));
+	const bool build_ok =
+		proto_hello_build(frame, MUX_MAX_PAYLOAD_SIZE, &hello);
+	const bool len_ok = build_ok && frame->len > MUX_FRAME_HEADER_SIZE;
+	const bool parse_ok =
+		len_ok && proto_hello_parse(
+				  &k_parse_test_session,
+				  frame->data + MUX_FRAME_HEADER_SIZE,
+				  frame->len - MUX_FRAME_HEADER_SIZE, &parsed);
+	/* Free the frame before asserting: a failing T_EXPECT longjmps out of the
+	 * case, so freeing first keeps it from leaking. parsed is a stack copy. */
+	free(frame);
+	T_EXPECT(build_ok);
+	T_EXPECT(len_ok);
+	T_EXPECT(parse_ok);
 	T_EXPECT_EQ(parsed.version, (int)MUX_PROTOCOL_VERSION);
 	T_EXPECT_EQ(parsed.msgid, hello.msgid);
 	T_EXPECT(parsed.reject_inbound);
@@ -255,7 +273,41 @@ T_DECLARE_CASE(test_proto_hello_build_and_parse_roundtrip)
 		memcmp(parsed.session_id, hello.session_id,
 		       sizeof(parsed.session_id)) == 0);
 	T_EXPECT_STREQ(parsed.identity, hello.identity);
+}
+
+/* The largest legal identity is 255 octets (proto_hello.identity is [256]);
+ * round-trip the exact boundary so an off-by-one that drops or corrupts a valid
+ * max-length claim is caught -- existing cases only test the 256-octet reject. */
+T_DECLARE_CASE(test_proto_hello_build_and_parse_max_identity)
+{
+	struct mux_frame *const frame =
+		malloc(MUX_FRAME_OBJECT_SIZE(MUX_MAX_PAYLOAD_SIZE));
+	T_EXPECT(frame != NULL);
+	struct proto_hello hello = {
+		.msgid = PROTO_MSG_CLIENT_HELLO,
+		.has_identity = true,
+	};
+	struct proto_hello parsed;
+
+	memset(hello.identity, 'a', sizeof(hello.identity) - 1);
+	hello.identity[sizeof(hello.identity) - 1] = '\0';
+	T_CHECK(strlen(hello.identity) == sizeof(hello.identity) - 1); /* 255 */
+
+	const bool build_ok =
+		proto_hello_build(frame, MUX_MAX_PAYLOAD_SIZE, &hello);
+	const bool parse_ok =
+		build_ok &&
+		proto_hello_parse(
+			&k_parse_test_session,
+			frame->data + MUX_FRAME_HEADER_SIZE,
+			frame->len - MUX_FRAME_HEADER_SIZE, &parsed);
+	/* Free the frame before asserting so a failing T_EXPECT can't skip it;
+	 * parsed is a stack copy. */
 	free(frame);
+	T_EXPECT(build_ok);
+	T_EXPECT(parse_ok);
+	T_EXPECT(parsed.has_identity);
+	T_EXPECT_STREQ(parsed.identity, hello.identity);
 }
 
 T_DECLARE_CASE(test_proto_hello_parse_rejects_missing_type)
@@ -263,7 +315,8 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_missing_type)
 	static const unsigned char json[] = "{\"msgid\":0}";
 	struct proto_hello parsed;
 
-	T_EXPECT(!proto_hello_parse(json, sizeof(json) - 1, &parsed));
+	T_EXPECT(!proto_hello_parse(
+		&k_parse_test_session, json, sizeof(json) - 1, &parsed));
 }
 
 /* A type field with an embedded NUL (a JSON u0000 escape) whose
@@ -277,7 +330,8 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_type_embedded_nul)
 		"\"msgid\":0}";
 	struct proto_hello parsed;
 
-	T_EXPECT(!proto_hello_parse(json, sizeof(json) - 1, &parsed));
+	T_EXPECT(!proto_hello_parse(
+		&k_parse_test_session, json, sizeof(json) - 1, &parsed));
 }
 
 T_DECLARE_CASE(test_proto_hello_parse_rejects_bad_session_id)
@@ -287,7 +341,8 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_bad_session_id)
 		"\"msgid\":0,\"session_id\":\"bad\"}";
 	struct proto_hello parsed;
 
-	T_EXPECT(!proto_hello_parse(json, sizeof(json) - 1, &parsed));
+	T_EXPECT(!proto_hello_parse(
+		&k_parse_test_session, json, sizeof(json) - 1, &parsed));
 }
 
 T_DECLARE_CASE(test_proto_hello_parse_rejects_oversized_identity)
@@ -305,7 +360,24 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_oversized_identity)
 		identity);
 
 	T_EXPECT(!proto_hello_parse(
-		(const unsigned char *)json, strlen(json), &parsed));
+		&k_parse_test_session, (const unsigned char *)json,
+		strlen(json), &parsed));
+}
+
+/* An identity extension with an embedded NUL (a JSON u0000 escape) whose
+ * strlen-truncated prefix ("svc") is itself a valid identity must be rejected,
+ * not silently accepted with the post-NUL bytes ("x") dropped: the wire length
+ * and the effective (pre-NUL) value would otherwise disagree -- the same parser
+ * differential proto_parse_type/proto_parse_session_id reject. */
+T_DECLARE_CASE(test_proto_hello_parse_rejects_identity_embedded_nul)
+{
+	static const unsigned char json[] =
+		"{\"type\":\"application/x-multiplexd-proto; version=1\","
+		"\"msgid\":0,\"extensions\":{\"identity\":\"svc\\u0000x\"}}";
+	struct proto_hello parsed;
+
+	T_EXPECT(!proto_hello_parse(
+		&k_parse_test_session, json, sizeof(json) - 1, &parsed));
 }
 
 /* The identity extension is documented as UTF-8 on the wire
@@ -319,7 +391,8 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_invalid_utf8_identity)
 	struct proto_hello parsed;
 
 	T_EXPECT(!proto_hello_parse(
-		(const unsigned char *)json, sizeof(json) - 1, &parsed));
+		&k_parse_test_session, (const unsigned char *)json,
+		sizeof(json) - 1, &parsed));
 }
 
 /* Well-formed multi-byte UTF-8 in the identity extension must still parse. */
@@ -331,7 +404,8 @@ T_DECLARE_CASE(test_proto_hello_parse_accepts_well_formed_utf8_identity)
 	struct proto_hello parsed;
 
 	T_CHECK(proto_hello_parse(
-		(const unsigned char *)json, sizeof(json) - 1, &parsed));
+		&k_parse_test_session, (const unsigned char *)json,
+		sizeof(json) - 1, &parsed));
 	T_EXPECT(parsed.has_identity);
 	T_EXPECT_STREQ(parsed.identity, "\xc3\xa9\xe4\xb8\xad");
 }
@@ -354,20 +428,24 @@ T_DECLARE_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume
 
 	T_EXPECT(handshake_enqueue_hello(&ss, PROTO_MSG_CLIENT_HELLO, true));
 	T_CHECK(ss.wire.sendbuf.head != NULL);
-	T_EXPECT(ss.wire.tx_pending);
-	T_EXPECT(proto_hello_parse(
-		ss.wire.sendbuf.head->data + MUX_FRAME_HEADER_SIZE,
-		ss.wire.sendbuf.head->len - MUX_FRAME_HEADER_SIZE, &parsed));
+	const bool tx_pending = ss.wire.tx_pending;
+	const bool parse_ok = proto_hello_parse(
+		&ss, ss.wire.sendbuf.head->data + MUX_FRAME_HEADER_SIZE,
+		ss.wire.sendbuf.head->len - MUX_FRAME_HEADER_SIZE, &parsed);
+	const uint_least32_t unreported = ss.unacked.unreported;
+	/* Free the queued frame before asserting so a failing T_EXPECT can't skip
+	 * it; parsed is a stack copy. */
+	mux_frame_put(&ss.pool, ss.wire.sendbuf.head);
+	T_EXPECT(tx_pending);
+	T_EXPECT(parse_ok);
 	T_EXPECT_EQ(parsed.msgid, PROTO_MSG_CLIENT_HELLO);
 	T_EXPECT(parsed.reject_inbound);
 	T_EXPECT(parsed.has_session_id);
 	/* has_resume_seq is not populated on the parse side; only resume_seq is. */
 	T_EXPECT_EQ(parsed.resume_seq, (uint_least32_t)41);
-	T_EXPECT_EQ(ss.unacked.unreported, (uint_least32_t)0);
+	T_EXPECT_EQ(unreported, (uint_least32_t)0);
 	T_EXPECT(parsed.has_identity);
 	T_EXPECT_STREQ(parsed.identity, "cli-service");
-
-	mux_frame_put(&ss.pool, ss.wire.sendbuf.head);
 }
 
 /* An identity.claim too long for the wire hello's identity field must be
@@ -388,13 +466,15 @@ T_DECLARE_CASE(test_handshake_enqueue_hello_omits_oversized_identity)
 
 	T_EXPECT(handshake_enqueue_hello(&ss, PROTO_MSG_CLIENT_HELLO, false));
 	T_CHECK(ss.wire.sendbuf.head != NULL);
-	T_EXPECT(proto_hello_parse(
-		ss.wire.sendbuf.head->data + MUX_FRAME_HEADER_SIZE,
-		ss.wire.sendbuf.head->len - MUX_FRAME_HEADER_SIZE, &parsed));
+	const bool parse_ok = proto_hello_parse(
+		&ss, ss.wire.sendbuf.head->data + MUX_FRAME_HEADER_SIZE,
+		ss.wire.sendbuf.head->len - MUX_FRAME_HEADER_SIZE, &parsed);
+	/* Free the queued frame before asserting so a failing T_EXPECT can't skip
+	 * it; parsed is a stack copy. */
+	mux_frame_put(&ss.pool, ss.wire.sendbuf.head);
+	T_EXPECT(parse_ok);
 	T_EXPECT_EQ(parsed.msgid, PROTO_MSG_CLIENT_HELLO);
 	T_EXPECT(!parsed.has_identity);
-
-	mux_frame_put(&ss.pool, ss.wire.sendbuf.head);
 }
 
 /* Declare a stack-backed frame with a real payload buffer: struct mux_frame's
@@ -423,30 +503,47 @@ T_DECLARE_CASE(test_handshake_process_server_hello_assigns_peer_identity)
 	memcpy(hello.identity, "srv-a", sizeof("srv-a"));
 	memset(hello.session_id, 0x44, sizeof(hello.session_id));
 	T_CHECK(build_hello_frame(frame, &hdr, &hello));
-	ringbuf_free(ss.wire.recvbuf);
-	ss.wire.recvbuf = ringbuf_new(frame->len);
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
 	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(ringbuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(ss.wire.recvbuf, frame->len);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	T_EXPECT(handshake_process_hello(&ss, &hdr, frame->len));
-	T_EXPECT_EQ(g_reset_calls, 0);
-	T_EXPECT_EQ(g_handshake_done_calls, 1);
-	T_EXPECT_EQ(ringbuf_readable(ss.wire.recvbuf), (size_t)0);
-	T_EXPECT(ss.handshake.peer_rejects_inbound_streams);
-	T_EXPECT(ss.handshake.has_session_id);
-	T_EXPECT(
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const int reset_calls = g_reset_calls;
+	const int done_calls = g_handshake_done_calls;
+	const size_t readable = bytebuf_readable(ss.wire.recvbuf);
+	const bool peer_rejects = ss.handshake.peer_rejects_inbound_streams;
+	const bool has_session_id = ss.handshake.has_session_id;
+	const bool session_id_match =
 		memcmp(ss.handshake.session_id, hello.session_id,
-		       sizeof(hello.session_id)) == 0);
-	T_EXPECT(ss.handshake.peer_identity != NULL);
-	T_EXPECT_STREQ(ss.handshake.peer_identity, "srv-a");
-
+		       sizeof(hello.session_id)) == 0;
+	const bool has_peer_identity = ss.handshake.peer_identity != NULL;
+	char peer_identity[sizeof(hello.identity)] = { 0 };
+	if (has_peer_identity) {
+		(void)snprintf(
+			peer_identity, sizeof(peer_identity), "%s",
+			ss.handshake.peer_identity);
+	}
+	/* Tear the fixtures down before asserting: a failing T_EXPECT longjmps out
+	 * of the case, so freeing first keeps peer_identity / recvbuf / the stream
+	 * table from leaking. Every asserted value is captured above. */
 	if (ss.sched.streams != NULL) {
 		table_free(ss.sched.streams);
 		ss.sched.streams = NULL;
 	}
 	free(ss.handshake.peer_identity);
-	ringbuf_free(ss.wire.recvbuf);
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(ok);
+	T_EXPECT_EQ(reset_calls, 0);
+	T_EXPECT_EQ(done_calls, 1);
+	T_EXPECT_EQ(readable, (size_t)0);
+	T_EXPECT(peer_rejects);
+	T_EXPECT(has_session_id);
+	T_EXPECT(session_id_match);
+	T_EXPECT(has_peer_identity);
+	T_EXPECT_STREQ(peer_identity, "srv-a");
 }
 
 T_DECLARE_CASE(test_handshake_process_resume_hello_calls_on_resume_match)
@@ -466,25 +563,234 @@ T_DECLARE_CASE(test_handshake_process_resume_hello_calls_on_resume_match)
 	setup_session(&ss, &pool_ctx, true);
 	memset(hello.session_id, 0x2C, sizeof(hello.session_id));
 	T_CHECK(build_hello_frame(frame, &hdr, &hello));
-	ringbuf_free(ss.wire.recvbuf);
-	ss.wire.recvbuf = ringbuf_new(frame->len);
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
 	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(ringbuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(ss.wire.recvbuf, frame->len);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
 	ss.callbacks.on_resume = resume_lookup_cb;
 	/* The owner reports it handled the resume (located the suspended session
 	 * and took this transient session's transport). */
 	g_resume_handled = true;
 
-	T_EXPECT(!handshake_process_hello(&ss, &hdr, frame->len));
-	T_EXPECT_EQ(g_resume_calls, 1);
-	T_EXPECT_EQ(g_resume_seq, (uint_least32_t)99);
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const int resume_calls = g_resume_calls;
+	const uint_least32_t resume_seq = g_resume_seq;
+	const int done_calls = g_handshake_done_calls;
+	const int reset_calls = g_reset_calls;
+	const int state = (int)ss.state;
+	/* Free the recvbuf before asserting so a failing T_EXPECT can't skip it;
+	 * the captured values are stack copies. */
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(resume_calls, 1);
+	T_EXPECT_EQ(resume_seq, (uint_least32_t)99);
 	/* Handed off: no fresh handshake, and the transient session is reset so
 	 * socket_cb tears it down. */
-	T_EXPECT_EQ(g_handshake_done_calls, 0);
-	T_EXPECT_EQ(g_reset_calls, 1);
-	T_EXPECT_EQ((int)ss.state, (int)SESSION_CLOSED);
-	ringbuf_free(ss.wire.recvbuf);
+	T_EXPECT_EQ(done_calls, 0);
+	T_EXPECT_EQ(reset_calls, 1);
+	T_EXPECT_EQ(state, (int)SESSION_CLOSED);
+}
+
+/* process_hello_server's on_resume-miss fallback (spec §5.8.3 step 4): when
+ * on_resume reports no matching suspended session, the server logs a warning and
+ * falls through to a fresh ServerHello carrying its own session_id, then
+ * completes the handshake. */
+T_DECLARE_CASE(
+	test_handshake_process_resume_hello_on_resume_miss_falls_back_fresh)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss;
+	TEST_FRAME(frame);
+	struct mux_header hdr;
+	struct proto_hello hello = {
+		.msgid = PROTO_MSG_CLIENT_HELLO,
+		.has_session_id = true,
+		.has_resume_seq = true,
+		.resume_seq = 99,
+	};
+	struct proto_hello parsed;
+
+	handshake_mock_reset();
+	setup_session(&ss, &pool_ctx, true);
+	/* The server was assigned its own session_id before this ClientHello. */
+	ss.handshake.has_session_id = true;
+	memset(ss.handshake.session_id, 0x77, sizeof(ss.handshake.session_id));
+	/* The resume attempt carries a different (now-unknown) id. */
+	memset(hello.session_id, 0x2C, sizeof(hello.session_id));
+	T_CHECK(build_hello_frame(frame, &hdr, &hello));
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
+	T_CHECK(ss.wire.recvbuf != NULL);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
+	ss.callbacks.on_resume = resume_lookup_cb;
+	/* No matching suspended session: the owner declines the resume. */
+	g_resume_handled = false;
+
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const int resume_calls = g_resume_calls;
+	const uint_least32_t resume_seq = g_resume_seq;
+	const int done_calls = g_handshake_done_calls;
+	const int reset_calls = g_reset_calls;
+	/* A fresh ServerHello carrying the server's own session_id was queued. */
+	const bool sendbuf_queued = ss.wire.sendbuf.head != NULL;
+	const bool parse_ok =
+		sendbuf_queued &&
+		proto_hello_parse(
+			&ss, ss.wire.sendbuf.head->data + MUX_FRAME_HEADER_SIZE,
+			ss.wire.sendbuf.head->len - MUX_FRAME_HEADER_SIZE,
+			&parsed);
+	const bool session_id_match =
+		parse_ok && memcmp(parsed.session_id, ss.handshake.session_id,
+				   sizeof(parsed.session_id)) == 0;
+	/* Tear the fixture down before asserting: a failing T_EXPECT longjmps out
+	 * of the case, so teardown first keeps the queued frame / recvbuf from
+	 * leaking. parsed and the captured values are stack-resident. */
+	teardown_session(&ss);
+
+	T_EXPECT(ok);
+	T_EXPECT_EQ(resume_calls, 1);
+	T_EXPECT_EQ(resume_seq, (uint_least32_t)99);
+	T_EXPECT_EQ(done_calls, 1);
+	T_EXPECT_EQ(reset_calls, 0);
+	T_CHECK(sendbuf_queued);
+	T_EXPECT(parse_ok);
+	T_EXPECT_EQ(parsed.msgid, PROTO_MSG_SERVER_HELLO);
+	T_EXPECT(parsed.has_session_id);
+	T_EXPECT(session_id_match);
+}
+
+/* Spec §5.2.2: the server always includes session_id in its ServerHello, so
+ * one without it is a server protocol violation and must close the connection.
+ * Accepting it would leave the client ESTABLISHED still flagged
+ * has_session_id but holding the previous, now-defunct id -- every piece of
+ * state behind it having just been wiped -- and the next reconnect would offer
+ * that dead id in a resume ClientHello. */
+T_DECLARE_CASE(test_handshake_process_server_hello_without_session_id_rejected)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss;
+	TEST_FRAME(frame);
+	struct mux_header hdr;
+	struct proto_hello hello = {
+		.msgid = PROTO_MSG_SERVER_HELLO,
+		.has_session_id = false,
+	};
+
+	handshake_mock_reset();
+	setup_session(&ss, &pool_ctx, false);
+	/* An id left over from the session this client is trying to resume. */
+	ss.handshake.has_session_id = true;
+	memset(ss.handshake.session_id, 0x61, sizeof(ss.handshake.session_id));
+	T_CHECK(build_hello_frame(frame, &hdr, &hello));
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
+	T_CHECK(ss.wire.recvbuf != NULL);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
+
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+
+	const int reset_calls = g_reset_calls;
+	const int done_calls = g_handshake_done_calls;
+	free(ss.handshake.peer_identity);
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(reset_calls, 1);
+	T_EXPECT_EQ(done_calls, 0);
+}
+
+/* The same rejection applies to a client with no session to resume: spec §5.2.2
+ * is unconditional, so a session_id-less ServerHello is a server protocol
+ * violation whether or not we were resuming. This is the half a plain first
+ * connect hits, and it is the stricter half -- before the guard such a client
+ * came up ESTABLISHED, merely unable to ever resume. Pinned separately so a
+ * guard narrowed to only the resume case (has_session_id && !peer's) cannot
+ * regress it unnoticed. */
+T_DECLARE_CASE(
+	test_handshake_process_fresh_server_hello_without_session_id_rejected)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss;
+	TEST_FRAME(frame);
+	struct mux_header hdr;
+	struct proto_hello hello = {
+		.msgid = PROTO_MSG_SERVER_HELLO,
+		.has_session_id = false,
+	};
+
+	handshake_mock_reset();
+	setup_session(&ss, &pool_ctx, false);
+	/* No prior session: nothing to resume, so this is a first connect. */
+	ss.handshake.has_session_id = false;
+	T_CHECK(build_hello_frame(frame, &hdr, &hello));
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
+	T_CHECK(ss.wire.recvbuf != NULL);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
+
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+
+	const int reset_calls = g_reset_calls;
+	const int done_calls = g_handshake_done_calls;
+	const bool adopted = ss.handshake.has_session_id;
+	free(ss.handshake.peer_identity);
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(reset_calls, 1);
+	T_EXPECT_EQ(done_calls, 0);
+	/* Nothing was adopted, so no reconnect can offer an id we never got. */
+	T_EXPECT(!adopted);
+}
+
+/* The peer-protocol-violation half of the confirmed-resume path: when the
+ * server's resume_seq cannot be reconciled against what we actually sent,
+ * unacked_resume_ack_recv fails and the session must reset rather than come up
+ * with a trimmed-wrong unacked log. */
+T_DECLARE_CASE(test_handshake_process_confirmed_resume_ack_rejected)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss;
+	TEST_FRAME(frame);
+	struct mux_header hdr;
+	struct proto_hello hello = {
+		.msgid = PROTO_MSG_SERVER_HELLO,
+		.has_session_id = true,
+		.has_resume_seq = true,
+		.resume_seq = 123,
+	};
+
+	handshake_mock_reset();
+	g_resume_ack_result = false;
+	setup_session(&ss, &pool_ctx, false);
+	ss.handshake.has_session_id = true;
+	memset(ss.handshake.session_id, 0x61, sizeof(ss.handshake.session_id));
+	memcpy(hello.session_id, ss.handshake.session_id,
+	       sizeof(hello.session_id));
+	T_CHECK(build_hello_frame(frame, &hdr, &hello));
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
+	T_CHECK(ss.wire.recvbuf != NULL);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
+
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+
+	const int ack_calls = g_resume_ack_recv_calls;
+	const int reset_calls = g_reset_calls;
+	const int done_calls = g_handshake_done_calls;
+	free(ss.handshake.peer_identity);
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(ack_calls, 1);
+	T_EXPECT_EQ(reset_calls, 1);
+	T_EXPECT_EQ(done_calls, 0);
 }
 
 T_DECLARE_CASE(test_handshake_process_confirmed_resume_calls_resume_ack_recv)
@@ -507,19 +813,27 @@ T_DECLARE_CASE(test_handshake_process_confirmed_resume_calls_resume_ack_recv)
 	memcpy(hello.session_id, ss.handshake.session_id,
 	       sizeof(hello.session_id));
 	T_CHECK(build_hello_frame(frame, &hdr, &hello));
-	ringbuf_free(ss.wire.recvbuf);
-	ss.wire.recvbuf = ringbuf_new(frame->len);
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
 	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(ringbuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(ss.wire.recvbuf, frame->len);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	T_EXPECT(handshake_process_hello(&ss, &hdr, frame->len));
-	T_EXPECT_EQ(g_resume_ack_recv_calls, 1);
-	T_EXPECT_EQ(ss.unacked.last_ack_recv, (uint_least32_t)123);
-	T_EXPECT_EQ(g_handshake_done_calls, 1);
-	T_EXPECT_EQ(g_reset_calls, 0);
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const int ack_calls = g_resume_ack_recv_calls;
+	const uint_least32_t last_ack_recv = ss.unacked.last_ack_recv;
+	const int done_calls = g_handshake_done_calls;
+	const int reset_calls = g_reset_calls;
+	/* Free the fixtures before asserting so a failing T_EXPECT can't skip them;
+	 * the captured values are stack copies. */
 	free(ss.handshake.peer_identity);
-	ringbuf_free(ss.wire.recvbuf);
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(ok);
+	T_EXPECT_EQ(ack_calls, 1);
+	T_EXPECT_EQ(last_ack_recv, (uint_least32_t)123);
+	T_EXPECT_EQ(done_calls, 1);
+	T_EXPECT_EQ(reset_calls, 0);
 }
 
 T_DECLARE_CASE(test_handshake_process_confirmed_resume_rearms_write_watcher)
@@ -550,23 +864,32 @@ T_DECLARE_CASE(test_handshake_process_confirmed_resume_rearms_write_watcher)
 	ss.unacked.frames = 1;
 	ss.unacked.retransmit_off = 0;
 	T_CHECK(build_hello_frame(frame, &hdr, &hello));
-	ringbuf_free(ss.wire.recvbuf);
-	ss.wire.recvbuf = ringbuf_new(frame->len);
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
 	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(ringbuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(ss.wire.recvbuf, frame->len);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	T_EXPECT(handshake_process_hello(&ss, &hdr, frame->len));
-	T_EXPECT_EQ(g_resume_ack_recv_calls, 1);
-	T_EXPECT_EQ(g_handshake_done_calls, 1);
-	T_EXPECT_EQ(g_update_watcher_calls, 1);
-	T_EXPECT(ss.wire.tx_pending);
-	T_EXPECT_EQ(g_reset_calls, 0);
-	/* Ring owns retransmit (stack var); clear ring only, don't mux_frame_put. */
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const int ack_calls = g_resume_ack_recv_calls;
+	const int done_calls = g_handshake_done_calls;
+	const int watcher_calls = g_update_watcher_calls;
+	const bool tx_pending = ss.wire.tx_pending;
+	const int reset_calls = g_reset_calls;
+	/* Free the fixtures before asserting so a failing T_EXPECT can't skip them;
+	 * the captured values are stack copies.
+	 * Ring owns retransmit (stack var); clear ring only, don't mux_frame_put. */
 	free(ss.unacked.ring);
 	ss.unacked.ring = NULL;
 	free(ss.handshake.peer_identity);
-	ringbuf_free(ss.wire.recvbuf);
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(ok);
+	T_EXPECT_EQ(ack_calls, 1);
+	T_EXPECT_EQ(done_calls, 1);
+	T_EXPECT_EQ(watcher_calls, 1);
+	T_EXPECT(tx_pending);
+	T_EXPECT_EQ(reset_calls, 0);
 }
 
 T_DECLARE_CASE(test_handshake_process_invalid_version_resets_session)
@@ -582,16 +905,22 @@ T_DECLARE_CASE(test_handshake_process_invalid_version_resets_session)
 	handshake_mock_reset();
 	setup_session(&ss, &pool_ctx, false);
 	build_raw_hello_frame(frame, &hdr, json);
-	ringbuf_free(ss.wire.recvbuf);
-	ss.wire.recvbuf = ringbuf_new(frame->len);
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
 	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(ringbuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(ss.wire.recvbuf, frame->len);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	T_EXPECT(!handshake_process_hello(&ss, &hdr, frame->len));
-	T_EXPECT_EQ(g_reset_calls, 1);
-	T_EXPECT_EQ(g_handshake_done_calls, 0);
-	ringbuf_free(ss.wire.recvbuf);
+	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const int reset_calls = g_reset_calls;
+	const int done_calls = g_handshake_done_calls;
+	/* Free the recvbuf before asserting so a failing T_EXPECT can't skip it;
+	 * the captured values are stack copies. */
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(reset_calls, 1);
+	T_EXPECT_EQ(done_calls, 0);
 }
 
 /* proto_hello_parse rejects a frame whose declared length exceeds the protocol
@@ -601,7 +930,8 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_oversized_json)
 	static const unsigned char json[] = "{}";
 	struct proto_hello parsed;
 	T_EXPECT(!proto_hello_parse(
-		json, (size_t)MUX_MAX_PAYLOAD_SIZE + 1, &parsed));
+		&k_parse_test_session, json, (size_t)MUX_MAX_PAYLOAD_SIZE + 1,
+		&parsed));
 }
 
 /* handshake_process_hello resets the session when a hello arrives outside the
@@ -861,8 +1191,9 @@ static size_t gen_hello_build(unsigned char *restrict buf, const size_t cap)
 
 	if (prng_bool()) {
 		hello.has_identity = true;
-		/* Length 0-254: all fit in proto_hello.identity[256]. */
-		const size_t id_len = prng_range(255);
+		/* Length 0-255: the 255 case is the largest legal identity and
+		 * still fits in proto_hello.identity[256] (255 chars + NUL). */
+		const size_t id_len = prng_range(256);
 		for (size_t i = 0; i < id_len; i++) {
 			hello.identity[i] = (char)('a' + (int)prng_range(26));
 		}
@@ -946,7 +1277,8 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			}
 
 			struct proto_hello out;
-			const bool ok = proto_hello_parse(json_buf, len, &out);
+			const bool ok = proto_hello_parse(
+				&k_parse_test_session, json_buf, len, &out);
 
 			/* Invariant 1: successful parse implies valid version. */
 			if (ok && out.version <= 0) {
@@ -972,7 +1304,8 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			}
 
 			struct proto_hello out;
-			const bool ok = proto_hello_parse(json_buf, len, &out);
+			const bool ok = proto_hello_parse(
+				&k_parse_test_session, json_buf, len, &out);
 
 			if (ok && out.version <= 0) {
 				print_fuzz_context(iter, seed, json_buf, len);
@@ -1053,21 +1386,38 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			 * path (spec §5.8.3). */
 			if (!accepted && prng_range(4u) == 0u) {
 				ss.handshake.has_session_id = true;
-				for (size_t i = 0; i < MUX_SESSION_ID_LEN;
-				     i++) {
-					ss.handshake.session_id[i] =
-						(unsigned char)prng_u32();
+				/* Half the time seed the id to the decode of a
+				 * corpus session_id (k_session_ids[0] -> 16 zero
+				 * bytes) so a generated ServerHello carrying that
+				 * same id actually confirms the resume.  A fully
+				 * random id matches the base64 corpus only
+				 * ~2^-128 of the time, which would leave
+				 * is_confirmed_resume / unacked_resume_ack_recv
+				 * unreached. */
+				const bool seed_corpus_id =
+					prng_bool() &&
+					proto_parse_session_id(
+						k_session_ids[0],
+						strlen(k_session_ids[0]),
+						ss.handshake.session_id);
+				if (!seed_corpus_id) {
+					for (size_t i = 0;
+					     i < MUX_SESSION_ID_LEN; i++) {
+						ss.handshake.session_id[i] =
+							(unsigned char)
+								prng_u32();
+					}
 				}
 			}
 
-			ss.wire.recvbuf = ringbuf_new(frame_size);
+			ss.wire.recvbuf = bytebuf_new(frame_size);
 			if (ss.wire.recvbuf == NULL) {
 				/* OOM: skip iteration. */
 				continue;
 			}
-			memcpy(ringbuf_write_ptr(ss.wire.recvbuf), frame_buf,
+			memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame_buf,
 			       frame_size);
-			ringbuf_produce(ss.wire.recvbuf, frame_size);
+			bytebuf_produce(ss.wire.recvbuf, frame_size);
 
 			const bool ret =
 				handshake_process_hello(&ss, &hdr, frame_size);
@@ -1117,17 +1467,23 @@ T_DECLARE_CASE(test_handshake_fuzz)
 
 static const struct testing_suite suite[] = {
 	T_CASE(test_proto_hello_build_and_parse_roundtrip),
+	T_CASE(test_proto_hello_build_and_parse_max_identity),
 	T_CASE(test_proto_hello_parse_rejects_missing_type),
 	T_CASE(test_proto_hello_parse_rejects_type_embedded_nul),
 	T_CASE(test_proto_hello_parse_rejects_bad_session_id),
 	T_CASE(test_proto_hello_parse_rejects_oversized_identity),
+	T_CASE(test_proto_hello_parse_rejects_identity_embedded_nul),
 	T_CASE(test_proto_hello_parse_rejects_invalid_utf8_identity),
 	T_CASE(test_proto_hello_parse_accepts_well_formed_utf8_identity),
 	T_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume),
 	T_CASE(test_handshake_enqueue_hello_omits_oversized_identity),
 	T_CASE(test_handshake_process_server_hello_assigns_peer_identity),
 	T_CASE(test_handshake_process_resume_hello_calls_on_resume_match),
+	T_CASE(test_handshake_process_resume_hello_on_resume_miss_falls_back_fresh),
 	T_CASE(test_handshake_process_confirmed_resume_calls_resume_ack_recv),
+	T_CASE(test_handshake_process_server_hello_without_session_id_rejected),
+	T_CASE(test_handshake_process_fresh_server_hello_without_session_id_rejected),
+	T_CASE(test_handshake_process_confirmed_resume_ack_rejected),
 	T_CASE(test_handshake_process_confirmed_resume_rearms_write_watcher),
 	T_CASE(test_handshake_process_invalid_version_resets_session),
 	T_CASE(test_proto_hello_parse_rejects_oversized_json),

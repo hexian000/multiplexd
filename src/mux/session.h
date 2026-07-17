@@ -291,6 +291,21 @@ static inline void session_publish_estimate(struct mux_session *restrict ss)
 	PUB_STORE(ss->_pub_bdp_tx, ss->estimator.tx.bdp);
 }
 
+/* True once the graceful-drain cascade has bulk-freed the session's streams.
+ * Closing the last active stream of a draining session runs stream_mark_closed
+ * -> sched_check_no_active_streams -> session_initiate_shutdown ->
+ * sched_free_streams, which frees every struct mux_stream and nulls the
+ * scheduler's stream table (the struct mux_session itself survives; the same
+ * shutdown also runs wire_discard_buffers, resetting the recvbuf). Within a
+ * single synchronous callback that is the only path that frees a stream, so a
+ * recv/flush caller that just invoked such a path must re-check this before
+ * touching the stream again -- or consuming the recvbuf, which the cascade has
+ * reset out from under it. */
+static inline bool session_streams_freed(const struct mux_session *restrict ss)
+{
+	return ss->sched.streams == NULL;
+}
+
 /* Recompute and apply the EV_READ/EV_WRITE mask for the mux socket watcher.
  * Shared by session.c and the send/recv pipelines. */
 void session_update_watcher(struct mux_session *restrict ss);
@@ -344,7 +359,7 @@ extern const struct table_opts mux_stream_table_opts;
 
 /* Log a parsed frame header at VERYVERBOSE level. */
 void session_log_frame_header(
-	struct mux_session *restrict ss, const char *restrict what,
+	const struct mux_session *restrict ss, const char *restrict what,
 	const unsigned char *restrict raw,
 	const struct mux_header *restrict hdr);
 

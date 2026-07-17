@@ -148,6 +148,19 @@ struct mux_test_fixture {
 	bool srv_resumed;
 	bool cli_resumed;
 	bool cli_connect_failed;
+	bool cli_lost;
+
+	/* Last on_event() payload captured for the event_data contract:
+	 * ESTABLISHED/RESUMED populate the ev_connected fields; STREAM_ESTABLISHED
+	 * populates ev_stream_established_ns; CLOSED populates the ev_closed
+	 * fields.  The LOST and CONNECT_FAILED payloads are zero, so only the
+	 * cli_lost and cli_connect_failed flags above record that they fired. */
+	int_least64_t ev_connected_ns;
+	const char *ev_connected_peer_id;
+	const char *ev_connected_peer_identity;
+	int_least64_t ev_stream_established_ns;
+	bool ev_closed_clean;
+	bool ev_closed_expired;
 
 	enum accept_mode accept_mode;
 
@@ -351,14 +364,8 @@ stream_io_cb(struct ev_loop *loop, mux_stream_io *w, const int revents)
 	(void)loop;
 	struct test_stream *const restrict ts = (struct test_stream *)w;
 
-	if (revents & EV_ERROR) {
-		ts->got_error = true;
-		if (!ts->closed) {
-			ts->closed = true;
-			mux_stream_close(ts->s);
-		}
-		return;
-	}
+	/* mux_stream_io is never registered with libev; the mux layer only ever
+	 * feeds it EV_READ/EV_WRITE, so EV_ERROR cannot arrive here. */
 
 	if (revents & EV_READ) {
 		if (ts->is_drain) {
@@ -537,10 +544,12 @@ static void on_event_cb(
 	void *data, struct mux_session *ss, enum mux_event event,
 	union mux_event_data edata)
 {
-	(void)edata;
 	struct mux_test_fixture *const restrict fx = data;
 	switch (event) {
 	case MUX_EVENT_ESTABLISHED:
+		fx->ev_connected_ns = edata.connected.ns;
+		fx->ev_connected_peer_id = edata.connected.peer_id;
+		fx->ev_connected_peer_identity = edata.connected.peer_identity;
 		if (ss == fx->srv) {
 			fx->srv_established = true;
 		} else {
@@ -548,10 +557,26 @@ static void on_event_cb(
 		}
 		break;
 	case MUX_EVENT_RESUMED:
+		fx->ev_connected_ns = edata.connected.ns;
+		fx->ev_connected_peer_id = edata.connected.peer_id;
+		fx->ev_connected_peer_identity = edata.connected.peer_identity;
 		if (ss == fx->srv) {
 			fx->srv_resumed = true;
 		} else {
 			fx->cli_resumed = true;
+		}
+		break;
+	case MUX_EVENT_STREAM_ESTABLISHED:
+		fx->ev_stream_established_ns = edata.stream_established.ns;
+		break;
+	case MUX_EVENT_LOST:
+		if (ss == fx->cli) {
+			fx->cli_lost = true;
+		}
+		break;
+	case MUX_EVENT_CONNECT_FAILED:
+		if (ss == fx->cli) {
+			fx->cli_connect_failed = true;
 		}
 		break;
 	case MUX_EVENT_SUSPENDED:
@@ -569,6 +594,8 @@ static void on_event_cb(
 		}
 		break;
 	case MUX_EVENT_CLOSED:
+		fx->ev_closed_clean = edata.closed.clean;
+		fx->ev_closed_expired = edata.closed.expired;
 		if (ss == fx->srv) {
 			fx->srv_closed = true;
 			fx->srv = NULL;
@@ -1099,11 +1126,19 @@ T_DECLARE_CASE(test_establish)
 
 	const int ret = wait_until(
 		&fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established, &fx);
-	T_EXPECT(ret == 0);
-	T_EXPECT(fx.srv_established);
-	T_EXPECT(fx.cli_established);
+	const bool srv_established = fx.srv_established;
+	const bool cli_established = fx.cli_established;
+	/* ESTABLISHED payload: setup latency is measured against a monotonic
+	 * clock, so an established peer reports a strictly positive ns. */
+	const int_least64_t connected_ns = fx.ev_connected_ns;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(srv_established);
+	T_EXPECT(cli_established);
+	T_EXPECT(connected_ns > 0);
 }
 
 T_DECLARE_CASE(test_send_recv_small)
@@ -1117,28 +1152,32 @@ T_DECLARE_CASE(test_send_recv_small)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char *payload = malloc(PAYLOAD_SMALL);
 	if (payload == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x42);
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
-		T_FATAL("mux_open_stream returned NULL");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("mux_open_stream returned NULL");
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		T_FATAL("test_stream_new failed");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -1152,15 +1191,24 @@ T_DECLARE_CASE(test_send_recv_small)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_SMALL);
-	if (ts->recv_len == PAYLOAD_SMALL) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0);
-	}
+	const size_t recv_len = ts->recv_len;
+	const bool payload_matches =
+		recv_len == PAYLOAD_SMALL &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0;
+	/* STREAM_ESTABLISHED payload: the active-open stream reports its
+	 * SYN-to-SYN|ACK latency once, and it is strictly positive. */
+	const int_least64_t stream_ns = fx.ev_stream_established_ns;
 
 	free(payload);
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_SMALL);
+	if (recv_len == PAYLOAD_SMALL) {
+		T_EXPECT(payload_matches);
+	}
+	T_EXPECT(stream_ns > 0);
 }
 
 /* test_idle_scheduler_stops_while_sendbuf_blocked: INIT stream on a full
@@ -1179,8 +1227,21 @@ T_DECLARE_CASE(test_idle_scheduler_stops_while_sendbuf_blocked)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		if (fx.cli != NULL) {
+			if (fx.cli->wire.sendbuf.head == frame) {
+				(void)mux_frame_list_pop(&fx.cli->wire.sendbuf);
+				mux_frame_put(&fx.cli->pool, frame);
+				frame = NULL;
+			}
+			fx.cli->wire.tx_pending = false;
+			session_notify(fx.cli);
+		}
+		if (fx.srv != NULL) {
+			session_notify(fx.srv);
+		}
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Stop transport watchers so EVRUN_NOWAIT executes only the idle path. */
@@ -1189,8 +1250,21 @@ T_DECLARE_CASE(test_idle_scheduler_stops_while_sendbuf_blocked)
 
 	frame = mux_frame_get(&fx.cli->pool, fx.cli->max_payload);
 	if (frame == NULL) {
+		if (fx.cli != NULL) {
+			if (fx.cli->wire.sendbuf.head == frame) {
+				(void)mux_frame_list_pop(&fx.cli->wire.sendbuf);
+				mux_frame_put(&fx.cli->pool, frame);
+				frame = NULL;
+			}
+			fx.cli->wire.tx_pending = false;
+			session_notify(fx.cli);
+		}
+		if (fx.srv != NULL) {
+			session_notify(fx.srv);
+		}
+		fixture_teardown(&fx);
 		T_FATAL("mux_frame_get failed");
-		goto cleanup;
+		return;
 	}
 	frame->pos = 0;
 	frame->len = MUX_FRAME_HEADER_SIZE;
@@ -1198,15 +1272,28 @@ T_DECLARE_CASE(test_idle_scheduler_stops_while_sendbuf_blocked)
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		if (fx.cli != NULL) {
+			if (fx.cli->wire.sendbuf.head == frame) {
+				(void)mux_frame_list_pop(&fx.cli->wire.sendbuf);
+				mux_frame_put(&fx.cli->pool, frame);
+				frame = NULL;
+			}
+			fx.cli->wire.tx_pending = false;
+			session_notify(fx.cli);
+		}
+		if (fx.srv != NULL) {
+			session_notify(fx.srv);
+		}
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	/* The INIT stream is parked on the low-priority queue while the sendbuf
 	 * is occupied; the lifecycle drain is NOT scheduled (an active idle watcher
 	 * would keep libev from sleeping and spin until the transport drains). */
-	T_EXPECT(!fx.cli->sched.lp_pending);
-	T_EXPECT(fx.cli->sched.lp_head != NULL);
-	T_EXPECT(fx.cli->wire.tx_pending);
+	const bool lp_not_pending_pre = !fx.cli->sched.lp_pending;
+	const bool lp_head_parked = fx.cli->sched.lp_head != NULL;
+	const bool tx_pending_pre = fx.cli->wire.tx_pending;
 
 	/* Stop the socket watcher so EVRUN_NOWAIT cannot flush the sendbuf:
 	 * opening the stream re-armed EV_WRITE via session_notify, so stop it here
@@ -1215,11 +1302,11 @@ T_DECLARE_CASE(test_idle_scheduler_stops_while_sendbuf_blocked)
 
 	ev_run(fx.loop, EVRUN_NOWAIT);
 
-	T_EXPECT(!fx.cli->sched.lp_pending);
-	T_EXPECT(fx.cli->wire.sendbuf.head == frame);
-	T_EXPECT(fx.cli->wire.tx_pending);
+	const bool lp_not_pending_post = !fx.cli->sched.lp_pending;
+	const bool sendbuf_head_is_frame = fx.cli->wire.sendbuf.head == frame;
+	const bool tx_pending_post = fx.cli->wire.tx_pending;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	if (fx.cli != NULL) {
 		if (fx.cli->wire.sendbuf.head == frame) {
 			(void)mux_frame_list_pop(&fx.cli->wire.sendbuf);
@@ -1233,6 +1320,13 @@ cleanup:
 		session_notify(fx.srv);
 	}
 	fixture_teardown(&fx);
+
+	T_EXPECT(lp_not_pending_pre);
+	T_EXPECT(lp_head_parked);
+	T_EXPECT(tx_pending_pre);
+	T_EXPECT(lp_not_pending_post);
+	T_EXPECT(sendbuf_head_is_frame);
+	T_EXPECT(tx_pending_post);
 }
 
 /* test_retransmit_excludes_lifecycle_drain: while replay is in flight
@@ -1249,8 +1343,9 @@ T_DECLARE_CASE(test_retransmit_excludes_lifecycle_drain)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Drive session_on_send by hand; stop the watcher so the loop cannot
@@ -1260,19 +1355,21 @@ T_DECLARE_CASE(test_retransmit_excludes_lifecycle_drain)
 	/* A fresh INIT stream parked on the lifecycle (lp) queue, drain armed. */
 	struct mux_stream *b = mux_open_stream(fx.cli);
 	if (b == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
-	T_EXPECT_EQ(b->state, STREAM_INIT);
-	T_EXPECT(fx.cli->sched.lp_head == b);
+	const enum stream_state b_state_pre = b->state;
+	const bool lp_head_is_b = fx.cli->sched.lp_head == b;
 	fx.cli->sched.lp_pending = true;
 
 	/* One unacked entry with the replay cursor at its head makes resume
 	 * replay "in flight" for this send pass. */
 	u = mux_frame_get(&fx.cli->pool, fx.cli->max_payload);
 	if (u == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_frame_get failed");
-		goto cleanup;
+		return;
 	}
 	u->pos = 0;
 	u->len = MUX_FRAME_HEADER_SIZE;
@@ -1287,8 +1384,9 @@ T_DECLARE_CASE(test_retransmit_excludes_lifecycle_drain)
 	unacked_track_sent(fx.cli, u); /* takes ownership; ring count -> 1 */
 	u = NULL;
 	if (fx.cli->unacked.ring == NULL || fx.cli->unacked.ring->count == 0) {
+		fixture_teardown(&fx);
 		T_FATAL("unacked ring not populated");
-		goto cleanup;
+		return;
 	}
 	fx.cli->unacked.retransmit_off = 0;
 
@@ -1296,14 +1394,19 @@ T_DECLARE_CASE(test_retransmit_excludes_lifecycle_drain)
 
 	/* Exclusivity: the lifecycle SYN must not have been staged ahead of the
 	 * replay; the drain stays pending for after replay completes. */
-	T_EXPECT_EQ(b->state, STREAM_INIT);
-	T_EXPECT(fx.cli->sched.lp_pending);
+	const enum stream_state b_state_post = b->state;
+	const bool lp_pending_final = fx.cli->sched.lp_pending;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	if (u != NULL) {
 		mux_frame_put(&fx.cli->pool, u);
 	}
 	fixture_teardown(&fx);
+
+	T_EXPECT_EQ(b_state_pre, STREAM_INIT);
+	T_EXPECT(lp_head_is_b);
+	T_EXPECT_EQ(b_state_post, STREAM_INIT);
+	T_EXPECT(lp_pending_final);
 }
 
 T_DECLARE_CASE(test_nagle_releases_queued_small_frame_on_ack)
@@ -1317,8 +1420,9 @@ T_DECLARE_CASE(test_nagle_releases_queued_small_frame_on_ack)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char payload_a[37];
@@ -1331,22 +1435,24 @@ T_DECLARE_CASE(test_nagle_releases_queued_small_frame_on_ack)
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 
 	size_t len_a = sizeof(payload_a);
-	T_EXPECT(mux_stream_send(s, payload_a, &len_a) == 0);
-	T_EXPECT_EQ(len_a, sizeof(payload_a));
+	const bool send_a_ok = mux_stream_send(s, payload_a, &len_a) == 0;
+	const size_t len_a_after = len_a;
 
 	size_t len_b = sizeof(payload_b);
-	T_EXPECT(mux_stream_send(s, payload_b, &len_b) == 0);
-	T_EXPECT_EQ(len_b, sizeof(payload_b));
+	const bool send_b_ok = mux_stream_send(s, payload_b, &len_b) == 0;
+	const size_t len_b_after = len_b;
 
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	mux_stream_io_start(fx.loop, &ts->w_io);
@@ -1358,14 +1464,23 @@ T_DECLARE_CASE(test_nagle_releases_queued_small_frame_on_ack)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT_EQ(ts->recv_len, sizeof(expected));
-	if (ts->recv_len == sizeof(expected)) {
-		T_EXPECT(memcmp(ts->recv_buf, expected, sizeof(expected)) == 0);
-	}
+	const size_t recv_len = ts->recv_len;
+	const bool payload_matches =
+		recv_len == sizeof(expected) &&
+		memcmp(ts->recv_buf, expected, sizeof(expected)) == 0;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(send_a_ok);
+	T_EXPECT_EQ(len_a_after, sizeof(payload_a));
+	T_EXPECT(send_b_ok);
+	T_EXPECT_EQ(len_b_after, sizeof(payload_b));
+	T_EXPECT(ret == 0);
+	T_EXPECT_EQ(recv_len, sizeof(expected));
+	if (recv_len == sizeof(expected)) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 T_DECLARE_CASE(test_send_recv_large)
@@ -1379,28 +1494,32 @@ T_DECLARE_CASE(test_send_recv_large)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char *payload = malloc(PAYLOAD_LARGE);
 	if (payload == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0x7F);
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
-		T_FATAL("mux_open_stream returned NULL");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("mux_open_stream returned NULL");
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		T_FATAL("test_stream_new failed");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -1414,15 +1533,20 @@ T_DECLARE_CASE(test_send_recv_large)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_LARGE);
-	if (ts->recv_len == PAYLOAD_LARGE) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0);
-	}
+	const size_t recv_len = ts->recv_len;
+	const bool payload_matches =
+		recv_len == PAYLOAD_LARGE &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0;
 
 	free(payload);
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_LARGE);
+	if (recv_len == PAYLOAD_LARGE) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 T_DECLARE_CASE(test_half_close)
@@ -1436,8 +1560,9 @@ T_DECLARE_CASE(test_half_close)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char payload[64];
@@ -1445,13 +1570,15 @@ T_DECLARE_CASE(test_half_close)
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -1461,12 +1588,15 @@ T_DECLARE_CASE(test_half_close)
 
 	/* Wait for the echo to arrive and client to receive EOF from server. */
 	const int ret = wait_until(&fx, EOF_TIMEOUT_MS / 1000.0, pred_eof, ts);
-	T_EXPECT(ret == 0);
-	T_EXPECT(ts->got_eof);
-	T_EXPECT(!ts->got_error);
+	const bool got_eof = ts->got_eof;
+	const bool got_error = ts->got_error;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(got_eof);
+	T_EXPECT(!got_error);
 }
 
 T_DECLARE_CASE(test_rst_on_unread_data)
@@ -1480,8 +1610,9 @@ T_DECLARE_CASE(test_rst_on_unread_data)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Server will close immediately when a stream arrives (RST). */
@@ -1492,13 +1623,15 @@ T_DECLARE_CASE(test_rst_on_unread_data)
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -1509,11 +1642,13 @@ T_DECLARE_CASE(test_rst_on_unread_data)
 	 * as EV_READ; mux_stream_recv returns -1 / ECONNRESET). */
 	const int ret =
 		wait_until(&fx, EOF_TIMEOUT_MS / 1000.0, pred_error, ts);
-	T_EXPECT(ret == 0);
-	T_EXPECT(ts->got_error);
+	const bool got_error = ts->got_error;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(got_error);
 }
 
 T_DECLARE_CASE(test_multi_stream)
@@ -1527,8 +1662,9 @@ T_DECLARE_CASE(test_multi_stream)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char *payloads[MULTI_CONCURRENCY];
@@ -1538,8 +1674,12 @@ T_DECLARE_CASE(test_multi_stream)
 	for (int i = 0; i < MULTI_CONCURRENCY; i++) {
 		payloads[i] = malloc(PAYLOAD_SMALL);
 		if (payloads[i] == NULL) {
+			for (int j = 0; j < MULTI_CONCURRENCY; j++) {
+				free(payloads[j]);
+			}
+			fixture_teardown(&fx);
 			T_FATAL("malloc failed");
-			goto cleanup_payloads;
+			return;
 		}
 		fill_payload(
 			payloads[i], PAYLOAD_SMALL, (uint_fast8_t)(i * 37));
@@ -1552,13 +1692,21 @@ T_DECLARE_CASE(test_multi_stream)
 	for (int i = 0; i < MULTI_CONCURRENCY; i++) {
 		struct mux_stream *s = mux_open_stream(fx.cli);
 		if (s == NULL) {
+			for (int j = 0; j < MULTI_CONCURRENCY; j++) {
+				free(payloads[j]);
+			}
+			fixture_teardown(&fx);
 			T_FATAL("mux_open_stream returned NULL");
-			goto cleanup_payloads;
+			return;
 		}
 		struct test_stream *ts = test_stream_new(&fx, s);
 		if (ts == NULL) {
+			for (int j = 0; j < MULTI_CONCURRENCY; j++) {
+				free(payloads[j]);
+			}
+			fixture_teardown(&fx);
 			T_FATAL("test_stream_new failed");
-			goto cleanup_payloads;
+			return;
 		}
 		if (fx.n_cli_streams < MAX_ACCEPTED) {
 			fx.cli_streams[fx.n_cli_streams++] = ts;
@@ -1570,34 +1718,39 @@ T_DECLARE_CASE(test_multi_stream)
 	}
 
 	/* Wait for all streams to receive their echoed payload. */
+	int rets[MULTI_CONCURRENCY];
+	size_t recv_lens[MULTI_CONCURRENCY];
+	bool matches[MULTI_CONCURRENCY];
 	for (int i = 0; i < MULTI_CONCURRENCY; i++) {
 		struct echo_ctx ctx = {
 			.ts = streams[i],
 			.expected = payloads[i],
 			.expected_len = PAYLOAD_SMALL,
 		};
-		const int ret = wait_until(
+		rets[i] = wait_until(
 			&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received,
 			&ctx);
-		T_EXPECT(ret == 0);
-		if (ret == 0) {
-			T_EXPECT_EQ(
-				streams[i]->recv_len, (size_t)PAYLOAD_SMALL);
-			if (streams[i]->recv_len == PAYLOAD_SMALL) {
-				T_EXPECT(
-					memcmp(streams[i]->recv_buf,
-					       payloads[i],
-					       PAYLOAD_SMALL) == 0);
-			}
-		}
+		recv_lens[i] = streams[i]->recv_len;
+		matches[i] = recv_lens[i] == PAYLOAD_SMALL &&
+			     memcmp(streams[i]->recv_buf, payloads[i],
+				    PAYLOAD_SMALL) == 0;
 	}
 
-cleanup_payloads:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	for (int i = 0; i < MULTI_CONCURRENCY; i++) {
 		free(payloads[i]);
 	}
-cleanup:
 	fixture_teardown(&fx);
+
+	for (int i = 0; i < MULTI_CONCURRENCY; i++) {
+		T_EXPECT(rets[i] == 0);
+		if (rets[i] == 0) {
+			T_EXPECT_EQ(recv_lens[i], (size_t)PAYLOAD_SMALL);
+			if (recv_lens[i] == PAYLOAD_SMALL) {
+				T_EXPECT(matches[i]);
+			}
+		}
+	}
 }
 
 /* server actively opens a stream and sends a
@@ -1615,29 +1768,33 @@ T_DECLARE_CASE(test_server_open_send_recv)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char *payload = malloc(PAYLOAD_SMALL);
 	if (payload == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x55);
 
 	/* Server actively opens a stream toward the client. */
 	struct mux_stream *s = mux_open_stream(fx.srv);
 	if (s == NULL) {
-		T_FATAL("mux_open_stream(srv) returned NULL");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("mux_open_stream(srv) returned NULL");
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		T_FATAL("test_stream_new failed");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
 	}
 	if (fx.n_srv_active_streams < MAX_ACCEPTED) {
 		fx.srv_active_streams[fx.n_srv_active_streams++] = ts;
@@ -1655,15 +1812,20 @@ T_DECLARE_CASE(test_server_open_send_recv)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_SMALL);
-	if (ts->recv_len == PAYLOAD_SMALL) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0);
-	}
+	const size_t recv_len = ts->recv_len;
+	const bool payload_matches =
+		recv_len == PAYLOAD_SMALL &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0;
 
 	free(payload);
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_SMALL);
+	if (recv_len == PAYLOAD_SMALL) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 /* client opens a stream but sends no data; the server sends a payload
@@ -1681,14 +1843,16 @@ T_DECLARE_CASE(test_client_open_server_sends_first)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char *payload = malloc(PAYLOAD_SMALL);
 	if (payload == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0xC3);
 
@@ -1700,15 +1864,17 @@ T_DECLARE_CASE(test_client_open_server_sends_first)
 	/* Client opens a stream; it does not send any data – it only receives. */
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
-		T_FATAL("mux_open_stream(cli) returned NULL");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("mux_open_stream(cli) returned NULL");
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		T_FATAL("test_stream_new failed");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	mux_stream_io_start(fx.loop, &ts->w_io);
@@ -1721,17 +1887,24 @@ T_DECLARE_CASE(test_client_open_server_sends_first)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_eof, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_SMALL);
-	T_EXPECT(ts->got_eof);
-	T_EXPECT(!ts->got_error);
-	if (ts->recv_len == PAYLOAD_SMALL) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0);
-	}
+	const size_t recv_len = ts->recv_len;
+	const bool got_eof = ts->got_eof;
+	const bool got_error = ts->got_error;
+	const bool payload_matches =
+		recv_len == PAYLOAD_SMALL &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0;
 
 	free(payload);
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_SMALL);
+	T_EXPECT(got_eof);
+	T_EXPECT(!got_error);
+	if (recv_len == PAYLOAD_SMALL) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 /* server actively opens a stream, sends a payload, then half-closes.
@@ -1749,8 +1922,9 @@ T_DECLARE_CASE(test_graceful_close_server_initiated)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char payload[64];
@@ -1759,13 +1933,15 @@ T_DECLARE_CASE(test_graceful_close_server_initiated)
 	/* Server opens and will send payload then FIN. */
 	struct mux_stream *s = mux_open_stream(fx.srv);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream(srv) returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	if (fx.n_srv_active_streams < MAX_ACCEPTED) {
 		fx.srv_active_streams[fx.n_srv_active_streams++] = ts;
@@ -1784,16 +1960,23 @@ T_DECLARE_CASE(test_graceful_close_server_initiated)
 	};
 	const int ret = wait_until(
 		&fx, EOF_TIMEOUT_MS / 1000.0, pred_echo_and_eof, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT(ts->got_eof);
-	T_EXPECT(!ts->got_error);
-	T_EXPECT_EQ(ts->recv_len, sizeof(payload));
-	if (ts->recv_len == sizeof(payload)) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, sizeof(payload)) == 0);
-	}
+	const bool got_eof = ts->got_eof;
+	const bool got_error = ts->got_error;
+	const size_t recv_len = ts->recv_len;
+	const bool payload_matches =
+		recv_len == sizeof(payload) &&
+		memcmp(ts->recv_buf, payload, sizeof(payload)) == 0;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(got_eof);
+	T_EXPECT(!got_error);
+	T_EXPECT_EQ(recv_len, sizeof(payload));
+	if (recv_len == sizeof(payload)) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 /* test_simultaneous_close: both ends half-close independently, exercising
@@ -1811,22 +1994,25 @@ T_DECLARE_CASE(test_simultaneous_close)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char *cli_payload = malloc(PAYLOAD_SMALL);
 	if (cli_payload == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(cli_payload, PAYLOAD_SMALL, 0x77);
 
 	unsigned char *srv_payload = malloc(PAYLOAD_SMALL);
 	if (srv_payload == NULL) {
-		T_FATAL("malloc failed");
 		free(cli_payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("malloc failed");
+		return;
 	}
 	fill_payload(srv_payload, PAYLOAD_SMALL, 0x88);
 
@@ -1838,17 +2024,19 @@ T_DECLARE_CASE(test_simultaneous_close)
 	/* Client opens a stream and sends cli_payload + FIN. */
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
-		T_FATAL("mux_open_stream returned NULL");
 		free(cli_payload);
 		free(srv_payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("mux_open_stream returned NULL");
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		T_FATAL("test_stream_new failed");
 		free(cli_payload);
 		free(srv_payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = cli_payload;
@@ -1861,10 +2049,11 @@ T_DECLARE_CASE(test_simultaneous_close)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_accepted_count,
 		    &acc_ctx) != 0) {
-		T_FATAL("server did not accept stream");
 		free(cli_payload);
 		free(srv_payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("server did not accept stream");
+		return;
 	}
 
 	/* Both sides independently receive data and a peer FIN. */
@@ -1873,29 +2062,39 @@ T_DECLARE_CASE(test_simultaneous_close)
 	const int ret = wait_until(
 		&fx, EOF_TIMEOUT_MS / 1000.0, pred_both_eof_no_error,
 		(void *)&ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT(ts->got_eof);
-	T_EXPECT(!ts->got_error);
-	T_EXPECT(srv_ts->got_eof);
-	T_EXPECT(!srv_ts->got_error);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_SMALL);
-	if (ts->recv_len == PAYLOAD_SMALL) {
-		T_EXPECT(memcmp(ts->recv_buf, srv_payload, PAYLOAD_SMALL) == 0);
-	}
-	T_EXPECT_EQ(srv_ts->recv_len, (size_t)PAYLOAD_SMALL);
-	if (srv_ts->recv_len == PAYLOAD_SMALL) {
-		T_EXPECT(
-			memcmp(srv_ts->recv_buf, cli_payload, PAYLOAD_SMALL) ==
-			0);
-	}
-	{
-		T_EXPECT_EQ(fx.cli->num_halfopen, (size_t)0);
-	}
+	const bool ts_got_eof = ts->got_eof;
+	const bool ts_got_error = ts->got_error;
+	const bool srv_got_eof = srv_ts->got_eof;
+	const bool srv_got_error = srv_ts->got_error;
+	const size_t ts_recv_len = ts->recv_len;
+	const bool ts_matches =
+		ts_recv_len == PAYLOAD_SMALL &&
+		memcmp(ts->recv_buf, srv_payload, PAYLOAD_SMALL) == 0;
+	const size_t srv_recv_len = srv_ts->recv_len;
+	const bool srv_matches =
+		srv_recv_len == PAYLOAD_SMALL &&
+		memcmp(srv_ts->recv_buf, cli_payload, PAYLOAD_SMALL) == 0;
+	const size_t cli_halfopen = fx.cli->num_halfopen;
 
 	free(cli_payload);
 	free(srv_payload);
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(ts_got_eof);
+	T_EXPECT(!ts_got_error);
+	T_EXPECT(srv_got_eof);
+	T_EXPECT(!srv_got_error);
+	T_EXPECT_EQ(ts_recv_len, (size_t)PAYLOAD_SMALL);
+	if (ts_recv_len == PAYLOAD_SMALL) {
+		T_EXPECT(ts_matches);
+	}
+	T_EXPECT_EQ(srv_recv_len, (size_t)PAYLOAD_SMALL);
+	if (srv_recv_len == PAYLOAD_SMALL) {
+		T_EXPECT(srv_matches);
+	}
+	T_EXPECT_EQ(cli_halfopen, (size_t)0);
 }
 
 /* server opens a stream and sends a payload; the client closes without
@@ -1913,8 +2112,9 @@ T_DECLARE_CASE(test_rst_from_client)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Client-side accepted streams will close on first readable event,
@@ -1928,13 +2128,15 @@ T_DECLARE_CASE(test_rst_from_client)
 	 * client-side receive buffer, triggering RST on close. */
 	struct mux_stream *s = mux_open_stream(fx.srv);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream(srv) returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	if (fx.n_srv_active_streams < MAX_ACCEPTED) {
 		fx.srv_active_streams[fx.n_srv_active_streams++] = ts;
@@ -1946,11 +2148,13 @@ T_DECLARE_CASE(test_rst_from_client)
 	/* Server should receive ECONNRESET (RST from client). */
 	const int ret =
 		wait_until(&fx, EOF_TIMEOUT_MS / 1000.0, pred_error, ts);
-	T_EXPECT(ret == 0);
-	T_EXPECT(ts->got_error);
+	const bool got_error = ts->got_error;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(got_error);
 }
 
 T_DECLARE_CASE(test_active_open_shutdown_before_synack)
@@ -1964,19 +2168,22 @@ T_DECLARE_CASE(test_active_open_shutdown_before_synack)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	mux_stream_io_start(fx.loop, &ts->w_io);
@@ -1989,10 +2196,9 @@ T_DECLARE_CASE(test_active_open_shutdown_before_synack)
 		.fx = &fx,
 		.min_accepted = 1,
 	};
-	T_EXPECT(
-		wait_until(
-			&fx, ECHO_TIMEOUT_MS / 1000.0, pred_accepted_count,
-			&accepted_ctx) == 0);
+	const int accepted_ret = wait_until(
+		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_accepted_count,
+		&accepted_ctx);
 
 	/* Direct I/O may complete the FIN/FIN exchange and close the stream
 	 * without delivering a final EOF callback.  The key regression signal
@@ -2001,18 +2207,106 @@ T_DECLARE_CASE(test_active_open_shutdown_before_synack)
 		.fx = &fx,
 		.ts = ts,
 	};
-	T_EXPECT(
-		wait_until(
-			&fx, EOF_TIMEOUT_MS / 1000.0,
-			pred_no_error_and_no_halfopen,
-			(void *)&stable_ctx) == 0);
-	T_EXPECT(!ts->got_error);
-	{
-		T_EXPECT_EQ(fx.cli->num_halfopen, (size_t)0);
+	const int stable_ret = wait_until(
+		&fx, EOF_TIMEOUT_MS / 1000.0, pred_no_error_and_no_halfopen,
+		(void *)&stable_ctx);
+	const bool no_error = !ts->got_error;
+	const size_t cli_halfopen = fx.cli->num_halfopen;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(accepted_ret == 0);
+	T_EXPECT(stable_ret == 0);
+	T_EXPECT(no_error);
+	T_EXPECT_EQ(cli_halfopen, (size_t)0);
+}
+
+/* mux_shutdown() drives a graceful session shutdown: the session defers into
+ * SESSION_CLOSING (not an immediate force-close), any open stream is torn down
+ * (its direct user watcher detached), and the transport is half-closed with a
+ * FIN -- the peer observes a clean EOF (and suspends for resume) rather than an
+ * abortive RST.  Exercised on the real two-session fixture.
+ *
+ * Note on .closed.clean: the shutdown initiator reaches CLOSED via the
+ * CLOSE_WAIT eof-wait (wire_wait_eof), which -- unlike the normal receive path
+ * -- never sets wire.rx_eof, so its own CLOSED payload reports clean == false.
+ * A resume-capable peer that reads the FIN suspends instead of closing, so a
+ * clean == true CLOSED is not reachable here; the clean/expired field contract
+ * is covered by the raw close cases (e.g. I-4). */
+T_DECLARE_CASE(test_shutdown_graceful)
+{
+	struct mux_test_fixture fx;
+	if (fixture_setup(&fx) != 0) {
+		T_FATAL("fixture_setup failed");
+		return;
 	}
 
-cleanup:
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
+		    &fx) != 0) {
+		fixture_teardown(&fx);
+		T_FATAL("sessions did not establish");
+		return;
+	}
+
+	struct mux_stream *s = mux_open_stream(fx.cli);
+	if (s == NULL) {
+		fixture_teardown(&fx);
+		T_FATAL("mux_open_stream returned NULL");
+		return;
+	}
+	struct test_stream *ts = test_stream_new(&fx, s);
+	if (ts == NULL) {
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
+	}
+	fx.cli_streams[fx.n_cli_streams++] = ts;
+	mux_stream_io_start(fx.loop, &ts->w_io);
+
+	/* Let the server accept the stream so the shutdown tears down a live,
+	 * two-sided stream rather than an unstarted one. */
+	struct accepted_count_ctx acc_ctx = { .fx = &fx, .min_accepted = 1 };
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_accepted_count,
+		    &acc_ctx) != 0) {
+		fixture_teardown(&fx);
+		T_FATAL("server did not accept the stream");
+		return;
+	}
+
+	/* Graceful shutdown: frees the open stream (detaching its direct user
+	 * watcher) and defers the transport close into SESSION_CLOSING. */
+	mux_shutdown(fx.cli);
+	/* The graceful path defers rather than force-closing: the session is now
+	 * CLOSING (still live), not already CLOSED. */
+	const bool post_shutdown_closing =
+		(fx.cli != NULL && fx.cli->state == SESSION_CLOSING);
+	/* sched_free_streams detached the stream from its user watcher. */
+	const bool stream_detached = (ts->w_io.stream == NULL);
+
+	const int ret = wait_until(
+		&fx, CLOSE_TIMEOUT_MS / 1000.0, pred_cli_closed, &fx);
+	const bool cli_closed = fx.cli_closed;
+	/* Half-closed, not reset: the peer read a clean FIN and suspended for
+	 * resume rather than seeing an abortive reset. */
+	const bool srv_suspended = fx.srv_suspended;
+	/* CLOSED payload fields (see the note above): the initiator reports a
+	 * non-clean close and this is not a resume-timeout expiry. */
+	const bool closed_clean = fx.ev_closed_clean;
+	const bool closed_expired = fx.ev_closed_expired;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(post_shutdown_closing);
+	T_EXPECT(ret == 0);
+	T_EXPECT(cli_closed);
+	T_EXPECT(stream_detached);
+	T_EXPECT(srv_suspended);
+	T_EXPECT(!closed_clean);
+	T_EXPECT(!closed_expired);
 }
 
 /* Raw interoperability test infrastructure: a minimal wire-level fixture where
@@ -2025,19 +2319,27 @@ struct raw_fixture {
 	bool srv_established;
 	bool srv_closed;
 	int raw_fd;
+
+	/* Last on_event() payload captured (event_data contract): ESTABLISHED
+	 * populates ev_connected_ns; CLOSED populates ev_closed_*. */
+	int_least64_t ev_connected_ns;
+	bool ev_closed_clean;
+	bool ev_closed_expired;
 };
 
 static void raw_on_event_cb(
 	void *data, struct mux_session *ss, enum mux_event event,
 	union mux_event_data edata)
 {
-	(void)edata;
 	struct raw_fixture *const fx = data;
 	switch (event) {
 	case MUX_EVENT_ESTABLISHED:
+		fx->ev_connected_ns = edata.connected.ns;
 		fx->srv_established = true;
 		break;
 	case MUX_EVENT_CLOSED:
+		fx->ev_closed_clean = edata.closed.clean;
+		fx->ev_closed_expired = edata.closed.expired;
 		fx->srv_closed = true;
 		fx->srv = NULL;
 		mux_close(ss);
@@ -2332,8 +2634,9 @@ T_DECLARE_CASE(test_interop_i1_non_syn_unknown_stream)
 		return;
 	}
 	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	const struct mux_header ack_hdr = {
@@ -2343,28 +2646,42 @@ T_DECLARE_CASE(test_interop_i1_non_syn_unknown_stream)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(fx.raw_fd, &ack_hdr));
+	const bool sent = raw_send_frame(fx.raw_fd, &ack_hdr);
 
-	int raw_fd = fx.raw_fd;
-	errno = 0;
-	const int wait_ret =
-		raw_wait_until(&fx, 0.1, raw_pred_data_available, &raw_fd);
-	if (wait_ret == 0) {
-		while (raw_pred_data_available(&raw_fd) > 0) {
-			struct mux_header resp;
-			T_EXPECT(raw_read_frame_header(fx.raw_fd, &resp));
-			T_EXPECT_EQ(resp.stream_id, (uint_least16_t)0);
-			T_EXPECT((resp.flags & MUX_FLAG_ACK) != 0);
-			T_EXPECT_EQ(resp.length, (uint_least16_t)0);
-			T_EXPECT(raw_discard_payload(fx.raw_fd, resp.length));
-		}
-	} else {
-		T_EXPECT_EQ(errno, ETIMEDOUT);
+	/* Deterministic drain: run the server loop until it makes no further
+	 * progress, instead of passing by a fixed wall-clock timeout. */
+	for (int i = 0; i < 16; i++) {
+		ev_run(fx.loop, EVRUN_NOWAIT);
 	}
-	T_EXPECT(raw_wait_until(&fx, 0.1, raw_pred_closed, &fx) != 0);
 
-cleanup:
+	/* A zero-length ACK for an unknown stream is an ignorable terminal
+	 * control frame: the session stays open and emits no stream-level
+	 * reply.  Any bytes present are session-level ACKs on stream 0. */
+	int raw_fd = fx.raw_fd;
+	bool responses_ok = true;
+	while (raw_pred_data_available(&raw_fd) > 0) {
+		struct mux_header resp;
+		if (!raw_read_frame_header(fx.raw_fd, &resp) ||
+		    resp.stream_id != 0 || (resp.flags & MUX_FLAG_ACK) == 0 ||
+		    resp.length != 0 ||
+		    !raw_discard_payload(fx.raw_fd, resp.length)) {
+			responses_ok = false;
+			break;
+		}
+	}
+	const bool srv_closed = fx.srv_closed;
+	/* ESTABLISHED payload from the hello exchange: positive setup latency. */
+	const int_least64_t connected_ns = fx.ev_connected_ns;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_fixture_teardown(&fx);
+
+	T_EXPECT(sent);
+	T_EXPECT(responses_ok);
+	/* Negative invariant asserted directly (no timeout): the session
+	 * stayed open. */
+	T_EXPECT(!srv_closed);
+	T_EXPECT(connected_ns > 0);
 }
 
 /* Stream-aware raw fixture: extends raw_fixture with an on_accept callback
@@ -2401,13 +2718,15 @@ static void raw_stream_on_event_cb(
 	void *data, struct mux_session *ss, enum mux_event event,
 	union mux_event_data edata)
 {
-	(void)edata;
 	struct raw_stream_fixture *const sfx = data;
 	switch (event) {
 	case MUX_EVENT_ESTABLISHED:
+		sfx->base.ev_connected_ns = edata.connected.ns;
 		sfx->base.srv_established = true;
 		break;
 	case MUX_EVENT_CLOSED:
+		sfx->base.ev_closed_clean = edata.closed.clean;
+		sfx->base.ev_closed_expired = edata.closed.expired;
 		sfx->base.srv_closed = true;
 		sfx->base.srv = NULL;
 		sfx->accepted_stream = NULL;
@@ -2475,8 +2794,9 @@ T_DECLARE_CASE(test_interop_i2_close_wait_push)
 		return;
 	}
 	if (!raw_do_hello(&sfx.base)) {
+		raw_stream_fixture_teardown(&sfx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	/* Open stream 1 from the raw client side. */
@@ -2487,16 +2807,16 @@ T_DECLARE_CASE(test_interop_i2_close_wait_push)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &syn_hdr));
+	const bool syn_sent = raw_send_frame(sfx.base.raw_fd, &syn_hdr);
 
 	/* Wait for SYN|ACK from server, then drain it (including any
 	 * piggybacked session-level headers packed in the same ctrl frame). */
 	int raw_fd = sfx.base.raw_fd;
-	T_EXPECT(
+	const bool synack_seen =
 		raw_wait_until(
-			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0);
-	T_EXPECT(raw_drain_frame(sfx.base.raw_fd));
-	T_EXPECT(raw_drain_available(sfx.base.raw_fd));
+			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	const bool synack_drained = raw_drain_frame(sfx.base.raw_fd);
+	const bool synack_extra_drained = raw_drain_available(sfx.base.raw_fd);
 
 	/* Half-close: send FIN to push the server-side stream into
 	 * STREAM_CLOSE_WAIT. */
@@ -2507,7 +2827,7 @@ T_DECLARE_CASE(test_interop_i2_close_wait_push)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &fin_hdr));
+	const bool fin_sent = raw_send_frame(sfx.base.raw_fd, &fin_hdr);
 
 	/* Drive the event loop so the FIN is processed before sending PUSH. */
 	ev_run(sfx.base.loop, EVRUN_NOWAIT);
@@ -2520,19 +2840,30 @@ T_DECLARE_CASE(test_interop_i2_close_wait_push)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &push_hdr));
+	const bool push_sent = raw_send_frame(sfx.base.raw_fd, &push_hdr);
 
 	/* Wait for and verify RST response. */
-	T_EXPECT(
+	const bool rst_seen =
 		raw_wait_until(
-			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0);
-	struct mux_header resp;
-	T_EXPECT(raw_read_frame_header(sfx.base.raw_fd, &resp));
-	T_EXPECT((resp.flags & MUX_FLAG_RST) != 0);
-	T_EXPECT_EQ(resp.stream_id, (uint_least16_t)1);
+			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	struct mux_header resp = { 0 };
+	const bool resp_read = raw_read_frame_header(sfx.base.raw_fd, &resp);
+	const bool resp_is_rst = (resp.flags & MUX_FLAG_RST) != 0;
+	const uint_least16_t resp_stream = resp.stream_id;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_stream_fixture_teardown(&sfx);
+
+	T_EXPECT(syn_sent);
+	T_EXPECT(synack_seen);
+	T_EXPECT(synack_drained);
+	T_EXPECT(synack_extra_drained);
+	T_EXPECT(fin_sent);
+	T_EXPECT(push_sent);
+	T_EXPECT(rst_seen);
+	T_EXPECT(resp_read);
+	T_EXPECT(resp_is_rst);
+	T_EXPECT_EQ(resp_stream, (uint_least16_t)1);
 }
 
 /* I-5: duplicate SYN for an existing stream.  After the SYN|ACK handshake the
@@ -2545,8 +2876,9 @@ T_DECLARE_CASE(test_interop_i5_duplicate_syn)
 		return;
 	}
 	if (!raw_do_hello(&sfx.base)) {
+		raw_stream_fixture_teardown(&sfx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	/* Open stream 1 from the raw client side. */
@@ -2557,30 +2889,40 @@ T_DECLARE_CASE(test_interop_i5_duplicate_syn)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &syn_hdr));
+	const bool syn_sent = raw_send_frame(sfx.base.raw_fd, &syn_hdr);
 
 	/* Wait for SYN|ACK, then drain it (including any piggybacked
 	 * session-level headers packed in the same ctrl frame). */
 	int raw_fd = sfx.base.raw_fd;
-	T_EXPECT(
+	const bool synack_seen =
 		raw_wait_until(
-			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0);
-	T_EXPECT(raw_drain_frame(sfx.base.raw_fd));
-	T_EXPECT(raw_drain_available(sfx.base.raw_fd));
+			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	const bool synack_drained = raw_drain_frame(sfx.base.raw_fd);
+	const bool synack_extra_drained = raw_drain_available(sfx.base.raw_fd);
 
 	/* Send a second SYN for the same stream ID — duplicate. */
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &syn_hdr));
+	const bool dup_syn_sent = raw_send_frame(sfx.base.raw_fd, &syn_hdr);
 
-	T_EXPECT(
+	const bool rst_seen =
 		raw_wait_until(
-			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0);
-	struct mux_header resp;
-	T_EXPECT(raw_read_frame_header(sfx.base.raw_fd, &resp));
-	T_EXPECT((resp.flags & MUX_FLAG_RST) != 0);
-	T_EXPECT_EQ(resp.stream_id, (uint_least16_t)1);
+			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	struct mux_header resp = { 0 };
+	const bool resp_read = raw_read_frame_header(sfx.base.raw_fd, &resp);
+	const bool resp_is_rst = (resp.flags & MUX_FLAG_RST) != 0;
+	const uint_least16_t resp_stream = resp.stream_id;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_stream_fixture_teardown(&sfx);
+
+	T_EXPECT(syn_sent);
+	T_EXPECT(synack_seen);
+	T_EXPECT(synack_drained);
+	T_EXPECT(synack_extra_drained);
+	T_EXPECT(dup_syn_sent);
+	T_EXPECT(rst_seen);
+	T_EXPECT(resp_read);
+	T_EXPECT(resp_is_rst);
+	T_EXPECT_EQ(resp_stream, (uint_least16_t)1);
 }
 
 /* I-3: ACK|FIN Extra carries a credit grant, not a status code.  A large
@@ -2596,28 +2938,32 @@ T_DECLARE_CASE(test_interop_i3_ack_fin_credit)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char *payload = malloc(PAYLOAD_LARGE);
 	if (payload == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0xA1);
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
-		T_FATAL("mux_open_stream returned NULL");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("mux_open_stream returned NULL");
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		T_FATAL("test_stream_new failed");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -2632,17 +2978,24 @@ T_DECLARE_CASE(test_interop_i3_ack_fin_credit)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_eof, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_LARGE);
-	T_EXPECT(ts->got_eof);
-	T_EXPECT(!ts->got_error);
-	if (ts->recv_len == PAYLOAD_LARGE) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0);
-	}
+	const size_t recv_len = ts->recv_len;
+	const bool got_eof = ts->got_eof;
+	const bool got_error = ts->got_error;
+	const bool payload_matches =
+		recv_len == PAYLOAD_LARGE &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0;
 
 	free(payload);
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_LARGE);
+	T_EXPECT(got_eof);
+	T_EXPECT(!got_error);
+	if (recv_len == PAYLOAD_LARGE) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 /* I-4: stream ID parity violation.  A client SYN with an even ID (2) breaks
@@ -2655,8 +3008,9 @@ T_DECLARE_CASE(test_interop_i4_stream_id_parity)
 		return;
 	}
 	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	const struct mux_header syn_hdr = {
@@ -2666,76 +3020,107 @@ T_DECLARE_CASE(test_interop_i4_stream_id_parity)
 		.stream_id = 2, /* even — invalid for a client-side stream */
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(fx.raw_fd, &syn_hdr));
+	const bool sent = raw_send_frame(fx.raw_fd, &syn_hdr);
 
 	/* Server must close the connection on stream ID parity violation. */
 	const int wait_ret = raw_wait_until(
 		&fx, CLOSE_TIMEOUT_MS / 1000.0, raw_pred_closed, &fx);
-	T_EXPECT(wait_ret == 0);
 
 	unsigned char dummy;
 	const ssize_t nr = recv(fx.raw_fd, &dummy, 1, 0);
-	T_EXPECT(nr == 0);
+	/* CLOSED payload: a protocol-error close is neither a clean peer FIN
+	 * nor a resume-timeout expiry. */
+	const bool closed_clean = fx.ev_closed_clean;
+	const bool closed_expired = fx.ev_closed_expired;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_fixture_teardown(&fx);
+
+	T_EXPECT(sent);
+	T_EXPECT(wait_ret == 0);
+	T_EXPECT(nr == 0);
+	T_EXPECT(!closed_clean);
+	T_EXPECT(!closed_expired);
 }
 
-/* I-6: fast-open credit boundary.  The client queues exactly
- * MUX_DEFAULT_SEND_WINDOW (16384) bytes before the loop runs, yielding one
- * SYN|PUSH of 16384 octets the receiver MUST accept without RST. */
+/* I-6: fast-open credit boundary.  With the frame payload cap raised to the
+ * full initial window, an active opener that queues MUX_DEFAULT_SEND_WINDOW
+ * (16384) bytes before the loop runs must emit exactly one SYN|PUSH of 16384
+ * octets -- not a max_frame_payload-split 16376+8.  Observed on the wire via
+ * the raw peer, not merely inferred from an echo round-trip. */
 T_DECLARE_CASE(test_interop_i6_fast_open_16384)
 {
-	struct mux_test_fixture fx;
-	if (fixture_setup(&fx) != 0) {
-		T_FATAL("fixture_setup failed");
+	struct raw_fixture fx;
+	if (raw_fixture_setup(&fx, &g_raw_callbacks, &fx) != 0) {
+		T_FATAL("raw_fixture_setup failed");
 		return;
 	}
-	if (wait_until(
-		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
-		    &fx) != 0) {
-		T_FATAL("sessions did not establish");
-		goto cleanup;
+	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
+		T_FATAL("hello exchange failed");
+		return;
+	}
+
+	/* Raise the frame payload cap to the full initial window so the queued
+	 * 16384 octets fit a single frame; the default 16376 would split them. */
+	fx.srv->max_payload = MUX_DEFAULT_SEND_WINDOW;
+
+	struct mux_stream *s = mux_open_stream(fx.srv);
+	if (s == NULL) {
+		raw_fixture_teardown(&fx);
+		T_FATAL("mux_open_stream returned NULL");
+		return;
 	}
 
 	unsigned char payload[MUX_DEFAULT_SEND_WINDOW];
 	fill_payload(payload, sizeof(payload), 0xB2);
-
-	struct mux_stream *s = mux_open_stream(fx.cli);
-	if (s == NULL) {
-		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
-	}
-	/* Queue the full credit window synchronously before the loop runs. */
+	/* Queue the full credit window before the loop runs: the scheduler must
+	 * fold SYN|PUSH and every octet into one frame. */
 	size_t len = sizeof(payload);
-	const int sr = mux_stream_send(s, payload, &len);
-	T_EXPECT(sr == 0);
-	T_EXPECT_EQ(len, sizeof(payload));
+	const bool queued = mux_stream_send(s, payload, &len) == 0 &&
+			    len == sizeof(payload);
 
-	struct test_stream *ts = test_stream_new(&fx, s);
-	if (ts == NULL) {
-		T_FATAL("test_stream_new failed");
-		goto cleanup;
-	}
-	fx.cli_streams[fx.n_cli_streams++] = ts;
-	mux_stream_io_start(fx.loop, &ts->w_io);
-
-	struct echo_ctx ctx = {
-		.ts = ts,
-		.expected = payload,
-		.expected_len = sizeof(payload),
-	};
-	const int ret = wait_until(
-		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT_EQ(ts->recv_len, sizeof(payload));
-	T_EXPECT(!ts->got_error);
-	if (ts->recv_len == sizeof(payload)) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, sizeof(payload)) == 0);
+	/* Flush the queued SYN|PUSH onto the wire (16 KiB fits the socketpair
+	 * send buffer in one write), then read it back from the raw side. */
+	for (int i = 0; i < 16; i++) {
+		ev_run(fx.loop, EVRUN_NOWAIT);
 	}
 
-cleanup:
-	fixture_teardown(&fx);
+	int raw_fd = fx.raw_fd;
+	struct mux_header syn = { 0 };
+	bool syn_read = false;
+	bool payload_drained = false;
+	/* Skip any piggybacked session-level control frames (stream 0) and stop
+	 * at the stream's opening SYN. */
+	for (int i = 0; i < 8 && raw_pred_data_available(&raw_fd) > 0; i++) {
+		struct mux_header hdr;
+		if (!raw_read_frame_header(fx.raw_fd, &hdr)) {
+			break;
+		}
+		if ((hdr.flags & MUX_FLAG_SYN) != 0) {
+			syn = hdr;
+			syn_read = true;
+			payload_drained =
+				raw_discard_payload(fx.raw_fd, hdr.length);
+			break;
+		}
+		if (!raw_discard_payload(fx.raw_fd, hdr.length)) {
+			break;
+		}
+	}
+	const uint_least8_t syn_flags = syn.flags;
+	const uint_least16_t syn_len = syn.length;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
+	raw_fixture_teardown(&fx);
+
+	T_EXPECT(queued);
+	T_EXPECT(syn_read);
+	T_EXPECT((syn_flags & MUX_FLAG_SYN) != 0);
+	T_EXPECT((syn_flags & MUX_FLAG_PUSH) != 0);
+	/* The whole 16384-octet payload rode one SYN|PUSH, not a split 16376. */
+	T_EXPECT_EQ(syn_len, (uint_least16_t)MUX_DEFAULT_SEND_WINDOW);
+	T_EXPECT(payload_drained);
 }
 
 /* I-7: out-of-order FIN then data.  After the client FIN the server stream is
@@ -2748,8 +3133,9 @@ T_DECLARE_CASE(test_interop_i7_fin_then_data)
 		return;
 	}
 	if (!raw_do_hello(&sfx.base)) {
+		raw_stream_fixture_teardown(&sfx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	const struct mux_header syn_hdr = {
@@ -2759,14 +3145,14 @@ T_DECLARE_CASE(test_interop_i7_fin_then_data)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &syn_hdr));
+	const bool syn_sent = raw_send_frame(sfx.base.raw_fd, &syn_hdr);
 
 	int raw_fd = sfx.base.raw_fd;
-	T_EXPECT(
+	const bool synack_seen =
 		raw_wait_until(
-			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0);
-	T_EXPECT(raw_drain_frame(sfx.base.raw_fd));
-	T_EXPECT(raw_drain_available(sfx.base.raw_fd));
+			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	const bool synack_drained = raw_drain_frame(sfx.base.raw_fd);
+	const bool synack_extra_drained = raw_drain_available(sfx.base.raw_fd);
 
 	const struct mux_header fin_hdr = {
 		.version = MUX_PROTOCOL_VERSION,
@@ -2775,7 +3161,7 @@ T_DECLARE_CASE(test_interop_i7_fin_then_data)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &fin_hdr));
+	const bool fin_sent = raw_send_frame(sfx.base.raw_fd, &fin_hdr);
 
 	ev_run(sfx.base.loop, EVRUN_NOWAIT);
 
@@ -2787,18 +3173,30 @@ T_DECLARE_CASE(test_interop_i7_fin_then_data)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame_payload(sfx.base.raw_fd, &push_hdr, payload));
+	const bool push_sent =
+		raw_send_frame_payload(sfx.base.raw_fd, &push_hdr, payload);
 
-	T_EXPECT(
+	const bool rst_seen =
 		raw_wait_until(
-			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0);
-	struct mux_header resp;
-	T_EXPECT(raw_read_frame_header(sfx.base.raw_fd, &resp));
-	T_EXPECT((resp.flags & MUX_FLAG_RST) != 0);
-	T_EXPECT_EQ(resp.stream_id, (uint_least16_t)1);
+			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	struct mux_header resp = { 0 };
+	const bool resp_read = raw_read_frame_header(sfx.base.raw_fd, &resp);
+	const bool resp_is_rst = (resp.flags & MUX_FLAG_RST) != 0;
+	const uint_least16_t resp_stream = resp.stream_id;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_stream_fixture_teardown(&sfx);
+
+	T_EXPECT(syn_sent);
+	T_EXPECT(synack_seen);
+	T_EXPECT(synack_drained);
+	T_EXPECT(synack_extra_drained);
+	T_EXPECT(fin_sent);
+	T_EXPECT(push_sent);
+	T_EXPECT(rst_seen);
+	T_EXPECT(resp_read);
+	T_EXPECT(resp_is_rst);
+	T_EXPECT_EQ(resp_stream, (uint_least16_t)1);
 }
 
 /* I-8: out-of-order RST.  After the client RSTs an established stream the
@@ -2812,8 +3210,9 @@ T_DECLARE_CASE(test_interop_i8_rst_then_non_rst)
 		return;
 	}
 	if (!raw_do_hello(&sfx.base)) {
+		raw_stream_fixture_teardown(&sfx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	const struct mux_header syn_hdr = {
@@ -2823,14 +3222,14 @@ T_DECLARE_CASE(test_interop_i8_rst_then_non_rst)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &syn_hdr));
+	const bool syn_sent = raw_send_frame(sfx.base.raw_fd, &syn_hdr);
 
 	int raw_fd = sfx.base.raw_fd;
-	T_EXPECT(
+	const bool synack_seen =
 		raw_wait_until(
-			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0);
-	T_EXPECT(raw_drain_frame(sfx.base.raw_fd));
-	T_EXPECT(raw_drain_available(sfx.base.raw_fd));
+			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	const bool synack_drained = raw_drain_frame(sfx.base.raw_fd);
+	const bool synack_extra_drained = raw_drain_available(sfx.base.raw_fd);
 
 	const struct mux_header rst_hdr = {
 		.version = MUX_PROTOCOL_VERSION,
@@ -2839,16 +3238,18 @@ T_DECLARE_CASE(test_interop_i8_rst_then_non_rst)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(sfx.base.raw_fd, &rst_hdr));
+	const bool rst_sent = raw_send_frame(sfx.base.raw_fd, &rst_hdr);
 
-	T_EXPECT(
-		raw_wait_until(&sfx.base, 0.1, raw_pred_closed, &sfx.base) !=
-		0);
-	/* Drain any session-level ACKs emitted during the wait; verifies that
-	 * the server does not proactively send a stream-level reply to the
-	 * RST. */
-	T_EXPECT(raw_drain_available(sfx.base.raw_fd));
-	T_EXPECT(raw_pred_data_available(&raw_fd) == 0);
+	/* Deterministically process the RST instead of passing by a timeout:
+	 * run the server loop until it makes no further progress. */
+	for (int i = 0; i < 16; i++) {
+		ev_run(sfx.base.loop, EVRUN_NOWAIT);
+	}
+	/* The server retires the stream but sends no proactive stream-level
+	 * reply to the RST; only session-level ACKs may appear. */
+	const bool acks_drained = raw_drain_available(sfx.base.raw_fd);
+	const bool no_reply_after_rst = raw_pred_data_available(&raw_fd) == 0;
+	const bool srv_open_after_rst = !sfx.base.srv_closed;
 
 	static const unsigned char payload[] = { 0x52 };
 	const struct mux_header push_hdr = {
@@ -2858,22 +3259,44 @@ T_DECLARE_CASE(test_interop_i8_rst_then_non_rst)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame_payload(sfx.base.raw_fd, &push_hdr, payload));
+	const bool push_sent =
+		raw_send_frame_payload(sfx.base.raw_fd, &push_hdr, payload);
 
-	T_EXPECT(
+	const bool rst_reply_seen =
 		raw_wait_until(
-			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0);
-	struct mux_header resp;
-	T_EXPECT(raw_read_frame_header(sfx.base.raw_fd, &resp));
-	T_EXPECT((resp.flags & MUX_FLAG_RST) != 0);
-	T_EXPECT_EQ(resp.stream_id, (uint_least16_t)1);
-	T_EXPECT(raw_drain_available(sfx.base.raw_fd));
-	T_EXPECT(
-		raw_wait_until(&sfx.base, 0.1, raw_pred_closed, &sfx.base) !=
-		0);
+			&sfx.base, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	struct mux_header resp = { 0 };
+	const bool rst_reply_read =
+		raw_read_frame_header(sfx.base.raw_fd, &resp);
+	const bool rst_reply_is_rst = (resp.flags & MUX_FLAG_RST) != 0;
+	const uint_least16_t rst_reply_stream = resp.stream_id;
+	const bool post_reply_drained = raw_drain_available(sfx.base.raw_fd);
 
-cleanup:
+	/* Again deterministic, not timeout-gated: the session must survive the
+	 * non-RST frame on the retired id. */
+	for (int i = 0; i < 16; i++) {
+		ev_run(sfx.base.loop, EVRUN_NOWAIT);
+	}
+	const bool srv_open_after_reply = !sfx.base.srv_closed;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_stream_fixture_teardown(&sfx);
+
+	T_EXPECT(syn_sent);
+	T_EXPECT(synack_seen);
+	T_EXPECT(synack_drained);
+	T_EXPECT(synack_extra_drained);
+	T_EXPECT(rst_sent);
+	T_EXPECT(acks_drained);
+	T_EXPECT(no_reply_after_rst);
+	T_EXPECT(srv_open_after_rst);
+	T_EXPECT(push_sent);
+	T_EXPECT(rst_reply_seen);
+	T_EXPECT(rst_reply_read);
+	T_EXPECT(rst_reply_is_rst);
+	T_EXPECT_EQ(rst_reply_stream, (uint_least16_t)1);
+	T_EXPECT(post_reply_drained);
+	T_EXPECT(srv_open_after_reply);
 }
 
 /* I-9: Reserved flag bit set — receiver MUST close the connection.
@@ -2887,8 +3310,9 @@ T_DECLARE_CASE(test_interop_i9_reserved_flag)
 		return;
 	}
 	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	const struct mux_header bad_hdr = {
@@ -2898,20 +3322,22 @@ T_DECLARE_CASE(test_interop_i9_reserved_flag)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(fx.raw_fd, &bad_hdr));
+	const bool bad_sent = raw_send_frame(fx.raw_fd, &bad_hdr);
 
 	/* Drive the loop until the server closes its side of the connection. */
 	const int wait_ret = raw_wait_until(
 		&fx, CLOSE_TIMEOUT_MS / 1000.0, raw_pred_closed, &fx);
-	T_EXPECT(wait_ret == 0);
 
 	/* Connection must be closed; next blocking recv returns EOF. */
 	unsigned char dummy;
 	const ssize_t nr = recv(fx.raw_fd, &dummy, 1, 0);
-	T_EXPECT(nr == 0);
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_fixture_teardown(&fx);
+
+	T_EXPECT(bad_sent);
+	T_EXPECT(wait_ret == 0);
+	T_EXPECT(nr == 0);
 }
 
 /* I-10: Hello version parameter mismatch — server MUST close the connection.
@@ -2938,19 +3364,24 @@ T_DECLARE_CASE(test_interop_i10_hello_version_mismatch)
 	};
 	unsigned char hdr_buf[MUX_FRAME_HEADER_SIZE];
 	mux_write_header(hdr_buf, &bad_hdr);
-	T_EXPECT(raw_write_all(fx.raw_fd, hdr_buf, sizeof(hdr_buf)));
-	T_EXPECT(raw_write_all(fx.raw_fd, bad_json, json_len));
+	const bool hdr_written =
+		raw_write_all(fx.raw_fd, hdr_buf, sizeof(hdr_buf));
+	const bool json_written = raw_write_all(fx.raw_fd, bad_json, json_len);
 
 	/* Server must close the connection on version mismatch. */
 	const int wait_ret = raw_wait_until(
 		&fx, CLOSE_TIMEOUT_MS / 1000.0, raw_pred_closed, &fx);
-	T_EXPECT(wait_ret == 0);
 
 	unsigned char dummy;
 	const ssize_t nr = recv(fx.raw_fd, &dummy, 1, 0);
-	T_EXPECT(nr == 0);
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_fixture_teardown(&fx);
+
+	T_EXPECT(hdr_written);
+	T_EXPECT(json_written);
+	T_EXPECT(wait_ret == 0);
+	T_EXPECT(nr == 0);
 }
 
 /* I-11: PING/PONG echo.  The raw side sends a stream-0 PING with an
@@ -2964,8 +3395,9 @@ T_DECLARE_CASE(test_interop_i11_ping_pong_echo)
 		return;
 	}
 	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	static const unsigned char ping_payload[] = {
@@ -2978,27 +3410,40 @@ T_DECLARE_CASE(test_interop_i11_ping_pong_echo)
 		.stream_id = STREAMID_CTRL,
 		.extra = MUX_CTRL_PING,
 	};
-	T_EXPECT(raw_send_frame_payload(fx.raw_fd, &ping_hdr, ping_payload));
+	const bool ping_sent =
+		raw_send_frame_payload(fx.raw_fd, &ping_hdr, ping_payload);
 
 	int raw_fd = fx.raw_fd;
-	T_EXPECT(
-		raw_wait_until(&fx, 1.0, raw_pred_data_available, &raw_fd) ==
-		0);
+	const bool pong_seen =
+		raw_wait_until(&fx, 1.0, raw_pred_data_available, &raw_fd) == 0;
 
-	struct mux_header resp;
-	T_EXPECT(raw_read_frame_header(fx.raw_fd, &resp));
-	T_EXPECT_EQ(resp.version, (uint_fast8_t)MUX_PROTOCOL_VERSION);
-	T_EXPECT_EQ(resp.flags, (uint_fast8_t)0);
-	T_EXPECT_EQ(resp.stream_id, (uint_least16_t)STREAMID_CTRL);
-	T_EXPECT_EQ(resp.extra, (uint_least16_t)MUX_CTRL_PONG);
-	T_EXPECT_EQ(resp.length, (uint_least16_t)sizeof(ping_payload));
-
+	struct mux_header resp = { 0 };
+	const bool pong_read = raw_read_frame_header(fx.raw_fd, &resp);
+	const uint_least8_t pong_version = resp.version;
+	const uint_least8_t pong_flags = resp.flags;
+	const uint_least16_t pong_stream = resp.stream_id;
+	const uint_least16_t pong_extra = resp.extra;
+	const uint_least16_t pong_len = resp.length;
 	unsigned char pong_payload[sizeof(ping_payload)];
-	T_EXPECT(raw_read_all(fx.raw_fd, pong_payload, sizeof(pong_payload)));
-	T_EXPECT(memcmp(pong_payload, ping_payload, sizeof(ping_payload)) == 0);
+	const bool pong_body_read =
+		raw_read_all(fx.raw_fd, pong_payload, sizeof(pong_payload));
+	const bool pong_matches =
+		pong_body_read &&
+		memcmp(pong_payload, ping_payload, sizeof(ping_payload)) == 0;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_fixture_teardown(&fx);
+
+	T_EXPECT(ping_sent);
+	T_EXPECT(pong_seen);
+	T_EXPECT(pong_read);
+	T_EXPECT_EQ(pong_version, (uint_fast8_t)MUX_PROTOCOL_VERSION);
+	T_EXPECT_EQ(pong_flags, (uint_fast8_t)0);
+	T_EXPECT_EQ(pong_stream, (uint_least16_t)STREAMID_CTRL);
+	T_EXPECT_EQ(pong_extra, (uint_least16_t)MUX_CTRL_PONG);
+	T_EXPECT_EQ(pong_len, (uint_least16_t)sizeof(ping_payload));
+	T_EXPECT(pong_body_read);
+	T_EXPECT(pong_matches);
 }
 
 /* I-12: unknown keepalive subtype.  A reserved stream-0 subtype is silently
@@ -3011,8 +3456,9 @@ T_DECLARE_CASE(test_interop_i12_unknown_keepalive_subtype)
 		return;
 	}
 	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	const struct mux_header unknown_hdr = {
@@ -3022,11 +3468,16 @@ T_DECLARE_CASE(test_interop_i12_unknown_keepalive_subtype)
 		.stream_id = STREAMID_CTRL,
 		.extra = 0x0003u,
 	};
-	T_EXPECT(raw_send_frame(fx.raw_fd, &unknown_hdr));
-	T_EXPECT(raw_wait_until(&fx, 0.1, raw_pred_closed, &fx) != 0);
+	const bool unknown_sent = raw_send_frame(fx.raw_fd, &unknown_hdr);
 
+	/* The reserved subtype must be silently discarded, so drive the loop to
+	 * quiescence and assert the negative directly instead of timing out. */
+	for (int i = 0; i < 16; i++) {
+		ev_run(fx.loop, EVRUN_NOWAIT);
+	}
 	int raw_fd = fx.raw_fd;
-	T_EXPECT(raw_pred_data_available(&raw_fd) == 0);
+	const bool no_reply_to_unknown = raw_pred_data_available(&raw_fd) == 0;
+	const bool srv_open_after_unknown = !fx.srv_closed;
 
 	static const unsigned char ping_payload[] = {
 		0x91, 0x82, 0x73, 0x64, 0x55,
@@ -3038,26 +3489,41 @@ T_DECLARE_CASE(test_interop_i12_unknown_keepalive_subtype)
 		.stream_id = STREAMID_CTRL,
 		.extra = MUX_CTRL_PING,
 	};
-	T_EXPECT(raw_send_frame_payload(fx.raw_fd, &ping_hdr, ping_payload));
+	const bool ping_sent =
+		raw_send_frame_payload(fx.raw_fd, &ping_hdr, ping_payload);
 
-	T_EXPECT(
-		raw_wait_until(&fx, 1.0, raw_pred_data_available, &raw_fd) ==
-		0);
-
-	struct mux_header resp;
-	T_EXPECT(raw_read_frame_header(fx.raw_fd, &resp));
-	T_EXPECT_EQ(resp.version, (uint_fast8_t)MUX_PROTOCOL_VERSION);
-	T_EXPECT_EQ(resp.flags, (uint_fast8_t)0);
-	T_EXPECT_EQ(resp.stream_id, (uint_least16_t)STREAMID_CTRL);
-	T_EXPECT_EQ(resp.extra, (uint_least16_t)MUX_CTRL_PONG);
-	T_EXPECT_EQ(resp.length, (uint_least16_t)sizeof(ping_payload));
-
+	const bool pong_seen =
+		raw_wait_until(&fx, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	struct mux_header resp = { 0 };
+	const bool pong_read = raw_read_frame_header(fx.raw_fd, &resp);
+	const uint_least8_t pong_version = resp.version;
+	const uint_least8_t pong_flags = resp.flags;
+	const uint_least16_t pong_stream = resp.stream_id;
+	const uint_least16_t pong_extra = resp.extra;
+	const uint_least16_t pong_len = resp.length;
 	unsigned char pong_payload[sizeof(ping_payload)];
-	T_EXPECT(raw_read_all(fx.raw_fd, pong_payload, sizeof(pong_payload)));
-	T_EXPECT(memcmp(pong_payload, ping_payload, sizeof(ping_payload)) == 0);
+	const bool pong_body_read =
+		raw_read_all(fx.raw_fd, pong_payload, sizeof(pong_payload));
+	const bool pong_matches =
+		pong_body_read &&
+		memcmp(pong_payload, ping_payload, sizeof(ping_payload)) == 0;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_fixture_teardown(&fx);
+
+	T_EXPECT(unknown_sent);
+	T_EXPECT(no_reply_to_unknown);
+	T_EXPECT(srv_open_after_unknown);
+	T_EXPECT(ping_sent);
+	T_EXPECT(pong_seen);
+	T_EXPECT(pong_read);
+	T_EXPECT_EQ(pong_version, (uint_fast8_t)MUX_PROTOCOL_VERSION);
+	T_EXPECT_EQ(pong_flags, (uint_fast8_t)0);
+	T_EXPECT_EQ(pong_stream, (uint_least16_t)STREAMID_CTRL);
+	T_EXPECT_EQ(pong_extra, (uint_least16_t)MUX_CTRL_PONG);
+	T_EXPECT_EQ(pong_len, (uint_least16_t)sizeof(ping_payload));
+	T_EXPECT(pong_body_read);
+	T_EXPECT(pong_matches);
 }
 
 /* I-13: invalid opening SYN flags.  SYN|ACK as the first frame for an unknown
@@ -3071,8 +3537,9 @@ T_DECLARE_CASE(test_interop_i13_invalid_syn_flags)
 		return;
 	}
 	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	const struct mux_header bad_hdr = {
@@ -3083,19 +3550,21 @@ T_DECLARE_CASE(test_interop_i13_invalid_syn_flags)
 		.stream_id = 1,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame(fx.raw_fd, &bad_hdr));
+	const bool bad_sent = raw_send_frame(fx.raw_fd, &bad_hdr);
 
 	/* Server must close the connection, not reply with RST. */
 	const int wait_ret = raw_wait_until(
 		&fx, CLOSE_TIMEOUT_MS / 1000.0, raw_pred_closed, &fx);
-	T_EXPECT(wait_ret == 0);
 
 	unsigned char dummy;
 	const ssize_t nr = recv(fx.raw_fd, &dummy, 1, 0);
-	T_EXPECT(nr == 0);
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_fixture_teardown(&fx);
+
+	T_EXPECT(bad_sent);
+	T_EXPECT(wait_ret == 0);
+	T_EXPECT(nr == 0);
 }
 
 /* I-14: reserved stream-0 frame type (spec §4.1).  A stream-0 frame
@@ -3109,8 +3578,9 @@ T_DECLARE_CASE(test_interop_i14_reserved_stream0_frame)
 		return;
 	}
 	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
 		T_FATAL("hello exchange failed");
-		goto cleanup;
+		return;
 	}
 
 	/* PUSH on stream 0: non-zero, non-ACK flags -> reserved frame type. */
@@ -3127,12 +3597,17 @@ T_DECLARE_CASE(test_interop_i14_reserved_stream0_frame)
 		.stream_id = STREAMID_CTRL,
 		.extra = 0,
 	};
-	T_EXPECT(raw_send_frame_payload(
-		fx.raw_fd, &reserved_hdr, reserved_payload));
-	T_EXPECT(raw_wait_until(&fx, 0.1, raw_pred_closed, &fx) != 0);
+	const bool reserved_sent = raw_send_frame_payload(
+		fx.raw_fd, &reserved_hdr, reserved_payload);
 
+	/* The reserved stream-0 frame must be silently discarded, so drive the
+	 * loop to quiescence and assert the negative directly, not by timeout. */
+	for (int i = 0; i < 16; i++) {
+		ev_run(fx.loop, EVRUN_NOWAIT);
+	}
 	int raw_fd = fx.raw_fd;
-	T_EXPECT(raw_pred_data_available(&raw_fd) == 0);
+	const bool no_reply_to_reserved = raw_pred_data_available(&raw_fd) == 0;
+	const bool srv_open_after_reserved = !fx.srv_closed;
 
 	/* The session must still answer a valid PING with a matching PONG. */
 	static const unsigned char ping_payload[] = {
@@ -3145,26 +3620,41 @@ T_DECLARE_CASE(test_interop_i14_reserved_stream0_frame)
 		.stream_id = STREAMID_CTRL,
 		.extra = MUX_CTRL_PING,
 	};
-	T_EXPECT(raw_send_frame_payload(fx.raw_fd, &ping_hdr, ping_payload));
+	const bool ping_sent =
+		raw_send_frame_payload(fx.raw_fd, &ping_hdr, ping_payload);
 
-	T_EXPECT(
-		raw_wait_until(&fx, 1.0, raw_pred_data_available, &raw_fd) ==
-		0);
-
-	struct mux_header resp;
-	T_EXPECT(raw_read_frame_header(fx.raw_fd, &resp));
-	T_EXPECT_EQ(resp.version, (uint_fast8_t)MUX_PROTOCOL_VERSION);
-	T_EXPECT_EQ(resp.flags, (uint_fast8_t)0);
-	T_EXPECT_EQ(resp.stream_id, (uint_least16_t)STREAMID_CTRL);
-	T_EXPECT_EQ(resp.extra, (uint_least16_t)MUX_CTRL_PONG);
-	T_EXPECT_EQ(resp.length, (uint_least16_t)sizeof(ping_payload));
-
+	const bool pong_seen =
+		raw_wait_until(&fx, 1.0, raw_pred_data_available, &raw_fd) == 0;
+	struct mux_header resp = { 0 };
+	const bool pong_read = raw_read_frame_header(fx.raw_fd, &resp);
+	const uint_least8_t pong_version = resp.version;
+	const uint_least8_t pong_flags = resp.flags;
+	const uint_least16_t pong_stream = resp.stream_id;
+	const uint_least16_t pong_extra = resp.extra;
+	const uint_least16_t pong_len = resp.length;
 	unsigned char pong_payload[sizeof(ping_payload)];
-	T_EXPECT(raw_read_all(fx.raw_fd, pong_payload, sizeof(pong_payload)));
-	T_EXPECT(memcmp(pong_payload, ping_payload, sizeof(ping_payload)) == 0);
+	const bool pong_body_read =
+		raw_read_all(fx.raw_fd, pong_payload, sizeof(pong_payload));
+	const bool pong_matches =
+		pong_body_read &&
+		memcmp(pong_payload, ping_payload, sizeof(ping_payload)) == 0;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	raw_fixture_teardown(&fx);
+
+	T_EXPECT(reserved_sent);
+	T_EXPECT(no_reply_to_reserved);
+	T_EXPECT(srv_open_after_reserved);
+	T_EXPECT(ping_sent);
+	T_EXPECT(pong_seen);
+	T_EXPECT(pong_read);
+	T_EXPECT_EQ(pong_version, (uint_fast8_t)MUX_PROTOCOL_VERSION);
+	T_EXPECT_EQ(pong_flags, (uint_fast8_t)0);
+	T_EXPECT_EQ(pong_stream, (uint_least16_t)STREAMID_CTRL);
+	T_EXPECT_EQ(pong_extra, (uint_least16_t)MUX_CTRL_PONG);
+	T_EXPECT_EQ(pong_len, (uint_least16_t)sizeof(ping_payload));
+	T_EXPECT(pong_body_read);
+	T_EXPECT(pong_matches);
 }
 
 /* when idle_timeout is configured on the
@@ -3188,8 +3678,9 @@ T_DECLARE_CASE(test_no_reconnect_with_idle_timeout)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Close the server session, causing a clean TCP close.  The client
@@ -3200,13 +3691,17 @@ T_DECLARE_CASE(test_no_reconnect_with_idle_timeout)
 
 	const int ret = wait_until(
 		&fx, CLOSE_TIMEOUT_MS / 1000.0, pred_cli_closed, &fx);
-	T_EXPECT(ret == 0);
-	T_EXPECT(fx.cli_closed);
-	/* cli is set to NULL by on_closed_cb; verify reconnect was not armed. */
-	T_EXPECT(fx.cli == NULL);
+	const bool cli_closed = fx.cli_closed;
+	/* cli is set to NULL by the CLOSED handler; verify reconnect was not
+	 * armed.  Capture before teardown, which frees the fixture. */
+	const bool cli_null = (fx.cli == NULL);
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(cli_closed);
+	T_EXPECT(cli_null);
 }
 
 /* fx_break_transport: RST the TCP connection so both sessions suspend.
@@ -3247,18 +3742,30 @@ static void test_session_set_write_only(struct mux_session *restrict ss)
 	ev_io_start(ss->loop, &ss->w_socket);
 }
 
-static void test_pump_unacked_no_wait(struct mux_test_fixture *restrict fx)
+static void test_pump_unacked_no_wait(
+	struct mux_test_fixture *restrict fx, const bool require_srv)
 {
 	test_session_set_write_only(fx->cli);
 	test_session_set_write_only(fx->srv);
 
-	for (int i = 0; i < 32; i++) {
+	/* Pump non-blocking until the client (and, when require_srv, the server)
+	 * has buffered unacked frames. Each caller asserts only the side it
+	 * genuinely populated: test_resume_retransmit opens a client and a server
+	 * stream and needs both buffered, but test_resume_stream_unacked_retransmit
+	 * opens only a client stream -- coupling it to srv->unacked.frames > 0 would
+	 * spuriously abort whenever the echo server has already flushed and had its
+	 * frames ACKed before both sides go write-only. The iteration bound only
+	 * guards against a hang (a handful of EV_WRITE-only runs suffices); the
+	 * postcondition is asserted below so a never-satisfied precondition fails
+	 * loudly here instead of as a confusing far-away failure (or vacuous pass)
+	 * in the caller. */
+	bool ready = false;
+	for (int i = 0; i < 32 && !ready; i++) {
 		ev_run(fx->loop, EVRUN_NOWAIT);
-		if (fx->cli->unacked.frames > 0 &&
-		    fx->srv->unacked.frames > 0) {
-			break;
-		}
+		ready = fx->cli->unacked.frames > 0 &&
+			(!require_srv || fx->srv->unacked.frames > 0);
 	}
+	T_CHECK(ready);
 
 	session_notify(fx->cli);
 	session_notify(fx->srv);
@@ -3279,24 +3786,38 @@ T_DECLARE_CASE(test_resume_idle)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	fx_break_transport(&fx);
 
 	const int ret =
 		wait_until(&fx, RESUME_TIMEOUT_MS / 1000.0, pred_resumed, &fx);
-	T_EXPECT(ret == 0);
-	T_EXPECT(fx.cli_suspended);
-	T_EXPECT(fx.srv_suspended);
-	T_EXPECT(fx.cli_resumed);
-	T_EXPECT(fx.srv_resumed);
-	T_EXPECT_EQ(mux_state(fx.cli), MUX_STATE_ESTABLISHED);
-	T_EXPECT_EQ(mux_state(fx.srv), MUX_STATE_ESTABLISHED);
+	const bool cli_suspended = fx.cli_suspended;
+	const bool srv_suspended = fx.srv_suspended;
+	const bool cli_resumed = fx.cli_resumed;
+	const bool srv_resumed = fx.srv_resumed;
+	const enum mux_state cli_state = mux_state(fx.cli);
+	const enum mux_state srv_state = mux_state(fx.srv);
+	/* Leaving ESTABLISHED on the break emits LOST; the RESUMED payload
+	 * carries the reconnect setup latency (strictly positive). */
+	const bool cli_lost = fx.cli_lost;
+	const int_least64_t connected_ns = fx.ev_connected_ns;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(cli_suspended);
+	T_EXPECT(srv_suspended);
+	T_EXPECT(cli_resumed);
+	T_EXPECT(srv_resumed);
+	T_EXPECT_EQ(cli_state, MUX_STATE_ESTABLISHED);
+	T_EXPECT_EQ(srv_state, MUX_STATE_ESTABLISHED);
+	T_EXPECT(cli_lost);
+	T_EXPECT(connected_ns > 0);
 }
 
 /* transport break with a stream in flight.
@@ -3322,34 +3843,49 @@ T_DECLARE_CASE(test_resume_retransmit)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		free(cli_payload);
+		free(srv_payload);
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	cli_payload = malloc(payload_len);
 	if (cli_payload == NULL) {
+		free(cli_payload);
+		free(srv_payload);
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(cli_payload, payload_len, 0x7B);
 
 	srv_payload = malloc(payload_len);
 	if (srv_payload == NULL) {
+		free(cli_payload);
+		free(srv_payload);
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(srv_payload, payload_len, 0x9C);
 
 	{
 		struct mux_stream *cli_s = mux_open_stream(fx.cli);
 		if (cli_s == NULL) {
+			free(cli_payload);
+			free(srv_payload);
+			fixture_teardown(&fx);
 			T_FATAL("mux_open_stream returned NULL");
-			goto cleanup;
+			return;
 		}
 		cli_ts = test_stream_new(&fx, cli_s);
 		if (cli_ts == NULL) {
+			free(cli_payload);
+			free(srv_payload);
+			fixture_teardown(&fx);
 			T_FATAL("test_stream_new failed");
-			goto cleanup;
+			return;
 		}
 		if (fx.n_cli_streams < MAX_ACCEPTED) {
 			fx.cli_streams[fx.n_cli_streams++] = cli_ts;
@@ -3357,13 +3893,19 @@ T_DECLARE_CASE(test_resume_retransmit)
 
 		struct mux_stream *srv_s = mux_open_stream(fx.srv);
 		if (srv_s == NULL) {
+			free(cli_payload);
+			free(srv_payload);
+			fixture_teardown(&fx);
 			T_FATAL("mux_open_stream(srv) returned NULL");
-			goto cleanup;
+			return;
 		}
 		srv_ts = test_stream_new(&fx, srv_s);
 		if (srv_ts == NULL) {
+			free(cli_payload);
+			free(srv_payload);
+			fixture_teardown(&fx);
 			T_FATAL("test_stream_new failed");
-			goto cleanup;
+			return;
 		}
 		if (fx.n_srv_active_streams < MAX_ACCEPTED) {
 			fx.srv_active_streams[fx.n_srv_active_streams++] =
@@ -3397,14 +3939,18 @@ T_DECLARE_CASE(test_resume_retransmit)
 		}
 		srv_sent += chunk;
 	}
-	T_EXPECT(cli_sent > 0);
-	T_EXPECT(srv_sent > 0);
+	/* Invariants are captured here and asserted only after teardown, so a
+	 * failing check cannot longjmp past fixture_teardown and leak the fixture
+	 * (and the payload buffers). */
+	const bool cli_sent_nonzero = cli_sent > 0;
+	const bool srv_sent_nonzero = srv_sent > 0;
 
 	mux_stream_io_start(fx.loop, &cli_ts->w_io);
 	mux_stream_io_start(fx.loop, &srv_ts->w_io);
-	test_pump_unacked_no_wait(&fx);
-	T_EXPECT(fx.cli->unacked.frames > 0);
-	T_EXPECT(fx.srv->unacked.frames > 0);
+	/* Both a client and a server stream are open, so both sides must buffer. */
+	test_pump_unacked_no_wait(&fx, true);
+	const bool cli_unacked_pre = fx.cli->unacked.frames > 0;
+	const bool srv_unacked_pre = fx.srv->unacked.frames > 0;
 	T_LOGF("pre-suspend unacked: cli=%zu srv=%zu", fx.cli->unacked.frames,
 	       fx.srv->unacked.frames);
 
@@ -3413,8 +3959,10 @@ T_DECLARE_CASE(test_resume_retransmit)
 	 * the preserved frames over a fresh transport. */
 	session_suspend(fx.cli);
 	session_suspend(fx.srv);
-	T_EXPECT(fx.cli->unacked.retransmit_off != SIZE_MAX);
-	T_EXPECT(fx.srv->unacked.retransmit_off != SIZE_MAX);
+	const bool cli_retrans_armed =
+		fx.cli->unacked.retransmit_off != SIZE_MAX;
+	const bool srv_retrans_armed =
+		fx.srv->unacked.retransmit_off != SIZE_MAX;
 	T_LOGF("retransmit armed: cli=%d srv=%d",
 	       fx.cli->unacked.retransmit_off != SIZE_MAX,
 	       fx.srv->unacked.retransmit_off != SIZE_MAX);
@@ -3437,13 +3985,13 @@ T_DECLARE_CASE(test_resume_retransmit)
 		       fx.srv->wire.tx_pending,
 		       fx.srv->unacked.retransmit_off != SIZE_MAX);
 	}
-	T_EXPECT(resume_ret == 0);
-	T_EXPECT(fx.cli_suspended);
-	T_EXPECT(fx.srv_suspended);
-	T_EXPECT(fx.cli_resumed);
-	T_EXPECT(fx.srv_resumed);
+	const bool cli_suspended = fx.cli_suspended;
+	const bool srv_suspended = fx.srv_suspended;
+	const bool cli_resumed = fx.cli_resumed;
+	const bool srv_resumed = fx.srv_resumed;
 
 	/* Bidirectional echo must complete after retransmission. */
+	bool cli_echo_ok;
 	{
 		struct echo_ctx cli_ctx = {
 			.ts = cli_ts,
@@ -3477,8 +4025,9 @@ T_DECLARE_CASE(test_resume_retransmit)
 			       srv_ts->recv_len, srv_sent, srv_ts->got_error,
 			       srv_ts->got_eof);
 		}
-		T_EXPECT(cli_echo_ret == 0);
+		cli_echo_ok = cli_echo_ret == 0;
 	}
+	bool srv_echo_ok;
 	{
 		struct echo_ctx srv_ctx = {
 			.ts = srv_ts,
@@ -3512,20 +4061,45 @@ T_DECLARE_CASE(test_resume_retransmit)
 			       srv_ts->recv_len, srv_sent, srv_ts->got_error,
 			       srv_ts->got_eof);
 		}
-		T_EXPECT(srv_echo_ret == 0);
+		srv_echo_ok = srv_echo_ret == 0;
 	}
-	T_EXPECT(!cli_ts->got_error);
-	T_EXPECT(!srv_ts->got_error);
-	if (cli_ts->recv_len >= cli_sent) {
-		T_EXPECT(memcmp(cli_ts->recv_buf, cli_payload, cli_sent) == 0);
-	}
-	if (srv_ts->recv_len >= srv_sent) {
-		T_EXPECT(memcmp(srv_ts->recv_buf, srv_payload, srv_sent) == 0);
-	}
-cleanup:
+	const bool cli_no_error = !cli_ts->got_error;
+	const bool srv_no_error = !srv_ts->got_error;
+	const size_t cli_recv_len = cli_ts->recv_len;
+	const size_t srv_recv_len = srv_ts->recv_len;
+	const bool cli_matches =
+		cli_recv_len >= cli_sent &&
+		memcmp(cli_ts->recv_buf, cli_payload, cli_sent) == 0;
+	const bool srv_matches =
+		srv_recv_len >= srv_sent &&
+		memcmp(srv_ts->recv_buf, srv_payload, srv_sent) == 0;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
 	free(cli_payload);
 	free(srv_payload);
 	fixture_teardown(&fx);
+
+	T_EXPECT(cli_sent_nonzero);
+	T_EXPECT(srv_sent_nonzero);
+	T_EXPECT(cli_unacked_pre);
+	T_EXPECT(srv_unacked_pre);
+	T_EXPECT(cli_retrans_armed);
+	T_EXPECT(srv_retrans_armed);
+	T_EXPECT(resume_ret == 0);
+	T_EXPECT(cli_suspended);
+	T_EXPECT(srv_suspended);
+	T_EXPECT(cli_resumed);
+	T_EXPECT(srv_resumed);
+	T_EXPECT(cli_echo_ok);
+	T_EXPECT(srv_echo_ok);
+	T_EXPECT(cli_no_error);
+	T_EXPECT(srv_no_error);
+	if (cli_recv_len >= cli_sent) {
+		T_EXPECT(cli_matches);
+	}
+	if (srv_recv_len >= srv_sent) {
+		T_EXPECT(srv_matches);
+	}
 }
 
 /* a stream mid-transfer across a real RST break must deliver its full
@@ -3544,26 +4118,34 @@ T_DECLARE_CASE(test_resume_stream_transparent)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	payload = malloc(PAYLOAD_LARGE);
 	if (payload == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0x5A);
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -3580,12 +4162,16 @@ T_DECLARE_CASE(test_resume_stream_transparent)
 	if (wait_until(
 		    &fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received,
 		    &partial_ctx) != 0) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("echo transfer did not get underway");
-		goto cleanup;
+		return;
 	}
-	T_EXPECT(ts->recv_len < (size_t)PAYLOAD_LARGE); /* still in flight */
-	T_EXPECT(!ts->got_eof);
-	T_EXPECT(!ts->got_error);
+	/* Captured here, asserted only after teardown (see the tail): a failing
+	 * check must not longjmp past fixture_teardown and leak the fixture. */
+	const bool in_flight = ts->recv_len < (size_t)PAYLOAD_LARGE;
+	const bool not_eof_pre = !ts->got_eof;
+	const bool not_error_pre = !ts->got_error;
 
 	fx_break_transport(&fx);
 
@@ -3600,24 +4186,40 @@ T_DECLARE_CASE(test_resume_stream_transparent)
 	const int ret = wait_until(
 		&fx, (RESUME_TIMEOUT_MS + ECHO_TIMEOUT_MS) / 1000.0,
 		pred_echo_received, &full_ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT(!ts->got_error);
-	T_EXPECT(!ts->got_eof);
+	const bool got_error = ts->got_error;
+	const bool got_eof = ts->got_eof;
 	/* A real resume must have occurred on both sides. */
-	T_EXPECT(fx.cli_suspended);
-	T_EXPECT(fx.srv_suspended);
-	T_EXPECT(fx.cli_resumed);
-	T_EXPECT(fx.srv_resumed);
-	T_EXPECT_EQ(mux_state(fx.cli), MUX_STATE_ESTABLISHED);
-	T_EXPECT_EQ(mux_state(fx.srv), MUX_STATE_ESTABLISHED);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_LARGE);
-	if (ts->recv_len == PAYLOAD_LARGE) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0);
-	}
+	const bool cli_suspended = fx.cli_suspended;
+	const bool srv_suspended = fx.srv_suspended;
+	const bool cli_resumed = fx.cli_resumed;
+	const bool srv_resumed = fx.srv_resumed;
+	const enum mux_state cli_state = mux_state(fx.cli);
+	const enum mux_state srv_state = mux_state(fx.srv);
+	const size_t recv_len = ts->recv_len;
+	const bool payload_matches =
+		recv_len == PAYLOAD_LARGE &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	free(payload);
 	fixture_teardown(&fx);
+
+	T_EXPECT(in_flight);
+	T_EXPECT(not_eof_pre);
+	T_EXPECT(not_error_pre);
+	T_EXPECT(ret == 0);
+	T_EXPECT(!got_error);
+	T_EXPECT(!got_eof);
+	T_EXPECT(cli_suspended);
+	T_EXPECT(srv_suspended);
+	T_EXPECT(cli_resumed);
+	T_EXPECT(srv_resumed);
+	T_EXPECT_EQ(cli_state, MUX_STATE_ESTABLISHED);
+	T_EXPECT_EQ(srv_state, MUX_STATE_ESTABLISHED);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_LARGE);
+	if (recv_len == PAYLOAD_LARGE) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 /* like test_resume_stream_transparent, but deterministically forces
@@ -3636,26 +4238,34 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	payload = malloc(PAYLOAD_LARGE);
 	if (payload == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0x3C);
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -3671,29 +4281,34 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 	if (wait_until(
 		    &fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received,
 		    &partial_ctx) != 0) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("echo transfer did not get underway");
-		goto cleanup;
+		return;
 	}
-	T_EXPECT(!ts->got_error);
+	/* Captured here, asserted only after teardown (see the tail): a failing
+	 * check must not longjmp past fixture_teardown and leak the fixture. */
+	const bool not_error_underway = !ts->got_error;
 
 	/* Force a non-empty unacked ring: stop processing ACKs and pump the send
-	 * side so sent frames stay pending replay. */
-	test_pump_unacked_no_wait(&fx);
-	T_EXPECT(fx.cli->unacked.frames > 0);
+	 * side so sent frames stay pending replay. Only a client stream is open, so
+	 * require only the client side (the echo server may already be fully ACKed). */
+	test_pump_unacked_no_wait(&fx, false);
+	const bool cli_unacked_pre = fx.cli->unacked.frames > 0;
 
 	/* Freeze straight into SUSPENDED with the ring populated; resume must
 	 * replay the preserved frames over the fresh transport. */
 	session_suspend(fx.cli);
 	session_suspend(fx.srv);
-	T_EXPECT(fx.cli->unacked.retransmit_off != SIZE_MAX);
+	const bool cli_retrans_armed =
+		fx.cli->unacked.retransmit_off != SIZE_MAX;
 
 	const int resume_ret =
 		wait_until(&fx, RESUME_TIMEOUT_MS / 1000.0, pred_resumed, &fx);
-	T_EXPECT(resume_ret == 0);
-	T_EXPECT(fx.cli_suspended);
-	T_EXPECT(fx.srv_suspended);
-	T_EXPECT(fx.cli_resumed);
-	T_EXPECT(fx.srv_resumed);
+	const bool cli_suspended = fx.cli_suspended;
+	const bool srv_suspended = fx.srv_suspended;
+	const bool cli_resumed = fx.cli_resumed;
+	const bool srv_resumed = fx.srv_resumed;
 
 	/* The full payload must echo back intact, with the stream never observing
 	 * an error or premature EOF: the retransmission is transparent. */
@@ -3705,17 +4320,32 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 	const int ret = wait_until(
 		&fx, (RESUME_TIMEOUT_MS + ECHO_TIMEOUT_MS) / 1000.0,
 		pred_echo_received, &full_ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT(!ts->got_error);
-	T_EXPECT(!ts->got_eof);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_LARGE);
-	if (ts->recv_len == PAYLOAD_LARGE) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0);
-	}
+	const bool got_error = ts->got_error;
+	const bool got_eof = ts->got_eof;
+	const size_t recv_len = ts->recv_len;
+	const bool payload_matches =
+		recv_len == PAYLOAD_LARGE &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	free(payload);
 	fixture_teardown(&fx);
+
+	T_EXPECT(not_error_underway);
+	T_EXPECT(cli_unacked_pre);
+	T_EXPECT(cli_retrans_armed);
+	T_EXPECT(resume_ret == 0);
+	T_EXPECT(cli_suspended);
+	T_EXPECT(srv_suspended);
+	T_EXPECT(cli_resumed);
+	T_EXPECT(srv_resumed);
+	T_EXPECT(ret == 0);
+	T_EXPECT(!got_error);
+	T_EXPECT(!got_eof);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_LARGE);
+	if (recv_len == PAYLOAD_LARGE) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 /* test_resume_handshake_transport_lost: transport failure during a client
@@ -3733,8 +4363,9 @@ T_DECLARE_CASE(test_resume_handshake_transport_lost)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Disable auto-reconnect so that session_suspend does not immediately
@@ -3746,15 +4377,18 @@ T_DECLARE_CASE(test_resume_handshake_transport_lost)
 	/* Suspend the client while the server remains ESTABLISHED.
 	 * The server will handle the resume once the client reconnects. */
 	session_suspend(fx.cli);
-	T_EXPECT_EQ(fx.cli->state, (int)SESSION_SUSPENDED);
+	/* Captured, asserted after teardown (see the tail): a failing check must
+	 * not longjmp past fixture_teardown and leak the fixture. */
+	const bool cli_suspended_pre = fx.cli->state == SESSION_SUSPENDED;
 
 	/* Give the client a dead-end socketpair: sp[1] is closed immediately
 	 * so the client's resume ClientHello hits an error (EPIPE or EOF)
 	 * during the handshake, exercising the re-suspension path. */
 	int sp[2];
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("socketpair failed");
-		goto cleanup;
+		return;
 	}
 	{
 		const int flags = fcntl(sp[0], F_GETFL, 0);
@@ -3774,20 +4408,26 @@ T_DECLARE_CASE(test_resume_handshake_transport_lost)
 		ev_run(fx.loop, EVRUN_NOWAIT);
 	}
 
-	T_EXPECT_EQ(fx.cli->state, (int)SESSION_SUSPENDED);
-	if (fx.cli->state != SESSION_SUSPENDED) {
+	/* On failure, tear down before asserting so the fixture cannot leak; the
+	 * subsequent real-resume steps assume a re-suspended client, so bail here
+	 * rather than driving them against a closed session. */
+	const bool cli_resuspended = fx.cli->state == SESSION_SUSPENDED;
+	if (!cli_resuspended) {
 		T_LOGF("client state after dead-end handshake: %d"
 		       " (expected SESSION_SUSPENDED=%d)",
 		       fx.cli->state, (int)SESSION_SUSPENDED);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_EXPECT(cli_resuspended);
+		return;
 	}
 
 	/* Restore the connect string and perform the real resume. */
 	memcpy(fx.connect_str, saved_connect_str, sizeof(fx.connect_str));
 	const int fd = fixture_dial(fx.connect_str);
 	if (fd < 0) {
+		fixture_teardown(&fx);
 		T_FATAL("fixture_dial failed for real resume attempt");
-		goto cleanup;
+		return;
 	}
 	mux_attach_fd(fx.cli, fd);
 
@@ -3803,13 +4443,18 @@ T_DECLARE_CASE(test_resume_handshake_transport_lost)
 		       fx.srv != NULL ? fx.srv->unacked.frames : 0,
 		       fx.cli_closed, fx.srv_closed);
 	}
-	T_EXPECT(ret == 0);
-	T_EXPECT(fx.cli_resumed);
-	T_EXPECT(fx.srv_resumed);
-	T_EXPECT(!fx.cli_connect_failed);
+	const bool cli_resumed = fx.cli_resumed;
+	const bool srv_resumed = fx.srv_resumed;
+	const bool cli_connect_failed = fx.cli_connect_failed;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(cli_suspended_pre);
+	T_EXPECT(ret == 0);
+	T_EXPECT(cli_resumed);
+	T_EXPECT(srv_resumed);
+	T_EXPECT(!cli_connect_failed);
 }
 
 /* nodelay=true, server sends PAYLOAD_LARGE to
@@ -3833,14 +4478,16 @@ T_DECLARE_CASE(test_nodelay_reverse_large)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	unsigned char *payload = malloc(PAYLOAD_LARGE);
 	if (payload == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0xE7);
 
@@ -3852,15 +4499,17 @@ T_DECLARE_CASE(test_nodelay_reverse_large)
 	/* Client opens a stream; it does not send any data – it only receives. */
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
-		T_FATAL("mux_open_stream(cli) returned NULL");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("mux_open_stream(cli) returned NULL");
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		T_FATAL("test_stream_new failed");
 		free(payload);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	mux_stream_io_start(fx.loop, &ts->w_io);
@@ -3873,17 +4522,24 @@ T_DECLARE_CASE(test_nodelay_reverse_large)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_eof, &ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_LARGE);
-	T_EXPECT(ts->got_eof);
-	T_EXPECT(!ts->got_error);
-	if (ts->recv_len == PAYLOAD_LARGE) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0);
-	}
+	const size_t recv_len = ts->recv_len;
+	const bool got_eof = ts->got_eof;
+	const bool got_error = ts->got_error;
+	const bool payload_matches =
+		recv_len == PAYLOAD_LARGE &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_LARGE) == 0;
 
 	free(payload);
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_LARGE);
+	T_EXPECT(got_eof);
+	T_EXPECT(!got_error);
+	if (recv_len == PAYLOAD_LARGE) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 /* BDP estimator tests. */
@@ -3953,31 +4609,32 @@ T_DECLARE_CASE(test_bdp_auto_stream_window_updated_by_pong)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	bdp_enable_auto_windows(fx.cli);
-	T_EXPECT(fx.cli->auto_stream_window);
-	T_EXPECT(fx.cli->auto_session_window);
-	T_EXPECT_EQ(
-		fx.cli->session_window,
-		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
-	T_EXPECT_EQ(fx.cli->stream_window, fx.cli->session_window);
+	const bool auto_stream = fx.cli->auto_stream_window;
+	const bool auto_session = fx.cli->auto_session_window;
+	const uint_least32_t session_window_initial = fx.cli->session_window;
+	const uint_least32_t stream_window_initial = fx.cli->stream_window;
 
 	/* Drive the PONG -> estimator -> session_update_window path directly.
 	 * Use 4 × MUX_INITIAL_SEND_WINDOW: a 1× sample lands at BDP_MIN
 	 * where integer-division truncation makes the assertion fragile. */
 	estimator_add(fx.cli, (uint_least64_t)MUX_INITIAL_SEND_WINDOW * 4);
-	T_EXPECT(fx.cli->estimator.ping_in_flight);
+	const bool ping_in_flight_after_add = fx.cli->estimator.ping_in_flight;
 	if (!fx.cli->estimator.ping_in_flight) {
+		fixture_teardown(&fx);
 		T_FATAL("estimator did not queue ping frame");
-		goto cleanup;
+		return;
 	}
 	/* Back-date the timestamp by 1 ms so the measured RTT is positive. */
 	if (fx.cli->estimator.last_probe_ns <= 1000000) {
+		fixture_teardown(&fx);
 		T_FATAL("invalid estimator timestamp");
-		goto cleanup;
+		return;
 	}
 	fx.cli->estimator.last_probe_ns -= 1000000;
 	const int_fast64_t sent_ns = fx.cli->estimator.last_probe_ns;
@@ -3990,29 +4647,41 @@ T_DECLARE_CASE(test_bdp_auto_stream_window_updated_by_pong)
 		.extra = MUX_CTRL_PONG,
 	};
 	const size_t frame_size = MUX_FRAME_HEADER_SIZE + MUX_PING_PAYLOAD_SIZE;
-	ringbuf_reset(fx.cli->wire.recvbuf);
-	if (!ringbuf_reserve(&fx.cli->wire.recvbuf, frame_size, false)) {
+	bytebuf_reset(fx.cli->wire.recvbuf);
+	if (!bytebuf_reserve(&fx.cli->wire.recvbuf, frame_size, false)) {
+		fixture_teardown(&fx);
 		T_FATAL("recvbuf has no space");
-		goto cleanup;
+		return;
 	}
-	unsigned char *const pong = ringbuf_write_ptr(fx.cli->wire.recvbuf);
+	unsigned char *const pong = bytebuf_write_ptr(fx.cli->wire.recvbuf);
 	mux_write_header(pong, &hdr);
 	write_uint64(pong + MUX_FRAME_HEADER_SIZE, (uint_fast64_t)sent_ns);
-	ringbuf_produce(fx.cli->wire.recvbuf, frame_size);
+	bytebuf_produce(fx.cli->wire.recvbuf, frame_size);
 	session_recv_pong(fx.cli, &hdr, frame_size);
 
 	/* PONG grows stream_window from the rx estimate; the idle tx
 	 * direction leaves session_window at its floor. */
+	const uint_least32_t stream_window_final = fx.cli->stream_window;
+	const uint_least32_t session_window_final = fx.cli->session_window;
+	const bool ping_in_flight_final = fx.cli->estimator.ping_in_flight;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(auto_stream);
+	T_EXPECT(auto_session);
+	T_EXPECT_EQ(
+		session_window_initial,
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
+	T_EXPECT_EQ(stream_window_initial, session_window_initial);
+	T_EXPECT(ping_in_flight_after_add);
 	T_EXPECT(
-		fx.cli->stream_window >
+		stream_window_final >
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
 	T_EXPECT_EQ(
-		fx.cli->session_window,
+		session_window_final,
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
-
-cleanup:
-	fixture_teardown(&fx);
+	T_EXPECT(!ping_in_flight_final);
 }
 
 /* test_bdp_session_window_grows_from_ack_sample_only: a pure sender (no inbound
@@ -4030,31 +4699,32 @@ T_DECLARE_CASE(test_bdp_session_window_grows_from_ack_sample_only)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	bdp_enable_auto_windows(fx.cli);
-	T_EXPECT_EQ(
-		fx.cli->session_window,
-		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
-	T_EXPECT_EQ(fx.cli->stream_window, fx.cli->session_window);
+	const uint_least32_t session_window_initial = fx.cli->session_window;
+	const uint_least32_t stream_window_initial = fx.cli->stream_window;
 
 	/* Mirror test_bdp_auto_stream_window_updated_by_pong, but drive the
 	 * cycle via estimator_add_acked only: sample stays 0 throughout. */
 	estimator_add_acked(
 		fx.cli, (uint_least64_t)MUX_INITIAL_SEND_WINDOW * 4);
-	T_EXPECT(fx.cli->estimator.ping_in_flight);
-	T_EXPECT_EQ(fx.cli->estimator.rx.sample, (size_t)0);
-	T_EXPECT(fx.cli->estimator.tx.sample > 0);
+	const bool ping_in_flight_after_add = fx.cli->estimator.ping_in_flight;
+	const size_t rx_sample_after_add = fx.cli->estimator.rx.sample;
+	const size_t tx_sample_after_add = fx.cli->estimator.tx.sample;
 	if (!fx.cli->estimator.ping_in_flight) {
+		fixture_teardown(&fx);
 		T_FATAL("estimator did not queue ping frame");
-		goto cleanup;
+		return;
 	}
 	/* Back-date the timestamp by 1 ms so the measured RTT is positive. */
 	if (fx.cli->estimator.last_probe_ns <= 1000000) {
+		fixture_teardown(&fx);
 		T_FATAL("invalid estimator timestamp");
-		goto cleanup;
+		return;
 	}
 	fx.cli->estimator.last_probe_ns -= 1000000;
 	const int_fast64_t sent_ns = fx.cli->estimator.last_probe_ns;
@@ -4067,31 +4737,45 @@ T_DECLARE_CASE(test_bdp_session_window_grows_from_ack_sample_only)
 		.extra = MUX_CTRL_PONG,
 	};
 	const size_t frame_size = MUX_FRAME_HEADER_SIZE + MUX_PING_PAYLOAD_SIZE;
-	ringbuf_reset(fx.cli->wire.recvbuf);
-	if (!ringbuf_reserve(&fx.cli->wire.recvbuf, frame_size, false)) {
+	bytebuf_reset(fx.cli->wire.recvbuf);
+	if (!bytebuf_reserve(&fx.cli->wire.recvbuf, frame_size, false)) {
+		fixture_teardown(&fx);
 		T_FATAL("recvbuf has no space");
-		goto cleanup;
+		return;
 	}
-	unsigned char *const pong = ringbuf_write_ptr(fx.cli->wire.recvbuf);
+	unsigned char *const pong = bytebuf_write_ptr(fx.cli->wire.recvbuf);
 	mux_write_header(pong, &hdr);
 	write_uint64(pong + MUX_FRAME_HEADER_SIZE, (uint_fast64_t)sent_ns);
-	ringbuf_produce(fx.cli->wire.recvbuf, frame_size);
+	bytebuf_produce(fx.cli->wire.recvbuf, frame_size);
 	session_recv_pong(fx.cli, &hdr, frame_size);
 
 	/* PONG grows session_window from the tx ack-clock estimate; the idle
 	 * rx direction leaves stream_window at its floor. */
+	const uint_least32_t session_window_final = fx.cli->session_window;
+	const uint_least32_t stream_window_final = fx.cli->stream_window;
+	const bool ping_in_flight_final = fx.cli->estimator.ping_in_flight;
+	const size_t rx_sample_final = fx.cli->estimator.rx.sample;
+	const size_t tx_sample_final = fx.cli->estimator.tx.sample;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
+	fixture_teardown(&fx);
+
+	T_EXPECT_EQ(
+		session_window_initial,
+		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
+	T_EXPECT_EQ(stream_window_initial, session_window_initial);
+	T_EXPECT(ping_in_flight_after_add);
+	T_EXPECT_EQ(rx_sample_after_add, (size_t)0);
+	T_EXPECT(tx_sample_after_add > 0);
 	T_EXPECT(
-		fx.cli->session_window >
+		session_window_final >
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
 	T_EXPECT_EQ(
-		fx.cli->stream_window,
+		stream_window_final,
 		(uint_least32_t)(MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT));
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
-	T_EXPECT_EQ(fx.cli->estimator.rx.sample, (size_t)0);
-	T_EXPECT_EQ(fx.cli->estimator.tx.sample, (size_t)0);
-
-cleanup:
-	fixture_teardown(&fx);
+	T_EXPECT(!ping_in_flight_final);
+	T_EXPECT_EQ(rx_sample_final, (size_t)0);
+	T_EXPECT_EQ(tx_sample_final, (size_t)0);
 }
 
 /* in manual window mode
@@ -4109,8 +4793,9 @@ T_DECLARE_CASE(test_bdp_manual_window_mode_no_estimator_effect)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Both windows non-zero → manual mode; auto_stream_window and
@@ -4121,18 +4806,22 @@ T_DECLARE_CASE(test_bdp_manual_window_mode_no_estimator_effect)
 	conf.session_window = (int)fixed_session;
 	conf.stream_window = (int)fixed_stream;
 	mux_set_config(fx.cli, &conf);
-	T_EXPECT(!fx.cli->auto_stream_window);
-	T_EXPECT(!fx.cli->auto_session_window);
-	T_EXPECT_EQ(fx.cli->session_window, fixed_session);
-	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
+	const bool no_auto_stream = !fx.cli->auto_stream_window;
+	const bool no_auto_session = !fx.cli->auto_session_window;
+	const uint_least32_t session_window = fx.cli->session_window;
+	const uint_least32_t stream_window = fx.cli->stream_window;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(no_auto_stream);
+	T_EXPECT(no_auto_session);
+	T_EXPECT_EQ(session_window, fixed_session);
+	T_EXPECT_EQ(stream_window, fixed_stream);
 	/* recv.c guards estimator_add with auto_stream_window; session and
 	 * stream windows must remain at their configured values. */
-	T_EXPECT_EQ(fx.cli->session_window, fixed_session);
-	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
-
-cleanup:
-	fixture_teardown(&fx);
+	T_EXPECT_EQ(session_window, fixed_session);
+	T_EXPECT_EQ(stream_window, fixed_stream);
 }
 
 /* session_window auto (= 0), stream_window manual (> 0):
@@ -4150,8 +4839,9 @@ T_DECLARE_CASE(test_bdp_auto_session_window_without_auto_stream_window)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* session_window = 0 (auto), stream_window = 4 (manual). */
@@ -4160,13 +4850,9 @@ T_DECLARE_CASE(test_bdp_auto_session_window_without_auto_stream_window)
 	conf.session_window = 0;
 	conf.stream_window = (int)fixed_stream;
 	mux_set_config(fx.cli, &conf);
-	T_EXPECT(!fx.cli->auto_stream_window);
-	T_EXPECT(fx.cli->auto_session_window);
-	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
-
-	/* recv.c guards estimator_add with auto_stream_window; stream_window
-	 * must remain at its configured value. */
-	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
+	const bool no_auto_stream = !fx.cli->auto_stream_window;
+	const bool auto_session = fx.cli->auto_session_window;
+	const uint_least32_t stream_window_after_config = fx.cli->stream_window;
 
 	/* session_update_session_window must still update session_window to
 	 * track peer_stream_window even when stream_window is manual. */
@@ -4176,12 +4862,22 @@ T_DECLARE_CASE(test_bdp_auto_session_window_without_auto_stream_window)
 	fx.cli->peer_stream_window = new_peer_window;
 	session_update_session_window(
 		fx.cli, estimator_tx_window_size(&fx.cli->estimator));
-	T_EXPECT_EQ(fx.cli->session_window, new_peer_window);
-	/* stream_window must not have been modified. */
-	T_EXPECT_EQ(fx.cli->stream_window, fixed_stream);
+	const uint_least32_t session_window_after_update =
+		fx.cli->session_window;
+	const uint_least32_t stream_window_after_update = fx.cli->stream_window;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(no_auto_stream);
+	T_EXPECT(auto_session);
+	T_EXPECT_EQ(stream_window_after_config, fixed_stream);
+	/* recv.c guards estimator_add with auto_stream_window; stream_window
+	 * must remain at its configured value. */
+	T_EXPECT_EQ(stream_window_after_config, fixed_stream);
+	T_EXPECT_EQ(session_window_after_update, new_peer_window);
+	/* stream_window must not have been modified. */
+	T_EXPECT_EQ(stream_window_after_update, fixed_stream);
 }
 
 /* in automatic
@@ -4199,13 +4895,14 @@ T_DECLARE_CASE(test_bdp_auto_session_window_tracks_peer_stream_window)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	bdp_enable_auto_windows(fx.cli);
-	T_EXPECT(fx.cli->auto_stream_window);
-	T_EXPECT(fx.cli->auto_session_window);
+	const bool auto_stream = fx.cli->auto_stream_window;
+	const bool auto_session = fx.cli->auto_session_window;
 
 	/* In auto mode, session_window tracks peer_stream_window via
 	 * session_update_session_window.  Set peer_stream_window to a value
@@ -4219,13 +4916,18 @@ T_DECLARE_CASE(test_bdp_auto_session_window_tracks_peer_stream_window)
 	session_update_session_window(
 		fx.cli, estimator_tx_window_size(&fx.cli->estimator));
 
-	T_EXPECT_EQ(fx.cli->session_window, new_peer_window);
+	const uint_least32_t session_window_after = fx.cli->session_window;
+	const uint_least32_t stream_window_after = fx.cli->stream_window;
+
+	/* Teardown first so a failing assert can't leak the fixture. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(auto_stream);
+	T_EXPECT(auto_session);
+	T_EXPECT_EQ(session_window_after, new_peer_window);
 	/* stream_window is driven by the BDP estimator, not peer_stream_window;
 	 * session_update_session_window must not change it. */
-	T_EXPECT_EQ(fx.cli->stream_window, initial_stream_window);
-
-cleanup:
-	fixture_teardown(&fx);
+	T_EXPECT_EQ(stream_window_after, initial_stream_window);
 }
 
 /* test_bdp_control_only_no_cycle: control-only inbound traffic must not
@@ -4242,8 +4944,9 @@ T_DECLARE_CASE(test_bdp_control_only_no_cycle)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	bdp_enable_auto_windows(fx.cli);
@@ -4252,18 +4955,26 @@ T_DECLARE_CASE(test_bdp_control_only_no_cycle)
 		.ss = fx.cli,
 		.before_bytes_recv = fx.cli->bytes_recv,
 	};
-	T_EXPECT(session_send_ctrl(fx.srv, STREAMID_CTRL, 0, MUX_CTRL_PROBE));
+	const bool ctrl_sent =
+		session_send_ctrl(fx.srv, STREAMID_CTRL, 0, MUX_CTRL_PROBE);
 	session_flush(fx.srv);
 	const int ret = wait_until(
 		&fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_control_only_no_bdp,
 		&ctx);
-	T_EXPECT(ret == 0);
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.rx.bw_wnd) == 0);
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.tx.bw_wnd) == 0);
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
+	const bool rx_bw_zero =
+		wndfilter_get(&fx.cli->estimator.rx.bw_wnd) == 0;
+	const bool tx_bw_zero =
+		wndfilter_get(&fx.cli->estimator.tx.bw_wnd) == 0;
+	const bool no_ping_in_flight = !fx.cli->estimator.ping_in_flight;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ctrl_sent);
+	T_EXPECT(ret == 0);
+	T_EXPECT(rx_bw_zero);
+	T_EXPECT(tx_bw_zero);
+	T_EXPECT(no_ping_in_flight);
 }
 
 /* starting a cycle queues the
@@ -4281,25 +4992,31 @@ T_DECLARE_CASE(test_bdp_ping_queued_before_send_progress)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	bdp_enable_auto_windows(fx.cli);
 	estimator_add(fx.cli, (uint_least64_t)MUX_MAX_PAYLOAD_SIZE);
 
-	T_EXPECT_EQ(
-		estimator_tx_window_size(&fx.cli->estimator),
-		(size_t)fx.cli->session_window * (size_t)MUX_WINDOW_UNIT);
-	T_EXPECT_EQ(
-		fx.cli->estimator.rx.sample,
-		(uint_least32_t)MUX_MAX_PAYLOAD_SIZE);
-	T_EXPECT(fx.cli->wire.oobbuf.head != NULL);
-	T_EXPECT(fx.cli->estimator.ping_in_flight);
-	T_EXPECT(fx.cli->estimator.last_probe_ns > 0);
+	const size_t tx_window_size =
+		estimator_tx_window_size(&fx.cli->estimator);
+	const size_t expected_tx_window =
+		(size_t)fx.cli->session_window * (size_t)MUX_WINDOW_UNIT;
+	const size_t rx_sample = fx.cli->estimator.rx.sample;
+	const bool oob_queued = fx.cli->wire.oobbuf.head != NULL;
+	const bool ping_in_flight = fx.cli->estimator.ping_in_flight;
+	const bool probe_ns_positive = fx.cli->estimator.last_probe_ns > 0;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT_EQ(tx_window_size, expected_tx_window);
+	T_EXPECT_EQ(rx_sample, (uint_least32_t)MUX_MAX_PAYLOAD_SIZE);
+	T_EXPECT(oob_queued);
+	T_EXPECT(ping_in_flight);
+	T_EXPECT(probe_ns_positive);
 }
 
 /* test_bdp_ping_sent: inbound PUSH starts an estimator cycle; the queued PING
@@ -4319,28 +5036,35 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	bdp_enable_auto_windows(fx.cli);
 
 	payload = malloc(PAYLOAD_SMALL);
 	if (payload == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x4E);
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -4356,17 +5080,24 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
-	T_EXPECT(ret == 0);
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
-	T_EXPECT_EQ(ts->recv_len, (size_t)PAYLOAD_SMALL);
-	if (ts->recv_len == PAYLOAD_SMALL) {
-		T_EXPECT(memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0);
-	}
+	const bool rtt_positive = wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0;
+	const bool no_ping_in_flight = !fx.cli->estimator.ping_in_flight;
+	const size_t recv_len = ts->recv_len;
+	const bool payload_matches =
+		recv_len == PAYLOAD_SMALL &&
+		memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0;
 
-cleanup:
 	free(payload);
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(rtt_positive);
+	T_EXPECT(no_ping_in_flight);
+	T_EXPECT_EQ(recv_len, (size_t)PAYLOAD_SMALL);
+	if (recv_len == PAYLOAD_SMALL) {
+		T_EXPECT(payload_matches);
+	}
 }
 
 /* on disconnect, stream_window is set to
@@ -4386,28 +5117,35 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	bdp_enable_auto_windows(fx.cli);
 
 	payload = malloc(PAYLOAD_SMALL);
 	if (payload == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x68);
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
@@ -4421,22 +5159,21 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 	};
 	const int cycle_ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
-	T_EXPECT(cycle_ret == 0);
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
+	const bool rtt_positive_after_cycle =
+		wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0;
 
 	/* Arm an in-flight probe (bypass the send-side rate limit) so the
 	 * transition below can be shown to clear the transient probe. */
 	fx.cli->estimator.last_probe_ns = 0;
 	estimator_add(fx.cli, (uint_fast64_t)MUX_MAX_PAYLOAD_SIZE);
-	T_EXPECT(fx.cli->estimator.ping_in_flight);
+	const bool ping_in_flight_after_add = fx.cli->estimator.ping_in_flight;
 
 	/* Seed a known raw BDP window so the expected post-stop stream_window is
 	 * a constant, not re-derived from the formula under test. */
 	fx.cli->estimator.rx.effective_bdp =
 		3u * (size_t)MUX_INITIAL_SEND_WINDOW;
-	T_EXPECT_EQ(
-		estimator_rx_window_size(&fx.cli->estimator),
-		3u * (size_t)MUX_INITIAL_SEND_WINDOW);
+	const size_t rx_window_size =
+		estimator_rx_window_size(&fx.cli->estimator);
 	const uint_least32_t initial_frames =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
 
@@ -4446,21 +5183,31 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 	 * (halve the raw BDP window, floored) and estimator_suspend. */
 	session_set_state(fx.cli, SESSION_SUSPENDED);
 
+	const uint_least32_t stream_window_after_stop = fx.cli->stream_window;
+	const bool rtt_positive_after_stop =
+		wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0;
+	const size_t effective_bdp_after_stop =
+		fx.cli->estimator.rx.effective_bdp;
+	const bool no_ping_after_stop = !fx.cli->estimator.ping_in_flight;
+
+	free(payload);
+	/* Teardown first so a failing assert can't leak the fixture. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(cycle_ret == 0);
+	T_EXPECT(rtt_positive_after_cycle);
+	T_EXPECT(ping_in_flight_after_add);
+	T_EXPECT_EQ(rx_window_size, 3u * (size_t)MUX_INITIAL_SEND_WINDOW);
 	/* stream_window halved to the raw BDP floor: 3*INITIAL / 2 / UNIT ==
 	 * 3*initial_frames/2, above the initial-window floor. A regression in the
 	 * divisor or floor would diverge from this constant. */
-	T_EXPECT_EQ(fx.cli->stream_window, 3u * initial_frames / 2u);
+	T_EXPECT_EQ(stream_window_after_stop, 3u * initial_frames / 2u);
 	/* Learned filter state survives the disconnect... */
-	T_EXPECT(wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0);
+	T_EXPECT(rtt_positive_after_stop);
 	T_EXPECT_EQ(
-		fx.cli->estimator.rx.effective_bdp,
-		3u * (size_t)MUX_INITIAL_SEND_WINDOW);
+		effective_bdp_after_stop, 3u * (size_t)MUX_INITIAL_SEND_WINDOW);
 	/* ...while the transient in-flight probe is cleared (estimator_suspend). */
-	T_EXPECT(!fx.cli->estimator.ping_in_flight);
-
-cleanup:
-	free(payload);
-	fixture_teardown(&fx);
+	T_EXPECT(no_ping_after_stop);
 }
 
 /* test_send_queue_saturates_read_credit: mux_stream_send must gate on
@@ -4488,14 +5235,16 @@ T_DECLARE_CASE(test_send_queue_saturates_read_credit)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 
 	/* Stream in STREAM_INIT: send_window = MUX_DEFAULT_SEND_WINDOW,
@@ -4506,8 +5255,9 @@ T_DECLARE_CASE(test_send_queue_saturates_read_credit)
 	/* Allocate a buffer that exactly fills the initial read credit. */
 	unsigned char *buf = malloc(initial_credit + 1);
 	if (buf == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("malloc failed");
-		goto cleanup;
+		return;
 	}
 	fill_payload(buf, initial_credit + 1, 0xAA);
 
@@ -4515,13 +5265,13 @@ T_DECLARE_CASE(test_send_queue_saturates_read_credit)
 
 	/* First call: exactly fills read_credit_avail. */
 	size_t len1 = initial_credit;
-	T_EXPECT(mux_stream_send(s, buf, &len1) == 0);
-	T_EXPECT_EQ(len1, initial_credit);
+	const bool send1_ok = mux_stream_send(s, buf, &len1) == 0;
+	const size_t len1_after = len1;
 
 	/* Second call: read_credit_avail = 0 → must be rejected. */
 	size_t len2 = 1;
-	T_EXPECT(mux_stream_send(s, buf, &len2) == 0);
-	T_EXPECT_EQ(len2, (size_t)0);
+	const bool send2_ok = mux_stream_send(s, buf, &len2) == 0;
+	const size_t len2_after = len2;
 
 	/* --- Part 2: credit restored after SYN|ACK --- */
 
@@ -4530,8 +5280,9 @@ T_DECLARE_CASE(test_send_queue_saturates_read_credit)
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
 		free(buf);
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = buf;
@@ -4542,19 +5293,28 @@ T_DECLARE_CASE(test_send_queue_saturates_read_credit)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_stream_established,
 		    &ec) != 0) {
-		T_FATAL("stream did not reach ESTABLISHED");
 		free(buf);
-		goto cleanup;
+		fixture_teardown(&fx);
+		T_FATAL("stream did not reach ESTABLISHED");
+		return;
 	}
 
 	/* SYN|ACK grants additional credit; read_credit_avail > 0 now. */
 	size_t len3 = 1;
-	T_EXPECT(mux_stream_send(s, buf + initial_credit, &len3) == 0);
-	T_EXPECT(len3 > 0);
+	const bool send3_ok =
+		mux_stream_send(s, buf + initial_credit, &len3) == 0;
+	const size_t len3_after = len3;
 
 	free(buf);
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(send1_ok);
+	T_EXPECT_EQ(len1_after, initial_credit);
+	T_EXPECT(send2_ok);
+	T_EXPECT_EQ(len2_after, (size_t)0);
+	T_EXPECT(send3_ok);
+	T_EXPECT(len3_after > 0);
 }
 
 /* Direct-mode mux_stream_send must pay into the same
@@ -4573,14 +5333,16 @@ T_DECLARE_CASE(test_stream_send_direct_mode_updates_send_buffered_frames)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 
 	const size_t before = s->session->send_buffered_frames;
@@ -4588,14 +5350,18 @@ T_DECLARE_CASE(test_stream_send_direct_mode_updates_send_buffered_frames)
 	unsigned char payload[10];
 	fill_payload(payload, sizeof(payload), 0x77);
 	size_t len = sizeof(payload);
-	T_EXPECT(mux_stream_send(s, payload, &len) == 0);
-	T_EXPECT_EQ(len, sizeof(payload));
+	const bool send_ok = mux_stream_send(s, payload, &len) == 0;
+	const size_t len_after = len;
 
 	/* One small payload fits in a single frame. */
-	T_EXPECT_EQ(s->session->send_buffered_frames, before + 1);
+	const size_t after = s->session->send_buffered_frames;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(send_ok);
+	T_EXPECT_EQ(len_after, sizeof(payload));
+	T_EXPECT_EQ(after, before + 1);
 }
 
 /* mux_open_stream must return NULL after
@@ -4612,31 +5378,36 @@ T_DECLARE_CASE(test_drain_rejects_new_streams)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Open a stream to hold the session in ESTABLISHED during drain,
 	 * ensuring the draining check in session_open_stream is exercised. */
 	struct mux_stream *s = mux_open_stream(fx.cli);
 	if (s == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	mux_stream_io_start(fx.loop, &ts->w_io);
 
 	mux_drain(fx.cli);
 
-	T_EXPECT(mux_open_stream(fx.cli) == NULL);
+	const bool open_rejected = mux_open_stream(fx.cli) == NULL;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(open_rejected);
 }
 
 /* a draining session must refuse inbound
@@ -4653,21 +5424,24 @@ T_DECLARE_CASE(test_drain_refuses_peer_syn)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
 		    &fx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("sessions did not establish");
-		goto cleanup;
+		return;
 	}
 
 	/* Open a stream and wait until the server accepts it, holding the
 	 * server session in ESTABLISHED during the drain. */
 	struct mux_stream *s1 = mux_open_stream(fx.cli);
 	if (s1 == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts1 = test_stream_new(&fx, s1);
 	if (ts1 == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts1;
 	mux_stream_io_start(fx.loop, &ts1->w_io);
@@ -4675,8 +5449,9 @@ T_DECLARE_CASE(test_drain_refuses_peer_syn)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_accepted_count,
 		    &acc_ctx) != 0) {
+		fixture_teardown(&fx);
 		T_FATAL("server did not accept the first stream");
-		goto cleanup;
+		return;
 	}
 
 	mux_drain(fx.srv);
@@ -4686,25 +5461,30 @@ T_DECLARE_CASE(test_drain_refuses_peer_syn)
 	 * server never surfaces the stream to on_accept. */
 	struct mux_stream *s2 = mux_open_stream(fx.cli);
 	if (s2 == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("mux_open_stream returned NULL");
-		goto cleanup;
+		return;
 	}
 	struct test_stream *ts2 = test_stream_new(&fx, s2);
 	if (ts2 == NULL) {
+		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
-		goto cleanup;
+		return;
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts2;
 	mux_stream_io_start(fx.loop, &ts2->w_io);
 
 	const int ret =
 		wait_until(&fx, EOF_TIMEOUT_MS / 1000.0, pred_error, ts2);
-	T_EXPECT(ret == 0);
-	T_EXPECT(ts2->got_error);
-	T_EXPECT(fx.n_accepted == 1);
+	const bool ts2_got_error = ts2->got_error;
+	const int n_accepted = fx.n_accepted;
 
-cleanup:
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(ts2_got_error);
+	T_EXPECT(n_accepted == 1);
 }
 
 /* Public API tests (mux_state / accessors / mux_stream_send / mux_stream_recv).
@@ -4844,13 +5624,19 @@ T_DECLARE_CASE(test_mux_stream_send_queues_payload)
 	ev_io_init(&ss.w_socket, mux_api_io_cb, fds[0], EV_READ);
 	ss.w_socket.data = &ss;
 	sched_init(&ss);
-	T_EXPECT(mux_stream_send(&s, payload, &len) == 0);
-	T_EXPECT_EQ(len, sizeof(payload));
-	T_EXPECT(s.send_queue.head != NULL);
+	const bool send_ok = mux_stream_send(&s, payload, &len) == 0;
+	const size_t len_after = len;
+	const bool queue_nonempty = s.send_queue.head != NULL;
+
+	/* Clean up before the asserts so a failing check can't leak. */
 	mux_frame_list_clear(&s.send_queue, &ss.pool);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
 	ev_loop_destroy(loop);
+
+	T_EXPECT(send_ok);
+	T_EXPECT_EQ(len_after, sizeof(payload));
+	T_EXPECT(queue_nonempty);
 }
 
 T_DECLARE_CASE(test_mux_stream_recv_reports_eagain_and_reset)
@@ -4861,20 +5647,27 @@ T_DECLARE_CASE(test_mux_stream_recv_reports_eagain_and_reset)
 		.state = STREAM_ESTABLISHED,
 		.session = &ss,
 	};
-	s.recvbuf = ringbuf_new(MUX_MAX_PAYLOAD_SIZE);
+	s.recvbuf = bytebuf_new(MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(s.recvbuf != NULL);
 	unsigned char buf[16];
 	size_t len = sizeof(buf);
 
 	errno = 0;
-	T_EXPECT(mux_stream_recv(&s, buf, &len) < 0);
-	T_EXPECT_EQ(errno, EAGAIN);
+	const bool recv1_neg = mux_stream_recv(&s, buf, &len) < 0;
+	const int errno1 = errno;
 
 	s.rst_received = true;
 	errno = 0;
-	T_EXPECT(mux_stream_recv(&s, buf, &len) < 0);
-	T_EXPECT_EQ(errno, ECONNRESET);
-	ringbuf_free(s.recvbuf);
+	const bool recv2_neg = mux_stream_recv(&s, buf, &len) < 0;
+	const int errno2 = errno;
+
+	/* Free the recvbuf before the asserts so a failing check can't leak. */
+	bytebuf_free(s.recvbuf);
+
+	T_EXPECT(recv1_neg);
+	T_EXPECT_EQ(errno1, EAGAIN);
+	T_EXPECT(recv2_neg);
+	T_EXPECT_EQ(errno2, ECONNRESET);
 }
 
 T_DECLARE_CASE(test_mux_stream_io_stop_clears_stream_binding)
@@ -4885,6 +5678,9 @@ T_DECLARE_CASE(test_mux_stream_io_stop_clears_stream_binding)
 	struct mux_stream s = {
 		.state = STREAM_ESTABLISHED,
 		.session = &ss,
+		/* Direct-mode stream: direct.w_io is the live union arm, so
+		 * mux_stream_io_stop's is_direct-guarded clear applies. */
+		.is_direct = true,
 	};
 	mux_stream_io watcher;
 
@@ -4895,11 +5691,16 @@ T_DECLARE_CASE(test_mux_stream_io_stop_clears_stream_binding)
 	s.direct.w_io = &watcher;
 
 	mux_stream_io_stop(loop, &watcher);
-	T_EXPECT(watcher.stream == NULL);
-	T_EXPECT(s.direct.w_io == NULL);
-	T_EXPECT_EQ(watcher.active, 0);
+	const bool watcher_unbound = watcher.stream == NULL;
+	const bool direct_cleared = s.direct.w_io == NULL;
+	const int watcher_active = watcher.active;
 
+	/* Destroy the loop before the asserts so a failing check can't leak. */
 	ev_loop_destroy(loop);
+
+	T_EXPECT(watcher_unbound);
+	T_EXPECT(direct_cleared);
+	T_EXPECT_EQ(watcher_active, 0);
 }
 
 /* main */
@@ -5004,7 +5805,7 @@ static int xs_setup(struct xs_fixture *restrict fx)
 	ev_timer_init(&fx->ss.w_idle_timeout, xs_timer_cb, 1.0, 0.0);
 	fx->ss.w_idle_timeout.data = &fx->ss;
 	sched_init(&fx->ss);
-	fx->ss.wire.recvbuf = ringbuf_new(4u * (size_t)MUX_MAX_FRAME_SIZE);
+	fx->ss.wire.recvbuf = bytebuf_new(4u * (size_t)MUX_MAX_FRAME_SIZE);
 	if (fx->ss.wire.recvbuf == NULL) {
 		table_free(fx->ss.sched.streams);
 		(void)close(fx->fds[0]);
@@ -5015,7 +5816,7 @@ static int xs_setup(struct xs_fixture *restrict fx)
 	}
 	fx->ss.unacked.ring = mux_frame_ring_new(MUX_FRAME_RING_MIN);
 	if (fx->ss.unacked.ring == NULL) {
-		ringbuf_free(fx->ss.wire.recvbuf);
+		bytebuf_free(fx->ss.wire.recvbuf);
 		fx->ss.wire.recvbuf = NULL;
 		table_free(fx->ss.sched.streams);
 		(void)close(fx->fds[0]);
@@ -5033,11 +5834,11 @@ static void xs_teardown(struct xs_fixture *restrict fx)
 		sched_free_streams(&fx->ss);
 	}
 	if (fx->ss.wire.oobbuf.head != NULL ||
-	    ringbuf_readable(fx->ss.wire.recvbuf) > 0 ||
+	    bytebuf_readable(fx->ss.wire.recvbuf) > 0 ||
 	    fx->ss.wire.sendbuf.head != NULL) {
 		wire_discard_buffers(&fx->ss);
 	}
-	ringbuf_free(fx->ss.wire.recvbuf);
+	bytebuf_free(fx->ss.wire.recvbuf);
 	fx->ss.wire.recvbuf = NULL;
 	mux_frame_ring_free(&fx->ss.unacked.ring, &fx->ss.pool);
 	fx->ss.unacked.frames = 0;
@@ -5107,14 +5908,21 @@ T_DECLARE_CASE(test_session_ack_trim_acks_feed_estimator)
 	fx.ss.unacked.last_ack_recv = 0;
 
 	const struct unacked_ack_result r = unacked_ack_trim(&fx.ss, 1);
-	T_EXPECT(r.ok);
-	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)0);
-	T_EXPECT_EQ(r.trimmed_bytes, sizeof(payload));
-	/* unacked stays decoupled from the estimator: no probe is started here. */
-	T_EXPECT_EQ(fx.ss.estimator.tx.sample, (size_t)0);
-	T_EXPECT(!fx.ss.estimator.ping_in_flight);
+	const bool r_ok = r.ok;
+	const size_t unacked_bytes = fx.ss.unacked.bytes;
+	const size_t trimmed_bytes = r.trimmed_bytes;
+	const size_t tx_sample = fx.ss.estimator.tx.sample;
+	const bool ping_in_flight = fx.ss.estimator.ping_in_flight;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	xs_teardown(&fx);
+
+	T_EXPECT(r_ok);
+	T_EXPECT_EQ(unacked_bytes, (size_t)0);
+	T_EXPECT_EQ(trimmed_bytes, sizeof(payload));
+	/* unacked stays decoupled from the estimator: no probe is started here. */
+	T_EXPECT_EQ(tx_sample, (size_t)0);
+	T_EXPECT(!ping_in_flight);
 }
 
 /* Manual mode (default: both auto_*_window flags false) must not probe the
@@ -5138,12 +5946,18 @@ T_DECLARE_CASE(test_session_ack_trim_manual_mode_skips_estimator)
 	fx.ss.unacked.bytes = sizeof(payload);
 	fx.ss.unacked.last_ack_recv = 0;
 
-	T_EXPECT(unacked_ack_trim(&fx.ss, 1).ok);
-	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)0);
-	T_EXPECT_EQ(fx.ss.estimator.tx.sample, (size_t)0);
-	T_EXPECT(!fx.ss.estimator.ping_in_flight);
+	const bool trim_ok = unacked_ack_trim(&fx.ss, 1).ok;
+	const size_t unacked_bytes = fx.ss.unacked.bytes;
+	const size_t tx_sample = fx.ss.estimator.tx.sample;
+	const bool ping_in_flight = fx.ss.estimator.ping_in_flight;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	xs_teardown(&fx);
+
+	T_EXPECT(trim_ok);
+	T_EXPECT_EQ(unacked_bytes, (size_t)0);
+	T_EXPECT_EQ(tx_sample, (size_t)0);
+	T_EXPECT(!ping_in_flight);
 }
 
 T_DECLARE_CASE(test_session_open_stream_enforces_limits)
@@ -5157,17 +5971,22 @@ T_DECLARE_CASE(test_session_open_stream_enforces_limits)
 
 	fx.ss.conf.max_halfopen = 1;
 	fx.ss.num_halfopen = 1;
-	T_EXPECT(session_open_stream(&fx.ss) == NULL);
+	const bool halfopen_limit_rejects = session_open_stream(&fx.ss) == NULL;
 
 	fx.ss.num_halfopen = 0;
 	fx.ss.conf.max_halfopen = 0;
 	fx.ss.conf.max_streams = 1;
 	existing = stream_new(&fx.ss, 3, true);
 	T_CHECK(existing != NULL);
-	T_EXPECT(sched_add_stream(&fx.ss, existing));
-	T_EXPECT(session_open_stream(&fx.ss) == NULL);
+	const bool add_existing_ok = sched_add_stream(&fx.ss, existing);
+	const bool max_streams_rejects = session_open_stream(&fx.ss) == NULL;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	xs_teardown(&fx);
+
+	T_EXPECT(halfopen_limit_rejects);
+	T_EXPECT(add_existing_ok);
+	T_EXPECT(max_streams_rejects);
 }
 
 T_DECLARE_CASE(test_session_open_stream_success_sets_default_send_window)
@@ -5180,11 +5999,16 @@ T_DECLARE_CASE(test_session_open_stream_success_sets_default_send_window)
 
 	struct mux_stream *const s = session_open_stream(&fx.ss);
 	T_CHECK(s != NULL);
-	T_EXPECT_EQ(s->id, (uint_least16_t)1);
-	T_EXPECT_EQ(s->send_window, (uint_least32_t)MUX_DEFAULT_SEND_WINDOW);
-	T_EXPECT(sched_find_stream(&fx.ss, s->id) == s);
+	const uint_least16_t s_id = s->id;
+	const uint_least32_t s_send_window = s->send_window;
+	const bool found_in_sched = sched_find_stream(&fx.ss, s->id) == s;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	xs_teardown(&fx);
+
+	T_EXPECT_EQ(s_id, (uint_least16_t)1);
+	T_EXPECT_EQ(s_send_window, (uint_least32_t)MUX_DEFAULT_SEND_WINDOW);
+	T_EXPECT(found_in_sched);
 }
 
 /* Regression: a received PONG must clear the estimator's ping_in_flight token
@@ -5219,21 +6043,23 @@ T_DECLARE_CASE(test_session_recv_pong_clears_ping_in_flight)
 		.stream_id = STREAMID_CTRL,
 		.extra = MUX_CTRL_PONG,
 	};
-	ringbuf_reset(fx.ss.wire.recvbuf);
-	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(fx.ss.wire.recvbuf, frame->len);
+	bytebuf_reset(fx.ss.wire.recvbuf);
+	memcpy(bytebuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(fx.ss.wire.recvbuf, frame->len);
 
 	session_recv_pong(&fx.ss, &hdr, frame->len);
 
-	T_EXPECT(!fx.ss.estimator.ping_in_flight);
-	/* Timer repeat must be restored to the keepalive interval, jittered
-	 * down into (keepalive * (1 - jitter), keepalive]. */
-	T_EXPECT(
-		fx.ss.w_keepalive.repeat > 48.0 &&
-		fx.ss.w_keepalive.repeat <= 60.0);
+	const bool no_ping_in_flight = !fx.ss.estimator.ping_in_flight;
+	const ev_tstamp keepalive_repeat = fx.ss.w_keepalive.repeat;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	mux_frame_put(&fx.ss.pool, frame);
 	xs_teardown(&fx);
+
+	T_EXPECT(no_ping_in_flight);
+	/* Timer repeat must be restored to the keepalive interval, jittered
+	 * down into (keepalive * (1 - jitter), keepalive]. */
+	T_EXPECT(keepalive_repeat > 48.0 && keepalive_repeat <= 60.0);
 }
 
 /* Any received PONG resets w_keepalive.repeat to the keepalive interval,
@@ -5263,21 +6089,23 @@ T_DECLARE_CASE(test_session_recv_pong_resets_keepalive_interval)
 		.stream_id = STREAMID_CTRL,
 		.extra = MUX_CTRL_PONG,
 	};
-	ringbuf_reset(fx.ss.wire.recvbuf);
-	memcpy(ringbuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
-	ringbuf_produce(fx.ss.wire.recvbuf, frame->len);
+	bytebuf_reset(fx.ss.wire.recvbuf);
+	memcpy(bytebuf_write_ptr(fx.ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(fx.ss.wire.recvbuf, frame->len);
 
 	session_recv_pong(&fx.ss, &hdr, frame->len);
 
-	T_EXPECT(!fx.ss.estimator.ping_in_flight);
-	/* Timer repeat must be set to the keepalive interval, jittered down
-	 * into (keepalive * (1 - jitter), keepalive]. */
-	T_EXPECT(
-		fx.ss.w_keepalive.repeat > 48.0 &&
-		fx.ss.w_keepalive.repeat <= 60.0);
+	const bool no_ping_in_flight = !fx.ss.estimator.ping_in_flight;
+	const ev_tstamp keepalive_repeat = fx.ss.w_keepalive.repeat;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	mux_frame_put(&fx.ss.pool, frame);
 	xs_teardown(&fx);
+
+	T_EXPECT(no_ping_in_flight);
+	/* Timer repeat must be set to the keepalive interval, jittered down
+	 * into (keepalive * (1 - jitter), keepalive]. */
+	T_EXPECT(keepalive_repeat > 48.0 && keepalive_repeat <= 60.0);
 }
 
 /* The sendbuf head is in-flight while send_blocked (TLS WANT_WRITE);
@@ -5305,11 +6133,14 @@ T_DECLARE_CASE(test_session_discard_keeps_blocked_inflight_head)
 	/* Mark the head as in flight; it must survive the discard. */
 	fx.ss.wire.send_blocked = true;
 	session_discard_stream_frames(&fx.ss, 5);
-	T_EXPECT(fx.ss.wire.sendbuf.head != NULL);
+	const bool head_survives = fx.ss.wire.sendbuf.head != NULL;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fx.ss.wire.send_blocked = false;
 	fx.ss.wire.tlsconn = NULL;
 	xs_teardown(&fx);
+
+	T_EXPECT(head_survives);
 #else /* WITH_TLS */
 	T_SKIP();
 #endif /* WITH_TLS */
@@ -5334,10 +6165,13 @@ T_DECLARE_CASE(test_session_discard_drops_blocked_head_without_tls)
 
 	fx.ss.wire.send_blocked = true;
 	session_discard_stream_frames(&fx.ss, 5);
-	T_EXPECT(fx.ss.wire.sendbuf.head == NULL);
+	const bool head_dropped = fx.ss.wire.sendbuf.head == NULL;
 
+	/* Teardown first so a failing assert can't leak the fixture. */
 	fx.ss.wire.send_blocked = false;
 	xs_teardown(&fx);
+
+	T_EXPECT(head_dropped);
 }
 
 /* Throughput benchmark */
@@ -5733,6 +6567,200 @@ T_DECLARE_BENCH(bench_mux_stream_throughput)
 			pred_drain_total, &ctx) == 0);
 }
 
+/* mux_stream_io_modify(): newly-added events must immediately deliver any
+ * already-satisfied condition (level-triggered semantics) and never re-deliver
+ * events that were already registered. */
+T_DECLARE_CASE(test_mux_stream_io_modify_delivers_ready_conditions)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	ss.loop = loop;
+
+	struct mux_stream s = {
+		.state = STREAM_ESTABLISHED,
+		.session = &ss,
+		.send_window = 64, /* stream_read_credit_avail() > 0 */
+	};
+	s.recvbuf = bytebuf_new(ss.max_payload);
+	T_CHECK(s.recvbuf != NULL);
+
+	mux_stream_io watcher;
+	mux_stream_io_init(&watcher, mux_api_cb, &s, EV_NONE);
+	watcher.loop = loop;
+	s.direct.w_io = &watcher;
+	s.is_direct = true;
+
+	/* Adding EV_WRITE to an established stream with send credit delivers an
+	 * immediate EV_WRITE; EV_READ is not ready (empty recvbuf, ESTABLISHED). */
+	ev_clear_pending(loop, &watcher);
+	mux_stream_io_modify(loop, &watcher, EV_READ | EV_WRITE);
+	int fed = ev_clear_pending(loop, &watcher);
+	const bool write_ready = (fed & EV_WRITE) != 0;
+	const bool read_not_ready = (fed & EV_READ) == 0;
+
+	/* Re-modifying with no newly-added bits delivers nothing. */
+	ev_clear_pending(loop, &watcher);
+	mux_stream_io_modify(loop, &watcher, EV_READ | EV_WRITE);
+	const int cleared_no_newbits = ev_clear_pending(loop, &watcher);
+
+	/* Buffered receive data makes EV_READ immediately ready on re-add, even
+	 * on an otherwise-open (ESTABLISHED) stream. */
+	watcher.events = EV_NONE;
+	const unsigned char rxbyte = 0;
+	memcpy(bytebuf_write_ptr(s.recvbuf), &rxbyte, 1);
+	bytebuf_produce(s.recvbuf, 1);
+	ev_clear_pending(loop, &watcher);
+	mux_stream_io_modify(loop, &watcher, EV_READ);
+	fed = ev_clear_pending(loop, &watcher);
+	const bool read_ready_buffered = (fed & EV_READ) != 0;
+	bytebuf_consume(s.recvbuf, 1);
+
+	/* A half-closed (CLOSE_WAIT) stream signals readable EOF: EV_READ is
+	 * immediately ready even with an empty recvbuf. */
+	watcher.events = EV_NONE;
+	s.state = STREAM_CLOSE_WAIT;
+	ev_clear_pending(loop, &watcher);
+	mux_stream_io_modify(loop, &watcher, EV_READ);
+	fed = ev_clear_pending(loop, &watcher);
+	const bool read_ready_closewait = (fed & EV_READ) != 0;
+	s.state = STREAM_ESTABLISHED;
+
+	/* EV_WRITE is suppressed when read credit is exhausted, even on a
+	 * send-eligible state: feeding a spurious EV_WRITE with zero credit would
+	 * busy-loop the caller. EV_READ is likewise not ready (empty recvbuf,
+	 * ESTABLISHED), so nothing is delivered. */
+	watcher.events = EV_NONE;
+	const uint_least32_t saved_send_window = s.send_window;
+	s.send_window = 0; /* stream_read_credit_avail() == 0 */
+	ev_clear_pending(loop, &watcher);
+	mux_stream_io_modify(loop, &watcher, EV_READ | EV_WRITE);
+	const int cleared_no_credit = ev_clear_pending(loop, &watcher);
+	s.send_window = saved_send_window;
+
+	/* A detached watcher (w->stream == NULL) delivers nothing. */
+	watcher.events = EV_NONE;
+	watcher.stream = NULL;
+	ev_clear_pending(loop, &watcher);
+	mux_stream_io_modify(loop, &watcher, EV_READ | EV_WRITE);
+	const int cleared_detached = ev_clear_pending(loop, &watcher);
+	watcher.stream = &s;
+
+	/* A received RST makes EV_READ immediately ready when it is re-added. */
+	watcher.events = EV_NONE;
+	s.rst_received = true;
+	ev_clear_pending(loop, &watcher);
+	mux_stream_io_modify(loop, &watcher, EV_READ);
+	fed = ev_clear_pending(loop, &watcher);
+	const bool read_ready_rst = (fed & EV_READ) != 0;
+
+	/* Clean up before the asserts so a failing check can't leak. */
+	bytebuf_free(s.recvbuf);
+	ev_loop_destroy(loop);
+
+	T_EXPECT(write_ready);
+	T_EXPECT(read_not_ready);
+	T_EXPECT_EQ(cleared_no_newbits, 0);
+	T_EXPECT(read_ready_buffered);
+	T_EXPECT(read_ready_closewait);
+	T_EXPECT_EQ(cleared_no_credit, 0);
+	T_EXPECT_EQ(cleared_detached, 0);
+	T_EXPECT(read_ready_rst);
+}
+
+/* mux_stream_io_modify(): a pending fed event for a bit the caller removes must
+ * not survive the modify (mirrors libev's ev_io_modify clearing pending). */
+T_DECLARE_CASE(test_mux_stream_io_modify_removed_bit_clears_pending)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	ss.loop = loop;
+
+	struct mux_stream s = {
+		.state = STREAM_ESTABLISHED,
+		.session = &ss,
+		.send_window = 64,
+	};
+	s.recvbuf = bytebuf_new(ss.max_payload);
+	T_CHECK(s.recvbuf != NULL);
+
+	mux_stream_io watcher;
+	mux_stream_io_init(&watcher, mux_api_cb, &s, EV_READ | EV_WRITE);
+	watcher.loop = loop;
+	s.direct.w_io = &watcher;
+	s.is_direct = true;
+
+	/* Stage a pending EV_WRITE (as the mux layer's ev_feed_event would), then
+	 * drop EV_WRITE from the watched set: the stale pending must be dropped. */
+	ev_feed_event(loop, &watcher, EV_WRITE);
+	mux_stream_io_modify(loop, &watcher, EV_READ);
+	const int after_remove = ev_clear_pending(loop, &watcher);
+
+	/* A pending event for a still-watched bit must survive an unrelated modify
+	 * (removing nothing). */
+	ev_feed_event(loop, &watcher, EV_READ);
+	mux_stream_io_modify(loop, &watcher, EV_READ);
+	const int kept_read = ev_clear_pending(loop, &watcher);
+
+	bytebuf_free(s.recvbuf);
+	ev_loop_destroy(loop);
+
+	T_EXPECT_EQ(after_remove & EV_WRITE, 0);
+	T_EXPECT((kept_read & EV_READ) != 0);
+}
+
+/* mux_transport_discard(): closes the detached transport's fd and clears it. */
+T_DECLARE_CASE(test_mux_transport_discard_closes_fd)
+{
+	int fds[2] = { -1, -1 };
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	struct mux_transport transport = {
+		.fd = fds[0],
+		.connect_started = 0,
+#if WITH_TLS
+		.tlsconn = NULL,
+#endif
+	};
+
+	mux_transport_discard(&transport);
+
+	const int transport_fd = transport.fd;
+	const bool fd_closed = fcntl(fds[0], F_GETFD) == -1 && errno == EBADF;
+
+	/* Close the surviving fd before the asserts so a failing check can't leak. */
+	(void)close(fds[1]);
+
+	T_EXPECT_EQ(transport_fd, -1);
+	T_EXPECT(fd_closed);
+}
+
+static bool set_callbacks_probe_on_accept(
+	void *data, const struct mux_session *ss, struct mux_stream *s)
+{
+	(void)data;
+	(void)ss;
+	(void)s;
+	return false;
+}
+
+/* mux_set_callbacks(): replaces the whole callback table by value. */
+T_DECLARE_CASE(test_mux_set_callbacks_replaces_callback_table)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx);
+	ss.callbacks = g_cli_callbacks;
+
+	struct mux_callbacks probe = g_cli_callbacks;
+	probe.on_accept = set_callbacks_probe_on_accept;
+	mux_set_callbacks(&ss, &probe);
+
+	T_EXPECT(ss.callbacks.on_accept == set_callbacks_probe_on_accept);
+	T_EXPECT(ss.callbacks.on_event == g_cli_callbacks.on_event);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_establish),
 	T_CASE(test_send_recv_small),
@@ -5749,6 +6777,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_simultaneous_close),
 	T_CASE(test_rst_from_client),
 	T_CASE(test_active_open_shutdown_before_synack),
+	T_CASE(test_shutdown_graceful),
 	T_CASE(test_interop_i1_non_syn_unknown_stream),
 	T_CASE(test_interop_i2_close_wait_push),
 	T_CASE(test_interop_i3_ack_fin_credit),
@@ -5790,6 +6819,10 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_mux_stream_send_queues_payload),
 	T_CASE(test_mux_stream_recv_reports_eagain_and_reset),
 	T_CASE(test_mux_stream_io_stop_clears_stream_binding),
+	T_CASE(test_mux_stream_io_modify_delivers_ready_conditions),
+	T_CASE(test_mux_stream_io_modify_removed_bit_clears_pending),
+	T_CASE(test_mux_transport_discard_closes_fd),
+	T_CASE(test_mux_set_callbacks_replaces_callback_table),
 	T_CASE(test_session_ack_trim_acks_feed_estimator),
 	T_CASE(test_session_ack_trim_manual_mode_skips_estimator),
 	T_CASE(test_session_open_stream_enforces_limits),
@@ -5799,7 +6832,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_session_discard_keeps_blocked_inflight_head),
 	T_CASE(test_session_discard_drops_blocked_head_without_tls),
 	/* Opt-in throughput benchmark (mux-over-TLS, loopback NIC); skipped by the
-	 * default run.  Select with `--run <ere>` or TESTING_FILTER. */
+	 * default run.  Select with `--bench <ere>` or TESTING_BENCH. */
 	T_BENCH(bench_mux_stream_throughput),
 	T_SUITE_END,
 };

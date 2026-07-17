@@ -44,8 +44,8 @@ void session_recv_pong(
 	size_t frame_size);
 
 /* Update session_window towards max(peer_stream_window,
- * ceil(window_bytes / MUX_WINDOW_UNIT), initial_frames).  No-op when
- * auto_session_window is false. */
+ * ceil(window_bytes / MUX_WINDOW_UNIT), initial_frames).  Unconditional: the
+ * callers gate on auto_session_window before calling. */
 void session_update_session_window(struct mux_session *ss, size_t window_bytes);
 
 #endif /* MUX_RECV_H */

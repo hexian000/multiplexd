@@ -54,34 +54,40 @@ struct sched_ctx {
  * emission (SYN, ACK/FIN) at scheduling time. */
 
 /* Free all streams; clear the ready queue, delay list, and stream table. */
-void sched_free_streams(struct mux_session *ss);
+void sched_free_streams(struct mux_session *restrict ss);
 
 /* Insert a stream into the table; returns false on alloc failure or duplicate ID. */
-bool sched_add_stream(struct mux_session *ss, struct mux_stream *s);
+bool sched_add_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s);
 
 /* Look up a stream by ID; returns NULL if not found. */
 struct mux_stream *
-sched_find_stream(struct mux_session *ss, uint_fast16_t stream_id);
+sched_find_stream(struct mux_session *restrict ss, uint_fast16_t stream_id);
 
 /* Return the next unused stream ID; returns STREAMID_CTRL when IDs are exhausted. */
-uint_least16_t sched_alloc_stream_id(struct mux_session *ss);
+uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss);
 
 /* Remove a stream from the coalescing delay list. */
-void sched_delay_remove(struct mux_session *ss, struct mux_stream *s);
+void sched_delay_remove(
+	struct mux_session *restrict ss, struct mux_stream *restrict s);
 
-/* Enqueue a stream onto the ready queue and arm the appropriate watcher. */
-void sched_wake(struct mux_session *ss, struct mux_stream *s);
+/* Route a stream to the scheduler. Before SESSION_ESTABLISHED it is just
+ * enqueued (the split queues are not active yet) and nothing is armed. Once
+ * ESTABLISHED, INIT/CLOSED streams go to the low-priority lifecycle queue (never
+ * the DRR ready queue) and others to the DRR ready queue, then the write path is
+ * armed via session_notify. */
+void sched_wake(struct mux_session *restrict ss, struct mux_stream *restrict s);
 
 /* React to the stream table's active (non-tombstone) count possibly having
  * just reached zero: initiate drain-shutdown, or arm the idle timer. Safe to
  * call whenever the table or tombstone count changes; a no-op when streams
  * remain active or the session isn't ESTABLISHED. */
-void sched_check_no_active_streams(struct mux_session *ss);
+void sched_check_no_active_streams(struct mux_session *restrict ss);
 
 /* Request a drain of the low-priority lifecycle queue: arm EV_WRITE (via
  * session_notify) when there is queued work and the sendbuf is clear.  Safe to
  * call unconditionally (self-guards on an occupied sendbuf or empty queue). */
-void sched_schedule(struct mux_session *ss);
+void sched_schedule(struct mux_session *restrict ss);
 
 /* Drain the low-priority lifecycle queue (INIT -> SYN batching, CLOSED ->
  * cleanup).  Run by session_on_send before it pumps. */
@@ -104,7 +110,7 @@ void sched_flush_ctrl(struct mux_session *restrict ss);
 
 /* Arm the coalescing timer if it is not already active.  Called when a
  * stream enters the delay list or when a deferred session ACK is pending. */
-void sched_coalesce_arm(struct mux_session *ss);
+void sched_coalesce_arm(struct mux_session *restrict ss);
 
 /* Initialise the w_coalesce watcher; called once in session_new. */
 void sched_init(struct mux_session *restrict ss);

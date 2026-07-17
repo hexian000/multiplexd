@@ -52,18 +52,22 @@ struct tls_connection;
 /* Wire Extra field counts window credit in units of this many bytes. */
 #define MUX_WINDOW_UNIT 16384u
 
-/* Initial per-stream send window before BDP estimation converges. */
+/* Auto stream/session receive-window floor (bytes) before BDP estimation
+ * converges: the smallest value the auto stream_window/session_window and the
+ * estimator's WNDSIZE_MIN are clamped up to. Despite the historical name it is
+ * not a send window -- stream_new sets each stream's send window from
+ * MUX_DEFAULT_SEND_WINDOW. */
 #define MUX_INITIAL_SEND_WINDOW 65536u
 
 /* The payload length is carried in a 16-bit wire field, so a full frame must
- * fit; and the send-window floor must admit one max-size frame, otherwise a
+ * fit; and the receive-window floor must admit one max-size frame, otherwise a
  * just-read frame could exceed every credit grant and never drain (deadlock). */
 static_assert(
 	MUX_MAX_PAYLOAD_SIZE <= UINT16_MAX,
 	"frame payload exceeds 16-bit length field");
 static_assert(
 	MUX_INITIAL_SEND_WINDOW >= MUX_MAX_PAYLOAD_SIZE,
-	"send-window floor must admit one max-size frame");
+	"receive-window floor must admit one max-size frame");
 
 /* Session identity length in bytes; transmitted as Base64 in the hello JSON. */
 #define MUX_SESSION_ID_LEN 16u
@@ -518,7 +522,9 @@ struct mux_transport {
  * connection.
  * @param[out] out Receives the detached transport.
  */
-void mux_transport_detach(struct mux_session *new_ss, struct mux_transport *out);
+void mux_transport_detach(
+	struct mux_session *restrict new_ss,
+	struct mux_transport *restrict out);
 
 /**
  * @brief Install a detached transport on a resumed session and complete the
@@ -529,15 +535,15 @@ void mux_transport_detach(struct mux_session *new_ss, struct mux_transport *out)
  * @param resume_seq Peer's resume sequence number.
  */
 void mux_resume_attach(
-	struct mux_session *ss, struct mux_transport *transport,
-	uint_least32_t resume_seq);
+	struct mux_session *restrict ss,
+	struct mux_transport *restrict transport, uint_least32_t resume_seq);
 
 /**
  * @brief Discard a detached transport that will not be installed.
  * @param[in] transport Transport to discard; closes the fd and frees the TLS
  * connection.
  */
-void mux_transport_discard(struct mux_transport *transport);
+void mux_transport_discard(struct mux_transport *restrict transport);
 
 /* --- Stream I/O watcher --- */
 
@@ -575,8 +581,12 @@ struct mux_stream_io {
  * @param[in] w Stream I/O watcher.
  * @note For passive-open streams this sends SYN|ACK and transitions to
  * ESTABLISHED.
+ * @return true if the watcher is now bound and will deliver events; false if the
+ * stream had already left every attachable state (a peer-triggerable race, e.g.
+ * a peer RST): the binding is severed (w->stream cleared) and no event will ever
+ * fire, so the caller must not keep waiting on @p w.
  */
-void mux_stream_io_start(struct ev_loop *loop, mux_stream_io *restrict w);
+bool mux_stream_io_start(struct ev_loop *loop, mux_stream_io *restrict w);
 
 /**
  * @brief Change the events a stream I/O watcher reports.
@@ -588,7 +598,12 @@ void mux_stream_io_modify(
 	struct ev_loop *loop, mux_stream_io *restrict w, int events);
 
 /**
- * @brief Deactivate a stream I/O watcher.
+ * @brief Permanently detach a stream I/O watcher from its stream.
+ * @note This is terminal, not a reversible pause: it severs the watcher from
+ * the stream (and the stream from the watcher), so the watcher cannot be
+ * re-armed with mux_stream_io_start afterwards. The application still owns the
+ * stream and must still mux_stream_close() it. To merely pause/resume delivery,
+ * use mux_stream_io_modify(loop, w, 0) instead.
  * @param loop Event loop.
  * @param[in] w Stream I/O watcher.
  */
@@ -630,7 +645,8 @@ uint_least16_t mux_stream_id(const struct mux_stream *s);
  * pool is exhausted before any data is queued.
  */
 int mux_stream_send(
-	struct mux_stream *s, const void *restrict buf, size_t *restrict len);
+	struct mux_stream *restrict s, const void *restrict buf,
+	size_t *restrict len);
 
 /**
  * @brief Copy up to *len bytes from the receive buffer.
@@ -658,8 +674,14 @@ void mux_stream_shutdown(struct mux_stream *s);
 /**
  * @brief Close with close(fd) semantics.
  * @param s Target stream.
- * @note Sends RST if the receive buffer has unread data; otherwise sends no
- * protocol frame (the caller must already have sent RST or FIN).
+ * @note Sends RST (abortive close) if the receive buffer has unread data;
+ * otherwise initiates a graceful FIN, as mux_stream_shutdown() does. No RST is
+ * sent for a stream that already received one -- spec §4.3.4 requires the
+ * receiver answer an RST with no frame at all -- so closing from an
+ * ECONNRESET notification is silent even with data still buffered.
+ * @note The caller relinquishes @p s: it must not be used again, and in direct
+ * mode mux_stream_recv() will not be called for it, so the library stops
+ * deferring the stream's final transition to that call.
  */
 void mux_stream_close(struct mux_stream *s);
 

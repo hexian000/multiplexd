@@ -147,16 +147,27 @@ void mux_drain(struct mux_session *ss)
 
 /* --- Stream I/O watcher --- */
 
-void mux_stream_io_start(struct ev_loop *loop, mux_stream_io *restrict w)
+bool mux_stream_io_start(struct ev_loop *loop, mux_stream_io *restrict w)
 {
-	stream_io_start(loop, w);
+	return stream_io_start(loop, w);
 }
 
 void mux_stream_io_modify(
 	struct ev_loop *loop, mux_stream_io *restrict w, const int events)
 {
+	const int removed = w->events & ~events;
 	const int added = events & ~w->events;
 	w->events = events;
+	/* A pending fed event for a bit the caller just removed must not fire
+	 * (mirrors libev's ev_io_modify clearing pending): drop the pending event
+	 * and re-feed only the bits still wanted. */
+	if (removed != 0) {
+		const int pending = ev_clear_pending(loop, w);
+		const int keep = pending & events;
+		if (keep != 0) {
+			ev_feed_event(loop, w, keep);
+		}
+	}
 	if (added == 0) {
 		return;
 	}
@@ -167,14 +178,12 @@ void mux_stream_io_modify(
 	}
 	int ready = 0;
 	if ((added & EV_READ) &&
-	    (ringbuf_readable(s->recvbuf) > 0 ||
+	    (bytebuf_readable(s->recvbuf) > 0 ||
 	     s->state == STREAM_CLOSE_WAIT || s->state == STREAM_CLOSING ||
 	     s->rst_received || s->aborted)) {
 		ready |= EV_READ;
 	}
-	if ((added & EV_WRITE) &&
-	    (s->state == STREAM_INIT || s->state == STREAM_ESTABLISHED ||
-	     s->state == STREAM_CLOSE_WAIT)) {
+	if ((added & EV_WRITE) && stream_can_send_data(s)) {
 		if (stream_read_credit_avail(s) > 0) {
 			ready |= EV_WRITE;
 		}
@@ -188,7 +197,11 @@ void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w)
 {
 	ev_clear_pending(loop, w);
 	struct mux_stream *const s = w->stream;
-	if (s != NULL) {
+	/* Only clear the direct union arm for an actually-direct stream: a
+	 * socket-mode stream's s->socket overlaps s->direct, so an unconditional
+	 * write would clobber socket.w_io (reachable when stream_io_start no-oped
+	 * on an unattachable stream, leaving is_direct false but w->stream bound). */
+	if (s != NULL && s->is_direct) {
 		s->direct.w_io = NULL;
 	}
 	w->stream = NULL;
@@ -216,8 +229,7 @@ int mux_stream_send(
 	struct mux_stream *restrict s, const void *restrict buf,
 	size_t *restrict len)
 {
-	if (s->state != STREAM_INIT && s->state != STREAM_ESTABLISHED &&
-	    s->state != STREAM_CLOSE_WAIT) {
+	if (!stream_can_send_data(s)) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -272,7 +284,7 @@ int mux_stream_recv(
 		return -1;
 	}
 
-	if (ringbuf_readable(s->recvbuf) == 0) {
+	if (bytebuf_readable(s->recvbuf) == 0) {
 		if (s->state != STREAM_CLOSE_WAIT &&
 		    s->state != STREAM_CLOSING) {
 			errno = EAGAIN;
@@ -287,17 +299,12 @@ int mux_stream_recv(
 		return 0; /* EOF */
 	}
 
-	const size_t cap = *len;
-	size_t copied = 0;
-	unsigned char *const dst = buf;
-
-	while (ringbuf_readable(s->recvbuf) > 0 && copied < cap) {
-		const size_t take =
-			MIN(cap - copied, ringbuf_readable(s->recvbuf));
-		memcpy(dst + copied, ringbuf_read_ptr(s->recvbuf), take);
-		ringbuf_consume(s->recvbuf, take);
-		copied += take;
-	}
+	/* struct bytebuf is a linear sliding window, so its readable bytes form a
+	 * single contiguous region; one copy of MIN(*len, readable) drains as much
+	 * as the caller's buffer holds -- no accumulation loop is needed. */
+	const size_t copied = MIN(*len, bytebuf_readable(s->recvbuf));
+	memcpy(buf, bytebuf_read_ptr(s->recvbuf), copied);
+	bytebuf_consume(s->recvbuf, copied);
 	ASSERT(s->buffered_bytes >= copied);
 	ASSERT(s->session->recv_buffered_bytes >= copied);
 	s->buffered_bytes -= (uint_least32_t)copied;
@@ -327,11 +334,18 @@ void mux_stream_close(struct mux_stream *s)
 	 * below cannot feed it a re-entrant EV_READ/EV_WRITE callback while the
 	 * caller is in the middle of relinquishing it (the mux library only ever
 	 * feeds this watcher EV_READ/EV_WRITE, never EV_ERROR). */
-	if (s->is_direct && s->direct.w_io != NULL) {
-		mux_stream_io_stop(s->direct.w_io->loop, s->direct.w_io);
+	if (s->is_direct) {
+		/* close(fd) semantics: the caller is relinquishing the stream and
+		 * will not call mux_stream_recv() again, so the close paths must not
+		 * keep deferring the final CLOSED transition to it. */
+		s->user_closed = true;
+		if (s->direct.w_io != NULL) {
+			mux_stream_io_stop(
+				s->direct.w_io->loop, s->direct.w_io);
+		}
 	}
 
-	if (ringbuf_readable(s->recvbuf) == 0) {
+	if (bytebuf_readable(s->recvbuf) == 0) {
 		/* No unread data: initiate graceful FIN. */
 		stream_shutdown(s);
 		return;
