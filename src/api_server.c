@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <locale.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -55,8 +56,11 @@ struct api_ctx {
 	bool hdr_done : 1;
 	bool keepalive : 1;
 	bool content_length_seen : 1;
-	/* Connection header value */
-	char connection[32];
+	/* Sticky OR of connection_has_close() over every Connection header, set
+	 * at parse time.  Replaces a fixed value buffer so neither a token list
+	 * longer than the buffer (dropping a trailing "close") nor a repeated
+	 * list-valued Connection header (RFC 7230 3.2.2) can lose the token. */
+	bool close_requested : 1;
 	size_t wpos;
 	/* parsed Content-Length from the request; 0 when absent */
 	size_t content_length;
@@ -93,7 +97,7 @@ static void api_ctx_reset(struct ev_loop *loop, struct api_ctx *restrict ctx)
 	ctx->hdr_done = false;
 	ctx->keepalive = false;
 	ctx->content_length_seen = false;
-	ctx->connection[0] = '\0';
+	ctx->close_requested = false;
 	ctx->content_length = 0;
 	BUF_RESET(ctx->wbuf);
 	VBUF_RESET(ctx->cbuf);
@@ -352,7 +356,9 @@ static double process_load(void)
 		const int_fast64_t total =
 			TIMESPEC_DIFF(monotime, last.monotime);
 		const int_fast64_t busy = TIMESPEC_DIFF(cputime, last.cputime);
-		if (busy > 0 && total > 0) {
+		/* total > 0 guards the division; busy == 0 is a legitimate 0.000%
+		 * load, not "unknown", so admit it too. */
+		if (busy >= 0 && total > 0) {
 			load = (double)busy / (double)total;
 		}
 	}
@@ -437,17 +443,15 @@ static void append_sessions(
 			VBUF_APPENDF(ctx->cbuf, "%-20s: offline\n", id);
 			continue;
 		}
+		FORMAT_BYTES(rx_str, t->rx_window);
+		FORMAT_BYTES(tx_str, t->tx_window);
 		if (t->rtt_ns > 0) {
-			FORMAT_BYTES(rx_str, t->rx_window);
-			FORMAT_BYTES(tx_str, t->tx_window);
 			FORMAT_DURATION(
 				rtt_str, make_duration_nanos(t->rtt_ns));
 			VBUF_APPENDF(
 				ctx->cbuf, "%-20s: W=Rx %s, Tx %s; RTT %s\n",
 				id, rx_str, tx_str, rtt_str);
 		} else {
-			FORMAT_BYTES(rx_str, t->rx_window);
-			FORMAT_BYTES(tx_str, t->tx_window);
 			VBUF_APPENDF(
 				ctx->cbuf, "%-20s: W=Rx %s, Tx %s\n", id,
 				rx_str, tx_str);
@@ -722,10 +726,10 @@ static struct vbuffer *append_stream_metrics(
 		"stream_fastopen_total", "counter",
 		"Total active-open streams whose first flight used SYN|PUSH",
 		"%" PRIuLEAST64, stats->num_stream_fastopen);
+	APPEND_METRIC_HDR(
+		"stream_establish_latency_seconds", "summary",
+		"Active-open stream establishment latency from SYN to SYN|ACK");
 	if (stats->stream_establish_count > 0) {
-		APPEND_METRIC_HDR(
-			"stream_establish_latency_seconds", "summary",
-			"Active-open stream establishment latency from SYN to SYN|ACK");
 		APPEND_METRIC_L(
 			"stream_establish_latency_seconds", "quantile=\"%s\"",
 			"%g", "0.5",
@@ -738,17 +742,10 @@ static struct vbuffer *append_stream_metrics(
 			"stream_establish_latency_seconds", "quantile=\"%s\"",
 			"%g", "0.99",
 			(double)stats->stream_establish_p99 * 1e-9);
-		APPEND_METRIC_VAL(
-			"stream_establish_latency_seconds_count",
-			"%" PRIuLEAST64, stats->num_stream_established);
-	} else {
-		APPEND_METRIC_HDR(
-			"stream_establish_latency_seconds", "summary",
-			"Active-open stream establishment latency from SYN to SYN|ACK");
-		APPEND_METRIC_VAL(
-			"stream_establish_latency_seconds_count",
-			"%" PRIuLEAST64, stats->num_stream_established);
 	}
+	APPEND_METRIC_VAL(
+		"stream_establish_latency_seconds_count", "%" PRIuLEAST64,
+		stats->num_stream_established);
 	return cbuf;
 }
 
@@ -808,25 +805,38 @@ static struct vbuffer *append_tunnel_metrics(
 	struct vbuffer *restrict cbuf,
 	const struct server_stats *restrict stats)
 {
-#define APPEND_TUNNEL_METRIC_F(name, help, type, line_fmt, keep_cond, ...)     \
-	do {                                                                   \
-		bool hdr = false;                                              \
-		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
-			const struct tunnel_stats *restrict t =                \
-				&stats->tunnels[i];                            \
-			if (!(keep_cond) || t->peer_identity == NULL) {        \
-				continue;                                      \
-			}                                                      \
-			if (!hdr) {                                            \
-				APPEND_METRIC_HDR(name, type, help);           \
-				hdr = true;                                    \
-			}                                                      \
-			char esc_id[IDENTITY_ESCAPED_MAX];                     \
-			escape_identity(                                       \
-				esc_id, sizeof(esc_id), t->peer_identity,      \
-				ESCAPE_METRIC);                                \
-			VBUF_APPENDF(cbuf, line_fmt, __VA_ARGS__);             \
-		}                                                              \
+/* Emit a paired rx/tx sample (one series per direction) for every kept
+ * tunnel. The metric name is spelled once (@p name): the header and both
+ * sample lines all derive their "multiplexd_<name>" prefix from it via the
+ * runtime %s, so # TYPE and the samples cannot silently diverge. @p valfmt is
+ * the value's printf conversion (a string literal, e.g. "%zu"). */
+#define APPEND_TUNNEL_METRIC_RXTX(                                                     \
+	name, help, type, valfmt, keep_cond, rx_val, tx_val)                           \
+	do {                                                                           \
+		bool hdr = false;                                                      \
+		for (size_t i = 0; i < stats->num_tunnels; i++) {                      \
+			const struct tunnel_stats *restrict t =                        \
+				&stats->tunnels[i];                                    \
+			if (!(keep_cond) || t->peer_identity == NULL) {                \
+				continue;                                              \
+			}                                                              \
+			if (!hdr) {                                                    \
+				APPEND_METRIC_HDR(name, type, help);                   \
+				hdr = true;                                            \
+			}                                                              \
+			char esc_id[IDENTITY_ESCAPED_MAX];                             \
+			escape_identity(                                               \
+				esc_id, sizeof(esc_id), t->peer_identity,              \
+				ESCAPE_METRIC);                                        \
+			VBUF_APPENDF(                                                  \
+				cbuf,                                                  \
+				"multiplexd_%s{identity=\"%s\",tunnel=\"%" PRIuLEAST64 \
+				"\",direction=\"rx\"} " valfmt "\n"                    \
+				"multiplexd_%s{identity=\"%s\",tunnel=\"%" PRIuLEAST64 \
+				"\",direction=\"tx\"} " valfmt "\n",                   \
+				name, esc_id, t->tunnel_index, (rx_val), name,         \
+				esc_id, t->tunnel_index, (tx_val));                    \
+		}                                                                      \
 	} while (0)
 
 #define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val, keep_cond)      \
@@ -854,48 +864,29 @@ static struct vbuffer *append_tunnel_metrics(
 		}                                                              \
 	} while (0)
 
-	APPEND_TUNNEL_METRIC_F(
+	APPEND_TUNNEL_METRIC_RXTX(
 		"session_bytes_total",
 		"Wire bytes on the mux link per identity session", "counter",
-		"multiplexd_session_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %" PRIuLEAST64 "\n"
-		"multiplexd_session_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %" PRIuLEAST64 "\n",
-		true, esc_id, t->tunnel_index, t->byt_mux_recv, esc_id,
-		t->tunnel_index, t->byt_mux_sent);
-	APPEND_TUNNEL_METRIC_F(
+		"%" PRIuLEAST64, true, t->byt_mux_recv, t->byt_mux_sent);
+	APPEND_TUNNEL_METRIC_RXTX(
 		"session_payload_bytes_total",
 		"PUSH-frame payload bytes on the mux link per identity session",
-		"counter",
-		"multiplexd_session_payload_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %" PRIuLEAST64 "\n"
-		"multiplexd_session_payload_bytes_total{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %" PRIuLEAST64 "\n",
-		true, esc_id, t->tunnel_index, t->byt_push_recv, esc_id,
-		t->tunnel_index, t->byt_push_sent);
-	APPEND_TUNNEL_METRIC_F(
+		"counter", "%" PRIuLEAST64, true, t->byt_push_recv,
+		t->byt_push_sent);
+	APPEND_TUNNEL_METRIC_RXTX(
 		"session_window_bytes",
-		"Per-stream window size per identity session", "counter",
-		"multiplexd_session_window_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %zu\n"
-		"multiplexd_session_window_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %zu\n",
-		t->established, esc_id, t->tunnel_index, t->rx_window, esc_id,
-		t->tunnel_index, t->tx_window);
+		"Per-stream window size per identity session", "gauge", "%zu",
+		t->established, t->rx_window, t->tx_window);
 	APPEND_TUNNEL_METRIC(
 		"session_rtt_seconds", "Round-trip time per identity session",
 		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9, t->established);
-	APPEND_TUNNEL_METRIC_F(
+	APPEND_TUNNEL_METRIC_RXTX(
 		"session_bdp_bytes",
-		"Bandwidth-delay product per identity session", "gauge",
-		"multiplexd_session_bdp_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"rx\"} %zu\n"
-		"multiplexd_session_bdp_bytes{identity=\"%s\",tunnel=\"%" PRIuLEAST64
-		"\",direction=\"tx\"} %zu\n",
-		t->established && (t->bdp_rx != 0 || t->bdp_tx != 0), esc_id,
-		t->tunnel_index, t->bdp_rx, esc_id, t->tunnel_index, t->bdp_tx);
+		"Bandwidth-delay product per identity session", "gauge", "%zu",
+		t->established && (t->bdp_rx != 0 || t->bdp_tx != 0), t->bdp_rx,
+		t->bdp_tx);
 
-#undef APPEND_TUNNEL_METRIC_F
+#undef APPEND_TUNNEL_METRIC_RXTX
 #undef APPEND_TUNNEL_METRIC
 
 	return cbuf;
@@ -916,6 +907,16 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	VBUF_RESET(ctx->cbuf);
 	struct vbuffer *restrict cbuf = ctx->cbuf;
 
+	/* Force LC_NUMERIC=C for the duration: init() runs setlocale(LC_ALL, ""),
+	 * so a comma-decimal operator locale (de_DE, fr_FR, ...) would make the six
+	 * stdio %f/%g samples below emit "1234,567", which Prometheus's value lexer
+	 * rejects -- failing the entire scrape. Same class as the Date header's
+	 * LC_TIME hazard. newlocale("C") is effectively infallible; on the off
+	 * chance it fails, fall back to the environment locale rather than error. */
+	const locale_t c_numeric = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+	const locale_t saved_locale =
+		c_numeric != (locale_t)0 ? uselocale(c_numeric) : (locale_t)0;
+
 	cbuf = append_gauge_metrics(cbuf, stats, uptime);
 	cbuf = append_stream_metrics(cbuf, stats);
 	cbuf = append_connection_metrics(cbuf, stats);
@@ -930,6 +931,11 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		}
 	}
 
+	if (c_numeric != (locale_t)0) {
+		(void)uselocale(saved_locale);
+		freelocale(c_numeric);
+	}
+
 	ctx->cbuf = cbuf;
 	if (VBUF_HAS_OOM(ctx->cbuf)) {
 		free(stats);
@@ -939,7 +945,6 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	respond_ok(
 		ctx, "text/plain; version=0.0.4; charset=utf-8",
 		ctx->cbuf->len);
-	/* body is in cbuf; send_cb will follow up with cbuf after wbuf */
 	free(stats);
 }
 
@@ -1044,6 +1049,35 @@ static void api_handle(struct api_ctx *restrict ctx)
 	respond_status(ctx, HTTP_NOT_FOUND);
 }
 
+/* True if the comma-separated Connection header value (RFC 7230 6.1) contains a
+ * case-insensitive "close" token, so that a token-list form such as
+ * "keep-alive, close" or "TE, close" is honored, not only a bare "close".
+ * Optional whitespace around the commas is trimmed. */
+static bool connection_has_close(const char *restrict value)
+{
+	const char *p = value;
+	while (*p != '\0') {
+		/* Skip leading OWS and empty (comma-only) list elements. */
+		while (*p == ' ' || *p == '\t' || *p == ',') {
+			p++;
+		}
+		const char *const start = p;
+		while (*p != '\0' && *p != ',') {
+			p++;
+		}
+		/* Trim trailing OWS from the [start, end) token. */
+		const char *end = p;
+		while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+			end--;
+		}
+		if ((size_t)(end - start) == 5 &&
+		    strncasecmp(start, "close", 5) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* Returns true if the connection should be kept alive after the response. */
 static bool api_should_keepalive(const struct api_ctx *restrict ctx)
 {
@@ -1051,8 +1085,7 @@ static bool api_should_keepalive(const struct api_ctx *restrict ctx)
 	if (version == NULL || strncmp(version, "HTTP/1.1", 8) != 0) {
 		return false;
 	}
-	return ctx->connection[0] == '\0' ||
-	       strcasecmp(ctx->connection, "close") != 0;
+	return !ctx->close_requested;
 }
 
 static void send_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
@@ -1170,12 +1203,10 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		if (key == NULL) {
 			ctx->hdr_done = true;
 		} else if (strcasecmp(key, "Connection") == 0) {
-			size_t vlen = strlen(value);
-			if (vlen >= sizeof(ctx->connection)) {
-				vlen = sizeof(ctx->connection) - 1;
-			}
-			(void)memcpy(ctx->connection, value, vlen);
-			ctx->connection[vlen] = '\0';
+			/* value points into the NUL-terminated rbuf, so parse it
+			 * now and accumulate: no truncation, and a repeated
+			 * Connection header combines instead of overwriting. */
+			ctx->close_requested |= connection_has_close(value);
 		} else if (strcasecmp(key, "Content-Length") == 0) {
 			/* RFC 7230 3.3.3: a second Content-Length is an
 			 * unrecoverable framing ambiguity, not "last one wins". */

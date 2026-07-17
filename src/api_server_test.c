@@ -679,6 +679,30 @@ static bool resp_date_is_english_imf_fixdate(const char *restrict buf)
 	"Connection: close\r\n"                                                \
 	"\r\n"
 
+#define REQ_HEALTHY_MULTI_TOKEN_CLOSE                                          \
+	"GET /healthy HTTP/1.1\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Connection: keep-alive, close\r\n"                                    \
+	"\r\n"
+
+/* A 34-octet token list whose trailing "close" lands past the old 32-byte
+ * value buffer; truncation to "...cl" dropped the token and held the socket. */
+#define REQ_HEALTHY_LONG_CLOSE                                                 \
+	"GET /healthy HTTP/1.1\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Connection: TE, Upgrade, HTTP2-Settings, close\r\n"                   \
+	"\r\n"
+
+/* RFC 7230 3.2.2: a repeated list-valued Connection header is the combined
+ * list; the pre-fix last-one-wins overwrite served "close" then "TE" as
+ * keep-alive. */
+#define REQ_HEALTHY_REPEATED_CLOSE                                             \
+	"GET /healthy HTTP/1.1\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Connection: close\r\n"                                                \
+	"Connection: TE\r\n"                                                   \
+	"\r\n"
+
 #define REQ_HEALTHY_HTTP10                                                     \
 	"GET /healthy HTTP/1.0\r\n"                                            \
 	"Host: test\r\n"                                                       \
@@ -732,6 +756,27 @@ static bool resp_date_is_english_imf_fixdate(const char *restrict buf)
 	"Content-Length: 9\r\n"                                                \
 	"\r\n"                                                                 \
 	"{bad json"
+
+/* A query component whose percent-encoding is invalid: url_query_component()'s
+ * unescape() rejects "%ZZ", exercising handle_stats()'s malformed-query 400. */
+#define REQ_STATS_MALFORMED_QUERY                                              \
+	"GET /stats?%ZZ HTTP/1.1\r\n"                                          \
+	"Host: test\r\n"                                                       \
+	"\r\n"
+
+/* PUT /config with neither Content-Length nor Transfer-Encoding reaches
+ * handle_config_put()'s 411 Length Required branch. */
+#define REQ_CONFIG_PUT_NO_LENGTH                                               \
+	"PUT /config HTTP/1.1\r\n"                                             \
+	"Host: test\r\n"                                                       \
+	"\r\n"
+
+/* PUT /config with an explicit empty body reaches the empty-body 400 branch. */
+#define REQ_CONFIG_PUT_EMPTY_BODY                                              \
+	"PUT /config HTTP/1.1\r\n"                                             \
+	"Host: test\r\n"                                                       \
+	"Content-Length: 0\r\n"                                                \
+	"\r\n"
 
 /* Helper — perform a single HTTP exchange on fx and fill rctx.
  * Returns 0 on success, -1 on timeout or error. */
@@ -787,12 +832,13 @@ T_DECLARE_CASE(test_healthy_get)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_GET);
+	/* Restore the locale and tear down before asserting so a failing T_EXPECT
+	 * can't skip either (rctx.buf is a stack buffer, safe to read afterward). */
+	(void)setlocale(LC_TIME, saved_locale[0] != '\0' ? saved_locale : "C");
+	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "Content-Length: 0"));
 	T_EXPECT(resp_date_is_english_imf_fixdate(rctx.buf));
-
-	(void)setlocale(LC_TIME, saved_locale[0] != '\0' ? saved_locale : "C");
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_stats_get_text)
@@ -804,6 +850,9 @@ T_DECLARE_CASE(test_stats_get_text)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_GET);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "text/plain"));
 	T_EXPECT(resp_contains(rctx.buf, "Sessions"));
@@ -816,8 +865,6 @@ T_DECLARE_CASE(test_stats_get_text)
 #endif
 	T_EXPECT(resp_contains(rctx.buf, "RST Frames"));
 	T_EXPECT(resp_contains(rctx.buf, "Stream Errors"));
-
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_stats_buffered_data_uses_configured_frame_size)
@@ -834,6 +881,10 @@ T_DECLARE_CASE(test_stats_buffered_data_uses_configured_frame_size)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_GET);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer and the expected/stale figures below derive only from
+	 * constants, so all are safe to read afterward). */
+	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 
 	char expect_tx[16];
@@ -848,8 +899,6 @@ T_DECLARE_CASE(test_stats_buffered_data_uses_configured_frame_size)
 	if (strcmp(expect_tx, stale_tx) != 0) {
 		T_EXPECT(!resp_contains(rctx.buf, stale_tx));
 	}
-
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_stats_get_nobanner)
@@ -861,12 +910,13 @@ T_DECLARE_CASE(test_stats_get_nobanner)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_GET_NOBANNER);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "text/plain"));
 	T_EXPECT(resp_contains(rctx.buf, "Server Time"));
 	T_EXPECT(!resp_contains(rctx.buf, "multiplexd "));
-
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_stats_post_text)
@@ -878,12 +928,13 @@ T_DECLARE_CASE(test_stats_post_text)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_POST);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "text/plain"));
 	T_EXPECT(resp_contains(rctx.buf, "Reconnects"));
 	T_EXPECT(resp_contains(rctx.buf, "Server Load"));
-
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_metrics_get)
@@ -895,6 +946,9 @@ T_DECLARE_CASE(test_metrics_get)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "text/plain; version=0.0.4"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_sessions "));
@@ -902,8 +956,6 @@ T_DECLARE_CASE(test_metrics_get)
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_stream_fastopen_total"));
 	T_EXPECT(resp_contains(
 		rctx.buf, "multiplexd_stream_establish_latency_seconds_count"));
-
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_not_found)
@@ -915,9 +967,10 @@ T_DECLARE_CASE(test_not_found)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_NOTFOUND_GET);
-	T_EXPECT_EQ(parse_status(rctx.buf), 404);
-
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
 	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 404);
 }
 
 T_DECLARE_CASE(test_method_not_allowed)
@@ -929,9 +982,10 @@ T_DECLARE_CASE(test_method_not_allowed)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_DELETE);
-	T_EXPECT_EQ(parse_status(rctx.buf), 405);
-
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
 	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 405);
 }
 
 /* Headers exceed HTTP_MAX_ENTITY with no terminator; server rejects with
@@ -984,9 +1038,14 @@ T_DECLARE_CASE(test_request_too_large)
 	/* Accept either a 413 or a connection reset before the response could be
 	 * read; aborting the oversized request is valid server behaviour. */
 	const int status = parse_status(rctx.buf);
+	/* Tear down before asserting so a failing T_EXPECT can't skip cleanup
+	 * (status is captured above; rctx.buf is a stack buffer, safe afterward). */
+	free(big_req);
+	apifx_teardown(&fx);
 	if (status > 0) {
 		T_EXPECT_EQ(status, 413);
 	}
+	return;
 
 cleanup:
 	free(big_req);
@@ -1004,15 +1063,17 @@ T_DECLARE_CASE(test_keepalive)
 
 	struct resp_wait_ctx rctx1;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx1, REQ_HEALTHY_GET);
-	T_EXPECT_EQ(parse_status(rctx1.buf), 200);
-	T_EXPECT(resp_contains(rctx1.buf, "keep-alive"));
 
 	/* Second request on the same connection */
 	struct resp_wait_ctx rctx2;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx2, REQ_HEALTHY_GET);
-	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
-
+	/* Teardown after the last exchange but before asserting so a failing
+	 * T_EXPECT can't skip it (both rctx buffers are stack buffers, safe to
+	 * read afterward). */
 	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx1.buf), 200);
+	T_EXPECT(resp_contains(rctx1.buf, "keep-alive"));
+	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
 }
 
 /* "Connection: close": server must close after sending the response. */
@@ -1025,19 +1086,103 @@ T_DECLARE_CASE(test_connection_close)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_CLOSE);
-	T_EXPECT_EQ(parse_status(rctx.buf), 200);
-	T_EXPECT(resp_contains(rctx.buf, "Connection: close"));
 
 	/* After the response the server must have closed srv_fd; expect EOF. */
 	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
-	if (wait_until(
-		    &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
-		    eof_wait_predicate, &ectx) != 0) {
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
+
+	/* Teardown after the last fx use (the EOF wait) but before asserting so a
+	 * failing T_EXPECT can't skip it; rctx.buf is a stack buffer and the EOF
+	 * result is captured above, both safe to read afterward. */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(rctx.buf, "Connection: close"));
+	if (!got_eof) {
 		T_LOG("expected EOF after Connection: close not received");
 		T_FAIL();
 	}
+}
+
+/* RFC 7230 6.1: "close" as one token in a Connection list ("keep-alive, close")
+ * must still close the connection; the pre-fix exact-string match treated the
+ * whole value as keep-alive. */
+T_DECLARE_CASE(test_connection_close_multi_token)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(
+		assert_exchange, &fx, &rctx, REQ_HEALTHY_MULTI_TOKEN_CLOSE);
+
+	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
 
 	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(rctx.buf, "Connection: close"));
+	if (!got_eof) {
+		T_LOG("expected EOF after multi-token Connection: close");
+		T_FAIL();
+	}
+}
+
+/* A "close" token past the old 32-byte value buffer must still close: the
+ * value is parsed at receipt now, not truncated into a fixed copy. */
+T_DECLARE_CASE(test_connection_close_long_token_list)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_LONG_CLOSE);
+
+	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
+
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(rctx.buf, "Connection: close"));
+	if (!got_eof) {
+		T_LOG("expected EOF after long-list Connection: close");
+		T_FAIL();
+	}
+}
+
+/* A repeated Connection header combines (RFC 7230 3.2.2): "close" then "TE"
+ * must close, not be overwritten to keep-alive by the last line. */
+T_DECLARE_CASE(test_connection_close_repeated_header)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_REPEATED_CLOSE);
+
+	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
+
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(rctx.buf, "Connection: close"));
+	if (!got_eof) {
+		T_LOG("expected EOF after repeated Connection: close");
+		T_FAIL();
+	}
 }
 
 T_DECLARE_CASE(test_stats_get_includes_identity_rows)
@@ -1301,6 +1446,117 @@ T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 	T_EXPECT(!resp_contains(rctx.buf, "BW=Rx"));
 }
 
+/* server_stats must count a tunnel that is both s->mux_tunnel and an identity-
+ * pool member exactly once: server_on_established pools every dialed tunnel
+ * whose peer identity matches an identity.listen key, mux_tunnel included, so
+ * without dedup it appears twice in tunnels[] and its streams/traffic/latency
+ * are aggregated twice into /stats and /metrics. */
+T_DECLARE_CASE(test_server_stats_dedups_mux_tunnel_in_identity_pool)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
+	T_CHECK(fx.srv.identities != NULL);
+	struct tunnel *const t = make_established_tunnel(&fx, "peer-dup", 3);
+	T_CHECK(t != NULL);
+	/* Same tunnel is both the top-level mux_tunnel and an identity-pool
+	 * member (teardown frees it once, via the pool). */
+	fx.srv.mux_tunnel = t;
+	struct identity_listener *const sl = calloc(1, sizeof(*sl));
+	T_CHECK(sl != NULL);
+	sl->peer_identity = "peer-dup";
+	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
+	T_CHECK(sl->tunnels != NULL);
+	sl->tunnels[0] = t;
+	sl->num_tunnels = 1;
+	{
+		void *slot = sl;
+		fx.srv.identities =
+			table_set(fx.srv.identities, sl->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
+
+	struct server_stats *const snap = server_stats(&fx.srv);
+	const size_t num_tunnels = snap != NULL ? snap->num_tunnels : 0;
+	free(snap);
+	fx.srv.mux_tunnel = NULL; /* freed via the pool by teardown */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(num_tunnels, (size_t)1);
+}
+
+/* /metrics float samples must use a '.' decimal separator regardless of
+ * LC_NUMERIC: the daemon's init() runs setlocale(LC_ALL, ""), and under a
+ * comma-decimal operator locale a stdio %g would emit "0,02", which Prometheus
+ * rejects, failing the whole scrape.  Best-effort like test_healthy_get: a
+ * comma-decimal locale must be installed to actually exercise the hazard, but
+ * the '.' assertion holds either way.  rtt = 20 ms -> session_rtt_seconds 0.02. */
+T_DECLARE_CASE(test_metrics_floats_use_c_numeric_locale)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
+	T_CHECK(fx.srv.identities != NULL);
+	struct identity_listener *const sl_rtt = calloc(1, sizeof(*sl_rtt));
+	T_CHECK(sl_rtt != NULL);
+	sl_rtt->peer_identity = "peer-loc";
+	struct tunnel *const restrict t1 =
+		make_established_tunnel(&fx, "peer-loc", 1);
+	T_CHECK(t1 != NULL);
+	struct mux_session *const ss = tunnel_session(t1);
+	ss->estimator.rtt = INT64_C(20000000); /* 20 ms */
+	session_publish_estimate(ss);
+	sl_rtt->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
+	T_CHECK(sl_rtt->tunnels != NULL);
+	sl_rtt->tunnels[0] = t1;
+	sl_rtt->num_tunnels = 1;
+	{
+		void *slot = sl_rtt;
+		fx.srv.identities = table_set(
+			fx.srv.identities, sl_rtt->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
+
+	/* Best-effort switch to a comma-decimal locale; a no-op if none is
+	 * installed (matching init()'s own silent fallback to "C"). */
+	const char *const prev_locale = setlocale(LC_NUMERIC, NULL);
+	char saved_locale[64] = { 0 };
+	if (prev_locale != NULL) {
+		(void)snprintf(
+			saved_locale, sizeof(saved_locale), "%s", prev_locale);
+	}
+	static const char *const comma_locales[] = {
+		"de_DE.utf8", "de_DE.UTF-8", "fr_FR.utf8", "nl_NL.utf8", NULL
+	};
+	for (const char *const *loc = comma_locales; *loc != NULL; loc++) {
+		if (setlocale(LC_NUMERIC, *loc) != NULL) {
+			break;
+		}
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	(void)setlocale(
+		LC_NUMERIC, saved_locale[0] != '\0' ? saved_locale : "C");
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_rtt_seconds{identity=\"peer-loc\",tunnel=\"1\"} 0.02"));
+}
+
 T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 {
 	struct apifx fx;
@@ -1348,6 +1604,70 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	T_EXPECT(resp_contains(
 		rctx.buf,
 		"multiplexd_session_window_bytes{identity=\"peer-win\",tunnel=\"1\",direction=\"tx\"} 65536"));
+	/* The window rises and falls, so the series is a gauge, not a counter --
+	 * a counter-typed gauge breaks rate()/increase() and reset detection. */
+	T_EXPECT(resp_contains(
+		rctx.buf, "# TYPE multiplexd_session_window_bytes gauge"));
+}
+
+/* Each tunnel series must expose samples under the exact name its # TYPE line
+ * declares. Guards against a metric name diverging between the header and the
+ * sample lines (a compile-clean break that would leave # TYPE naming a series
+ * with no samples and the samples carrying an untyped name). */
+T_DECLARE_CASE(test_metrics_session_counter_type_matches_samples)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	fx.srv.identities = table_new(&(struct table_opts){
+		.hash = TABLE_OPTS_STR.hash,
+		.eq = TABLE_OPTS_STR.eq,
+		.flags = TABLE_FAST,
+	});
+	T_CHECK(fx.srv.identities != NULL);
+	struct identity_listener *const sl = calloc(1, sizeof(*sl));
+	T_CHECK(sl != NULL);
+	sl->peer_identity = "peer-cnt";
+	struct tunnel *const restrict t1 =
+		make_established_tunnel(&fx, "peer-cnt", 1);
+	T_CHECK(t1 != NULL);
+	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
+	T_CHECK(sl->tunnels != NULL);
+	sl->tunnels[0] = t1;
+	sl->num_tunnels = 1;
+	{
+		void *slot = sl;
+		fx.srv.identities =
+			table_set(fx.srv.identities, sl->peer_identity, &slot);
+		T_CHECK(slot == NULL);
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it. */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	/* Both counter series (keep_cond is unconditionally true) must emit a
+	 * sample under the same name their # TYPE line declares. */
+	T_EXPECT(resp_contains(
+		rctx.buf, "# TYPE multiplexd_session_bytes_total counter"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_bytes_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"rx\"} "));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_bytes_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} "));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"# TYPE multiplexd_session_payload_bytes_total counter"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_payload_bytes_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"rx\"} "));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_payload_bytes_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} "));
 }
 
 /* A peer identity containing structural characters must be escaped in the
@@ -1470,12 +1790,12 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 
 	struct resp_wait_ctx rctx1;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx1, REQ_STATS_POST);
-	T_EXPECT_EQ(parse_status(rctx1.buf), 200);
-	T_EXPECT(resp_contains(rctx1.buf, "Mux Throughput"));
-	T_EXPECT(resp_contains(rctx1.buf, "Server Load"));
-	T_EXPECT(fx.srv.rate_tracker.is_set);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uint_least64_t)2048);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uint_least64_t)4096);
+	/* Capture the post-first-POST rate-tracker state before the counter
+	 * mutation and second POST below overwrite it, so these values can be
+	 * asserted after teardown rather than read from the freed fixture. */
+	const bool rt1_is_set = fx.srv.rate_tracker.is_set;
+	const uint_least64_t rt1_recv = fx.srv.rate_tracker.byt_mux_recv;
+	const uint_least64_t rt1_sent = fx.srv.rate_tracker.byt_mux_sent;
 
 	fx.srv.counters.traffic_byt_mux_recv = 3072;
 	fx.srv.counters.traffic_byt_mux_sent = 6144;
@@ -1484,13 +1804,24 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 
 	struct resp_wait_ctx rctx2;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx2, REQ_STATS_POST);
+	/* Capture the post-second-POST rate-tracker state before teardown. */
+	const uint_least64_t rt2_recv = fx.srv.rate_tracker.byt_mux_recv;
+	const uint_least64_t rt2_sent = fx.srv.rate_tracker.byt_mux_sent;
+
+	/* Teardown before asserting so a failing T_EXPECT can't skip it; the rctx
+	 * buffers are stack buffers and every fx field read is captured above. */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx1.buf), 200);
+	T_EXPECT(resp_contains(rctx1.buf, "Mux Throughput"));
+	T_EXPECT(resp_contains(rctx1.buf, "Server Load"));
+	T_EXPECT(rt1_is_set);
+	T_EXPECT_EQ(rt1_recv, (uint_least64_t)2048);
+	T_EXPECT_EQ(rt1_sent, (uint_least64_t)4096);
 	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
 	T_EXPECT(resp_contains(rctx2.buf, "Mux Throughput"));
 	T_EXPECT(resp_contains(rctx2.buf, "Server Load"));
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_recv, (uint_least64_t)3072);
-	T_EXPECT_EQ(fx.srv.rate_tracker.byt_mux_sent, (uint_least64_t)6144);
-
-	apifx_teardown(&fx);
+	T_EXPECT_EQ(rt2_recv, (uint_least64_t)3072);
+	T_EXPECT_EQ(rt2_sent, (uint_least64_t)6144);
 }
 
 T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
@@ -1509,13 +1840,14 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_reconnects_total 7"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_rst_sent_total 11"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_rst_recv_total 17"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_stream_errors_total 19"));
-
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_not_found_keepalive_followed_by_success)
@@ -1527,15 +1859,17 @@ T_DECLARE_CASE(test_not_found_keepalive_followed_by_success)
 
 	struct resp_wait_ctx rctx1;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx1, REQ_NOTFOUND_GET);
-	T_EXPECT_EQ(parse_status(rctx1.buf), 404);
-	T_EXPECT(resp_contains(rctx1.buf, "Connection: keep-alive"));
 
 	struct resp_wait_ctx rctx2;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx2, REQ_HEALTHY_GET);
+	/* Teardown after the last exchange but before asserting so a failing
+	 * T_EXPECT can't skip it (both rctx buffers are stack buffers, safe to
+	 * read afterward). */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx1.buf), 404);
+	T_EXPECT(resp_contains(rctx1.buf, "Connection: keep-alive"));
 	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
 	T_EXPECT(resp_contains(rctx2.buf, "Content-Length: 0"));
-
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_connection_close_on_non_keepalive_request)
@@ -1547,18 +1881,22 @@ T_DECLARE_CASE(test_connection_close_on_non_keepalive_request)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_HTTP10);
-	T_EXPECT_EQ(parse_status(rctx.buf), 200);
-	T_EXPECT(resp_contains(rctx.buf, "Connection: close"));
 
 	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
-	if (wait_until(
-		    &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
-		    eof_wait_predicate, &ectx) != 0) {
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
+
+	/* Teardown after the last fx use (the EOF wait) but before asserting so a
+	 * failing T_EXPECT can't skip it; rctx.buf is a stack buffer and the EOF
+	 * result is captured above, both safe to read afterward. */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(rctx.buf, "Connection: close"));
+	if (!got_eof) {
 		T_LOG("expected EOF after HTTP/1.0 request not received");
 		T_FAIL();
 	}
-
-	apifx_teardown(&fx);
 }
 
 /* A Transfer-Encoding this server cannot decode must be rejected (501) and
@@ -1574,17 +1912,21 @@ T_DECLARE_CASE(test_transfer_encoding_rejected)
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(
 		assert_exchange, &fx, &rctx, REQ_TRANSFER_ENCODING_CHUNKED);
-	T_EXPECT_EQ(parse_status(rctx.buf), 501);
 
 	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
-	if (wait_until(
-		    &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
-		    eof_wait_predicate, &ectx) != 0) {
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
+
+	/* Teardown after the last fx use (the EOF wait) but before asserting so a
+	 * failing T_EXPECT can't skip it; rctx.buf is a stack buffer and the EOF
+	 * result is captured above, both safe to read afterward. */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 501);
+	if (!got_eof) {
 		T_LOG("expected EOF after rejected Transfer-Encoding request");
 		T_FAIL();
 	}
-
-	apifx_teardown(&fx);
 }
 
 /* A second Content-Length header is a framing ambiguity, not "last one
@@ -1599,17 +1941,21 @@ T_DECLARE_CASE(test_duplicate_content_length_rejected)
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(
 		assert_exchange, &fx, &rctx, REQ_DUPLICATE_CONTENT_LENGTH);
-	T_EXPECT_EQ(parse_status(rctx.buf), 400);
 
 	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
-	if (wait_until(
-		    &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
-		    eof_wait_predicate, &ectx) != 0) {
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
+
+	/* Teardown after the last fx use (the EOF wait) but before asserting so a
+	 * failing T_EXPECT can't skip it; rctx.buf is a stack buffer and the EOF
+	 * result is captured above, both safe to read afterward. */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
+	if (!got_eof) {
 		T_LOG("expected EOF after rejected duplicate Content-Length");
 		T_FAIL();
 	}
-
-	apifx_teardown(&fx);
 }
 
 /* A leading '+' is not part of RFC 7230's Content-Length = 1*DIGIT
@@ -1666,20 +2012,22 @@ T_DECLARE_CASE(test_malformed_url_path_rejected)
 	struct resp_wait_ctx rctx1;
 	T_CALL_SUBCASE(
 		assert_exchange, &fx, &rctx1, REQ_MALFORMED_URL_DOUBLE_SLASH);
-	T_EXPECT_EQ(parse_status(rctx1.buf), 400);
-	T_EXPECT(resp_contains(rctx1.buf, "Connection: keep-alive"));
 
 	struct resp_wait_ctx rctx2;
 	T_CALL_SUBCASE(
 		assert_exchange, &fx, &rctx2, REQ_MALFORMED_URL_NO_SLASH);
-	T_EXPECT_EQ(parse_status(rctx2.buf), 400);
 
 	/* Prove the server process and connection are both still healthy. */
 	struct resp_wait_ctx rctx3;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx3, REQ_HEALTHY_GET);
-	T_EXPECT_EQ(parse_status(rctx3.buf), 200);
-
+	/* Teardown after the last exchange but before asserting so a failing
+	 * T_EXPECT can't skip it (all rctx buffers are stack buffers, safe to
+	 * read afterward). */
 	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx1.buf), 400);
+	T_EXPECT(resp_contains(rctx1.buf, "Connection: keep-alive"));
+	T_EXPECT_EQ(parse_status(rctx2.buf), 400);
+	T_EXPECT_EQ(parse_status(rctx3.buf), 200);
 }
 
 T_DECLARE_CASE(test_config_get_returns_json)
@@ -1691,12 +2039,13 @@ T_DECLARE_CASE(test_config_get_returns_json)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_CONFIG_GET);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "application/json"));
 	T_EXPECT(resp_contains(
 		rctx.buf, "application/x-multiplexd-config; version=1"));
-
-	apifx_teardown(&fx);
 }
 
 T_DECLARE_CASE(test_config_put_malformed_body)
@@ -1708,9 +2057,58 @@ T_DECLARE_CASE(test_config_put_malformed_body)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_CONFIG_PUT_MALFORMED);
-	T_EXPECT_EQ(parse_status(rctx.buf), 400);
-
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
 	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
+}
+
+/* handle_stats() rejects a query component it cannot unescape with 400; the
+ * suite otherwise only sends the well-formed /stats?nobanner=1. */
+T_DECLARE_CASE(test_stats_malformed_query_rejected)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_MALFORMED_QUERY);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
+}
+
+/* PUT /config with no Content-Length (and no Transfer-Encoding) reaches the 411
+ * Length Required branch -- distinct from the chunked path, which 501s before
+ * dispatch. */
+T_DECLARE_CASE(test_config_put_no_content_length)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_CONFIG_PUT_NO_LENGTH);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 411);
+}
+
+/* PUT /config with Content-Length: 0 reaches the empty-body 400 branch ("a
+ * config body can never legitimately be empty"). */
+T_DECLARE_CASE(test_config_put_empty_body_rejected)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_CONFIG_PUT_EMPTY_BODY);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
 }
 
 /* A body over the old 8192-byte HTTP_MAX_ENTITY cap must now reach config
@@ -1746,11 +2144,12 @@ T_DECLARE_CASE(test_config_put_large_body_not_rejected_for_size)
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, req);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
 	/* Not 413: a >8KiB body must not be rejected purely for size. 400
 	 * because the config lacks a required transport. */
 	T_EXPECT_EQ(parse_status(rctx.buf), 400);
-
-	apifx_teardown(&fx);
 }
 
 /* Exercises the real server_apply_config() reload, so it needs a properly
@@ -1817,12 +2216,18 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_request_too_large),
 	T_CASE(test_keepalive),
 	T_CASE(test_connection_close),
+	T_CASE(test_connection_close_multi_token),
+	T_CASE(test_connection_close_long_token_list),
+	T_CASE(test_connection_close_repeated_header),
 	T_CASE(test_stats_get_includes_identity_rows),
 	T_CASE(test_healthy_offline),
 	T_CASE(test_healthy_escapes_control_chars_in_identity),
 	T_CASE(test_healthy_all_online),
 	T_CASE(test_stats_identity_shows_window_when_rtt_known),
+	T_CASE(test_server_stats_dedups_mux_tunnel_in_identity_pool),
 	T_CASE(test_metrics_reports_identity_window_bytes),
+	T_CASE(test_metrics_session_counter_type_matches_samples),
+	T_CASE(test_metrics_floats_use_c_numeric_locale),
 	T_CASE(test_metrics_escapes_special_chars_in_identity),
 	T_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity),
 	T_CASE(test_stats_post_tracks_rate_deltas),
@@ -1835,6 +2240,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_malformed_url_path_rejected),
 	T_CASE(test_config_get_returns_json),
 	T_CASE(test_config_put_malformed_body),
+	T_CASE(test_stats_malformed_query_rejected),
+	T_CASE(test_config_put_no_content_length),
+	T_CASE(test_config_put_empty_body_rejected),
 	T_CASE(test_config_put_large_body_not_rejected_for_size),
 	T_CASE(test_config_put_success),
 	T_SUITE_END,
