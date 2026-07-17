@@ -41,17 +41,23 @@ bool csv_unescape(char *restrict field);
  *          by null-terminating the field and unescaping it. No memory allocations are performed.
  *          The function handles both quoted and unquoted fields according to RFC 4180.
  * @param[inout] buf Pointer to the CSV data buffer. The buffer is modified in-place.
- * @param[out] field Pointer to store the parsed field string, or NULL if end of
- *             data is reached or more data is needed.
+ * @param[out] field Pointer to store the parsed field string, or NULL if the end
+ *             of data was reached with no field, more data is needed for a
+ *             complete quoted field, or the data was invalid.
  * @param[out] sep The delimiter that terminated the field, so the caller can tell
  *             a field separator from a record separator: ',' for a field
  *             separator, '\n' for a record separator (a lone LF or a CRLF, which
  *             is consumed as a single unit), '\r' for a lone-CR record separator,
  *             or '\0' when the field ran to the end of the buffer (the last
  *             field) or no field was produced.
- * @return Pointer to the start of the next field for continued parsing, or NULL if parsing failed
- *         due to invalid data. If the return value equals the input buf, more data is needed
- *         for a complete quoted field.
+ * @return The start of the next field for continued parsing (not equal to buf).
+ *         Equal to the input buf when more data is needed for a complete quoted
+ *         field (with `field` NULL). NULL when no next field is returned: for a
+ *         valid *last* field that ran to the end of the buffer (with `field`
+ *         set), or when no field is produced at all -- exhausted input or
+ *         invalid data (both with `field` NULL). The last-field case is told
+ *         apart by whether `field` was set, so a NULL return alone must not be
+ *         treated as an error.
  */
 char *
 csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep);

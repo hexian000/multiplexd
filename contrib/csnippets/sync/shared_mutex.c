@@ -15,7 +15,7 @@
 		assert(status == thrd_success);                                \
 	} while (0)
 
-int smtx_init(smtx_t *restrict mutex)
+int smtx_init(smtx_t *mutex)
 {
 	memset(mutex, 0, sizeof(*mutex));
 	int status = mtx_init(&mutex->state_mu, mtx_plain);
@@ -36,13 +36,7 @@ int smtx_init(smtx_t *restrict mutex)
 	return thrd_success;
 }
 
-static inline void notify_waiters(smtx_t *restrict mutex)
-{
-	THRD_ASSERT(cnd_signal(&mutex->exclusive_cond));
-	THRD_ASSERT(cnd_broadcast(&mutex->shared_cond));
-}
-
-int smtx_lock(smtx_t *restrict mutex)
+int smtx_lock(smtx_t *mutex)
 {
 	int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
@@ -58,7 +52,7 @@ int smtx_lock(smtx_t *restrict mutex)
 	return mtx_unlock(&mutex->state_mu);
 }
 
-int smtx_trylock(smtx_t *restrict mutex)
+int smtx_trylock(smtx_t *mutex)
 {
 	int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
@@ -76,7 +70,7 @@ int smtx_trylock(smtx_t *restrict mutex)
 	return mtx_unlock(&mutex->state_mu);
 }
 
-int smtx_unlock(smtx_t *restrict mutex)
+int smtx_unlock(smtx_t *mutex)
 {
 	int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
@@ -85,11 +79,22 @@ int smtx_unlock(smtx_t *restrict mutex)
 	assert(mutex->state.exclusive);
 	assert(mutex->state.shared_count == 0);
 	mutex->state.exclusive = false;
-	notify_waiters(mutex);
+	/* Clearing `exclusive` unblocks a writer (predicate exclusive ||
+	 * shared_count > 0) if one is queued, otherwise the readers (predicate
+	 * exclusive || exclusive_waiting > 0). The two are mutually exclusive: with
+	 * a writer queued the readers' predicate is still true, so a broadcast only
+	 * wakes them to re-wait (a thundering herd on a read-heavy lock); with none
+	 * queued nobody waits on exclusive_cond (a parked writer always holds an
+	 * un-decremented exclusive_waiting), so the signal is a no-op. */
+	if (mutex->state.exclusive_waiting > 0) {
+		THRD_ASSERT(cnd_signal(&mutex->exclusive_cond));
+	} else {
+		THRD_ASSERT(cnd_broadcast(&mutex->shared_cond));
+	}
 	return mtx_unlock(&mutex->state_mu);
 }
 
-int smtx_sharedlock(smtx_t *restrict mutex)
+int smtx_sharedlock(smtx_t *mutex)
 {
 	int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
@@ -102,7 +107,7 @@ int smtx_sharedlock(smtx_t *restrict mutex)
 	return mtx_unlock(&mutex->state_mu);
 }
 
-int smtx_trysharedlock(smtx_t *restrict mutex)
+int smtx_trysharedlock(smtx_t *mutex)
 {
 	int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
@@ -116,7 +121,7 @@ int smtx_trysharedlock(smtx_t *restrict mutex)
 	return mtx_unlock(&mutex->state_mu);
 }
 
-int smtx_sharedunlock(smtx_t *restrict mutex)
+int smtx_sharedunlock(smtx_t *mutex)
 {
 	int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
@@ -126,12 +131,17 @@ int smtx_sharedunlock(smtx_t *restrict mutex)
 	assert(mutex->state.shared_count > 0);
 	mutex->state.shared_count--;
 	if (mutex->state.shared_count == 0) {
-		notify_waiters(mutex);
+		/* Only a writer can be unblocked here: `exclusive` is already
+		 * false and `exclusive_waiting` is untouched, so every parked
+		 * reader's predicate is unchanged and broadcasting to them
+		 * would wake all of them only to re-wait -- a thundering herd
+		 * on a lock built for read-heavy use. */
+		THRD_ASSERT(cnd_signal(&mutex->exclusive_cond));
 	}
 	return mtx_unlock(&mutex->state_mu);
 }
 
-void smtx_destroy(smtx_t *restrict mutex)
+void smtx_destroy(smtx_t *mutex)
 {
 	mtx_destroy(&mutex->state_mu);
 	cnd_destroy(&mutex->shared_cond);

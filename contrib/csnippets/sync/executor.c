@@ -148,8 +148,17 @@ static bool enqueue(struct executor *e, const struct task *task)
 		e->queue.head = new_item;
 	}
 	e->queue.tail = new_item;
-	THRD_ASSERT(mtx_unlock(&e->mu));
+	/* Signal while still holding the lock, as executor_detach does below
+	 * and for the same reason: once the lock is released a concurrent
+	 * detach can let the workers drain this item, exit, and (as the last
+	 * one) free the executor, so touching e->cond after the unlock would be
+	 * a use-after-free. Note executor.h disclaims concurrent submit, and
+	 * this does not make that case safe on its own -- the mtx_lock above
+	 * can land on an already-freed executor just the same -- but it removes
+	 * the window that is ours to remove and matches the module's other
+	 * enqueue paths. */
 	THRD_ASSERT(cnd_signal(&e->cond));
+	THRD_ASSERT(mtx_unlock(&e->mu));
 	return true;
 }
 
@@ -162,8 +171,12 @@ void executor_join(struct executor *e)
 {
 	THRD_ASSERT(mtx_lock(&e->mu));
 	e->exit_flag = true;
-	THRD_ASSERT(mtx_unlock(&e->mu));
+	/* Broadcast under the lock, as enqueue and executor_detach do. On this
+	 * (non-detached) path no worker frees the executor, so the after-unlock
+	 * broadcast was safe -- but signalling under the lock keeps all five
+	 * notify sites in the module consistent and needs no such invariant. */
 	THRD_ASSERT(cnd_broadcast(&e->cond));
+	THRD_ASSERT(mtx_unlock(&e->mu));
 	const size_t nthreads = e->nthreads;
 	for (size_t i = 0; i < nthreads; i++) {
 		THRD_ASSERT(thrd_join(e->workers[i], NULL));
@@ -183,8 +196,12 @@ void executor_detach(struct executor *e)
 	THRD_ASSERT(mtx_lock(&e->mu));
 	e->exit_flag = true;
 	e->detached = true;
-	THRD_ASSERT(mtx_unlock(&e->mu));
+	/* Broadcast while still holding the lock: once the lock is released a
+	 * worker can observe exit_flag, exit, and (as the last one) free the
+	 * executor, so touching e->cond after the unlock would be a use-after-
+	 * free. */
 	THRD_ASSERT(cnd_broadcast(&e->cond));
+	THRD_ASSERT(mtx_unlock(&e->mu));
 	/* With workers, the last one to exit frees the executor; with none,
 	 * there is nobody to do it, so free it here. */
 	if (nthreads == 0) {

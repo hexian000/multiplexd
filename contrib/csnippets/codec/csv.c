@@ -62,26 +62,41 @@ int csv_escape(char *restrict buf, size_t maxlen, const char *restrict field)
  * quote; the transformed content is NUL-terminated at the closing quote.
  * Returns a pointer to the byte just after the closing quote in the original
  * buffer (which the caller inspects for the following separator), or NULL if
- * the closing quote is missing (an incomplete quoted field). */
+ * the closing quote is missing (an incomplete quoted field).
+ *
+ * The closing quote is located first, before anything is written, so an
+ * incomplete field (no closing quote yet) leaves the buffer byte-for-byte
+ * intact: csv_scanfield hands such a buffer back to a streaming caller that
+ * appends more data and retries, which only works if the retried buffer still
+ * begins with the opening quote and unshifted content. Rewriting in place
+ * before the field was known complete corrupted that retry. */
 static char *csv_unescape_quoted(char *restrict field)
 {
-	size_t w = 0;
-	for (size_t r = 1; field[r] != '\0'; r++) {
+	size_t end = 0;
+	for (size_t r = 1;; r++) {
+		if (field[r] == '\0') {
+			return NULL; /* ran off the buffer, no closing quote */
+		}
 		if (field[r] == '"') {
 			if (field[r + 1] == '"') {
-				/* doubled quote -> single quote */
-				field[w++] = '"';
-				r++;
+				r++; /* doubled quote: part of the content */
 				continue;
 			}
-			/* closing quote: terminate the transformed content and
-			 * report where the next field begins */
-			field[w] = '\0';
-			return &field[r + 1];
+			end = r; /* lone quote: the closing quote */
+			break;
+		}
+	}
+	/* the field is known complete: collapse doubled quotes in place up to
+	 * the closing quote and terminate the transformed content */
+	size_t w = 0;
+	for (size_t r = 1; r < end; r++) {
+		if (field[r] == '"') {
+			r++; /* skip the second quote of the doubled pair */
 		}
 		field[w++] = field[r];
 	}
-	return NULL; /* ran off the buffer without a closing quote */
+	field[w] = '\0';
+	return &field[end + 1];
 }
 
 bool csv_unescape(char *restrict field)
@@ -107,6 +122,7 @@ csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep)
 	}
 
 	const bool quoted = (*buf == '"');
+	bool unquoted_has_quote = false;
 	char *p;
 	if (quoted) {
 		/* unescape in place and locate the byte after the closing quote,
@@ -118,10 +134,25 @@ csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep)
 			*sep = '\0';
 			return buf;
 		}
+		/* the closing quote must be followed immediately by a field or
+		 * record separator (or end of data); stray bytes after it are
+		 * malformed input, not a new separator */
+		if (*p != '\0' && *p != ',' && *p != '\r' && *p != '\n') {
+			*field = NULL;
+			*sep = '\0';
+			return NULL;
+		}
 	} else {
-		/* unquoted field: stop at the first field/record separator */
+		/* unquoted field: stop at the first field/record separator, and in
+		 * the same pass flag a stray '"'. The loop already excludes ',',
+		 * '\r' and '\n', so once the field is NUL-terminated at its
+		 * separator a lone '"' is the only special character it can still
+		 * contain -- detecting it here spares a second full scan. */
 		p = buf;
 		while (*p && *p != ',' && *p != '\n' && *p != '\r') {
+			if (*p == '"') {
+				unquoted_has_quote = true;
+			}
 			p++;
 		}
 	}
@@ -145,9 +176,14 @@ csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep)
 	}
 
 	/* A quoted field was already unescaped and validated above; an unquoted
-	 * field (now NUL-terminated at its separator) must contain no stray
-	 * special characters. */
-	if (!quoted && !csv_unescape(*field)) {
+	 * field is malformed only if it holds a stray '"', flagged during the
+	 * scan above. */
+	if (unquoted_has_quote) {
+		/* clear the outputs like the quoted failure paths do; a NULL
+		 * return also means end of data, so leaving them set would make
+		 * a malformed last field indistinguishable from a valid one */
+		*field = NULL;
+		*sep = '\0';
 		return NULL; /* invalid field */
 	}
 
