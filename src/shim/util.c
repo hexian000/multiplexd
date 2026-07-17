@@ -29,6 +29,9 @@ bool csprng_bytes(unsigned char *buf, const size_t len)
 		LOGE_F("open /dev/urandom: (%d) %s", err, strerror(err));
 		return false;
 	}
+	/* fd is a read-only /dev/urandom handle: there are no buffered writes to
+	 * flush, so a close() error is not actionable -- the three (void)close(fd)
+	 * below intentionally discard it. */
 	size_t off = 0;
 	while (off < len) {
 		const ssize_t n = read(fd, buf + off, len - off);
@@ -53,10 +56,6 @@ bool csprng_bytes(unsigned char *buf, const size_t len)
 	return true;
 }
 
-/* RFC 1035: Section 2.3.4 */
-#define FQDN_MAX_LENGTH ((size_t)(255))
-#define ADDR_MAX_LENGTH (FQDN_MAX_LENGTH + sizeof(":65535"))
-
 /* Split addrstr into hoststr/portstr via buf (capacity buflen); false if
  * addrstr doesn't fit or has no valid host:port syntax. */
 static bool split_addr(
@@ -76,7 +75,7 @@ bool resolve_addr(
 	union sockaddr_max *restrict addr, const char *restrict addrstr,
 	const enum sa_resolve_type type)
 {
-	char buf[ADDR_MAX_LENGTH];
+	char buf[ADDR_MAX_STRLEN + 1];
 	char *hoststr, *portstr;
 	if (!split_addr(buf, sizeof(buf), addrstr, &hoststr, &portstr)) {
 		return false;
@@ -88,7 +87,7 @@ bool resolve_bindaddr(
 	union sockaddr_max *restrict addr, const char *restrict addrstr,
 	const enum sa_resolve_type type)
 {
-	char buf[ADDR_MAX_LENGTH];
+	char buf[ADDR_MAX_STRLEN + 1];
 	char *hoststr, *portstr;
 	if (!split_addr(buf, sizeof(buf), addrstr, &hoststr, &portstr)) {
 		return false;

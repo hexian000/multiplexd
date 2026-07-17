@@ -3,13 +3,12 @@
 
 /**
  * @file util.h
- * @brief Common utilities, globals, and helpers.
+ * @brief CSPRNG bytes, address resolution, and event/thread assertion macros.
  */
 
 #ifndef SHIM_UTIL_H
 #define SHIM_UTIL_H
 
-#include "net/addr.h"
 #include "os/socket.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
@@ -25,14 +24,22 @@
 #if WITH_THREADS
 #include <threads.h>
 
+/* The local is status_, not status: the macro's own declaration comes into
+ * scope before its initializer, so a plainer name would make THRD_ASSERT(f(x))
+ * read the macro's indeterminate local at any call site whose argument is
+ * spelled the same. A trailing underscore is unreserved in every scope, unlike
+ * a thrd_ prefix, which C11 7.31.15 keeps for <threads.h> itself. */
 #define THRD_ASSERT(expr)                                                      \
 	do {                                                                   \
-		const int status = (expr);                                     \
-		(void)status;                                                  \
-		assert(status == thrd_success);                                \
+		const int status_ = (expr);                                    \
+		(void)status_;                                                 \
+		assert(status_ == thrd_success);                               \
 	} while (0)
 #else /* WITH_THREADS */
-#define THRD_ASSERT(expr) ((void)(0))
+/* Still evaluate expr: the WITH_THREADS form above performs the call even under
+ * NDEBUG, so discarding it here would silently drop a lock or thread operation
+ * from a no-threads build. */
+#define THRD_ASSERT(expr) ((void)(expr))
 #endif /* WITH_THREADS */
 
 #define CHECK_REVENTS(revents, accept)                                         \
@@ -54,6 +61,15 @@
  * @return false if the entropy source could not be opened or read.
  */
 bool csprng_bytes(unsigned char *buf, size_t len);
+
+/* RFC 1035 Section 2.3.4: a fully-qualified domain name is at most 255 octets. */
+#define FQDN_MAX_LENGTH ((size_t)255)
+
+/* Longest accepted "host:port" address string, in octets excluding the NUL: a
+ * 255-octet FQDN plus ":65535". This is the single source of truth for the
+ * address-length limit -- conf.c's identity.listen check and every address
+ * "maxLength" in conf_schema.json must match it. */
+#define ADDR_MAX_STRLEN (FQDN_MAX_LENGTH + sizeof(":65535") - 1)
 
 bool resolve_addr(
 	union sockaddr_max *restrict addr, const char *restrict addrstr,

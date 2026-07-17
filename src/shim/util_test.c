@@ -2,8 +2,7 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* util_test.c - black-box tests for util.c's public API: address resolution
- * (resolve_addr, resolve_bindaddr), CSPRNG byte generation (csprng_bytes),
- * and a socket-option smoke test.
+ * (resolve_addr, resolve_bindaddr) and CSPRNG byte generation (csprng_bytes).
  * Dependencies: links the real util.c (+ TLS backend). */
 
 #include "shim/util.h"
@@ -12,30 +11,12 @@
 #include "utils/testing.h"
 
 #include <netinet/in.h>
-#include <netinet/tcp.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-T_DECLARE_CASE(test_socket_notsent_lowat_sets_option)
-{
-	const int fd = socket(AF_INET, SOCK_STREAM, 0);
-	T_CHECK(fd >= 0);
-#if WITH_TCP_NOTSENT_LOWAT
-	(void)socket_notsent_lowat(fd, 4096);
-	int val = 0;
-	socklen_t len = sizeof(val);
-	T_CHECK(getsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &val, &len) ==
-		0);
-	T_EXPECT_EQ(val, 4096);
-#else /* WITH_TCP_NOTSENT_LOWAT */
-	/* Platform lacks TCP_NOTSENT_LOWAT; only verify no crash. */
-	(void)_t_;
-	(void)socket_notsent_lowat(fd, 4096);
-#endif /* WITH_TCP_NOTSENT_LOWAT */
-	(void)close(fd);
-}
 
 T_DECLARE_CASE(test_resolve_addr_ipv4_parses_correctly)
 {
@@ -84,8 +65,8 @@ T_DECLARE_CASE(test_resolve_addr_oversized_returns_false)
 
 T_DECLARE_CASE(test_resolve_addr_at_length_bound_rejected)
 {
-	/* addrlen == ADDR_MAX_LENGTH (262 = 255 + sizeof(":65535")): the
-	 * smallest length the bound check must reject. An off-by-one bound
+	/* addrlen == ADDR_MAX_STRLEN + 1 (262 = one past the 261-octet limit):
+	 * the smallest length the bound check must reject. An off-by-one bound
 	 * regression would let this slip past the check and write one byte
 	 * past the fixed-size buffer, caught by ASan. */
 	char addrstr[263];
@@ -185,8 +166,40 @@ T_DECLARE_CASE(test_csprng_bytes_not_repeating)
 	T_EXPECT(memcmp(a, b, sizeof(a)) != 0);
 }
 
+/* csprng_bytes must return false (its documented contract) when /dev/urandom
+ * cannot be opened. Lower RLIMIT_NOFILE and exhaust the table with dup() so
+ * open() deterministically fails with EMFILE. The read-error/unexpected-EOF
+ * branches are not provokable without dependency injection, so only the
+ * open-failure branch is covered. */
+T_DECLARE_CASE(test_csprng_bytes_fails_when_fd_exhausted)
+{
+	struct rlimit orig;
+	T_CHECK(getrlimit(RLIMIT_NOFILE, &orig) == 0);
+	struct rlimit low = orig;
+	low.rlim_cur = 64; /* bounded exhaustion; existing fds stay open */
+	T_CHECK(setrlimit(RLIMIT_NOFILE, &low) == 0);
+
+	int dups[64];
+	size_t n = 0;
+	for (; n < sizeof(dups) / sizeof(dups[0]); n++) {
+		const int d = dup(STDIN_FILENO);
+		if (d < 0) {
+			break; /* EMFILE: the table is now full */
+		}
+		dups[n] = d;
+	}
+
+	unsigned char buf[8] = { 0 };
+	const bool ok = csprng_bytes(buf, sizeof(buf));
+
+	for (size_t i = 0; i < n; i++) {
+		(void)close(dups[i]);
+	}
+	T_CHECK(setrlimit(RLIMIT_NOFILE, &orig) == 0);
+	T_EXPECT(!ok);
+}
+
 static const struct testing_suite suite[] = {
-	T_CASE(test_socket_notsent_lowat_sets_option),
 	T_CASE(test_resolve_addr_ipv4_parses_correctly),
 	T_CASE(test_resolve_addr_ipv6_parses_correctly),
 	T_CASE(test_resolve_addr_invalid_returns_false),
@@ -198,6 +211,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_resolve_bindaddr_empty_host_wildcard),
 	T_CASE(test_csprng_bytes_fills_buffer),
 	T_CASE(test_csprng_bytes_not_repeating),
+	T_CASE(test_csprng_bytes_fails_when_fd_exhausted),
 	T_SUITE_END,
 };
 

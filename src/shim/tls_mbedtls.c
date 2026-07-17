@@ -50,8 +50,9 @@
 
 struct tls_ctx_impl {
 	/* Reference count: mbedTLS has no library-level refcount for the parsed
-	 * ssl_config, so siblings produced by tls_ctx_ref() share this struct and
-	 * the last tls_ctx_free() releases it.  Relaxed-atomic under threads. */
+	 * ssl_config, so siblings produced by tls_ctx_ref() and every live
+	 * connection (tls_conn_alloc) share this struct, and the last release
+	 * (tls_ctx_free / tls_conn_free) frees it.  Relaxed-atomic under threads. */
 #if WITH_THREADS
 	atomic_size_t refcount;
 #else
@@ -78,6 +79,11 @@ struct tls_ctx_impl {
 
 struct tls_conn_impl {
 	mbedtls_ssl_context ssl;
+	/* Owning context: mbedtls_ssl_setup() stores a raw pointer into ctx->conf
+	 * inside ssl, so the connection holds a reference (released in
+	 * tls_conn_free) to keep the config alive for its whole lifetime, matching
+	 * OpenSSL's SSL_new() up-ref of the SSL_CTX. */
+	struct tls_ctx_impl *ctx;
 	/* socket fd, or -1 for a buffered (memory-transport) connection */
 	int fd;
 	/* I/O event notifier; see struct tls_callback. */
@@ -138,6 +144,26 @@ const char *tls_version(void)
 	return "mbedTLS " MBEDTLS_VERSION_STRING;
 }
 
+/* mbedtls_x509_crt_parse[_file] returns 0 on full success, a negative mbedTLS
+ * error on total failure, or a positive count of certificates it could not
+ * parse in an otherwise-usable bundle. Log whichever applies -- LOG_MBEDERROR
+ * only renders negative codes, so a positive count must be reported directly --
+ * and return true iff the parse fully succeeded. */
+static bool tls_crt_parse_ok(const int ret)
+{
+	if (ret < 0) {
+		LOG_MBEDERROR(ERROR, "mbedtls_x509_crt_parse", ret);
+		return false;
+	}
+	if (ret > 0) {
+		LOGE_F("mbedtls_x509_crt_parse: %d certificate(s) could not be"
+		       " parsed",
+		       ret);
+		return false;
+	}
+	return true;
+}
+
 /* Load a PEM blob (text). mbedTLS parsers expect the trailing NUL byte to be
  * counted in the length. */
 static int
@@ -170,11 +196,7 @@ bool tls_load_cert(
 		ret = parse_cert_buffer(&c->own_cert, cert_data);
 		break;
 	}
-	if (ret != 0) {
-		LOG_MBEDERROR(ERROR, "mbedtls_x509_crt_parse", ret);
-		return false;
-	}
-	return true;
+	return tls_crt_parse_ok(ret);
 }
 
 bool tls_load_key(
@@ -251,8 +273,7 @@ bool tls_load_authcerts(
 			ret = parse_cert_buffer(&c->ca_chain, authcerts[i]);
 			break;
 		}
-		if (ret != 0) {
-			LOG_MBEDERROR(ERROR, "mbedtls_x509_crt_parse", ret);
+		if (!tls_crt_parse_ok(ret)) {
 			return false;
 		}
 		c->ca_chain_loaded = true;
@@ -340,25 +361,30 @@ static int *parse_ciphersuites(const char *restrict list)
 }
 
 /* Parse a comma-separated ALPN list into the NULL-terminated heap array
- * mbedtls_ssl_conf_alpn_protocols expects; uses RFC 4180 CSV so a name
- * may contain a comma when quoted.  Returns NULL on failure or empty list. */
-static char **parse_alpn(const char *restrict list)
+ * mbedtls_ssl_conf_alpn_protocols expects; uses RFC 4180 CSV so a name may
+ * contain a comma when quoted.  On success sets *out (NULL for a legitimately
+ * absent or all-empty list, else a heap array the caller frees) and returns
+ * true; returns false on OOM or a malformed list so context creation fails
+ * closed rather than silently dropping the operator's configured ALPN (matching
+ * the OpenSSL backend). */
+static bool parse_alpn(const char *restrict list, char ***restrict out)
 {
+	*out = NULL;
 	if (list == NULL || list[0] == '\0') {
-		return NULL;
+		return true;
 	}
 	/* csv_scanfield parses the buffer in-place, so work on a mutable copy. */
 	size_t cap = 0;
 	char *const work = dup_for_tokens(list, ',', &cap);
 	if (work == NULL) {
 		LOGOOM();
-		return NULL;
+		return false;
 	}
-	char **const out = calloc(cap, sizeof(*out));
-	if (out == NULL) {
+	char **const arr = calloc(cap, sizeof(*arr));
+	if (arr == NULL) {
 		LOGOOM();
 		free(work);
-		return NULL;
+		return false;
 	}
 	size_t k = 0;
 	for (char *p = work; p != NULL;) {
@@ -366,9 +392,24 @@ static char **parse_alpn(const char *restrict list)
 		/* ALPN is a flat comma-separated list, so the delimiter kind
 		 * (field vs record separator) is irrelevant; discard it. */
 		char sep;
+		/* csv_scanfield unescapes a quoted field in place and, for an
+		 * empty quoted field ("") it later rejects, zeroes the field's
+		 * first byte before returning its parse-error NULL.  Record
+		 * whether any input remained before the call so the guard below
+		 * cannot misread that clobbered byte as a clean end. */
+		const bool had_input = (*p != '\0');
 		char *const next = csv_scanfield(p, &field, &sep);
 		if (next == p) {
 			/* unterminated quoted field with no more data */
+			LOGW_F("malformed ALPN list '%s'", list);
+			goto fail;
+		}
+		if (field == NULL && next == NULL && had_input) {
+			/* csv_scanfield returns NULL for both a clean end and a
+			 * hard parse error (stray bytes after a closing quote,
+			 * or an invalid unquoted field); input remaining before
+			 * the call yet no field produced is the latter -- fail
+			 * closed instead of silently truncating the list. */
 			LOGW_F("malformed ALPN list '%s'", list);
 			goto fail;
 		}
@@ -378,25 +419,27 @@ static char **parse_alpn(const char *restrict list)
 				LOGOOM();
 				goto fail;
 			}
-			out[k++] = s;
+			arr[k++] = s;
 		}
 		p = next;
 	}
 	free(work);
 	if (k == 0) {
-		free(out);
-		return NULL;
+		/* All fields empty (e.g. ",,"): no protocols, but not an error. */
+		free(arr);
+		return true;
 	}
-	out[k] = NULL;
-	return out;
+	arr[k] = NULL;
+	*out = arr;
+	return true;
 
 fail:
 	for (size_t i = 0; i < k; i++) {
-		free(out[i]);
+		free(arr[i]);
 	}
-	free(out);
+	free(arr);
 	free(work);
-	return NULL;
+	return false;
 }
 
 static void tls_ctx_impl_init(struct tls_ctx_impl *restrict c)
@@ -442,6 +485,34 @@ static void tls_ctx_impl_free(struct tls_ctx_impl *restrict c)
 	free(c);
 }
 
+/* Take a reference on the shared parsed config. tls_ctx_ref() and every live
+ * connection (whose mbedtls_ssl_context holds a raw pointer into c->conf) hold
+ * one; the config outlives them all. */
+static void tls_ctx_impl_ref(struct tls_ctx_impl *restrict c)
+{
+#if WITH_THREADS
+	(void)atomic_fetch_add_explicit(&c->refcount, 1, memory_order_relaxed);
+#else
+	c->refcount++;
+#endif
+}
+
+/* Release a reference taken by tls_ctx_impl_ref(); the last owner frees c. */
+static void tls_ctx_impl_unref(struct tls_ctx_impl *restrict c)
+{
+#if WITH_THREADS
+	if (atomic_fetch_sub_explicit(&c->refcount, 1, memory_order_acq_rel) !=
+	    1) {
+		return;
+	}
+#else /* WITH_THREADS */
+	if (--c->refcount != 0) {
+		return;
+	}
+#endif /* WITH_THREADS */
+	tls_ctx_impl_free(c);
+}
+
 /* Verify callback: accept any CA-trusted certificate regardless of hostname.
  * Clears the CN-mismatch flag from the empty hostname passed to tls_client;
  * all other verification failures are preserved. */
@@ -467,17 +538,29 @@ static bool tls_pk_pair_matches(
 	unsigned char key_der[MBEDTLS_PK_MAX_PUBKEY_RAW_LEN + 64];
 	const int cert_len = mbedtls_pk_write_pubkey_der(
 		cert_pk, cert_der, sizeof(cert_der));
+	if (cert_len <= 0) {
+		LOG_MBEDERROR(
+			ERROR, "mbedtls_pk_write_pubkey_der (cert)", cert_len);
+		return false;
+	}
 	const int key_len =
 		mbedtls_pk_write_pubkey_der(key, key_der, sizeof(key_der));
-	if (cert_len <= 0 || key_len <= 0) {
+	if (key_len <= 0) {
+		LOG_MBEDERROR(
+			ERROR, "mbedtls_pk_write_pubkey_der (key)", key_len);
 		return false;
 	}
 	/* Both writers fill from the end of their buffer; see each function's
-	 * own doc comment in mbedtls/pk.h. */
-	return cert_len == key_len &&
-	       memcmp(cert_der + sizeof(cert_der) - (size_t)cert_len,
-		      key_der + sizeof(key_der) - (size_t)key_len,
-		      (size_t)cert_len) == 0;
+	 * own doc comment in mbedtls/pk.h. A genuine mismatch is diagnosed here so
+	 * the caller cannot misreport an export failure as "keys differ". */
+	if (cert_len != key_len ||
+	    memcmp(cert_der + sizeof(cert_der) - (size_t)cert_len,
+		   key_der + sizeof(key_der) - (size_t)key_len,
+		   (size_t)cert_len) != 0) {
+		LOGE("certificate and private key do not match");
+		return false;
+	}
+	return true;
 }
 #endif /* MBEDTLS_LEGACY_RNG */
 
@@ -525,11 +608,14 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 		return NULL;
 	}
 	/* MBEDTLS_SSL_PRESET_DEFAULT leaves conf->cert_profile at
-	 * mbedtls_x509_crt_profile_default (RSA >= 2048 bits; curves at or above
-	 * the 128-bit security level, excluding e.g. P-224), applied to the
-	 * peer's chain during verification. tls_verify_cert_strength_cb() in the
-	 * OpenSSL backend mirrors this floor so both backends accept/reject the
-	 * same certificates; keep the two in sync. */
+	 * mbedtls_x509_crt_profile_default (signature digest SHA-256/384/512 --
+	 * the SHA-3 family was added to this profile only in mbedTLS 4.2.0, above
+	 * the supported 3.6 LTS / 4.0 / 4.1 floor; RSA >= 2048 bits; curves at or
+	 * above the 128-bit security level, excluding e.g. P-224), applied to the
+	 * peer's chain during verification -- except the trust anchor, whose own
+	 * self-signature digest is not checked. tls_verify_cert_strength_cb() in
+	 * the OpenSSL backend mirrors this floor so both backends accept/reject
+	 * the same certificates; keep the two in sync. */
 	mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
 	mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
 	if (conf->kernel_offload) {
@@ -579,7 +665,8 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 	}
 #else /* MBEDTLS_LEGACY_RNG */
 	if (!tls_pk_pair_matches(&c->own_cert.pk, &c->own_key)) {
-		LOGE("certificate and private key do not match");
+		/* tls_pk_pair_matches already logged the specific cause (an
+		 * export error, or a genuine cert/key mismatch). */
 		tls_ctx_free(ctx);
 		return NULL;
 	}
@@ -607,7 +694,10 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 
 	/* ALPN list, shared by client (advertise) and server (select).  The
 	 * array must outlive the config, so it is retained on the context. */
-	c->alpn = parse_alpn(conf->alpn);
+	if (!parse_alpn(conf->alpn, &c->alpn)) {
+		tls_ctx_free(ctx);
+		return NULL;
+	}
 	if (c->alpn != NULL) {
 		const int alpn_ret = mbedtls_ssl_conf_alpn_protocols(
 			&c->conf, (const char **)c->alpn);
@@ -661,11 +751,7 @@ struct tls_context *tls_ctx_ref(struct tls_context *restrict ctx)
 	struct tls_ctx_impl *const c = tls_ctx_raw(ctx);
 	/* Share this parsed config; the returned handle aliases ctx but is freed
 	 * independently via tls_ctx_free() (last owner releases the struct). */
-#if WITH_THREADS
-	(void)atomic_fetch_add_explicit(&c->refcount, 1, memory_order_relaxed);
-#else
-	c->refcount++;
-#endif
+	tls_ctx_impl_ref(c);
 	return ctx;
 }
 
@@ -675,17 +761,7 @@ void tls_ctx_free(struct tls_context *restrict ctx)
 		return;
 	}
 	struct tls_ctx_impl *const c = tls_ctx_raw(ctx);
-#if WITH_THREADS
-	if (atomic_fetch_sub_explicit(&c->refcount, 1, memory_order_acq_rel) !=
-	    1) {
-		return;
-	}
-#else /* WITH_THREADS */
-	if (--c->refcount != 0) {
-		return;
-	}
-#endif /* WITH_THREADS */
-	tls_ctx_impl_free(c);
+	tls_ctx_impl_unref(c);
 }
 
 /* BIO callbacks: drive mbedtls over a non-blocking fd. */
@@ -791,6 +867,10 @@ static struct tls_conn_impl *tls_conn_alloc(struct tls_ctx_impl *restrict c)
 		free(conn);
 		return NULL;
 	}
+	/* ssl now holds a raw pointer into c->conf; keep the config alive for the
+	 * connection's whole lifetime (released in tls_conn_free). */
+	tls_ctx_impl_ref(c);
+	conn->ctx = c;
 	return conn;
 }
 
@@ -815,10 +895,12 @@ static struct tls_connection *tls_conn_new(
 	}
 	if (!is_server) {
 		/* mbedtls_ssl_set_hostname() must run before the handshake under
-		 * VERIFY_REQUIRED.  Pass the SNI (empty string omits the extension);
-		 * tls_ca_verify clears the CN-mismatch flag. */
-		const int ret = mbedtls_ssl_set_hostname(
-			&conn->ssl, c->sni != NULL ? c->sni : "");
+		 * VERIFY_REQUIRED.  Pass c->sni directly: NULL (no SNI configured)
+		 * sets the HOSTNAME_SET flag VERIFY_REQUIRED needs yet omits the
+		 * extension, whereas a non-NULL "" would emit a zero-length
+		 * server_name extension (RFC 6066 violation).  tls_ca_verify clears
+		 * the CN-mismatch flag. */
+		const int ret = mbedtls_ssl_set_hostname(&conn->ssl, c->sni);
 		if (ret != 0) {
 			LOG_MBEDERROR(WARNING, "mbedtls_ssl_set_hostname", ret);
 		}
@@ -1002,6 +1084,15 @@ enum tls_error tls_shutdown(struct tls_connection *restrict conn)
 		return TLS_ERROR_WANT_READ;
 	case MBEDTLS_ERR_SSL_WANT_WRITE:
 		return TLS_ERROR_WANT_WRITE;
+	case MBEDTLS_ERR_NET_CONN_RESET:
+	case MBEDTLS_ERR_NET_SEND_FAILED:
+	case MBEDTLS_ERR_NET_RECV_FAILED:
+		/* Classify transport failures during close_notify as
+		 * TLS_ERROR_SYSCALL, matching map_io_error() and the OpenSSL
+		 * backend rather than funnelling them to TLS_ERROR_SSL. A failed
+		 * shutdown is benign, so keep the DEBUG level both backends use. */
+		LOG_MBEDERROR(DEBUG, "mbedtls_ssl_close_notify", ret);
+		return TLS_ERROR_SYSCALL;
 	default:
 		LOG_MBEDERROR(DEBUG, "mbedtls_ssl_close_notify", ret);
 		return TLS_ERROR_SSL;
@@ -1017,6 +1108,9 @@ void tls_conn_free(struct tls_connection *conn)
 	mbedtls_ssl_free(&c->ssl);
 	free(c->in);
 	free(c->out);
+	/* Release the context reference taken in tls_conn_alloc() after the ssl
+	 * object (which pointed into ctx->conf) is torn down. */
+	tls_ctx_impl_unref(c->ctx);
 	free(c);
 }
 

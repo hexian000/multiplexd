@@ -390,6 +390,145 @@ static char test_expired_key_pem[] =
 	"9vYtZX+/TZoECntmdfMAnrnpJSLSXg==\n"
 	"-----END PRIVATE KEY-----\n";
 
+/* Sub-floor certificates for certificate-strength rejection tests, all issued
+ * by one strong CA (test_weak_floor_ca_cert_pem, RSA-2048 / SHA-256) so the
+ * trust anchor itself is always loadable; each leaf is below one leg of the
+ * floor both TLS backends must enforce. Generated with Python's cryptography
+ * library (like test_expired_cert_pem):
+ *  - test_weak_rsa_cert_pem: an RSA-1024 leaf (< TLS_RSA_MIN_BITS).
+ *  - test_weak_curve_cert_pem: an EC secp224r1 (P-224) leaf, a curve outside
+ *    mbedtls_x509_crt_profile_default's allowlist.
+ *  - test_weak_digest_cert_pem: an RSA-2048 leaf CA-signed with SHA-1
+ *    (< the SHA-256 digest floor); on a non-anchor leaf, since the floor
+ *    exempts a trust anchor's own self-signature. */
+static char test_weak_floor_ca_cert_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIIC4TCCAcmgAwIBAgIUGBYn8sMqRdA3UjyfuZ2W/yXI83IwDQYJKoZIhvcNAQEL\n"
+	"BQAwHzEdMBsGA1UEAwwUd2Vha2Zsb29yLWNhLmV4YW1wbGUwIBcNMjAwMTAxMDAw\n"
+	"MDAwWhgPMjA5OTAxMDEwMDAwMDBaMB8xHTAbBgNVBAMMFHdlYWtmbG9vci1jYS5l\n"
+	"eGFtcGxlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzber445ccuVT\n"
+	"iLGH8Q3Jo8XjLGMlPFLgWsbqFbQzp2/ZnEi0k8vljziAvIC4XggGkbsDYe3mtcK5\n"
+	"43QWY+joVhLVCh7KqLZfBbAHRropalSaWXvLk24OOmPssfsenqoU7jZUZbgJdCUJ\n"
+	"yepkduQhPAIcdjY5LcKMT15r3sTm3gNJ2LNVWtfxqzCmEDnlI5V0Dc5EqOkkUwWZ\n"
+	"V2rN0Nl1bcim8Oq/XgoP0C/v6fguqaW4wF+PoaAqBSqPb3HkBQRI4dVjsQw6O50+\n"
+	"v6nJy/lZTcnENQOBUANjZqu21fu7QCY4FGZVE79kM4ppVohqT3gghNNVGHZUPbOK\n"
+	"6obncZe+LQIDAQABoxMwETAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\n"
+	"A4IBAQDFZJbYX48YOW3lfprA7Bhtqgzn+/0jFLHlAOW+bu9qdm9n2yC6oNKOj8O/\n"
+	"Bg8W7FHaTyGJzrBKZJFLXc0Av1NKFAfTyEBYPnu6ErBqVNhPttWgnflOV4HW2lkm\n"
+	"uXRz9MiMPURYlHSvGnIQ9RssGfyohATLhbDYxVChBXeBylkE1cCSqal+0A7vB2PE\n"
+	"SXfm+un/FO0EAiZHNh9CDa/bP12zPIwZh9QJH5JcvKjT5X3p8jn3jJS8ahSOzzmD\n"
+	"6nyRxT2kCcAS+p8DBMb0uBppvFGJ4Jya2LQsC6nFy8LNuMSgyIzFJa0SmtBsbnIn\n"
+	"SfO9/ufhjD8dCX4cefuxSP8Hr4/l\n"
+	"-----END CERTIFICATE-----\n";
+
+static char test_weak_rsa_cert_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIICYzCCAUugAwIBAgIUBR0FjwQjzqpGR9qMXotgE/WeFPgwDQYJKoZIhvcNAQEL\n"
+	"BQAwHzEdMBsGA1UEAwwUd2Vha2Zsb29yLWNhLmV4YW1wbGUwIBcNMjAwMTAxMDAw\n"
+	"MDAwWhgPMjA5OTAxMDEwMDAwMDBaMBoxGDAWBgNVBAMMD3dlYWtyc2EuZXhhbXBs\n"
+	"ZTCBnzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEAvzD00cjecLaWIxtIq5E/zNgb\n"
+	"iaMvS0uEpMkXrQGOMH6TJdLP2uYybZHz9GIVCIzJK2O7VlFRjdSLGfXRAkXItScW\n"
+	"IhayOW0OO7F6IbjbmJDQe8qJ6jqwCR0xNgRMYynnvgzY0nNz4+MU3V5bOE9odwR+\n"
+	"Iyyt3xAeO9YZNffBy7kCAwEAAaMeMBwwGgYDVR0RBBMwEYIPd2Vha3JzYS5leGFt\n"
+	"cGxlMA0GCSqGSIb3DQEBCwUAA4IBAQC5e0p+dfHC5rWFFZD+AIld8zD/93gpKTjL\n"
+	"o43NhKAajERxheLNLcXl2J6Vi9G0P5ROzSCp1O/V/gKKlkGzSWdAUyjWNoRlMA4K\n"
+	"qfgV1dVvWX5QEv7hIyzYADUnqdNuM7uMpK82eDYmCxHoHcCDY4bgZWgo5VWEHp3h\n"
+	"ERHcJyOcr+4b3SrXGgHZAGDMnt22DdjbDkj3mFkY0QtUz4R5Kfy7o9227vsq29WB\n"
+	"gnge8ZF9/GNWTmX5SfQ7e2cgx1Hg2vEvZ8VLSt3DUDSzdjDrlaHJzlG6i81U5c6Y\n"
+	"xRyvCQZ3owKimsKRRDAU12aV5RyfgYJxq9861vzu/mFqWAuFvznt\n"
+	"-----END CERTIFICATE-----\n";
+
+static char test_weak_rsa_key_pem[] =
+	"-----BEGIN PRIVATE KEY-----\n"
+	"MIICdQIBADANBgkqhkiG9w0BAQEFAASCAl8wggJbAgEAAoGBAL8w9NHI3nC2liMb\n"
+	"SKuRP8zYG4mjL0tLhKTJF60BjjB+kyXSz9rmMm2R8/RiFQiMyStju1ZRUY3Uixn1\n"
+	"0QJFyLUnFiIWsjltDjuxeiG425iQ0HvKieo6sAkdMTYETGMp574M2NJzc+PjFN1e\n"
+	"WzhPaHcEfiMsrd8QHjvWGTX3wcu5AgMBAAECgYAAy+JpMU4D6C7N7KIr3MoIP2o1\n"
+	"85ER3jmqOhA4L0Z5Wz2frbYh8k2JeU8r2HC//V4lKSAxptsRHS6LKCP7v3Crlqcb\n"
+	"hWpn2fQxYRT/kPxDsuCGL6iqY7SPK8ZdyOvyUdtIO9fWAmzCumw6Ke2o8oVDx0f8\n"
+	"g9wAaeQG1TemYqjjgQJBAPyE8EHQ963+i0HCIa2dG0rRQNCNHeCzJ+rmjRywxd8C\n"
+	"BNNZtcEdh1+xOY6OJOgNHOP3dmzpbqNvgC0kwmhbYfECQQDB05w9+WMq280/imGV\n"
+	"P7knx9hX5j9YKRGlIN/17Phv15KpBVh3edn/NhQxfXxCliYKPbkVjct8NgZzDTRx\n"
+	"Ir5JAkAVCa5KjXJVGKPZcqcDo9cmQJC5z0fx9Hsa4uJWxZN2pOBqC0tNL3ybyFQX\n"
+	"QFhqzMzfYTqIkFobW6q+GBXqQ9LBAkB9/LV3Vy5NgngEUEejwrrwj6chY4lTHcbZ\n"
+	"ZegNq43E7QPol4/sgSjhCd7QWHe3tG9fgsVWrEdTIq7IhBHNZD75AkAj7rCUPWJF\n"
+	"O2tR7IbPsJ2MSGQ1QraVGSV9WUO4IBua7mk73FiLQD8N3MUQztYqvSzsH2Q3MuqT\n"
+	"FupzctYBSP0Z\n"
+	"-----END PRIVATE KEY-----\n";
+
+static char test_weak_curve_cert_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIICFDCB/aADAgECAhRvyBJ16XugsWG+mCGl0jv0RPqjxDANBgkqhkiG9w0BAQsF\n"
+	"ADAfMR0wGwYDVQQDDBR3ZWFrZmxvb3ItY2EuZXhhbXBsZTAgFw0yMDAxMDEwMDAw\n"
+	"MDBaGA8yMDk5MDEwMTAwMDAwMFowHDEaMBgGA1UEAwwRd2Vha2N1cnZlLmV4YW1w\n"
+	"bGUwTjAQBgcqhkjOPQIBBgUrgQQAIQM6AAT9GUnEHvz/FaaUWHF7P2Eb5NSCjRvq\n"
+	"nfIZHl7Ajd0c3P04/A6l6EbwLJukhBsscWjjIl1ZV928+qMgMB4wHAYDVR0RBBUw\n"
+	"E4IRd2Vha2N1cnZlLmV4YW1wbGUwDQYJKoZIhvcNAQELBQADggEBABgJRhtcoFq0\n"
+	"+Vonc5bcTbz0TRBlT9EPYfbT1tTFonlG/Cdje07eAQntCqjpaDpqQHqoMNUjQ/gE\n"
+	"fYvWwn/nhvtcgFQR5bLMJ84gWJ9dr32ae2IUxMgghYkD/TPDN92yC5+IZVtcSK4D\n"
+	"YYBoSFyQfi0Qs/4UTULUEEbBKTEIko6/a/Agkg+2E6d5DOa9orQsPVXmJAbTsJmM\n"
+	"J2DfABGMjOKowAqOprI8g+uJ4pCudjlZwStNC01DKrSaAUzhilNX0G9tyd+aNZmi\n"
+	"SMXNRt/vnbIMc07dwHgn1BVTSC+f0Cu2VuVSeg0j9La8I6ZuMCxGbBKSYTwvkhku\n"
+	"drg/RVvXTmw=\n"
+	"-----END CERTIFICATE-----\n";
+
+static char test_weak_curve_key_pem[] =
+	"-----BEGIN PRIVATE KEY-----\n"
+	"MHgCAQAwEAYHKoZIzj0CAQYFK4EEACEEYTBfAgEBBBzblD1Sx6w7H39EKuXs22cy\n"
+	"Z0x66gY0/gGpRn4eoTwDOgAE/RlJxB78/xWmlFhxez9hG+TUgo0b6p3yGR5ewI3d\n"
+	"HNz9OPwOpehG8CybpIQbLHFo4yJdWVfdvPo=\n"
+	"-----END PRIVATE KEY-----\n";
+
+static char test_weak_digest_cert_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIIC7TCCAdWgAwIBAgIUAv6IlOFRnGzlm6C/JPllDSX5jEgwDQYJKoZIhvcNAQEF\n"
+	"BQAwHzEdMBsGA1UEAwwUd2Vha2Zsb29yLWNhLmV4YW1wbGUwIBcNMjAwMTAxMDAw\n"
+	"MDAwWhgPMjA5OTAxMDEwMDAwMDBaMB0xGzAZBgNVBAMMEndlYWtkaWdlc3QuZXhh\n"
+	"bXBsZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANAGjnQDjN3wf84M\n"
+	"RXuADPIpCUI5SaBJXheOHJGXH0JxQoYehxHUlCsTbEIPpaiO5fRbCqVkzI64l0L1\n"
+	"1CbELJyQNVrNh58jcyGQLCoxfAC8cJg5f24E7EzZi0UMlUi8UEGukxYR57Cz/eqC\n"
+	"4dlmG+RkASoOkDPqbAD/lYGso0xxWa1ZhCHjgDdxWl1ewMf42ULNjgTH+M87tp0V\n"
+	"YM+r9ZWSjQWakfaQ/xZ501l3RK2YKDbPYXSh0ZCEXnYMFAF/EtHJkJ0wIA6Km3+2\n"
+	"pDCKENX9op9U2JNTDTtd/hkBdXwkyTfcB1/7BfsETZotBmgKcuynp/0n4rZ1C9BV\n"
+	"azTzBhcCAwEAAaMhMB8wHQYDVR0RBBYwFIISd2Vha2RpZ2VzdC5leGFtcGxlMA0G\n"
+	"CSqGSIb3DQEBBQUAA4IBAQB55+24R2B4C6oYLMqCsHlJOIscF+C1Oe0GKWWtUaPp\n"
+	"e50bDCyUebqaCg2G3BUWFFXJguukrzUsEs5Ht4MO+GSA6GAL4PMojZi2t/WtmNh2\n"
+	"TjSt5IcCmSqdBLpK82IEtu3YjALOGhtbWvsXFfM48OsYgMaD7PwGcZtB6k+1VEX8\n"
+	"KUh+ZuLrJWAX+aKSyMsd7U7C1QYSEt2Ui+eTEgn5FafDhmekse1jWY9fMvQcRfIV\n"
+	"+jqzv56y4cp48OezIlK4Mex6lU7soaBkvBIVv9p33UCVODL0iqf6ICoytrF5v6Ao\n"
+	"xKBOImm1GnSXwNWnonJcHCD9lzXhuexWqEw+TbQUlMyl\n"
+	"-----END CERTIFICATE-----\n";
+
+static char test_weak_digest_key_pem[] =
+	"-----BEGIN PRIVATE KEY-----\n"
+	"MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDQBo50A4zd8H/O\n"
+	"DEV7gAzyKQlCOUmgSV4XjhyRlx9CcUKGHocR1JQrE2xCD6WojuX0WwqlZMyOuJdC\n"
+	"9dQmxCyckDVazYefI3MhkCwqMXwAvHCYOX9uBOxM2YtFDJVIvFBBrpMWEeews/3q\n"
+	"guHZZhvkZAEqDpAz6mwA/5WBrKNMcVmtWYQh44A3cVpdXsDH+NlCzY4Ex/jPO7ad\n"
+	"FWDPq/WVko0FmpH2kP8WedNZd0StmCg2z2F0odGQhF52DBQBfxLRyZCdMCAOipt/\n"
+	"tqQwihDV/aKfVNiTUw07Xf4ZAXV8JMk33Adf+wX7BE2aLQZoCnLsp6f9J+K2dQvQ\n"
+	"VWs08wYXAgMBAAECggEAR8y7hldjW4cS1a9um/3Kehqn02+qdeRc0Yx/V9DtPSWS\n"
+	"bHBE9maE7Yk6qGJ2LwODYx+5QPTVlb0omDf5DZhQPYmYoMqnsMmvhzoXxEhoIGjq\n"
+	"A+B0lyij1rKPWznInN5CZSk4Izny2g6F6VdbVInlvqK1tCpqo0CaHo4YsDVB97PX\n"
+	"48zgoaYZhrKs2xzATm2t6v0oJlFESVpPTwgwj2KhZJOPmgghUOmtNh81e3oP6r9x\n"
+	"mmRwSZ/F3DFCbN275rV9cAgCY5mwS7UrcZqGZSSWx2O5lkRdM6ErCTJq5V3IPPYq\n"
+	"isaVa4eUrzaOg2ItGOOm2gebEXXN52n77GWhIl+qoQKBgQD84kx+pnuUrnI4Uc9s\n"
+	"AARlvHW1DgyOfmISN/LMaiRxUzVNB4MnjC26e+9iyGFMRkjgk7ydXkFsG7hth+TP\n"
+	"0prejBiQPoTt9Ac+Z47Do+0iCiNebIWVd2E93EfXEYcEy8LApUkrN66pdvIPwLtA\n"
+	"5nHJuZnzQz0GV5JayCyL1U3gEwKBgQDSlsF2ITKloTavFdFi3oWgj3+DdJDVE8wZ\n"
+	"W1E2SSeJP3TJxoDbK6fIQAq9CsaelFCiSpffrbZeh8ZMTkJUNCCAcaHDcPTw8dgp\n"
+	"0VTrpOOZgiumdNYDajBjSTRv00ZRD0lGzsUEPg/Jw+j7PFnRg2YNaE7hweuXozLf\n"
+	"In0xT8qqbQKBgArjm7Oga5XdZSGztCDMZ2QSF2dycWv5WTO7oQLYVzViBduJRUaA\n"
+	"rL9o8sfoJPhp1l2FPwvvsRV8pBZjUaD5Sp3mnnAnoQW2ClHPl8Ao4N8kXJ2GQsJK\n"
+	"368QOy+xm4TDWWF+PIZV4Xl+m7G99NI4mhG7ojttW8VYI/8wu2pSBwZtAoGAZxrG\n"
+	"l6bDXFKlKm39OXIHbMg1P1BYBOsPd669AV4pzEnUTWIx/pzOJf4tA8d93XByVjM9\n"
+	"TpeHfZruXLfIQ9/NtfVspPruAfX2xuqlsEXn5WXVJ0d27O8Vx9a0pLeFavSYBOIB\n"
+	"lgUox7lynWc79pdl5NSYInJGfdS6eIMzVmxhprUCgYALWvIvyyTn8Q4R2NJXY/a6\n"
+	"38FOOetUQYI8PApmqYYCSxql+J7+TDg2y41JQBWogDHerbXowQmbSb3q1oSuShPN\n"
+	"A2vTM+TnHwTPuzdu4rCP6bDa11rEkHJcMJBgYC9cXOcQ/uV2K4WzW2OReSwrQEd0\n"
+	"V+h+BXRXD3tseB2uANf+qw==\n"
+	"-----END PRIVATE KEY-----\n";
+
 static bool write_pem_file(const char *path, const char *data)
 {
 	FILE *const fp = fopen(path, "w");
@@ -857,6 +996,35 @@ T_DECLARE_CASE(test_tls_ctx_invalid_ciphersuites_fail)
 	rm_tmpdir(tmpl);
 }
 
+/* An empty ciphersuites string must fail context creation on both backends.
+ * mbedTLS rejects it at context creation; OpenSSL's SSL_CTX_set_ciphersuites("")
+ * would otherwise succeed but leave a TLS-1.3-pinned context with zero suites
+ * that can never handshake. */
+T_DECLARE_CASE(test_tls_ctx_empty_ciphersuites_fails)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char ciphersuites[] = "";
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	const struct tls_config tls_conf = {
+		.cert = cert_path,
+		.key = key_path,
+		.authcerts = authcerts,
+		.authcerts_count = 1,
+		.ciphersuites = ciphersuites,
+	};
+	T_EXPECT(tls_ctx_server(&tls_conf) == NULL);
+	T_EXPECT(tls_ctx_client(&tls_conf) == NULL);
+
+	rm_tmpdir(tmpl);
+}
+
 #if !WITH_OPENSSL
 /* mbedtls_ssl_get_ciphersuite_id() resolves from a unified TLS-1.2+1.3
  * registry with no applicability check against the pinned TLS-1.3-only
@@ -1043,6 +1211,72 @@ T_DECLARE_CASE(test_tls_full_handshake_and_io)
 	rm_tmpdir(tmpl);
 }
 
+/* Backend-agnostic tls_ctx_ref lifetime: ref a client context, free the
+ * *original*, then complete a handshake and round-trip through the ref. The
+ * shared parsed credentials must survive the original's free -- exercising
+ * mbedTLS's hand-rolled tls_ctx_impl_ref/unref (and per-connection
+ * tls_conn_alloc/free) as well as OpenSSL's SSL_CTX up-ref, which the
+ * WITH_OPENSSL-only ALPN case never covers under mbedTLS. */
+T_DECLARE_CASE(test_tls_ctx_ref_shares_credentials_after_original_freed)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	struct tls_context *const cli_ref = tls_ctx_ref(cli_ctx);
+	T_CHECK(cli_ref != NULL);
+	/* Free the original: only the ref keeps the shared credentials alive. */
+	tls_ctx_free(cli_ctx);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ref, fds[1]);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+	T_EXPECT(drive_handshake(srv_conn, cli_conn, 20));
+
+	unsigned char send_buf[] = "hello";
+	unsigned char recv_buf[sizeof(send_buf)] = { 0 };
+	size_t send_len = sizeof(send_buf) - 1;
+	size_t recv_len = sizeof(recv_buf) - 1;
+	T_EXPECT_EQ(tls_send(cli_conn, send_buf, &send_len), TLS_ERROR_NONE);
+	T_EXPECT_EQ(tls_recv(srv_conn, recv_buf, &recv_len), TLS_ERROR_NONE);
+	T_EXPECT_EQ(recv_len, sizeof(send_buf) - 1);
+	T_EXPECT(memcmp(recv_buf, send_buf, recv_len) == 0);
+
+	T_EXPECT(drive_shutdown(cli_conn, srv_conn, 10));
+
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	tls_ctx_free(cli_ref);
+	tls_ctx_free(srv_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	rm_tmpdir(tmpl);
+}
+
 T_DECLARE_CASE(test_tls_handshake_syscall_on_closed_peer)
 {
 	char tmpl[] = "/tmp/tls_test_XXXXXX";
@@ -1211,6 +1445,87 @@ T_DECLARE_CASE(test_tls_expired_cert_rejected)
 	tls_ctx_free(srv_ctx);
 	(void)close(fds[0]);
 	(void)close(fds[1]);
+}
+
+/* The certificate-strength floor both backends must enforce identically has no
+ * rejection coverage otherwise (every other fixture is above it). Each case
+ * below has the client present a peer certificate below one leg of the floor
+ * and the server trust it (or its CA) via authcerts; the sub-floor certificate
+ * must not yield a completed handshake. The server presents the strong
+ * test_cert_pem, which the client accepts, so only the client certificate's
+ * strength is under test.
+ *
+ * A sub-floor certificate can be refused at two points: the TLS library may
+ * decline to load it as an own certificate (OpenSSL's own security level
+ * rejects a sub-2048 RSA key, so cli_ctx creation fails), or -- when it loads
+ * and reaches the wire, as it does on the mbedTLS backend whose profile is
+ * applied only at verification -- the server's verify floor rejects it during
+ * the handshake. Either outcome means the weak certificate was not accepted. */
+T_DECLARE_SUBCASE(
+	assert_peer_cert_rejected, const char *restrict cli_cert,
+	const char *restrict cli_key, char *cli_trust)
+{
+	char *srv_authcerts[] = { cli_trust };
+	char *cli_authcerts[] = { test_cert_pem };
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = test_cert_pem,
+						     .key = test_key_pem,
+						     .authcerts = srv_authcerts,
+						     .authcerts_count = 1 });
+	T_CHECK(srv_ctx != NULL);
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cli_cert,
+						     .key = cli_key,
+						     .authcerts = cli_authcerts,
+						     .authcerts_count = 1 });
+	if (cli_ctx == NULL) {
+		/* Refused at load: the weak certificate never reaches the wire. */
+		tls_ctx_free(srv_ctx);
+		return;
+	}
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+	T_EXPECT(!drive_handshake(srv_conn, cli_conn, 20));
+
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	tls_ctx_free(cli_ctx);
+	tls_ctx_free(srv_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+}
+
+/* An RSA key below TLS_RSA_MIN_BITS (RSA-1024) must be rejected. */
+T_DECLARE_CASE(test_tls_weak_rsa_cert_rejected)
+{
+	T_CALL_SUBCASE(
+		assert_peer_cert_rejected, test_weak_rsa_cert_pem,
+		test_weak_rsa_key_pem, test_weak_floor_ca_cert_pem);
+}
+
+/* An EC key on a curve outside the allowlist (secp224r1 / P-224) must be
+ * rejected. */
+T_DECLARE_CASE(test_tls_weak_curve_cert_rejected)
+{
+	T_CALL_SUBCASE(
+		assert_peer_cert_rejected, test_weak_curve_cert_pem,
+		test_weak_curve_key_pem, test_weak_floor_ca_cert_pem);
+}
+
+/* A leaf whose signature digest is below the floor (SHA-1) must be rejected. */
+T_DECLARE_CASE(test_tls_weak_digest_cert_rejected)
+{
+	T_CALL_SUBCASE(
+		assert_peer_cert_rejected, test_weak_digest_cert_pem,
+		test_weak_digest_key_pem, test_weak_floor_ca_cert_pem);
 }
 
 /* Verify tls_shutdown is one-way: sending close_notify returns NONE without
@@ -1452,11 +1767,41 @@ T_DECLARE_CASE(test_tls_alpn_quoted_entry_at_list_end)
 	rm_tmpdir(tmpl);
 }
 
+/* A malformed ALPN list must fail context creation (fail closed), not silently
+ * drop the operator's configured ALPN.  An unterminated quote and stray bytes
+ * after a closing quote both make tls_ctx_server/tls_ctx_client return NULL --
+ * the gap that let the silent-drop (mbedTLS parse_alpn) and CSV-truncation (both
+ * backends) ALPN P0s through. */
+T_DECLARE_CASE(test_tls_alpn_malformed_list_fails_ctx)
+{
+	static const char *const bad[] = {
+		"\"unterminated", /* quote never closed */
+		"h2,\"x\"y", /* stray bytes after a closing quote */
+		"h2,\"\"x", /* stray bytes after an empty closing quote */
+		"\"\"x", /* stray bytes after a leading empty quoted field */
+		NULL,
+	};
+	for (const char *const *list = bad; *list != NULL; list++) {
+		T_EXPECT(
+			tls_ctx_server(
+				&(struct tls_config){ .cert = test_cert_pem,
+						      .key = test_key_pem,
+						      .alpn = *list }) == NULL);
+		T_EXPECT(
+			tls_ctx_client(
+				&(struct tls_config){ .cert = test_cert_pem,
+						      .key = test_key_pem,
+						      .alpn = *list }) == NULL);
+	}
+}
+
 #if WITH_OPENSSL
-/* OpenSSL-only: tls_ctx_ref() must refuse to share a server-role context
- * whose ssl_ctx has an ALPN select callback registered, since that callback
- * argument is the context wrapper's own address (see alpn_cb_registered in
- * tls_openssl.c). mbedTLS has no analogous case. */
+/* OpenSSL-only: tls_ctx_ref() refuses to share a server-role context whose
+ * ssl_ctx has an ALPN select callback registered.  The callback argument is an
+ * SSL_CTX-lifetime struct alpn_wire (via ex_data), so sharing would no longer
+ * dangle; the refusal is conservative, keeping one owner per ALPN-enabled
+ * server context (see alpn_cb_registered in tls_openssl.c).  mbedTLS has no
+ * analogous case. */
 T_DECLARE_CASE(test_tls_ctx_ref_refuses_alpn_server)
 {
 	struct tls_context *const alpn_server =
@@ -1475,6 +1820,54 @@ T_DECLARE_CASE(test_tls_ctx_ref_refuses_alpn_server)
 	T_EXPECT(plain_ref != NULL);
 	tls_ctx_free(plain_ref);
 	tls_ctx_free(plain_server);
+}
+
+/* OpenSSL-only regression: SSL_new up-refs only the SSL_CTX, not the
+ * tls_ctx_impl wrapper, so a reload that tls_ctx_free()s the server context
+ * while an accepted connection is still mid-handshake must not leave
+ * alpn_select_cb dereferencing a freed buffer.  Freeing both contexts before
+ * driving the handshake reproduces the window; the fix hangs the ALPN buffer
+ * off the SSL_CTX ex_data, so the pre-fix wrapper-as-callback-arg tripped ASan
+ * heap-use-after-free here. */
+T_DECLARE_CASE(test_tls_alpn_survives_ctx_free_mid_handshake)
+{
+	char *authcerts[] = { test_cert_pem };
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = test_cert_pem,
+						     .key = test_key_pem,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1,
+						     .alpn = "h2,http/1.1" });
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = test_cert_pem,
+						     .key = test_key_pem,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1,
+						     .alpn = "h2" });
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2] = { -1, -1 };
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+
+	/* Free both contexts before the handshake runs: the SSL objects keep the
+	 * SSL_CTX alive via SSL_new's ref, but the wrappers are gone. */
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
+
+	const bool ok = drive_handshake(srv_conn, cli_conn, 20);
+
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	T_EXPECT(ok);
 }
 #endif /* WITH_OPENSSL */
 
@@ -1563,6 +1956,107 @@ static bool tls_pipe(struct tls_connection *src, struct tls_connection *dst)
 static void count_io_event(void *ctx)
 {
 	(*(int *)ctx)++;
+}
+
+/* Scan a single plaintext TLS ClientHello record for a server_name (SNI,
+ * extension type 0) extension.  Returns 1 if present, 0 if absent, -1 on a
+ * malformed or short buffer.  Only the one-record ClientHello a fresh handshake
+ * emits is handled -- enough to assert the SNI extension's presence/absence. */
+static int client_hello_has_sni(const unsigned char *restrict buf, size_t n)
+{
+	if (n < 5 || buf[0] != 0x16) { /* handshake record */
+		return -1;
+	}
+	size_t off = 5;
+	if (n - off < 4 || buf[off] != 0x01) { /* ClientHello */
+		return -1;
+	}
+	off += 4; /* msg_type(1) + length(3) */
+	if (n - off < 2 + 32 + 1) {
+		return -1;
+	}
+	off += 2 + 32; /* legacy_version + random */
+	const size_t sid_len = buf[off];
+	off += 1;
+	if (n - off < sid_len + 2) {
+		return -1;
+	}
+	off += sid_len;
+	const size_t cs_len = ((size_t)buf[off] << 8) | buf[off + 1];
+	off += 2;
+	if (n - off < cs_len + 1) {
+		return -1;
+	}
+	off += cs_len;
+	const size_t comp_len = buf[off];
+	off += 1;
+	if (n - off < comp_len + 2) {
+		return -1;
+	}
+	off += comp_len;
+	const size_t ext_total = ((size_t)buf[off] << 8) | buf[off + 1];
+	off += 2;
+	if (ext_total > n - off) {
+		return -1;
+	}
+	const size_t ext_end = off + ext_total;
+	while (off + 4 <= ext_end) {
+		const size_t ext_type = ((size_t)buf[off] << 8) | buf[off + 1];
+		const size_t ext_len =
+			((size_t)buf[off + 2] << 8) | buf[off + 3];
+		off += 4;
+		if (ext_len > ext_end - off) {
+			return -1;
+		}
+		if (ext_type == 0x0000) {
+			return 1;
+		}
+		off += ext_len;
+	}
+	return 0;
+}
+
+/* Capture the ClientHello a fresh buffered client emits and report whether it
+ * carries an SNI extension: 1 present, 0 absent, -1 on failure. */
+static int client_hello_sni_state(const struct tls_config *restrict conf)
+{
+	struct tls_context *const ctx = tls_ctx_client(conf);
+	if (ctx == NULL) {
+		return -1;
+	}
+	struct tls_connection *const conn = tls_client(ctx, -1);
+	int result = -1;
+	if (conn != NULL) {
+		(void)tls_handshake(conn);
+		unsigned char buf[16384];
+		const size_t n = tls_output(conn, buf, sizeof(buf));
+		result = client_hello_has_sni(buf, n);
+	}
+	tls_conn_free(conn);
+	tls_ctx_free(ctx);
+	return result;
+}
+
+/* A client with no SNI configured must omit the server_name extension entirely,
+ * not send a zero-length one (RFC 6066).  mbedtls_ssl_set_hostname("") emitted
+ * an empty extension where NULL omits it; OpenSSL already omitted it, so this
+ * backend-agnostic case also guards against a regression there. */
+T_DECLARE_CASE(test_tls_client_hello_omits_empty_sni)
+{
+	char *authcerts[] = { test_cert_pem };
+	const int without_sni = client_hello_sni_state(
+		&(struct tls_config){ .cert = test_cert_pem,
+				      .key = test_key_pem,
+				      .authcerts = authcerts,
+				      .authcerts_count = 1 });
+	const int with_sni = client_hello_sni_state(
+		&(struct tls_config){ .cert = test_cert_pem,
+				      .key = test_key_pem,
+				      .authcerts = authcerts,
+				      .authcerts_count = 1,
+				      .sni = "example.com" });
+	T_EXPECT_EQ(without_sni, 0);
+	T_EXPECT_EQ(with_sni, 1);
 }
 
 /* Drive the TLS handshake on two buffered connections by shuttling ciphertext
@@ -1998,6 +2492,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tls_load_authcerts_rejects_invalid_entries),
 	T_CASE(test_tls_load_authcerts_rejects_corrupted_chain),
 	T_CASE(test_tls_ctx_invalid_ciphersuites_fail),
+	T_CASE(test_tls_ctx_empty_ciphersuites_fails),
 #if !WITH_OPENSSL
 	T_CASE(test_tls_ctx_tls12_only_ciphersuite_fails),
 #endif
@@ -2005,22 +2500,29 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tls_load_cert_from_memory_succeeds),
 	T_CASE(test_tls_load_key_from_memory_succeeds),
 	T_CASE(test_tls_full_handshake_and_io),
+	T_CASE(test_tls_ctx_ref_shares_credentials_after_original_freed),
 	T_CASE(test_tls_handshake_syscall_on_closed_peer),
 	T_CASE(test_tls_sni_mismatch_still_succeeds),
+	T_CASE(test_tls_client_hello_omits_empty_sni),
 	T_CASE(test_tls_ca_signed_chain_accepted),
 	T_CASE(test_tls_expired_cert_rejected),
+	T_CASE(test_tls_weak_rsa_cert_rejected),
+	T_CASE(test_tls_weak_curve_cert_rejected),
+	T_CASE(test_tls_weak_digest_cert_rejected),
 	T_CASE(test_tls_shutdown_oneway),
 	T_CASE(test_tls_recv_syscall_on_abrupt_peer_close),
 	T_CASE(test_tls_alpn_negotiation),
 	T_CASE(test_tls_alpn_quoted_entry_at_list_end),
+	T_CASE(test_tls_alpn_malformed_list_fails_ctx),
 #if WITH_OPENSSL
 	T_CASE(test_tls_ctx_ref_refuses_alpn_server),
+	T_CASE(test_tls_alpn_survives_ctx_free_mid_handshake),
 #endif
 	T_CASE(test_tls_peer_cert_der_after_handshake),
 	T_CASE(test_tls_buf_handshake_and_io),
 	T_CASE(test_tls_buf_recv_drains_stacked_records),
 	/* Opt-in throughput benchmarks (16 KiB/op, AES-128-GCM); skipped by the
-	 * default run.  Select with `--run <ere>` or TESTING_FILTER. */
+	 * default run.  Select with `--bench <ere>` or TESTING_BENCH. */
 	T_BENCH(bench_tcp_throughput),
 	T_BENCH(bench_tls_throughput),
 	T_SUITE_END,
