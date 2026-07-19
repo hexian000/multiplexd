@@ -522,6 +522,46 @@ def _run_gperf(lookup_name: str, keys: list) -> str:
                  repr(lookup_name) + ":\n" + e.stderr)
 
 
+def _suppress_unused_hash_params(lines: list, hash_name: str) -> list:
+    """Cast-to-void whichever of the gperf hash's ``str``/``len`` parameters its
+    generated body does not reference, so the hash never trips
+    ``-Wunused-parameter``.
+
+    gperf drops ``len`` from the hash when every key that reaches it has the
+    same length (the length term is then constant), and drops ``str`` for a
+    pure length hash, so which parameter is unused depends on the key set and
+    must be detected rather than assumed.  Casting an *used* parameter to void
+    as well would be harmless, but emitting only what is needed keeps the
+    generated output minimal.
+    """
+    sig = hash_name + " (register const char *str, register size_t len)"
+    sig_idx = next(
+        (i for i, ln in enumerate(lines) if ln.rstrip().endswith(sig)), None)
+    if sig_idx is None:
+        return lines
+    brace_idx = next(
+        (i for i in range(sig_idx + 1, len(lines)) if lines[i].strip() == "{"),
+        None)
+    if brace_idx is None:
+        return lines
+    # Find the function's closing brace by tracking brace depth from the opener
+    # (the asso_values initializer braces balance out along the way).
+    depth = 0
+    end_idx = len(lines) - 1
+    for i in range(brace_idx, len(lines)):
+        depth += lines[i].count("{") - lines[i].count("}")
+        if depth == 0:
+            end_idx = i
+            break
+    body = "".join(lines[brace_idx + 1:end_idx])
+    casts = []
+    if not re.search(r"\bstr\b", body):
+        casts.append(f"{_INDENT}(void)(str);\n")
+    if not re.search(r"\blen\b", body):
+        casts.append(f"{_INDENT}(void)(len);\n")
+    return lines[:brace_idx + 1] + casts + lines[brace_idx + 1:]
+
+
 def _postprocess_gperf(
         src: str, lookup_name: str, public_lookup: bool = True) -> str:
     """Post-process gperf output for inclusion in the generated .c file.
@@ -570,19 +610,9 @@ def _postprocess_gperf(
     kv_ret = "const struct " + lookup_name + "_kv *\n"
     result = ["static " + ln if ln == kv_ret else ln for ln in result]
 
-    # Suppress -Wunused-parameter on the hash function's `str` argument.
-    patched = []
-    hash_sig = lookup_name + "_hash"
-    in_hash_func = False
-    for line in result:
-        patched.append(line)
-        if not in_hash_func and line.rstrip().endswith(
-                hash_sig + " (register const char *str, register size_t len)"):
-            in_hash_func = True
-        elif in_hash_func and line.strip() == "{":
-            patched.append(f"{_INDENT}(void)(str);\n")
-            in_hash_func = False
-    result = patched
+    # Suppress -Wunused-parameter on whichever of the hash's parameters gperf's
+    # generated body does not reference.
+    result = _suppress_unused_hash_params(result, lookup_name + "_hash")
 
     result.append("\n")
     for macro in _GPERF_MACROS:
@@ -987,14 +1017,109 @@ def generate_free_h(scopes: list, pfx: str, sub_schema: bool = False) -> list:
     return lines
 
 
-def _warn_unsupported_props(node, path: str = "") -> None:
-    """Print a warning for every property whose schema degrades to a raw
-    JSON fragment for a reason the schema author may not expect
-    ($ref, union types, missing type, unsupported array items, out-of-range
-    integer bounds).  Deliberately dynamic objects (additionalProperties
+# JSON Schema keywords the generator consumes structurally or treats as pure
+# annotations; their presence on a node never means a dropped constraint.
+_RECOGNIZED_KEYWORDS = frozenset({
+    # structure the generator acts on
+    "type", "properties", "items", "required", "additionalProperties",
+    "enum", "const", "default",
+    # core / annotation keywords with no code-generation effect by design
+    "title", "description", "$comment", "examples", "deprecated",
+    "readOnly", "writeOnly", "$schema", "$id", "$ref", "$anchor",
+    "$defs", "definitions",
+})
+
+# Constraint keywords the generator actually enforces, keyed by inferred kind.
+# Both backends stay in lockstep here: _scalar_constraint_checks (fast) and
+# _build_constraint_c (size) emit checks for exactly these.
+_ENFORCED_KEYWORDS = {
+    "string": frozenset({"minLength", "maxLength"}),
+    "int": frozenset(
+        {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+         "multipleOf"}),
+    "uint": frozenset(
+        {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+         "multipleOf"}),
+    "double": frozenset(
+        {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+         "multipleOf"}),
+    "array_string": frozenset({"minItems", "maxItems"}),
+    "array_primitive": frozenset({"minItems", "maxItems"}),
+    "array_object": frozenset({"minItems", "maxItems"}),
+}
+
+
+def _dynamic_reason(prop: dict) -> str:
+    """Explain why *prop* degrades to a raw JSON fragment (a ``dynamic`` kind
+    that is not a deliberate dynamic object)."""
+    if "$ref" in prop:
+        return "$ref is not resolved"
+    if isinstance(prop.get("type"), list):
+        return "union types are not supported"
+    if "type" not in prop:
+        return "no 'type' keyword"
+    if prop.get("type") == "array":
+        return "unsupported array item type"
+    if prop.get("type") == "integer":
+        return "integer bounds exceed the 64-bit range"
+    return "unsupported construct"
+
+
+def _warn_dropped_keywords(prop: dict, kind: str, path: str) -> None:
+    """Warn for each keyword on *prop* that the generator emits no check for,
+    so a constraint the author wrote -- e.g. a string ``pattern`` or ``format``
+    -- is not dropped without a diagnostic."""
+    recognized = _RECOGNIZED_KEYWORDS | _ENFORCED_KEYWORDS.get(
+        kind, frozenset())
+    for key in sorted(prop):
+        if key not in recognized:
+            print(
+                f"  warning: property {path!r}: keyword {key!r} is not "
+                "enforced by the generator; the constraint is ignored",
+                file=sys.stderr)
+
+
+def _warn_unsupported_props(
+        node, path: str = "", strict: bool = False,
+        check_own: bool = False) -> None:
+    """Print a warning for schema constructs the generator does not honor:
+    a property that degrades to a raw JSON fragment for a reason the author may
+    not expect ($ref, union types, missing type, unsupported array items,
+    out-of-range integer bounds); a constraint keyword the generator emits no
+    check for; and an ``additionalProperties: false`` node that is inert
+    without ``--strict``.  Deliberately dynamic objects (additionalProperties
     without fixed properties) are not warned about."""
     if not isinstance(node, dict):
         return
+    # 'additionalProperties: false' is honored only by the per-object key switch
+    # that --strict tightens, and only a property-bearing object gets that
+    # switch.  Warn when the constraint is therefore inert -- but the remedy
+    # differs: a property-bearing object needs --strict (so warn only when it is
+    # off), while a property-less object is stored as a raw JSON fragment and can
+    # never reject keys, so --strict is not the fix -- warn regardless and say so.
+    if node.get("type") == "object" \
+            and node.get("additionalProperties") is False:
+        if "properties" not in node:
+            print(
+                f"  warning: {path or '<root>'}: 'additionalProperties: false' "
+                "has no effect on an object with no fixed properties; it is "
+                "stored as a raw JSON fragment and unknown keys are accepted",
+                file=sys.stderr)
+        elif not strict:
+            print(
+                f"  warning: {path or '<root>'}: 'additionalProperties: false' "
+                "has no effect without --strict; unknown keys are accepted",
+                file=sys.stderr)
+    # Check this node's OWN dropped-constraint keywords when it is reached as a
+    # subtree root -- the top-level schema, or a $defs/definitions entry -- since
+    # no parent properties-loop or array-items visit covers it.  Nested
+    # properties and array items are checked by their parent below and pass
+    # check_own=False to avoid a double warning.  A dynamic node carries no
+    # enforceable constraint, so skip it.
+    if check_own:
+        own_kind = _infer_c_type(node)["kind"]
+        if own_kind != "dynamic":
+            _warn_dropped_keywords(node, own_kind, path or "<root>")
     if node.get("type") == "object" and "properties" in node:
         for key, prop in sorted(node["properties"].items()):
             ppath = f"{path}.{key}" if path else key
@@ -1002,29 +1127,24 @@ def _warn_unsupported_props(node, path: str = "") -> None:
                 continue
             desc = _infer_c_type(prop)
             if desc["kind"] == "dynamic" and not _is_dynamic_object(prop):
-                if "$ref" in prop:
-                    reason = "$ref is not resolved"
-                elif isinstance(prop.get("type"), list):
-                    reason = "union types are not supported"
-                elif "type" not in prop:
-                    reason = "no 'type' keyword"
-                elif prop.get("type") == "array":
-                    reason = "unsupported array item type"
-                elif prop.get("type") == "integer":
-                    reason = "integer bounds exceed the 64-bit range"
-                else:
-                    reason = "unsupported construct"
                 print(
-                    f"  warning: property {ppath!r}: {reason}; "
+                    f"  warning: property {ppath!r}: {_dynamic_reason(prop)}; "
                     "the value is stored as a raw JSON fragment",
                     file=sys.stderr)
-            _warn_unsupported_props(prop, ppath)
+            else:
+                _warn_dropped_keywords(prop, desc["kind"], ppath)
+            _warn_unsupported_props(prop, ppath, strict)
     elif node.get("type") == "array" and isinstance(node.get("items"), dict):
-        _warn_unsupported_props(node["items"], path + "[]")
+        item = node["items"]
+        idesc = _infer_c_type(item)
+        if idesc["kind"] != "dynamic":
+            _warn_dropped_keywords(item, idesc["kind"], path + "[]")
+        _warn_unsupported_props(item, path + "[]", strict)
     for defs_key in ("$defs", "definitions"):
         for dname, dnode in sorted(node.get(defs_key, {}).items()):
             _warn_unsupported_props(
-                dnode, f"{path}#{dname}" if path else f"#{dname}")
+                dnode, f"{path}#{dname}" if path else f"#{dname}", strict,
+                check_own=True)
 
 
 def generate_unmarshal_h(scopes: list, pfx: str, sub_schema: bool = False) -> list:
@@ -1290,6 +1410,17 @@ def _has_double_fields(scopes: list) -> bool:
                 return True
             if (desc["kind"] == "array_primitive"
                     and desc.get("c_base") == "double"):
+                return True
+    return False
+
+
+def _has_string_fields(scopes: list) -> bool:
+    """True when any scope has a string field or an array-of-string field
+    (the marshal functions then emit the json_emit_str_ helper via EMIT_STR)."""
+    for _, keys, node in scopes:
+        for key in keys:
+            if _infer_c_type(node["properties"][key])["kind"] in (
+                    "string", "array_string"):
                 return True
     return False
 
@@ -1800,6 +1931,32 @@ def generate_marshal_c(
     # threads the running length counter through (in n_, out return value);
     # json_emit_str_ returns a negative value to signal an unrepresentable
     # string.
+    #
+    # json_emit_str_ (wrapped by the EMIT_STR macro) is the one marshal helper
+    # with a conditional caller: EMIT_STR is generated only for string and
+    # array-of-string fields.  A schema whose whole object graph has no such
+    # field would otherwise carry an unused file-local helper and trip
+    # -Werror=unused-function, so gate the helper, its macro, and its #undef on
+    # a string actually being present -- mirroring the <math.h>/isfinite gating
+    # for double fields (_has_double_fields).
+    needs_emit_str = _has_string_fields(scopes)
+    str_helper = [
+        "static int json_emit_str_(",
+        f"{_INDENT}char *buf, size_t bufsz, int n_, const char *s, size_t len)",
+        "{",
+        f"{_INDENT}char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL;",
+        f"{_INDENT}const int r_ =",
+        f"{_INDENT * 2}json_marshal_string(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, s, len);",
+        f"{_INDENT}if (r_ < 0) {{ return -1; }}",
+        f"{_INDENT}return n_ + r_;",
+        "}",
+    ] if needs_emit_str else []
+    str_macro = [
+        "#define EMIT_STR(s, len) do { \\",
+        f"{_INDENT}n_ = json_emit_str_(buf, bufsz, n_, (s), (len)); \\",
+        f"{_INDENT}if (n_ < 0) {{ return -1; }} \\",
+        "} while (0)",
+    ] if needs_emit_str else []
     lines = [
         "static int json_emit_ch_(char *buf, size_t bufsz, int n_, char c)",
         "{",
@@ -1815,15 +1972,7 @@ def generate_marshal_c(
         f"{_INDENT}}}",
         f"{_INDENT}return n_ + (int)len;",
         "}",
-        "static int json_emit_str_(",
-        f"{_INDENT}char *buf, size_t bufsz, int n_, const char *s, size_t len)",
-        "{",
-        f"{_INDENT}char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL;",
-        f"{_INDENT}const int r_ =",
-        f"{_INDENT * 2}json_marshal_string(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, s, len);",
-        f"{_INDENT}if (r_ < 0) {{ return -1; }}",
-        f"{_INDENT}return n_ + r_;",
-        "}",
+    ] + str_helper + [
         "static int json_emit_indent_(",
         f"{_INDENT}char *buf, size_t bufsz, int n_, const char *indent,",
         f"{_INDENT}size_t ind_len_, int d)",
@@ -1845,10 +1994,7 @@ def generate_marshal_c(
         f"{_INDENT}if (r_ < 0) {{ return -1; }} \\",
         f"{_INDENT}n_ += r_; \\",
         "} while (0)",
-        "#define EMIT_STR(s, len) do { \\",
-        f"{_INDENT}n_ = json_emit_str_(buf, bufsz, n_, (s), (len)); \\",
-        f"{_INDENT}if (n_ < 0) {{ return -1; }} \\",
-        "} while (0)",
+    ] + str_macro + [
         "#define EMIT_SUB(fn, arg, d) do { \\",
         f"{_INDENT}char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \\",
         f"{_INDENT}r_ = (fn)(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (arg), indent, (d)); \\",
@@ -2171,7 +2317,7 @@ def generate_marshal_c(
         "",
         "#undef EMIT",
         "#undef EMITF",
-        "#undef EMIT_STR",
+    ] + (["#undef EMIT_STR"] if needs_emit_str else []) + [
         "#undef EMIT_SUB",
         "#undef EMIT_LIT",
         "#undef EMIT_RAW",
@@ -2489,7 +2635,7 @@ def _build_constraint_c(
 
 def _field_entry(
         ename: str, key: str, fname: str, desc: dict, schema_pfx: str,
-        scope_name: str, pfx: str, req_bit: "int | None",
+        scope_name: str, pfx: str, req_bit: "int | None", required: bool,
         cvar: "str | None") -> str:
     """Return the C designated initializer for one struct json_field entry."""
     kind = desc["kind"]
@@ -2503,6 +2649,11 @@ def _field_entry(
     ]
     if is_array:
         parts.append(".is_array = true")
+    # .required drives marshal presence (a required array/object always emits)
+    # and is schema-derived, so it stays set even under --no-validate, where
+    # .req_bit -- consumed only by unmarshal's required_mask check -- is -1.
+    if required:
+        parts.append(".required = true")
     parts.append(f".req_bit = {req_bit if req_bit is not None else -1}")
     parts.append(f".offset = offsetof(struct {ename}, {cfield})")
     if is_array:
@@ -2593,7 +2744,7 @@ def generate_tables_c(
             lines.append(
                 f"{_INDENT}" + _field_entry(
                     ename, key, fname_map[key], desc, schema_pfx, scope_name,
-                    pfx, rb, cvars.get(key)) + ",")
+                    pfx, rb, key in required, cvars.get(key)) + ",")
         lines.append("};")
 
         # Schema object.
@@ -2740,8 +2891,9 @@ def process(schema_path: Path, opts: argparse.Namespace) -> None:
                         f"{const_name!r}; rename the conflicting properties")
                 enum_const_owner[const_name] = scope_name
 
-    # Warn about constructs that silently degrade to raw JSON fragments.
-    _warn_unsupported_props(schema)
+    # Warn about constructs that silently degrade to raw JSON fragments and
+    # constraint keywords the generator does not enforce.
+    _warn_unsupported_props(schema, strict=opts.strict, check_own=True)
 
     # --output-name overrides the generated file basename (default: the schema
     # stem).  Generated symbols still derive from the schema stem, so the same
