@@ -2327,8 +2327,7 @@ T_DECLARE_CASE(test_send_handle_rx_closed_tls_close_is_terminal)
 	fx.ss.wire.rx_open = false;
 	fx.ss.accepted = false; /* outbound: clears the cached session_id */
 	fx.ss.handshake.has_session_id = true;
-	fx.ss.wire.tlsconn =
-		(struct tls_connection *)(void *)&fx; /* live TLS */
+	fx.ss.wire.tlsconn = (struct tls_connection *)&fx; /* live TLS */
 
 	const bool stop = send_handle_rx_closed(&fx.ss);
 
@@ -2395,7 +2394,7 @@ T_DECLARE_CASE(test_discard_stream_frames_keeps_blocked_tls_head)
 	struct mux_frame *const head = fx.ss.wire.sendbuf.head;
 	si_queue_ctrl(&fx, 5, MUX_FLAG_PUSH); /* not the head: discarded */
 	fx.ss.wire.send_blocked = true;
-	fx.ss.wire.tlsconn = (struct tls_connection *)(void *)&fx;
+	fx.ss.wire.tlsconn = (struct tls_connection *)&fx;
 
 	session_discard_stream_frames(&fx.ss, 5);
 

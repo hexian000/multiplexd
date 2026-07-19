@@ -425,7 +425,7 @@ T_DECLARE_CASE(test_wire_flush_done_without_memory_transport_tls)
 	ss.wire.tlsconn = (struct tls_connection *)&sentinel;
 	T_EXPECT_EQ(wire_flush(&ss), WIRE_FLUSH_DONE);
 	ss.wire.tlsconn = NULL;
-#endif
+#endif /* WITH_TLS */
 }
 
 T_DECLARE_CASE(test_wire_shutdown_plain_tcp_returns_done)

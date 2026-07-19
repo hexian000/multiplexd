@@ -14,8 +14,10 @@
 #include "shim/util.h"
 #include "tunnel.h"
 
+#include "algo/hashtable.h"
 #include "os/clock.h"
 #include "os/socket.h"
+#include "sync/task.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
@@ -2562,7 +2564,7 @@ static bool build_identity_dialer_conf(
 		return false;
 	}
 	conf->identity.mux_connect =
-		malloc(sizeof(*conf->identity.mux_connect));
+		(char **)malloc(sizeof(*conf->identity.mux_connect));
 	if (conf->identity.mux_connect == NULL) {
 		return false;
 	}

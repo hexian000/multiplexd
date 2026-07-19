@@ -6,6 +6,8 @@
 
 #include "conf.h"
 
+#include "mux/mux.h"
+
 #include "utils/slog.h"
 #include "utils/testing.h"
 
