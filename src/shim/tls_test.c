@@ -396,11 +396,17 @@ static char test_expired_key_pem[] =
  * floor both TLS backends must enforce. Generated with Python's cryptography
  * library (like test_expired_cert_pem):
  *  - test_weak_rsa_cert_pem: an RSA-1024 leaf (< TLS_RSA_MIN_BITS).
- *  - test_weak_curve_cert_pem: an EC secp224r1 (P-224) leaf, a curve outside
- *    mbedtls_x509_crt_profile_default's allowlist.
  *  - test_weak_digest_cert_pem: an RSA-2048 leaf CA-signed with SHA-1
  *    (< the SHA-256 digest floor); on a non-anchor leaf, since the floor
- *    exempts a trust anchor's own self-signature. */
+ *    exempts a trust anchor's own self-signature.
+ * These two reach the wire on the mbedTLS backend (whose profile is enforced
+ * only at verification), so the server's floor rejects them mid-handshake.
+ * The EC-curve allowlist gets no handshake fixture: under the TLS-1.3-only
+ * policy a sub-floor curve (e.g. P-224) has no TLS 1.3 signature scheme, so the
+ * handshake aborts for a protocol reason upstream of the curve check and would
+ * assert nothing.  The OpenSSL floor as a whole -- including the curve
+ * allowlist -- is exercised directly in tls_openssl_test.c, since OpenSSL
+ * refuses to load a sub-floor own certificate and it never reaches the wire. */
 static char test_weak_floor_ca_cert_pem[] =
 	"-----BEGIN CERTIFICATE-----\n"
 	"MIIC4TCCAcmgAwIBAgIUGBYn8sMqRdA3UjyfuZ2W/yXI83IwDQYJKoZIhvcNAQEL\n"
@@ -454,29 +460,6 @@ static char test_weak_rsa_key_pem[] =
 	"ZegNq43E7QPol4/sgSjhCd7QWHe3tG9fgsVWrEdTIq7IhBHNZD75AkAj7rCUPWJF\n"
 	"O2tR7IbPsJ2MSGQ1QraVGSV9WUO4IBua7mk73FiLQD8N3MUQztYqvSzsH2Q3MuqT\n"
 	"FupzctYBSP0Z\n"
-	"-----END PRIVATE KEY-----\n";
-
-static char test_weak_curve_cert_pem[] =
-	"-----BEGIN CERTIFICATE-----\n"
-	"MIICFDCB/aADAgECAhRvyBJ16XugsWG+mCGl0jv0RPqjxDANBgkqhkiG9w0BAQsF\n"
-	"ADAfMR0wGwYDVQQDDBR3ZWFrZmxvb3ItY2EuZXhhbXBsZTAgFw0yMDAxMDEwMDAw\n"
-	"MDBaGA8yMDk5MDEwMTAwMDAwMFowHDEaMBgGA1UEAwwRd2Vha2N1cnZlLmV4YW1w\n"
-	"bGUwTjAQBgcqhkjOPQIBBgUrgQQAIQM6AAT9GUnEHvz/FaaUWHF7P2Eb5NSCjRvq\n"
-	"nfIZHl7Ajd0c3P04/A6l6EbwLJukhBsscWjjIl1ZV928+qMgMB4wHAYDVR0RBBUw\n"
-	"E4IRd2Vha2N1cnZlLmV4YW1wbGUwDQYJKoZIhvcNAQELBQADggEBABgJRhtcoFq0\n"
-	"+Vonc5bcTbz0TRBlT9EPYfbT1tTFonlG/Cdje07eAQntCqjpaDpqQHqoMNUjQ/gE\n"
-	"fYvWwn/nhvtcgFQR5bLMJ84gWJ9dr32ae2IUxMgghYkD/TPDN92yC5+IZVtcSK4D\n"
-	"YYBoSFyQfi0Qs/4UTULUEEbBKTEIko6/a/Agkg+2E6d5DOa9orQsPVXmJAbTsJmM\n"
-	"J2DfABGMjOKowAqOprI8g+uJ4pCudjlZwStNC01DKrSaAUzhilNX0G9tyd+aNZmi\n"
-	"SMXNRt/vnbIMc07dwHgn1BVTSC+f0Cu2VuVSeg0j9La8I6ZuMCxGbBKSYTwvkhku\n"
-	"drg/RVvXTmw=\n"
-	"-----END CERTIFICATE-----\n";
-
-static char test_weak_curve_key_pem[] =
-	"-----BEGIN PRIVATE KEY-----\n"
-	"MHgCAQAwEAYHKoZIzj0CAQYFK4EEACEEYTBfAgEBBBzblD1Sx6w7H39EKuXs22cy\n"
-	"Z0x66gY0/gGpRn4eoTwDOgAE/RlJxB78/xWmlFhxez9hG+TUgo0b6p3yGR5ewI3d\n"
-	"HNz9OPwOpehG8CybpIQbLHFo4yJdWVfdvPo=\n"
 	"-----END PRIVATE KEY-----\n";
 
 static char test_weak_digest_cert_pem[] =
@@ -1457,10 +1440,14 @@ T_DECLARE_CASE(test_tls_expired_cert_rejected)
  *
  * A sub-floor certificate can be refused at two points: the TLS library may
  * decline to load it as an own certificate (OpenSSL's own security level
- * rejects a sub-2048 RSA key, so cli_ctx creation fails), or -- when it loads
- * and reaches the wire, as it does on the mbedTLS backend whose profile is
- * applied only at verification -- the server's verify floor rejects it during
- * the handshake. Either outcome means the weak certificate was not accepted. */
+ * rejects a sub-2048 RSA key / SHA-1 signature, so cli_ctx creation fails), or
+ * -- when it loads and reaches the wire, as it does on the mbedTLS backend
+ * whose profile is applied only at verification -- the server's verify floor
+ * rejects it during the handshake. Either outcome means the weak certificate
+ * was not accepted.  On OpenSSL both cases take the load-refusal path, so they
+ * do NOT exercise tls_verify_cert_strength_cb(); that verify floor is covered
+ * directly in tls_openssl_test.c.  These handshake cases are what genuinely
+ * exercises the mbedTLS profile floor. */
 T_DECLARE_SUBCASE(
 	assert_peer_cert_rejected, const char *restrict cli_cert,
 	const char *restrict cli_key, char *cli_trust)
@@ -1509,15 +1496,6 @@ T_DECLARE_CASE(test_tls_weak_rsa_cert_rejected)
 	T_CALL_SUBCASE(
 		assert_peer_cert_rejected, test_weak_rsa_cert_pem,
 		test_weak_rsa_key_pem, test_weak_floor_ca_cert_pem);
-}
-
-/* An EC key on a curve outside the allowlist (secp224r1 / P-224) must be
- * rejected. */
-T_DECLARE_CASE(test_tls_weak_curve_cert_rejected)
-{
-	T_CALL_SUBCASE(
-		assert_peer_cert_rejected, test_weak_curve_cert_pem,
-		test_weak_curve_key_pem, test_weak_floor_ca_cert_pem);
 }
 
 /* A leaf whose signature digest is below the floor (SHA-1) must be rejected. */
@@ -1590,6 +1568,75 @@ T_DECLARE_CASE(test_tls_shutdown_oneway)
 	tls_ctx_free(cli_ctx);
 	tls_ctx_free(srv_ctx);
 	(void)close(fds[0]);
+	(void)close(fds[1]);
+	rm_tmpdir(tmpl);
+}
+
+/* A transport failure while sending close_notify must classify as
+ * TLS_ERROR_SYSCALL on both backends, not TLS_ERROR_SSL: the shim's
+ * cross-backend contract routes a syscall-level failure to SYSCALL (mbedTLS's
+ * MBEDTLS_ERR_NET_CONN_RESET / NET_SEND_FAILED / NET_RECV_FAILED and OpenSSL's
+ * SSL_ERROR_SYSCALL all land there).  Complete a handshake, drop the peer's
+ * transport, then drive tls_shutdown: the close_notify send hits a broken pipe
+ * (EPIPE -> NET_CONN_RESET on mbedTLS; SIGPIPE is ignored in main), so both
+ * backends must report SYSCALL.  Guards the parity contract against a
+ * regression that let the NET_* cases fall back to the default TLS_ERROR_SSL
+ * branch -- the whole suite would otherwise pass while the two backends
+ * re-diverged (cf. test_tls_shutdown_oneway, which only covers the NONE happy
+ * path). */
+T_DECLARE_CASE(test_tls_shutdown_syscall_on_broken_transport)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1 });
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+	T_CHECK(drive_handshake(srv_conn, cli_conn, 20));
+
+	/* Drop the server's transport with no close_notify; the client's
+	 * close_notify send below then hits a broken pipe.  NOCLOSE semantics
+	 * (SSL_set_fd / mbedTLS net BIO) mean freeing srv_conn never touches this
+	 * fd, so closing it here is safe. */
+	(void)close(fds[0]);
+
+	enum tls_error sd = TLS_ERROR_WANT_WRITE;
+	for (int i = 0; i < 10 && (sd == TLS_ERROR_WANT_READ ||
+				   sd == TLS_ERROR_WANT_WRITE);
+	     i++) {
+		sd = tls_shutdown(cli_conn);
+	}
+	T_EXPECT_EQ(sd, TLS_ERROR_SYSCALL);
+
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	tls_ctx_free(cli_ctx);
+	tls_ctx_free(srv_ctx);
 	(void)close(fds[1]);
 	rm_tmpdir(tmpl);
 }
@@ -2507,9 +2554,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tls_ca_signed_chain_accepted),
 	T_CASE(test_tls_expired_cert_rejected),
 	T_CASE(test_tls_weak_rsa_cert_rejected),
-	T_CASE(test_tls_weak_curve_cert_rejected),
 	T_CASE(test_tls_weak_digest_cert_rejected),
 	T_CASE(test_tls_shutdown_oneway),
+	T_CASE(test_tls_shutdown_syscall_on_broken_transport),
 	T_CASE(test_tls_recv_syscall_on_abrupt_peer_close),
 	T_CASE(test_tls_alpn_negotiation),
 	T_CASE(test_tls_alpn_quoted_entry_at_list_end),

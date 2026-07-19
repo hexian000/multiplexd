@@ -66,3 +66,30 @@ add_shim_test(tls_test
     ${GENCERTS_SOURCES}
     tls_test.c
 )
+
+# White-box: compiles tls_openssl.c into the test TU to reach the static
+# certificate-strength floor helpers (tls_ec_curve_allowed /
+# tls_cert_digest_allowed / tls_verify_cert_strength_cb).  No black-box
+# handshake can present a sub-floor certificate to them -- OpenSSL refuses to
+# load one -- so they are unreachable through the public API.  Must NOT link
+# `shim`, which would duplicate tls_openssl.c's public symbols.
+if(WITH_OPENSSL)
+    add_executable(tls_openssl_test tls_openssl_test.c)
+    target_include_directories(tls_openssl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_include_directories(tls_openssl_test PRIVATE ${CMAKE_SOURCE_DIR}/contrib/csnippets)
+    target_include_directories(tls_openssl_test SYSTEM PRIVATE ${TLS_INCLUDES})
+
+    target_compile_options(tls_openssl_test PRIVATE "-include${CMAKE_CURRENT_BINARY_DIR}/../config.h")
+    target_compile_options(tls_openssl_test PRIVATE -pedantic -Wall -Wextra -Werror)
+
+    if(FORCE_POSIX)
+        target_compile_definitions(tls_openssl_test PRIVATE _POSIX_C_SOURCE=200809L)
+    else()
+        target_compile_definitions(tls_openssl_test PRIVATE _GNU_SOURCE)
+    endif()
+
+    target_link_libraries(tls_openssl_test PRIVATE csnippets ${TLS_LIBS})
+
+    add_test(NAME tls_openssl_test COMMAND tls_openssl_test)
+    add_dependencies(check tls_openssl_test)
+endif()
