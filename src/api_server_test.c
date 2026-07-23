@@ -18,8 +18,8 @@
 #include "algo/hashtable.h"
 #include "os/clock.h"
 #include "os/socket.h"
+#include "strings/format.h"
 #include "sync/task.h"
-#include "utils/formats.h"
 #include "utils/testing.h"
 
 #include <ev.h>
@@ -189,13 +189,13 @@ static struct tunnel *make_established_tunnel(
 	PUB_STORE(ss->_pub_state, SESSION_ESTABLISHED);
 	for (size_t i = 0; i < num_streams; i++) {
 		struct mux_stream *const s =
-			stream_new(ss, (uint_fast16_t)(i * 2u + 1u), true);
+			mux_stream_new(ss, (uint_fast16_t)(i * 2u + 1u), true);
 		if (s == NULL) {
 			tunnel_close(t);
 			return NULL;
 		}
-		if (!sched_add_stream(ss, s)) {
-			stream_free(s);
+		if (!mux_sched_add_stream(ss, s)) {
+			mux_stream_free(s);
 			tunnel_close(t);
 			return NULL;
 		}

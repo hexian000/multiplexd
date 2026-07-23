@@ -16,9 +16,9 @@
 #include "net/url.h"
 #include "os/clock.h"
 #include "os/socket.h"
-#include "utils/ascii.h"
+#include "utils/ctype_ascii.h"
 #include "utils/buffer.h"
-#include "utils/formats.h"
+#include "strings/format.h"
 #include "utils/slog.h"
 
 #include <ev.h>
@@ -952,7 +952,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 static void handle_config_get(struct api_ctx *restrict ctx)
 {
 	size_t len;
-	char *const restrict json = conf_dump(ctx->s->conf, &len);
+	char *const restrict json = conf_dump(ctx->s->conf, &len, NULL);
 	if (json == NULL) {
 		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
 		return;
@@ -1111,8 +1111,7 @@ static void send_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	size_t len = remaining;
 	const int err = socket_send(ctx->fd, src, &len);
 	if (err != 0) {
-		if (err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS ||
-		    err == ENOMEM) {
+		if (sock_would_block(err)) {
 			return; /* wait for EV_WRITE */
 		}
 		LOGD_F("api [fd:%d]: send: (%d) %s", ctx->fd, err,
@@ -1159,8 +1158,7 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	const int err =
 		socket_recv(ctx->fd, ctx->rbuf.data + ctx->rbuf.len, &n);
 	if (err != 0) {
-		if (err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS ||
-		    err == ENOMEM) {
+		if (sock_would_block(err)) {
 			return; /* wait for EV_READ */
 		}
 		LOGD_F("api [fd:%d]: recv: (%d) %s", ctx->fd, err,
