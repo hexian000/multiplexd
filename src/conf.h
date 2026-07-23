@@ -114,8 +114,9 @@ struct config *conf_parse(char *json, size_t len);
 struct config *conf_parsefile(const char *path);
 
 /* Serialize config to a heap JSON string (caller frees); @p lenp optionally
- * receives the length excluding NUL. NULL on failure. */
-char *conf_dump(const struct config *conf, size_t *lenp);
+ * receives the length excluding NUL. @p indent is the per-level indent string
+ * for pretty output, or NULL for compact. NULL on failure. */
+char *conf_dump(const struct config *conf, size_t *lenp, const char *indent);
 
 #if WITH_TLS
 /* Replace "@path" PEM references with in-memory PEM strings, in place.

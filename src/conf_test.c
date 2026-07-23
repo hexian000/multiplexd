@@ -42,7 +42,7 @@ static bool
 write_conf_file(const struct config *restrict conf, const char *restrict path)
 {
 	size_t len;
-	char *const json = conf_dump(conf, &len);
+	char *const json = conf_dump(conf, &len, NULL);
 	if (json == NULL) {
 		return false;
 	}

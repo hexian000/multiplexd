@@ -15,7 +15,7 @@
 #include "codec/json.h"
 #include "meta/minmax.h"
 #include "net/mime.h"
-#include "utils/ascii.h"
+#include "utils/ctype_ascii.h"
 #include "utils/buffer.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
@@ -59,6 +59,27 @@ static char *conf_strndup(
 	return dst;
 }
 
+/* Parse one strictly-digit-only field of max_startups, terminated by sep, and
+ * advance *nptr past it. strtoumax() alone would also accept a leading sign or
+ * whitespace; the schema documents the field as "^[0-9]+:[0-9]+:[0-9]+$", so
+ * reject anything else and any value above INT_MAX. Returns false (without
+ * logging -- the caller emits one message) on any malformation. */
+static bool parse_startups_field(
+	const char **restrict nptr, const char sep, int *restrict out)
+{
+	if (!isdigit((unsigned char)**nptr)) {
+		return false;
+	}
+	char *endptr = NULL;
+	const uintmax_t v = strtoumax(*nptr, &endptr, 10);
+	if (endptr == *nptr || *endptr != sep || v > INT_MAX) {
+		return false;
+	}
+	*nptr = (sep == '\0') ? endptr : endptr + 1;
+	*out = (int)v;
+	return true;
+}
+
 static bool
 conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 {
@@ -66,47 +87,17 @@ conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 		return true;
 	}
 	const char *nptr = s;
-	char *endptr = NULL;
-
-	/* strtoumax() alone would also accept a leading sign or whitespace;
-	 * the schema documents this field as the strictly digit-only
-	 * "^[0-9]+:[0-9]+:[0-9]+$", so reject anything else before each
-	 * conversion instead of relying on strtoumax()'s laxer parsing. */
-	if (!isdigit((unsigned char)*nptr)) {
-		LOGE_F("invalid max_startups format: \"%s\"", s);
-		return false;
-	}
-	const uintmax_t start = strtoumax(nptr, &endptr, 10);
-	if (endptr == nptr || *endptr != ':' || start > INT_MAX) {
-		LOGE_F("invalid max_startups format: \"%s\"", s);
-		return false;
-	}
-	nptr = endptr + 1;
-
-	if (!isdigit((unsigned char)*nptr)) {
-		LOGE_F("invalid max_startups format: \"%s\"", s);
-		return false;
-	}
-	const uintmax_t rate = strtoumax(nptr, &endptr, 10);
-	if (endptr == nptr || *endptr != ':' || rate > INT_MAX) {
-		LOGE_F("invalid max_startups format: \"%s\"", s);
-		return false;
-	}
-	nptr = endptr + 1;
-
-	if (!isdigit((unsigned char)*nptr)) {
-		LOGE_F("invalid max_startups format: \"%s\"", s);
-		return false;
-	}
-	const uintmax_t full = strtoumax(nptr, &endptr, 10);
-	if (endptr == nptr || *endptr != '\0' || full > INT_MAX) {
+	int start, rate, full;
+	if (!parse_startups_field(&nptr, ':', &start) ||
+	    !parse_startups_field(&nptr, ':', &rate) ||
+	    !parse_startups_field(&nptr, '\0', &full)) {
 		LOGE_F("invalid max_startups format: \"%s\"", s);
 		return false;
 	}
 
-	cfg->startup_limit_start = (int)start;
-	cfg->startup_limit_rate = (int)rate;
-	cfg->startup_limit_full = (int)full;
+	cfg->startup_limit_start = start;
+	cfg->startup_limit_rate = rate;
+	cfg->startup_limit_full = full;
 	return true;
 }
 
@@ -210,6 +201,35 @@ static bool identity_listen_cb(
 		}                                                              \
 	} while (0)
 
+/* Load a JSON string-view array into a heap array of NUL-terminated copies (the
+ * inverse of build_json_string_arr).  Sets both out params; leaves them
+ * untouched for an empty source.  On a per-element failure sets *out_count to
+ * the number copied so the partial array is still freed, and returns false
+ * (conf_strndup already logged). */
+static bool conf_load_string_arr(
+	const char *restrict field, const struct json_string *restrict src,
+	const size_t count, char ***restrict out, size_t *restrict out_count)
+{
+	if (count == 0) {
+		return true;
+	}
+	char **const arr = (char **)malloc(count * sizeof(*arr));
+	if (arr == NULL) {
+		LOGOOM();
+		return false;
+	}
+	*out = arr;
+	*out_count = count;
+	for (size_t i = 0; i < count; i++) {
+		arr[i] = conf_strndup(field, src[i].str, src[i].len);
+		if (arr[i] == NULL) {
+			*out_count = i;
+			return false;
+		}
+	}
+	return true;
+}
+
 #if WITH_TLS
 static bool
 conf_load_tls(struct config *restrict cfg, const struct json_conf *restrict obj)
@@ -221,23 +241,11 @@ conf_load_tls(struct config *restrict cfg, const struct json_conf *restrict obj)
 		obj->tls.ciphersuites);
 	STRNDUP_FIELD("tls.sni", cfg->tls_sni, obj->tls.sni);
 	STRNDUP_FIELD("tls.alpn", cfg->tls_alpn, obj->tls.alpn);
-	if (obj->tls.authcerts_count > 0) {
-		cfg->tls_authcerts = (char **)malloc(
-			obj->tls.authcerts_count * sizeof(*cfg->tls_authcerts));
-		if (cfg->tls_authcerts == NULL) {
-			LOGOOM();
-			return false;
-		}
-		cfg->tls_authcerts_count = obj->tls.authcerts_count;
-		for (size_t i = 0; i < obj->tls.authcerts_count; i++) {
-			cfg->tls_authcerts[i] = conf_strndup(
-				"tls.authcerts[]", obj->tls.authcerts[i].str,
-				obj->tls.authcerts[i].len);
-			if (cfg->tls_authcerts[i] == NULL) {
-				cfg->tls_authcerts_count = i;
-				return false;
-			}
-		}
+	if (!conf_load_string_arr(
+		    "tls.authcerts[]", obj->tls.authcerts,
+		    obj->tls.authcerts_count, &cfg->tls_authcerts,
+		    &cfg->tls_authcerts_count)) {
+		return false;
 	}
 	cfg->tls_socket_offload = obj->tls.socket_offload;
 	/* KTLS requires the library to own the socket fd. */
@@ -345,26 +353,11 @@ static bool conf_load_identity(
 {
 	STRNDUP_FIELD(
 		"identity.claim", cfg->identity.claim, obj->identity.claim);
-	if (obj->identity.mux_connect_count > 0) {
-		cfg->identity.mux_connect = (char **)malloc(
-			obj->identity.mux_connect_count *
-			sizeof(*cfg->identity.mux_connect));
-		if (cfg->identity.mux_connect == NULL) {
-			LOGOOM();
-			return false;
-		}
-		cfg->identity.mux_connect_count =
-			obj->identity.mux_connect_count;
-		for (size_t i = 0; i < obj->identity.mux_connect_count; i++) {
-			cfg->identity.mux_connect[i] = conf_strndup(
-				"identity.mux_connect[]",
-				obj->identity.mux_connect[i].str,
-				obj->identity.mux_connect[i].len);
-			if (cfg->identity.mux_connect[i] == NULL) {
-				cfg->identity.mux_connect_count = i;
-				return false;
-			}
-		}
+	if (!conf_load_string_arr(
+		    "identity.mux_connect[]", obj->identity.mux_connect,
+		    obj->identity.mux_connect_count, &cfg->identity.mux_connect,
+		    &cfg->identity.mux_connect_count)) {
+		return false;
 	}
 	/* identity.listen: raw JSON fragment pointing into the json buffer.
 	 * Walk it now and strdup each peer address before json_free_conf. */
@@ -440,12 +433,20 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 
 #undef STRNDUP_FIELD
 
+/* Timeout fields are in seconds: 0 disables the timeout, any positive value is
+ * clamped to [10, 86400].  Centralizes the shared bounds so the mux timeouts
+ * cannot drift apart (schema minimum 0 rules out a negative input). */
+static int clamp_timeout(const int v)
+{
+	return v > 0 ? CLAMP(v, 10, 86400) : 0;
+}
+
 /* Clamp keepalive and derive the inactivity deadline:
  * max(keepalive*1.1, keepalive+90s).  keepalive == 0 disables both. */
 static void conf_derive_mux_timeout(struct config *restrict conf)
 {
+	conf->mux.keepalive = clamp_timeout(conf->mux.keepalive);
 	if (conf->mux.keepalive > 0) {
-		conf->mux.keepalive = CLAMP(conf->mux.keepalive, 10, 86400);
 		conf->mux.timeout =
 			conf->mux.keepalive + MAX(conf->mux.keepalive / 10, 90);
 	} else {
@@ -463,24 +464,10 @@ static void conf_derive_mux_timeout(struct config *restrict conf)
 static void conf_normalize(struct config *restrict conf)
 {
 	conf_derive_mux_timeout(conf);
-	if (conf->mux.send_timeout > 0) {
-		conf->mux.send_timeout =
-			CLAMP(conf->mux.send_timeout, 10, 86400);
-	}
-	if (conf->mux.connect_timeout > 0) {
-		conf->mux.connect_timeout =
-			CLAMP(conf->mux.connect_timeout, 10, 86400);
-	}
-	if (conf->mux.resume_timeout > 0) {
-		conf->mux.resume_timeout =
-			CLAMP(conf->mux.resume_timeout, 10, 86400);
-	}
-	if (conf->mux.idle_timeout > 0) {
-		conf->mux.idle_timeout =
-			CLAMP(conf->mux.idle_timeout, 10, 86400);
-	} else {
-		conf->mux.idle_timeout = 0;
-	}
+	conf->mux.send_timeout = clamp_timeout(conf->mux.send_timeout);
+	conf->mux.connect_timeout = clamp_timeout(conf->mux.connect_timeout);
+	conf->mux.resume_timeout = clamp_timeout(conf->mux.resume_timeout);
+	conf->mux.idle_timeout = clamp_timeout(conf->mux.idle_timeout);
 	conf->loglevel =
 		CLAMP(conf->loglevel, LOG_LEVEL_SILENCE, LOG_LEVEL_VERYVERBOSE);
 	/* Resolve "lo == 0" to its final value now, so every session reads an
@@ -895,7 +882,9 @@ static bool build_json_string_arr(
 	return true;
 }
 
-char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
+char *conf_dump(
+	const struct config *restrict conf, size_t *restrict lenp,
+	const char *restrict indent)
 {
 	/* Three heap temporaries feed the `raw` literal below; they are released
 	 * once at the cleanup label so a future addition need only be freed there.
@@ -1044,7 +1033,7 @@ char *conf_dump(const struct config *restrict conf, size_t *restrict lenp)
 		goto cleanup;
 	}
 	const int json_sz =
-		json_marshal_conf(out, CONF_MAXSIZE + 1, &raw, NULL);
+		json_marshal_conf(out, CONF_MAXSIZE + 1, &raw, indent);
 	if (json_sz <= 0 || json_sz > CONF_MAXSIZE) {
 		LOGE_F("config dump failed or exceeds maximum size of %d bytes",
 		       CONF_MAXSIZE);
