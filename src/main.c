@@ -13,6 +13,8 @@
 #include "shim/tls.h"
 #endif
 
+#include "io/file.h"
+
 #include "math/rand.h"
 #include "os/daemon.h"
 #if WITH_CRASH_HANDLER
@@ -35,6 +37,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Per-level indent used when --dump-config pretty-prints the resolved config. */
+#define DUMP_CONFIG_INDENT "    "
 
 static struct {
 	const char *conf_path;
@@ -277,11 +282,26 @@ static bool drop_privileges_verified(const char *restrict user_name)
 #define PATH_SEPARATOR '/'
 #endif
 
+/* io_filewriter() heap-allocates a stream that slog only borrows for the
+ * process lifetime; cache one per standard stream so the boot sequence's
+ * repeated stdout/stderr sink switches neither leak the prior sink nor
+ * dangle. */
+static struct io_stream *log_filewriter(FILE *const f)
+{
+	static struct io_stream *stdout_writer = NULL;
+	static struct io_stream *stderr_writer = NULL;
+	struct io_stream **restrict slot =
+		(f == stdout) ? &stdout_writer : &stderr_writer;
+	if (*slot == NULL) {
+		*slot = io_filewriter(f);
+	}
+	return *slot;
+}
+
 static void init(void)
 {
 	(void)setlocale(LC_ALL, "");
-	(void)setvbuf(stdout, NULL, _IONBF, 0);
-	slog_setoutput(SLOG_OUTPUT_FILE, stdout);
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stdout));
 	{
 		static char prefix[] = __FILE__;
 		char *s = strrchr(prefix, PATH_SEPARATOR);
@@ -327,9 +347,9 @@ int main(int argc, char **argv)
 	 * simply keeps this stderr sink. Restore the stdout boot sink afterwards --
 	 * stdout is deliberate for the daemon body (the config's `log` defaults
 	 * there). */
-	slog_setoutput(SLOG_OUTPUT_FILE, stderr);
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stderr));
 	parse_args(argc, argv);
-	slog_setoutput(SLOG_OUTPUT_FILE, stdout);
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stdout));
 	/* --dump-config writes machine-readable JSON to stdout, so move the log
 	 * off that stream for the rest of the run: config parsing legitimately
 	 * warns (e.g. plaintext mode), and any such line would otherwise land on
@@ -337,7 +357,7 @@ int main(int argc, char **argv)
 	 * before the config's own `log` setting is applied, so nothing points the
 	 * sink back at stdout. */
 	if (args.dump_config) {
-		slog_setoutput(SLOG_OUTPUT_FILE, stderr);
+		slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stderr));
 	}
 	/* Boot/parse-phase log level: the CLI --loglevel if given, else NOTICE.
 	 * Once a config is loaded, the effective runtime level is applied below. */
@@ -387,7 +407,8 @@ int main(int argc, char **argv)
 
 	if (args.dump_config) {
 		size_t dump_len;
-		char *const dump_json = conf_dump(conf, &dump_len);
+		char *const dump_json =
+			conf_dump(conf, &dump_len, DUMP_CONFIG_INDENT);
 		if (dump_json == NULL) {
 			LOGF("failed to dump config");
 			conf_free(conf);
@@ -413,9 +434,9 @@ int main(int argc, char **argv)
 	slog_setlevel(args.loglevel >= 0 ? args.loglevel : conf->loglevel);
 	if (conf->log != NULL) {
 		if (strcmp(conf->log, "stdout") == 0) {
-			slog_setoutput(SLOG_OUTPUT_FILE, stdout);
+			slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stdout));
 		} else if (strcmp(conf->log, "stderr") == 0) {
-			slog_setoutput(SLOG_OUTPUT_FILE, stderr);
+			slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stderr));
 		} else if (strcmp(conf->log, "terminal") == 0) {
 			slog_setoutput(SLOG_OUTPUT_TERMINAL, stderr);
 		} else if (strcmp(conf->log, "syslog") == 0) {
