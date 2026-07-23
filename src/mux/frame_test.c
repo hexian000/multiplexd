@@ -532,7 +532,7 @@ T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 	T_EXPECT_EQ(ctx.free_calls, n);
 }
 
-/* Direct coverage of bytebuf_reserve's four decision points: fast-path (space
+/* Direct coverage of mux_bytebuf_reserve's four decision points: fast-path (space
  * already available), compaction, doubling growth, and overflow rejection. */
 
 T_DECLARE_CASE(test_bytebuf_reserve_noop_when_space_available)
@@ -541,14 +541,14 @@ T_DECLARE_CASE(test_bytebuf_reserve_noop_when_space_available)
 	T_CHECK(rb != NULL);
 	bytebuf_produce(rb, 4);
 
-	T_EXPECT(bytebuf_reserve(&rb, 12, false));
+	T_EXPECT(mux_bytebuf_reserve(&rb, 12, false));
 	T_EXPECT_EQ(rb->cap, (size_t)16);
 	T_EXPECT_EQ(rb->off, (size_t)0);
 
 	/* need == 0 is always satisfied too, even with zero space left. */
 	bytebuf_produce(rb, 12);
 	T_EXPECT_EQ(bytebuf_write_space(rb), (size_t)0);
-	T_EXPECT(bytebuf_reserve(&rb, 0, false));
+	T_EXPECT(mux_bytebuf_reserve(&rb, 0, false));
 
 	bytebuf_free(rb);
 }
@@ -566,7 +566,7 @@ T_DECLARE_CASE(test_bytebuf_reserve_compaction_recovers_space)
 	T_CHECK(rb->off == 5 && rb->len == 3);
 	T_EXPECT_EQ(bytebuf_write_space(rb), (size_t)2);
 
-	T_EXPECT(bytebuf_reserve(&rb, 5, false));
+	T_EXPECT(mux_bytebuf_reserve(&rb, 5, false));
 	T_EXPECT_EQ(rb->off, (size_t)0);
 	T_EXPECT_EQ(rb->len, (size_t)3);
 	T_EXPECT_EQ(rb->cap, (size_t)10); /* compaction alone; no realloc */
@@ -582,7 +582,7 @@ T_DECLARE_CASE(test_bytebuf_reserve_returns_false_when_cannot_grow)
 	T_CHECK(rb != NULL);
 	bytebuf_produce(rb, 4); /* off=0 already: compact is a no-op */
 
-	T_EXPECT(!bytebuf_reserve(&rb, 1, false));
+	T_EXPECT(!mux_bytebuf_reserve(&rb, 1, false));
 	T_EXPECT_EQ(rb->cap, (size_t)4);
 
 	bytebuf_free(rb);
@@ -600,7 +600,7 @@ T_DECLARE_CASE(test_bytebuf_reserve_doubling_growth_loop)
 	T_CHECK(rb->off == 0 && rb->len == 0);
 
 	/* min_cap = 0 + 20 = 20; doubling from 4: 4, 8, 16, 32 (first >= 20). */
-	T_EXPECT(bytebuf_reserve(&rb, 20, true));
+	T_EXPECT(mux_bytebuf_reserve(&rb, 20, true));
 	T_EXPECT_EQ(rb->cap, (size_t)32);
 	T_EXPECT(bytebuf_write_space(rb) >= (size_t)20);
 
@@ -616,7 +616,7 @@ T_DECLARE_CASE(test_bytebuf_reserve_overflow_clamp_rejects)
 	struct bytebuf *rb = bytebuf_new(4);
 	T_CHECK(rb != NULL);
 
-	T_EXPECT(!bytebuf_reserve(&rb, SIZE_MAX - rb->len, true));
+	T_EXPECT(!mux_bytebuf_reserve(&rb, SIZE_MAX - rb->len, true));
 	T_EXPECT_EQ(
 		rb->cap, (size_t)4); /* untouched: rejected before realloc */
 
@@ -634,7 +634,7 @@ T_DECLARE_CASE(test_bytebuf_reserve_len_plus_need_overflow_rejects)
 	bytebuf_produce(rb, 4); /* len = 4 so len + need can overflow */
 	T_CHECK(rb->len == 4);
 
-	T_EXPECT(!bytebuf_reserve(&rb, SIZE_MAX - 3, true));
+	T_EXPECT(!mux_bytebuf_reserve(&rb, SIZE_MAX - 3, true));
 	T_EXPECT_EQ(
 		rb->cap, (size_t)4); /* untouched: rejected before realloc */
 

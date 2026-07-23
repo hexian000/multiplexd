@@ -47,11 +47,11 @@ static bool fail_and_free_cb(
 	if (s->state != STREAM_CLOSED) {
 		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
 	}
-	stream_free(s);
+	mux_stream_free(s);
 	return true;
 }
 
-void sched_free_streams(struct mux_session *restrict ss)
+void mux_sched_free_streams(struct mux_session *restrict ss)
 {
 	ss->sched.sched_head = NULL;
 	ss->sched.sched_tail = NULL;
@@ -74,12 +74,12 @@ void sched_free_streams(struct mux_session *restrict ss)
 	}
 }
 
-bool sched_add_stream(
+bool mux_sched_add_stream(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	/* Reject a duplicate ID *before* touching the table: table_set would
 	 * replace the existing mapping with s and return the old element, but the
-	 * callers respond to a false return by stream_free(s) -- which would leave
+	 * callers respond to a false return by mux_stream_free(s) -- which would leave
 	 * the table holding a freed pointer and orphan the original stream. */
 	if (ss->sched.streams != NULL) {
 		void *found = NULL;
@@ -102,7 +102,7 @@ bool sched_add_stream(
 	return true;
 }
 
-struct mux_stream *sched_find_stream(
+struct mux_stream *mux_sched_find_stream(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id)
 {
 	if (ss->sched.streams == NULL) {
@@ -121,7 +121,7 @@ struct mux_stream *sched_find_stream(
 /* Wrap-around counter with parity enforcement (client odd, server even);
  * +2 step avoids rapid ID reuse; returns STREAMID_CTRL when all matching-
  * parity IDs are occupied. */
-uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss)
+uint_least16_t mux_sched_alloc_stream_id(struct mux_session *restrict ss)
 {
 	const uint_least16_t parity = ss->accepted ? 0u : 1u;
 	uint_least16_t id = ss->sched.next_stream_id;
@@ -152,7 +152,7 @@ uint_least16_t sched_alloc_stream_id(struct mux_session *restrict ss)
 	return STREAMID_CTRL;
 }
 
-void sched_delay_remove(
+void mux_sched_delay_remove(
 	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	if (s->delay_prev != NULL) {
@@ -209,19 +209,20 @@ sched_lp_enqueue(struct mux_session *restrict ss, struct mux_stream *restrict s)
 	}
 }
 
-void sched_wake(struct mux_session *restrict ss, struct mux_stream *restrict s)
+void mux_sched_wake(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	if (ss->state != SESSION_ESTABLISHED) {
 		/* Before SESSION_ESTABLISHED the split queues are not active yet. */
 		sched_enqueue(ss, s);
 		return;
 	}
-	/* Keep INIT/CLOSED out of DRR.  If sendbuf is busy, the session_on_send epilogue
+	/* Keep INIT/CLOSED out of DRR.  If sendbuf is busy, the mux_session_on_send epilogue
 	 * re-arms the lp drain after the current frame drains. */
 	if (s->state == STREAM_INIT || s->state == STREAM_CLOSED) {
 		sched_lp_enqueue(ss, s);
 		if (ss->wire.sendbuf.head == NULL) {
-			sched_schedule(ss);
+			mux_sched_schedule(ss);
 		} else {
 			ss->wire.tx_pending = true;
 		}
@@ -229,18 +230,18 @@ void sched_wake(struct mux_session *restrict ss, struct mux_stream *restrict s)
 		sched_enqueue(ss, s);
 		ss->wire.tx_pending = true;
 	}
-	session_notify(ss);
+	mux_session_notify(ss);
 }
 
 /* React to the stream table's active (non-tombstone) count possibly having
  * just reached zero: initiate drain-shutdown, or arm the idle timer.
  * Tombstones (CLOSED streams lingering for late-frame suppression, not
- * active) are subtracted, matching session_drain()/session_open_stream()'s
+ * active) are subtracted, matching mux_session_drain()/mux_session_open_stream()'s
  * own "active stream count" -- otherwise drain-shutdown/idle-timer-arm waits
  * for every remaining tombstone to also expire and be swept. Safe to call
  * whenever the table or tombstone count changes; a no-op when streams remain
  * active or the session isn't ESTABLISHED. */
-void sched_check_no_active_streams(struct mux_session *restrict ss)
+void mux_sched_check_no_active_streams(struct mux_session *restrict ss)
 {
 	if (table_size(ss->sched.streams) != ss->sched.num_tombstones) {
 		return;
@@ -249,7 +250,7 @@ void sched_check_no_active_streams(struct mux_session *restrict ss)
 		return;
 	}
 	if (ss->draining) {
-		session_initiate_shutdown(ss);
+		mux_session_initiate_shutdown(ss);
 		return;
 	}
 	if (!ss->accepted && ss->conf.idle_timeout > 0) {
@@ -257,39 +258,39 @@ void sched_check_no_active_streams(struct mux_session *restrict ss)
 	}
 }
 
-void sched_schedule(struct mux_session *restrict ss)
+void mux_sched_schedule(struct mux_session *restrict ss)
 {
 	/* Guarded centrally so callers can request the drain unconditionally: an
-	 * occupied sendbuf must defer it (the session_on_send epilogue re-arms on drain). */
+	 * occupied sendbuf must defer it (the mux_session_on_send epilogue re-arms on drain). */
 	if (ss->sched.lp_head == NULL || ss->wire.sendbuf.head != NULL) {
 		return;
 	}
 	ss->sched.lp_pending = true;
-	session_notify(ss);
+	mux_session_notify(ss);
 }
 
 static void
 sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
-	struct mux_frame *const frame = stream_dequeue_send(s);
+	struct mux_frame *const frame = mux_stream_dequeue_send(s);
 	if (frame != NULL) {
 		LOGVV_F("[fd:%d] sent SYN|PUSH for stream=%" PRIuLEAST16
 			" payload=%zu",
 			ss->w_socket.fd, s->id,
 			frame->len - MUX_FRAME_HEADER_SIZE);
-		session_send_push(ss, s, frame);
+		mux_session_send_push(ss, s, frame);
 		COUNTER_ADD(ss->cnt.num_stream_fastopen, 1);
-		stream_mark_syn_sent(s);
+		mux_stream_mark_syn_sent(s);
 		return;
 	}
-	const uint_fast32_t inc = stream_grant_inc(s);
-	if (!session_send_ctrl(ss, s->id, MUX_FLAG_SYN, inc)) {
+	const uint_fast32_t inc = mux_stream_grant_inc(s);
+	if (!mux_session_send_ctrl(ss, s->id, MUX_FLAG_SYN, inc)) {
 		return;
 	}
 	LOGVV_F("[fd:%d] sent SYN for stream %" PRIuLEAST16, ss->w_socket.fd,
 		s->id);
 	s->grant_sent += inc * MUX_WINDOW_UNIT;
-	stream_mark_syn_sent(s);
+	mux_stream_mark_syn_sent(s);
 }
 
 static void sched_remove_stream(
@@ -305,13 +306,13 @@ static void sched_remove_stream(
 	if (s->state != STREAM_CLOSED) {
 		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
 	}
-	sched_check_no_active_streams(ss);
+	mux_sched_check_no_active_streams(ss);
 }
 
 /* Drain the low-priority lifecycle queue (INIT→SYN batching, CLOSED→
  * cleanup); deferred to batch SYN flights for streams opened together,
- * re-armed by session_on_send if sendbuf is still occupied. */
-void sched_drain_lp(struct mux_session *restrict ss)
+ * re-armed by mux_session_on_send if sendbuf is still occupied. */
+void mux_sched_drain_lp(struct mux_session *restrict ss)
 {
 	if (ss->state != SESSION_ESTABLISHED) {
 		return;
@@ -343,7 +344,7 @@ void sched_drain_lp(struct mux_session *restrict ss)
 
 		if (s->state == STREAM_CLOSED) {
 			sched_remove_stream(ss, s);
-			stream_free(s);
+			mux_stream_free(s);
 			continue;
 		}
 
@@ -356,7 +357,7 @@ void sched_drain_lp(struct mux_session *restrict ss)
 					WARNING, ss,
 					"SYN failed (OOM), closing stream %" PRIuLEAST16,
 					s->id);
-				stream_close(s);
+				mux_stream_do_close(s);
 			}
 			/* SYN_SENT: data waits for SYN|ACK; continue batching
 			 * while the sendbuf tail is a staging entry; a SYN+PUSH
@@ -373,7 +374,7 @@ void sched_drain_lp(struct mux_session *restrict ss)
 	}
 }
 
-void sched_delay(
+void mux_sched_delay(
 	struct mux_session *restrict ss, struct mux_stream *restrict s,
 	const uint_fast8_t ticks)
 {
@@ -391,7 +392,7 @@ void sched_delay(
 	if (ss->sched.delay_head != NULL) {
 		ss->sched.delay_head->delay_prev = s;
 	} else {
-		sched_coalesce_arm(ss);
+		mux_sched_coalesce_arm(ss);
 	}
 	ss->sched.delay_head = s;
 }
@@ -411,7 +412,7 @@ static void sched_send_ctrl_flags(
 	uint_fast8_t flags = 0;
 	uint_fast32_t inc = 0;
 	if (has_ack_pending) {
-		inc = stream_grant_inc(s);
+		inc = mux_stream_grant_inc(s);
 		if (inc > 0) {
 			flags |= MUX_FLAG_ACK;
 		}
@@ -421,12 +422,12 @@ static void sched_send_ctrl_flags(
 	}
 
 	if (flags == 0) {
-		/* Grantable sub-unit: clear ack_pending; stream_check_ack re-arms on recovery. */
+		/* Grantable sub-unit: clear ack_pending; mux_stream_check_ack re-arms on recovery. */
 		s->ack_pending = false;
 		return;
 	}
 
-	if (!session_send_ctrl(ss, s->id, flags, inc)) {
+	if (!mux_session_send_ctrl(ss, s->id, flags, inc)) {
 		return;
 	}
 	if (flags & MUX_FLAG_ACK) {
@@ -436,11 +437,11 @@ static void sched_send_ctrl_flags(
 		 * remains; otherwise the tick must still fire to flush
 		 * the queued send frame. */
 		if (s->send_queue.head == NULL && s->delay_pending) {
-			sched_delay_remove(ss, s);
+			mux_sched_delay_remove(ss, s);
 		}
 	}
 	if (flags & MUX_FLAG_FIN) {
-		stream_mark_fin_sent(s);
+		mux_stream_mark_fin_sent(s);
 	}
 }
 
@@ -474,7 +475,7 @@ static void sched_drr_continue(
 	/* Budget exhausted: yield and re-queue for the next round,
 	 * preserving leftover deficit. */
 	ss->sched.drr_active = NULL;
-	sched_wake(ss, s);
+	mux_sched_wake(ss, s);
 }
 
 static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
@@ -494,7 +495,7 @@ static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
 /* Scan the DRR ready queue and stage at most one PUSH frame; skips streams
  * blocked on credit, queue empty, Nagle, or non-ESTABLISHED state.
  * Returns true iff a frame was staged. */
-bool sched_next_data(struct mux_session *restrict ss)
+bool mux_sched_next_data(struct mux_session *restrict ss)
 {
 	for (;;) {
 		struct mux_stream *s;
@@ -517,7 +518,7 @@ bool sched_next_data(struct mux_session *restrict ss)
 			 * queue. */
 			if (!ev_is_active(&s->w_tombstone)) {
 				sched_lp_enqueue(ss, s);
-				sched_schedule(ss);
+				mux_sched_schedule(ss);
 			}
 			continue;
 		}
@@ -527,7 +528,7 @@ bool sched_next_data(struct mux_session *restrict ss)
 		if (s->state == STREAM_INIT) {
 			ss->sched.drr_active = NULL;
 			sched_lp_enqueue(ss, s);
-			sched_schedule(ss);
+			mux_sched_schedule(ss);
 			continue;
 		}
 		/* SYN_SENT stays queued-only until the peer's SYN|ACK re-opens credit. */
@@ -539,7 +540,7 @@ bool sched_next_data(struct mux_session *restrict ss)
 		LOGVV_F("[fd:%d] sched stream=%" PRIuLEAST16, ss->w_socket.fd,
 			s->id);
 
-		struct mux_frame *const frame = stream_dequeue_send(s);
+		struct mux_frame *const frame = mux_stream_dequeue_send(s);
 		if (frame != NULL) {
 			const size_t payload =
 				frame->len - MUX_FRAME_HEADER_SIZE;
@@ -550,14 +551,14 @@ bool sched_next_data(struct mux_session *restrict ss)
 			    s->deficit < (uint_least32_t)payload) {
 				s->deficit += ss->max_payload;
 			}
-			session_send_push(ss, s, frame);
+			mux_session_send_push(ss, s, frame);
 			if (ss->state != SESSION_ESTABLISHED) {
 				/* A piggybacked FIN may free s during a drain;
 				 * leaving ESTABLISHED is the signal used in recv.c too. */
 				return true;
 			}
 			s->deficit -= (uint_least32_t)payload;
-			stream_notify_recv(s);
+			mux_stream_notify_recv(s);
 			sched_drr_continue(ss, s);
 			sched_send_ctrl_flags(ss, s);
 			return true;
@@ -565,7 +566,7 @@ bool sched_next_data(struct mux_session *restrict ss)
 
 		ss->sched.drr_active = NULL;
 		/* Discard deficit unconditionally so a parked stream cannot bank
-		 * budget and jump ahead once sched_wake() re-admits it to DRR. */
+		 * budget and jump ahead once mux_sched_wake() re-admits it to DRR. */
 		s->deficit = 0;
 		/* Nagle may be holding a small frame; schedule a
 		 * delayed flush if credit is available. */
@@ -584,7 +585,7 @@ bool sched_next_data(struct mux_session *restrict ss)
 					" unacked=%" PRIuLEAST32,
 					s->id, payload, credit,
 					s->unacked_bytes);
-				sched_delay(ss, s, MUX_NAGLE_TICKS);
+				mux_sched_delay(ss, s, MUX_NAGLE_TICKS);
 			}
 		}
 
@@ -598,9 +599,9 @@ bool sched_next_data(struct mux_session *restrict ss)
  * ACK/FIN until the next round even during a session stall, when
  * send_stage_next relies on this call to keep flowing regardless.
  * The 8-byte control frames pack into one staging entry.
- * Never calls stream_check_ack — ack_pending is set by the receive path and by
+ * Never calls mux_stream_check_ack — ack_pending is set by the receive path and by
  * sched_coalesce_cb (which arms it for a stream with a pending grant). */
-void sched_flush_ctrl(struct mux_session *restrict ss)
+void mux_sched_flush_ctrl(struct mux_session *restrict ss)
 {
 	if (ss->sched.drr_active != NULL &&
 	    ss->sched.drr_active->state != STREAM_CLOSED) {
@@ -628,7 +629,7 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	ASSERT(loop == ss->loop);
 	(void)loop;
 	/* Walk the list in-place: survivors stay; expired nodes are removed in
-	 * O(1) and scheduled.  Reentrant sched_delay calls prepend to
+	 * O(1) and scheduled.  Reentrant mux_sched_delay calls prepend to
 	 * delay_head and are visited in the next tick. */
 	for (struct mux_stream *s = ss->sched.delay_head; s != NULL;) {
 		struct mux_stream *const next = s->delay_next;
@@ -640,7 +641,7 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		const bool has_grant = stream_grantable_bytes(s) >=
 				       (uint_fast32_t)MUX_WINDOW_UNIT;
 		/* Expired: O(1) remove from list. */
-		sched_delay_remove(ss, s);
+		mux_sched_delay_remove(ss, s);
 		s->nagle_flush = true;
 		if (has_grant) {
 			s->ack_pending = true;
@@ -650,7 +651,7 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 			"coalesce timer released stream %" PRIuLEAST16
 			": ack=%d",
 			s->id, has_grant);
-		sched_wake(ss, s);
+		mux_sched_wake(ss, s);
 		s = next;
 	}
 
@@ -664,27 +665,27 @@ sched_coalesce_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 				DEBUG, ss,
 				"session ACK timer fired: unreported=%" PRIuLEAST32,
 				ss->unacked.unreported);
-			session_emit_ack(ss);
+			mux_session_emit_ack(ss);
 		}
 	} else {
 		ss->unacked.ack_ticks = 0;
 	}
 	/* Stop the coalescing timer when both the delay list and the session-ACK
-	 * backlog are empty; sched_delay / sched_coalesce_arm will restart it
+	 * backlog are empty; mux_sched_delay / mux_sched_coalesce_arm will restart it
 	 * when new work arrives. */
 	if (ss->sched.delay_head == NULL && ss->unacked.unreported == 0) {
 		ev_timer_stop(ss->loop, &ss->sched.w_coalesce);
 	}
 }
 
-void sched_coalesce_arm(struct mux_session *restrict ss)
+void mux_sched_coalesce_arm(struct mux_session *restrict ss)
 {
 	if (!ev_is_active(&ss->sched.w_coalesce)) {
 		ev_timer_again(ss->loop, &ss->sched.w_coalesce);
 	}
 }
 
-void sched_init(struct mux_session *restrict ss)
+void mux_sched_init(struct mux_session *restrict ss)
 {
 	ev_timer_init(
 		&ss->sched.w_coalesce, sched_coalesce_cb, 0.0,

@@ -2,7 +2,7 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* handshake_test.c - white-box tests for handshake.c (proto_hello build/parse
- * and handshake_process_hello). Dependencies: handshake.c #included; real
+ * and mux_handshake_process_hello). Dependencies: handshake.c #included; real
  * frame.c/proto_schema.gen.c linked; session/unacked/sched mocked. */
 
 #include "mux/handshake.h"
@@ -88,13 +88,13 @@ static struct mux_frame_allocator make_pool(struct frame_pool_ctx *ctx)
 	};
 }
 
-void session_reset(struct mux_session *ss)
+void mux_session_reset(struct mux_session *ss)
 {
 	ss->state = SESSION_CLOSED;
 	g_reset_calls++;
 }
 
-void session_handshake_done(struct mux_session *ss)
+void mux_session_handshake_done(struct mux_session *ss)
 {
 	(void)ss;
 	g_handshake_done_calls++;
@@ -106,12 +106,12 @@ void update_watcher(struct mux_session *ss)
 	g_update_watcher_calls++;
 }
 
-void session_notify(struct mux_session *restrict ss)
+void mux_session_notify(struct mux_session *restrict ss)
 {
 	update_watcher(ss);
 }
 
-bool unacked_resume_ack_recv(
+bool mux_unacked_resume_ack_recv(
 	struct mux_session *restrict ss, const uint_least32_t peer_ack)
 {
 	g_resume_ack_recv_calls++;
@@ -119,7 +119,7 @@ bool unacked_resume_ack_recv(
 	return g_resume_ack_result;
 }
 
-void unacked_free_all(struct mux_session *ss)
+void mux_unacked_free_all(struct mux_session *ss)
 {
 	mux_frame_ring_free(&ss->unacked.ring, &ss->pool);
 	ss->unacked.frames = 0;
@@ -133,7 +133,7 @@ void unacked_free_all(struct mux_session *ss)
 	ss->unacked.stalled = false;
 }
 
-void sched_free_streams(struct mux_session *restrict ss)
+void mux_sched_free_streams(struct mux_session *restrict ss)
 {
 	g_sched_free_calls++;
 	ss->sched.sched_head = NULL;
@@ -179,12 +179,12 @@ static void setup_session(
 
 static void teardown_session(struct mux_session *restrict ss)
 {
-	/* Free frames queued by handshake_enqueue_hello (server fresh path). */
+	/* Free frames queued by mux_handshake_enqueue_hello (server fresh path). */
 	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
 	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
 	/* Free unacked ring (empty in fuzz sessions). */
-	unacked_free_all(ss);
-	/* Free peer identity string (strdup'd by handshake_process_hello). */
+	mux_unacked_free_all(ss);
+	/* Free peer identity string (strdup'd by mux_handshake_process_hello). */
 	free(ss->handshake.peer_identity);
 	ss->handshake.peer_identity = NULL;
 	/* Free stream table (allocated by table_new on client fresh-session path). */
@@ -426,7 +426,8 @@ T_DECLARE_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume
 	ss.unacked.unreported = 7;
 	ss.unacked.last_ack_recv = 99;
 
-	T_EXPECT(handshake_enqueue_hello(&ss, PROTO_MSG_CLIENT_HELLO, true));
+	T_EXPECT(
+		mux_handshake_enqueue_hello(&ss, PROTO_MSG_CLIENT_HELLO, true));
 	T_CHECK(ss.wire.sendbuf.head != NULL);
 	const bool tx_pending = ss.wire.tx_pending;
 	const bool parse_ok = proto_hello_parse(
@@ -464,7 +465,8 @@ T_DECLARE_CASE(test_handshake_enqueue_hello_omits_oversized_identity)
 	T_CHECK(strlen(identity) == sizeof(parsed.identity));
 	ss.handshake.identity = identity;
 
-	T_EXPECT(handshake_enqueue_hello(&ss, PROTO_MSG_CLIENT_HELLO, false));
+	T_EXPECT(mux_handshake_enqueue_hello(
+		&ss, PROTO_MSG_CLIENT_HELLO, false));
 	T_CHECK(ss.wire.sendbuf.head != NULL);
 	const bool parse_ok = proto_hello_parse(
 		&ss, ss.wire.sendbuf.head->data + MUX_FRAME_HEADER_SIZE,
@@ -509,7 +511,7 @@ T_DECLARE_CASE(test_handshake_process_server_hello_assigns_peer_identity)
 	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
 	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 	const int reset_calls = g_reset_calls;
 	const int done_calls = g_handshake_done_calls;
 	const size_t readable = bytebuf_readable(ss.wire.recvbuf);
@@ -573,7 +575,7 @@ T_DECLARE_CASE(test_handshake_process_resume_hello_calls_on_resume_match)
 	 * and took this transient session's transport). */
 	g_resume_handled = true;
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 	const int resume_calls = g_resume_calls;
 	const uint_least32_t resume_seq = g_resume_seq;
 	const int done_calls = g_handshake_done_calls;
@@ -629,7 +631,7 @@ T_DECLARE_CASE(
 	/* No matching suspended session: the owner declines the resume. */
 	g_resume_handled = false;
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 	const int resume_calls = g_resume_calls;
 	const uint_least32_t resume_seq = g_resume_seq;
 	const int done_calls = g_handshake_done_calls;
@@ -691,7 +693,7 @@ T_DECLARE_CASE(test_handshake_process_server_hello_without_session_id_rejected)
 	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
 	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 
 	const int reset_calls = g_reset_calls;
 	const int done_calls = g_handshake_done_calls;
@@ -733,7 +735,7 @@ T_DECLARE_CASE(
 	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
 	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 
 	const int reset_calls = g_reset_calls;
 	const int done_calls = g_handshake_done_calls;
@@ -750,7 +752,7 @@ T_DECLARE_CASE(
 
 /* The peer-protocol-violation half of the confirmed-resume path: when the
  * server's resume_seq cannot be reconciled against what we actually sent,
- * unacked_resume_ack_recv fails and the session must reset rather than come up
+ * mux_unacked_resume_ack_recv fails and the session must reset rather than come up
  * with a trimmed-wrong unacked log. */
 T_DECLARE_CASE(test_handshake_process_confirmed_resume_ack_rejected)
 {
@@ -779,7 +781,7 @@ T_DECLARE_CASE(test_handshake_process_confirmed_resume_ack_rejected)
 	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
 	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 
 	const int ack_calls = g_resume_ack_recv_calls;
 	const int reset_calls = g_reset_calls;
@@ -819,7 +821,7 @@ T_DECLARE_CASE(test_handshake_process_confirmed_resume_calls_resume_ack_recv)
 	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
 	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 	const int ack_calls = g_resume_ack_recv_calls;
 	const uint_least32_t last_ack_recv = ss.unacked.last_ack_recv;
 	const int done_calls = g_handshake_done_calls;
@@ -870,7 +872,7 @@ T_DECLARE_CASE(test_handshake_process_confirmed_resume_rearms_write_watcher)
 	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
 	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 	const int ack_calls = g_resume_ack_recv_calls;
 	const int done_calls = g_handshake_done_calls;
 	const int watcher_calls = g_update_watcher_calls;
@@ -911,7 +913,7 @@ T_DECLARE_CASE(test_handshake_process_invalid_version_resets_session)
 	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
 	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
-	const bool ok = handshake_process_hello(&ss, &hdr, frame->len);
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 	const int reset_calls = g_reset_calls;
 	const int done_calls = g_handshake_done_calls;
 	/* Free the recvbuf before asserting so a failing T_EXPECT can't skip it;
@@ -934,7 +936,7 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_oversized_json)
 		&parsed));
 }
 
-/* handshake_process_hello resets the session when a hello arrives outside the
+/* mux_handshake_process_hello resets the session when a hello arrives outside the
  * SESSION_HANDSHAKE state. */
 T_DECLARE_CASE(test_handshake_process_hello_outside_handshake_resets)
 {
@@ -948,11 +950,12 @@ T_DECLARE_CASE(test_handshake_process_hello_outside_handshake_resets)
 
 	/* hdr is zero-initialized (length=0); frame_size must match the
 	 * caller-guaranteed MUX_FRAME_HEADER_SIZE + hdr.length invariant. */
-	T_EXPECT(!handshake_process_hello(&ss, &hdr, MUX_FRAME_HEADER_SIZE));
+	T_EXPECT(
+		!mux_handshake_process_hello(&ss, &hdr, MUX_FRAME_HEADER_SIZE));
 	T_EXPECT_EQ(g_reset_calls, 1);
 }
 
-/* fuzz - proto_hello_parse and handshake_process_hello, three modes:
+/* fuzz - proto_hello_parse and mux_handshake_process_hello, three modes:
  * random bytes, synthesized JSON, full frames with varied headers.
  * Set MUX_FUZZ_SEED/MUX_FUZZ_ITERATIONS to reproduce; seed fixed for CI. */
 
@@ -1314,7 +1317,7 @@ T_DECLARE_CASE(test_handshake_fuzz)
 					"version <= 0");
 			}
 
-			/* Mode C (30%): Frame -> handshake_process_hello */
+			/* Mode C (30%): Frame -> mux_handshake_process_hello */
 		} else {
 			/* Generate JSON body. */
 			size_t json_len;
@@ -1392,7 +1395,7 @@ T_DECLARE_CASE(test_handshake_fuzz)
 				 * same id actually confirms the resume.  A fully
 				 * random id matches the base64 corpus only
 				 * ~2^-128 of the time, which would leave
-				 * is_confirmed_resume / unacked_resume_ack_recv
+				 * is_confirmed_resume / mux_unacked_resume_ack_recv
 				 * unreached. */
 				const bool seed_corpus_id =
 					prng_bool() &&
@@ -1419,8 +1422,8 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			       frame_size);
 			bytebuf_produce(ss.wire.recvbuf, frame_size);
 
-			const bool ret =
-				handshake_process_hello(&ss, &hdr, frame_size);
+			const bool ret = mux_handshake_process_hello(
+				&ss, &hdr, frame_size);
 
 			/* Invariant 2: state must be a valid session_state. */
 			if ((unsigned)ss.state > (unsigned)SESSION_CLOSED) {
@@ -1430,34 +1433,34 @@ T_DECLARE_CASE(test_handshake_fuzz)
 					"session state out of range");
 			}
 
-			/* Invariant 3: session_reset -> SESSION_CLOSED. */
+			/* Invariant 3: mux_session_reset -> SESSION_CLOSED. */
 			if (g_reset_calls > 0 && ss.state != SESSION_CLOSED) {
 				print_fuzz_context(
 					iter, seed, frame_buf, frame_size);
 				T_FATAL("invariant 3 violated: "
-					"session_reset called but "
+					"mux_session_reset called but "
 					"state != SESSION_CLOSED");
 			}
 
 			/* Invariant 4: return true -> exactly one
-			 * session_handshake_done call. */
+			 * mux_session_handshake_done call. */
 			if (ret && g_handshake_done_calls != 1) {
 				print_fuzz_context(
 					iter, seed, frame_buf, frame_size);
 				T_FATAL("invariant 4 violated: "
-					"handshake_process_hello returned true "
-					"but session_handshake_done not called "
+					"mux_handshake_process_hello returned true "
+					"but mux_session_handshake_done not called "
 					"exactly once");
 			}
 
-			/* Invariant 5: handshake_done and session_reset are
+			/* Invariant 5: handshake_done and mux_session_reset are
 			 * mutually exclusive within a single call. */
 			if (g_handshake_done_calls > 0 && g_reset_calls > 0) {
 				print_fuzz_context(
 					iter, seed, frame_buf, frame_size);
 				T_FATAL("invariant 5 violated: "
-					"session_handshake_done and "
-					"session_reset both called");
+					"mux_session_handshake_done and "
+					"mux_session_reset both called");
 			}
 
 			teardown_session(&ss);

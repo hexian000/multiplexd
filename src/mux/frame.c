@@ -70,7 +70,7 @@ const struct mux_config mux_conf_default = {
 	.readahead = 128 * 1024,
 };
 
-bool bytebuf_reserve(
+bool mux_bytebuf_reserve(
 	struct bytebuf **restrict rbp, const size_t need, const bool can_grow)
 {
 	struct bytebuf *const rb = *rbp;
@@ -111,7 +111,7 @@ bool bytebuf_reserve(
 	return true;
 }
 
-void bytebuf_shrink(struct bytebuf **restrict rbp, const size_t target_cap)
+void mux_bytebuf_shrink(struct bytebuf **restrict rbp, const size_t target_cap)
 {
 	struct bytebuf *const rb = *rbp;
 	/* Keep whichever is larger: the requested floor or the live bytes. */

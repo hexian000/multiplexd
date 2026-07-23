@@ -14,6 +14,7 @@
 #if WITH_TLS
 #include "shim/tls.h"
 #endif
+#include "shim/util.h"
 
 #include "io/io.h"
 #include "os/socket.h"
@@ -45,7 +46,7 @@ static int wire_cipher_push(struct mux_session *restrict ss)
 				}
 			}
 			if (bytebuf_write_space(ss->wire.rawbuf) == 0 &&
-			    !bytebuf_reserve(
+			    !mux_bytebuf_reserve(
 				    &ss->wire.rawbuf, IO_BUFSIZE, true)) {
 				LOGOOM();
 				return ENOMEM;
@@ -68,8 +69,7 @@ static int wire_cipher_push(struct mux_session *restrict ss)
 		const int err = socket_send(
 			ss->w_socket.fd, bytebuf_read_ptr(rb), &nbytes);
 		if (err != 0) {
-			if (err == EAGAIN || err == EWOULDBLOCK ||
-			    err == ENOBUFS || err == ENOMEM) {
+			if (sock_would_block(err)) {
 				return EAGAIN; /* socket full; residue retained */
 			}
 			LOGE_F("send [fd:%d]: (%d) %s", ss->w_socket.fd, err,
@@ -152,8 +152,7 @@ static bool wire_recv_buffered(
 	size_t clen = *len;
 	const int serr = socket_recv(ss->w_socket.fd, buf, &clen);
 	if (serr != 0) {
-		if (serr != EAGAIN && serr != EWOULDBLOCK && serr != ENOBUFS &&
-		    serr != ENOMEM) {
+		if (!sock_would_block(serr)) {
 			LOGE_F("recv [fd:%d]: (%d) %s", ss->w_socket.fd, serr,
 			       strerror(serr));
 			ss->wire.rx_open = false;
@@ -225,7 +224,7 @@ static bool wire_recv_buffered(
 }
 #endif /* WITH_TLS */
 
-bool wire_send(
+bool mux_wire_send(
 	struct mux_session *restrict ss, const unsigned char *restrict buf,
 	size_t *restrict len)
 {
@@ -262,8 +261,7 @@ bool wire_send(
 			const int err = socket_send(
 				ss->w_socket.fd, buf + nbsent, &nbytes);
 			if (err != 0) {
-				if (err == EAGAIN || err == EWOULDBLOCK ||
-				    err == ENOBUFS || err == ENOMEM) {
+				if (sock_would_block(err)) {
 					break; /* wait for EV_WRITE */
 				}
 				LOGE_F("send [fd:%d]: (%d) %s", ss->w_socket.fd,
@@ -287,7 +285,7 @@ bool wire_send(
 	return true;
 }
 
-bool wire_recv(
+bool mux_wire_recv(
 	struct mux_session *restrict ss, unsigned char *restrict buf,
 	size_t *restrict len)
 {
@@ -328,8 +326,7 @@ bool wire_recv(
 	{
 		const int err = socket_recv(ss->w_socket.fd, buf, len);
 		if (err != 0) {
-			if (err == EAGAIN || err == EWOULDBLOCK ||
-			    err == ENOBUFS || err == ENOMEM) {
+			if (sock_would_block(err)) {
 				*len = 0;
 				return true; /* wait for EV_READ */
 			}
@@ -340,7 +337,7 @@ bool wire_recv(
 		}
 		if (*len == 0) {
 			/* TCP FIN: graceful close like close_notify.  tx_pending
-			 * makes session_on_send see !rx_open and enter SESSION_CLOSING. */
+			 * makes mux_session_on_send see !rx_open and enter SESSION_CLOSING. */
 			LOGV_F("[fd:%d] connection closed by peer",
 			       ss->w_socket.fd);
 			ss->wire.rx_open = false;
@@ -353,7 +350,7 @@ bool wire_recv(
 	return true;
 }
 
-bool wire_has_pending(const struct mux_session *restrict ss)
+bool mux_wire_has_pending(const struct mux_session *restrict ss)
 {
 #if WITH_TLS
 	/* Set by the on_recv notifier during the last tls_recv. */
@@ -364,7 +361,7 @@ bool wire_has_pending(const struct mux_session *restrict ss)
 #endif
 }
 
-void wire_discard_buffers(struct mux_session *restrict ss)
+void mux_wire_discard_buffers(struct mux_session *restrict ss)
 {
 	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
 	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
@@ -378,7 +375,7 @@ void wire_discard_buffers(struct mux_session *restrict ss)
 #endif
 }
 
-void wire_sendbuf_push(
+void mux_wire_sendbuf_push(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
 	ASSERT(frame->len > 0);
@@ -406,7 +403,7 @@ void wire_sendbuf_push(
 	ss->wire.sendbuf_staging = true;
 }
 
-enum wire_flush_result wire_flush(struct mux_session *restrict ss)
+enum wire_flush_result mux_wire_flush(struct mux_session *restrict ss)
 {
 #if WITH_TLS
 	if (ss->wire.tlsconn != NULL && !ss->conf.tls_socket_offload) {
@@ -426,7 +423,7 @@ enum wire_flush_result wire_flush(struct mux_session *restrict ss)
 }
 
 #if WITH_TLS
-void wire_set_tlsctx(
+void mux_wire_set_tlsctx(
 	struct mux_session *restrict ss, struct tls_context *restrict tlsctx)
 {
 	ss->wire.tlsctx = tlsctx;
@@ -449,7 +446,7 @@ static void wire_on_tls_recv(void *ctx)
 	ss->wire.tls_readable = true;
 }
 
-bool wire_tls_start(struct mux_session *restrict ss)
+bool mux_wire_tls_start(struct mux_session *restrict ss)
 {
 	if (ss->wire.tlsctx == NULL && ss->wire.tlsconn == NULL) {
 		return true;
@@ -472,14 +469,14 @@ bool wire_tls_start(struct mux_session *restrict ss)
 	/* Inbound: the accepted connection was created before this session
 	 * existed (the notifier ctx).  Either way, bind the notifier now. */
 	tls_set_callback(ss->wire.tlsconn, &cb);
-	/* The TLS handshake is driven implicitly by the first wire_send/wire_recv
+	/* The TLS handshake is driven implicitly by the first mux_wire_send/mux_wire_recv
 	 * of the mux hello exchange, reporting cross-direction stalls via tls_want;
 	 * update_watcher already arms the right events in SESSION_HANDSHAKE. */
 	return true;
 }
 
 #ifndef NDEBUG
-void wire_tls_log_status(struct mux_session *restrict ss)
+void mux_wire_tls_log_status(struct mux_session *restrict ss)
 {
 	if (ss->wire.tlsconn == NULL) {
 		return;
@@ -493,7 +490,7 @@ void wire_tls_log_status(struct mux_session *restrict ss)
 }
 #endif /* NDEBUG */
 
-void wire_adopt_tlsconn(
+void mux_wire_adopt_tlsconn(
 	struct mux_session *restrict ss, struct tls_connection *restrict conn)
 {
 	if (ss->wire.tlsconn != NULL) {
@@ -503,7 +500,7 @@ void wire_adopt_tlsconn(
 	if (conn != NULL) {
 		/* The connection was created for the transient session that carried
 		 * the resume hello; rebind the I/O notifier to ss so it never fires
-		 * on the old session (mirrors the inbound bind in wire_tls_start). */
+		 * on the old session (mirrors the inbound bind in mux_wire_tls_start). */
 		const struct tls_callback cb = {
 			.ctx = ss,
 			.on_send = wire_on_tls_send,
@@ -516,13 +513,13 @@ void wire_adopt_tlsconn(
 /* Free a detached TLS connection not owned by any session (e.g. a resume
  * transport handoff that could not be installed).  Keeps session.c off a
  * direct shim/tls.h dependency; tls_conn_free is NULL-safe. */
-void wire_tlsconn_free(struct tls_connection *restrict conn)
+void mux_wire_tlsconn_free(struct tls_connection *restrict conn)
 {
 	tls_conn_free(conn);
 }
 #endif /* WITH_TLS */
 
-void wire_conn_free(struct mux_session *restrict ss)
+void mux_wire_conn_free(struct mux_session *restrict ss)
 {
 #if WITH_TLS
 	if (ss->wire.tlsconn != NULL) {
@@ -534,7 +531,7 @@ void wire_conn_free(struct mux_session *restrict ss)
 #endif
 }
 
-enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
+enum wire_shutdown_state mux_wire_shutdown(struct mux_session *restrict ss)
 {
 #if WITH_TLS
 	if (ss->wire.tlsconn != NULL) {
@@ -544,9 +541,9 @@ enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
 		case TLS_ERROR_NONE:
 			/* Our close_notify is flushed (one-way); fall through to TCP
 			 * half-close; peer's close_notify is read later via
-			 * wire_wait_eof; memory-transport: push alert first. */
+			 * mux_wire_wait_eof; memory-transport: push alert first. */
 			if (!ss->conf.tls_socket_offload) {
-				switch (wire_flush(ss)) {
+				switch (mux_wire_flush(ss)) {
 				case WIRE_FLUSH_DONE:
 					break;
 				case WIRE_FLUSH_BLOCKED:
@@ -578,7 +575,7 @@ enum wire_shutdown_state wire_shutdown(struct mux_session *restrict ss)
 
 #if WITH_TLS
 /* Map a post-shutdown tls_recv() result to a wire_eof outcome. Shared by
- * wire_wait_eof's memory-transport and fd-backed branches so the four-way
+ * mux_wire_wait_eof's memory-transport and fd-backed branches so the four-way
  * mapping cannot drift between them. */
 static enum wire_eof_result eof_from_tls_recv(
 	const struct mux_session *restrict ss, const enum tls_error err,
@@ -607,7 +604,7 @@ static enum wire_eof_result eof_from_tls_recv(
 }
 #endif /* WITH_TLS */
 
-enum wire_eof_result wire_wait_eof(struct mux_session *restrict ss)
+enum wire_eof_result mux_wire_wait_eof(struct mux_session *restrict ss)
 {
 	unsigned char buf[256];
 #if WITH_TLS
@@ -617,8 +614,7 @@ enum wire_eof_result wire_wait_eof(struct mux_session *restrict ss)
 		size_t clen = sizeof(buf);
 		const int serr = socket_recv(ss->w_socket.fd, buf, &clen);
 		if (serr != 0) {
-			if (serr == EAGAIN || serr == EWOULDBLOCK ||
-			    serr == ENOBUFS || serr == ENOMEM) {
+			if (sock_would_block(serr)) {
 				return WIRE_EOF_PENDING;
 			}
 			return WIRE_EOF_ERROR;
@@ -647,8 +643,7 @@ enum wire_eof_result wire_wait_eof(struct mux_session *restrict ss)
 	{
 		const int err = socket_recv(ss->w_socket.fd, buf, &len);
 		if (err != 0) {
-			if (err == EAGAIN || err == EWOULDBLOCK ||
-			    err == ENOBUFS || err == ENOMEM) {
+			if (sock_would_block(err)) {
 				eagain = true;
 				len = 0; /* no unexpected data yet */
 			} else {

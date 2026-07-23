@@ -9,7 +9,7 @@
  *        and hand payload to stream receive buffers.
  *
  * The mux fd is handled in three layers: receive (recv.c) -> schedule (sched.c)
- * -> send (send.c + wire.c).  Cross-layer seam: session_flush_resp lets a
+ * -> send (send.c + wire.c).  Cross-layer seam: mux_session_flush_resp lets a
  * receive batch synchronously drive schedule+send (prompt PONG/ACK) rather than
  * waiting for the next EV_WRITE.
  */
@@ -33,8 +33,8 @@
 #include "meta/likely.h"
 #include "meta/minmax.h"
 #include "os/clock.h"
+#include "strings/format.h"
 #include "utils/debug.h"
-#include "utils/formats.h"
 #include "utils/slog.h"
 
 #include <ev.h>
@@ -130,17 +130,17 @@ static void process_syn_payload(
 	struct mux_session *ss, struct mux_stream *restrict s,
 	const struct mux_header *restrict hdr, const size_t frame_size)
 {
-	/* stream_start() has already collapsed SYN_SENT before SYN|PUSH reaches here. */
+	/* mux_stream_start() has already collapsed SYN_SENT before SYN|PUSH reaches here. */
 	if ((hdr->flags & MUX_FLAG_PUSH) && hdr->length > 0 &&
 	    (s->state == STREAM_ESTABLISHED ||
 	     s->state == STREAM_SYN_RECEIVED)) {
 		/* Bound the fast-open payload by the credit this side has granted the
 		 * peer, so bytes_received can never overtake grant_sent: nothing
-		 * downstream enforces it, as stream_recv_copy only guards recv_window,
+		 * downstream enforces it, as mux_stream_recv_copy only guards recv_window,
 		 * which floors at four frames (65536). Without this, a payload above
 		 * the grant is copied in, and stream_grantable_bytes then evaluates
 		 * (grant_sent - bytes_received) in wrapping uint_least32_t arithmetic
-		 * (~4.29e9), so stream_grant_inc returns 0 forever and the stream's
+		 * (~4.29e9), so mux_stream_grant_inc returns 0 forever and the stream's
 		 * credit loop never reopens.
 		 *
 		 * grant_sent is the exact bound on the SYN|ACK path (spec §4.3.1's
@@ -157,8 +157,8 @@ static void process_syn_payload(
 				": fast-open payload exceeds granted credit:"
 				" length=%" PRIuLEAST16 " grant=%" PRIuLEAST32,
 				s->id, hdr->length, s->grant_sent);
-			stream_abort(s, MUX_STATUS_FLOW_CONTROL_ERROR);
-			/* Same drain-cascade hazard as below: stream_abort can free the
+			mux_stream_abort(s, MUX_STATUS_FLOW_CONTROL_ERROR);
+			/* Same drain-cascade hazard as below: mux_stream_abort can free the
 			 * last active stream of a draining session, whose shutdown
 			 * resets this recvbuf -- do not consume a ring it already
 			 * reset. */
@@ -174,13 +174,13 @@ static void process_syn_payload(
 		COUNTER_ADD(
 			ss->cnt.traffic.byt_push_recv,
 			(uint_least64_t)hdr->length);
-		stream_recv_copy(
+		mux_stream_recv_copy(
 			s,
 			bytebuf_read_ptr(ss->wire.recvbuf) +
 				MUX_FRAME_HEADER_SIZE,
 			hdr->length);
 		/* Same drain-cascade hazard as dispatch_by_stream()'s PUSH branch:
-		 * a fast-open payload can stream_abort the last active stream of a
+		 * a fast-open payload can mux_stream_abort the last active stream of a
 		 * draining session, whose shutdown frees the streams and resets this
 		 * recvbuf -- do not consume a ring the cascade already reset. */
 		if (session_streams_freed(ss)) {
@@ -188,8 +188,8 @@ static void process_syn_payload(
 		}
 		bytebuf_consume(ss->wire.recvbuf, frame_size);
 		if (ss->auto_stream_window || ss->auto_session_window) {
-			estimator_add(ss, hdr->length);
-			session_flush_oob(ss);
+			mux_estimator_add(ss, hdr->length);
+			mux_session_flush_oob(ss);
 		}
 		return;
 	}
@@ -211,7 +211,8 @@ static void stream_report_established(
 	if (LOGLEVEL(DEBUG)) {
 		char stream_tag_[256];
 		char latency_str[32];
-		(void)stream_format_tag(stream_tag_, sizeof(stream_tag_), s);
+		(void)mux_stream_format_tag(
+			stream_tag_, sizeof(stream_tag_), s);
 		(void)format_duration(
 			latency_str, sizeof(latency_str),
 			make_duration_nanos(latency));
@@ -252,7 +253,7 @@ static void dispatch_by_stream(
 			return;
 		}
 		/* First late non-SYN frame: reply with one RST, then suppress.
-		 * Latch rst_sent from the enqueue result (like the #41 stream_abort
+		 * Latch rst_sent from the enqueue result (like the #41 mux_stream_abort
 		 * fix) so an OOM'd RST stays retryable on the next late frame
 		 * instead of being permanently suppressed. */
 		if (!s->rst_sent) {
@@ -261,7 +262,7 @@ static void dispatch_by_stream(
 				"late frame for closed stream %" PRIuFAST16
 				", sending RST",
 				stream_id);
-			s->rst_sent = session_send_ctrl(
+			s->rst_sent = mux_session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_PROTOCOL_ERROR);
 		} else {
@@ -279,11 +280,11 @@ static void dispatch_by_stream(
 	}
 
 	if (UNLIKELY(hdr->flags & MUX_FLAG_RST)) {
-		/* Consume before stream_recv_rst(): closing the last active stream
-		 * during a drain cascades into session_initiate_shutdown() ->
-		 * wire_discard_buffers(), which resets this same recvbuf. */
+		/* Consume before mux_stream_recv_rst(): closing the last active stream
+		 * during a drain cascades into mux_session_initiate_shutdown() ->
+		 * mux_wire_discard_buffers(), which resets this same recvbuf. */
 		bytebuf_consume(ss->wire.recvbuf, frame_size);
-		stream_recv_rst(s, hdr->extra);
+		mux_stream_recv_rst(s, hdr->extra);
 		return;
 	}
 
@@ -296,9 +297,9 @@ static void dispatch_by_stream(
 			(uint_least8_t)flags, stream_id, s->state);
 		/* Latch from the enqueue result so an OOM'd RST stays retryable
 		 * (the tombstone's late-frame handler above re-sends it), matching
-		 * the #41 stream_abort fix. */
+		 * the #41 mux_stream_abort fix. */
 		if (!s->rst_sent) {
-			s->rst_sent = session_send_ctrl(
+			s->rst_sent = mux_session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_PROTOCOL_ERROR);
 		}
@@ -308,7 +309,7 @@ static void dispatch_by_stream(
 		 * just sent above. Consume first: see the comment on the RST
 		 * branch above. */
 		bytebuf_consume(ss->wire.recvbuf, frame_size);
-		stream_recv_rst(s, MUX_STATUS_PROTOCOL_ERROR);
+		mux_stream_recv_rst(s, MUX_STATUS_PROTOCOL_ERROR);
 		return;
 	}
 
@@ -316,11 +317,11 @@ static void dispatch_by_stream(
 	 * SYN|ACK carries its own window update in the SYN branch below. */
 	if ((flags & MUX_FLAG_ACK) && !(flags & MUX_FLAG_SYN)) {
 		s->unacked_bytes = 0;
-		stream_recv_window(s, hdr->extra);
-		/* stream_recv_window() may stream_abort on a spec §6.6 excessive-
+		mux_stream_recv_window(s, hdr->extra);
+		/* mux_stream_recv_window() may mux_stream_abort on a spec §6.6 excessive-
 		 * credit overflow; on the last active stream of a draining session
-		 * that cascades into sched_free_streams() (frees s) +
-		 * wire_discard_buffers() (resets this recvbuf). The PUSH copy, FIN
+		 * that cascades into mux_sched_free_streams() (frees s) +
+		 * mux_wire_discard_buffers() (resets this recvbuf). The PUSH copy, FIN
 		 * handling, and consume further down would then touch the freed
 		 * stream or the reset ring, and the post-copy guard below runs too
 		 * late to cover this earlier free -- so stop once the free shows. */
@@ -344,14 +345,14 @@ static void dispatch_by_stream(
 			" queued=%" PRIuLEAST32 " unacked=%" PRIuLEAST32,
 			stream_id, hdr->extra, s->queued_send_bytes,
 			s->unacked_bytes);
-		/* Clear unacked bytes before stream_recv_window so its watcher
+		/* Clear unacked bytes before mux_stream_recv_window so its watcher
 		 * update and wakeup see the unlocked Nagle state. */
 		s->unacked_bytes = 0;
-		stream_recv_window(s, hdr->extra);
+		mux_stream_recv_window(s, hdr->extra);
 		/* Defense-in-depth, mirroring the ACK-only guard above: a SYN|ACK
 		 * grant on the initial send window cannot overflow §6.6 today (a
 		 * SYN_SENT stream has been granted no prior credit), but keep every
-		 * free-capable stream_recv_window() call uniformly guarded so the
+		 * free-capable mux_stream_recv_window() call uniformly guarded so the
 		 * drain-cascade invariant cannot silently drift. */
 		if (session_streams_freed(ss)) {
 			return;
@@ -361,55 +362,56 @@ static void dispatch_by_stream(
 		session_set_peer_stream_window(
 			ss, (uint_least32_t)(s->send_window / MUX_WINDOW_UNIT));
 		if (ss->auto_session_window) {
-			session_update_session_window(
-				ss, estimator_tx_window_size(&ss->estimator));
+			mux_session_update_session_window(
+				ss,
+				mux_estimator_tx_window_size(&ss->estimator));
 		}
 		stream_report_established(ss, s);
-		stream_start(s);
+		mux_stream_start(s);
 		process_syn_payload(ss, s, hdr, frame_size);
 		return;
 	}
 
 	/* ACK (incl. ACK|FIN): Extra is a credit grant, not a status code;
-	 * stream_recv_window was already called in the ACK-only block.  send_window
+	 * mux_stream_recv_window was already called in the ACK-only block.  send_window
 	 * is cumulative granted credit, not the peer's window, so do not derive
-	 * peer_stream_window from ACK increments.  stream_recv_window already emits
+	 * peer_stream_window from ACK increments.  mux_stream_recv_window already emits
 	 * the "peer ACK restored send credit" DEBUG log on the same condition. */
 
 	if (LIKELY((flags & MUX_FLAG_PUSH) && hdr->length > 0)) {
 		COUNTER_ADD(
 			ss->cnt.traffic.byt_push_recv,
 			(uint_least64_t)hdr->length);
-		stream_recv_copy(
+		mux_stream_recv_copy(
 			s,
 			bytebuf_read_ptr(ss->wire.recvbuf) +
 				MUX_FRAME_HEADER_SIZE,
 			hdr->length);
-		/* stream_recv_copy() may stream_abort on a recv-window/flow-control
+		/* mux_stream_recv_copy() may mux_stream_abort on a recv-window/flow-control
 		 * overflow or bytebuf OOM; on the last active stream of a draining
-		 * session that cascades into session_initiate_shutdown() ->
-		 * sched_free_streams() (frees s) + wire_discard_buffers() (resets
+		 * session that cascades into mux_session_initiate_shutdown() ->
+		 * mux_sched_free_streams() (frees s) + mux_wire_discard_buffers() (resets
 		 * this recvbuf). The consume below would then run on a reset ring and
-		 * stream_recv_fin(s) on freed memory, so stop once the free shows. */
+		 * mux_stream_recv_fin(s) on freed memory, so stop once the free shows. */
 		if (session_streams_freed(ss)) {
 			return;
 		}
 		bytebuf_consume(ss->wire.recvbuf, frame_size);
 		if (ss->auto_stream_window || ss->auto_session_window) {
-			estimator_add(ss, hdr->length);
-			session_flush_oob(ss);
+			mux_estimator_add(ss, hdr->length);
+			mux_session_flush_oob(ss);
 		}
 		if (flags & MUX_FLAG_FIN) {
-			stream_recv_fin(s);
+			mux_stream_recv_fin(s);
 		}
 		return;
 	}
 
-	/* Consume before stream_recv_fin(): see the comment on the RST branch
+	/* Consume before mux_stream_recv_fin(): see the comment on the RST branch
 	 * above. */
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 	if (flags & MUX_FLAG_FIN) {
-		stream_recv_fin(s);
+		mux_stream_recv_fin(s);
 	}
 }
 
@@ -442,7 +444,7 @@ static void dispatch_no_stream(
 				", closing connection",
 				(uint_least8_t)(flags & MUX_FLAG_MASK),
 				stream_id);
-			session_reset(ss);
+			mux_session_reset(ss);
 			return;
 		}
 
@@ -452,7 +454,7 @@ static void dispatch_no_stream(
 				"invalid peer stream id parity: stream=%" PRIuLEAST16
 				", closing connection",
 				hdr->stream_id);
-			session_reset(ss);
+			mux_session_reset(ss);
 			return;
 		}
 
@@ -472,7 +474,7 @@ static void dispatch_no_stream(
 				"%" PRIuFAST16 ", closing connection",
 				hdr->length, (unsigned)MUX_DEFAULT_SEND_WINDOW,
 				stream_id);
-			session_reset(ss);
+			mux_session_reset(ss);
 			return;
 		}
 
@@ -482,7 +484,7 @@ static void dispatch_no_stream(
 				"reject stream %" PRIuFAST16
 				": session draining",
 				stream_id);
-			session_send_ctrl(
+			mux_session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_REFUSED_STREAM);
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
@@ -497,32 +499,33 @@ static void dispatch_no_stream(
 				"reject stream %" PRIuFAST16
 				": max_streams (%d) reached",
 				stream_id, ss->conf.max_streams);
-			session_send_ctrl(
+			mux_session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_REFUSED_STREAM);
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
 
-		struct mux_stream *const s = stream_new(ss, stream_id, false);
+		struct mux_stream *const s =
+			mux_stream_new(ss, stream_id, false);
 		if (s == NULL) {
 			MUX_LOG(ERROR, ss, "stream allocation failed");
 			/* This frame is already counted into recv_seq,
 			 * so silently dropping it here (unlike the draining/max_streams
 			 * branches above) would leave the peer's opener waiting in
 			 * SYN_SENT with no error signal until an application timeout;
-			 * session_send_ctrl is itself OOM-tolerant, so this is safe to
+			 * mux_session_send_ctrl is itself OOM-tolerant, so this is safe to
 			 * attempt even here. */
-			session_send_ctrl(
+			mux_session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_INTERNAL_ERROR);
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
-		if (!sched_add_stream(ss, s)) {
+		if (!mux_sched_add_stream(ss, s)) {
 			MUX_LOG(ERROR, ss, "failed to add stream to table");
-			stream_free(s);
-			session_send_ctrl(
+			mux_stream_free(s);
+			mux_session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_INTERNAL_ERROR);
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
@@ -530,7 +533,7 @@ static void dispatch_no_stream(
 		}
 		/* The peer's SYN carries its own receive window in extra; grant the
 		 * initial default plus that window, exactly as the SYN|ACK path's
-		 * stream_recv_window() does. No cap at our stream_window: the peer
+		 * mux_stream_recv_window() does. No cap at our stream_window: the peer
 		 * owns its receive buffer, and extra=UINT16_MAX yields ~1 GiB, still
 		 * inside spec §6.6's INT32_MAX bound (16384 * 65535 + 16384). Capping
 		 * here also dropped the default frame's credit relative to SYN|ACK. */
@@ -542,12 +545,13 @@ static void dispatch_no_stream(
 		session_set_peer_stream_window(
 			ss, (uint_least32_t)hdr->extra + 1u);
 		if (ss->auto_session_window) {
-			session_update_session_window(
-				ss, estimator_tx_window_size(&ss->estimator));
+			mux_session_update_session_window(
+				ss,
+				mux_estimator_tx_window_size(&ss->estimator));
 		}
 		if (LOGLEVEL(INFO)) {
 			char stream_tag_[256];
-			(void)stream_format_tag(
+			(void)mux_stream_format_tag(
 				stream_tag_, sizeof(stream_tag_), s);
 			LOGI_F("%s stream accepted (send_window=%" PRIuLEAST32
 			       ")",
@@ -563,11 +567,11 @@ static void dispatch_no_stream(
 			 * stays retryable (the late-frame handler re-sends it),
 			 * and mark aborted so the rejected stream is still counted
 			 * failed even when rst_sent stays false on OOM. */
-			s->rst_sent = session_send_ctrl(
+			s->rst_sent = mux_session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_REFUSED_STREAM);
 			s->aborted = true;
-			stream_close(s);
+			mux_stream_do_close(s);
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
@@ -582,11 +586,11 @@ static void dispatch_no_stream(
 			 * stays retryable (the late-frame handler re-sends it),
 			 * and mark aborted so the rejected stream is still counted
 			 * failed even when rst_sent stays false on OOM. */
-			s->rst_sent = session_send_ctrl(
+			s->rst_sent = mux_session_send_ctrl(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_REFUSED_STREAM);
 			s->aborted = true;
-			stream_close(s);
+			mux_stream_do_close(s);
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
@@ -611,7 +615,7 @@ static void dispatch_no_stream(
 		DEBUG, ss,
 		"non-SYN frame for unknown stream %" PRIuFAST16 ", sending RST",
 		stream_id);
-	session_send_ctrl(
+	mux_session_send_ctrl(
 		ss, stream_id, MUX_FLAG_RST, MUX_STATUS_PROTOCOL_ERROR);
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 }
@@ -629,17 +633,17 @@ static bool dispatch_ctrl_frame(
 			" unacked=%zu stalled=%d",
 			hdr->extra, ss->unacked.frames, ss->unacked.stalled);
 		const struct unacked_ack_result r =
-			unacked_ack_recv(ss, hdr->extra);
+			mux_unacked_ack_recv(ss, hdr->extra);
 		if (!r.ok) {
 			/* Peer acked more frames than were sent. */
-			session_reset(ss);
+			mux_session_reset(ss);
 			return false;
 		}
 		/* unacked stays free of the estimator and send pipeline:
 		 * drive both here from the result. */
 		if ((ss->auto_stream_window || ss->auto_session_window) &&
 		    r.trimmed_bytes > 0) {
-			estimator_add_acked(ss, r.trimmed_bytes);
+			mux_estimator_add_acked(ss, r.trimmed_bytes);
 		}
 		if (r.unstalled) {
 			mux_notify_write(ss);
@@ -648,10 +652,10 @@ static bool dispatch_ctrl_frame(
 	if (hdr->flags == 0) {
 		switch (hdr->extra) {
 		case MUX_CTRL_PING:
-			session_recv_ping(ss, hdr, frame_size);
+			mux_session_recv_ping(ss, hdr, frame_size);
 			break;
 		case MUX_CTRL_PONG:
-			session_recv_pong(ss, hdr, frame_size);
+			mux_session_recv_pong(ss, hdr, frame_size);
 			break;
 		default:
 			/* MUX_CTRL_PROBE and reserved: discard */
@@ -673,12 +677,12 @@ static void dispatch_frame(struct mux_session *ss)
 		struct mux_header hdr;
 		mux_read_header(p, &hdr);
 		if (LOGLEVEL(VERYVERBOSE)) {
-			session_log_frame_header(ss, "frame in", p, &hdr);
+			mux_session_log_frame_header(ss, "frame in", p, &hdr);
 		}
 
 		/* hdr.length is a 16-bit field (max MUX_MAX_PAYLOAD_SIZE), so a peer
 		 * may send a frame larger than our configured max_payload; recvbuf
-		 * grows on demand and is shrunk after (session_on_recv). We never
+		 * grows on demand and is shrunk after (mux_session_on_recv). We never
 		 * send oversized frames. */
 		const size_t frame_size = MUX_FRAME_HEADER_SIZE + hdr.length;
 		if (bytebuf_readable(ss->wire.recvbuf) < frame_size) {
@@ -687,7 +691,7 @@ static void dispatch_frame(struct mux_session *ss)
 
 		/* Dispatch hello frames (version = 0). */
 		if (hdr.version == 0) {
-			handshake_process_hello(ss, &hdr, frame_size);
+			mux_handshake_process_hello(ss, &hdr, frame_size);
 			if (ss->state == SESSION_CLOSED) {
 				return;
 			}
@@ -708,7 +712,7 @@ static void dispatch_frame(struct mux_session *ss)
 				") received before session established (state=%d),"
 				" closing connection",
 				hdr.version, ss->state);
-			session_reset(ss);
+			mux_session_reset(ss);
 			return;
 		}
 
@@ -717,7 +721,7 @@ static void dispatch_frame(struct mux_session *ss)
 				ERROR, ss,
 				"unsupported protocol version %" PRIuLEAST8,
 				hdr.version);
-			session_reset(ss);
+			mux_session_reset(ss);
 			return;
 		}
 
@@ -729,7 +733,7 @@ static void dispatch_frame(struct mux_session *ss)
 				", closing connection",
 				(uint_least8_t)(hdr.flags &
 						(uint_fast8_t)(~MUX_FLAG_MASK)));
-			session_reset(ss);
+			mux_session_reset(ss);
 			return;
 		}
 
@@ -738,7 +742,7 @@ static void dispatch_frame(struct mux_session *ss)
 				return;
 			}
 			/* dispatch_ctrl_frame can reset the session and still return
-			 * true (e.g. session_recv_ping's oversized-PING path), so apply
+			 * true (e.g. mux_session_recv_ping's oversized-PING path), so apply
 			 * the same post-dispatch state check the stream path below does
 			 * rather than continuing to dispatch on a CLOSED session. */
 			if (ss->state != SESSION_ESTABLISHED) {
@@ -761,10 +765,10 @@ static void dispatch_frame(struct mux_session *ss)
 				DEBUG, ss,
 				"forced session ACK: unreported=%" PRIuLEAST32,
 				ss->unacked.unreported);
-			session_emit_ack(ss);
+			mux_session_emit_ack(ss);
 		}
 		if (ss->unacked.unreported > 0) {
-			sched_coalesce_arm(ss);
+			mux_sched_coalesce_arm(ss);
 		}
 
 		if (hdr.flags & MUX_FLAG_RST) {
@@ -772,7 +776,7 @@ static void dispatch_frame(struct mux_session *ss)
 		}
 
 		struct mux_stream *const s =
-			sched_find_stream(ss, hdr.stream_id);
+			mux_sched_find_stream(ss, hdr.stream_id);
 		if (s != NULL) {
 			dispatch_by_stream(ss, s, &hdr);
 		} else {
@@ -784,7 +788,7 @@ static void dispatch_frame(struct mux_session *ss)
 	}
 }
 
-void session_dispatch_pending(struct mux_session *restrict ss)
+void mux_session_dispatch_pending(struct mux_session *restrict ss)
 {
 	dispatch_frame(ss);
 }
@@ -815,9 +819,9 @@ static bool recv_one(struct mux_session *restrict ss)
 	/* Offer the read-ahead window so one plaintext recv() can drain several
 	 * buffered frames per syscall.  The ring still grows on demand for a larger
 	 * peer frame. */
-	if (!bytebuf_reserve(&ss->wire.recvbuf, recv_window(ss), true)) {
+	if (!mux_bytebuf_reserve(&ss->wire.recvbuf, recv_window(ss), true)) {
 		LOGOOM();
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 
@@ -825,14 +829,8 @@ static bool recv_one(struct mux_session *restrict ss)
 	size_t nread = cap;
 	unsigned char *const buf = bytebuf_write_ptr(ss->wire.recvbuf);
 
-	if (!wire_recv(ss, buf, &nread)) {
-		if (ss->handshake.has_session_id &&
-		    (ss->state == SESSION_ESTABLISHED ||
-		     (ss->state == SESSION_HANDSHAKE && !ss->accepted))) {
-			session_suspend(ss);
-		} else {
-			session_reset(ss);
-		}
+	if (!mux_wire_recv(ss, buf, &nread)) {
+		mux_session_suspend_or_reset(ss);
 		return false;
 	}
 	if (nread == 0) {
@@ -844,11 +842,11 @@ static bool recv_one(struct mux_session *restrict ss)
 				MUX_LOG(DEBUG, ss,
 					"connection closed during resume handshake;"
 					" re-suspending");
-				session_suspend(ss);
+				mux_session_suspend(ss);
 			} else {
 				MUX_LOG(DEBUG, ss,
 					"connection closed during protocol handshake");
-				session_reset(ss);
+				mux_session_reset(ss);
 			}
 		}
 		return false;
@@ -865,11 +863,11 @@ static bool recv_one(struct mux_session *restrict ss)
 	return true;
 }
 
-void session_on_recv(struct mux_session *restrict ss)
+void mux_session_on_recv(struct mux_session *restrict ss)
 {
 	if (recv_one(ss)) {
 		while (ss->state == SESSION_ESTABLISHED &&
-		       wire_has_pending(ss)) {
+		       mux_wire_has_pending(ss)) {
 			if (!recv_one(ss)) {
 				break;
 			}
@@ -877,19 +875,19 @@ void session_on_recv(struct mux_session *restrict ss)
 	}
 	/* Reclaim capacity grown for oversized frames; floor is one read-ahead
 	 * window plus one partial frame to avoid regrowth churn. */
-	bytebuf_shrink(
+	mux_bytebuf_shrink(
 		&ss->wire.recvbuf,
 		recv_window(ss) +
 			((size_t)MUX_FRAME_HEADER_SIZE + ss->max_payload));
 	/* Flush responses (PONG, ACKs, credit) immediately rather than waiting
 	 * for EV_WRITE; prompt PONG avoids inflating the peer's RTT sample. */
-	session_flush_resp(ss);
+	mux_session_flush_resp(ss);
 }
 
 /* Handle an inbound PING (spec §5.3.2): queue a PONG echoing the payload
  * byte-for-byte.  Silently discards the PING when rate-limited; closes the
  * connection on an oversized PING, which cannot be echoed. */
-void session_recv_ping(
+void mux_session_recv_ping(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
@@ -902,7 +900,7 @@ void session_recv_ping(
 			"oversized PING (%" PRIuLEAST16
 			" bytes) cannot be echoed; closing connection",
 			hdr->length);
-		session_reset(ss);
+		mux_session_reset(ss);
 		return;
 	}
 
@@ -912,12 +910,12 @@ void session_recv_ping(
 		return;
 	}
 
-	/* Read the PING payload before discarding the frame; session_send_oob
+	/* Read the PING payload before discarding the frame; mux_session_send_oob
 	 * copies it into oobbuf. */
 	const unsigned char *const ping_payload =
 		bytebuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE;
-	const bool queued =
-		session_send_oob(ss, MUX_CTRL_PONG, ping_payload, hdr->length);
+	const bool queued = mux_session_send_oob(
+		ss, MUX_CTRL_PONG, ping_payload, hdr->length);
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 	if (!queued) {
 		/* OOM: PONG dropped.  OOB is never retransmitted, so the peer's
@@ -927,7 +925,7 @@ void session_recv_ping(
 	}
 
 	ss->ping_recv_last_ns = now;
-	session_flush_oob(ss);
+	mux_session_flush_oob(ss);
 }
 
 /* Expand the receive window of one stream to new_window bytes.  Called via
@@ -944,21 +942,25 @@ static bool update_stream_window_cb(
 		return true;
 	}
 	s->recv_window = new_window;
-	stream_check_ack(s);
+	mux_stream_check_ack(s);
 	return true;
+}
+
+/* Ceiling of window_bytes in MUX_WINDOW_UNIT frames, floored at the configured
+ * initial send window; shared by the stream- and session-window updates. */
+static uint_least32_t window_frames_floor(const size_t window_bytes)
+{
+	const uint_least32_t initial_frames =
+		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
+	const size_t target_frames =
+		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
+	return (uint_least32_t)MAX(target_frames, (size_t)initial_frames);
 }
 
 static void session_update_stream_window(
 	struct mux_session *restrict ss, const size_t window_bytes)
 {
-	/* Never let the auto stream_window fall below the configured initial
-	 * window, mirroring session_update_session_window's floor below. */
-	const uint_least32_t initial_frames =
-		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
-	const size_t target_frames =
-		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
-	const uint_least32_t frames =
-		(uint_least32_t)MAX(target_frames, (size_t)initial_frames);
+	const uint_least32_t frames = window_frames_floor(window_bytes);
 
 	if (ss->stream_window == frames) {
 		return;
@@ -970,7 +972,7 @@ static void session_update_stream_window(
 		table_iterate(ss->sched.streams, update_stream_window_cb, &w);
 	}
 	/* On shrink: each stream lazily syncs recv_window down in
-	 * stream_check_ack once outstanding peer credit is consumed. */
+	 * mux_stream_check_ack once outstanding peer credit is consumed. */
 	MUX_LOG_F(
 		INFO, ss, "estimator updated: window=%zu stream=%zu",
 		window_bytes, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
@@ -979,7 +981,7 @@ static void session_update_stream_window(
 /* Handle an inbound PONG (spec §5.3.3): feed the echoed timestamp into the
  * estimator, apply its BDP to the live window floors, and reset the keepalive
  * timer so a successful PONG always defers the next probe. */
-void session_recv_pong(
+void mux_session_recv_pong(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
@@ -992,34 +994,30 @@ void session_recv_pong(
 		bytebuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE);
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 
-	estimator_calculate(ss, sent_ns);
+	mux_estimator_calculate(ss, sent_ns);
 	if (ss->auto_stream_window) {
 		session_update_stream_window(
-			ss, estimator_rx_window_size(&ss->estimator));
+			ss, mux_estimator_rx_window_size(&ss->estimator));
 	}
 	if (ss->auto_session_window) {
-		session_update_session_window(
-			ss, estimator_tx_window_size(&ss->estimator));
+		mux_session_update_session_window(
+			ss, mux_estimator_tx_window_size(&ss->estimator));
 	}
 
 	/* Any PONG confirms the link is alive: reset the keepalive deadline
 	 * regardless of which path sent the PING. */
-	const double keepalive = keepalive_interval(ss);
+	const double keepalive = mux_keepalive_interval(ss);
 	ev_timer_set(&ss->w_keepalive, 0.0, keepalive);
 	if (ev_is_active(&ss->w_keepalive)) {
 		ev_timer_again(ss->loop, &ss->w_keepalive);
 	}
 }
 
-void session_update_session_window(
+void mux_session_update_session_window(
 	struct mux_session *restrict ss, const size_t window_bytes)
 {
-	const uint_least32_t initial_frames =
-		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
-	const size_t target_frames =
-		(window_bytes + MUX_WINDOW_UNIT - 1) / MUX_WINDOW_UNIT;
-	const uint_least32_t new_window = (uint_least32_t)MAX(
-		MAX(ss->peer_stream_window, target_frames), initial_frames);
+	const uint_least32_t frames = window_frames_floor(window_bytes);
+	const uint_least32_t new_window = MAX(ss->peer_stream_window, frames);
 	if (ss->session_window == new_window) {
 		return;
 	}

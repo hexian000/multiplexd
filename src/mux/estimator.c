@@ -37,7 +37,7 @@
  * approaches the current window (demand × 1.5 > effective_bdp). */
 #define STARTUP_GROWTH_FACTOR 3u
 
-void estimator_init(struct mux_session *restrict ss, const size_t bdp)
+void mux_estimator_init(struct mux_session *restrict ss, const size_t bdp)
 {
 	ss->estimator = (struct estimator_ctx){ 0 };
 	/* Clamp the seed to at least WNDSIZE_MIN: effective_bdp == 0 is an
@@ -56,7 +56,7 @@ static void reset_samples(struct estimator_ctx *restrict est)
 	est->tx.sample = 0;
 }
 
-void estimator_suspend(struct mux_session *restrict ss)
+void mux_estimator_suspend(struct mux_session *restrict ss)
 {
 	struct estimator_ctx *const restrict est = &ss->estimator;
 	est->ping_in_flight = false;
@@ -68,7 +68,7 @@ send_ping(struct mux_session *restrict ss, const int_fast64_t now_ns)
 {
 	unsigned char payload[MUX_PING_PAYLOAD_SIZE];
 	write_uint64(payload, (uint_fast64_t)now_ns);
-	if (!session_send_oob(ss, MUX_CTRL_PING, payload, sizeof(payload))) {
+	if (!mux_session_send_oob(ss, MUX_CTRL_PING, payload, sizeof(payload))) {
 		return false;
 	}
 	struct estimator_ctx *const restrict est = &ss->estimator;
@@ -77,8 +77,8 @@ send_ping(struct mux_session *restrict ss, const int_fast64_t now_ns)
 	return true;
 }
 
-/* Shared probe-start/rate-limit/accumulate logic for estimator_add and
- * estimator_add_acked, parameterized by direction. */
+/* Shared probe-start/rate-limit/accumulate logic for mux_estimator_add and
+ * mux_estimator_add_acked, parameterized by direction. */
 static void run_probe_cycle(
 	struct mux_session *restrict ss, struct estimator_dir_ctx *restrict d,
 	const char *restrict label, const uint_fast64_t bytes)
@@ -121,12 +121,13 @@ static void run_probe_cycle(
 	d->sample = (size_t)bytes;
 }
 
-void estimator_add(struct mux_session *restrict ss, const uint_fast64_t bytes)
+void mux_estimator_add(
+	struct mux_session *restrict ss, const uint_fast64_t bytes)
 {
 	run_probe_cycle(ss, &ss->estimator.rx, "rx", bytes);
 }
 
-void estimator_add_acked(
+void mux_estimator_add_acked(
 	struct mux_session *restrict ss, const uint_fast64_t bytes)
 {
 	run_probe_cycle(ss, &ss->estimator.tx, "tx", bytes);
@@ -169,7 +170,7 @@ static void phase_track(
 	/* Re-enter STARTUP only when measured BDP outgrows the window.  Keying
 	 * on d->bdp (spike-immune) rather than the raw byte count avoids
 	 * re-ramping on RTT jitter; the != 0 guard is defensive against an unseeded
-	 * effective_bdp -- estimator_init always seeds a non-zero window, so it only
+	 * effective_bdp -- mux_estimator_init always seeds a non-zero window, so it only
 	 * matters to white-box tests that skip it. */
 	if (d->effective_bdp != 0 && d->bdp > d->effective_bdp) {
 		d->phase = ESTIMATOR_STARTUP;
@@ -262,7 +263,7 @@ static void calc_dir(
 	}
 }
 
-void estimator_calculate(
+void mux_estimator_calculate(
 	struct mux_session *restrict ss, const int_fast64_t sent_ns)
 {
 	struct estimator_ctx *const restrict est = &ss->estimator;
@@ -344,12 +345,12 @@ static size_t window_size(const struct estimator_dir_ctx *restrict d)
 	return CLAMP(d->effective_bdp, floor, WNDSIZE_MAX);
 }
 
-size_t estimator_rx_window_size(const struct estimator_ctx *restrict est)
+size_t mux_estimator_rx_window_size(const struct estimator_ctx *restrict est)
 {
 	return window_size(&est->rx);
 }
 
-size_t estimator_tx_window_size(const struct estimator_ctx *restrict est)
+size_t mux_estimator_tx_window_size(const struct estimator_ctx *restrict est)
 {
 	return window_size(&est->tx);
 }

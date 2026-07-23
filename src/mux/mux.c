@@ -36,12 +36,12 @@ size_t mux_frame_object_size(const size_t max_payload)
 struct mux_session *
 mux_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts)
 {
-	return session_new(loop, opts);
+	return mux_session_new(loop, opts);
 }
 
 void mux_close(struct mux_session *ss)
 {
-	session_close(ss);
+	mux_session_close(ss);
 }
 
 void mux_set_callbacks(struct mux_session *ss, const struct mux_callbacks *cb)
@@ -51,17 +51,17 @@ void mux_set_callbacks(struct mux_session *ss, const struct mux_callbacks *cb)
 
 void mux_shutdown(struct mux_session *ss)
 {
-	session_initiate_shutdown(ss);
+	mux_session_initiate_shutdown(ss);
 }
 
 void mux_start(struct mux_session *ss)
 {
-	session_start(ss);
+	mux_session_start(ss);
 }
 
 void mux_attach_fd(struct mux_session *ss, const int fd)
 {
-	session_attach_fd(ss, fd);
+	mux_session_attach_fd(ss, fd);
 }
 
 /* --- Session accessors --- */
@@ -132,24 +132,24 @@ void mux_session_stats(
 void mux_set_config(
 	struct mux_session *ss, const struct mux_config *restrict conf)
 {
-	session_set_config(ss, conf);
+	mux_session_set_config(ss, conf);
 #if WITH_TLS
 	if (conf->tlsctx != NULL) {
-		wire_set_tlsctx(ss, conf->tlsctx);
+		mux_wire_set_tlsctx(ss, conf->tlsctx);
 	}
 #endif
 }
 
 void mux_drain(struct mux_session *ss)
 {
-	session_drain(ss);
+	mux_session_drain(ss);
 }
 
 /* --- Stream I/O watcher --- */
 
 bool mux_stream_io_start(struct ev_loop *loop, mux_stream_io *restrict w)
 {
-	return stream_io_start(loop, w);
+	return mux_stream_do_io_start(loop, w);
 }
 
 void mux_stream_io_modify(
@@ -177,16 +177,11 @@ void mux_stream_io_modify(
 		return;
 	}
 	int ready = 0;
-	if ((added & EV_READ) &&
-	    (bytebuf_readable(s->recvbuf) > 0 ||
-	     s->state == STREAM_CLOSE_WAIT || s->state == STREAM_CLOSING ||
-	     s->rst_received || s->aborted)) {
+	if ((added & EV_READ) && stream_direct_read_ready(s)) {
 		ready |= EV_READ;
 	}
-	if ((added & EV_WRITE) && stream_can_send_data(s)) {
-		if (stream_read_credit_avail(s) > 0) {
-			ready |= EV_WRITE;
-		}
+	if ((added & EV_WRITE) && stream_direct_write_ready(s)) {
+		ready |= EV_WRITE;
 	}
 	if (ready != 0) {
 		ev_feed_event(loop, w, ready);
@@ -199,7 +194,7 @@ void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w)
 	struct mux_stream *const s = w->stream;
 	/* Only clear the direct union arm for an actually-direct stream: a
 	 * socket-mode stream's s->socket overlaps s->direct, so an unconditional
-	 * write would clobber socket.w_io (reachable when stream_io_start no-oped
+	 * write would clobber socket.w_io (reachable when mux_stream_do_io_start no-oped
 	 * on an unattachable stream, leaving is_direct false but w->stream bound). */
 	if (s != NULL && s->is_direct) {
 		s->direct.w_io = NULL;
@@ -212,12 +207,12 @@ void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w)
 
 struct mux_stream *mux_open_stream(struct mux_session *ss)
 {
-	return session_open_stream(ss);
+	return mux_session_open_stream(ss);
 }
 
 void mux_stream_attach(struct mux_stream *s, const int fd)
 {
-	stream_attach_fd(s, fd);
+	mux_stream_attach_fd(s, fd);
 }
 
 uint_least16_t mux_stream_id(const struct mux_stream *s)
@@ -262,7 +257,7 @@ int mux_stream_send(
 		/* Must go through the same bookkeeping every
 		 * dequeue/free path pays back, not a hand-rolled push that
 		 * skips send_buffered_frames. */
-		stream_queue_send(s, frame);
+		mux_stream_queue_send(s, frame);
 
 		p += chunk;
 		remaining -= chunk;
@@ -270,7 +265,7 @@ int mux_stream_send(
 
 	const size_t queued = to_send - remaining;
 	if (queued > 0) {
-		sched_wake(s->session, s);
+		mux_sched_wake(s->session, s);
 	}
 	*len = queued;
 	return 0;
@@ -293,7 +288,7 @@ int mux_stream_recv(
 		/* CLOSE_WAIT (peer FIN) or CLOSING (both FINs): return EOF below.
 		 * On CLOSING the recv buffer is drained, so close now (idempotent). */
 		if (s->state == STREAM_CLOSING) {
-			stream_close(s);
+			mux_stream_do_close(s);
 		}
 		*len = 0;
 		return 0; /* EOF */
@@ -311,7 +306,7 @@ int mux_stream_recv(
 	s->session->recv_buffered_bytes -= copied;
 	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, copied);
 
-	stream_check_ack(s);
+	mux_stream_check_ack(s);
 
 	*len = copied;
 	return 0;
@@ -322,7 +317,7 @@ void mux_stream_shutdown(struct mux_stream *s)
 	if (s->state == STREAM_CLOSED) {
 		return;
 	}
-	stream_shutdown(s);
+	mux_stream_do_shutdown(s);
 }
 
 void mux_stream_close(struct mux_stream *s)
@@ -330,7 +325,7 @@ void mux_stream_close(struct mux_stream *s)
 	if (s->state == STREAM_CLOSED) {
 		return;
 	}
-	/* Detach the user watcher first so the stream_shutdown()/stream_close()
+	/* Detach the user watcher first so the mux_stream_do_shutdown()/mux_stream_do_close()
 	 * below cannot feed it a re-entrant EV_READ/EV_WRITE callback while the
 	 * caller is in the middle of relinquishing it (the mux library only ever
 	 * feeds this watcher EV_READ/EV_WRITE, never EV_ERROR). */
@@ -347,9 +342,9 @@ void mux_stream_close(struct mux_stream *s)
 
 	if (bytebuf_readable(s->recvbuf) == 0) {
 		/* No unread data: initiate graceful FIN. */
-		stream_shutdown(s);
+		mux_stream_do_shutdown(s);
 		return;
 	}
 	/* Unread data present: send RST (close(fd) semantics). */
-	stream_close(s);
+	mux_stream_do_close(s);
 }

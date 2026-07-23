@@ -109,7 +109,7 @@
 struct mux_frame {
 	/* pos is live only while the frame sits on wire.sendbuf or as a
 	 * retransmit copy being staged for send; unacked_count becomes live
-	 * only after unacked_track_sent() hands the frame to the unacked
+	 * only after mux_unacked_track_sent() hands the frame to the unacked
 	 * ring. The two phases never overlap for the same object: a
 	 * retransmit always allocates a fresh copy rather than reusing the
 	 * original ring entry (see send.c). */
@@ -295,18 +295,19 @@ static inline void mux_read_header(
 
 /* Linear (not circular) byte FIFO: readable bytes are the contiguous region
  * [off, off+len); it recovers space by memmove-compacting toward off==0, not by
- * wrapping, so bytebuf_reserve can cost an O(len) copy. */
+ * wrapping, so mux_bytebuf_reserve can cost an O(len) copy. */
 struct bytebuf {
 	size_t off, len, cap;
 	unsigned char data[];
 };
 
-bool bytebuf_reserve(struct bytebuf **restrict rbp, size_t need, bool can_grow);
+bool mux_bytebuf_reserve(
+	struct bytebuf **restrict rbp, size_t need, bool can_grow);
 
 /* Shrink the buffer's capacity back toward target_cap, reclaiming memory grown
  * to assemble an oversized inbound frame.  Never shrinks below the live byte
  * count, and is a no-op when the capacity is already at or below target_cap. */
-void bytebuf_shrink(struct bytebuf **restrict rbp, size_t target_cap);
+void mux_bytebuf_shrink(struct bytebuf **restrict rbp, size_t target_cap);
 
 static inline struct bytebuf *bytebuf_new(const size_t cap)
 {

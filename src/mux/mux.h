@@ -55,7 +55,7 @@ struct tls_connection;
 /* Auto stream/session receive-window floor (bytes) before BDP estimation
  * converges: the smallest value the auto stream_window/session_window and the
  * estimator's WNDSIZE_MIN are clamped up to. Despite the historical name it is
- * not a send window -- stream_new sets each stream's send window from
+ * not a send window -- mux_stream_new sets each stream's send window from
  * MUX_DEFAULT_SEND_WINDOW. */
 #define MUX_INITIAL_SEND_WINDOW 65536u
 

@@ -65,12 +65,12 @@ struct proto_hello {
 };
 
 /* Build and enqueue a hello frame; include resume_seq when resuming. */
-bool handshake_enqueue_hello(
+bool mux_handshake_enqueue_hello(
 	struct mux_session *ss, int msgid, bool include_resume_seq);
 
 /* Parse and validate an incoming hello frame, advancing the handshake
  * state machine. */
-bool handshake_process_hello(
+bool mux_handshake_process_hello(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	size_t frame_size);
 

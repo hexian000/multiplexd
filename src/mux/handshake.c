@@ -280,14 +280,14 @@ done:
 	return ok;
 }
 
-bool handshake_enqueue_hello(
+bool mux_handshake_enqueue_hello(
 	struct mux_session *ss, const int msgid, const bool include_resume_seq)
 {
 	struct mux_frame *const frame =
 		mux_frame_get(&ss->pool, ss->max_payload);
 	if (frame == NULL) {
 		LOGOOM();
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 	/* Include the server-assigned session_id when available.
@@ -337,7 +337,7 @@ bool handshake_enqueue_hello(
 	if (!proto_hello_build(frame, frame->cap, &hello_msg)) {
 		MUX_LOG(ERROR, ss, "failed to build hello message");
 		mux_frame_put(&ss->pool, frame);
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 	LOG_BIN_F(
@@ -355,7 +355,7 @@ bool handshake_enqueue_hello(
 }
 
 /* Server side: received ClientHello.  Returns true to continue to
- * session_handshake_done; false if the session was handed off or errored. */
+ * mux_session_handshake_done; false if the session was handed off or errored. */
 static bool process_hello_server(
 	struct mux_session *restrict ss,
 	const struct proto_hello *restrict peer_hello)
@@ -369,7 +369,7 @@ static bool process_hello_server(
 		if (ss->callbacks.on_resume(
 			    ss->userdata, ss, peer_hello->session_id,
 			    peer_hello->resume_seq)) {
-			session_reset(ss);
+			mux_session_reset(ss);
 			return false;
 		}
 		MUX_LOG(WARNING, ss,
@@ -377,12 +377,12 @@ static bool process_hello_server(
 			" treating as fresh");
 	}
 	/* Fresh session: reply with our session_id. */
-	return handshake_enqueue_hello(ss, PROTO_MSG_SERVER_HELLO, false);
+	return mux_handshake_enqueue_hello(ss, PROTO_MSG_SERVER_HELLO, false);
 }
 
 /* Client fresh-session path (spec §5.8.3 step 4): discard preserved streams and
  * unacked frames, reset counters, adopt the server's session_id, and clear
- * peer_addr so session_handshake_done fires ESTABLISHED, not RESUMED. */
+ * peer_addr so mux_session_handshake_done fires ESTABLISHED, not RESUMED. */
 static bool handshake_client_fresh(
 	struct mux_session *restrict ss,
 	const struct proto_hello *restrict peer_hello)
@@ -397,14 +397,14 @@ static bool handshake_client_fresh(
 				table_size(ss->sched.streams) :
 				0);
 	}
-	sched_free_streams(ss);
+	mux_sched_free_streams(ss);
 	ss->sched.streams = table_new(&mux_stream_table_opts);
 	if (ss->sched.streams == NULL) {
 		LOGOOM();
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
-	unacked_free_all(ss);
+	mux_unacked_free_all(ss);
 	ss->unacked.recv_seq = 0;
 	ss->unacked.unreported = 0;
 	ss->unacked.last_ack_recv = 0;
@@ -441,12 +441,12 @@ static bool process_hello_client(
 	 * Without one there is nothing to adopt, and continuing would leave this
 	 * client ESTABLISHED still flagged has_session_id but holding the
 	 * previous, now-defunct id while handshake_client_fresh has already wiped
-	 * every piece of state behind it -- the ghost resume session_reset exists
+	 * every piece of state behind it -- the ghost resume mux_session_reset exists
 	 * to prevent. The next reconnect would then offer that dead id in a resume
 	 * ClientHello. */
 	if (!peer_hello->has_session_id) {
 		MUX_LOG(ERROR, ss, "ServerHello without session_id");
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 	const bool is_confirmed_resume =
@@ -455,8 +455,8 @@ static bool process_hello_client(
 		       MUX_SESSION_ID_LEN) == 0;
 	if (is_confirmed_resume) {
 		/* Trim our unacked list by the server's resume_seq. */
-		if (!unacked_resume_ack_recv(ss, peer_hello->resume_seq)) {
-			session_reset(ss);
+		if (!mux_unacked_resume_ack_recv(ss, peer_hello->resume_seq)) {
+			mux_session_reset(ss);
 			return false;
 		}
 		MUX_LOG_F(
@@ -472,7 +472,7 @@ static bool process_hello_client(
 	return true;
 }
 
-bool handshake_process_hello(
+bool mux_handshake_process_hello(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
@@ -483,7 +483,7 @@ bool handshake_process_hello(
 	ASSERT(frame_size == MUX_FRAME_HEADER_SIZE + hdr->length);
 	if (ss->state != SESSION_HANDSHAKE) {
 		MUX_LOG(ERROR, ss, "unexpected hello frame outside handshake");
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 	if (hdr->flags != 0 || hdr->stream_id != 0 || hdr->extra != 0) {
@@ -492,7 +492,7 @@ bool handshake_process_hello(
 			"invalid hello frame: flags=0x%02" PRIxLEAST8
 			" stream_id=%" PRIuLEAST16 " extra=%" PRIuLEAST16,
 			hdr->flags, hdr->stream_id, hdr->extra);
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 	const unsigned char *const p = bytebuf_read_ptr(ss->wire.recvbuf);
@@ -505,14 +505,14 @@ bool handshake_process_hello(
 	if (!proto_hello_parse(
 		    ss, p + MUX_FRAME_HEADER_SIZE, (size_t)hdr->length,
 		    &peer_hello)) {
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 	if (peer_hello.version != MUX_PROTOCOL_VERSION) {
 		MUX_LOG_F(
 			ERROR, ss, "incompatible protocol version: %d",
 			peer_hello.version);
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 	if (peer_hello.msgid != expected_msgid) {
@@ -520,7 +520,7 @@ bool handshake_process_hello(
 			ERROR, ss,
 			"protocol hello: unexpected msgid %d (expected %d)",
 			peer_hello.msgid, expected_msgid);
-		session_reset(ss);
+		mux_session_reset(ss);
 		return false;
 	}
 	MUX_LOG_F(
@@ -542,7 +542,7 @@ bool handshake_process_hello(
 		char *const dup = strdup(peer_hello.identity);
 		if (dup == NULL) {
 			LOGOOM();
-			session_reset(ss);
+			mux_session_reset(ss);
 			return false;
 		}
 		free(ss->handshake.peer_identity);
@@ -555,12 +555,12 @@ bool handshake_process_hello(
 	if (!ok) {
 		return false;
 	}
-	session_handshake_done(ss);
+	mux_session_handshake_done(ss);
 	/* If resuming, start retransmitting from the head after handshake. */
 	if (ss->unacked.ring != NULL && ss->unacked.ring->count > 0) {
-		ss->unacked.retransmit_off = 0;
+		unacked_set_replay_off(&ss->unacked, 0);
 		ss->wire.tx_pending = true;
-		session_notify(ss);
+		mux_session_notify(ss);
 	}
 	return true;
 }

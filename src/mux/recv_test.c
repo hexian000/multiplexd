@@ -123,7 +123,7 @@ static void spies_reset(void)
 /* Collaborator stubs.  Pulled in before recv.c so its external references
  * bind to these definitions. */
 
-bool session_send_ctrl(
+bool mux_session_send_ctrl(
 	struct mux_session *ss, uint_fast16_t stream_id, uint_fast8_t flags,
 	uint_fast32_t extra)
 {
@@ -135,7 +135,7 @@ bool session_send_ctrl(
 	return g.send_ctrl_ret;
 }
 
-bool session_send_oob(
+bool mux_session_send_oob(
 	struct mux_session *ss, uint_fast8_t extra,
 	const unsigned char *payload, size_t payload_len)
 {
@@ -147,19 +147,19 @@ bool session_send_oob(
 	return g.send_oob_ret;
 }
 
-void session_flush_oob(struct mux_session *ss)
+void mux_session_flush_oob(struct mux_session *ss)
 {
 	(void)ss;
 	g.flush_oob_calls++;
 }
 
-void session_flush_resp(struct mux_session *ss)
+void mux_session_flush_resp(struct mux_session *ss)
 {
 	(void)ss;
 	g.flush_resp_calls++;
 }
 
-void session_emit_ack(struct mux_session *ss)
+void mux_session_emit_ack(struct mux_session *ss)
 {
 	(void)ss;
 	g.emit_ack_calls++;
@@ -171,19 +171,32 @@ void mux_notify_write(struct mux_session *ss)
 	g.notify_write_calls++;
 }
 
-void session_reset(struct mux_session *ss)
+void mux_session_reset(struct mux_session *ss)
 {
 	g.reset_calls++;
 	ss->state = SESSION_CLOSED;
 }
 
-void session_suspend(struct mux_session *ss)
+void mux_session_suspend(struct mux_session *ss)
 {
 	g.suspend_calls++;
 	ss->state = SESSION_SUSPENDED;
 }
 
-void session_log_frame_header(
+/* Mirrors production mux_session_suspend_or_reset so these white-box tests still
+ * observe the suspend-vs-reset decision via the stubs above. */
+void mux_session_suspend_or_reset(struct mux_session *ss)
+{
+	if (ss->handshake.has_session_id &&
+	    (ss->state == SESSION_ESTABLISHED ||
+	     (ss->state == SESSION_HANDSHAKE && !ss->accepted))) {
+		mux_session_suspend(ss);
+	} else {
+		mux_session_reset(ss);
+	}
+}
+
+void mux_session_log_frame_header(
 	const struct mux_session *ss, const char *what,
 	const unsigned char *raw, const struct mux_header *hdr)
 {
@@ -193,20 +206,20 @@ void session_log_frame_header(
 	(void)hdr;
 }
 
-double keepalive_interval(const struct mux_session *ss)
+double mux_keepalive_interval(const struct mux_session *ss)
 {
 	(void)ss;
 	return g.keepalive_ret;
 }
 
-void stream_abort(struct mux_stream *restrict s, const enum mux_status code)
+void mux_stream_abort(struct mux_stream *restrict s, const enum mux_status code)
 {
 	g.abort_calls++;
 	g.abort_code = code;
 	if (g.abort_free_streams) {
-		/* Reproduce the drain cascade a real stream_abort() triggers when it
+		/* Reproduce the drain cascade a real mux_stream_abort() triggers when it
 		 * takes down the last active stream of a draining session, exactly as
-		 * the stream_recv_copy spy below does. */
+		 * the mux_stream_recv_copy spy below does. */
 		struct mux_session *const ss = s->session;
 		table_free(ss->sched.streams);
 		ss->sched.streams = NULL;
@@ -215,17 +228,17 @@ void stream_abort(struct mux_stream *restrict s, const enum mux_status code)
 	}
 }
 
-void stream_recv_copy(
+void mux_stream_recv_copy(
 	struct mux_stream *s, const unsigned char *payload, size_t payload_len)
 {
 	(void)payload;
 	g.recv_copy_calls++;
 	g.recv_copy_len = payload_len;
 	if (g.recv_copy_free_streams) {
-		/* Reproduce the drain cascade stream_recv_copy() triggers when it
+		/* Reproduce the drain cascade mux_stream_recv_copy() triggers when it
 		 * aborts the last active stream of a draining session:
-		 * session_initiate_shutdown() -> sched_free_streams() (frees every
-		 * stream and nulls the table) + wire_discard_buffers() (resets the
+		 * mux_session_initiate_shutdown() -> mux_sched_free_streams() (frees every
+		 * stream and nulls the table) + mux_wire_discard_buffers() (resets the
 		 * recvbuf), then SESSION_CLOSING. */
 		struct mux_session *const ss = s->session;
 		table_free(ss->sched.streams);
@@ -235,28 +248,28 @@ void stream_recv_copy(
 	}
 }
 
-void stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
+void mux_stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
 {
 	(void)s;
 	g.recv_rst_calls++;
 	g.recv_rst_status = status;
 }
 
-void stream_recv_fin(struct mux_stream *s)
+void mux_stream_recv_fin(struct mux_stream *s)
 {
 	(void)s;
 	g.recv_fin_calls++;
 }
 
-void stream_recv_window(struct mux_stream *s, uint_fast32_t window_inc)
+void mux_stream_recv_window(struct mux_stream *s, uint_fast32_t window_inc)
 {
 	g.recv_window_calls++;
 	g.recv_window_inc = window_inc;
 	if (g.recv_window_free_streams) {
-		/* Reproduce the drain cascade stream_recv_window() triggers when a
+		/* Reproduce the drain cascade mux_stream_recv_window() triggers when a
 		 * spec §6.6 credit overflow aborts the last active stream of a
-		 * draining session: sched_free_streams() (frees every stream and
-		 * nulls the table) + wire_discard_buffers() (resets the recvbuf),
+		 * draining session: mux_sched_free_streams() (frees every stream and
+		 * nulls the table) + mux_wire_discard_buffers() (resets the recvbuf),
 		 * then SESSION_CLOSING -- identical to the recv_copy spy above. */
 		struct mux_session *const ss = s->session;
 		table_free(ss->sched.streams);
@@ -266,13 +279,13 @@ void stream_recv_window(struct mux_stream *s, uint_fast32_t window_inc)
 	}
 }
 
-void stream_check_ack(struct mux_stream *s)
+void mux_stream_check_ack(struct mux_stream *s)
 {
 	(void)s;
 	g.check_ack_calls++;
 }
 
-void stream_start(struct mux_stream *s)
+void mux_stream_start(struct mux_stream *s)
 {
 	g.stream_start_calls++;
 	/* Mirror production: the active opener's SYN|ACK collapses SYN_SENT to
@@ -282,20 +295,20 @@ void stream_start(struct mux_stream *s)
 	s->state = STREAM_ESTABLISHED;
 }
 
-void stream_free(struct mux_stream *s)
+void mux_stream_free(struct mux_stream *s)
 {
 	(void)s;
 	g.stream_free_calls++;
 }
 
-void stream_close(struct mux_stream *s)
+void mux_stream_do_close(struct mux_stream *s)
 {
 	(void)s;
 	g.stream_close_calls++;
 }
 
 struct mux_stream *
-stream_new(struct mux_session *ss, uint_fast16_t id, bool active_open)
+mux_stream_new(struct mux_session *ss, uint_fast16_t id, bool active_open)
 {
 	(void)ss;
 	(void)id;
@@ -304,13 +317,14 @@ stream_new(struct mux_session *ss, uint_fast16_t id, bool active_open)
 	return g.stream_new_ret;
 }
 
-int stream_format_tag(char *buf, size_t buflen, const struct mux_stream *s)
+int mux_stream_format_tag(char *buf, size_t buflen, const struct mux_stream *s)
 {
 	(void)s;
 	return snprintf(buf, buflen, "[test]");
 }
 
-struct mux_stream *sched_find_stream(struct mux_session *ss, uint_fast16_t id)
+struct mux_stream *
+mux_sched_find_stream(struct mux_session *ss, uint_fast16_t id)
 {
 	(void)ss;
 	(void)id;
@@ -318,7 +332,7 @@ struct mux_stream *sched_find_stream(struct mux_session *ss, uint_fast16_t id)
 	return g.find_stream_ret;
 }
 
-bool sched_add_stream(struct mux_session *ss, struct mux_stream *s)
+bool mux_sched_add_stream(struct mux_session *ss, struct mux_stream *s)
 {
 	(void)ss;
 	(void)s;
@@ -326,47 +340,47 @@ bool sched_add_stream(struct mux_session *ss, struct mux_stream *s)
 	return g.add_stream_ret;
 }
 
-void sched_coalesce_arm(struct mux_session *ss)
+void mux_sched_coalesce_arm(struct mux_session *ss)
 {
 	(void)ss;
 	g.coalesce_arm_calls++;
 }
 
-void estimator_add(struct mux_session *ss, uint_fast64_t bytes)
+void mux_estimator_add(struct mux_session *ss, uint_fast64_t bytes)
 {
 	(void)ss;
 	g.est_add_calls++;
 	g.est_add_bytes = bytes;
 }
 
-void estimator_add_acked(struct mux_session *ss, uint_fast64_t bytes)
+void mux_estimator_add_acked(struct mux_session *ss, uint_fast64_t bytes)
 {
 	(void)ss;
 	g.est_add_acked_calls++;
 	g.est_add_acked_bytes = bytes;
 }
 
-void estimator_calculate(struct mux_session *ss, int_fast64_t sent_ns)
+void mux_estimator_calculate(struct mux_session *ss, int_fast64_t sent_ns)
 {
 	(void)ss;
 	g.est_calc_calls++;
 	g.est_calc_sent_ns = sent_ns;
 }
 
-size_t estimator_rx_window_size(const struct estimator_ctx *est)
+size_t mux_estimator_rx_window_size(const struct estimator_ctx *est)
 {
 	(void)est;
 	return g.est_window_ret;
 }
 
-size_t estimator_tx_window_size(const struct estimator_ctx *est)
+size_t mux_estimator_tx_window_size(const struct estimator_ctx *est)
 {
 	(void)est;
 	return g.est_window_ret;
 }
 
 struct unacked_ack_result
-unacked_ack_recv(struct mux_session *ss, uint_fast32_t count)
+mux_unacked_ack_recv(struct mux_session *ss, uint_fast32_t count)
 {
 	(void)ss;
 	g.ack_trim_calls++;
@@ -374,7 +388,7 @@ unacked_ack_recv(struct mux_session *ss, uint_fast32_t count)
 	return g.ack_trim_ret;
 }
 
-bool handshake_process_hello(
+bool mux_handshake_process_hello(
 	struct mux_session *ss, const struct mux_header *hdr, size_t frame_size)
 {
 	(void)hdr;
@@ -384,7 +398,7 @@ bool handshake_process_hello(
 	return true;
 }
 
-bool wire_recv(
+bool mux_wire_recv(
 	struct mux_session *restrict ss, unsigned char *restrict buf,
 	size_t *restrict len)
 {
@@ -403,7 +417,7 @@ bool wire_recv(
 	return true;
 }
 
-bool wire_has_pending(const struct mux_session *ss)
+bool mux_wire_has_pending(const struct mux_session *ss)
 {
 	(void)ss;
 	if (g.wire_has_pending_remaining > 0) {
@@ -413,7 +427,8 @@ bool wire_has_pending(const struct mux_session *ss)
 	return false;
 }
 
-bool bytebuf_reserve(struct bytebuf **restrict rbp, size_t need, bool can_grow)
+bool mux_bytebuf_reserve(
+	struct bytebuf **restrict rbp, size_t need, bool can_grow)
 {
 	(void)rbp;
 	(void)need;
@@ -423,7 +438,7 @@ bool bytebuf_reserve(struct bytebuf **restrict rbp, size_t need, bool can_grow)
 	return g.bytebuf_reserve_ret;
 }
 
-void bytebuf_shrink(struct bytebuf **restrict rbp, size_t target_cap)
+void mux_bytebuf_shrink(struct bytebuf **restrict rbp, size_t target_cap)
 {
 	/* The fixture's recvbuf is never grown, so shrinking is a no-op here. */
 	(void)rbp;
@@ -540,7 +555,7 @@ static void push_frame(
 }
 
 /* A bare stream with the given id and state; spies never dereference more.
- * grant_sent carries stream_new()'s implicit initial credit (frame.h) so the
+ * grant_sent carries mux_stream_new()'s implicit initial credit (frame.h) so the
  * fast-open credit check in process_syn_payload sees what production would. */
 static struct mux_stream make_stream(uint_least16_t id, enum stream_state state)
 {
@@ -670,7 +685,7 @@ T_DECLARE_CASE(test_valid_peer_stream_id)
 	T_EXPECT(client_odd_rejected);
 }
 
-/* session_update_session_window / session_update_stream_window. */
+/* mux_session_update_session_window / session_update_stream_window. */
 
 T_DECLARE_CASE(test_update_session_window_floors_and_noop)
 {
@@ -682,19 +697,19 @@ T_DECLARE_CASE(test_update_session_window_floors_and_noop)
 	/* Below the initial-frames floor: clamps up to MUX_INITIAL_SEND_WINDOW. */
 	fx.ss.session_window = 1;
 	fx.ss.peer_stream_window = 0;
-	session_update_session_window(&fx.ss, 0);
+	mux_session_update_session_window(&fx.ss, 0);
 	const uint_least32_t initial =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
 	const uint_least32_t window_after_floor = fx.ss.session_window;
 
 	/* Idempotent: same target is a no-op (no stall side effects). */
-	session_update_session_window(&fx.ss, 0);
+	mux_session_update_session_window(&fx.ss, 0);
 	const uint_least32_t window_after_noop = fx.ss.session_window;
 	const int notify_after_noop = g.notify_write_calls;
 
 	/* peer_stream_window acts as a floor above the initial window. */
 	fx.ss.peer_stream_window = initial + 10u;
-	session_update_session_window(&fx.ss, 0);
+	mux_session_update_session_window(&fx.ss, 0);
 	const uint_least32_t window_after_peer_floor = fx.ss.session_window;
 
 	/* Teardown before the asserts; T_FAILNOW would skip it otherwise. */
@@ -721,7 +736,8 @@ T_DECLARE_CASE(test_update_session_window_clears_stall_on_growth)
 	fx.ss.peer_stream_window = 0;
 
 	/* window_bytes large enough that target_frames dominates the floors. */
-	session_update_session_window(&fx.ss, (size_t)10u * MUX_WINDOW_UNIT);
+	mux_session_update_session_window(
+		&fx.ss, (size_t)10u * MUX_WINDOW_UNIT);
 
 	const bool stalled = fx.ss.unacked.stalled;
 	/* Free the fixture first so a failing assert can't leak it. */
@@ -789,7 +805,7 @@ T_DECLARE_CASE(test_update_stream_window_floors_to_initial)
 		return;
 	}
 	/* window_bytes=0 must clamp up to the initial-frames floor, exactly
-	 * like session_update_session_window, not just to 1 frame. */
+	 * like mux_session_update_session_window, not just to 1 frame. */
 	const uint_least32_t initial =
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT;
 	fx.ss.stream_window = 1;
@@ -839,7 +855,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_rst)
 	rf_teardown(&fx);
 
 	T_EXPECT_EQ(g.recv_rst_calls, 1);
-	/* The peer's status code must reach stream_recv_rst,
+	/* The peer's status code must reach mux_stream_recv_rst,
 	 * not just trigger the call. */
 	T_EXPECT_EQ(
 		g.recv_rst_status, (uint_fast16_t)MUX_STATUS_REFUSED_STREAM);
@@ -878,7 +894,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_invalid_flags_sends_rst)
 	T_EXPECT_EQ(readable, (size_t)0);
 }
 
-/* When the invalid-flags RST enqueue OOMs (session_send_ctrl returns false),
+/* When the invalid-flags RST enqueue OOMs (mux_session_send_ctrl returns false),
  * rst_sent must stay false so the RST is retried on the next frame rather than
  * being permanently suppressed -- the #41 retryable-RST contract, which the
  * unconditional latch defeated. */
@@ -1051,10 +1067,10 @@ T_DECLARE_CASE(test_dispatch_by_stream_push_fin)
 	T_EXPECT_EQ(readable, (size_t)0);
 }
 
-/* dispatch_by_stream PUSH|FIN: when stream_recv_copy() aborts the last active
+/* dispatch_by_stream PUSH|FIN: when mux_stream_recv_copy() aborts the last active
  * stream of a draining session, the drain cascade frees the stream and resets
  * the recvbuf; dispatch_by_stream() must not consume the reset ring nor call
- * stream_recv_fin() on the freed stream. Without the guard the consume would
+ * mux_stream_recv_fin() on the freed stream. Without the guard the consume would
  * assert on the reset ring (readable 0 < frame_size). */
 T_DECLARE_CASE(test_dispatch_by_stream_push_fin_survives_stream_freed)
 {
@@ -1085,7 +1101,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_push_fin_survives_stream_freed)
 	T_EXPECT_EQ(readable, (size_t)0);
 }
 
-/* dispatch_by_stream ACK|PUSH: stream_recv_window() runs before the PUSH copy
+/* dispatch_by_stream ACK|PUSH: mux_stream_recv_window() runs before the PUSH copy
  * and is itself free-capable -- a spec §6.6 credit overflow aborts the stream,
  * and on the last active stream of a draining session the cascade frees it and
  * resets the recvbuf. The post-copy guard cannot cover this earlier free, so
@@ -1122,11 +1138,11 @@ T_DECLARE_CASE(test_dispatch_by_stream_ack_push_survives_window_abort)
 	T_EXPECT_EQ(readable, (size_t)0);
 }
 
-/* dispatch_by_stream SYN|ACK: stream_recv_window() runs on the SYN branch too
+/* dispatch_by_stream SYN|ACK: mux_stream_recv_window() runs on the SYN branch too
  * and is free-capable -- a spec §6.6 credit overflow can abort the stream, and
  * on the last active stream of a draining session the cascade frees it and
  * resets the recvbuf. The SYN-branch guard must bail right after the window
- * update: no establishment side effects (session window / stream_start /
+ * update: no establishment side effects (session window / mux_stream_start /
  * process_syn_payload) and no consume of the reset ring. Without the guard,
  * process_syn_payload's consume runs on the reset ring and asserts. */
 T_DECLARE_CASE(test_dispatch_by_stream_synack_survives_window_abort)
@@ -1548,7 +1564,7 @@ T_DECLARE_CASE(test_process_syn_payload_accepts_credit_boundary_fastopen)
 
 /* The SYN|ACK reject path -- process_syn_payload's live-grant check, now the
  * path where that check actually fires -- carries the same drain-cascade hazard
- * as the copy path: stream_abort can take down the last active stream of a
+ * as the copy path: mux_stream_abort can take down the last active stream of a
  * draining session, whose shutdown frees the streams and resets this recvbuf,
  * so the frame must not be consumed from a ring the cascade already reset. */
 T_DECLARE_CASE(test_dispatch_by_stream_synack_reject_guards_drain_cascade)
@@ -1560,7 +1576,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_synack_reject_guards_drain_cascade)
 	}
 	struct mux_stream s = make_stream(1, STREAM_SYN_SENT);
 	/* The cascade spy reaches the session through the stream, as the real
-	 * stream_abort does. grant_sent is make_stream()'s implicit 16384. */
+	 * mux_stream_abort does. grant_sent is make_stream()'s implicit 16384. */
 	s.session = &fx.ss;
 	s.send_window = 2u * MUX_WINDOW_UNIT;
 	g.abort_free_streams = true;
@@ -1590,7 +1606,7 @@ T_DECLARE_CASE(test_dispatch_by_stream_synack_reject_guards_drain_cascade)
 	T_EXPECT_EQ(readable, (size_t)0);
 }
 
-/* process_syn_payload copy path (fast-open SYN): when stream_recv_copy() aborts
+/* process_syn_payload copy path (fast-open SYN): when mux_stream_recv_copy() aborts
  * the last active stream of a draining session, the drain cascade frees the
  * streams and resets the recvbuf. The guard after the copy must stop before the
  * consume; without it the consume runs on the reset ring and asserts. The ACK
@@ -1608,7 +1624,7 @@ T_DECLARE_CASE(test_process_syn_payload_copy_guards_drain_cascade)
 	static struct mux_stream newstream;
 	newstream = make_stream(3, STREAM_SYN_RECEIVED);
 	/* The cascade spy reaches the session through the stream, as the real
-	 * stream_recv_copy does; stream_new() would have wired this up. */
+	 * mux_stream_recv_copy does; mux_stream_new() would have wired this up. */
 	newstream.session = &fx.ss;
 	g.stream_new_ret = &newstream;
 	g.recv_copy_free_streams = true;
@@ -1822,7 +1838,7 @@ T_DECLARE_CASE(test_dispatch_no_stream_add_stream_fails)
 
 	T_EXPECT_EQ(g.add_stream_calls, 1);
 	T_EXPECT_EQ(g.stream_free_calls, 1);
-	/* Same as the stream_new OOM branch above -- the
+	/* Same as the mux_stream_new OOM branch above -- the
 	 * frame is already counted into recv_seq, so this must not drop
 	 * silently either. */
 	T_EXPECT_EQ(g.send_ctrl_calls, 1);
@@ -1923,7 +1939,7 @@ T_DECLARE_CASE(test_dispatch_frame_accepts_oversized_length)
 }
 
 /* Regression (#26): the ctrl branch must apply the same post-dispatch state
- * check as the stream path. session_recv_ping's oversized-PING path resets the
+ * check as the stream path. mux_session_recv_ping's oversized-PING path resets the
  * session but dispatch_ctrl_frame still returns true, so without the check the
  * loop would re-enter and dispatch the next frame on a CLOSED session. Two
  * back-to-back oversized PINGs: only the first may be dispatched. */
@@ -1957,7 +1973,7 @@ T_DECLARE_CASE(test_dispatch_frame_ctrl_reset_stops_loop)
 
 /* A fully-buffered oversized PUSH is delivered to the stream intact: the whole
  * payload (larger than the session's configured max_payload, 65528 here, but
- * still wire-legal) reaches stream_recv_copy. */
+ * still wire-legal) reaches mux_stream_recv_copy. */
 T_DECLARE_CASE(test_dispatch_by_stream_oversized_push)
 {
 	struct recv_fixture fx;
@@ -2047,7 +2063,7 @@ T_DECLARE_CASE(test_dispatch_frame_hello_routed_to_handshake)
 }
 
 /* A hello frame (version=0) arriving while still SESSION_HANDSHAKE -- its
- * ordinary arrival state -- must still reach handshake_process_hello
+ * ordinary arrival state -- must still reach mux_handshake_process_hello
  * unaffected by the pre-established gate below. */
 T_DECLARE_CASE(test_dispatch_frame_hello_during_handshake_unaffected)
 {
@@ -2228,7 +2244,7 @@ T_DECLARE_CASE(test_dispatch_frame_data_forces_session_ack)
 	T_EXPECT_EQ(readable, (size_t)0);
 }
 
-/* session_recv_ping / session_recv_pong control handlers. */
+/* mux_session_recv_ping / mux_session_recv_pong control handlers. */
 
 T_DECLARE_CASE(test_recv_ping_rate_limited)
 {
@@ -2247,7 +2263,7 @@ T_DECLARE_CASE(test_recv_ping_rate_limited)
 	push_frame(&fx, &h);
 	const size_t frame_size = MUX_FRAME_HEADER_SIZE + h.length;
 
-	session_recv_ping(&fx.ss, &h, frame_size);
+	mux_session_recv_ping(&fx.ss, &h, frame_size);
 
 	const size_t readable = bytebuf_readable(fx.ss.wire.recvbuf);
 	/* Free the fixture first so a failing assert can't leak it. */
@@ -2275,7 +2291,7 @@ T_DECLARE_CASE(test_recv_ping_oom_drops_pong)
 	push_frame(&fx, &h);
 	const size_t frame_size = MUX_FRAME_HEADER_SIZE + h.length;
 
-	session_recv_ping(&fx.ss, &h, frame_size);
+	mux_session_recv_ping(&fx.ss, &h, frame_size);
 
 	/* ping_recv_last_ns is not advanced when the PONG could not be queued. */
 	const bool ping_ns_not_advanced =
@@ -2312,7 +2328,7 @@ T_DECLARE_CASE(test_recv_ping_oversized_resets)
 	push_frame(&fx, &h);
 	const size_t frame_size = MUX_FRAME_HEADER_SIZE + h.length;
 
-	session_recv_ping(&fx.ss, &h, frame_size);
+	mux_session_recv_ping(&fx.ss, &h, frame_size);
 
 	/* Free the fixture first so a failing assert can't leak it. */
 	rf_teardown(&fx);
@@ -2337,7 +2353,7 @@ T_DECLARE_CASE(test_recv_pong_short_payload_ignored)
 	push_frame(&fx, &h);
 	const size_t frame_size = MUX_FRAME_HEADER_SIZE + h.length;
 
-	session_recv_pong(&fx.ss, &h, frame_size);
+	mux_session_recv_pong(&fx.ss, &h, frame_size);
 
 	const size_t readable = bytebuf_readable(fx.ss.wire.recvbuf);
 	/* Teardown up front; a failing check below must not leak it. */
@@ -2368,7 +2384,7 @@ T_DECLARE_CASE(test_recv_pong_feeds_estimator)
 	bytebuf_produce(fx.ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE + h.length);
 	const size_t frame_size = MUX_FRAME_HEADER_SIZE + h.length;
 
-	session_recv_pong(&fx.ss, &h, frame_size);
+	mux_session_recv_pong(&fx.ss, &h, frame_size);
 
 	const size_t readable = bytebuf_readable(fx.ss.wire.recvbuf);
 	/* Free the fixture first so a failing assert can't leak it. */
@@ -2379,7 +2395,7 @@ T_DECLARE_CASE(test_recv_pong_feeds_estimator)
 	T_EXPECT_EQ(readable, (size_t)0);
 }
 
-/* recv_one / session_on_recv: the transport read pump. */
+/* recv_one / mux_session_on_recv: the transport read pump. */
 
 T_DECLARE_CASE(test_recv_one_error_suspends_resumable)
 {
@@ -2448,7 +2464,7 @@ T_DECLARE_CASE(test_recv_one_handshake_suspends_resumable)
 	T_EXPECT_EQ(g.reset_calls, 0);
 }
 
-/* recv_one: a TLS close_notify -- wire_recv succeeds but reports nread==0 --
+/* recv_one: a TLS close_notify -- mux_wire_recv succeeds but reports nread==0 --
  * during the handshake has no send-side handler, so recv_one drives teardown
  * itself. A client mid-resume (session id negotiated, not yet accepted)
  * re-suspends to preserve its streams rather than resetting. */
@@ -2535,7 +2551,7 @@ T_DECLARE_CASE(test_session_on_recv_dispatches_and_loops)
 		T_FATAL("rf_setup failed");
 		return;
 	}
-	/* Stage a single PROBE frame for wire_recv to deliver, then report one
+	/* Stage a single PROBE frame for mux_wire_recv to deliver, then report one
 	 * more pending read.  The second read returns zero bytes (EAGAIN), so the
 	 * drain loop runs a second recv_one and then breaks. */
 	static unsigned char frame[MUX_FRAME_HEADER_SIZE];
@@ -2548,7 +2564,7 @@ T_DECLARE_CASE(test_session_on_recv_dispatches_and_loops)
 	g.wire_recv_nread = sizeof(frame);
 	g.wire_has_pending_remaining = 1; /* one extra loop iteration */
 
-	session_on_recv(&fx.ss);
+	mux_session_on_recv(&fx.ss);
 
 	const size_t readable = bytebuf_readable(fx.ss.wire.recvbuf);
 	/* Free the fixture first so a failing assert can't leak it. */

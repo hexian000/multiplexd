@@ -44,7 +44,7 @@ static int g_mark_fin_sent_calls;
 static int g_send_push_calls;
 static struct mux_frame *g_last_sent_frame;
 static uint_least16_t g_last_push_stream_id;
-/* When set, stream_dequeue_send() returns NULL for this stream without
+/* When set, mux_stream_dequeue_send() returns NULL for this stream without
  * popping its queue: simulates a credit-exhausted or Nagle-held stream. */
 static struct mux_stream *g_block_stream;
 static int g_notify_recv_calls;
@@ -85,7 +85,7 @@ sched_timer_noop_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	(void)revents;
 }
 
-int stream_format_tag(
+int mux_stream_format_tag(
 	char *restrict buf, const size_t buflen,
 	const struct mux_stream *restrict s)
 {
@@ -99,7 +99,7 @@ static void update_watcher(struct mux_session *ss)
 	g_update_watcher_calls++;
 }
 
-void session_notify(struct mux_session *restrict ss)
+void mux_session_notify(struct mux_session *restrict ss)
 {
 	ss->wire.tx_pending = true;
 	if (ss->w_socket.fd != -1) {
@@ -107,7 +107,7 @@ void session_notify(struct mux_session *restrict ss)
 	}
 }
 
-bool session_send_ctrl(
+bool mux_session_send_ctrl(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id,
 	const uint_fast8_t flags, const uint_fast32_t extra)
 {
@@ -119,19 +119,19 @@ bool session_send_ctrl(
 	return true;
 }
 
-uint_fast32_t stream_grant_inc(const struct mux_stream *s)
+uint_fast32_t mux_stream_grant_inc(const struct mux_stream *s)
 {
 	(void)s;
 	return g_stream_grant_inc;
 }
 
-void stream_mark_fin_sent(struct mux_stream *s)
+void mux_stream_mark_fin_sent(struct mux_stream *s)
 {
 	(void)s;
 	g_mark_fin_sent_calls++;
 }
 
-void session_send_push(
+void mux_session_send_push(
 	struct mux_session *ss, struct mux_stream *restrict s,
 	struct mux_frame *restrict frame)
 {
@@ -141,7 +141,7 @@ void session_send_push(
 	g_last_push_stream_id = s->id;
 }
 
-struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
+struct mux_frame *mux_stream_dequeue_send(struct mux_stream *restrict s)
 {
 	if (s == g_block_stream) {
 		/* Blocked (credit exhausted / Nagle-held): queue is left
@@ -151,43 +151,48 @@ struct mux_frame *stream_dequeue_send(struct mux_stream *restrict s)
 	return mux_frame_list_pop(&s->send_queue);
 }
 
-void stream_notify_recv(struct mux_stream *restrict s)
+void mux_stream_notify_recv(struct mux_stream *restrict s)
 {
 	(void)s;
 	g_notify_recv_calls++;
 }
 
-void session_flush(struct mux_session *ss)
+void mux_session_flush(struct mux_session *ss)
 {
 	(void)ss;
 	g_flush_calls++;
 }
 
-void stream_mark_syn_sent(struct mux_stream *s)
+void mux_stream_mark_syn_sent(struct mux_stream *s)
 {
 	g_mark_syn_sent_calls++;
 	s->state = STREAM_SYN_SENT;
 }
 
-void stream_free(struct mux_stream *s)
+void mux_stream_free(struct mux_stream *s)
 {
 	g_stream_free_calls++;
 	free(s);
 }
 
-void session_emit_ack(struct mux_session *ss)
+void mux_stream_do_close(struct mux_stream *s)
+{
+	(void)s;
+}
+
+void mux_session_emit_ack(struct mux_session *ss)
 {
 	(void)ss;
 	g_emit_ack_calls++;
 }
 
-void stream_check_ack(struct mux_stream *s)
+void mux_stream_check_ack(struct mux_stream *s)
 {
 	(void)s;
 	g_stream_check_ack_calls++;
 }
 
-void session_initiate_shutdown(struct mux_session *ss)
+void mux_session_initiate_shutdown(struct mux_session *ss)
 {
 	(void)ss;
 	g_session_initiate_shutdown_calls++;
@@ -216,7 +221,7 @@ static void make_session(struct mux_session *restrict ss)
 	ss->w_socket.fd = -1;
 	ev_timer_init(&ss->w_idle_timeout, sched_timer_noop_cb, 0.0, 1.0);
 	ss->w_idle_timeout.data = ss;
-	sched_init(ss);
+	mux_sched_init(ss);
 }
 
 static void cleanup_session(struct mux_session *restrict ss)
@@ -294,7 +299,7 @@ T_DECLARE_CASE(test_sched_alloc_stream_id_nearly_full)
 	}
 
 	/* Only 65534 remains free. */
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)65534);
+	T_EXPECT_EQ(mux_sched_alloc_stream_id(&ss), (uint_least16_t)65534);
 
 	/* Occupy the last slot; next call must report exhaustion. */
 	{
@@ -305,7 +310,8 @@ T_DECLARE_CASE(test_sched_alloc_stream_id_nearly_full)
 			&elem);
 		T_CHECK(ss.sched.streams != NULL);
 	}
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
+	T_EXPECT_EQ(
+		mux_sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
 
 	cleanup_session(&ss);
 }
@@ -317,11 +323,11 @@ T_DECLARE_CASE(test_sched_alloc_stream_id_starts_at_minimum)
 
 	/* Client (odd IDs): first allocation returns ID 1. */
 	ss.accepted = false;
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)1);
+	T_EXPECT_EQ(mux_sched_alloc_stream_id(&ss), (uint_least16_t)1);
 
 	/* Server (even IDs): first allocation skips STREAMID_CTRL and returns ID 2. */
 	ss.accepted = true;
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)2);
+	T_EXPECT_EQ(mux_sched_alloc_stream_id(&ss), (uint_least16_t)2);
 
 	cleanup_session(&ss);
 }
@@ -334,7 +340,7 @@ T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
 
 	sched_test_reset();
 	ss.conf.idle_timeout = 1;
-	T_EXPECT(sched_add_stream(&ss, &stream));
+	T_EXPECT(mux_sched_add_stream(&ss, &stream));
 	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)1);
 	T_EXPECT(!ev_is_active(&ss.w_idle_timeout));
 
@@ -346,7 +352,7 @@ T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
 }
 
 /* A second, distinct stream at an ID already in the table must be rejected by
- * sched_add_stream's self-check (the old `elem == s` check let a genuine
+ * mux_sched_add_stream's self-check (the old `elem == s` check let a genuine
  * collision through, returning true and silently overwriting the mapping). */
 T_DECLARE_CASE(test_sched_add_stream_rejects_duplicate_id)
 {
@@ -356,15 +362,15 @@ T_DECLARE_CASE(test_sched_add_stream_rejects_duplicate_id)
 	struct mux_stream second = { .id = 7 };
 
 	sched_test_reset();
-	T_EXPECT(sched_add_stream(&ss, &first));
+	T_EXPECT(mux_sched_add_stream(&ss, &first));
 	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)1);
 
 	/* Same ID, different object: rejected, no new entry, and the table still
 	 * maps the ID to the ORIGINAL stream -- a replace-then-free would have left
 	 * it holding a dangling pointer to the caller-freed duplicate. */
-	T_EXPECT(!sched_add_stream(&ss, &second));
+	T_EXPECT(!mux_sched_add_stream(&ss, &second));
 	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)1);
-	T_EXPECT(sched_find_stream(&ss, 7) == &first);
+	T_EXPECT(mux_sched_find_stream(&ss, 7) == &first);
 
 	cleanup_session(&ss);
 }
@@ -381,17 +387,17 @@ T_DECLARE_CASE(test_sched_free_streams_clears_stream_counter)
 	first->id = 3;
 	second->id = 5;
 	sched_test_reset();
-	T_EXPECT(sched_add_stream(&ss, first));
-	T_EXPECT(sched_add_stream(&ss, second));
+	T_EXPECT(mux_sched_add_stream(&ss, first));
+	T_EXPECT(mux_sched_add_stream(&ss, second));
 	ss.unacked.stalled = true;
 
-	sched_free_streams(&ss);
+	mux_sched_free_streams(&ss);
 	T_EXPECT(ss.cnt.num_stream_failed == NULL);
 	T_EXPECT_EQ(g_stream_free_calls, 2);
 	T_EXPECT(ss.sched.streams == NULL);
 	/* The send-stall gate is not the scheduler's to clear: it belongs to the
 	 * reliability module and falls with the unacked bytes in
-	 * unacked_free_all(), which every teardown caller pairs with this. Assert
+	 * mux_unacked_free_all(), which every teardown caller pairs with this. Assert
 	 * the gate is left alone rather than merely saying so, since this suite
 	 * compiles the real sched.c and would otherwise not notice the
 	 * cross-module poke coming back. */
@@ -410,9 +416,9 @@ T_DECLARE_CASE(test_sched_wake_enqueues_only_once)
 	};
 
 	sched_test_reset();
-	ss.w_socket.fd = 3; /* live socket: session_notify arms EV_WRITE */
-	sched_wake(&ss, &stream);
-	sched_wake(&ss, &stream);
+	ss.w_socket.fd = 3; /* live socket: mux_session_notify arms EV_WRITE */
+	mux_sched_wake(&ss, &stream);
+	mux_sched_wake(&ss, &stream);
 	T_EXPECT(ss.sched.sched_head == &stream);
 	T_EXPECT(ss.sched.sched_tail == &stream);
 	T_EXPECT(stream.sched_queue == SCHED_QUEUE_DRR);
@@ -460,16 +466,16 @@ T_DECLARE_CASE(test_sched_delay_remove_handles_head_middle_and_tail)
 	second.delay_next = &third;
 	third.delay_prev = &second;
 
-	sched_delay_remove(&ss, &second);
+	mux_sched_delay_remove(&ss, &second);
 	T_EXPECT(first.delay_next == &third);
 	T_EXPECT(third.delay_prev == &first);
 	T_EXPECT(!second.delay_pending);
 
-	sched_delay_remove(&ss, &first);
+	mux_sched_delay_remove(&ss, &first);
 	T_EXPECT(ss.sched.delay_head == &third);
 	T_EXPECT(third.delay_prev == NULL);
 
-	sched_delay_remove(&ss, &third);
+	mux_sched_delay_remove(&ss, &third);
 	T_EXPECT(ss.sched.delay_head == NULL);
 
 	cleanup_session(&ss);
@@ -503,11 +509,11 @@ T_DECLARE_CASE(test_sched_send_ctrl_flags_emits_ack_and_fin)
 }
 
 /* drr_active is off-FIFO while spending its round budget (file
- * header note), so sched_flush_ctrl must flush its pending ACK/FIN
+ * header note), so mux_sched_flush_ctrl must flush its pending ACK/FIN
  * explicitly -- sched_head's walk alone would skip it, which matters most
  * during a session stall (send_stage_next) when this is the only remaining
  * path for per-stream ACK/FIN to flow. Also covers a sched_head member in the
- * same call, since sched_flush_ctrl previously had no test of its own. */
+ * same call, since mux_sched_flush_ctrl previously had no test of its own. */
 T_DECLARE_CASE(test_sched_flush_ctrl_includes_drr_active)
 {
 	struct mux_session ss;
@@ -532,7 +538,7 @@ T_DECLARE_CASE(test_sched_flush_ctrl_includes_drr_active)
 
 	sched_test_reset();
 	g_stream_grant_inc = 2;
-	sched_flush_ctrl(&ss);
+	mux_sched_flush_ctrl(&ss);
 	T_EXPECT_EQ(g_send_ctrl_calls, 2);
 	T_EXPECT(!active.ack_pending);
 	T_EXPECT(!queued.ack_pending);
@@ -540,7 +546,7 @@ T_DECLARE_CASE(test_sched_flush_ctrl_includes_drr_active)
 	cleanup_session(&ss);
 }
 
-/* sched_flush_ctrl must skip CLOSED streams at both check points: the CLOSED
+/* mux_sched_flush_ctrl must skip CLOSED streams at both check points: the CLOSED
  * drr_active guard and the `state != STREAM_CLOSED` skip in the sched_head
  * walk. A CLOSED stream (tombstone) carrying stale ack_pending must not emit a
  * control frame. */
@@ -576,7 +582,7 @@ T_DECLARE_CASE(test_sched_flush_ctrl_skips_closed_streams)
 
 	sched_test_reset();
 	g_stream_grant_inc = 2;
-	sched_flush_ctrl(&ss);
+	mux_sched_flush_ctrl(&ss);
 	/* Only the live stream emits; both CLOSED streams are skipped. */
 	T_EXPECT_EQ(g_send_ctrl_calls, 1);
 	T_EXPECT_EQ(g_last_ctrl_stream_id, (uint_fast16_t)9);
@@ -584,7 +590,7 @@ T_DECLARE_CASE(test_sched_flush_ctrl_skips_closed_streams)
 	cleanup_session(&ss);
 }
 
-/* sched_check_no_active_streams treats a table of only tombstones (CLOSED
+/* mux_sched_check_no_active_streams treats a table of only tombstones (CLOSED
  * streams awaiting late-frame suppression) as "no active streams": it compares
  * table_size against num_tombstones, not against zero. Verify a draining
  * ESTABLISHED session shuts down only once the last live entry is counted as a
@@ -597,24 +603,24 @@ T_DECLARE_CASE(test_sched_check_no_active_streams_subtracts_tombstones)
 
 	sched_test_reset();
 	ss.draining = true;
-	T_EXPECT(sched_add_stream(&ss, &tomb));
+	T_EXPECT(mux_sched_add_stream(&ss, &tomb));
 
 	/* num_tombstones (0) < table_size (1): the CLOSED entry still counts as
 	 * active, so no drain-shutdown. */
 	ss.sched.num_tombstones = 0;
-	sched_check_no_active_streams(&ss);
+	mux_sched_check_no_active_streams(&ss);
 	T_EXPECT_EQ(g_session_initiate_shutdown_calls, 0);
 
 	/* num_tombstones (1) == table_size (1): the sole entry is a tombstone,
 	 * so the session has no active streams and the drain completes. */
 	ss.sched.num_tombstones = 1;
-	sched_check_no_active_streams(&ss);
+	mux_sched_check_no_active_streams(&ss);
 	T_EXPECT_EQ(g_session_initiate_shutdown_calls, 1);
 
 	cleanup_session(&ss);
 }
 
-/* sched_next_data pulls a CLOSED stream off the DRR ready queue and, while the
+/* mux_sched_next_data pulls a CLOSED stream off the DRR ready queue and, while the
  * tombstone timer does not own it, reroutes it to the lp cleanup queue instead
  * of trying to send its data. */
 T_DECLARE_CASE(test_sched_next_data_reroutes_closed_stream_to_lp)
@@ -628,7 +634,7 @@ T_DECLARE_CASE(test_sched_next_data_reroutes_closed_stream_to_lp)
 
 	/* w_tombstone is inactive (zeroed): the CLOSED stream leaves the DRR
 	 * queue, lands in the lp cleanup queue, and no data is staged. */
-	T_EXPECT(!sched_next_data(&ss));
+	T_EXPECT(!mux_sched_next_data(&ss));
 	T_EXPECT(ss.sched.sched_head == NULL);
 	T_EXPECT(ss.sched.lp_head == &closed);
 	T_EXPECT(ss.sched.drr_active == NULL);
@@ -652,7 +658,7 @@ T_DECLARE_CASE(test_sched_next_data_sends_frame_and_resets_deficit_on_drain)
 	sched_test_reset();
 	mux_frame_list_push(&stream.send_queue, &frame);
 	sched_enqueue(&ss, &stream);
-	T_EXPECT(sched_next_data(&ss));
+	T_EXPECT(mux_sched_next_data(&ss));
 	T_EXPECT_EQ(g_send_push_calls, 1);
 	T_EXPECT(g_last_sent_frame == &frame);
 	T_EXPECT_EQ(g_notify_recv_calls, 1);
@@ -683,14 +689,14 @@ T_DECLARE_CASE(test_sched_sole_stream_drains_without_requeue)
 	sched_enqueue(&ss, &stream);
 
 	/* First two frames keep the stream active without re-queuing. */
-	T_EXPECT(sched_next_data(&ss));
+	T_EXPECT(mux_sched_next_data(&ss));
 	T_EXPECT(ss.sched.drr_active == &stream);
 	T_EXPECT(ss.sched.sched_head == NULL);
-	T_EXPECT(sched_next_data(&ss));
+	T_EXPECT(mux_sched_next_data(&ss));
 	T_EXPECT(ss.sched.drr_active == &stream);
 	T_EXPECT(ss.sched.sched_head == NULL);
 	/* Third drains the queue: the stream yields. */
-	T_EXPECT(sched_next_data(&ss));
+	T_EXPECT(mux_sched_next_data(&ss));
 	T_EXPECT(ss.sched.drr_active == NULL);
 	T_EXPECT_EQ(g_send_push_calls, 3);
 
@@ -709,7 +715,7 @@ T_DECLARE_CASE(test_sched_drain_lp_sends_syn_for_init_stream)
 	sched_test_reset();
 	g_stream_grant_inc = 3;
 	sched_lp_enqueue(&ss, &stream);
-	sched_drain_lp(&ss);
+	mux_sched_drain_lp(&ss);
 	T_EXPECT_EQ(g_send_ctrl_calls, 1);
 	T_EXPECT_EQ(g_last_ctrl_flags, (uint_fast8_t)MUX_FLAG_SYN);
 	T_EXPECT_EQ(g_last_ctrl_extra, (uint_fast32_t)3);
@@ -748,7 +754,8 @@ T_DECLARE_CASE(test_stream_id_exhaustion)
 			ss.sched.streams, (const void *)(uintptr_t)i, &elem);
 		T_CHECK(ss.sched.streams != NULL);
 	}
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
+	T_EXPECT_EQ(
+		mux_sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
 	cleanup_session(&ss);
 }
 
@@ -767,7 +774,7 @@ T_DECLARE_CASE(test_stream_id_wraparound_client)
 	}
 	/* Start scan near wrap: next_stream_id=65533; only 65535 free. */
 	ss.sched.next_stream_id = 65533;
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)65535);
+	T_EXPECT_EQ(mux_sched_alloc_stream_id(&ss), (uint_least16_t)65535);
 	/* Now all odd IDs occupied; next allocation fails. */
 	{
 		void *dummy = (void *)(uintptr_t)65535;
@@ -777,14 +784,15 @@ T_DECLARE_CASE(test_stream_id_wraparound_client)
 			&elem);
 		T_CHECK(ss.sched.streams != NULL);
 	}
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
+	T_EXPECT_EQ(
+		mux_sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
 	/* Remove ID 1; next allocation wraps back to 1. */
 	{
 		void *elem = NULL;
 		ss.sched.streams = table_del(
 			ss.sched.streams, (const void *)(uintptr_t)1, &elem);
 	}
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)1);
+	T_EXPECT_EQ(mux_sched_alloc_stream_id(&ss), (uint_least16_t)1);
 	cleanup_session(&ss);
 }
 
@@ -803,7 +811,7 @@ T_DECLARE_CASE(test_stream_id_wraparound_server)
 	}
 	/* Start scan near wrap: next_stream_id=65532; only 65534 free. */
 	ss.sched.next_stream_id = 65532;
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)65534);
+	T_EXPECT_EQ(mux_sched_alloc_stream_id(&ss), (uint_least16_t)65534);
 	/* Now all even IDs occupied; next allocation fails. */
 	{
 		void *dummy = (void *)(uintptr_t)65534;
@@ -813,14 +821,15 @@ T_DECLARE_CASE(test_stream_id_wraparound_server)
 			&elem);
 		T_CHECK(ss.sched.streams != NULL);
 	}
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
+	T_EXPECT_EQ(
+		mux_sched_alloc_stream_id(&ss), (uint_least16_t)STREAMID_CTRL);
 	/* Remove ID 2; next allocation wraps back to 2. */
 	{
 		void *elem = NULL;
 		ss.sched.streams = table_del(
 			ss.sched.streams, (const void *)(uintptr_t)2, &elem);
 	}
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)2);
+	T_EXPECT_EQ(mux_sched_alloc_stream_id(&ss), (uint_least16_t)2);
 	cleanup_session(&ss);
 }
 
@@ -837,7 +846,7 @@ T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 		T_CHECK(s != NULL);
 		s->id = (uint_least16_t)(i * 2 + 1);
 		s->state = STREAM_ESTABLISHED;
-		T_EXPECT(sched_add_stream(&ss, s));
+		T_EXPECT(mux_sched_add_stream(&ss, s));
 	}
 	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)4);
 	ss.sched.num_tombstones = 2;
@@ -847,9 +856,9 @@ T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 		T_CHECK(s != NULL);
 		s->id = 9;
 		s->state = STREAM_INIT;
-		T_EXPECT(sched_add_stream(&ss, s));
+		T_EXPECT(mux_sched_add_stream(&ss, s));
 	}
-	sched_free_streams(&ss);
+	mux_sched_free_streams(&ss);
 	cleanup_session(&ss);
 }
 
@@ -866,7 +875,7 @@ T_DECLARE_CASE(test_stream_id_collision_skip)
 			ss.sched.streams, (const void *)(uintptr_t)2, &elem);
 		T_CHECK(ss.sched.streams != NULL);
 	}
-	T_EXPECT_EQ(sched_alloc_stream_id(&ss), (uint_least16_t)4);
+	T_EXPECT_EQ(mux_sched_alloc_stream_id(&ss), (uint_least16_t)4);
 	cleanup_session(&ss);
 }
 
@@ -882,16 +891,16 @@ T_DECLARE_CASE(test_sched_wake_double_enqueue_idempotent)
 	T_CHECK(s != NULL);
 	s->id = 1;
 	s->state = STREAM_ESTABLISHED;
-	T_EXPECT(sched_add_stream(&ss, s));
-	sched_wake(&ss, s);
+	T_EXPECT(mux_sched_add_stream(&ss, s));
+	mux_sched_wake(&ss, s);
 	T_EXPECT(s->sched_queue == SCHED_QUEUE_DRR);
 	T_EXPECT(ss.sched.sched_head == s);
 	T_EXPECT(ss.sched.sched_tail == s);
-	sched_wake(&ss, s);
+	mux_sched_wake(&ss, s);
 	T_EXPECT(ss.sched.sched_head == s);
 	T_EXPECT(ss.sched.sched_tail == s);
 	T_EXPECT(s->next == NULL);
-	sched_free_streams(&ss);
+	mux_sched_free_streams(&ss);
 	cleanup_session(&ss);
 }
 
@@ -905,15 +914,15 @@ T_DECLARE_CASE(test_lp_queue_double_enqueue_prevented)
 	T_CHECK(s != NULL);
 	s->id = 1;
 	s->state = STREAM_INIT;
-	T_EXPECT(sched_add_stream(&ss, s));
-	sched_wake(&ss, s);
+	T_EXPECT(mux_sched_add_stream(&ss, s));
+	mux_sched_wake(&ss, s);
 	T_EXPECT(ss.sched.lp_head == s);
 	T_EXPECT(ss.sched.lp_tail == s);
-	sched_wake(&ss, s);
+	mux_sched_wake(&ss, s);
 	T_EXPECT(ss.sched.lp_head == s);
 	T_EXPECT(ss.sched.lp_tail == s);
 	T_EXPECT(s->next == NULL);
-	sched_free_streams(&ss);
+	mux_sched_free_streams(&ss);
 	cleanup_session(&ss);
 }
 
@@ -944,7 +953,7 @@ T_DECLARE_CASE(test_sched_next_data_skips_empty_queue_stream)
 	sched_enqueue(&ss, &stream_b);
 
 	/* Should skip A (no frame) and produce B's frame. */
-	T_EXPECT(sched_next_data(&ss));
+	T_EXPECT(mux_sched_next_data(&ss));
 	T_EXPECT_EQ(g_send_push_calls, 1);
 	T_EXPECT(g_last_sent_frame == &frame_b);
 	T_EXPECT_EQ(g_notify_recv_calls, 1);
@@ -975,7 +984,7 @@ T_DECLARE_CASE(test_sched_next_data_exhausts_queue_returns_false)
 	sched_enqueue(&ss, &stream_b);
 
 	/* Neither has data: must exhaust the queue and return false. */
-	T_EXPECT(!sched_next_data(&ss));
+	T_EXPECT(!mux_sched_next_data(&ss));
 	T_EXPECT_EQ(g_send_push_calls, 0);
 
 	/* Queue must be empty after exhaustive scan. */
@@ -1022,7 +1031,7 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 	/* A takes its first (small) turn and stays drr_active with leftover
 	 * deficit, exactly like a stream that "gets a little credit, sends a
 	 * little" before stalling. */
-	T_EXPECT(sched_next_data(&ss));
+	T_EXPECT(mux_sched_next_data(&ss));
 	T_EXPECT_EQ(g_last_push_stream_id, stream_a.id);
 	sched_test_tally_push(
 		&bytes_a, stream_a.id, &bytes_b, stream_b.id, &bytes_c,
@@ -1040,7 +1049,7 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 	while ((bytes_b < (size_t)ss.max_payload ||
 		bytes_c < (size_t)ss.max_payload) &&
 	       guard++ < 50) {
-		T_CHECK(sched_next_data(&ss));
+		T_CHECK(mux_sched_next_data(&ss));
 		T_CHECK(g_last_push_stream_id != stream_a.id);
 		sched_test_tally_push(
 			&bytes_a, stream_a.id, &bytes_b, stream_b.id, &bytes_c,
@@ -1057,10 +1066,10 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 	T_EXPECT(ss.sched.drr_active != &stream_a);
 	T_EXPECT(stream_a.sched_queue == SCHED_QUEUE_NONE);
 
-	/* Unblock A exactly as stream_recv_window() or the coalescing timer
+	/* Unblock A exactly as mux_stream_recv_window() or the coalescing timer
 	 * would in production: clear the external stall and re-admit it. */
 	g_block_stream = NULL;
-	sched_wake(&ss, &stream_a);
+	mux_sched_wake(&ss, &stream_a);
 
 	/* Measure the uninterrupted burst A sends once rescheduled, stopping
 	 * the instant another stream is served (A yielded). */
@@ -1069,7 +1078,7 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 	bool a_continuing = true;
 	guard = 0;
 	while (a_continuing && guard++ < 50) {
-		T_CHECK(sched_next_data(&ss));
+		T_CHECK(mux_sched_next_data(&ss));
 		const bool was_a = (g_last_push_stream_id == stream_a.id);
 		const size_t n = sched_test_tally_push(
 			&bytes_a, stream_a.id, &bytes_b, stream_b.id, &bytes_c,
@@ -1091,7 +1100,7 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 
 	/* Drain everything and confirm no bytes were lost or duplicated. */
 	guard = 0;
-	while (guard++ < 50 && sched_next_data(&ss)) {
+	while (guard++ < 50 && mux_sched_next_data(&ss)) {
 		sched_test_tally_push(
 			&bytes_a, stream_a.id, &bytes_b, stream_b.id, &bytes_c,
 			stream_c.id);
@@ -1108,7 +1117,7 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 }
 
 /* The lifecycle-drain request is self-guarding: no-op on an empty queue or
- * occupied sendbuf; marks pending and arms EV_WRITE (via session_notify) only
+ * occupied sendbuf; marks pending and arms EV_WRITE (via mux_session_notify) only
  * when there is queued work and the sendbuf is clear. */
 T_DECLARE_CASE(test_sched_schedule_self_guards_on_queue_and_sendbuf)
 {
@@ -1121,28 +1130,28 @@ T_DECLARE_CASE(test_sched_schedule_self_guards_on_queue_and_sendbuf)
 
 	/* Empty lp queue: nothing to drain, must not mark pending. */
 	ss.sched.lp_pending = false;
-	sched_schedule(&ss);
+	mux_sched_schedule(&ss);
 	T_EXPECT(!ss.sched.lp_pending);
 	T_EXPECT_EQ(g_update_watcher_calls, 0);
 
 	/* Queued work but the sendbuf is occupied: defer (no-op). */
 	sched_lp_enqueue(&ss, &stream);
 	ss.wire.sendbuf.head = &staged;
-	sched_schedule(&ss);
+	mux_sched_schedule(&ss);
 	T_EXPECT(!ss.sched.lp_pending);
 	T_EXPECT_EQ(g_update_watcher_calls, 0);
 
 	/* Queued work and the sendbuf clear, but no live socket (fd == -1):
 	 * mark pending without arming the watcher. */
 	ss.wire.sendbuf.head = NULL;
-	sched_schedule(&ss);
+	mux_sched_schedule(&ss);
 	T_EXPECT(ss.sched.lp_pending);
 	T_EXPECT_EQ(g_update_watcher_calls, 0);
 
-	/* With a live socket the request arms EV_WRITE via session_notify. */
+	/* With a live socket the request arms EV_WRITE via mux_session_notify. */
 	ss.sched.lp_pending = false;
 	ss.w_socket.fd = 3; /* any value != -1; only tested for liveness here */
-	sched_schedule(&ss);
+	mux_sched_schedule(&ss);
 	T_EXPECT(ss.sched.lp_pending);
 	T_EXPECT(g_update_watcher_calls >= 1);
 
@@ -1167,7 +1176,7 @@ T_DECLARE_BENCH(bench_sched_enqueue_dequeue)
 	cleanup_session(&ss);
 }
 
-/* sched_wake before SESSION_ESTABLISHED routes through the single pre-split
+/* mux_sched_wake before SESSION_ESTABLISHED routes through the single pre-split
  * queue rather than the DRR/LP split. */
 T_DECLARE_CASE(test_sched_wake_before_established_uses_single_queue)
 {
@@ -1176,7 +1185,7 @@ T_DECLARE_CASE(test_sched_wake_before_established_uses_single_queue)
 	ss.state = SESSION_HANDSHAKE;
 	struct mux_stream stream = { .id = 5, .state = STREAM_ESTABLISHED };
 
-	sched_wake(&ss, &stream);
+	mux_sched_wake(&ss, &stream);
 	T_EXPECT(ss.sched.sched_head == &stream);
 	T_EXPECT(stream.sched_queue == SCHED_QUEUE_DRR);
 
@@ -1184,7 +1193,7 @@ T_DECLARE_CASE(test_sched_wake_before_established_uses_single_queue)
 	cleanup_session(&ss);
 }
 
-/* sched_delay shortens the deadline when an earlier request arrives for a
+/* mux_sched_delay shortens the deadline when an earlier request arrives for a
  * stream already in the delay list. */
 T_DECLARE_CASE(test_sched_delay_shortens_pending_deadline)
 {
@@ -1197,23 +1206,23 @@ T_DECLARE_CASE(test_sched_delay_shortens_pending_deadline)
 	};
 	ss.sched.delay_head = &stream;
 
-	sched_delay(&ss, &stream, 2); /* sooner than 5 */
+	mux_sched_delay(&ss, &stream, 2); /* sooner than 5 */
 	T_EXPECT_EQ(stream.delay_ticks, (uint_fast8_t)2);
-	sched_delay(&ss, &stream, 4); /* not sooner: unchanged */
+	mux_sched_delay(&ss, &stream, 4); /* not sooner: unchanged */
 	T_EXPECT_EQ(stream.delay_ticks, (uint_fast8_t)2);
 
 	ss.sched.delay_head = NULL;
 	cleanup_session(&ss);
 }
 
-/* sched_find_stream returns NULL when the stream table has not been created. */
+/* mux_sched_find_stream returns NULL when the stream table has not been created. */
 T_DECLARE_CASE(test_sched_find_stream_null_table)
 {
 	struct mux_session ss;
 	make_session(&ss);
 	struct hashtable *const saved = ss.sched.streams;
 	ss.sched.streams = NULL;
-	T_EXPECT(sched_find_stream(&ss, 1) == NULL);
+	T_EXPECT(mux_sched_find_stream(&ss, 1) == NULL);
 	ss.sched.streams = saved;
 	cleanup_session(&ss);
 }
@@ -1248,7 +1257,7 @@ T_DECLARE_CASE(test_sched_remove_stream_drain_and_absent)
 	sched_test_reset();
 
 	struct mux_stream stream = { .id = 5, .state = STREAM_ESTABLISHED };
-	T_CHECK(sched_add_stream(&ss, &stream));
+	T_CHECK(mux_sched_add_stream(&ss, &stream));
 	ss.draining = true;
 	ss.state = SESSION_ESTABLISHED;
 	sched_remove_stream(&ss, &stream);
@@ -1261,7 +1270,7 @@ T_DECLARE_CASE(test_sched_remove_stream_drain_and_absent)
 	cleanup_session(&ss);
 }
 
-/* sched_drain_lp frees a CLOSED stream parked on the low-priority queue. */
+/* mux_sched_drain_lp frees a CLOSED stream parked on the low-priority queue. */
 T_DECLARE_CASE(test_sched_drain_lp_frees_closed_stream)
 {
 	struct mux_session ss;
@@ -1276,7 +1285,7 @@ T_DECLARE_CASE(test_sched_drain_lp_frees_closed_stream)
 	ss.sched.lp_tail = s;
 	ss.state = SESSION_ESTABLISHED;
 
-	sched_drain_lp(&ss);
+	mux_sched_drain_lp(&ss);
 	T_EXPECT_EQ(g_stream_free_calls, 1);
 	T_EXPECT(ss.sched.lp_head == NULL);
 

@@ -180,7 +180,7 @@ struct mux_session {
 	/* Event watchers */
 	struct {
 		/* fd is closed exactly once (guarded by != -1, reset to -1
-		 * after) by session_suspend/session_cleanup; never close it
+		 * after) by mux_session_suspend/session_cleanup; never close it
 		 * directly elsewhere (e.g. tunnel.c's task_drop_transport). */
 		ev_io w_socket;
 		ev_timer w_timeout;
@@ -196,7 +196,7 @@ struct mux_session {
 	bool auto_stream_window : 1;
 	/* session_window configured as 0: track the TX BDP estimate automatically. */
 	bool auto_session_window : 1;
-	/* shut down once the last stream closes; set by session_drain(). */
+	/* shut down once the last stream closes; set by mux_session_drain(). */
 	bool draining : 1;
 
 	/* Unacked-frame cap (the send-stall gate); auto mode tracks the TX BDP
@@ -283,7 +283,7 @@ static inline void session_set_peer_stream_window(
 }
 
 /* Publish the estimator's rtt/bdp gauges to their mirrors; call after any
- * estimator update (estimator_calculate / estimator_init). */
+ * estimator update (mux_estimator_calculate / mux_estimator_init). */
 static inline void session_publish_estimate(struct mux_session *restrict ss)
 {
 	PUB_STORE(ss->_pub_rtt, ss->estimator.rtt);
@@ -293,10 +293,10 @@ static inline void session_publish_estimate(struct mux_session *restrict ss)
 
 /* True once the graceful-drain cascade has bulk-freed the session's streams.
  * Closing the last active stream of a draining session runs stream_mark_closed
- * -> sched_check_no_active_streams -> session_initiate_shutdown ->
- * sched_free_streams, which frees every struct mux_stream and nulls the
+ * -> mux_sched_check_no_active_streams -> mux_session_initiate_shutdown ->
+ * mux_sched_free_streams, which frees every struct mux_stream and nulls the
  * scheduler's stream table (the struct mux_session itself survives; the same
- * shutdown also runs wire_discard_buffers, resetting the recvbuf). Within a
+ * shutdown also runs mux_wire_discard_buffers, resetting the recvbuf). Within a
  * single synchronous callback that is the only path that frees a stream, so a
  * recv/flush caller that just invoked such a path must re-check this before
  * touching the stream again -- or consuming the recvbuf, which the cascade has
@@ -308,47 +308,47 @@ static inline bool session_streams_freed(const struct mux_session *restrict ss)
 
 /* Recompute and apply the EV_READ/EV_WRITE mask for the mux socket watcher.
  * Shared by session.c and the send/recv pipelines. */
-void session_update_watcher(struct mux_session *restrict ss);
+void mux_session_update_watcher(struct mux_session *restrict ss);
 
 /* conf.keepalive scaled by a random jitter factor; shared with recv.c so a
  * received PONG can re-arm the keepalive deadline. */
-double keepalive_interval(const struct mux_session *restrict ss);
+double mux_keepalive_interval(const struct mux_session *restrict ss);
 
 /* Allocate and initialize a new session; takes ownership of opts->fd. */
-struct mux_session *
-session_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts);
+struct mux_session *mux_session_new(
+	struct ev_loop *restrict loop, const struct mux_session_opts *opts);
 
 /* Tear down and free a session; caller must remove it from external lists first. */
-void session_close(struct mux_session *restrict ss);
+void mux_session_close(struct mux_session *restrict ss);
 
 /* Apply a new configuration snapshot; safe to call on a running session. */
-void session_set_config(
+void mux_session_set_config(
 	struct mux_session *restrict ss,
 	const struct mux_config *restrict conf);
 
 /* Begin I/O: accepted -> start handshake; client (fd=-1) -> no-op;
  * call mux_attach_fd() afterward to supply a connected fd. */
-void session_start(struct mux_session *restrict ss);
+void mux_session_start(struct mux_session *restrict ss);
 
 /* Accept a connected fd and transition to SESSION_CONNECT.
  * Valid from SESSION_INIT (initial connect), SESSION_SUSPENDED (resume),
  * or SESSION_CLOSED (reconnect after idle/timeout).  Takes fd ownership. */
-void session_attach_fd(struct mux_session *restrict ss, int fd);
+void mux_session_attach_fd(struct mux_session *restrict ss, int fd);
 
 /* Drop in-flight data, close all streams, and begin the transport close sequence. */
-void session_initiate_shutdown(struct mux_session *restrict ss);
+void mux_session_initiate_shutdown(struct mux_session *restrict ss);
 
 /* Drain: reject new inbound streams and begin graceful shutdown when the last
- * stream closes (or immediately if already idle); cleared by session_attach_fd()
+ * stream closes (or immediately if already idle); cleared by mux_session_attach_fd()
  * on a genuinely fresh (re)connect, but preserved across a resume from
  * SUSPENDED so a transport blip can't silently cancel a pending drain. */
-void session_drain(struct mux_session *restrict ss);
+void mux_session_drain(struct mux_session *restrict ss);
 
 /* Open a new locally-initiated stream; returns NULL when the session rejects it. */
-struct mux_stream *session_open_stream(struct mux_session *restrict ss);
+struct mux_stream *mux_session_open_stream(struct mux_session *restrict ss);
 
 /* Request a deferred flush: mark egress pending and arm EV_WRITE. */
-void session_notify(struct mux_session *restrict ss);
+void mux_session_notify(struct mux_session *restrict ss);
 
 /** Prebuilt table_opts for the per-session stream table, keyed by stream ID.
  * Uses a 16-bit integer hash suitable for the stream-ID key space. */
@@ -358,7 +358,7 @@ extern const struct table_opts mux_stream_table_opts;
  * frame dispatch and receive-side window updates live in recv.h. */
 
 /* Log a parsed frame header at VERYVERBOSE level. */
-void session_log_frame_header(
+void mux_session_log_frame_header(
 	const struct mux_session *restrict ss, const char *restrict what,
 	const unsigned char *restrict raw,
 	const struct mux_header *restrict hdr);
@@ -370,22 +370,26 @@ void session_log_frame_header(
 /* Transition the session state machine to newstate, emitting the
  * corresponding lifecycle events and (re)arming timers.  Exposed so the send
  * pipeline can drive SESSION_CLOSING on a peer-closed transport. */
-void session_set_state(struct mux_session *ss, enum session_state newstate);
+void mux_session_set_state(struct mux_session *ss, enum session_state newstate);
 
 /* Close the transport and transition to SESSION_CLOSED.
- * For established sessions that qualify for resumption, use session_suspend()
- * instead; session_reset() discards all stream and unacked state. */
-void session_reset(struct mux_session *ss);
+ * For established sessions that qualify for resumption, use mux_session_suspend()
+ * instead; mux_session_reset() discards all stream and unacked state. */
+void mux_session_reset(struct mux_session *ss);
 
-/* Call session_reset then fire MUX_EVENT_CLOSED if the session closed.
+/* Call mux_session_reset then fire MUX_EVENT_CLOSED if the session closed.
  * expired is set when the event is triggered by a resume-timeout. */
-void session_notify_closed(struct mux_session *restrict ss, bool expired);
+void mux_session_notify_closed(struct mux_session *restrict ss, bool expired);
 
 /* Suspend the transport on error, preserving stream and unacked state for resume. */
-void session_suspend(struct mux_session *restrict ss);
+void mux_session_suspend(struct mux_session *restrict ss);
+
+/* On a transport loss, mux_session_suspend() a resumable session (preserving its
+ * streams) or mux_session_reset() it otherwise. */
+void mux_session_suspend_or_reset(struct mux_session *restrict ss);
 
 /* Complete session establishment after a successful hello exchange. */
-void session_handshake_done(struct mux_session *ss);
+void mux_session_handshake_done(struct mux_session *ss);
 
 /* Resume handoff primitives (mux_transport_detach / mux_resume_attach /
  * mux_transport_discard) are declared in mux.h: the owner orchestrates any
