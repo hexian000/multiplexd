@@ -2182,7 +2182,7 @@ T_DECLARE_CASE(test_server_config_reload)
 	char *const saved_type = fx.conf_a->type;
 	fx.conf_a->type = NULL;
 	size_t dump_len;
-	char *const dump_json = conf_dump(fx.conf_a, &dump_len);
+	char *const dump_json = conf_dump(fx.conf_a, &dump_len, NULL);
 	fx.conf_a->type = saved_type;
 	bool dump_ok = false;
 	if (dump_json != NULL) {
