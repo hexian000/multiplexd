@@ -115,11 +115,14 @@ bool csv_unescape(char *restrict field)
 char *
 csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep)
 {
-	if (!buf || !*buf) {
+	if (!buf) {
 		*field = NULL;
 		*sep = '\0';
 		return NULL;
 	}
+	/* A non-NULL but empty buffer is one empty field, not end of data: it is
+	 * how a trailing field separator's following field (RFC 4180) and a lone
+	 * empty record are represented. End of data is signalled by a NULL buf. */
 
 	const bool quoted = (*buf == '"');
 	bool unquoted_has_quote = false;
@@ -163,16 +166,29 @@ csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep)
 	 * is a record separator; ',' is a field separator; '\0' is end of data. */
 	char *next;
 	if (*p == '\0') {
+		/* the field ran to the end of the buffer with no separator: it is
+		 * the last field of the data */
 		*sep = '\0';
 		next = NULL;
-	} else if (*p == '\r' && p[1] == '\n') {
-		*sep = '\n';
-		*p = '\0';
-		next = p + 2;
-	} else {
-		*sep = *p;
+	} else if (*p == ',') {
+		/* field separator: a following field always exists per RFC 4180,
+		 * even when the comma is the last byte -- then the trailing field
+		 * is empty and next points at the buffer's terminator, which the
+		 * follow-up call scans as one empty field */
+		*sep = ',';
 		*p = '\0';
 		next = p + 1;
+	} else if (*p == '\r' && p[1] == '\n') {
+		/* record separator (CRLF): the record is complete, so an occurrence
+		 * at the very end of the buffer yields no trailing empty field */
+		*sep = '\n';
+		*p = '\0';
+		next = (p[2] == '\0') ? NULL : p + 2;
+	} else {
+		/* record separator (lone LF or CR): same end-of-buffer rule */
+		*sep = *p;
+		*p = '\0';
+		next = (p[1] == '\0') ? NULL : p + 1;
 	}
 
 	/* A quoted field was already unescaped and validated above; an unquoted

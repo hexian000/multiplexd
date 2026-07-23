@@ -40,10 +40,15 @@ bool csv_unescape(char *restrict field);
  * @details Parses the next field from the CSV data buffer, modifying the buffer in-place
  *          by null-terminating the field and unescaping it. No memory allocations are performed.
  *          The function handles both quoted and unquoted fields according to RFC 4180.
- * @param[inout] buf Pointer to the CSV data buffer. The buffer is modified in-place.
- * @param[out] field Pointer to store the parsed field string, or NULL if the end
- *             of data was reached with no field, more data is needed for a
- *             complete quoted field, or the data was invalid.
+ * @param[inout] buf Pointer to the CSV data buffer, or NULL to signal end of
+ *             data. The buffer is modified in-place. A non-NULL but empty
+ *             buffer is treated as a single empty field, not end of data:
+ *             a field separator at the very end of the buffer yields a
+ *             trailing empty field (RFC 4180: `a,` parses to `a`, ``), and
+ *             a record separator at the end does not.
+ * @param[out] field Pointer to store the parsed field string, or NULL when buf
+ *             is NULL (end of data), more data is needed for a complete quoted
+ *             field, or the data was invalid.
  * @param[out] sep The delimiter that terminated the field, so the caller can tell
  *             a field separator from a record separator: ',' for a field
  *             separator, '\n' for a record separator (a lone LF or a CRLF, which
@@ -52,12 +57,13 @@ bool csv_unescape(char *restrict field);
  *             field) or no field was produced.
  * @return The start of the next field for continued parsing (not equal to buf).
  *         Equal to the input buf when more data is needed for a complete quoted
- *         field (with `field` NULL). NULL when no next field is returned: for a
- *         valid *last* field that ran to the end of the buffer (with `field`
- *         set), or when no field is produced at all -- exhausted input or
- *         invalid data (both with `field` NULL). The last-field case is told
- *         apart by whether `field` was set, so a NULL return alone must not be
- *         treated as an error.
+ *         field (with `field` NULL). NULL when no next field is returned: for
+ *         the last field of the data (with `field` set) -- whether it ran to
+ *         the end of the buffer or ended at a record separator that was the
+ *         buffer's final byte(s) -- or when no field is produced at all --
+ *         exhausted input or invalid data (both with `field` NULL). The
+ *         last-field case is told apart by whether `field` was set, so a NULL
+ *         return alone must not be treated as an error.
  */
 char *
 csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep);
