@@ -9,8 +9,9 @@
 #if WITH_TLS
 
 #include "shim/tls.h"
+#include "shim/util.h"
 
-#include "codec/csv.h"
+#include "meta/minmax.h"
 #include "utils/slog.h"
 
 #include <mbedtls/build_info.h>
@@ -360,6 +361,25 @@ static int *parse_ciphersuites(const char *restrict list)
 	return ids;
 }
 
+struct alpn_collect {
+	char **arr;
+	size_t k;
+};
+
+/* alpn_field_fn: append a heap copy of each ALPN name to the array. */
+static bool alpn_collect_field(void *ctx, const char *name, const size_t len)
+{
+	(void)len;
+	struct alpn_collect *const a = ctx;
+	char *const s = strdup(name);
+	if (s == NULL) {
+		LOGOOM();
+		return false;
+	}
+	a->arr[a->k++] = s;
+	return true;
+}
+
 /* Parse a comma-separated ALPN list into the NULL-terminated heap array
  * mbedtls_ssl_conf_alpn_protocols expects; uses RFC 4180 CSV so a name may
  * contain a comma when quoted.  On success sets *out (NULL for a legitimately
@@ -373,7 +393,7 @@ static bool parse_alpn(const char *restrict list, char ***restrict out)
 	if (list == NULL || list[0] == '\0') {
 		return true;
 	}
-	/* csv_scanfield parses the buffer in-place, so work on a mutable copy. */
+	/* alpn_tokenize parses the buffer in-place, so work on a mutable copy. */
 	size_t cap = 0;
 	char *const work = dup_for_tokens(list, ',', &cap);
 	if (work == NULL) {
@@ -386,60 +406,24 @@ static bool parse_alpn(const char *restrict list, char ***restrict out)
 		free(work);
 		return false;
 	}
-	size_t k = 0;
-	for (char *p = work; p != NULL;) {
-		char *field = NULL;
-		/* ALPN is a flat comma-separated list, so the delimiter kind
-		 * (field vs record separator) is irrelevant; discard it. */
-		char sep;
-		/* csv_scanfield unescapes a quoted field in place and, for an
-		 * empty quoted field ("") it later rejects, zeroes the field's
-		 * first byte before returning its parse-error NULL.  Record
-		 * whether any input remained before the call so the guard below
-		 * cannot misread that clobbered byte as a clean end. */
-		const bool had_input = (*p != '\0');
-		char *const next = csv_scanfield(p, &field, &sep);
-		if (next == p) {
-			/* unterminated quoted field with no more data */
-			LOGW_F("malformed ALPN list '%s'", list);
-			goto fail;
-		}
-		if (field == NULL && next == NULL && had_input) {
-			/* csv_scanfield returns NULL for both a clean end and a
-			 * hard parse error (stray bytes after a closing quote,
-			 * or an invalid unquoted field); input remaining before
-			 * the call yet no field produced is the latter -- fail
-			 * closed instead of silently truncating the list. */
-			LOGW_F("malformed ALPN list '%s'", list);
-			goto fail;
-		}
-		if (field != NULL && field[0] != '\0') {
-			char *const s = strdup(field);
-			if (s == NULL) {
-				LOGOOM();
-				goto fail;
-			}
-			arr[k++] = s;
-		}
-		p = next;
-	}
+	struct alpn_collect a = { .arr = arr, .k = 0 };
+	const bool ok = alpn_tokenize(work, list, alpn_collect_field, &a);
 	free(work);
-	if (k == 0) {
+	if (!ok) {
+		for (size_t i = 0; i < a.k; i++) {
+			free(arr[i]);
+		}
+		free(arr);
+		return false;
+	}
+	if (a.k == 0) {
 		/* All fields empty (e.g. ",,"): no protocols, but not an error. */
 		free(arr);
 		return true;
 	}
-	arr[k] = NULL;
+	arr[a.k] = NULL;
 	*out = arr;
 	return true;
-
-fail:
-	for (size_t i = 0; i < k; i++) {
-		free(arr[i]);
-	}
-	free(arr);
-	free(work);
-	return false;
 }
 
 static void tls_ctx_impl_init(struct tls_ctx_impl *restrict c)
@@ -806,6 +790,53 @@ static int tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 	return MBEDTLS_ERR_NET_RECV_FAILED;
 }
 
+/* Append datalen bytes to a FIFO staging buffer (buf, off, len, cap),
+ * compacting any drained prefix and growing as needed. Returns false on
+ * allocation failure (buffer left intact), true otherwise. */
+static bool buf_fifo_push(
+	unsigned char **restrict buf, size_t *restrict off,
+	size_t *restrict len, size_t *restrict cap,
+	const unsigned char *restrict data, const size_t datalen)
+{
+	if (*off > 0) {
+		memmove(*buf, *buf + *off, *len);
+		*off = 0;
+	}
+	const size_t needed = *len + datalen;
+	if (needed > *cap) {
+		const size_t newcap = needed < 4096u ? 4096u : needed * 2u;
+		unsigned char *const p = realloc(*buf, newcap);
+		if (p == NULL) {
+			return false;
+		}
+		*buf = p;
+		*cap = newcap;
+	}
+	memcpy(*buf + *len, data, datalen);
+	*len += datalen;
+	return true;
+}
+
+/* Remove up to datalen bytes from the front of a FIFO staging buffer into
+ * data, advancing the read offset and resetting it once the buffer drains.
+ * Returns the number of bytes copied (0 if the buffer is empty). */
+static size_t buf_fifo_pop(
+	unsigned char *restrict buf, size_t *restrict off, size_t *restrict len,
+	unsigned char *restrict data, const size_t datalen)
+{
+	const size_t n = MIN(*len, datalen);
+	if (n == 0) {
+		return 0;
+	}
+	memcpy(data, buf + *off, n);
+	*off += n;
+	*len -= n;
+	if (*len == 0) {
+		*off = 0;
+	}
+	return n;
+}
+
 /* Memory-transport BIO callbacks for buffered connections; ctx is the owning
  * tls_conn_impl, whose in/out staging buffers carry the ciphertext. */
 
@@ -813,23 +844,11 @@ static int tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 static int tls_buf_send(void *ctx, const unsigned char *data, size_t len)
 {
 	struct tls_conn_impl *const conn = ctx;
-	/* Compact the drained prefix before measuring slack. */
-	if (conn->out_off > 0) {
-		memmove(conn->out, conn->out + conn->out_off, conn->out_len);
-		conn->out_off = 0;
+	if (!buf_fifo_push(
+		    &conn->out, &conn->out_off, &conn->out_len, &conn->out_cap,
+		    data, len)) {
+		return MBEDTLS_ERR_SSL_ALLOC_FAILED;
 	}
-	const size_t needed = conn->out_len + len;
-	if (needed > conn->out_cap) {
-		const size_t newcap = needed < 4096u ? 4096u : needed * 2u;
-		unsigned char *const p = realloc(conn->out, newcap);
-		if (p == NULL) {
-			return MBEDTLS_ERR_SSL_ALLOC_FAILED;
-		}
-		conn->out = p;
-		conn->out_cap = newcap;
-	}
-	memcpy(conn->out + conn->out_len, data, len);
-	conn->out_len += len;
 	return (int)len;
 }
 
@@ -840,13 +859,8 @@ static int tls_buf_recv(void *ctx, unsigned char *data, size_t len)
 	if (conn->in_len == 0) {
 		return MBEDTLS_ERR_SSL_WANT_READ;
 	}
-	const size_t n = conn->in_len < len ? conn->in_len : len;
-	memcpy(data, conn->in + conn->in_off, n);
-	conn->in_off += n;
-	conn->in_len -= n;
-	if (conn->in_len == 0) {
-		conn->in_off = 0;
-	}
+	const size_t n =
+		buf_fifo_pop(conn->in, &conn->in_off, &conn->in_len, data, len);
 	return (int)n;
 }
 
@@ -945,24 +959,8 @@ bool tls_input(
 		return true;
 	}
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
-	/* Compact the consumed prefix before measuring slack. */
-	if (c->in_off > 0) {
-		memmove(c->in, c->in + c->in_off, c->in_len);
-		c->in_off = 0;
-	}
-	const size_t needed = c->in_len + len;
-	if (needed > c->in_cap) {
-		const size_t newcap = needed < 4096u ? 4096u : needed * 2u;
-		unsigned char *const p = realloc(c->in, newcap);
-		if (p == NULL) {
-			return false;
-		}
-		c->in = p;
-		c->in_cap = newcap;
-	}
-	memcpy(c->in + c->in_len, data, len);
-	c->in_len += len;
-	return true;
+	return buf_fifo_push(
+		&c->in, &c->in_off, &c->in_len, &c->in_cap, data, len);
 }
 
 size_t tls_output(
@@ -973,17 +971,7 @@ size_t tls_output(
 		return 0;
 	}
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
-	const size_t n = c->out_len < len ? c->out_len : len;
-	if (n == 0) {
-		return 0;
-	}
-	memcpy(buf, c->out + c->out_off, n);
-	c->out_off += n;
-	c->out_len -= n;
-	if (c->out_len == 0) {
-		c->out_off = 0;
-	}
-	return n;
+	return buf_fifo_pop(c->out, &c->out_off, &c->out_len, buf, len);
 }
 
 static enum tls_error map_io_error(const int ret, const char *op)

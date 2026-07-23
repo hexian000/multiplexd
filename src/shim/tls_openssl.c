@@ -9,8 +9,9 @@
 #if WITH_TLS
 
 #include "shim/tls.h"
+#include "shim/util.h"
 
-#include "codec/csv.h"
+#include "meta/minmax.h"
 #include "utils/slog.h"
 
 #include <openssl/bio.h>
@@ -141,6 +142,27 @@ static void tls_fire_recv(struct tls_conn_impl *restrict c)
 	}
 }
 
+struct alpn_pack {
+	unsigned char *buf;
+	size_t w;
+	const char *list;
+};
+
+/* alpn_field_fn: pack each ALPN name into the wire buffer as a 1-byte length
+ * prefix followed by the name. */
+static bool alpn_pack_field(void *ctx, const char *name, const size_t len)
+{
+	struct alpn_pack *const a = ctx;
+	if (len > 255) {
+		LOGW_F("ALPN entry too long in '%s'", a->list);
+		return false;
+	}
+	a->buf[a->w++] = (unsigned char)len;
+	memcpy(a->buf + a->w, name, len);
+	a->w += len;
+	return true;
+}
+
 /* Build an ALPN wire buffer (each protocol prefixed by a 1-byte length)
  * from a comma-separated list (RFC 4180 CSV; quoted commas allowed);
  * sets *out (heap, caller frees) and *outlen; *out=NULL for empty list. */
@@ -154,7 +176,7 @@ static bool alpn_wire_from_list(
 		return true;
 	}
 	const size_t list_len = strlen(list);
-	/* csv_scanfield parses the buffer in-place, so work on a mutable copy. */
+	/* alpn_tokenize parses the buffer in-place, so work on a mutable copy. */
 	char *const work = malloc(list_len + 1);
 	if (work == NULL) {
 		LOGOOM();
@@ -170,60 +192,19 @@ static bool alpn_wire_from_list(
 		free(work);
 		return false;
 	}
-	size_t w = 0;
-	for (char *p = work; p != NULL;) {
-		char *field = NULL;
-		/* ALPN is a flat comma-separated list, so the delimiter kind
-		 * (field vs record separator) is irrelevant; discard it. */
-		char sep;
-		/* csv_scanfield unescapes a quoted field in place and, for an
-		 * empty quoted field ("") it later rejects, zeroes the field's
-		 * first byte before returning its parse-error NULL.  Record
-		 * whether any input remained before the call so the guard below
-		 * cannot misread that clobbered byte as a clean end. */
-		const bool had_input = (*p != '\0');
-		char *const next = csv_scanfield(p, &field, &sep);
-		if (next == p) {
-			/* unterminated quoted field with no more data */
-			LOGW_F("malformed ALPN list '%s'", list);
-			free(buf);
-			free(work);
-			return false;
-		}
-		if (field == NULL && next == NULL && had_input) {
-			/* csv_scanfield returns NULL for both a clean end and a
-			 * hard parse error (stray bytes after a closing quote,
-			 * or an invalid unquoted field); input remaining before
-			 * the call yet no field produced is the latter -- fail
-			 * closed instead of silently truncating the list. */
-			LOGW_F("malformed ALPN list '%s'", list);
-			free(buf);
-			free(work);
-			return false;
-		}
-		if (field != NULL) {
-			const size_t tok = strlen(field);
-			if (tok > 255) {
-				LOGW_F("ALPN entry too long in '%s'", list);
-				free(buf);
-				free(work);
-				return false;
-			}
-			if (tok > 0) {
-				buf[w++] = (unsigned char)tok;
-				memcpy(buf + w, field, tok);
-				w += tok;
-			}
-		}
-		p = next;
-	}
+	struct alpn_pack a = { .buf = buf, .w = 0, .list = list };
+	const bool ok = alpn_tokenize(work, list, alpn_pack_field, &a);
 	free(work);
-	if (w == 0) {
+	if (!ok) {
+		free(buf);
+		return false;
+	}
+	if (a.w == 0) {
 		free(buf);
 		return true;
 	}
 	*out = buf;
-	*outlen = w;
+	*outlen = a.w;
 	return true;
 }
 
@@ -563,32 +544,6 @@ static bool load_cert_from_bio(SSL_CTX *ctx, BIO *bio)
 	return (count > 0);
 }
 
-static bool load_cert_from_memory(SSL_CTX *ctx, const char *pem_data)
-{
-	ERR_clear_error();
-	BIO *bio = BIO_new_mem_buf(pem_data, -1);
-	if (bio == NULL) {
-		LOG_SSLERROR(ERROR, "BIO_new_mem_buf");
-		return false;
-	}
-	const bool ok = load_cert_from_bio(ctx, bio);
-	BIO_free(bio);
-	return ok;
-}
-
-static bool load_cert_from_file(SSL_CTX *ctx, const char *filename)
-{
-	ERR_clear_error();
-	BIO *bio = BIO_new_file(filename, "r");
-	if (bio == NULL) {
-		LOG_SSLERROR(ERROR, "BIO_new_file");
-		return false;
-	}
-	const bool ok = load_cert_from_bio(ctx, bio);
-	BIO_free(bio);
-	return ok;
-}
-
 /* Refuses to prompt: with no callback, PEM_read_bio_PrivateKey falls back to
  * OpenSSL's default UI, which blocks reading a passphrase from the
  * controlling terminal -- fatal for a single-threaded event loop, whether at
@@ -618,32 +573,6 @@ static bool load_key_from_bio(SSL_CTX *ctx, BIO *bio)
 		return false;
 	}
 	return true;
-}
-
-static bool load_key_from_memory(SSL_CTX *ctx, const char *pem_data)
-{
-	ERR_clear_error();
-	BIO *bio = BIO_new_mem_buf(pem_data, -1);
-	if (bio == NULL) {
-		LOG_SSLERROR(ERROR, "BIO_new_mem_buf");
-		return false;
-	}
-	const bool ok = load_key_from_bio(ctx, bio);
-	BIO_free(bio);
-	return ok;
-}
-
-static bool load_key_from_file(SSL_CTX *ctx, const char *filename)
-{
-	ERR_clear_error();
-	BIO *bio = BIO_new_file(filename, "r");
-	if (bio == NULL) {
-		LOG_SSLERROR(ERROR, "BIO_new_file");
-		return false;
-	}
-	const bool ok = load_key_from_bio(ctx, bio);
-	BIO_free(bio);
-	return ok;
 }
 
 static bool load_authcert_from_bio(SSL_CTX *ctx, BIO *bio)
@@ -679,6 +608,20 @@ static bool load_authcert_from_bio(SSL_CTX *ctx, BIO *bio)
 	return true;
 }
 
+/* Open a PEM source as a BIO: a "@<path>" reference becomes a file BIO,
+ * anything else a read-only memory BIO over the string. Clears the error queue
+ * first and logs on failure. The caller has already rejected an empty ref. */
+static BIO *tls_pem_bio(const char *ref)
+{
+	ERR_clear_error();
+	BIO *const bio = (ref[0] == '@') ? BIO_new_file(ref + 1, "r") :
+					   BIO_new_mem_buf(ref, -1);
+	if (bio == NULL) {
+		LOG_SSLERROR(ERROR, "BIO_new");
+	}
+	return bio;
+}
+
 bool tls_load_cert(
 	struct tls_context *restrict ctx, const char *restrict cert_data)
 {
@@ -692,18 +635,16 @@ bool tls_load_cert(
 	 * first so re-loading onto an existing context doesn't accumulate
 	 * stale intermediates from a previous load. */
 	(void)SSL_CTX_clear_chain_certs(ssl_ctx);
-	bool ok;
-	switch (*cert_data) {
-	case '\0':
+	if (cert_data[0] == '\0') {
 		LOGE("certificate data is empty");
 		return false;
-	case '@':
-		ok = load_cert_from_file(ssl_ctx, cert_data + 1);
-		break;
-	default:
-		ok = load_cert_from_memory(ssl_ctx, cert_data);
-		break;
 	}
+	BIO *const bio = tls_pem_bio(cert_data);
+	if (bio == NULL) {
+		return false;
+	}
+	const bool ok = load_cert_from_bio(ssl_ctx, bio);
+	BIO_free(bio);
 	return ok;
 }
 
@@ -715,18 +656,16 @@ bool tls_load_key(
 		return false;
 	}
 	SSL_CTX *const ssl_ctx = tls_ssl_ctx(ctx);
-	bool ok;
-	switch (*key_data) {
-	case '\0':
+	if (key_data[0] == '\0') {
 		LOGE("key data is empty");
 		return false;
-	case '@':
-		ok = load_key_from_file(ssl_ctx, key_data + 1);
-		break;
-	default:
-		ok = load_key_from_memory(ssl_ctx, key_data);
-		break;
 	}
+	BIO *const bio = tls_pem_bio(key_data);
+	if (bio == NULL) {
+		return false;
+	}
+	const bool ok = load_key_from_bio(ssl_ctx, bio);
+	BIO_free(bio);
 	return ok;
 }
 
@@ -747,21 +686,12 @@ bool tls_load_authcerts(
 			LOGE_F("authcerts[%zu] is NULL", i);
 			return false;
 		}
-		ERR_clear_error();
-		BIO *bio;
-		switch (*authcerts[i]) {
-		case '\0':
+		if (authcerts[i][0] == '\0') {
 			LOGE_F("authcerts[%zu] is empty", i);
 			return false;
-		case '@':
-			bio = BIO_new_file(authcerts[i] + 1, "r");
-			break;
-		default:
-			bio = BIO_new_mem_buf(authcerts[i], -1);
-			break;
 		}
+		BIO *const bio = tls_pem_bio(authcerts[i]);
 		if (bio == NULL) {
-			LOG_SSLERROR(ERROR, "BIO_new");
 			return false;
 		}
 		const bool ok = load_authcert_from_bio(ssl_ctx, bio);
@@ -1104,8 +1034,8 @@ bool tls_input(
 	const unsigned char *p = data;
 	size_t remain = len;
 	while (remain > 0) {
-		const int n = BIO_write(
-			rbio, p, (int)(remain > INT_MAX ? INT_MAX : remain));
+		const int n =
+			BIO_write(rbio, p, (int)MIN(remain, (size_t)INT_MAX));
 		if (n <= 0) {
 			return false;
 		}
@@ -1123,8 +1053,7 @@ size_t tls_output(
 		return 0;
 	}
 	BIO *const wbio = SSL_get_wbio(tls_conn_ssl(conn));
-	const int ret =
-		BIO_read(wbio, buf, (int)(len > INT_MAX ? INT_MAX : len));
+	const int ret = BIO_read(wbio, buf, (int)MIN(len, (size_t)INT_MAX));
 	return ret > 0 ? (size_t)ret : 0;
 }
 
@@ -1177,7 +1106,7 @@ enum tls_error tls_send(
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
 	SSL *const ssl = c->ssl;
 	ERR_clear_error();
-	const int req_len = (int)(*len > (size_t)INT_MAX ? INT_MAX : *len);
+	const int req_len = (int)MIN(*len, (size_t)INT_MAX);
 	const int ret = SSL_write(ssl, buf, req_len);
 	const int saved_errno = errno;
 	/* Resolve the result code before firing notifiers (see tls_handshake):
@@ -1222,7 +1151,7 @@ enum tls_error tls_recv(
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
 	SSL *const ssl = c->ssl;
 	ERR_clear_error();
-	const int req_len = (int)(*len > (size_t)INT_MAX ? INT_MAX : *len);
+	const int req_len = (int)MIN(*len, (size_t)INT_MAX);
 	const int ret = SSL_read(ssl, buf, req_len);
 	const int saved_errno = errno;
 	/* Resolve the result code before firing notifiers (see tls_handshake):

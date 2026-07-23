@@ -72,9 +72,10 @@ add_shim_test(tls_test
 # tls_cert_digest_allowed / tls_verify_cert_strength_cb).  No black-box
 # handshake can present a sub-floor certificate to them -- OpenSSL refuses to
 # load one -- so they are unreachable through the public API.  Must NOT link
-# `shim`, which would duplicate tls_openssl.c's public symbols.
+# `shim`, which would duplicate tls_openssl.c's public symbols; util.c is
+# compiled in directly for the shared alpn_tokenize() helper tls_openssl.c uses.
 if(WITH_OPENSSL)
-    add_executable(tls_openssl_test tls_openssl_test.c)
+    add_executable(tls_openssl_test tls_openssl_test.c util.c)
     target_include_directories(tls_openssl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_include_directories(tls_openssl_test PRIVATE ${CMAKE_SOURCE_DIR}/contrib/csnippets)
     target_include_directories(tls_openssl_test SYSTEM PRIVATE ${TLS_INCLUDES})

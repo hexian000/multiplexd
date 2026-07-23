@@ -3,7 +3,8 @@
 
 /**
  * @file util.h
- * @brief CSPRNG bytes, address resolution, and event/thread assertion macros.
+ * @brief CSPRNG bytes, address resolution, ALPN list tokenizing, and
+ * event/thread assertion macros.
  */
 
 #ifndef SHIM_UTIL_H
@@ -78,5 +79,33 @@ bool resolve_addr(
 bool resolve_bindaddr(
 	union sockaddr_max *restrict addr, const char *restrict addrstr,
 	enum sa_resolve_type type);
+
+/* True if a socket send/recv errno is transient backpressure to retry
+ * (EAGAIN/EWOULDBLOCK, or a full kernel buffer: ENOBUFS/ENOMEM) rather than a
+ * permanent failure. */
+bool sock_would_block(int err);
+
+#if WITH_TLS
+/**
+ * @brief Callback for alpn_tokenize(): invoked once per non-empty ALPN
+ * protocol name (NUL-terminated, len == strlen(name)).
+ * @return false to abort tokenizing (the callback logs its own reason).
+ */
+typedef bool (*alpn_field_fn)(void *ctx, const char *name, size_t len);
+
+/**
+ * @brief Tokenize a comma-separated ALPN list (RFC 4180 CSV; a quoted name may
+ * contain a comma), invoking fn for each non-empty validated name.
+ * @param[inout] work Mutable copy of the list; unescaped in place.
+ * @param list Original list string, used only for log messages.
+ * @param fn Per-name callback; a false return aborts and propagates.
+ * @param ctx Opaque context passed through to fn.
+ * @return false on a malformed list (logged here) or when fn returns false;
+ * true otherwise, including an empty or all-empty list.
+ */
+bool alpn_tokenize(
+	char *restrict work, const char *restrict list, alpn_field_fn fn,
+	void *ctx);
+#endif /* WITH_TLS */
 
 #endif /* SHIM_UTIL_H */
