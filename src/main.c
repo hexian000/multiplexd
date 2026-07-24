@@ -301,7 +301,7 @@ static struct io_stream *log_filewriter(FILE *const f)
 static void init(void)
 {
 	(void)setlocale(LC_ALL, "");
-	slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stdout));
+	slog_setoutput(SLOG_OUTPUT_STREAM, log_filewriter(stdout));
 	{
 		static char prefix[] = __FILE__;
 		char *s = strrchr(prefix, PATH_SEPARATOR);
@@ -347,9 +347,9 @@ int main(int argc, char **argv)
 	 * simply keeps this stderr sink. Restore the stdout boot sink afterwards --
 	 * stdout is deliberate for the daemon body (the config's `log` defaults
 	 * there). */
-	slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stderr));
+	slog_setoutput(SLOG_OUTPUT_STREAM, log_filewriter(stderr));
 	parse_args(argc, argv);
-	slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stdout));
+	slog_setoutput(SLOG_OUTPUT_STREAM, log_filewriter(stdout));
 	/* --dump-config writes machine-readable JSON to stdout, so move the log
 	 * off that stream for the rest of the run: config parsing legitimately
 	 * warns (e.g. plaintext mode), and any such line would otherwise land on
@@ -357,7 +357,7 @@ int main(int argc, char **argv)
 	 * before the config's own `log` setting is applied, so nothing points the
 	 * sink back at stdout. */
 	if (args.dump_config) {
-		slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stderr));
+		slog_setoutput(SLOG_OUTPUT_STREAM, log_filewriter(stderr));
 	}
 	/* Boot/parse-phase log level: the CLI --loglevel if given, else NOTICE.
 	 * Once a config is loaded, the effective runtime level is applied below. */
@@ -434,11 +434,12 @@ int main(int argc, char **argv)
 	slog_setlevel(args.loglevel >= 0 ? args.loglevel : conf->loglevel);
 	if (conf->log != NULL) {
 		if (strcmp(conf->log, "stdout") == 0) {
-			slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stdout));
+			slog_setoutput(SLOG_OUTPUT_STREAM, log_filewriter(stdout));
 		} else if (strcmp(conf->log, "stderr") == 0) {
-			slog_setoutput(SLOG_OUTPUT_WRITER, log_filewriter(stderr));
+			slog_setoutput(SLOG_OUTPUT_STREAM, log_filewriter(stderr));
 		} else if (strcmp(conf->log, "terminal") == 0) {
-			slog_setoutput(SLOG_OUTPUT_TERMINAL, stderr);
+			slog_setoutput(
+				SLOG_OUTPUT_TERMINAL, log_filewriter(stderr));
 		} else if (strcmp(conf->log, "syslog") == 0) {
 			slog_setoutput(SLOG_OUTPUT_SYSLOG, PROJECT_NAME, NULL);
 		} else if (strcmp(conf->log, "discard") == 0) {

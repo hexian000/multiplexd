@@ -6843,7 +6843,7 @@ static const struct testing_suite suite[] = {
 int main(int argc, char **argv)
 {
 	T_CHECK(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
-	slog_setoutput(SLOG_OUTPUT_WRITER, io_filewriter(stderr));
+	slog_setoutput(SLOG_OUTPUT_STREAM, io_filewriter(stderr));
 	slog_setlevel(LOG_LEVEL_DEBUG);
 
 	return testing_main(argc, argv, suite);
