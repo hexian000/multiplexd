@@ -381,9 +381,10 @@ struct mux_frame_ring *mux_frame_ring_grow(struct mux_frame_ring *r)
 const struct table_opts mux_stream_table_opts = { 0 };
 
 /* frame.c data global the header-inline framing helpers reference; stubbed here
- * since this white-box TU does not link frame.c. */
+ * since this white-box TU does not link frame.c. Keep max_frame_payload in step
+ * with the real definition in frame.c (16384 - MUX_FRAME_HEADER_SIZE). */
 const struct mux_config mux_conf_default = {
-	.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE,
+	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 	.readahead = 128 * 1024,
 };
 
