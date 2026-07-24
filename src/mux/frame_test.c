@@ -148,7 +148,7 @@ T_DECLARE_CASE(test_header_roundtrip_with_flag_combinations)
 		},
 	};
 
-	for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(headers); i++) {
 		unsigned char buf[MUX_FRAME_HEADER_SIZE];
 		struct mux_header roundtrip = { 0 };
 
@@ -194,7 +194,7 @@ T_DECLARE_CASE(test_frame_list_drain_clears_head_tail_and_count)
 	struct mux_frame_list list = { 0 };
 	struct mux_frame *frames[3] = { 0 };
 
-	for (size_t i = 0; i < sizeof(frames) / sizeof(frames[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(frames); i++) {
 		frames[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(frames[i] != NULL);
 		mux_frame_list_push(&list, frames[i]);
@@ -245,8 +245,9 @@ T_DECLARE_CASE(test_frame_list_push_front_empty_and_nonempty)
 }
 
 /* remove_after must cover interior removal (head/tail untouched), tail removal
- * (list->tail reset to prev), and head removal of the sole element (prev NULL,
- * list empties and tail resets to NULL). */
+ * (list->tail reset to prev), head removal of the sole element (prev NULL, list
+ * empties and tail resets to NULL), and head removal from a multi-node list
+ * (prev NULL, head advances to the survivor while tail stays). */
 T_DECLARE_CASE(test_frame_list_remove_after_head_interior_tail)
 {
 	struct mux_frame_list list = { 0 };
@@ -273,12 +274,28 @@ T_DECLARE_CASE(test_frame_list_remove_after_head_interior_tail)
 	T_EXPECT(list.tail == &a);
 	T_EXPECT(a.next == NULL);
 
-	/* Head removal of the sole remaining element (prev=NULL): list empties
-	 * and tail resets to NULL. */
+	/* Head removal of the sole remaining element (prev=NULL, frame==tail):
+	 * list empties and tail resets to NULL. */
 	T_EXPECT(mux_frame_list_remove_after(&list, NULL) == &a);
 	T_EXPECT_EQ(list.count, (size_t)0);
 	T_EXPECT(list.head == NULL);
 	T_EXPECT(list.tail == NULL);
+
+	/* Head removal from a multi-node list (prev=NULL, frame!=tail): head must
+	 * advance to the second node while tail and the survivors stay linked.
+	 * send.c reaches this via remove_after(list, NULL) when the first physical
+	 * buffer node's sub-frames all belong to a reset stream and later nodes
+	 * follow. */
+	mux_frame_list_push(&list, &a);
+	mux_frame_list_push(&list, &b);
+	mux_frame_list_push(&list, &c);
+	/* list rebuilt: a -> b -> c, head=a tail=c count=3 */
+	T_EXPECT(mux_frame_list_remove_after(&list, NULL) == &a);
+	T_EXPECT_EQ(list.count, (size_t)2);
+	T_EXPECT(list.head == &b);
+	T_EXPECT(list.tail == &c);
+	T_EXPECT(b.next == &c);
+	T_EXPECT(a.next == NULL);
 }
 
 T_DECLARE_CASE(test_frame_ring_null_and_empty_ops)
@@ -384,11 +401,10 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
 	struct mux_frame_ring *r = NULL;
+	struct mux_frame *frames[MUX_FRAME_RING_MIN + 14];
 	const int cap0 = MUX_FRAME_RING_MIN; /* 16 */
+	const int total = (int)ARRAY_SIZE(frames); /* 30 */
 	const int pop_n = 10;
-	const int push2 = 14; /* total after pop: 6 + 14 = 20 > 16 → grow */
-	const int total = cap0 + push2;
-	struct mux_frame *frames[MUX_FRAME_RING_MIN + 14]; /* 30 */
 
 	/* Round 1: fill to capacity. */
 	for (int i = 0; i < cap0; i++) {
@@ -402,7 +418,8 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 	}
 	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)(cap0 - pop_n));
 
-	/* Round 2: push 14 more; slots wrap around, then grow fires. */
+	/* Round 2: push total - cap0 == 14 more; after the pop, 6 + 14 = 20 > 16,
+	 * so slots wrap around and then the grow fires. */
 	for (int i = cap0; i < total; i++) {
 		frames[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(frames[i] != NULL);
@@ -438,11 +455,13 @@ T_DECLARE_CASE(test_frame_ring_peek_and_free_wrapped)
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
 	struct mux_frame_ring *r = NULL;
+	struct mux_frame *pushed[MUX_FRAME_RING_MIN + 4];
 	const int cap0 = MUX_FRAME_RING_MIN; /* 16 */
+	const int total = (int)ARRAY_SIZE(pushed); /* 20 */
 	const int pop_n = 10;
-	const int push2 = 4; /* 6 + 4 = 10 <= 16: stays wrapped, no grow */
+	const int push2 =
+		total - cap0; /* 4: 6 + 4 = 10 <= 16, stays wrapped, no grow */
 	const int held = cap0 - pop_n + push2; /* 10 */
-	struct mux_frame *pushed[MUX_FRAME_RING_MIN + 4]; /* 20 */
 
 	for (int i = 0; i < cap0; i++) {
 		pushed[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
@@ -454,8 +473,8 @@ T_DECLARE_CASE(test_frame_ring_peek_and_free_wrapped)
 		T_EXPECT(mux_frame_ring_pop(r) == pushed[i]);
 		mux_frame_put(&pool, pushed[i]);
 	}
-	/* Push 4 more; they wrap into slots 0..3 while head stays at 10. */
-	for (int i = cap0; i < cap0 + push2; i++) {
+	/* Push push2 == 4 more; they wrap into slots 0..3 while head stays at 10. */
+	for (int i = cap0; i < total; i++) {
 		pushed[i] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 		T_CHECK(pushed[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, pushed[i]));
@@ -491,7 +510,7 @@ T_DECLARE_CASE(test_frame_ring_grow_zeroes_new_slots)
 		T_CHECK(f != NULL);
 		T_CHECK(mux_frame_ring_push(&r, f));
 	}
-	/* One more push fills the ring to capacity and forces the 2x grow. */
+	/* The ring is at capacity; one more push forces the 2x grow. */
 	struct mux_frame *const last =
 		mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(last != NULL);
@@ -714,7 +733,7 @@ T_DECLARE_CASE(test_mux_status_str_names_known_codes_distinctly)
 		MUX_STATUS_FLOW_CONTROL_ERROR, MUX_STATUS_INTERNAL_ERROR,
 		MUX_STATUS_REFUSED_STREAM,     MUX_STATUS_CANCEL,
 	};
-	for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(known); i++) {
 		const char *const name =
 			mux_status_str((uint_fast16_t)known[i]);
 		T_CHECK(name != NULL);

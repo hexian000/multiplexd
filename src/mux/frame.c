@@ -26,9 +26,7 @@
  * session state machine. */
 static uint_fast32_t stream_id_hash(const void *key, const uint_fast32_t seed)
 {
-	/* FNV-1a over the 16-bit stream id via csnippets' shared implementation
-	 * (the same fnv1a_32 its own ptr_hash uses), rather than hand-rolling the
-	 * rounds and the FNV prime a second time. */
+	/* FNV-1a over the 16-bit stream id. */
 	const uint16_t id = (uint16_t)(uintptr_t)key;
 	return fnv1a_32(&id, sizeof(id), seed);
 }
@@ -135,7 +133,7 @@ void mux_bytebuf_shrink(struct bytebuf **restrict rbp, const size_t target_cap)
 
 struct mux_frame_ring *mux_frame_ring_new(const size_t cap)
 {
-	ASSERT(cap == 0 || (cap & (cap - 1)) == 0);
+	ASSERT(cap != 0 && (cap & (cap - 1)) == 0);
 	struct mux_frame_ring *const r =
 		malloc(sizeof(*r) + cap * sizeof(struct mux_frame *));
 	if (r == NULL) {

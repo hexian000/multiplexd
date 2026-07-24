@@ -31,7 +31,8 @@
    |              Payload (0-65535 octets)
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+- ......
 
-   The 2-byte Extra field interpretation depends on frame flags:
+   The 2-byte Extra field interpretation depends on the frame flags and, for
+   stream 0, on the Stream ID being 0.  On a non-zero stream:
    - RST clear, ACK set (FIN may also be set, e.g. ACK|FIN): credit grant
      in units of MUX_WINDOW_UNIT bytes (receiver adds extra *
      MUX_WINDOW_UNIT to cumulative send credit).
@@ -40,10 +41,16 @@
      without ACK).
    - RST set: status code (enum mux_status); all other flags are ignored.
    - SYN clear, ACK clear, FIN set, RST clear: Extra MUST be zero.
+   On stream 0 (session control):
+   - ACK set: a session-level frame count -- the number of non-stream-0
+     frames the sender has processed since its last session ACK (spec
+     §2.4.3), consumed verbatim with no MUX_WINDOW_UNIT scaling.
+   - Flags == 0: a keepalive subtype (MUX_CTRL_*, spec §2.4.4).
    The initial per-stream credit is MUX_DEFAULT_SEND_WINDOW bytes
    (implicit, not transmitted).  In-memory send_window stores cumulative
-   granted credit in bytes; unit conversion is applied only in
-   mux_write_header / mux_read_header.
+   granted credit in bytes; the byte<->unit conversion happens at the send
+   and receive call sites (recv.c, sched.c, send.c), not in the serialization
+   helpers below, which move the raw Extra field verbatim.
 */
 
 /* MUX_FRAME_HEADER_SIZE, MUX_MAX_FRAME_SIZE, and MUX_MAX_PAYLOAD_SIZE are defined
@@ -61,7 +68,8 @@
 #define MUX_COALESCING_INTERVAL 0.04
 
 /* Number of ticks before a Nagle-held small frame is flushed.
- * Matches the recommended 40 ms reference limit from spec §7.1. */
+ * 1 tick × MUX_COALESCING_INTERVAL = 40 ms, the local latency budget for
+ * coalescing; spec §7.1 leaves the deferral timer implementation-defined. */
 #define MUX_NAGLE_TICKS 1
 
 /* Number of ticks before a sub-threshold delayed-ACK grant is flushed.
@@ -396,9 +404,9 @@ struct mux_frame_ring {
 	struct mux_frame *entries[];
 };
 
-/* Allocate a new ring with initial @p cap (may be 0; grows on first push).
- * @p cap MUST be a power of two (0 counts): index arithmetic elsewhere masks
- * with (capacity - 1) rather than using modulo. Returns NULL on OOM. */
+/* Allocate a new ring with initial @p cap. @p cap MUST be a non-zero power of
+ * two: index arithmetic elsewhere masks with (capacity - 1) rather than using
+ * modulo. Returns NULL on OOM. */
 struct mux_frame_ring *mux_frame_ring_new(size_t cap);
 
 /* Grow capacity 2× (or to MUX_FRAME_RING_MIN on first alloc) and linearise.
@@ -416,7 +424,7 @@ mux_frame_ring_size(const struct mux_frame_ring *restrict r)
 static inline struct mux_frame *
 mux_frame_ring_peek(const struct mux_frame_ring *restrict r, size_t offset)
 {
-	if (r == NULL || r->count == 0 || r->capacity == 0) {
+	if (r == NULL || r->count == 0) {
 		return NULL;
 	}
 	ASSERT(offset < r->count);
