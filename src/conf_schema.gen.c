@@ -60,6 +60,8 @@ json_lookup_conf_identity(const char *str, size_t len)
 		return len == 6 && memcmp(str, "listen", 6) == 0 ? 1 : -1;
 	case 'm':
 		return len == 11 && memcmp(str, "mux_connect", 11) == 0 ? 2 : -1;
+	case 'v':
+		return len == 6 && memcmp(str, "verify", 6) == 0 ? 3 : -1;
 	default: return -1;
 	}
 }
@@ -173,13 +175,14 @@ json_lookup_conf_tcp(const char *str, size_t len)
 typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_tls_entry_;
 static const json_lookup_conf_tls_entry_ json_lookup_conf_tls_keys_[] = {
 	{"key", 3, 5},
-	{"sni", 3, 6},
+	{"psk", 3, 6},
+	{"sni", 3, 7},
 	{"alpn", 4, 0},
 	{"cert", 4, 2},
 	{"authcerts", 9, 1},
 	{"ciphersuites", 12, 3},
 	{"kernel_offload", 14, 4},
-	{"socket_offload", 14, 7},
+	{"socket_offload", 14, 8},
 };
 static int json_lookup_conf_tls_cmp_(const void *key_, const void *entry_)
 {
@@ -194,7 +197,7 @@ json_lookup_conf_tls(const char *str, size_t len)
 {
 	const json_lookup_conf_tls_entry_ key_ = {str, len, 0};
 	const json_lookup_conf_tls_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_tls_keys_, 8, sizeof(*json_lookup_conf_tls_keys_), json_lookup_conf_tls_cmp_);
+		bsearch(&key_, json_lookup_conf_tls_keys_, 9, sizeof(*json_lookup_conf_tls_keys_), json_lookup_conf_tls_cmp_);
 	return e_ ? e_->idx : -1;
 }
 
@@ -219,12 +222,13 @@ static const struct json_field json_conf_tls_fields[] = {
 	{ .name = "ciphersuites", .name_len = 12, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, ciphersuites) },
 	{ .name = "kernel_offload", .name_len = 14, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tls, kernel_offload) },
 	{ .name = "key", .name_len = 3, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, key) },
+	{ .name = "psk", .name_len = 3, .kind = JSON_K_DYNAMIC, .req_bit = -1, .offset = offsetof(struct json_conf_tls, psk_json) },
 	{ .name = "sni", .name_len = 3, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_tls, sni) },
 	{ .name = "socket_offload", .name_len = 14, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_tls, socket_offload) },
 };
 static const struct json_schema json_conf_tls_schema = {
 	.fields = json_conf_tls_fields,
-	.n_fields = 8,
+	.n_fields = 9,
 	.obj_size = sizeof(struct json_conf_tls),
 	.lookup = json_lookup_conf_tls,
 	.defaults = &json_conf_tls_defaults,
@@ -397,22 +401,27 @@ static const struct json_schema json_conf_mux_schema = {
 
 static const struct json_constraint json_conf_identity_claim_c = {
 	.flags = JSON_C_MAX_LEN,
-	.str = { .max_len = 255 },
+	.str = { .max_len = 63 },
 };
 static const struct json_constraint json_conf_identity_mux_connect_c = {
 	.flags = JSON_C_MAX_LEN,
 	.str = { .max_len = 261 },
 };
+static const struct json_conf_identity json_conf_identity_defaults = {
+	.verify = false,
+};
 static const struct json_field json_conf_identity_fields[] = {
 	{ .name = "claim", .name_len = 5, .kind = JSON_K_STRING, .req_bit = -1, .offset = offsetof(struct json_conf_identity, claim), .constraint = &json_conf_identity_claim_c },
 	{ .name = "listen", .name_len = 6, .kind = JSON_K_DYNAMIC, .req_bit = -1, .offset = offsetof(struct json_conf_identity, listen_json) },
 	{ .name = "mux_connect", .name_len = 11, .kind = JSON_K_STRING, .is_array = true, .req_bit = -1, .offset = offsetof(struct json_conf_identity, mux_connect), .count_offset = offsetof(struct json_conf_identity, mux_connect_count), .constraint = &json_conf_identity_mux_connect_c },
+	{ .name = "verify", .name_len = 6, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_identity, verify) },
 };
 static const struct json_schema json_conf_identity_schema = {
 	.fields = json_conf_identity_fields,
-	.n_fields = 3,
+	.n_fields = 4,
 	.obj_size = sizeof(struct json_conf_identity),
 	.lookup = json_lookup_conf_identity,
+	.defaults = &json_conf_identity_defaults,
 	.present_field = -1,
 };
 
@@ -448,6 +457,9 @@ static const struct json_constraint json_conf_mux_listen_c = {
 	.str = { .max_len = 261 },
 };
 static const struct json_conf json_conf_defaults = {
+	.identity = {
+		.verify = false,
+	},
 	.loglevel = UINTMAX_C(4),
 	.mux = {
 		.connect_timeout = 15u,

@@ -22,6 +22,8 @@ struct json_conf_tls {
 	struct json_string *authcerts;
 	size_t authcerts_count;
 
+	struct json_string psk_json;
+
 	bool kernel_offload;
 	bool socket_offload;
 };
@@ -79,6 +81,8 @@ struct json_conf_identity {
 	size_t mux_connect_count;
 
 	struct json_string listen_json;
+
+	bool verify;
 };
 
 struct json_conf {
@@ -126,7 +130,8 @@ bool json_unmarshal_conf(
  * @param bufsz Size of @p buf in bytes.
  * @param obj Object to encode.
  * @param indent Per-level indent for pretty output, or NULL for compact.
- * @return Byte length excluding NUL (truncates if >= @p bufsz), or -1 on error.
+ * @return Byte length excluding NUL (truncates if >= @p bufsz), or -1 on
+ * error -- including a length this int return cannot represent.
  */
 int json_marshal_conf(
 	char *buf, size_t bufsz, const struct json_conf *obj, const char *indent);

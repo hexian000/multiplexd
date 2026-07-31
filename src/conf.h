@@ -30,6 +30,16 @@ struct conf_socket_opts {
 	int backlog;
 };
 
+/* One tls.psk entry: a peer identity and the key shared with it.  Kept
+ * hex-encoded so server_cleanse_tls_config()'s strlen-based erase stays valid
+ * -- a decoded key can contain NULs and would be under-erased. */
+struct psk_entry {
+	char *id;
+	size_t id_len;
+	/* Lowercase hex, or "@path" until conf_inline_pem() resolves it. */
+	char *hex;
+};
+
 /* Per-peer listen entry inside the identity block. */
 struct identity_peer {
 	/* Peer-side identity used as routing key. */
@@ -50,6 +60,11 @@ struct conf_identity {
 	size_t peers_count;
 	/* Allocated capacity of peers[] (>= peers_count); grown geometrically. */
 	size_t peers_cap;
+	/* Require a peer's claimed identity to be named by the certificate it
+	 * presented.  Deliberately not inside #if WITH_TLS: the generated schema
+	 * always carries the key, and conf_check reports it as a hard error in a
+	 * build or configuration without TLS rather than silently ignoring it. */
+	bool verify;
 };
 
 struct config {
@@ -83,10 +98,15 @@ struct config {
 	 * When false, the mux layer owns socket I/O and shuttles ciphertext through
 	 * the TLS library over in-memory buffers (memory transport). */
 	bool tls_socket_offload;
+	/* tls.psk entries in document order; the first is the one a dialing
+	 * node offers, since both TLS backends accept only one client PSK. */
+	struct psk_entry *tls_psk;
+	size_t tls_psk_count;
+	size_t tls_psk_cap;
 #endif /* WITH_TLS */
 
 	/* Mux session parameters; window fields in frame units. */
-	struct mux_config mux;
+	struct mux_session_config mux;
 	/* TCP socket options for the mux transport socket. */
 	struct conf_socket_opts mux_tcp;
 	/* TCP socket options for the local application socket. */
@@ -127,8 +147,10 @@ bool conf_inline_pem(struct config *conf);
 /* Free a configuration; NULL is allowed. */
 void conf_free(struct config *conf);
 
-/* Build a struct mux_config from the config: copies conf->mux and sets
- * reject_inbound from conf->connect. */
-struct mux_config conf_get_mux(const struct config *conf);
+/* Build a struct mux_session_config from the config: copies conf->mux, sets
+ * reject_inbound from conf->connect, and (with TLS) carries in
+ * tls_socket_offload, which lives at the top level of struct config rather
+ * than inside conf->mux. */
+struct mux_session_config conf_get_mux(const struct config *conf);
 
 #endif /* CONF_H */

@@ -8,6 +8,7 @@
 
 #include "mux/mux.h"
 
+#include "meta/arraysize.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
@@ -247,6 +248,25 @@ T_DECLARE_CASE(test_conf_identity_connect_count)
 	conf_free(conf);
 }
 
+T_DECLARE_CASE(test_conf_identity_verify_defaults_false)
+{
+	struct config *const conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\"}");
+	T_CHECK(conf != NULL);
+	T_EXPECT(!conf->identity.verify);
+	conf_free(conf);
+}
+
+/* identity.verify has nothing to check without a peer certificate, so it is a
+ * hard error rather than being silently ignored -- in a plaintext
+ * configuration under WITH_TLS, and in any configuration without it. */
+T_DECLARE_CASE(test_conf_identity_verify_requires_tls)
+{
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"mynode\",\"verify\":true}}");
+	T_EXPECT(conf == NULL);
+}
+
 T_DECLARE_CASE(test_conf_loglevel_parsed)
 {
 	struct config *const conf = parse_tmpconf(
@@ -286,8 +306,10 @@ T_DECLARE_CASE(test_conf_parsefile_requires_claim_for_identity_listen)
 	conf_free(accepted);
 }
 
-/* mux_listen and mux_connect together are legal: server mode wins and
- * mux_connect is ignored with a warning, not rejected. */
+/* mux_listen and mux_connect together are legal and both take effect: the
+ * daemon accepts inbound sessions and maintains the outbound one.  Asserting
+ * mux_connect survives conf_check is the point -- nothing clears it, and
+ * server_reload_mux_tunnel dials it regardless of mux_listen. */
 T_DECLARE_CASE(test_conf_parsefile_accepts_mux_listen_and_mux_connect)
 {
 	struct config *const conf = parse_tmpconf(
@@ -300,9 +322,9 @@ T_DECLARE_CASE(test_conf_parsefile_accepts_mux_listen_and_mux_connect)
 
 T_DECLARE_CASE(test_conf_parsefile_accepts_max_length_identity_claim)
 {
-	/* The hello extension's identity field is 256 bytes (255 octets +
-	 * NUL; handshake.h); the boundary value itself must still load. */
-	char claim[256];
+	/* MUX_MAX_CLAIM_LEN bounds what this implementation claims (mux.h); the
+	 * boundary value itself must still load. */
+	char claim[MUX_MAX_CLAIM_LEN + 1];
 	memset(claim, 'a', sizeof(claim) - 1);
 	claim[sizeof(claim) - 1] = '\0';
 	char json[512];
@@ -312,16 +334,17 @@ T_DECLARE_CASE(test_conf_parsefile_accepts_max_length_identity_claim)
 		claim);
 	struct config *const conf = parse_tmpconf(json);
 	T_CHECK(conf != NULL);
-	T_EXPECT_EQ((int)strlen(conf->identity.claim), 255);
+	T_EXPECT_EQ((int)strlen(conf->identity.claim), (int)MUX_MAX_CLAIM_LEN);
 	conf_free(conf);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_claim)
 {
-	/* One octet past the 255-octet wire limit must be rejected at
-	 * load/reload time instead of being silently dropped later, deep in
-	 * the handshake. */
-	char claim[257];
+	/* One octet past MUX_MAX_CLAIM_LEN must be rejected at load/reload time
+	 * instead of being silently dropped later, deep in the handshake --
+	 * where an escape-heavy claim outgrows the frame and the hello could
+	 * never be built, reconnecting forever. */
+	char claim[MUX_MAX_CLAIM_LEN + 2];
 	memset(claim, 'a', sizeof(claim) - 1);
 	claim[sizeof(claim) - 1] = '\0';
 	char json[512];
@@ -654,6 +677,27 @@ T_DECLARE_CASE(test_conf_parsefile_max_startups_rejects_non_strict_digits)
 	}
 }
 
+/* parse_startups_field stores into int startup_limit_* fields, so it rejects
+ * anything above INT_MAX. The cases above cover format, non-strict digits, rate
+ * and ordering, but never a value past that bound -- the disjunct guarding the
+ * narrowing was unverified. The first two also drive strtoumax's ERANGE path
+ * (a value past UINTMAX_MAX), the third the plain v > INT_MAX comparison. */
+T_DECLARE_CASE(test_conf_parsefile_max_startups_rejects_overflow)
+{
+	static const char *const bad[] = {
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"99999999999999999999999999:1:2\"}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"1:99999999999999999999999999:2\"}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"max_startups\":\"9999999999:1:2\"}",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(bad); i++) {
+		struct config *const conf = parse_tmpconf(bad[i]);
+		T_EXPECT(conf == NULL);
+		if (conf != NULL) {
+			conf_free(conf);
+		}
+	}
+}
+
 T_DECLARE_CASE(test_conf_parsefile_invalid_max_startups_rate)
 {
 	const char *json =
@@ -949,6 +993,136 @@ T_DECLARE_CASE(test_conf_inline_pem_fails_for_missing_file)
 
 	T_EXPECT(!conf_inline_pem(conf));
 	conf_free(conf);
+}
+
+/* With TLS credentials present, identity.verify is accepted and survives a
+ * dump/parse round-trip, so GET /config and --dump-config report it. */
+/* A 32-octet key as hex; the value itself is irrelevant to parsing. */
+#define PSK_HEX                                                                \
+	"\"0101010101010101010101010101010101010101010101010101010101010101\""
+
+T_DECLARE_CASE(test_conf_psk_parsed_in_order)
+{
+	/* Document order decides which key a dialing node offers, so it must
+	 * survive parsing rather than being reordered or deduped away. */
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
+		"\"beta\":" PSK_HEX ",\"alpha\":" PSK_HEX "}}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->tls_psk_count, 2);
+	T_EXPECT_STREQ(conf->tls_psk[0].id, "beta");
+	T_EXPECT_STREQ(conf->tls_psk[1].id, "alpha");
+	conf_free(conf);
+}
+
+/* "" is a valid identity (spec 5.2.3.2 sets no lower bound, and identity.claim
+ * accepts it), so it must be a usable tls.psk key rather than being conflated
+ * with "no entry" -- the same trap 2d33aea fixed for certificates. */
+T_DECLARE_CASE(test_conf_psk_empty_identity)
+{
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
+		"\"\":" PSK_HEX "}}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->tls_psk_count, 1);
+	T_EXPECT_STREQ(conf->tls_psk[0].id, "");
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_psk_rejects_certificate_fields)
+{
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{"
+		"\"cert\":\"c\",\"key\":\"k\",\"authcerts\":[\"a\"],"
+		"\"psk\":{\"peer\":" PSK_HEX "}}}");
+	T_EXPECT(conf == NULL);
+}
+
+T_DECLARE_CASE(test_conf_psk_rejects_identity_verify)
+{
+	/* PSK binds identity through the binder, so the certificate-mode
+	 * switch has nothing to enable and is refused rather than ignored. */
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\","
+		"\"identity\":{\"claim\":\"me\",\"verify\":true},"
+		"\"tls\":{\"psk\":{\"peer\":" PSK_HEX "}}}");
+	T_EXPECT(conf == NULL);
+}
+
+T_DECLARE_CASE(test_conf_psk_rejects_duplicate_identity)
+{
+	struct config *const conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
+		"\"peer\":" PSK_HEX ",\"peer\":" PSK_HEX "}}}");
+	T_EXPECT(conf == NULL);
+}
+
+T_DECLARE_CASE(test_conf_psk_rejects_bad_key)
+{
+	/* Length and alphabet are checked in conf_inline_pem(), once any
+	 * "@path" is resolved, so drive that rather than conf_check(). */
+	struct config *const shortkey = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
+		"\"peer\":\"0101\"}}}");
+	T_CHECK(shortkey != NULL);
+	T_EXPECT(!conf_inline_pem(shortkey));
+	conf_free(shortkey);
+
+	/* Right length, wrong alphabet. */
+	struct config *const nothex = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
+		"\"peer\":\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"}}}");
+	T_CHECK(nothex != NULL);
+	T_EXPECT(!conf_inline_pem(nothex));
+	conf_free(nothex);
+}
+
+T_DECLARE_CASE(test_conf_psk_dump_roundtrip)
+{
+	struct config *const orig = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
+		"\"peer\":" PSK_HEX "}}}");
+	T_CHECK(orig != NULL);
+
+	char tmpl[] = "/tmp/conf_psk_dump_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(write_conf_file(orig, tmpl));
+
+	struct config *const reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT_EQ((int)reparsed->tls_psk_count, 1);
+	T_EXPECT_STREQ(reparsed->tls_psk[0].id, "peer");
+
+	conf_free(reparsed);
+	conf_free(orig);
+}
+
+T_DECLARE_CASE(test_conf_identity_verify_with_tls_roundtrip)
+{
+	struct config *const orig = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\","
+		"\"identity\":{\"claim\":\"mynode\",\"verify\":true},"
+		"\"tls\":{\"cert\":\"c\",\"key\":\"k\",\"authcerts\":[\"a\"]}}");
+	T_CHECK(orig != NULL);
+	T_EXPECT(orig->identity.verify);
+
+	char tmpl[] = "/tmp/conf_id_verify_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(write_conf_file(orig, tmpl));
+
+	struct config *const reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT(reparsed->identity.verify);
+
+	conf_free(reparsed);
+	conf_free(orig);
 }
 #endif /* WITH_TLS */
 
@@ -1354,6 +1528,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_parsefile_rejects_embedded_nul_in_mux_connect_field),
 	T_CASE(test_conf_parsefile_invalid_max_startups_format),
 	T_CASE(test_conf_parsefile_max_startups_rejects_non_strict_digits),
+	T_CASE(test_conf_parsefile_max_startups_rejects_overflow),
 	T_CASE(test_conf_parsefile_invalid_max_startups_rate),
 	T_CASE(test_conf_parsefile_invalid_max_startups_range),
 	T_CASE(test_conf_parsefile_clamps_timeout_fields),
@@ -1374,6 +1549,14 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_inline_pem_replaces_at_path),
 	T_CASE(test_conf_inline_pem_concatenates_authcerts_bundle),
 	T_CASE(test_conf_inline_pem_fails_for_missing_file),
+	T_CASE(test_conf_identity_verify_with_tls_roundtrip),
+	T_CASE(test_conf_psk_parsed_in_order),
+	T_CASE(test_conf_psk_empty_identity),
+	T_CASE(test_conf_psk_rejects_certificate_fields),
+	T_CASE(test_conf_psk_rejects_identity_verify),
+	T_CASE(test_conf_psk_rejects_duplicate_identity),
+	T_CASE(test_conf_psk_rejects_bad_key),
+	T_CASE(test_conf_psk_dump_roundtrip),
 #endif /* WITH_TLS */
 	T_CASE(test_conf_parsefile_ignores_comment_keys),
 	T_CASE(test_conf_parsefile_unknown_root_key),
@@ -1386,6 +1569,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_parsefile_both_windows_positive),
 	T_CASE(test_conf_parsefile_max_startups_valid),
 	T_CASE(test_conf_dump_identity_fields),
+	T_CASE(test_conf_identity_verify_defaults_false),
+	T_CASE(test_conf_identity_verify_requires_tls),
 	T_CASE(test_conf_dump_identity_listen_roundtrip),
 	T_CASE(test_conf_dump_identity_listen_exact_grow_boundary),
 	T_CASE(test_conf_parsefile_rejects_oversized_file),

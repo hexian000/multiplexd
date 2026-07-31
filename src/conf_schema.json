@@ -93,6 +93,14 @@
                     "description": "Comma-separated ALPN protocol list advertised (client) or selected (server) in the TLS handshake. Empty (the default) omits the ALPN extension entirely.",
                     "type": "string"
                 },
+                "psk": {
+                    "description": "External pre-shared keys, keyed by peer identity. Values are lowercase hex (at least 32 octets) or '@path' to a file holding the same. Mutually exclusive with cert/key/authcerts: a PSK handshake sends no certificate in either direction. Generate with --genpsk; a hand-written key is unsafe, because the identity label published on the wire is derived from it. When dialing, the first entry is the one offered.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "description": "Lowercase hex key, or '@path'. A map value, so it bypasses generated per-field checks; length and format are enforced by conf_check in conf.c instead.",
+                        "type": "string"
+                    }
+                },
                 "authcerts": {
                     "description": "Allowed peer certificates. Each entry is '@/path/to/cert.pem' or an inline PEM string.",
                     "type": "array",
@@ -317,7 +325,12 @@
                 "claim": {
                     "description": "This node's identity string, presented to peers during handshake. Required when routing by identity.",
                     "type": "string",
-                    "maxLength": 255
+                    "maxLength": 63
+                },
+                "verify": {
+                    "description": "Require a peer's claimed identity to appear as a URI subjectAltName ('multiplexd:<identity>', percent-encoded) in the certificate it presented. A peer that claims no identity is unaffected and stays unidentified. Requires TLS; applies to newly accepted sessions and to future handshakes on existing ones.",
+                    "type": "boolean",
+                    "default": false
                 },
                 "mux_connect": {
                     "description": "Mux endpoints to dial; one persistent outbound session is maintained per entry.",
