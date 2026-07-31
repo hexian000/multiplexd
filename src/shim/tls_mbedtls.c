@@ -400,7 +400,7 @@ static bool parse_alpn(const char *restrict list, char ***restrict out)
 		LOGOOM();
 		return false;
 	}
-	char **const arr = calloc(cap, sizeof(*arr));
+	char **const arr = (char **)calloc(cap, sizeof(*arr));
 	if (arr == NULL) {
 		LOGOOM();
 		free(work);
@@ -413,12 +413,12 @@ static bool parse_alpn(const char *restrict list, char ***restrict out)
 		for (size_t i = 0; i < a.k; i++) {
 			free(arr[i]);
 		}
-		free(arr);
+		free((void *)arr);
 		return false;
 	}
 	if (a.k == 0) {
 		/* All fields empty (e.g. ",,"): no protocols, but not an error. */
-		free(arr);
+		free((void *)arr);
 		return true;
 	}
 	arr[a.k] = NULL;
@@ -460,7 +460,7 @@ static void tls_ctx_impl_free(struct tls_ctx_impl *restrict c)
 		for (char **p = c->alpn; *p != NULL; p++) {
 			free(*p);
 		}
-		free(c->alpn);
+		free((void *)c->alpn);
 	}
 #ifdef MBEDTLS_LEGACY_RNG
 	mbedtls_ctr_drbg_free(&c->ctr_drbg);
@@ -753,16 +753,18 @@ static int tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
 {
 	const int fd = (int)(intptr_t)ctx;
 	ssize_t n;
+	int err;
 	do {
 		n = send(fd, buf, len, MSG_NOSIGNAL);
-	} while (n < 0 && errno == EINTR);
+		err = errno;
+	} while (n < 0 && err == EINTR);
 	if (n >= 0) {
 		return (int)n;
 	}
-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
+	if (err == EAGAIN || err == EWOULDBLOCK) {
 		return MBEDTLS_ERR_SSL_WANT_WRITE;
 	}
-	if (errno == ECONNRESET || errno == EPIPE) {
+	if (err == ECONNRESET || err == EPIPE) {
 		return MBEDTLS_ERR_NET_CONN_RESET;
 	}
 	return MBEDTLS_ERR_NET_SEND_FAILED;
@@ -772,19 +774,21 @@ static int tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 {
 	const int fd = (int)(intptr_t)ctx;
 	ssize_t n;
+	int err;
 	do {
 		n = recv(fd, buf, len, 0);
-	} while (n < 0 && errno == EINTR);
+		err = errno;
+	} while (n < 0 && err == EINTR);
 	if (n > 0) {
 		return (int)n;
 	}
 	if (n == 0) {
 		return 0;
 	}
-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
+	if (err == EAGAIN || err == EWOULDBLOCK) {
 		return MBEDTLS_ERR_SSL_WANT_READ;
 	}
-	if (errno == ECONNRESET) {
+	if (err == ECONNRESET) {
 		return MBEDTLS_ERR_NET_CONN_RESET;
 	}
 	return MBEDTLS_ERR_NET_RECV_FAILED;
