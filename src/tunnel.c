@@ -753,11 +753,10 @@ static int tunnel_thread(void *arg)
 #endif /* WITH_THREADS */
 
 /* Enqueue a task on this tunnel's own loop/thread, reporting whether it was
- * accepted. The queue is unbounded (dispatcher_invoke falls back to malloc
- * once its inline pool is exhausted), so false means allocation failed, not
- * that a peer is slow to drain it; callers own the task's heap payload, if any,
- * and must free it and report the failure rather than leak or assert. Runs
- * inline without threads. */
+ * accepted. The queue is bounded (a fixed-capacity ring), so dispatcher_invoke
+ * returns false when it is full — i.e. the tunnel thread is slow to drain it;
+ * callers own the task's heap payload, if any, and must free it and report the
+ * failure rather than leak or assert. Runs inline without threads. */
 static bool tunnel_post(struct tunnel *restrict t, struct task task)
 {
 #if WITH_THREADS
