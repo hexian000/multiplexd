@@ -4,6 +4,7 @@
 
 #include "codec/json.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,7 +161,6 @@ bool json_unmarshal_proto(
 		}
 		case JSON_PROTO_RESUME_SEQ: {
 			if (!json_parse_uint(val_, val_len_, &obj->resume_seq)) { goto fail_; }
-			if (obj->resume_seq > 4294967295u) { goto fail_; }
 			break;
 		}
 		case JSON_PROTO_SESSION_ID: {
@@ -196,31 +196,36 @@ fail_:
 /** @name Marshal
  *  @{ */
 
-static int json_emit_ch_(char *buf, size_t bufsz, int n_, char c)
+static int json_checked_int_(size_t n_)
 {
-	if (buf != NULL && (size_t)n_ < bufsz) { buf[n_] = c; }
+	if (n_ > (size_t)INT_MAX) { return -1; }
+	return (int)n_;
+}
+static size_t json_emit_ch_(char *buf, size_t bufsz, size_t n_, char c)
+{
+	if (buf != NULL && n_ < bufsz) { buf[n_] = c; }
 	return n_ + 1;
 }
-static int json_emit_raw_(
-	char *buf, size_t bufsz, int n_, const char *s, size_t len)
+static size_t json_emit_raw_(
+	char *buf, size_t bufsz, size_t n_, const char *s, size_t len)
 {
-	if (buf != NULL && (size_t)n_ < bufsz) {
-		const size_t cap_ = bufsz - (size_t)n_;
+	if (buf != NULL && n_ < bufsz) {
+		const size_t cap_ = bufsz - n_;
 		memcpy(buf + n_, s, len < cap_ ? len : cap_);
 	}
-	return n_ + (int)len;
+	return n_ + len;
 }
-static int json_emit_str_(
-	char *buf, size_t bufsz, int n_, const char *s, size_t len)
+static size_t json_emit_str_(
+	char *buf, size_t bufsz, size_t n_, const char *s, size_t len)
 {
-	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL;
+	char *dst_ = (buf != NULL && n_ < bufsz) ? buf + n_ : NULL;
 	const int r_ =
-		json_marshal_string(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, s, len);
-	if (r_ < 0) { return -1; }
-	return n_ + r_;
+		json_marshal_string(dst_, dst_ != NULL ? bufsz - n_ : 0, s, len);
+	if (r_ < 0) { return SIZE_MAX; }
+	return n_ + (size_t)r_;
 }
-static int json_emit_indent_(
-	char *buf, size_t bufsz, int n_, const char *indent,
+static size_t json_emit_indent_(
+	char *buf, size_t bufsz, size_t n_, const char *indent,
 	size_t ind_len_, int d)
 {
 	if (indent == NULL) { return n_; }
@@ -233,20 +238,20 @@ static int json_emit_indent_(
 
 #define EMIT(c) do { n_ = json_emit_ch_(buf, bufsz, n_, (char)(c)); } while (0)
 #define EMITF(fmt, ...) do { \
-	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
-	r_ = snprintf(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, fmt, __VA_ARGS__); \
-	if (r_ < 0) { return -1; } \
-	n_ += r_; \
+	char *dst_ = (buf != NULL && n_ < bufsz) ? buf + n_ : NULL; \
+	r_ = snprintf(dst_, dst_ != NULL ? bufsz - n_ : 0, fmt, __VA_ARGS__); \
+	if (r_ < 0) { return SIZE_MAX; } \
+	n_ += (size_t)r_; \
 } while (0)
 #define EMIT_STR(s, len) do { \
 	n_ = json_emit_str_(buf, bufsz, n_, (s), (len)); \
-	if (n_ < 0) { return -1; } \
+	if (n_ == SIZE_MAX) { return SIZE_MAX; } \
 } while (0)
 #define EMIT_SUB(fn, arg, d) do { \
-	char *dst_ = (buf != NULL && (size_t)n_ < bufsz) ? buf + n_ : NULL; \
-	r_ = (fn)(dst_, dst_ != NULL ? bufsz - (size_t)n_ : 0, (arg), indent, (d)); \
-	if (r_ < 0) { return -1; } \
-	n_ += r_; \
+	char *dst_ = (buf != NULL && n_ < bufsz) ? buf + n_ : NULL; \
+	const size_t rsub_ = (fn)(dst_, dst_ != NULL ? bufsz - n_ : 0, (arg), indent, (d)); \
+	if (rsub_ == SIZE_MAX) { return SIZE_MAX; } \
+	n_ += rsub_; \
 } while (0)
 #define EMIT_LIT(s) do { \
 	static const char lit_[] = s; \
@@ -263,11 +268,11 @@ static int json_emit_indent_(
 	if (indent != NULL) { EMIT(' '); } \
 } while (0)
 
-static int json_marshal_proto_extensions_impl(
+static size_t json_marshal_proto_extensions_impl(
 	char *buf, size_t bufsz, const struct json_proto_extensions *obj,
 	const char *indent, int depth)
 {
-	int n_ = 0;
+	size_t n_ = 0;
 	int r_ = 0;
 	(void)r_;
 	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
@@ -275,7 +280,7 @@ static int json_marshal_proto_extensions_impl(
 	(void)depth;
 
 	EMIT('{');
-	const int n_start_ = n_;
+	const size_t n_start_ = n_;
 
 	if (obj->identity.str != NULL) {
 		EMIT_INDENT(depth + 1);
@@ -304,17 +309,17 @@ static int json_marshal_proto_extensions_impl(
 	}
 	EMIT('}');
 	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
+		buf[n_ < bufsz ? n_ : bufsz - 1] = '\0';
 	}
 
 	return n_;
 }
 
-static int json_marshal_proto_impl(
+static size_t json_marshal_proto_impl(
 	char *buf, size_t bufsz, const struct json_proto *obj,
 	const char *indent, int depth)
 {
-	int n_ = 0;
+	size_t n_ = 0;
 	int r_ = 0;
 	(void)r_;
 	const size_t ind_len_ = (indent != NULL) ? strlen(indent) : 0;
@@ -322,7 +327,7 @@ static int json_marshal_proto_impl(
 	(void)depth;
 
 	EMIT('{');
-	const int n_start_ = n_;
+	const size_t n_start_ = n_;
 
 	EMIT_INDENT(depth + 1);
 	EMIT('"');
@@ -354,15 +359,17 @@ static int json_marshal_proto_impl(
 		EMIT_STR(obj->session_id.str, obj->session_id.len);
 		EMIT(',');
 	}
+	EMIT_INDENT(depth + 1);
+	EMIT('"');
+	EMIT_LIT("type");
+	EMIT('"');
+	EMIT_COLON();
 	if (obj->type.str != NULL) {
-		EMIT_INDENT(depth + 1);
-		EMIT('"');
-		EMIT_LIT("type");
-		EMIT('"');
-		EMIT_COLON();
 		EMIT_STR(obj->type.str, obj->type.len);
-		EMIT(',');
+	} else {
+		EMIT_LIT("\"\"");
 	}
+	EMIT(',');
 
 	if (n_ > n_start_) {
 		n_--;
@@ -370,7 +377,7 @@ static int json_marshal_proto_impl(
 	}
 	EMIT('}');
 	if (buf != NULL && bufsz > 0) {
-		buf[(size_t)n_ < bufsz ? (size_t)n_ : bufsz - 1] = '\0';
+		buf[n_ < bufsz ? n_ : bufsz - 1] = '\0';
 	}
 
 	return n_;
@@ -380,7 +387,8 @@ int json_marshal_proto(
 	char *buf, size_t bufsz, const struct json_proto *obj,
 	const char *indent)
 {
-	return json_marshal_proto_impl(buf, bufsz, obj, indent, 0);
+	return json_checked_int_(
+		json_marshal_proto_impl(buf, bufsz, obj, indent, 0));
 }
 
 

@@ -55,7 +55,8 @@ bool json_unmarshal_proto(
  * @param bufsz Size of @p buf in bytes.
  * @param obj Object to encode.
  * @param indent Per-level indent for pretty output, or NULL for compact.
- * @return Byte length excluding NUL (truncates if >= @p bufsz), or -1 on error.
+ * @return Byte length excluding NUL (truncates if >= @p bufsz), or -1 on
+ * error -- including a length this int return cannot represent.
  */
 int json_marshal_proto(
 	char *buf, size_t bufsz, const struct json_proto *obj, const char *indent);
