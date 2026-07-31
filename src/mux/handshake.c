@@ -6,20 +6,19 @@
  * @brief Internal mux hello and resume handshake implementation.
  */
 
-#include "mux/handshake.h"
-
 #include "mux/frame.h"
+#include "mux/handshake.h"
 #include "mux/mux.h"
 #include "mux/proto_schema.gen.h"
 #include "mux/sched.h"
 #include "mux/session.h"
 #include "mux/unacked.h"
 #include "mux/wire.h"
+#include "shim/util.h"
 
 #include "algo/hashtable.h"
 #include "binary/serialize.h"
 #include "codec/base64.h"
-#include "net/mime.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
 
@@ -117,8 +116,8 @@ static bool proto_parse_type(
 		return false;
 	}
 	const size_t len = type_len;
-	/* mime_parse tokenizes the buffer in place; copy onto the heap rather
-	 * than a peer-sized stack VLA (the ASSERT bound compiles out under
+	/* mime_check_media tokenizes the buffer in place; copy onto the heap
+	 * rather than a peer-sized stack VLA (the ASSERT bound compiles out under
 	 * NDEBUG, leaving the stack at the mercy of the peer's type length). */
 	char *const buf = malloc(len + 1);
 	if (buf == NULL) {
@@ -128,37 +127,21 @@ static bool proto_parse_type(
 	memcpy(buf, type, len + 1);
 
 	bool ok = false;
-	char *media_type, *media_subtype;
-	char *next = mime_parse(buf, &media_type, &media_subtype);
-	if (next == NULL || strcmp(media_type, "application") != 0 ||
-	    strcmp(media_subtype, "x-multiplexd-proto") != 0) {
+	const char *version = NULL;
+	switch (mime_check_media(buf, "x-multiplexd-proto", &version)) {
+	case MIME_CHECK_OK:
+		break;
+	case MIME_CHECK_BAD_TYPE:
 		/* type is attacker-controlled (only known NUL-free, up to ~64 KiB
 		 * and can carry decoded ESC/LF); bound the logged length so a peer
 		 * cannot push kilobytes of arbitrary bytes into an ERROR line. */
 		MUX_LOG_F(ERROR, ss, "unsupported protocol: \"%.64s\"", type);
 		goto done;
-	}
-
-	const char *version = NULL;
-	char *key, *value;
-	for (;;) {
-		next = mime_parseparam(next, &key, &value);
-		if (next == NULL) {
-			/* mime_parseparam returns NULL only on a parse error (a
-			 * clean end sets *key = NULL with a non-NULL return), so
-			 * reject rather than silently accept the valid prefix. */
-			MUX_LOG_F(
-				ERROR, ss,
-				"malformed protocol type parameter: \"%.64s\"",
-				type);
-			goto done;
-		}
-		if (key == NULL) {
-			break; /* clean end of parameters */
-		}
-		if (strcmp(key, "version") == 0) {
-			version = value;
-		}
+	case MIME_CHECK_MALFORMED:
+		MUX_LOG_F(
+			ERROR, ss,
+			"malformed protocol type parameter: \"%.64s\"", type);
+		goto done;
 	}
 	if (version == NULL) {
 		MUX_LOG(ERROR, ss, "protocol version not specified");
