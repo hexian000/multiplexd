@@ -4,6 +4,7 @@
 #include "sync/executor.h"
 
 #include "sync/task.h"
+#include "sync/thrd.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -12,24 +13,15 @@
 #include <stdlib.h>
 #include <threads.h>
 
-#define THRD_ASSERT(expr)                                                      \
-	do {                                                                   \
-		const int status = (expr);                                     \
-		(void)status;                                                  \
-		assert(status == thrd_success);                                \
-	} while (0)
-
-struct task_item {
-	struct task task;
-	struct task_item *next;
-};
-
 struct executor {
 	mtx_t mu;
 	cnd_t cond;
-	struct {
-		struct task_item *head, *tail;
-	} queue;
+	/* Bounded ring buffer; allocated separately because workers[] is the
+	 * flexible array member and a struct may have only one */
+	struct task *buf;
+	size_t capacity;
+	size_t head;
+	size_t count;
 	bool exit_flag : 1;
 	bool detached : 1;
 	size_t nthreads;
@@ -41,6 +33,7 @@ static void free_executor(struct executor *restrict e)
 {
 	mtx_destroy(&e->mu);
 	cnd_destroy(&e->cond);
+	free(e->buf);
 	free(e);
 }
 
@@ -48,15 +41,13 @@ static bool dequeue(struct executor *e, struct task *task)
 {
 	THRD_ASSERT(mtx_lock(&e->mu));
 	for (;;) {
-		struct task_item *restrict item = e->queue.head;
-		if (item != NULL) {
-			e->queue.head = item->next;
-			if (e->queue.tail == item) {
-				e->queue.tail = NULL;
+		if (e->count > 0) {
+			*task = e->buf[e->head];
+			if (++e->head >= e->capacity) {
+				e->head -= e->capacity;
 			}
+			e->count--;
 			THRD_ASSERT(mtx_unlock(&e->mu));
-			*task = item->task;
-			free(item);
 			return true;
 		}
 		if (e->exit_flag) {
@@ -85,7 +76,7 @@ static int worker_main(void *p)
 	return 0;
 }
 
-struct executor *executor_create(const size_t nworkers)
+struct executor *executor_create(const size_t nworkers, const size_t capacity)
 {
 	if (nworkers == 0) {
 		/* a 0-worker executor can never run a submitted task; reject it
@@ -93,7 +84,14 @@ struct executor *executor_create(const size_t nworkers)
 		 * no worker nothing ever drains the queue */
 		return NULL;
 	}
+	if (capacity == 0) {
+		/* a 0-slot bounded queue could never accept a task */
+		return NULL;
+	}
 	if (nworkers > (SIZE_MAX - sizeof(struct executor)) / sizeof(thrd_t)) {
+		return NULL;
+	}
+	if (capacity > SIZE_MAX / sizeof(struct task)) {
 		return NULL;
 	}
 	struct executor *restrict e =
@@ -101,18 +99,26 @@ struct executor *executor_create(const size_t nworkers)
 	if (e == NULL) {
 		return NULL;
 	}
+	e->buf = malloc(sizeof(struct task) * capacity);
+	if (e->buf == NULL) {
+		free(e);
+		return NULL;
+	}
 	e->exit_flag = false;
 	e->detached = false;
-	e->queue.head = NULL;
-	e->queue.tail = NULL;
+	e->capacity = capacity;
+	e->head = 0;
+	e->count = 0;
 	e->nthreads = 0;
 	e->live = 0;
 	if (mtx_init(&e->mu, mtx_plain) != thrd_success) {
+		free(e->buf);
 		free(e);
 		return NULL;
 	}
 	if (cnd_init(&e->cond) != thrd_success) {
 		mtx_destroy(&e->mu);
+		free(e->buf);
 		free(e);
 		return NULL;
 	}
@@ -130,24 +136,21 @@ struct executor *executor_create(const size_t nworkers)
 
 static bool enqueue(struct executor *e, const struct task *task)
 {
-	struct task_item *new_item = malloc(sizeof(struct task_item));
-	if (new_item == NULL) {
-		return false;
-	}
-	*new_item = (struct task_item){ *task, NULL };
 	THRD_ASSERT(mtx_lock(&e->mu));
 	if (e->exit_flag) {
 		THRD_ASSERT(mtx_unlock(&e->mu));
-		free(new_item);
 		return false;
 	}
-	struct task_item *restrict item = e->queue.tail;
-	if (item != NULL) {
-		item->next = new_item;
-	} else {
-		e->queue.head = new_item;
+	if (e->count == e->capacity) {
+		THRD_ASSERT(mtx_unlock(&e->mu));
+		return false;
 	}
-	e->queue.tail = new_item;
+	size_t tail = e->head + e->count;
+	if (tail >= e->capacity) {
+		tail -= e->capacity;
+	}
+	e->buf[tail] = *task;
+	e->count++;
 	/* Signal while still holding the lock, as executor_detach does below
 	 * and for the same reason: once the lock is released a concurrent
 	 * detach can let the workers drain this item, exit, and (as the last

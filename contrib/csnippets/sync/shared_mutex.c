@@ -3,17 +3,12 @@
 
 #include "shared_mutex.h"
 
+#include "sync/thrd.h"
+
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
 #include <threads.h>
-
-#define THRD_ASSERT(expr)                                                      \
-	do {                                                                   \
-		const int status = (expr);                                     \
-		(void)status;                                                  \
-		assert(status == thrd_success);                                \
-	} while (0)
 
 int smtx_init(smtx_t *mutex)
 {

@@ -24,6 +24,7 @@
  * @param field Input field to escape (null-terminated string)
  * @return Number of characters that would be written (excluding null terminator).
  *         If the return value is >= maxlen, the output was truncated.
+ *         Returns -1 if that count would exceed INT_MAX.
  */
 int csv_escape(char *restrict buf, size_t maxlen, const char *restrict field);
 

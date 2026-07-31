@@ -20,15 +20,18 @@ struct executor;
 /**
  * @brief Create a new executor.
  * @param[in] nworkers Number of worker threads; must be >= 1.
- * @return The new executor, or NULL if nworkers is 0 or on allocation failure.
+ * @param[in] capacity Maximum number of tasks the bounded queue can hold; must
+ * be >= 1.
+ * @return The new executor, or NULL if nworkers or capacity is 0, or on
+ * allocation failure.
  */
-struct executor *executor_create(size_t nworkers);
+struct executor *executor_create(size_t nworkers, size_t capacity);
 
 /**
  * @brief Submit a task to executor.
  * @param[in] e The executor.
  * @param[in] task Task to be scheduled.
- * @return true on success, false if allocation fails or the executor is
+ * @return true on success, false if the queue is full or the executor is
  * shutting down (executor_join/executor_detach has been called).
  * @note Submitting concurrently with or after executor_join/executor_detach
  * returns is not supported and may still crash; this only covers the

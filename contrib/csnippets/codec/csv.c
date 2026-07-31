@@ -3,6 +3,7 @@
 
 #include "csv.h"
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -54,6 +55,12 @@ int csv_escape(char *restrict buf, size_t maxlen, const char *restrict field)
 
 #undef WRITE_CH
 
+	/* The int return cannot represent a count past INT_MAX; signal that with
+	 * -1 rather than an implementation-defined narrowing, matching json.c's
+	 * marshal_checked_int. */
+	if (w > (size_t)INT_MAX) {
+		return -1;
+	}
 	return (int)w;
 }
 

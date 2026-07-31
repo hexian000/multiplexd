@@ -8,4 +8,5 @@ target_sources(csnippets
     "${CMAKE_CURRENT_SOURCE_DIR}/executor.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/shared_mutex.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/task.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thrd.h"
 )
