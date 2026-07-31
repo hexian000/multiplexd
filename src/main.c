@@ -7,14 +7,15 @@
  */
 
 #include "conf.h"
+#if WITH_OPENSSL
 #include "gencerts.h"
+#endif
 #include "server.h"
 #if WITH_TLS
 #include "shim/tls.h"
 #endif
 
 #include "io/file.h"
-
 #include "math/rand.h"
 #include "os/daemon.h"
 #if WITH_CRASH_HANDLER
@@ -434,9 +435,11 @@ int main(int argc, char **argv)
 	slog_setlevel(args.loglevel >= 0 ? args.loglevel : conf->loglevel);
 	if (conf->log != NULL) {
 		if (strcmp(conf->log, "stdout") == 0) {
-			slog_setoutput(SLOG_OUTPUT_STREAM, log_filewriter(stdout));
+			slog_setoutput(
+				SLOG_OUTPUT_STREAM, log_filewriter(stdout));
 		} else if (strcmp(conf->log, "stderr") == 0) {
-			slog_setoutput(SLOG_OUTPUT_STREAM, log_filewriter(stderr));
+			slog_setoutput(
+				SLOG_OUTPUT_STREAM, log_filewriter(stderr));
 		} else if (strcmp(conf->log, "terminal") == 0) {
 			slog_setoutput(
 				SLOG_OUTPUT_TERMINAL, log_filewriter(stderr));
