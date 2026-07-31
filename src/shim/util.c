@@ -10,17 +10,24 @@
 #include "shim/util.h"
 
 #if WITH_TLS
+#include "shim/tls.h"
+
 #include "codec/csv.h"
+#include "net/url.h"
 #endif
+
 #include "net/addr.h"
 #include "net/mime.h"
 #include "os/socket.h"
+#include "utils/ctype_ascii.h"
 #include "utils/slog.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -67,12 +74,21 @@ static bool split_addr(
 	char *restrict buf, const size_t buflen, const char *restrict addrstr,
 	char **restrict hoststr, char **restrict portstr)
 {
-	const size_t addrlen = strlen(addrstr);
+	/* strnlen, not strlen: it stops at buflen, so addrlen <= buflen holds by
+	 * construction and the guard below leaves addrlen < buflen at the
+	 * terminator store. An unbounded strlen leaves the optimizer unable to
+	 * tie addrlen to buf's size, and it reports the store as overflowing on
+	 * the very path the guard already excludes. */
+	const size_t addrlen = strnlen(addrstr, buflen);
 	if (addrlen >= buflen) {
 		return false;
 	}
-	memcpy(buf, addrstr, addrlen);
-	buf[addrlen] = '\0';
+	/* strnlen returning short of buflen means it found the terminator, so
+	 * copy it along with the string: one bounded memcpy of addrlen + 1 <=
+	 * buflen bytes. Storing the terminator separately at buf[addrlen] left
+	 * the optimizer unable to tie the index to buf's size, and it reported
+	 * that store as overflowing on the path the guard already excludes. */
+	memcpy(buf, addrstr, addrlen + 1);
 	return splithostport(buf, hoststr, portstr);
 }
 
@@ -136,6 +152,58 @@ enum mime_check_result mime_check_media(
 	return MIME_CHECK_OK;
 }
 
+void escape_identity(
+	char *restrict out, const size_t outsize, const char *restrict in,
+	const enum escape_ctx ctx)
+{
+	size_t o = 0;
+	for (size_t i = 0; in[i] != '\0'; i++) {
+		const unsigned char c = (unsigned char)in[i];
+		char esc = '\0';
+		switch (c) {
+		case '\\':
+		case '"':
+			esc = (char)c;
+			break;
+		case '\n':
+			esc = 'n';
+			break;
+		case '\t':
+			esc = ctx == ESCAPE_PLAIN ? 't' : '\0';
+			break;
+		case '\r':
+			esc = ctx == ESCAPE_PLAIN ? 'r' : '\0';
+			break;
+		default:
+			break;
+		}
+		if (esc != '\0') {
+			if (o + 2 >= outsize) {
+				break;
+			}
+			out[o++] = '\\';
+			out[o++] = esc;
+		} else if (ctx == ESCAPE_PLAIN && c < 0x20) {
+			/* Any remaining C0 control byte (e.g. ESC) would let a
+			 * crafted identity drive terminal cursor motion; emit an
+			 * inert \xNN escape. */
+			if (o + 4 >= outsize) {
+				break;
+			}
+			out[o++] = '\\';
+			out[o++] = 'x';
+			tohexlower(&out[o], c);
+			o += 2;
+		} else {
+			if (o + 1 >= outsize) {
+				break;
+			}
+			out[o++] = (char)c;
+		}
+	}
+	out[o] = '\0';
+}
+
 #if WITH_TLS
 bool alpn_tokenize(
 	char *restrict work, const char *restrict list, const alpn_field_fn fn,
@@ -177,4 +245,90 @@ bool alpn_tokenize(
 	}
 	return true;
 }
+
+/* True when one URI subjectAltName from a peer certificate names @p identity.
+ *
+ * The name is decoded and then compared, rather than the identity being
+ * encoded and compared byte for byte: percent-encoding is not canonical, so a
+ * certificate issued by other tooling may escape a different, equally valid
+ * set of octets for the same identity.  Decoding to octets is what makes those
+ * agree, and the aliasing it admits is harmless -- the issuing CA chose the
+ * name either way.
+ *
+ * url_unescape_path() is reused rather than decoding by hand because it
+ * rejects every control character the decode produces, %00 among them, while
+ * the byte is still in hand (see unescape() in net/url.c).  Accepting the
+ * prefix before an embedded NUL is the null-prefix certificate attack, and
+ * that rejection is also what makes the strcmp() below sound.  csnippets does
+ * deliberately decode "%%" to a literal '%' where a strict RFC 3986 decoder
+ * errors (net/url.h); harmless here, since "%%" and "%25" decode alike. */
+static bool
+identity_uri_matches(const char *restrict uri, const char *restrict identity)
+{
+	const size_t scheme_len = sizeof(IDENTITY_URI_SCHEME) - 1;
+	if (strncmp(uri, IDENTITY_URI_SCHEME, scheme_len) != 0) {
+		return false;
+	}
+	const char *const encoded = uri + scheme_len;
+	const size_t len = strlen(encoded);
+	if (len > IDENTITY_ENCODED_MAX) {
+		return false;
+	}
+	char buf[IDENTITY_ENCODED_MAX + 1];
+	memcpy(buf, encoded, len + 1);
+	if (!url_unescape_path(buf)) {
+		return false;
+	}
+	return strcmp(buf, identity) == 0;
+}
+
+bool identity_matches_cert(
+	struct tls_connection *const conn, const char *const identity)
+{
+	char **names = NULL;
+	size_t count = 0;
+	if (!tls_peer_cert_uri_sans(conn, &names, &count)) {
+		return false;
+	}
+	bool matched = false;
+	for (size_t i = 0; i < count && !matched; i++) {
+		matched = identity_uri_matches(names[i], identity);
+	}
+	/* One allocation holds both the pointer array and the names. */
+	free((void *)names);
+	return matched;
+}
 #endif /* WITH_TLS */
+
+/* Best-effort cleanup after a later step fails; the caller is already
+ * returning an error, so a failed unlink here is only logged. */
+void discard_file(const char *path)
+{
+	if (unlink(path) != 0) {
+		const int err = errno;
+		LOGW_F("failed to remove %s: (%d) %s", path, err,
+		       strerror(err));
+	}
+}
+
+/* Create `path` exclusively (O_EXCL refuses to overwrite an existing file)
+ * and wrap it in a stream, discarding the file if fdopen fails. mode is
+ * masked by umask (POSIX semantics): an upper bound, not a guarantee. */
+FILE *create_exclusive(const char *path, mode_t mode)
+{
+	const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+	if (fd < 0) {
+		const int err = errno;
+		LOGE_F("failed to open %s: (%d) %s", path, err, strerror(err));
+		return NULL;
+	}
+	FILE *const fp = fdopen(fd, "w");
+	if (fp == NULL) {
+		const int err = errno;
+		LOGE_F("fdopen %s: (%d) %s", path, err, strerror(err));
+		(void)close(fd);
+		discard_file(path);
+		return NULL;
+	}
+	return fp;
+}

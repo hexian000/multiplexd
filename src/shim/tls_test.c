@@ -6,6 +6,8 @@
 
 #include "shim/tls.h"
 
+#include "shim/util.h"
+
 #if WITH_TLS
 
 #include "utils/slog.h"
@@ -512,6 +514,34 @@ static char test_weak_digest_key_pem[] =
 	"V+h+BXRXD3tseB2uANf+qw==\n"
 	"-----END PRIVATE KEY-----\n";
 
+/* Self-signed P-256/SHA-256 certificate (well above both backends' strength
+ * floor) whose subjectAltName carries, in order: a DNS name that must be
+ * ignored, "multiplexd:client-a", the percent-encoded UTF-8 identity
+ * "multiplexd:caf%C3%A9", and a URI in an unrelated scheme that must not match.
+ * Produced with the openssl CLI rather than gencerts(), which is unavailable in
+ * a non-OpenSSL build. */
+static char identity_cert_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIICADCCAaagAwIBAgIUFUKPae2ekFyJEKps8tigJhNCMvIwCgYIKoZIzj0EAwIw\n"
+	"GzEZMBcGA1UEAwwQaWRlbnRpdHkuZXhhbXBsZTAgFw0yNjA4MDYwMzE5MzhaGA8y\n"
+	"MTI2MDcxMzAzMTkzOFowGzEZMBcGA1UEAwwQaWRlbnRpdHkuZXhhbXBsZTBZMBMG\n"
+	"ByqGSM49AgEGCCqGSM49AwEHA0IABIJ21b380L3JimzF8hLNQoHHpPBUYS+7jNPp\n"
+	"haUpUaRDIdckntCrtPNb28l9CJ4TCZR+AqbLiIdERA3WBrfn3ICjgcUwgcIwDwYD\n"
+	"VR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAoQwHQYDVR0lBBYwFAYIKwYBBQUH\n"
+	"AwEGCCsGAQUFBwMCMGEGA1UdEQRaMFiCEGlkZW50aXR5LmV4YW1wbGWGE211bHRp\n"
+	"cGxleGQ6Y2xpZW50LWGGFG11bHRpcGxleGQ6Y2FmJUMzJUE5hhlodHRwczovL2V4\n"
+	"YW1wbGUuY29tL290aGVyMB0GA1UdDgQWBBRXW/+gnbJLfqRposhQOgKNm48sXTAK\n"
+	"BggqhkjOPQQDAgNIADBFAiBzhcKYVgMsfblg4CiLSD3L4imS82XAGWpehszk6unz\n"
+	"pwIhANDc+HKlqdZypDy5gtGS3QnNIsfuLxcEycMJNJp0k7Wy\n"
+	"-----END CERTIFICATE-----\n";
+
+static char identity_key_pem[] =
+	"-----BEGIN PRIVATE KEY-----\n"
+	"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQge265Ux5i6NiqO6ks\n"
+	"VjZw8uQ6yPJ9xaXKhPh7ireU54KhRANCAASCdtW9/NC9yYpsxfISzUKBx6TwVGEv\n"
+	"u4zT6YWlKVGkQyHXJJ7Qq7TzW9vJfQieEwmUfgKmy4iHREQN1ga359yA\n"
+	"-----END PRIVATE KEY-----\n";
+
 static bool write_pem_file(const char *path, const char *data)
 {
 	FILE *const fp = fopen(path, "w");
@@ -530,6 +560,12 @@ static bool make_test_certs(void)
 		return false;
 	}
 	if (!write_pem_file("t-key.pem", test_key_pem)) {
+		return false;
+	}
+	if (!write_pem_file("id-cert.pem", identity_cert_pem)) {
+		return false;
+	}
+	if (!write_pem_file("id-key.pem", identity_key_pem)) {
 		return false;
 	}
 	return true;
@@ -1985,6 +2021,339 @@ T_DECLARE_CASE(test_tls_peer_cert_der_after_handshake)
 	rm_tmpdir(tmpl);
 }
 
+/* Handshake both ends using the identity fixture certificate, so each side sees
+ * it as the peer certificate.  On success the caller owns everything and must
+ * run identity_fixture_teardown(); on failure nothing is left open. */
+struct identity_fixture {
+	struct tls_context *srv_ctx, *cli_ctx;
+	struct tls_connection *srv_conn, *cli_conn;
+	int fds[2];
+};
+
+static bool identity_fixture_setup(
+	struct identity_fixture *restrict f, const char *restrict tmpl)
+{
+	char cert[PATH_MAX + 2];
+	char key[PATH_MAX + 2];
+	(void)snprintf(cert, sizeof(cert), "@%s/id-cert.pem", tmpl);
+	(void)snprintf(key, sizeof(key), "@%s/id-key.pem", tmpl);
+	char *authcerts[] = { cert };
+	const struct tls_config conf = {
+		.cert = cert,
+		.key = key,
+		.authcerts = authcerts,
+		.authcerts_count = 1,
+	};
+	*f = (struct identity_fixture){ .fds = { -1, -1 } };
+	f->srv_ctx = tls_ctx_server(&conf);
+	f->cli_ctx = tls_ctx_client(&conf);
+	if (f->srv_ctx == NULL || f->cli_ctx == NULL ||
+	    socketpair(AF_UNIX, SOCK_STREAM, 0, f->fds) != 0) {
+		tls_ctx_free(f->srv_ctx);
+		tls_ctx_free(f->cli_ctx);
+		return false;
+	}
+	if (fcntl(f->fds[0], F_SETFL, O_NONBLOCK) != 0 ||
+	    fcntl(f->fds[1], F_SETFL, O_NONBLOCK) != 0) {
+		goto fail;
+	}
+	f->srv_conn = tls_server(f->srv_ctx, f->fds[0]);
+	f->cli_conn = tls_client(f->cli_ctx, f->fds[1]);
+	if (f->srv_conn == NULL || f->cli_conn == NULL ||
+	    !drive_handshake(f->srv_conn, f->cli_conn, 20)) {
+		tls_conn_free(f->srv_conn);
+		tls_conn_free(f->cli_conn);
+		goto fail;
+	}
+	return true;
+fail:
+	(void)close(f->fds[0]);
+	(void)close(f->fds[1]);
+	tls_ctx_free(f->srv_ctx);
+	tls_ctx_free(f->cli_ctx);
+	return false;
+}
+
+static void identity_fixture_teardown(struct identity_fixture *restrict f)
+{
+	tls_conn_free(f->cli_conn);
+	tls_conn_free(f->srv_conn);
+	tls_ctx_free(f->cli_ctx);
+	tls_ctx_free(f->srv_ctx);
+	(void)close(f->fds[0]);
+	(void)close(f->fds[1]);
+}
+
+/* PSK fixtures.  The expected labels are golden values cross-checked against
+ * an independent HKDF-SHA256 implementation and the openssl kdf CLI, so they
+ * pin the derivation itself rather than merely agreeing with whatever this
+ * build computes -- and both backends must reproduce them. */
+static const unsigned char psk_ones[TLS_PSK_MIN_LEN] = {
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+static const unsigned char psk_twos[TLS_PSK_MIN_LEN] = {
+	2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+	2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+};
+#define PSK_ONES_LABEL "940645b8f8542cfecce8598684ea96de"
+#define PSK_TWOS_LABEL "955df2a45f835db1569e151156e4b8dc"
+
+T_DECLARE_CASE(test_tls_psk_label)
+{
+	char buf[TLS_PSK_LABEL_MAX + 1];
+	size_t len = sizeof(buf);
+	T_EXPECT(tls_psk_label(psk_ones, sizeof(psk_ones), buf, &len));
+	T_EXPECT_STREQ(buf, PSK_ONES_LABEL);
+	T_EXPECT_EQ((int)len, (int)TLS_PSK_LABEL_MAX);
+
+	/* Deterministic, and distinct for a different key. */
+	len = sizeof(buf);
+	T_EXPECT(tls_psk_label(psk_ones, sizeof(psk_ones), buf, &len));
+	T_EXPECT_STREQ(buf, PSK_ONES_LABEL);
+	len = sizeof(buf);
+	T_EXPECT(tls_psk_label(psk_twos, sizeof(psk_twos), buf, &len));
+	T_EXPECT_STREQ(buf, PSK_TWOS_LABEL);
+
+	/* Rejects a key outside the accepted range and a short buffer. */
+	len = sizeof(buf);
+	T_EXPECT(!tls_psk_label(psk_ones, TLS_PSK_MIN_LEN - 1, buf, &len));
+	T_EXPECT(!tls_psk_label(psk_ones, TLS_PSK_MAX_LEN + 1, buf, &len));
+	len = TLS_PSK_LABEL_MAX;
+	T_EXPECT(!tls_psk_label(psk_ones, sizeof(psk_ones), buf, &len));
+	len = sizeof(buf);
+	T_EXPECT(!tls_psk_label(NULL, sizeof(psk_ones), buf, &len));
+}
+
+/* tls_psk_lookup_fn knowing only psk_ones. */
+static bool psk_test_lookup(
+	void *ctx, const char *identity, unsigned char *key, size_t *key_len)
+{
+	(void)ctx;
+	if (strcmp(identity, PSK_ONES_LABEL) != 0) {
+		return false;
+	}
+	if (*key_len < sizeof(psk_ones)) {
+		return false;
+	}
+	memcpy(key, psk_ones, sizeof(psk_ones));
+	*key_len = sizeof(psk_ones);
+	return true;
+}
+
+/* Handshake a PSK pair over a socketpair; *ok reports completion. */
+T_DECLARE_SUBCASE(
+	run_psk_handshake, const unsigned char *client_key, bool *restrict ok,
+	char *restrict srv_label, char *restrict cli_label)
+{
+	*ok = false;
+	srv_label[0] = cli_label[0] = '\0';
+	struct tls_context *const srv_ctx = tls_ctx_server(
+		&(struct tls_config){ .psk_lookup = psk_test_lookup });
+	struct tls_context *const cli_ctx = tls_ctx_client(&(struct tls_config){
+		.psk = client_key, .psk_len = TLS_PSK_MIN_LEN });
+	/* A context with only PSK credentials must be creatable: no
+	 * certificate, no key, no trust store. */
+	T_EXPECT(srv_ctx != NULL);
+	T_EXPECT(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
+	T_EXPECT(srv_conn != NULL);
+	T_EXPECT(cli_conn != NULL);
+
+	*ok = drive_handshake(srv_conn, cli_conn, 20);
+	size_t len = TLS_PSK_LABEL_MAX + 1;
+	if (!tls_peer_psk_label(srv_conn, srv_label, &len)) {
+		srv_label[0] = '\0';
+	}
+	len = TLS_PSK_LABEL_MAX + 1;
+	if (!tls_peer_psk_label(cli_conn, cli_label, &len)) {
+		cli_label[0] = '\0';
+	}
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	tls_ctx_free(cli_ctx);
+	tls_ctx_free(srv_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+}
+
+/* No certificate is involved on either side, which is the point. */
+T_DECLARE_CASE(test_tls_psk_handshake)
+{
+	bool ok = false;
+	char srv_label[TLS_PSK_LABEL_MAX + 1];
+	char cli_label[TLS_PSK_LABEL_MAX + 1];
+	T_CALL_SUBCASE(run_psk_handshake, psk_ones, &ok, srv_label, cli_label);
+	T_EXPECT(ok);
+	T_EXPECT_STREQ(srv_label, PSK_ONES_LABEL);
+	T_EXPECT_STREQ(cli_label, PSK_ONES_LABEL);
+}
+
+/* A key the server does not know must not complete a handshake. */
+T_DECLARE_CASE(test_tls_psk_unknown_rejected)
+{
+	bool ok = true;
+	char srv_label[TLS_PSK_LABEL_MAX + 1];
+	char cli_label[TLS_PSK_LABEL_MAX + 1];
+	T_CALL_SUBCASE(run_psk_handshake, psk_twos, &ok, srv_label, cli_label);
+	T_EXPECT(!ok);
+	/* The server authenticated nobody, so it reports no label. */
+	T_EXPECT_STREQ(srv_label, "");
+}
+
+T_DECLARE_CASE(test_tls_peer_cert_uri_sans)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	struct identity_fixture f;
+	T_CHECK(identity_fixture_setup(&f, tmpl));
+
+	/* Only the three URI entries are reported, in certificate order: the DNS
+	 * name is a different GeneralName CHOICE, and the foreign-scheme URI is
+	 * still a URI name and so is returned (the scheme filter belongs to
+	 * identity_matches_cert, not to extraction). */
+	char **names = NULL;
+	size_t count = 0;
+	T_EXPECT(tls_peer_cert_uri_sans(f.cli_conn, &names, &count));
+	T_EXPECT(count == 3);
+	if (count == 3) {
+		T_EXPECT(strcmp(names[0], "multiplexd:client-a") == 0);
+		T_EXPECT(strcmp(names[1], "multiplexd:caf%C3%A9") == 0);
+		T_EXPECT(strcmp(names[2], "https://example.com/other") == 0);
+	}
+	/* One allocation backs both the pointer array and the names. */
+	free((void *)names);
+
+	/* Defensive NULL handling, per the tls.h contract. */
+	T_EXPECT(!tls_peer_cert_uri_sans(NULL, &names, &count));
+	T_EXPECT(!tls_peer_cert_uri_sans(f.cli_conn, NULL, &count));
+	T_EXPECT(!tls_peer_cert_uri_sans(f.cli_conn, &names, NULL));
+
+	T_EXPECT(drive_shutdown(f.cli_conn, f.srv_conn, 10));
+	identity_fixture_teardown(&f);
+	rm_tmpdir(tmpl);
+}
+
+T_DECLARE_CASE(test_tls_peer_cert_uri_sans_absent)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	const struct tls_config conf = { .cert = cert_path,
+					 .key = key_path,
+					 .authcerts = authcerts,
+					 .authcerts_count = 1 };
+	struct tls_context *const srv_ctx = tls_ctx_server(&conf);
+	struct tls_context *const cli_ctx = tls_ctx_client(&conf);
+	T_CHECK(srv_ctx != NULL);
+	T_CHECK(cli_ctx != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
+	T_CHECK(srv_conn != NULL);
+	T_CHECK(cli_conn != NULL);
+	T_CHECK(drive_handshake(srv_conn, cli_conn, 20));
+
+	/* A certificate with no URI subjectAltName is not an error: it reports
+	 * zero names and leaves nothing to free. */
+	char **names = (char **)(uintptr_t)1;
+	size_t count = 1;
+	T_EXPECT(tls_peer_cert_uri_sans(cli_conn, &names, &count));
+	T_EXPECT(names == NULL);
+	T_EXPECT(count == 0);
+	/* Nothing to match against, so no identity can be claimed. */
+	T_EXPECT(!identity_matches_cert(cli_conn, "client-a"));
+
+	T_EXPECT(drive_shutdown(cli_conn, srv_conn, 10));
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	tls_ctx_free(cli_ctx);
+	tls_ctx_free(srv_ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+	rm_tmpdir(tmpl);
+}
+
+T_DECLARE_CASE(test_identity_matches_cert)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	struct identity_fixture f;
+	T_CHECK(identity_fixture_setup(&f, tmpl));
+
+	/* Plain identity, and one whose UTF-8 octets are percent-encoded in the
+	 * certificate: both compare equal after decoding.  Both roles check the
+	 * same certificate here. */
+	T_EXPECT(identity_matches_cert(f.cli_conn, "client-a"));
+	T_EXPECT(identity_matches_cert(f.cli_conn, "caf\xC3\xA9"));
+	T_EXPECT(identity_matches_cert(f.srv_conn, "client-a"));
+
+	T_EXPECT(drive_shutdown(f.cli_conn, f.srv_conn, 10));
+	identity_fixture_teardown(&f);
+	rm_tmpdir(tmpl);
+}
+
+T_DECLARE_CASE(test_identity_matches_cert_rejects)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	struct identity_fixture f;
+	T_CHECK(identity_fixture_setup(&f, tmpl));
+
+	/* A different identity, the still-encoded spelling, a bare prefix, the
+	 * empty identity, and a name carried under another URI scheme must all
+	 * fail. */
+	T_EXPECT(!identity_matches_cert(f.cli_conn, "client-b"));
+	T_EXPECT(!identity_matches_cert(f.cli_conn, "caf%C3%A9"));
+	T_EXPECT(!identity_matches_cert(f.cli_conn, "client"));
+	T_EXPECT(!identity_matches_cert(f.cli_conn, ""));
+	T_EXPECT(!identity_matches_cert(
+		f.cli_conn, "https://example.com/other"));
+	/* The scheme is matched exactly: RFC 3986 spells it lower case in
+	 * canonical form, and only that spelling is accepted.  Passing a whole
+	 * URI as the identity must not match either. */
+	T_EXPECT(!identity_matches_cert(f.cli_conn, "MULTIPLEXD:client-a"));
+	T_EXPECT(!identity_matches_cert(f.cli_conn, "multiplexd:client-a"));
+
+	T_EXPECT(drive_shutdown(f.cli_conn, f.srv_conn, 10));
+	identity_fixture_teardown(&f);
+	rm_tmpdir(tmpl);
+}
+
 /* Move all pending outgoing ciphertext from @p src into @p dst's inbound buffer
  * (the "wire" between two buffered connections). Returns false on OOM. */
 static bool tls_pipe(struct tls_connection *src, struct tls_connection *dst)
@@ -2568,6 +2937,13 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tls_alpn_survives_ctx_free_mid_handshake),
 #endif
 	T_CASE(test_tls_peer_cert_der_after_handshake),
+	T_CASE(test_tls_psk_label),
+	T_CASE(test_tls_psk_handshake),
+	T_CASE(test_tls_psk_unknown_rejected),
+	T_CASE(test_tls_peer_cert_uri_sans),
+	T_CASE(test_tls_peer_cert_uri_sans_absent),
+	T_CASE(test_identity_matches_cert),
+	T_CASE(test_identity_matches_cert_rejects),
 	T_CASE(test_tls_buf_handshake_and_io),
 	T_CASE(test_tls_buf_recv_drains_stacked_records),
 	/* Opt-in throughput benchmarks (16 KiB/op, AES-128-GCM); skipped by the

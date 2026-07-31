@@ -12,8 +12,10 @@
 #include "shim/util.h"
 
 #include "meta/minmax.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
+#include <mbedtls/asn1.h>
 #include <mbedtls/build_info.h>
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
@@ -31,12 +33,27 @@
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
+#include <mbedtls/hkdf.h>
+#include <mbedtls/md.h>
 
 #define MBEDTLS_LEGACY_RNG
 #else
 #include <psa/crypto.h>
 #endif
 
+/* Production shares one tls_ctx_impl -- and therefore one mbedtls_ssl_config --
+ * across tunnel threads, which run handshakes concurrently against the
+ * library's global crypto state (4.x: the PSA core; 3.x: the ctr_drbg wired via
+ * mbedtls_ssl_conf_rng). mbedTLS documents that as thread-safe only when built
+ * with MBEDTLS_THREADING_C, which upstream leaves off by default; without it
+ * the races are undefined behavior and can reach nonce reuse. Fail the build
+ * rather than ship it: no m.sh configuration pairs threads with this backend,
+ * so only the unsafe combination is blocked. */
+#if WITH_THREADS && !defined(MBEDTLS_THREADING_C)
+#error "ENABLE_THREADS with the mbedTLS backend requires an mbedTLS built with MBEDTLS_THREADING_C"
+#endif
+
+#include <assert.h>
 #include <errno.h>
 #if WITH_THREADS
 #include <stdatomic.h>
@@ -59,7 +76,6 @@ struct tls_ctx_impl {
 #else
 	size_t refcount;
 #endif
-	bool is_server;
 	mbedtls_ssl_config conf;
 	mbedtls_x509_crt own_cert;
 	mbedtls_pk_context own_key;
@@ -72,6 +88,15 @@ struct tls_ctx_impl {
 	/* ALPN protocol list: NULL-terminated array of heap strings retained
 	 * for the lifetime of conf (mbedtls keeps the pointer). NULL = none. */
 	char **alpn;
+	/* External PSK credentials, replacing certificate authentication.
+	 * Client role: the offered key and its derived label, both retained for
+	 * conf's lifetime because mbedtls_ssl_conf_psk() keeps the pointers.
+	 * Server role: the lookup that resolves a label the client offered. */
+	unsigned char psk[TLS_PSK_MAX_LEN];
+	size_t psk_len;
+	char psk_label[TLS_PSK_LABEL_MAX + 1];
+	tls_psk_lookup_fn psk_lookup;
+	void *psk_lookup_ctx;
 #ifdef MBEDTLS_LEGACY_RNG
 	mbedtls_ctr_drbg_context ctr_drbg;
 	mbedtls_entropy_context entropy;
@@ -96,6 +121,10 @@ struct tls_conn_impl {
 	size_t in_off, in_len, in_cap;
 	unsigned char *out;
 	size_t out_off, out_len, out_cap;
+	/* PSK identity label this connection authenticated with; empty for a
+	 * certificate handshake.  Recorded by the server's lookup callback as
+	 * the handshake selects it, and copied from the context for a client. */
+	char psk_label[TLS_PSK_LABEL_MAX + 1];
 };
 
 static struct tls_ctx_impl *tls_ctx_raw(struct tls_context *restrict ctx)
@@ -433,7 +462,6 @@ static void tls_ctx_impl_init(struct tls_ctx_impl *restrict c)
 #else
 	c->refcount = 1;
 #endif
-	c->is_server = false;
 	mbedtls_ssl_config_init(&c->conf);
 	mbedtls_x509_crt_init(&c->own_cert);
 	mbedtls_pk_init(&c->own_key);
@@ -450,6 +478,9 @@ static void tls_ctx_impl_init(struct tls_ctx_impl *restrict c)
 
 static void tls_ctx_impl_free(struct tls_ctx_impl *restrict c)
 {
+	/* Before freeing the config, which still points at c->psk. */
+	mbedtls_platform_zeroize(c->psk, sizeof(c->psk));
+	c->psk_len = 0;
 	mbedtls_ssl_config_free(&c->conf);
 	mbedtls_x509_crt_free(&c->own_cert);
 	mbedtls_pk_free(&c->own_key);
@@ -548,6 +579,93 @@ static bool tls_pk_pair_matches(
 }
 #endif /* MBEDTLS_LEGACY_RNG */
 
+/* True when the config selects PSK rather than certificate authentication. */
+static bool tls_conf_is_psk(const struct tls_config *restrict conf)
+{
+	return conf->psk_lookup != NULL || conf->psk_len > 0;
+}
+
+/* mbedTLS hands the callback the ssl object, not our wrapper.  tls_conn_impl
+ * embeds it as its first member, so the wrapper is recoverable by cast --
+ * asserted here rather than assumed. */
+static_assert(
+	offsetof(struct tls_conn_impl, ssl) == 0,
+	"tls_conn_impl must start with its mbedtls_ssl_context");
+
+/* Server role: resolve the label the client offered and install its key for
+ * this handshake.  A non-zero return rejects the handshake; a PSK-mode context
+ * has no certificate to fall back to. */
+static int psk_lookup_cb(
+	void *p, mbedtls_ssl_context *ssl, const unsigned char *identity,
+	size_t identity_len)
+{
+	struct tls_ctx_impl *const restrict c = p;
+	if (c->psk_lookup == NULL) {
+		return -1;
+	}
+	/* Attacker-chosen and not NUL-terminated: bound it, and reject an
+	 * embedded NUL rather than truncating to a shorter label that might
+	 * resolve to a different peer's key. */
+	if (identity_len > TLS_PSK_LABEL_MAX ||
+	    memchr(identity, '\0', identity_len) != NULL) {
+		return -1;
+	}
+	char label[TLS_PSK_LABEL_MAX + 1];
+	memcpy(label, identity, identity_len);
+	label[identity_len] = '\0';
+
+	unsigned char key[TLS_PSK_MAX_LEN];
+	size_t key_len = sizeof(key);
+	if (!c->psk_lookup(c->psk_lookup_ctx, label, key, &key_len)) {
+		return -1;
+	}
+	const int ret = mbedtls_ssl_set_hs_psk(ssl, key, key_len);
+	mbedtls_platform_zeroize(key, sizeof(key));
+	if (ret != 0) {
+		LOG_MBEDERROR(ERROR, "mbedtls_ssl_set_hs_psk", ret);
+		return -1;
+	}
+	struct tls_conn_impl *const restrict conn =
+		(struct tls_conn_impl *)(void *)ssl;
+	memcpy(conn->psk_label, label, identity_len + 1);
+	return 0;
+}
+
+/* Install PSK credentials, replacing certificate authentication.  The client's
+ * key and label are retained in the context because mbedtls_ssl_conf_psk()
+ * keeps the pointers rather than copying. */
+static bool tls_ctx_set_psk(
+	struct tls_ctx_impl *restrict c, const struct tls_config *restrict conf,
+	const bool is_server)
+{
+	if (is_server) {
+		c->psk_lookup = conf->psk_lookup;
+		c->psk_lookup_ctx = conf->psk_lookup_ctx;
+		mbedtls_ssl_conf_psk_cb(&c->conf, psk_lookup_cb, c);
+		return true;
+	}
+	if (conf->psk_len < TLS_PSK_MIN_LEN ||
+	    conf->psk_len > TLS_PSK_MAX_LEN) {
+		LOGE("tls.psk: key length out of range");
+		return false;
+	}
+	memcpy(c->psk, conf->psk, conf->psk_len);
+	c->psk_len = conf->psk_len;
+	size_t label_len = sizeof(c->psk_label);
+	if (!tls_psk_label(c->psk, c->psk_len, c->psk_label, &label_len)) {
+		LOGE("tls.psk: failed to derive the identity label");
+		return false;
+	}
+	const int ret = mbedtls_ssl_conf_psk(
+		&c->conf, c->psk, c->psk_len,
+		(const unsigned char *)c->psk_label, label_len);
+	if (ret != 0) {
+		LOG_MBEDERROR(ERROR, "mbedtls_ssl_conf_psk", ret);
+		return false;
+	}
+	return true;
+}
+
 static struct tls_context *
 tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 {
@@ -557,7 +675,6 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 		return NULL;
 	}
 	tls_ctx_impl_init(c);
-	c->is_server = is_server;
 	struct tls_context *const ctx = (struct tls_context *)c;
 
 #ifdef MBEDTLS_LEGACY_RNG
@@ -601,6 +718,15 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 	 * the OpenSSL backend mirrors this floor so both backends accept/reject
 	 * the same certificates; keep the two in sync. */
 	mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+#if defined(MBEDTLS_SSL_SESSION_TICKETS) && defined(MBEDTLS_SSL_CLI_C)
+	/* mux implements its own session resumption, so TLS 1.3 session tickets
+	 * are redundant stateful surface; the OpenSSL backend disables them via
+	 * SSL_OP_NO_TICKET + SSL_CTX_set_num_tickets(0). Client-side only here:
+	 * mbedTLS gates server-side issuance on a ticket callback this backend
+	 * never installs, so a server issues none either way. */
+	mbedtls_ssl_conf_session_tickets(
+		&c->conf, MBEDTLS_SSL_SESSION_TICKETS_DISABLED);
+#endif
 	mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
 	if (conf->kernel_offload) {
 		LOGW("tls.kernel_offload: not supported by the mbedTLS backend; "
@@ -613,56 +739,74 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 #ifdef MBEDTLS_LEGACY_RNG
 	mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
 #endif
-	/* See OpenSSL backend for the rationale: private CA gates transport
-	 * authentication; application-level identity comes from the hello. */
-	mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-	/* tls_client always calls mbedtls_ssl_set_hostname(); this callback clears
-	 * the resulting CN-mismatch flag. */
-	mbedtls_ssl_conf_verify(&c->conf, tls_ca_verify, NULL);
+	const bool is_psk = tls_conf_is_psk(conf);
+	if (is_psk) {
+		/* A PSK handshake carries no certificate in either direction, so
+		 * no trust store applies and no verification callback runs. */
+		mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+		/* Ephemeral only: bare psk_ke would drop forward secrecy. */
+		mbedtls_ssl_conf_tls13_key_exchange_modes(
+			&c->conf,
+			MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL);
+		if (!tls_ctx_set_psk(c, conf, is_server)) {
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+	} else {
+		/* See OpenSSL backend for the rationale: private CA gates transport
+		 * authentication; application-level identity comes from the hello. */
+		mbedtls_ssl_conf_authmode(
+			&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+		/* tls_client always calls mbedtls_ssl_set_hostname(); this callback clears
+		 * the resulting CN-mismatch flag. */
+		mbedtls_ssl_conf_verify(&c->conf, tls_ca_verify, NULL);
 
-	if (!tls_load_cert(ctx, conf->cert)) {
-		LOGE("failed to load TLS certificate");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
-	if (!tls_load_key(ctx, conf->key)) {
-		LOGE("failed to load TLS private key");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
-	ret = mbedtls_ssl_conf_own_cert(&c->conf, &c->own_cert, &c->own_key);
-	if (ret != 0) {
-		LOG_MBEDERROR(ERROR, "mbedtls_ssl_conf_own_cert", ret);
-		tls_ctx_free(ctx);
-		return NULL;
-	}
-	/* mbedtls_ssl_conf_own_cert() only fails on allocation failure; check
-	 * the cert/key pairing explicitly, mirroring the OpenSSL backend. */
+		if (!tls_load_cert(ctx, conf->cert)) {
+			LOGE("failed to load TLS certificate");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+		if (!tls_load_key(ctx, conf->key)) {
+			LOGE("failed to load TLS private key");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+		ret = mbedtls_ssl_conf_own_cert(
+			&c->conf, &c->own_cert, &c->own_key);
+		if (ret != 0) {
+			LOG_MBEDERROR(ERROR, "mbedtls_ssl_conf_own_cert", ret);
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+		/* mbedtls_ssl_conf_own_cert() only fails on allocation failure; check
+		 * the cert/key pairing explicitly, mirroring the OpenSSL backend. */
 #ifdef MBEDTLS_LEGACY_RNG
-	ret = mbedtls_pk_check_pair(
-		&c->own_cert.pk, &c->own_key, mbedtls_ctr_drbg_random,
-		&c->ctr_drbg);
-	if (ret != 0) {
-		LOG_MBEDERROR(ERROR, "mbedtls_pk_check_pair", ret);
-		tls_ctx_free(ctx);
-		return NULL;
-	}
+		ret = mbedtls_pk_check_pair(
+			&c->own_cert.pk, &c->own_key, mbedtls_ctr_drbg_random,
+			&c->ctr_drbg);
+		if (ret != 0) {
+			LOG_MBEDERROR(ERROR, "mbedtls_pk_check_pair", ret);
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 #else /* MBEDTLS_LEGACY_RNG */
-	if (!tls_pk_pair_matches(&c->own_cert.pk, &c->own_key)) {
-		/* tls_pk_pair_matches already logged the specific cause (an
-		 * export error, or a genuine cert/key mismatch). */
-		tls_ctx_free(ctx);
-		return NULL;
-	}
+		if (!tls_pk_pair_matches(&c->own_cert.pk, &c->own_key)) {
+			/* tls_pk_pair_matches already logged the specific cause (an
+			 * export error, or a genuine cert/key mismatch). */
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 #endif /* MBEDTLS_LEGACY_RNG */
 
-	if (!tls_load_authcerts(ctx, conf->authcerts, conf->authcerts_count)) {
-		LOGE("failed to load authorized certificates");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
-	if (c->ca_chain_loaded) {
-		mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca_chain, NULL);
+		if (!tls_load_authcerts(
+			    ctx, conf->authcerts, conf->authcerts_count)) {
+			LOGE("failed to load authorized certificates");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+		if (c->ca_chain_loaded) {
+			mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca_chain, NULL);
+		}
 	}
 
 	if (conf->ciphersuites != NULL) {
@@ -761,7 +905,11 @@ static int tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
 	if (n >= 0) {
 		return (int)n;
 	}
-	if (err == EAGAIN || err == EWOULDBLOCK) {
+	/* sock_would_block is the project's single transient-backpressure
+	 * predicate (it also admits ENOBUFS/ENOMEM, a full kernel buffer); every
+	 * non-offload socket path uses it, and treating those as fatal here would
+	 * tear down the whole TLS+mux session where plain TCP waits for EV_WRITE. */
+	if (sock_would_block(err)) {
 		return MBEDTLS_ERR_SSL_WANT_WRITE;
 	}
 	if (err == ECONNRESET || err == EPIPE) {
@@ -785,7 +933,8 @@ static int tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 	if (n == 0) {
 		return 0;
 	}
-	if (err == EAGAIN || err == EWOULDBLOCK) {
+	/* Transient backpressure, per sock_would_block; see tls_bio_send. */
+	if (sock_would_block(err)) {
 		return MBEDTLS_ERR_SSL_WANT_READ;
 	}
 	if (err == ECONNRESET) {
@@ -889,6 +1038,11 @@ static struct tls_conn_impl *tls_conn_alloc(struct tls_ctx_impl *restrict c)
 	 * connection's whole lifetime (released in tls_conn_free). */
 	tls_ctx_impl_ref(c);
 	conn->ctx = c;
+	/* Client role: the label is fixed at configuration time, so carry it onto
+	 * the connection now.  A server learns it from psk_lookup_cb instead. */
+	if (c->psk_len > 0) {
+		memcpy(conn->psk_label, c->psk_label, sizeof(conn->psk_label));
+	}
 	return conn;
 }
 
@@ -989,6 +1143,15 @@ static enum tls_error map_io_error(const int ret, const char *op)
 		return TLS_ERROR_WANT_WRITE;
 	case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
 		return TLS_ERROR_ZERO_RETURN;
+#if defined(MBEDTLS_SSL_SESSION_TICKETS) && defined(MBEDTLS_SSL_CLI_C)
+	case MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET:
+		/* A TLS 1.3 client is handed one of these per post-handshake
+		 * NewSessionTicket. The library documents it as non-fatal (retry
+		 * the read), and tls_ctx_init disables tickets so we should never
+		 * see one -- but a peer that sends them anyway must not fall into
+		 * the default TLS_ERROR_SSL and tear the session down. */
+		return TLS_ERROR_WANT_READ;
+#endif
 	case MBEDTLS_ERR_NET_CONN_RESET:
 	case MBEDTLS_ERR_NET_SEND_FAILED:
 	case MBEDTLS_ERR_NET_RECV_FAILED:
@@ -1053,11 +1216,15 @@ enum tls_error tls_recv(
 		 * TCP close/RST or a non-conformant peer): a protocol-violating
 		 * EOF, distinct from the orderly MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY
 		 * (which map_io_error handles as TLS_ERROR_ZERO_RETURN). Classify
-		 * it as TLS_ERROR_SYSCALL and log it, matching the OpenSSL
-		 * backend's SSL_ERROR_SYSCALL/ret==0 handling, so the caller tears
-		 * the session down instead of busy-looping on an always-readable
-		 * EOF fd. Not routed through map_io_error's generic case 0, which
-		 * is the handshake/write success case. */
+		 * it as TLS_ERROR_SYSCALL and log it, so the caller tears the
+		 * session down instead of busy-looping on an always-readable EOF
+		 * fd. The backends differ on the code, not the outcome: OpenSSL 3.x
+		 * reports this condition as SSL_ERROR_SSL with
+		 * SSL_R_UNEXPECTED_EOF_WHILE_READING, hence TLS_ERROR_SSL -- the
+		 * pre-3.0 SSL_ERROR_SYSCALL this once matched is gone -- and
+		 * tls_test's abrupt-close case accepts either. Not routed through
+		 * map_io_error's generic case 0, which is the handshake/write
+		 * success case. */
 		LOGE("mbedtls_ssl_read: connection closed without a proper TLS shutdown");
 		return TLS_ERROR_SYSCALL;
 	}
@@ -1119,11 +1286,193 @@ bool tls_peer_cert_der(
 	}
 	unsigned char *der = malloc(cert->raw.len);
 	if (der == NULL) {
+		LOGOOM();
 		return false;
 	}
 	memcpy(der, cert->raw.p, cert->raw.len);
 	*out = der;
 	*len = cert->raw.len;
+	return true;
+}
+
+/* GeneralName CHOICE [6] uniformResourceIdentifier: a primitive,
+ * context-specific tag.  mbedtls_x509_crt keeps every SAN entry's raw tag and
+ * octets in subject_alt_names, so entries are matched on the tag here rather
+ * than through mbedtls_x509_parse_subject_alt_name(), whose supported CHOICE
+ * set differs across the mbedTLS versions this backend builds against. */
+#define X509_SAN_TAG_URI (MBEDTLS_ASN1_CONTEXT_SPECIFIC | 6)
+
+bool tls_peer_cert_uri_sans(
+	struct tls_connection *conn, char ***out, size_t *count)
+{
+	if (conn == NULL || out == NULL || count == NULL) {
+		return false;
+	}
+	struct tls_conn_impl *const c = tls_conn_raw(conn);
+	const mbedtls_x509_crt *const cert = mbedtls_ssl_get_peer_cert(&c->ssl);
+	if (cert == NULL) {
+		return false;
+	}
+
+	/* subject_alt_names is embedded by value: with no SAN extension the head
+	 * entry is zeroed, so the NULL-data check below also covers that case.
+	 *
+	 * Pass 1: size the block, rejecting an embedded NUL while the raw octets
+	 * are in hand -- see the tls_peer_cert_uri_sans() contract in tls.h. */
+	size_t n_uri = 0;
+	size_t bytes = 0;
+	for (const mbedtls_x509_sequence *san = &cert->subject_alt_names;
+	     san != NULL; san = san->next) {
+		if (san->buf.tag != X509_SAN_TAG_URI || san->buf.p == NULL) {
+			continue;
+		}
+		if (memchr(san->buf.p, '\0', san->buf.len) != NULL) {
+			LOGE("peer certificate: URI subjectAltName contains an"
+			     " embedded NUL");
+			return false;
+		}
+		n_uri++;
+		bytes += san->buf.len + 1;
+	}
+	if (n_uri == 0) {
+		*out = NULL;
+		*count = 0;
+		return true;
+	}
+
+	/* One block: the pointer array first (so it keeps malloc's alignment),
+	 * then the NUL-terminated names, letting the caller free(*out) once. */
+	char **const block = (char **)malloc(n_uri * sizeof(*block) + bytes);
+	if (block == NULL) {
+		LOGOOM();
+		return false;
+	}
+	char *pos = (char *)(block + n_uri);
+	size_t k = 0;
+	for (const mbedtls_x509_sequence *san = &cert->subject_alt_names;
+	     san != NULL; san = san->next) {
+		if (san->buf.tag != X509_SAN_TAG_URI || san->buf.p == NULL) {
+			continue;
+		}
+		ASSERT(k < n_uri);
+		memcpy(pos, san->buf.p, san->buf.len);
+		pos[san->buf.len] = '\0';
+		block[k++] = pos;
+		pos += san->buf.len + 1;
+	}
+	ASSERT(k == n_uri);
+	*out = block;
+	*count = n_uri;
+	return true;
+}
+
+bool tls_peer_psk_label(
+	struct tls_connection *restrict conn, char *restrict buf,
+	size_t *restrict len)
+{
+	if (conn == NULL || buf == NULL || len == NULL ||
+	    *len < TLS_PSK_LABEL_MAX + 1) {
+		return false;
+	}
+	const struct tls_conn_impl *const c = tls_conn_raw(conn);
+	const size_t label_len = strlen(c->psk_label);
+	if (label_len == 0) {
+		/* Certificate handshake: not an error, the caller distinguishes
+		 * the two credential modes by this return. */
+		return false;
+	}
+	memcpy(buf, c->psk_label, label_len + 1);
+	*len = label_len;
+	return true;
+}
+
+/* Info string for tls_psk_label()'s HKDF-Expand.  Must stay byte-identical to
+ * the OpenSSL backend's PSK_LABEL_INFO: the label travels on the wire, so the
+ * two backends have to derive the same one from the same key. */
+#define PSK_LABEL_INFO "multiplexd psk id v1"
+#define PSK_LABEL_RAW_LEN (TLS_PSK_LABEL_MAX / 2u)
+
+/* HKDF-SHA256 with an absent (all-zero) salt, matching OpenSSL's EVP_KDF
+ * default. Split on the same version boundary as the RNG: 4.x removed the
+ * legacy mbedtls_hkdf() module in favour of PSA. */
+static bool psk_hkdf_sha256(
+	const unsigned char *restrict psk, const size_t psk_len,
+	unsigned char *restrict out, const size_t out_len)
+{
+#ifdef MBEDTLS_LEGACY_RNG
+	const mbedtls_md_info_t *const md =
+		mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+	if (md == NULL) {
+		LOGE("mbedtls: SHA-256 unavailable");
+		return false;
+	}
+	const int ret = mbedtls_hkdf(
+		md, NULL, 0, psk, psk_len,
+		(const unsigned char *)PSK_LABEL_INFO,
+		sizeof(PSK_LABEL_INFO) - 1, out, out_len);
+	if (ret != 0) {
+		LOG_MBEDERROR(ERROR, "mbedtls_hkdf", ret);
+		return false;
+	}
+	return true;
+#else /* MBEDTLS_LEGACY_RNG */
+	/* Context-free entry point: tls_ctx_init() initialises PSA, but the key
+	 * generator and config load call this with no context.  psa_crypto_init()
+	 * is idempotent, so initialise defensively rather than ordering-depend. */
+	psa_status_t st = psa_crypto_init();
+	if (st != PSA_SUCCESS) {
+		LOGE_F("psa_crypto_init: %d", (int)st);
+		return false;
+	}
+	psa_key_derivation_operation_t op = PSA_KEY_DERIVATION_OPERATION_INIT;
+	st = psa_key_derivation_setup(&op, PSA_ALG_HKDF(PSA_ALG_SHA_256));
+	if (st == PSA_SUCCESS) {
+		st = psa_key_derivation_input_bytes(
+			&op, PSA_KEY_DERIVATION_INPUT_SALT, NULL, 0);
+	}
+	if (st == PSA_SUCCESS) {
+		st = psa_key_derivation_input_bytes(
+			&op, PSA_KEY_DERIVATION_INPUT_SECRET, psk, psk_len);
+	}
+	if (st == PSA_SUCCESS) {
+		st = psa_key_derivation_input_bytes(
+			&op, PSA_KEY_DERIVATION_INPUT_INFO,
+			(const unsigned char *)PSK_LABEL_INFO,
+			sizeof(PSK_LABEL_INFO) - 1);
+	}
+	if (st == PSA_SUCCESS) {
+		st = psa_key_derivation_output_bytes(&op, out, out_len);
+	}
+	(void)psa_key_derivation_abort(&op);
+	if (st != PSA_SUCCESS) {
+		LOGE_F("psa HKDF-SHA256: %d", (int)st);
+		return false;
+	}
+	return true;
+#endif /* MBEDTLS_LEGACY_RNG */
+}
+
+bool tls_psk_label(
+	const unsigned char *restrict psk, const size_t psk_len,
+	char *restrict buf, size_t *restrict len)
+{
+	if (psk == NULL || buf == NULL || len == NULL ||
+	    *len < TLS_PSK_LABEL_MAX + 1 || psk_len < TLS_PSK_MIN_LEN ||
+	    psk_len > TLS_PSK_MAX_LEN) {
+		return false;
+	}
+	unsigned char raw[PSK_LABEL_RAW_LEN];
+	if (!psk_hkdf_sha256(psk, psk_len, raw, sizeof(raw))) {
+		return false;
+	}
+	for (size_t i = 0; i < sizeof(raw); i++) {
+		static const char hex[] = "0123456789abcdef";
+		buf[i * 2] = hex[raw[i] >> 4u];
+		buf[i * 2 + 1] = hex[raw[i] & 0x0fu];
+	}
+	buf[TLS_PSK_LABEL_MAX] = '\0';
+	mbedtls_platform_zeroize(raw, sizeof(raw));
+	*len = TLS_PSK_LABEL_MAX;
 	return true;
 }
 

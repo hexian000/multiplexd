@@ -94,3 +94,30 @@ if(WITH_OPENSSL)
     add_test(NAME tls_openssl_test COMMAND tls_openssl_test)
     add_dependencies(check tls_openssl_test)
 endif()
+
+# White-box: compiles tls_mbedtls.c into the test TU to reach its static
+# error-classification helpers (map_io_error and the socket-offload BIO
+# callbacks).  The codes they translate come from the library or the kernel, so
+# no black-box handshake can present a chosen one.  Must NOT link `shim`, which
+# would duplicate tls_mbedtls.c's public symbols; util.c is compiled in directly
+# for sock_would_block(), the shared transient-backpressure predicate.
+if(WITH_MBEDTLS)
+    add_executable(tls_mbedtls_test tls_mbedtls_test.c util.c)
+    target_include_directories(tls_mbedtls_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_include_directories(tls_mbedtls_test PRIVATE ${CMAKE_SOURCE_DIR}/contrib/csnippets)
+    target_include_directories(tls_mbedtls_test SYSTEM PRIVATE ${TLS_INCLUDES})
+
+    target_compile_options(tls_mbedtls_test PRIVATE "-include${CMAKE_CURRENT_BINARY_DIR}/../config.h")
+    target_compile_options(tls_mbedtls_test PRIVATE -pedantic -Wall -Wextra -Werror)
+
+    if(FORCE_POSIX)
+        target_compile_definitions(tls_mbedtls_test PRIVATE _POSIX_C_SOURCE=200809L)
+    else()
+        target_compile_definitions(tls_mbedtls_test PRIVATE _GNU_SOURCE)
+    endif()
+
+    target_link_libraries(tls_mbedtls_test PRIVATE csnippets ${TLS_LIBS})
+
+    add_test(NAME tls_mbedtls_test COMMAND tls_mbedtls_test)
+    add_dependencies(check tls_mbedtls_test)
+endif()

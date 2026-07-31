@@ -20,7 +20,9 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
 
 #if WITH_THREADS
 #include <threads.h>
@@ -62,6 +64,21 @@
  * @return false if the entropy source could not be opened or read.
  */
 bool csprng_bytes(unsigned char *buf, size_t len);
+
+/**
+ * @brief Remove a file, warning rather than failing when it cannot be.
+ * Used to discard partially written output.
+ */
+void discard_file(const char *path);
+
+/**
+ * @brief Create @p path exclusively and wrap it in a write stream.
+ * @param mode Permission bits, masked by umask (an upper bound, not a
+ * guarantee).
+ * @return The stream, or NULL on failure (logged).  O_EXCL means an existing
+ * file is never overwritten, which is what makes it safe for key material.
+ */
+FILE *create_exclusive(const char *path, mode_t mode);
 
 /* RFC 1035 Section 2.3.4: a fully-qualified domain name is at most 255 octets. */
 #define FQDN_MAX_LENGTH ((size_t)255)
@@ -106,6 +123,35 @@ enum mime_check_result {
 enum mime_check_result
 mime_check_media(char *buf, const char *subtype, const char **version_out);
 
+/* An identity is only NUL-excluded per doc/spec.md 5.2.3.2, so a peer may claim
+ * one holding quotes, backslashes, newlines or other control bytes. Escape it
+ * before interpolating into text output, or a crafted identity forges log
+ * records, corrupts the /metrics exposition, or drives a reader's terminal.
+ *
+ * Worst case per octet is a plaintext control byte at 4 bytes (\xNN); the
+ * metric context never exceeds 2x. */
+enum { IDENTITY_ESCAPED_MAX = 4 * 255 + 1 };
+
+/* escape_identity() target grammar. The Prometheus 0.0.4 text format accepts
+ * only \\, \" and \n as backslash escapes inside a label value; any other
+ * escape (e.g. \t or \r) is an "invalid escape sequence" that makes the whole
+ * scrape unparseable, so TAB and CR are emitted literally there -- both are
+ * valid label-value bytes. Plaintext -- a log record or a status line -- has no
+ * such grammar, so it escapes every control byte: TAB and CR as \t and \r, and
+ * any other C0 byte (e.g. ESC) as an inert \xNN. */
+enum escape_ctx { ESCAPE_METRIC, ESCAPE_PLAIN };
+
+/**
+ * @brief Escape an identity for interpolation into text output.
+ * @param[out] out Escaped result; always NUL-terminated, truncated to fit.
+ * @param outsize Size of out; IDENTITY_ESCAPED_MAX never truncates.
+ * @param[in] in Identity to escape, NUL-terminated.
+ * @param ctx Grammar the escaping must satisfy.
+ */
+void escape_identity(
+	char *restrict out, size_t outsize, const char *restrict in,
+	enum escape_ctx ctx);
+
 #if WITH_TLS
 /**
  * @brief Callback for alpn_tokenize(): invoked once per non-empty ALPN
@@ -127,6 +173,40 @@ typedef bool (*alpn_field_fn)(void *ctx, const char *name, size_t len);
 bool alpn_tokenize(
 	char *restrict work, const char *restrict list, alpn_field_fn fn,
 	void *ctx);
+
+struct tls_connection;
+
+/* URI subjectAltName scheme carrying a peer's mux identity: the opaque
+ * (path-rootless) form "multiplexd:<identity>", with the identity
+ * percent-encoded.  The authority form "multiplexd://<identity>" is
+ * deliberately not used -- RFC 5280 Section 4.2.1.6 then requires the host to
+ * be a fully qualified domain name or IP address, and an identity is neither.
+ * Matched exactly: RFC 3986 schemes are case-insensitive with lowercase
+ * canonical, and accepting only the canonical spelling keeps the comparison a
+ * plain prefix match. */
+#define IDENTITY_URI_SCHEME "multiplexd:"
+
+/* Longest percent-encoded identity worth examining: the spec's 255-octet wire
+ * limit on a received identity (mux/handshake.h proto_hello.identity) with
+ * every octet escaped.  A longer name cannot decode to an identity any peer
+ * could have claimed, so it is rejected without decoding.
+ *
+ * Deliberately the received limit, not MUX_MAX_CLAIM_LEN: that bounds what
+ * *this* implementation claims, while what is checked here is what a peer
+ * claimed, which is accepted up to the full 255. */
+#define IDENTITY_ENCODED_MAX ((size_t)255 * 3)
+
+/**
+ * @brief True when the peer's certificate names @p identity in a URI
+ * subjectAltName, i.e. carries IDENTITY_URI_SCHEME followed by the
+ * percent-encoded identity (spec Section 10.1, identity-specific certificate
+ * pinning).
+ * @param conn Connection whose handshake has completed.
+ * @param[in] identity Identity claimed by the peer, NUL-terminated.
+ * @return true only on a match; false when the peer presented no certificate,
+ * carries no such name, or the name is malformed.
+ */
+bool identity_matches_cert(struct tls_connection *conn, const char *identity);
 #endif /* WITH_TLS */
 
 #endif /* SHIM_UTIL_H */

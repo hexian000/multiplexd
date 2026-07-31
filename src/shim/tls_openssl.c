@@ -12,18 +12,24 @@
 #include "shim/util.h"
 
 #include "meta/minmax.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
+#include <openssl/asn1.h>
 #include <openssl/bio.h>
+#include <openssl/core_names.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
 #include <openssl/obj_mac.h>
 #include <openssl/objects.h>
 #include <openssl/opensslv.h>
+#include <openssl/params.h>
 #include <openssl/pem.h>
 #include <openssl/pemerr.h>
 #include <openssl/prov_ssl.h>
+#include <openssl/safestack.h>
 #include <openssl/ssl.h>
 #include <openssl/tls1.h>
 #include <openssl/types.h>
@@ -36,6 +42,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -213,6 +220,64 @@ static bool alpn_wire_from_list(
  * the tls_ctx_impl wrapper's: SSL_new up-refs only the SSL_CTX, and tls_ctx_free
  * frees the wrapper while accepted connections may still be mid-handshake, so
  * the callback must not reach into the wrapper. */
+/* Info string for tls_psk_label()'s HKDF-Expand.  Versioned: changing the
+ * derivation changes every deployment's wire labels, so a future revision must
+ * bump this rather than silently reinterpret the same input. */
+#define PSK_LABEL_INFO "multiplexd psk id v1"
+/* Octets of HKDF output behind the hex label. */
+#define PSK_LABEL_RAW_LEN (TLS_PSK_LABEL_MAX / 2u)
+
+bool tls_psk_label(
+	const unsigned char *restrict psk, const size_t psk_len,
+	char *restrict buf, size_t *restrict len)
+{
+	if (psk == NULL || buf == NULL || len == NULL ||
+	    *len < TLS_PSK_LABEL_MAX + 1 || psk_len < TLS_PSK_MIN_LEN ||
+	    psk_len > TLS_PSK_MAX_LEN) {
+		return false;
+	}
+	EVP_KDF *const kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
+	if (kdf == NULL) {
+		LOG_SSLERROR(ERROR, "EVP_KDF_fetch(HKDF)");
+		return false;
+	}
+	EVP_KDF_CTX *const kctx = EVP_KDF_CTX_new(kdf);
+	EVP_KDF_free(kdf);
+	if (kctx == NULL) {
+		LOG_SSLERROR(ERROR, "EVP_KDF_CTX_new");
+		return false;
+	}
+	/* Salt is deliberately absent: HKDF-Extract with an all-zero salt, so
+	 * both backends agree without exchanging one. */
+	char digest[] = "SHA256";
+	char info[] = PSK_LABEL_INFO;
+	const OSSL_PARAM params[] = {
+		OSSL_PARAM_construct_utf8_string(
+			OSSL_KDF_PARAM_DIGEST, digest, 0),
+		OSSL_PARAM_construct_octet_string(
+			OSSL_KDF_PARAM_KEY, (void *)(uintptr_t)psk, psk_len),
+		OSSL_PARAM_construct_octet_string(
+			OSSL_KDF_PARAM_INFO, info, sizeof(info) - 1),
+		OSSL_PARAM_construct_end(),
+	};
+	unsigned char raw[PSK_LABEL_RAW_LEN];
+	const int ret = EVP_KDF_derive(kctx, raw, sizeof(raw), params);
+	EVP_KDF_CTX_free(kctx);
+	if (ret <= 0) {
+		LOG_SSLERROR(ERROR, "EVP_KDF_derive");
+		return false;
+	}
+	for (size_t i = 0; i < sizeof(raw); i++) {
+		static const char hex[] = "0123456789abcdef";
+		buf[i * 2] = hex[raw[i] >> 4u];
+		buf[i * 2 + 1] = hex[raw[i] & 0x0fu];
+	}
+	buf[TLS_PSK_LABEL_MAX] = '\0';
+	OPENSSL_cleanse(raw, sizeof(raw));
+	*len = TLS_PSK_LABEL_MAX;
+	return true;
+}
+
 struct alpn_wire {
 	unsigned char *buf;
 	size_t len;
@@ -541,7 +606,11 @@ static bool load_cert_from_bio(SSL_CTX *ctx, BIO *bio)
 	if (!pem_scan_ended_cleanly()) {
 		return false;
 	}
-	return (count > 0);
+	if (count == 0) {
+		LOGE("no certificates parsed from certificate data");
+		return false;
+	}
+	return true;
 }
 
 /* Refuses to prompt: with no callback, PEM_read_bio_PrivateKey falls back to
@@ -733,6 +802,346 @@ tls_ctx_apply_ciphersuites(SSL_CTX *ssl_ctx, const char *ciphersuites)
 	return true;
 }
 
+/* PSK credentials retained for the SSL_CTX's lifetime.  Hung off the SSL_CTX
+ * via ex_data for the same reason as struct alpn_wire: the handshake callbacks
+ * receive only an SSL, and SSL_new up-refs the SSL_CTX rather than this
+ * backend's wrapper, so reaching into the wrapper could dangle. */
+struct psk_conf {
+	/* Client role: the offered key and its derived label. */
+	unsigned char psk[TLS_PSK_MAX_LEN];
+	size_t psk_len;
+	char label[TLS_PSK_LABEL_MAX + 1];
+	/* Server role. */
+	tls_psk_lookup_fn lookup;
+	void *lookup_ctx;
+	/* Suite whose handshake hash the PSK is bound to; see psk_pick_cipher. */
+	const SSL_CIPHER *cipher;
+};
+
+static void psk_conf_ex_free(
+	void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl,
+	void *argp)
+{
+	(void)parent;
+	(void)ad;
+	(void)idx;
+	(void)argl;
+	(void)argp;
+	struct psk_conf *const pc = ptr;
+	if (pc != NULL) {
+		OPENSSL_cleanse(pc->psk, sizeof(pc->psk));
+		free(pc);
+	}
+}
+
+static CRYPTO_ONCE g_psk_ex_idx_once = CRYPTO_ONCE_STATIC_INIT;
+static int g_psk_ctx_ex_idx = -1;
+static int g_psk_ssl_ex_idx = -1;
+
+/* CRYPTO_EX_free for the per-connection label: without it the string outlives
+ * the SSL that owns it, which the sanitizer build reports as a leak. */
+static void psk_label_ex_free(
+	void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl,
+	void *argp)
+{
+	(void)parent;
+	(void)ad;
+	(void)idx;
+	(void)argl;
+	(void)argp;
+	OPENSSL_free(ptr);
+}
+
+static void psk_ex_idx_init(void)
+{
+	g_psk_ctx_ex_idx =
+		SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, psk_conf_ex_free);
+	/* The per-connection label is a plain heap string; freed with the SSL. */
+	g_psk_ssl_ex_idx =
+		SSL_get_ex_new_index(0, NULL, NULL, NULL, psk_label_ex_free);
+}
+
+static bool psk_ex_idx_ready(void)
+{
+	return CRYPTO_THREAD_run_once(&g_psk_ex_idx_once, psk_ex_idx_init) ==
+		       1 &&
+	       g_psk_ctx_ex_idx >= 0 && g_psk_ssl_ex_idx >= 0;
+}
+
+static struct psk_conf *psk_conf_of(SSL *ssl)
+{
+	if (!psk_ex_idx_ready()) {
+		return NULL;
+	}
+	return SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), g_psk_ctx_ex_idx);
+}
+
+/* Record which label authenticated this connection, for tls_peer_psk_label().
+ * OpenSSL exposes no getter for the negotiated PSK identity, so both callbacks
+ * stash it as the handshake selects it. */
+static bool psk_conn_set_label(SSL *ssl, const char *label)
+{
+	if (!psk_ex_idx_ready()) {
+		return false;
+	}
+	char *const dup = OPENSSL_strdup(label);
+	if (dup == NULL) {
+		LOGOOM();
+		return false;
+	}
+	OPENSSL_free(SSL_get_ex_data(ssl, g_psk_ssl_ex_idx));
+	if (SSL_set_ex_data(ssl, g_psk_ssl_ex_idx, dup) != 1) {
+		OPENSSL_free(dup);
+		return false;
+	}
+	return true;
+}
+
+/* The five TLS 1.3 suites, by IANA id.  SSL_CTX_get_ciphers() also carries the
+ * separate TLS 1.2 list, which pinning min=max=TLS1.3 does not remove, so the
+ * suite is matched by id rather than by position. */
+static bool cipher_is_tls13(const SSL_CIPHER *c)
+{
+	switch (SSL_CIPHER_get_id(c)) {
+	case 0x03001301u: /* TLS_AES_128_GCM_SHA256 */
+	case 0x03001302u: /* TLS_AES_256_GCM_SHA384 */
+	case 0x03001303u: /* TLS_CHACHA20_POLY1305_SHA256 */
+	case 0x03001304u: /* TLS_AES_128_CCM_SHA256 */
+	case 0x03001305u: /* TLS_AES_128_CCM_8_SHA256 */
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Choose the suite whose handshake hash binds the PSK.
+ *
+ * A TLS 1.3 PSK is tied to one hash, so both peers must land on a suite using
+ * it or the handshake cannot complete.  With an explicit tls.ciphersuites the
+ * first configured suite decides, which keeps the option meaningful; with none
+ * configured SHA-256 is chosen rather than OpenSSL's default preference, whose
+ * first entry is TLS_AES_256_GCM_SHA384.  The caller then narrows the suite
+ * list to that hash, so negotiation cannot pick a mismatching one. */
+static const SSL_CIPHER *
+psk_pick_cipher(SSL_CTX *ssl_ctx, const char *ciphersuites)
+{
+	STACK_OF(SSL_CIPHER) *const sk = SSL_CTX_get_ciphers(ssl_ctx);
+	if (sk == NULL) {
+		return NULL;
+	}
+	const int n = sk_SSL_CIPHER_num(sk);
+	const SSL_CIPHER *sha256 = NULL;
+	for (int i = 0; i < n; i++) {
+		const SSL_CIPHER *const c = sk_SSL_CIPHER_value(sk, i);
+		if (!cipher_is_tls13(c)) {
+			continue;
+		}
+		if (ciphersuites != NULL) {
+			return c; /* first configured suite wins */
+		}
+		if (sha256 == NULL &&
+		    SSL_CIPHER_get_handshake_digest(c) == EVP_sha256()) {
+			sha256 = c;
+		}
+	}
+	return sha256;
+}
+
+/* Narrow the TLS 1.3 suite list to those sharing @p cipher's handshake hash,
+ * so a PSK bound to that hash can always be used by whatever is negotiated. */
+static bool
+psk_restrict_ciphersuites(SSL_CTX *ssl_ctx, const SSL_CIPHER *restrict cipher)
+{
+	const EVP_MD *const want = SSL_CIPHER_get_handshake_digest(cipher);
+	STACK_OF(SSL_CIPHER) *const sk = SSL_CTX_get_ciphers(ssl_ctx);
+	char list[256];
+	size_t w = 0;
+	const int n = sk == NULL ? 0 : sk_SSL_CIPHER_num(sk);
+	for (int i = 0; i < n; i++) {
+		const SSL_CIPHER *const c = sk_SSL_CIPHER_value(sk, i);
+		if (!cipher_is_tls13(c) ||
+		    SSL_CIPHER_get_handshake_digest(c) != want) {
+			continue;
+		}
+		const char *const name = SSL_CIPHER_get_name(c);
+		const int len = snprintf(
+			list + w, sizeof(list) - w, "%s%s", w > 0 ? ":" : "",
+			name);
+		if (len < 0 || (size_t)len >= sizeof(list) - w) {
+			LOGE("tls.psk: ciphersuite list too long");
+			return false;
+		}
+		w += (size_t)len;
+	}
+	if (w == 0) {
+		LOGE("tls.psk: no TLS 1.3 ciphersuite matches the PSK hash");
+		return false;
+	}
+	if (SSL_CTX_set_ciphersuites(ssl_ctx, list) != 1) {
+		LOG_SSLERROR(ERROR, "SSL_CTX_set_ciphersuites(psk)");
+		return false;
+	}
+	return true;
+}
+
+static SSL_SESSION *psk_session_new(
+	const SSL_CIPHER *restrict cipher, const unsigned char *restrict key,
+	const size_t key_len)
+{
+	SSL_SESSION *const sess = SSL_SESSION_new();
+	if (sess == NULL) {
+		LOG_SSLERROR(ERROR, "SSL_SESSION_new");
+		return NULL;
+	}
+	if (SSL_SESSION_set1_master_key(sess, key, key_len) != 1 ||
+	    SSL_SESSION_set_cipher(sess, cipher) != 1 ||
+	    SSL_SESSION_set_protocol_version(sess, TLS1_3_VERSION) != 1) {
+		LOG_SSLERROR(ERROR, "SSL_SESSION setup");
+		SSL_SESSION_free(sess);
+		return NULL;
+	}
+	return sess;
+}
+
+/* Server role: resolve the label the client offered.  Returning 1 with
+ * *sess == NULL means "no PSK for this identity"; the handshake then fails on
+ * its own, since a PSK-mode context has no certificate to fall back to. */
+static int psk_find_session_cb(
+	SSL *ssl, const unsigned char *identity, size_t identity_len,
+	SSL_SESSION **sess)
+{
+	*sess = NULL;
+	struct psk_conf *const pc = psk_conf_of(ssl);
+	if (pc == NULL || pc->lookup == NULL) {
+		return 1;
+	}
+	/* Attacker-chosen and not NUL-terminated: bound it, and reject an
+	 * embedded NUL rather than truncating to a shorter label that might
+	 * resolve to a different peer's key. */
+	if (identity_len > TLS_PSK_LABEL_MAX ||
+	    memchr(identity, '\0', identity_len) != NULL) {
+		return 1;
+	}
+	char label[TLS_PSK_LABEL_MAX + 1];
+	memcpy(label, identity, identity_len);
+	label[identity_len] = '\0';
+
+	unsigned char key[TLS_PSK_MAX_LEN];
+	size_t key_len = sizeof(key);
+	if (!pc->lookup(pc->lookup_ctx, label, key, &key_len)) {
+		return 1;
+	}
+	SSL_SESSION *const s = psk_session_new(pc->cipher, key, key_len);
+	OPENSSL_cleanse(key, sizeof(key));
+	if (s == NULL) {
+		return 0;
+	}
+	if (!psk_conn_set_label(ssl, label)) {
+		SSL_SESSION_free(s);
+		return 0;
+	}
+	*sess = s;
+	return 1;
+}
+
+/* Client role: offer the single configured PSK. */
+static int psk_use_session_cb(
+	SSL *ssl, const EVP_MD *md, const unsigned char **id, size_t *idlen,
+	SSL_SESSION **sess)
+{
+	*sess = NULL;
+	struct psk_conf *const pc = psk_conf_of(ssl);
+	if (pc == NULL || pc->psk_len == 0) {
+		return 1;
+	}
+	/* When OpenSSL asks for a particular digest, only offer the PSK if it is
+	 * the one the key is bound to. */
+	if (md != NULL && SSL_CIPHER_get_handshake_digest(pc->cipher) != md) {
+		return 1;
+	}
+	SSL_SESSION *const s =
+		psk_session_new(pc->cipher, pc->psk, pc->psk_len);
+	if (s == NULL) {
+		return 0;
+	}
+	if (!psk_conn_set_label(ssl, pc->label)) {
+		SSL_SESSION_free(s);
+		return 0;
+	}
+	*id = (const unsigned char *)pc->label;
+	*idlen = strlen(pc->label);
+	*sess = s;
+	return 1;
+}
+
+/* Install PSK credentials on a context, replacing certificate authentication.
+ * Returns false on failure; the caller frees the context. */
+static bool tls_ctx_set_psk(
+	struct tls_ctx_impl *restrict c, const struct tls_config *restrict conf,
+	const bool is_server)
+{
+	if (!psk_ex_idx_ready()) {
+		LOGE("failed to register PSK ex_data slots");
+		return false;
+	}
+	const SSL_CIPHER *const cipher =
+		psk_pick_cipher(c->ssl_ctx, conf->ciphersuites);
+	if (cipher == NULL) {
+		LOGE("tls.psk: no usable TLS 1.3 ciphersuite");
+		return false;
+	}
+	if (!psk_restrict_ciphersuites(c->ssl_ctx, cipher)) {
+		return false;
+	}
+	struct psk_conf *const pc = calloc(1, sizeof(*pc));
+	if (pc == NULL) {
+		LOGOOM();
+		return false;
+	}
+	pc->cipher = cipher;
+	if (is_server) {
+		pc->lookup = conf->psk_lookup;
+		pc->lookup_ctx = conf->psk_lookup_ctx;
+	} else {
+		if (conf->psk_len < TLS_PSK_MIN_LEN ||
+		    conf->psk_len > TLS_PSK_MAX_LEN) {
+			LOGE("tls.psk: key length out of range");
+			free(pc);
+			return false;
+		}
+		memcpy(pc->psk, conf->psk, conf->psk_len);
+		pc->psk_len = conf->psk_len;
+		size_t label_len = sizeof(pc->label);
+		if (!tls_psk_label(
+			    pc->psk, pc->psk_len, pc->label, &label_len)) {
+			LOGE("tls.psk: failed to derive the identity label");
+			OPENSSL_cleanse(pc->psk, sizeof(pc->psk));
+			free(pc);
+			return false;
+		}
+	}
+	if (SSL_CTX_set_ex_data(c->ssl_ctx, g_psk_ctx_ex_idx, pc) != 1) {
+		LOG_SSLERROR(ERROR, "SSL_CTX_set_ex_data(psk)");
+		OPENSSL_cleanse(pc->psk, sizeof(pc->psk));
+		free(pc);
+		return false;
+	}
+	if (is_server) {
+		SSL_CTX_set_psk_find_session_callback(
+			c->ssl_ctx, psk_find_session_cb);
+	} else {
+		SSL_CTX_set_psk_use_session_callback(
+			c->ssl_ctx, psk_use_session_cb);
+	}
+	return true;
+}
+
+/* True when the config selects PSK rather than certificate authentication. */
+static bool tls_conf_is_psk(const struct tls_config *restrict conf)
+{
+	return conf->psk_lookup != NULL || conf->psk_len > 0;
+}
+
 struct tls_context *tls_ctx_server(const struct tls_config *conf)
 {
 	ERR_clear_error();
@@ -756,34 +1165,46 @@ struct tls_context *tls_ctx_server(const struct tls_config *conf)
 
 	tls_ctx_tune(ssl_ctx, conf->kernel_offload, conf->readahead);
 
-	if (!tls_load_cert(ctx, conf->cert)) {
-		LOGE("failed to load TLS certificate");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
+	const bool is_psk = tls_conf_is_psk(conf);
+	if (!is_psk) {
+		if (!tls_load_cert(ctx, conf->cert)) {
+			LOGE("failed to load TLS certificate");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 
-	if (!tls_load_key(ctx, conf->key)) {
-		LOGE("failed to load TLS private key");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
+		if (!tls_load_key(ctx, conf->key)) {
+			LOGE("failed to load TLS private key");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 
-	if (!SSL_CTX_check_private_key(ssl_ctx)) {
-		LOG_SSLERROR(ERROR, "SSL_CTX_check_private_key");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
+		if (!SSL_CTX_check_private_key(ssl_ctx)) {
+			LOG_SSLERROR(ERROR, "SSL_CTX_check_private_key");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 
-	if (!tls_load_authcerts(ctx, conf->authcerts, conf->authcerts_count)) {
-		LOGE("failed to load authorized certificates");
-		tls_ctx_free(ctx);
-		return NULL;
+		if (!tls_load_authcerts(
+			    ctx, conf->authcerts, conf->authcerts_count)) {
+			LOGE("failed to load authorized certificates");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+		SSL_CTX_set_verify(
+			ssl_ctx,
+			SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+			tls_verify_cert_strength_cb);
 	}
-	SSL_CTX_set_verify(
-		ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-		tls_verify_cert_strength_cb);
 
 	if (!tls_ctx_apply_ciphersuites(ssl_ctx, conf->ciphersuites)) {
+		tls_ctx_free(ctx);
+		return NULL;
+	}
+
+	/* After the suite list is applied: the PSK is bound to a hash chosen
+	 * from it, and the list is then narrowed to that hash. */
+	if (is_psk && !tls_ctx_set_psk(c, conf, true)) {
 		tls_ctx_free(ctx);
 		return NULL;
 	}
@@ -818,36 +1239,45 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf)
 	}
 	tls_ctx_tune(ssl_ctx, conf->kernel_offload, conf->readahead);
 
-	/* Client certificate is mandatory for mutual authentication */
-	if (!tls_load_cert(ctx, conf->cert)) {
-		LOGE("failed to load TLS certificate");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
+	const bool is_psk = tls_conf_is_psk(conf);
+	if (!is_psk) {
+		/* Client certificate is mandatory for mutual authentication */
+		if (!tls_load_cert(ctx, conf->cert)) {
+			LOGE("failed to load TLS certificate");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 
-	if (!tls_load_key(ctx, conf->key)) {
-		LOGE("failed to load TLS private key");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
+		if (!tls_load_key(ctx, conf->key)) {
+			LOGE("failed to load TLS private key");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 
-	if (!SSL_CTX_check_private_key(ssl_ctx)) {
-		LOG_SSLERROR(ERROR, "SSL_CTX_check_private_key");
-		tls_ctx_free(ctx);
-		return NULL;
-	}
+		if (!SSL_CTX_check_private_key(ssl_ctx)) {
+			LOG_SSLERROR(ERROR, "SSL_CTX_check_private_key");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 
-	if (!tls_load_authcerts(ctx, conf->authcerts, conf->authcerts_count)) {
-		LOGE("failed to load authorized certificates");
-		tls_ctx_free(ctx);
-		return NULL;
+		if (!tls_load_authcerts(
+			    ctx, conf->authcerts, conf->authcerts_count)) {
+			LOGE("failed to load authorized certificates");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+		/* Verify the peer certificate against the pinned CA store; hostname check is
+		 * omitted (see "Deployment Notes" in README.md). */
+		SSL_CTX_set_verify(
+			ssl_ctx, SSL_VERIFY_PEER, tls_verify_cert_strength_cb);
 	}
-	/* Verify the peer certificate against the pinned CA store; hostname check is
-	 * omitted (see "Deployment Notes" in README.md). */
-	SSL_CTX_set_verify(
-		ssl_ctx, SSL_VERIFY_PEER, tls_verify_cert_strength_cb);
 
 	if (!tls_ctx_apply_ciphersuites(ssl_ctx, conf->ciphersuites)) {
+		tls_ctx_free(ctx);
+		return NULL;
+	}
+
+	if (is_psk && !tls_ctx_set_psk(c, conf, false)) {
 		tls_ctx_free(ctx);
 		return NULL;
 	}
@@ -1245,19 +1675,154 @@ bool tls_peer_cert_der(
 	}
 	const int der_len = i2d_X509(cert, NULL);
 	if (der_len <= 0) {
+		LOG_SSLERROR(ERROR, "i2d_X509");
 		X509_free(cert);
 		return false;
 	}
 	unsigned char *const der = malloc((size_t)der_len);
 	if (der == NULL) {
+		LOGOOM();
 		X509_free(cert);
 		return false;
 	}
 	unsigned char *p = der;
-	i2d_X509(cert, &p);
+	/* The length query above already succeeded, so this cannot fail; check
+	 * anyway rather than drop the return value. */
+	if (i2d_X509(cert, &p) <= 0) {
+		LOG_SSLERROR(ERROR, "i2d_X509");
+		free(der);
+		X509_free(cert);
+		return false;
+	}
 	X509_free(cert);
 	*out = der;
 	*len = (size_t)der_len;
+	return true;
+}
+
+/* The raw octets of a GeneralName that is a [6] uniformResourceIdentifier, or
+ * NULL for any other CHOICE.  The IA5String is not NUL-terminated, so the
+ * length is returned alongside; the caller checks for an embedded NUL. */
+static const unsigned char *
+san_uri_octets(const GENERAL_NAME *restrict name, int *restrict len)
+{
+	int type = 0;
+	const ASN1_IA5STRING *const uri = GENERAL_NAME_get0_value(name, &type);
+	if (type != GEN_URI || uri == NULL) {
+		return NULL;
+	}
+	const int uri_len = ASN1_STRING_length(uri);
+	const unsigned char *const data = ASN1_STRING_get0_data(uri);
+	if (uri_len < 0 || data == NULL) {
+		return NULL;
+	}
+	*len = uri_len;
+	return data;
+}
+
+bool tls_peer_cert_uri_sans(
+	struct tls_connection *conn, char ***out, size_t *count)
+{
+	if (conn == NULL || out == NULL || count == NULL) {
+		return false;
+	}
+	SSL *const ssl = tls_conn_ssl(conn);
+	ERR_clear_error();
+	X509 *const cert = SSL_get1_peer_certificate(ssl);
+	if (cert == NULL) {
+		return false;
+	}
+	/* X509_get_ext_d2i() decodes into an independently owned object, so the
+	 * certificate is released before the names are walked. */
+	GENERAL_NAMES *const names =
+		X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+	X509_free(cert);
+	if (names == NULL) {
+		/* No subjectAltName extension at all: zero names, not an error. */
+		*out = NULL;
+		*count = 0;
+		return true;
+	}
+	const int num = sk_GENERAL_NAME_num(names);
+
+	/* Pass 1: size the block, rejecting an embedded NUL while the raw octets
+	 * are in hand -- see the tls_peer_cert_uri_sans() contract in tls.h. */
+	size_t n_uri = 0;
+	size_t bytes = 0;
+	for (int i = 0; i < num; i++) {
+		int len = 0;
+		const unsigned char *const data =
+			san_uri_octets(sk_GENERAL_NAME_value(names, i), &len);
+		if (data == NULL) {
+			continue;
+		}
+		if (memchr(data, '\0', (size_t)len) != NULL) {
+			LOGE("peer certificate: URI subjectAltName contains an"
+			     " embedded NUL");
+			GENERAL_NAMES_free(names);
+			return false;
+		}
+		n_uri++;
+		bytes += (size_t)len + 1;
+	}
+	if (n_uri == 0) {
+		GENERAL_NAMES_free(names);
+		*out = NULL;
+		*count = 0;
+		return true;
+	}
+
+	/* One block: the pointer array first (so it keeps malloc's alignment),
+	 * then the NUL-terminated names, letting the caller free(*out) once. */
+	char **const block = (char **)malloc(n_uri * sizeof(*block) + bytes);
+	if (block == NULL) {
+		LOGOOM();
+		GENERAL_NAMES_free(names);
+		return false;
+	}
+	char *pos = (char *)(block + n_uri);
+	size_t k = 0;
+	for (int i = 0; i < num; i++) {
+		int len = 0;
+		const unsigned char *const data =
+			san_uri_octets(sk_GENERAL_NAME_value(names, i), &len);
+		if (data == NULL) {
+			continue;
+		}
+		ASSERT(k < n_uri);
+		memcpy(pos, data, (size_t)len);
+		pos[len] = '\0';
+		block[k++] = pos;
+		pos += (size_t)len + 1;
+	}
+	ASSERT(k == n_uri);
+	GENERAL_NAMES_free(names);
+	*out = block;
+	*count = n_uri;
+	return true;
+}
+
+bool tls_peer_psk_label(
+	struct tls_connection *restrict conn, char *restrict buf,
+	size_t *restrict len)
+{
+	if (conn == NULL || buf == NULL || len == NULL ||
+	    *len < TLS_PSK_LABEL_MAX + 1 || !psk_ex_idx_ready()) {
+		return false;
+	}
+	const char *const label =
+		SSL_get_ex_data(tls_conn_ssl(conn), g_psk_ssl_ex_idx);
+	if (label == NULL) {
+		/* Certificate handshake: not an error, the caller distinguishes
+		 * the two credential modes by this return. */
+		return false;
+	}
+	const size_t label_len = strlen(label);
+	if (label_len > TLS_PSK_LABEL_MAX) {
+		return false;
+	}
+	memcpy(buf, label, label_len + 1);
+	*len = label_len;
 	return true;
 }
 

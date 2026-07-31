@@ -48,8 +48,36 @@ struct tls_callback {
 	void (*on_recv)(void *ctx);
 };
 
+/* External pre-shared key bounds.  RFC 9257 wants a PSK at least as long as
+ * the hash output, and the label published below is a one-way function of the
+ * key, so a low-entropy PSK becomes offline-crackable: the minimum is a floor
+ * on *length*, not on entropy, and keys must come from a CSPRNG. */
+#define TLS_PSK_MIN_LEN 32u
+#define TLS_PSK_MAX_LEN 64u
+/* Derived identity label: 16 octets, lowercase hex, excluding the NUL. */
+#define TLS_PSK_LABEL_MAX 32u
+
+/**
+ * @brief Resolve a PSK identity offered by a client (server role).
+ * @param ctx Opaque context from @c tls_config.psk_lookup_ctx.
+ * @param[in] identity NUL-terminated label from the ClientHello.  Chosen by
+ * the peer and therefore untrusted: already bounded at ::TLS_PSK_LABEL_MAX,
+ * but never log it unescaped.
+ * @param[out] key Caller-provided buffer of ::TLS_PSK_MAX_LEN octets.  Copied
+ * into rather than lent, so no key outlives the call.
+ * @param[inout] key_len In: capacity.  Out: octets written.
+ * @return true if the identity is known; false rejects the handshake.
+ */
+typedef bool (*tls_psk_lookup_fn)(
+	void *ctx, const char *identity, unsigned char *key, size_t *key_len);
+
 /**
  * @brief Runtime TLS parameters for @c tls_ctx_server / @c tls_ctx_client.
+ *
+ * Exactly one credential set must be supplied: the certificate fields
+ * (@c cert, @c key, @c authcerts) or the PSK fields.  They are mutually
+ * exclusive -- a PSK handshake sends no Certificate message in either
+ * direction, which is the point of offering it.
  *
  * String fields are PEM data or "@filename" (see @c tls_load_cert), only borrowed
  * for the duration of the call; the implementation copies what it retains.
@@ -61,6 +89,15 @@ struct tls_config {
 	/* Authorized certificate PEMs/filenames; may be NULL. */
 	char *const *authcerts;
 	size_t authcerts_count;
+	/* Client role: the single PSK offered.  Both backends accept only one
+	 * client-side PSK, so a node that dials several peers offers the first
+	 * key it has configured.  Borrowed; the implementation copies it. */
+	const unsigned char *psk;
+	size_t psk_len;
+	/* Server role: resolves a label the client offered.  NULL leaves PSK
+	 * handshakes unsupported on this context. */
+	tls_psk_lookup_fn psk_lookup;
+	void *psk_lookup_ctx;
 	/* Colon-separated TLS 1.3 cipher suites, or NULL for defaults. */
 	const char *ciphersuites;
 	/* Comma-separated ALPN list; NULL or empty omits the extension. */
@@ -130,15 +167,40 @@ bool tls_load_authcerts(
 void tls_secure_erase(void *ptr, size_t len);
 
 /**
- * @brief Create a TLS 1.3 server context requiring a client certificate (mutual auth).
- * @param[in] conf Parameters; conf->cert and conf->key MUST NOT be NULL, conf->sni is ignored.
+ * @brief Derive the wire identity label for an external PSK.
+ *
+ * HKDF-SHA256 over the key with a fixed info string, hex-encoded.  The label
+ * is public -- it travels in the ClientHello in the clear -- so it is
+ * deliberately derived from the key rather than from the peer's identity,
+ * which is low-entropy and would be recoverable by dictionary attack.  The
+ * hash is fixed at SHA-256 regardless of the negotiated cipher suite, since
+ * both peers must agree on the label without negotiating it.
+ *
+ * @param[in] psk Key of ::TLS_PSK_MIN_LEN to ::TLS_PSK_MAX_LEN octets.
+ * @param psk_len Key length.
+ * @param[out] buf Receives the NUL-terminated label.
+ * @param[inout] len In: capacity, at least ::TLS_PSK_LABEL_MAX + 1.  Out:
+ * label length excluding the NUL.
+ * @return true on success.
+ * @note Pure and context-free: usable at config load and by the key
+ * generator, not only during a handshake.
+ */
+bool tls_psk_label(
+	const unsigned char *psk, size_t psk_len, char *buf, size_t *len);
+
+/**
+ * @brief Create a TLS 1.3 server context.
+ * @param[in] conf Parameters; exactly one credential set -- conf->cert with
+ * conf->key (mutual certificate authentication, requiring a client
+ * certificate), or conf->psk_lookup (external PSK).  conf->sni is ignored.
  * @return The context, or NULL on failure.
  */
 struct tls_context *tls_ctx_server(const struct tls_config *conf);
 
 /**
- * @brief Create a TLS 1.3 client context that verifies the peer against conf->authcerts.
- * @param[in] conf Parameters; conf->cert and conf->key MUST NOT be NULL.
+ * @brief Create a TLS 1.3 client context.
+ * @param[in] conf Parameters; exactly one credential set -- conf->cert with
+ * conf->key, verifying the peer against conf->authcerts, or conf->psk.
  * @return The context, or NULL on failure.
  */
 struct tls_context *tls_ctx_client(const struct tls_config *conf);
@@ -157,6 +219,10 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf);
  * @param ctx Context to share from; NULL returns NULL.
  * @return An owned context handle to free with @c tls_ctx_free, or NULL on
  *         failure.
+ * @note Backend divergence: the OpenSSL backend refuses to share a server
+ * context that registered an ALPN callback and returns NULL, where mbedTLS
+ * succeeds. A portable caller must not assume a server context can be shared,
+ * and must not read the NULL as an allocation failure.
  */
 struct tls_context *tls_ctx_ref(struct tls_context *ctx);
 
@@ -278,6 +344,45 @@ void tls_conn_free(struct tls_connection *conn);
  */
 bool tls_peer_cert_der(
 	struct tls_connection *conn, unsigned char **out, size_t *len);
+
+/**
+ * @brief The peer certificate's URI subjectAltName entries (RFC 5280
+ * Section 4.2.1.6 uniformResourceIdentifier, GeneralName [6]), available only
+ * after a successful handshake.
+ * @param conn Target connection.
+ * @param[out] out Receives a malloc'd array of NUL-terminated names, or NULL
+ * when the certificate carries none. One allocation: the pointer array is
+ * followed by the name bytes, so a single free(*out) releases everything.
+ * @param[out] count Receives the number of entries; 0 when @p *out is NULL.
+ * @return true on success, including the no-URI-name case; false when no peer
+ * certificate is available, on allocation failure, or when any URI name
+ * contains an embedded NUL.
+ * @note An embedded NUL fails the whole call rather than truncating the name.
+ * A conformant IA5String identity never contains one, and silently accepting
+ * the prefix before it is the null-prefix certificate attack. Neither backend
+ * checks this for us: both hand out raw buffer+length.
+ * @note Exception to this header's NULL convention: both backends check
+ * @p conn, @p out, and @p count defensively and return false if any is NULL,
+ * instead of it being undefined behavior.
+ */
+bool tls_peer_cert_uri_sans(
+	struct tls_connection *conn, char ***out, size_t *count);
+
+/**
+ * @brief The PSK identity label this connection authenticated with.
+ * @param conn Target connection, after a successful handshake.
+ * @param[out] buf Receives the NUL-terminated label.
+ * @param[inout] len In: capacity, at least ::TLS_PSK_LABEL_MAX + 1.  Out:
+ * label length excluding the NUL.
+ * @return true when the handshake used a PSK; false for a certificate
+ * handshake, which is not an error -- the caller distinguishes the two
+ * credential modes by this return.
+ * @note The binder proves the peer holds the key for the label it offered, so
+ * a true return is an authenticated statement of which configured peer this
+ * is -- unlike a certificate's subjectAltName, nothing further need be
+ * checked to trust it.
+ */
+bool tls_peer_psk_label(struct tls_connection *conn, char *buf, size_t *len);
 
 /** @} */
 

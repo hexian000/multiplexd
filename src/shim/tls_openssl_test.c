@@ -18,16 +18,20 @@
 /* Compile the backend into this TU to reach its static floor helpers. */
 #include "tls_openssl.c"
 
+#include "utils/slog.h"
 #include "utils/testing.h"
 
 #include <openssl/asn1.h>
+#include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <openssl/ssl.h>
 #include <openssl/types.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 /* Generate a key pair; a NULL result is a test-setup failure, not a case
  * failure, so abort via T_CHECK rather than returning it. */
@@ -254,10 +258,60 @@ T_DECLARE_CASE(test_verify_cert_strength_cb)
 	EVP_PKEY_free(ec224);
 }
 
+/* Captures slog output so a case can assert on a diagnostic rather than only
+ * on a return value. */
+static char g_log_capture[1024];
+static size_t g_log_capture_len;
+
+static void
+log_capture_writer(void *ud, const unsigned char *buf, const size_t len)
+{
+	(void)ud;
+	if (g_log_capture_len + len + 1 > sizeof(g_log_capture)) {
+		return;
+	}
+	memcpy(g_log_capture + g_log_capture_len, buf, len);
+	g_log_capture_len += len;
+	g_log_capture[g_log_capture_len] = '\0';
+}
+
+/* A PEM source that scans cleanly to EOF but carries no certificate -- a file
+ * holding only a private key, say -- must say so. load_authcert_from_bio logs
+ * the identical condition; without a message here the only trace is the
+ * caller's generic "failed to load TLS certificate", hiding that the data
+ * parsed fine and simply had no certificate in it. */
+T_DECLARE_CASE(test_load_cert_without_certificate_logs)
+{
+	static const char pem[] = "# no certificate in here\n";
+	BIO *const bio = BIO_new_mem_buf(pem, (int)(sizeof(pem) - 1));
+	T_CHECK(bio != NULL);
+	SSL_CTX *const ctx = SSL_CTX_new(TLS_client_method());
+	T_CHECK(ctx != NULL);
+
+	g_log_capture[0] = '\0';
+	g_log_capture_len = 0;
+	const int prev_level = slog_level_;
+	slog_setlevel(LOG_LEVEL_ERROR);
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_capture_writer, NULL);
+	const bool loaded = load_cert_from_bio(ctx, bio);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+	slog_setlevel(prev_level);
+
+	const bool logged =
+		strstr(g_log_capture, "no certificates parsed") != NULL;
+
+	SSL_CTX_free(ctx);
+	BIO_free(bio);
+
+	T_EXPECT(!loaded);
+	T_EXPECT(logged);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_ec_curve_allowlist),
 	T_CASE(test_cert_digest_floor),
 	T_CASE(test_verify_cert_strength_cb),
+	T_CASE(test_load_cert_without_certificate_logs),
 	T_SUITE_END,
 };
 

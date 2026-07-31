@@ -78,6 +78,24 @@ T_DECLARE_CASE(test_resolve_addr_at_length_bound_rejected)
 	T_EXPECT(!resolve_addr(&addr, addrstr, SA_RESOLVE_TCP));
 }
 
+/* addrlen == ADDR_MAX_STRLEN (261): the longest address the bound check
+ * accepts, and the only length at which the copy fills buf exactly. The
+ * rejecting side of the bound is covered above; this drives the accepting side,
+ * where an off-by-one in the copy length writes one byte past a stack buffer.
+ * Resolution then fails on the nonexistent host, so the return value says
+ * nothing -- the assertion here is ASan's, under the sanitizer build. */
+T_DECLARE_CASE(test_resolve_addr_at_length_bound_copies_in_bounds)
+{
+	char addrstr[ADDR_MAX_STRLEN + 1];
+	memset(addrstr, 'a', sizeof(addrstr) - 6);
+	memcpy(addrstr + sizeof(addrstr) - 6, ":1234", 6);
+	T_EXPECT_EQ(strlen(addrstr), (size_t)ADDR_MAX_STRLEN);
+
+	union sockaddr_max addr;
+	(void)resolve_addr(&addr, addrstr, SA_RESOLVE_TCP);
+	(void)resolve_bindaddr(&addr, addrstr, SA_RESOLVE_TCP);
+}
+
 T_DECLARE_CASE(test_resolve_bindaddr_ipv4_parses_correctly)
 {
 	union sockaddr_max addr;
@@ -281,6 +299,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_resolve_addr_invalid_returns_false),
 	T_CASE(test_resolve_addr_oversized_returns_false),
 	T_CASE(test_resolve_addr_at_length_bound_rejected),
+	T_CASE(test_resolve_addr_at_length_bound_copies_in_bounds),
 	T_CASE(test_resolve_bindaddr_ipv4_parses_correctly),
 	T_CASE(test_resolve_bindaddr_invalid_returns_false),
 	T_CASE(test_resolve_bindaddr_oversized_returns_false),
