@@ -5,16 +5,18 @@
  * Uses the public mux API; local proto_hello_build crafts raw hello bytes
  * for the raw-peer driver. */
 
+#include "mux/mux.h"
+
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
-#include "mux/mux.h"
 #include "mux/proto_schema.gen.h"
 #include "mux/recv.h"
 #include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.h"
 #include "mux/stream.h"
+#include "mux/stream_io.h"
 #include "mux/unacked.h"
 #include "mux/wire.h"
 #if WITH_TLS
@@ -753,7 +755,7 @@ static void pending_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	}
 
 	struct mux_test_fixture *const restrict fx = pa->fx;
-	const struct mux_config srv_conf = {
+	const struct mux_session_config srv_conf = {
 		.timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
@@ -763,7 +765,8 @@ static void pending_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		.max_streams = 64,
 		.stream_window = 4,
 		.session_window = 256,
-		.max_frame_payload = mux_conf_default.max_frame_payload,
+		.max_frame_payload =
+			mux_session_config_default.max_frame_payload,
 		.nodelay = fx->nodelay,
 	};
 	unsigned char srv_sid[MUX_SESSION_ID_LEN];
@@ -799,9 +802,9 @@ static void pending_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	/* The listen socket remains open so the client can reconnect. */
 }
 
-static struct mux_config make_cli_conf(const bool nodelay)
+static struct mux_session_config make_cli_conf(const bool nodelay)
 {
-	return (struct mux_config){
+	return (struct mux_session_config){
 		.nodelay = nodelay,
 		.timeout = 30,
 		.keepalive = 15,
@@ -812,7 +815,8 @@ static struct mux_config make_cli_conf(const bool nodelay)
 		.max_streams = 64,
 		.stream_window = 4,
 		.session_window = 256,
-		.max_frame_payload = mux_conf_default.max_frame_payload,
+		.max_frame_payload =
+			mux_session_config_default.max_frame_payload,
 	};
 }
 
@@ -889,7 +893,7 @@ static int fixture_setup(struct mux_test_fixture *restrict fx)
 
 	/* Client session: fd=-1, session_connect() will call connect() and
 	 * arm EV_WRITE on the TCP connection. */
-	const struct mux_config cli_conf = make_cli_conf(fx->nodelay);
+	const struct mux_session_config cli_conf = make_cli_conf(fx->nodelay);
 	unsigned char cli_sid[MUX_SESSION_ID_LEN];
 	proto_session_id_new(cli_sid);
 	const struct mux_session_opts cli_opts = {
@@ -1165,11 +1169,11 @@ T_DECLARE_CASE(test_send_recv_small)
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x42);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -1270,7 +1274,7 @@ T_DECLARE_CASE(test_idle_scheduler_stops_while_sendbuf_blocked)
 	frame->len = MUX_FRAME_HEADER_SIZE;
 	mux_frame_list_push(&fx.cli->wire.sendbuf, frame);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		if (fx.cli != NULL) {
 			if (fx.cli->wire.sendbuf.head == frame) {
@@ -1285,7 +1289,7 @@ T_DECLARE_CASE(test_idle_scheduler_stops_while_sendbuf_blocked)
 			mux_session_notify(fx.srv);
 		}
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	/* The INIT stream is parked on the low-priority queue while the sendbuf
@@ -1353,10 +1357,10 @@ T_DECLARE_CASE(test_retransmit_excludes_lifecycle_drain)
 	ev_io_stop(fx.loop, &fx.cli->w_socket);
 
 	/* A fresh INIT stream parked on the lifecycle (lp) queue, drain armed. */
-	struct mux_stream *b = mux_open_stream(fx.cli);
+	struct mux_stream *b = mux_stream_open(fx.cli);
 	if (b == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	const enum stream_state b_state_pre = b->state;
@@ -1434,10 +1438,10 @@ T_DECLARE_CASE(test_nagle_releases_queued_small_frame_on_ack)
 	memcpy(expected, payload_a, sizeof(payload_a));
 	memcpy(expected + sizeof(payload_a), payload_b, sizeof(payload_b));
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 
@@ -1508,11 +1512,11 @@ T_DECLARE_CASE(test_send_recv_large)
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0x7F);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -1569,10 +1573,10 @@ T_DECLARE_CASE(test_half_close)
 	unsigned char payload[64];
 	fill_payload(payload, sizeof(payload), 0x11);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -1622,10 +1626,10 @@ T_DECLARE_CASE(test_rst_on_unread_data)
 	unsigned char payload[64];
 	fill_payload(payload, sizeof(payload), 0xAB);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -1691,13 +1695,13 @@ T_DECLARE_CASE(test_multi_stream)
 		streams[i] = NULL;
 	}
 	for (int i = 0; i < MULTI_CONCURRENCY; i++) {
-		struct mux_stream *s = mux_open_stream(fx.cli);
+		struct mux_stream *s = mux_stream_open(fx.cli);
 		if (s == NULL) {
 			for (int j = 0; j < MULTI_CONCURRENCY; j++) {
 				free(payloads[j]);
 			}
 			fixture_teardown(&fx);
-			T_FATAL("mux_open_stream returned NULL");
+			T_FATAL("mux_stream_open returned NULL");
 			return;
 		}
 		struct test_stream *ts = test_stream_new(&fx, s);
@@ -1783,11 +1787,11 @@ T_DECLARE_CASE(test_server_open_send_recv)
 	fill_payload(payload, PAYLOAD_SMALL, 0x55);
 
 	/* Server actively opens a stream toward the client. */
-	struct mux_stream *s = mux_open_stream(fx.srv);
+	struct mux_stream *s = mux_stream_open(fx.srv);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream(srv) returned NULL");
+		T_FATAL("mux_stream_open(srv) returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -1863,11 +1867,11 @@ T_DECLARE_CASE(test_client_open_server_sends_first)
 	fx.accept_send_len = PAYLOAD_SMALL;
 
 	/* Client opens a stream; it does not send any data – it only receives. */
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream(cli) returned NULL");
+		T_FATAL("mux_stream_open(cli) returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -1932,10 +1936,10 @@ T_DECLARE_CASE(test_graceful_close_server_initiated)
 	fill_payload(payload, sizeof(payload), 0xD4);
 
 	/* Server opens and will send payload then FIN. */
-	struct mux_stream *s = mux_open_stream(fx.srv);
+	struct mux_stream *s = mux_stream_open(fx.srv);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream(srv) returned NULL");
+		T_FATAL("mux_stream_open(srv) returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -2023,12 +2027,12 @@ T_DECLARE_CASE(test_simultaneous_close)
 	fx.accept_send_len = PAYLOAD_SMALL;
 
 	/* Client opens a stream and sends cli_payload + FIN. */
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(cli_payload);
 		free(srv_payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -2127,10 +2131,10 @@ T_DECLARE_CASE(test_rst_from_client)
 
 	/* Server opens a stream and sends data; this data will land in the
 	 * client-side receive buffer, triggering RST on close. */
-	struct mux_stream *s = mux_open_stream(fx.srv);
+	struct mux_stream *s = mux_stream_open(fx.srv);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream(srv) returned NULL");
+		T_FATAL("mux_stream_open(srv) returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -2174,10 +2178,10 @@ T_DECLARE_CASE(test_active_open_shutdown_before_synack)
 		return;
 	}
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -2251,10 +2255,10 @@ T_DECLARE_CASE(test_shutdown_graceful)
 		return;
 	}
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -2392,7 +2396,7 @@ static int raw_fixture_setup(
 	}
 	fx->raw_fd = fds[1];
 
-	const struct mux_config srv_conf = {
+	const struct mux_session_config srv_conf = {
 		.timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
@@ -2402,7 +2406,8 @@ static int raw_fixture_setup(
 		.max_streams = 64,
 		.stream_window = 4,
 		.session_window = 256,
-		.max_frame_payload = mux_conf_default.max_frame_payload,
+		.max_frame_payload =
+			mux_session_config_default.max_frame_payload,
 	};
 
 	unsigned char raw_sid[MUX_SESSION_ID_LEN];
@@ -2952,11 +2957,11 @@ T_DECLARE_CASE(test_interop_i3_ack_fin_credit)
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0xA1);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -3066,10 +3071,10 @@ T_DECLARE_CASE(test_interop_i6_fast_open_16384)
 	 * 16384 octets fit a single frame; the default 16376 would split them. */
 	fx.srv->max_payload = MUX_DEFAULT_SEND_WINDOW;
 
-	struct mux_stream *s = mux_open_stream(fx.srv);
+	struct mux_stream *s = mux_stream_open(fx.srv);
 	if (s == NULL) {
 		raw_fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 
@@ -3872,12 +3877,12 @@ T_DECLARE_CASE(test_resume_retransmit)
 	fill_payload(srv_payload, payload_len, 0x9C);
 
 	{
-		struct mux_stream *cli_s = mux_open_stream(fx.cli);
+		struct mux_stream *cli_s = mux_stream_open(fx.cli);
 		if (cli_s == NULL) {
 			free(cli_payload);
 			free(srv_payload);
 			fixture_teardown(&fx);
-			T_FATAL("mux_open_stream returned NULL");
+			T_FATAL("mux_stream_open returned NULL");
 			return;
 		}
 		cli_ts = test_stream_new(&fx, cli_s);
@@ -3892,12 +3897,12 @@ T_DECLARE_CASE(test_resume_retransmit)
 			fx.cli_streams[fx.n_cli_streams++] = cli_ts;
 		}
 
-		struct mux_stream *srv_s = mux_open_stream(fx.srv);
+		struct mux_stream *srv_s = mux_stream_open(fx.srv);
 		if (srv_s == NULL) {
 			free(cli_payload);
 			free(srv_payload);
 			fixture_teardown(&fx);
-			T_FATAL("mux_open_stream(srv) returned NULL");
+			T_FATAL("mux_stream_open(srv) returned NULL");
 			return;
 		}
 		srv_ts = test_stream_new(&fx, srv_s);
@@ -4134,11 +4139,11 @@ T_DECLARE_CASE(test_resume_stream_transparent)
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0x5A);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -4254,11 +4259,11 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 	}
 	fill_payload(payload, PAYLOAD_LARGE, 0x3C);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -4498,11 +4503,11 @@ T_DECLARE_CASE(test_nodelay_reverse_large)
 	fx.accept_send_len = PAYLOAD_LARGE;
 
 	/* Client opens a stream; it does not send any data – it only receives. */
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream(cli) returned NULL");
+		T_FATAL("mux_stream_open(cli) returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -4553,7 +4558,7 @@ struct bdp_ctx {
 
 static void bdp_enable_auto_windows(struct mux_session *restrict ss)
 {
-	struct mux_config conf = *mux_conf(ss);
+	struct mux_session_config conf = *mux_conf(ss);
 	conf.stream_window = 0;
 	conf.session_window = 0;
 	mux_set_config(ss, &conf);
@@ -4803,7 +4808,7 @@ T_DECLARE_CASE(test_bdp_manual_window_mode_no_estimator_effect)
 	 * auto_session_window must be clear. */
 	const uint_least32_t fixed_session = 8;
 	const uint_least32_t fixed_stream = 4;
-	struct mux_config conf = *mux_conf(fx.cli);
+	struct mux_session_config conf = *mux_conf(fx.cli);
 	conf.session_window = (int)fixed_session;
 	conf.stream_window = (int)fixed_stream;
 	mux_set_config(fx.cli, &conf);
@@ -4847,7 +4852,7 @@ T_DECLARE_CASE(test_bdp_auto_session_window_without_auto_stream_window)
 
 	/* session_window = 0 (auto), stream_window = 4 (manual). */
 	const uint_least32_t fixed_stream = 4;
-	struct mux_config conf = *mux_conf(fx.cli);
+	struct mux_session_config conf = *mux_conf(fx.cli);
 	conf.session_window = 0;
 	conf.stream_window = (int)fixed_stream;
 	mux_set_config(fx.cli, &conf);
@@ -5053,11 +5058,11 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x4E);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -5134,11 +5139,11 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 	}
 	fill_payload(payload, PAYLOAD_SMALL, 0x68);
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		free(payload);
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -5241,10 +5246,10 @@ T_DECLARE_CASE(test_send_queue_saturates_read_credit)
 		return;
 	}
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 
@@ -5339,10 +5344,10 @@ T_DECLARE_CASE(test_stream_send_direct_mode_updates_send_buffered_frames)
 		return;
 	}
 
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 
@@ -5365,7 +5370,7 @@ T_DECLARE_CASE(test_stream_send_direct_mode_updates_send_buffered_frames)
 	T_EXPECT_EQ(after, before + 1);
 }
 
-/* mux_open_stream must return NULL after
+/* mux_stream_open must return NULL after
  * mux_drain is called while a stream is open (so state stays ESTABLISHED
  * and the draining flag is what gates the rejection). */
 T_DECLARE_CASE(test_drain_rejects_new_streams)
@@ -5386,10 +5391,10 @@ T_DECLARE_CASE(test_drain_rejects_new_streams)
 
 	/* Open a stream to hold the session in ESTABLISHED during drain,
 	 * ensuring the draining check in mux_session_open_stream is exercised. */
-	struct mux_stream *s = mux_open_stream(fx.cli);
+	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
@@ -5403,7 +5408,7 @@ T_DECLARE_CASE(test_drain_rejects_new_streams)
 
 	mux_drain(fx.cli);
 
-	const bool open_rejected = mux_open_stream(fx.cli) == NULL;
+	const bool open_rejected = mux_stream_open(fx.cli) == NULL;
 
 	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
@@ -5432,10 +5437,10 @@ T_DECLARE_CASE(test_drain_refuses_peer_syn)
 
 	/* Open a stream and wait until the server accepts it, holding the
 	 * server session in ESTABLISHED during the drain. */
-	struct mux_stream *s1 = mux_open_stream(fx.cli);
+	struct mux_stream *s1 = mux_stream_open(fx.cli);
 	if (s1 == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts1 = test_stream_new(&fx, s1);
@@ -5460,10 +5465,10 @@ T_DECLARE_CASE(test_drain_refuses_peer_syn)
 	/* A stream opened by the peer after the drain must be refused:
 	 * the client observes RST (delivered as a recv error) and the
 	 * server never surfaces the stream to on_accept. */
-	struct mux_stream *s2 = mux_open_stream(fx.cli);
+	struct mux_stream *s2 = mux_stream_open(fx.cli);
 	if (s2 == NULL) {
 		fixture_teardown(&fx);
-		T_FATAL("mux_open_stream returned NULL");
+		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts2 = test_stream_new(&fx, s2);
@@ -5541,8 +5546,8 @@ static struct mux_session make_session(struct frame_pool_ctx *restrict pool_ctx)
 {
 	return (struct mux_session){
 		.pool = make_pool(pool_ctx),
-		.max_payload =
-			(uint_least32_t)mux_conf_default.max_frame_payload,
+		.max_payload = (uint_least32_t)mux_session_config_default
+				       .max_frame_payload,
 		.state = SESSION_ESTABLISHED,
 		/* Seed the stats mirrors that mux_state()/mux_session_stats() read. */
 		._pub_state = SESSION_ESTABLISHED,
@@ -5567,6 +5572,45 @@ T_DECLARE_CASE(test_mux_state_maps_internal_states)
 	T_EXPECT_EQ(mux_state(&ss), (enum mux_state)MUX_STATE_CONNECT);
 	PUB_STORE(ss._pub_state, SESSION_CLOSED);
 	T_EXPECT_EQ(mux_state(&ss), (enum mux_state)MUX_STATE_CLOSED);
+	PUB_STORE(ss._pub_state, SESSION_CLOSING);
+	T_EXPECT_EQ(mux_state(&ss), (enum mux_state)MUX_STATE_CLOSING);
+	PUB_STORE(ss._pub_state, SESSION_CLOSE_WAIT);
+	T_EXPECT_EQ(mux_state(&ss), (enum mux_state)MUX_STATE_CLOSING);
+}
+
+/* A shutting-down session must report as neither usable nor attachable.  Both
+ * internal closing states still own their transport: mux_session_attach_fd
+ * rejects them, and session_resume_attach drops a handoff to them.  Folding
+ * them into ESTABLISHED lets server_on_resume_lookup pick a closing tunnel as a
+ * resume target, whose dropped handoff then closes the peer's fresh transport
+ * with no ServerHello sent; folding them into CLOSED instead lets
+ * open_stream_task's demand-reconnect attach to one and trip that CHECKMSGF.
+ * Pin all three consumer predicates against both states. */
+T_DECLARE_CASE(test_mux_state_closing_is_neither_usable_nor_attachable)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss = make_session(&pool_ctx);
+
+	PUB_STORE(ss._pub_state, SESSION_CLOSING);
+	const enum mux_state closing = mux_state(&ss);
+	PUB_STORE(ss._pub_state, SESSION_CLOSE_WAIT);
+	const enum mux_state close_wait = mux_state(&ss);
+
+	/* server_on_resume_lookup: never eligible as a resume target. */
+	T_EXPECT(
+		closing != MUX_STATE_SUSPENDED &&
+		closing != MUX_STATE_ESTABLISHED);
+	T_EXPECT(
+		close_wait != MUX_STATE_SUSPENDED &&
+		close_wait != MUX_STATE_ESTABLISHED);
+	/* open_stream_task: never demand-reconnected into. */
+	T_EXPECT(closing != MUX_STATE_SUSPENDED && closing != MUX_STATE_CLOSED);
+	T_EXPECT(
+		close_wait != MUX_STATE_SUSPENDED &&
+		close_wait != MUX_STATE_CLOSED);
+	/* listener_has_live_tunnel / tunnel_stats: not counted as live. */
+	T_EXPECT(closing != MUX_STATE_ESTABLISHED);
+	T_EXPECT(close_wait != MUX_STATE_ESTABLISHED);
 }
 
 T_DECLARE_CASE(test_mux_peer_addr_and_window_accessors)
@@ -5780,7 +5824,7 @@ static int xs_setup(struct xs_fixture *restrict fx)
 		.loop = fx->loop,
 		.state = SESSION_ESTABLISHED,
 		.pool = xs_make_pool(&fx->pool_ctx),
-		.max_payload = (uint_least32_t)mux_conf_default.max_frame_payload,
+		.max_payload = (uint_least32_t)mux_session_config_default.max_frame_payload,
 		.session_window = 8,
 		.stream_window = 4,
 		.wire = {
@@ -6384,7 +6428,7 @@ static int bench_fixture_setup(struct mux_test_fixture *restrict fx)
 	/* Throughput config: nodelay (iperf-style) + large stream_window to
 	 * keep grants above the 2-frame immediate-ACK threshold and avoid
 	 * deferring window updates to the coalescing timer. */
-	struct mux_config conf = make_cli_conf(true);
+	struct mux_session_config conf = make_cli_conf(true);
 	conf.stream_window = 256;
 #if WITH_TLS
 	/* Socket-offloaded TLS on both ends: the pre-wrapped server connection owns
@@ -6526,7 +6570,7 @@ static void bench_mux_setup(void)
 	T_CHECK(bench_mux_send_buf != NULL);
 	fill_payload(bench_mux_send_buf, CHUNK_SIZE, 0x5A);
 
-	struct mux_stream *const s = mux_open_stream(bench_mux_fx.cli);
+	struct mux_stream *const s = mux_stream_open(bench_mux_fx.cli);
 	T_CHECK(s != NULL);
 	bench_mux_ts = test_stream_new(&bench_mux_fx, s);
 	T_CHECK(bench_mux_ts != NULL);
@@ -6817,6 +6861,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_drain_refuses_peer_syn),
 
 	T_CASE(test_mux_state_maps_internal_states),
+	T_CASE(test_mux_state_closing_is_neither_usable_nor_attachable),
 	T_CASE(test_mux_peer_addr_and_window_accessors),
 	T_CASE(test_mux_stream_send_rejects_invalid_state),
 	T_CASE(test_mux_stream_send_queues_payload),

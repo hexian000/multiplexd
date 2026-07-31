@@ -14,9 +14,10 @@
  * delay list uses delay_prev/next; drr_active is off-FIFO while spending its
  * budget. */
 
+#include "mux/sched.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
-#include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.h"
 #include "mux/stream.h"
@@ -44,7 +45,7 @@ static bool fail_and_free_cb(
 	struct mux_stream *const restrict s = element;
 	struct mux_session *const restrict ss = data;
 	if (s->state != STREAM_CLOSED) {
-		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
+		COUNTER_ADD(ss->cnt.stream.num_stream_failed, 1);
 	}
 	mux_stream_free(s);
 	return true;
@@ -278,7 +279,7 @@ sched_send_syn(struct mux_session *restrict ss, struct mux_stream *restrict s)
 			ss->w_socket.fd, s->id,
 			frame->len - MUX_FRAME_HEADER_SIZE);
 		mux_session_send_push(ss, s, frame);
-		COUNTER_ADD(ss->cnt.num_stream_fastopen, 1);
+		COUNTER_ADD(ss->cnt.stream.num_stream_fastopen, 1);
 		mux_stream_mark_syn_sent(s);
 		return;
 	}
@@ -303,7 +304,7 @@ static void sched_remove_stream(
 	}
 	/* CLOSED streams already counted; fail only live streams freed here. */
 	if (s->state != STREAM_CLOSED) {
-		COUNTER_ADD(ss->cnt.num_stream_failed, 1);
+		COUNTER_ADD(ss->cnt.stream.num_stream_failed, 1);
 	}
 	mux_sched_check_no_active_streams(ss);
 }
@@ -492,8 +493,8 @@ static struct mux_stream *sched_dequeue(struct mux_session *restrict ss)
 }
 
 /* Scan the DRR ready queue and stage at most one PUSH frame; skips streams
- * blocked on credit, queue empty, Nagle, or non-ESTABLISHED state.
- * Returns true iff a frame was staged. */
+ * blocked on credit, queue empty, Nagle, or a state stream_can_send_data()
+ * rejects.  Returns true iff a frame was staged. */
 bool mux_sched_next_data(struct mux_session *restrict ss)
 {
 	for (;;) {

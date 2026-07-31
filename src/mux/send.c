@@ -14,11 +14,12 @@
  * mux_session_flush_resp).
  */
 
+#include "mux/send.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/recv.h"
 #include "mux/sched.h"
-#include "mux/send.h"
 #include "mux/session.h"
 #include "mux/stream.h"
 #include "mux/unacked.h"
@@ -561,7 +562,7 @@ bool mux_session_send_ctrl(
 	/* Counted only once the RST is actually enqueued, matching every other
 	 * traffic counter in this file (an OOM above returns before this). */
 	if (flags & MUX_FLAG_RST) {
-		COUNTER_ADD(ss->cnt.num_rst_sent, 1);
+		COUNTER_ADD(ss->cnt.errors.num_rst_sent, 1);
 	}
 	mux_notify_write(ss);
 	return true;

@@ -11,6 +11,7 @@
 
 #include "mux/frame.h"
 #include "mux/mux.h"
+#include "mux/stream_io.h"
 
 #include <ev.h>
 
@@ -216,7 +217,7 @@ struct mux_stream *mux_stream_new(
 
 void mux_stream_free(struct mux_stream *s);
 
-void mux_stream_attach_fd(struct mux_stream *s, int fd);
+void mux_stream_do_attach_fd(struct mux_stream *s, int fd);
 
 bool mux_stream_do_io_start(struct ev_loop *loop, struct mux_stream_io *w);
 

@@ -53,8 +53,10 @@
    helpers below, which move the raw Extra field verbatim.
 */
 
-/* MUX_FRAME_HEADER_SIZE, MUX_MAX_FRAME_SIZE, and MUX_MAX_PAYLOAD_SIZE are defined
- * together in mux.h so the frame-size cap stays the single anchor. */
+/* MUX_FRAME_HEADER_SIZE and MUX_MAX_PAYLOAD_SIZE anchor the frame-size cap in
+ * mux.h (they are part of the public wire contract).  MUX_MAX_FRAME_SIZE is the
+ * derived buffer cap and internal to the mux stack, so it lives here. */
+#define MUX_MAX_FRAME_SIZE (MUX_FRAME_HEADER_SIZE + MUX_MAX_PAYLOAD_SIZE)
 
 #define MUX_PROTOCOL_VERSION 0x01
 
@@ -110,6 +112,13 @@
 /* Minimum nanoseconds between honouring consecutive inbound PINGs (50 ms);
  * kept below the startup probe interval so a peer's PINGs are always answered. */
 #define MUX_PONG_RATE_LIMIT_NS (INT64_C(50000000))
+
+/* Nanoseconds an outbound BDP probe may stay unanswered before its cycle is
+ * abandoned (5 s).  A PONG is not guaranteed: spec §5.3.2 lets a conforming
+ * peer rate-limit inbound PINGs and discard the excess, and mux_session_recv_ping
+ * drops one on frame-pool OOM.  Well above the steady-state probe interval, so
+ * a merely slow link never trips it. */
+#define MUX_PING_PROBE_TIMEOUT_NS (INT64_C(5000000000))
 
 /* Frame structure.  Payload starts at data[MUX_FRAME_HEADER_SIZE].  data[] is a
  * flexible array member, so a frame object is mux_frame_object_size(max_payload)

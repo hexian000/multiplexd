@@ -15,11 +15,23 @@
 
 #include "mux/frame.h"
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 struct mux_session;
+
+/* Largest hello the marshaller can produce: a resume hello claiming
+ * MUX_MAX_CLAIM_LEN octets of control characters. Pinned against the real
+ * marshaller by handshake_test. */
+#define MUX_MAX_HELLO_JSON_SIZE 555u
+
+/* proto_hello_build reserves one byte for the marshaller's NUL, so the payload
+ * must strictly exceed the JSON. */
+static_assert(
+	MUX_MIN_FRAME_PAYLOAD > MUX_MAX_HELLO_JSON_SIZE,
+	"minimum frame payload must exceed the largest possible hello");
 
 /* Session identity, resume, and peer capability state.  Embedded by value in
  * mux_session. */

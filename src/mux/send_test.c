@@ -383,7 +383,7 @@ const struct table_opts mux_stream_table_opts = { 0 };
 /* frame.c data global the header-inline framing helpers reference; stubbed here
  * since this white-box TU does not link frame.c. Keep max_frame_payload in step
  * with the real definition in frame.c (16384 - MUX_FRAME_HEADER_SIZE). */
-const struct mux_config mux_conf_default = {
+const struct mux_session_config mux_session_config_default = {
 	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 	.readahead = 128 * 1024,
 };
@@ -954,13 +954,14 @@ T_DECLARE_CASE(test_send_ctrl_oom)
 	spies_reset();
 	fx.pool_ctx.fail = true;
 	mux_counter rst_sent = 0;
-	fx.ss.cnt.num_rst_sent = &rst_sent;
+	fx.ss.cnt.errors.num_rst_sent = &rst_sent;
 
 	const bool ok = mux_session_send_ctrl(&fx.ss, 5, MUX_FLAG_RST, 0);
 
 	const int push_calls = g_sendbuf_push_calls;
 	const bool sendbuf_empty = fx.ss.wire.sendbuf.head == NULL;
-	const uint_least64_t rst_count = COUNTER_LOAD(fx.ss.cnt.num_rst_sent);
+	const uint_least64_t rst_count =
+		COUNTER_LOAD(fx.ss.cnt.errors.num_rst_sent);
 	si_teardown(&fx);
 
 	T_EXPECT(!ok);

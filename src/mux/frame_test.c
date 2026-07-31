@@ -5,8 +5,9 @@
  * Dependencies: frame.c #included (leaf module, no collaborators to mock).
  * Benches (bench section) are opt-in: run with TESTING_BENCH set in the env. */
 
-#include "mux/frame.c"
 #include "mux/frame.h"
+
+#include "mux/frame.c"
 #include "mux/mux.h"
 
 #include "meta/arraysize.h"

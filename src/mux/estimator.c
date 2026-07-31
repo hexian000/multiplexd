@@ -2,6 +2,7 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 #include "mux/estimator.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/send.h"
@@ -83,19 +84,27 @@ static void run_probe_cycle(
 	const char *restrict label, const uint_fast64_t bytes)
 {
 	struct estimator_ctx *const restrict est = &ss->estimator;
+	const int_fast64_t sent_ns = clock_monotonic_ns();
 	if (est->ping_in_flight) {
-		/* No probe timeout: the ordered transport delivers the PONG
-		 * eventually, and abandoning early can't speed it up (a new PING only
-		 * queues behind it).  A dead link is caught by send_timeout/w_timeout
-		 * instead, both of which route through
-		 * session_on_dead_link() (session.c). */
-		d->sample += (size_t)bytes;
-		LOGD_F("PING in flight; accumulating %s sample, %zu bytes",
-		       label, d->sample);
-		return;
+		if (sent_ns - est->last_probe_ns < MUX_PING_PROBE_TIMEOUT_NS) {
+			d->sample += (size_t)bytes;
+			LOGD_F("PING in flight; accumulating %s sample, %zu bytes",
+			       label, d->sample);
+			return;
+		}
+		/* The PONG is not coming: a conforming peer may rate-limit our
+		 * PINGs and discard the excess (spec §5.3.2), and a peer running
+		 * this code drops one on frame-pool OOM.  Without this the probe
+		 * gate would never reopen and the estimator would stay frozen for
+		 * the session's life.  The accumulated samples have no RTT to pair
+		 * with, so the cycle restarts clean below. */
+		LOGD_F("PING unanswered for %" PRIdFAST64
+		       " ms; abandoning probe cycle",
+		       (sent_ns - est->last_probe_ns) / 1000000);
+		est->ping_in_flight = false;
+		reset_samples(est);
 	}
 
-	const int_fast64_t sent_ns = clock_monotonic_ns();
 	/* The probe cycle is shared by both directions but the growth phase is
 	 * per-direction: probe at the faster STARTUP rate until both directions
 	 * reach TRACK, so a fresh window converges quickly. */

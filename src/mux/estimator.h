@@ -9,13 +9,29 @@
 #ifndef MUX_ESTIMATOR_H
 #define MUX_ESTIMATOR_H
 
+#include "mux/mux.h"
+
 #include "algo/wndfilter.h"
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 struct mux_session;
+
+/* Auto stream/session receive-window floor (bytes) before BDP estimation
+ * converges: the smallest value the auto stream_window/session_window and the
+ * estimator's WNDSIZE_MIN are clamped up to. Despite the historical name it is
+ * not a send window -- mux_stream_new sets each stream's send window from
+ * MUX_DEFAULT_SEND_WINDOW. */
+#define MUX_INITIAL_SEND_WINDOW 65536u
+
+/* The receive-window floor must admit one max-size frame, otherwise a just-read
+ * frame could exceed every credit grant and never drain (deadlock). */
+static_assert(
+	MUX_INITIAL_SEND_WINDOW >= MUX_MAX_PAYLOAD_SIZE,
+	"receive-window floor must admit one max-size frame");
 
 enum estimator_phase {
 	ESTIMATOR_STARTUP = 0,

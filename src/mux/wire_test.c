@@ -5,11 +5,12 @@
  * staging/coalescing); wire.c #included, real frame.c and TLS backend linked,
  * real socketpairs used; no sibling collaborators mocked. */
 
+#include "mux/wire.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/wire.c"
-#include "mux/wire.h"
 #if WITH_TLS
 #include "shim/tls.h"
 #endif

@@ -6,6 +6,7 @@
  * mux_session_send_oob is the only other mocked collaborator; no siblings linked. */
 
 #include "mux/estimator.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
@@ -205,6 +206,39 @@ T_DECLARE_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight)
 	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)35);
 	T_EXPECT_EQ(g_send_oob_calls, 0);
 	T_EXPECT(ss.estimator.ping_in_flight);
+}
+
+/* A PONG is not guaranteed on a healthy transport: spec §5.3.2 lets a
+ * conforming peer rate-limit inbound PINGs and discard the excess, and
+ * mux_session_recv_ping drops one on frame-pool OOM. An unanswered probe must
+ * therefore be abandoned rather than hold the gate shut for the session's
+ * life, freezing the estimator at its last window. */
+T_DECLARE_CASE(test_estimator_abandons_unanswered_probe)
+{
+	struct mux_session ss = make_session();
+	const int_fast64_t now = MUX_PING_PROBE_TIMEOUT_NS + 1;
+
+	estimator_test_reset();
+	set_clock_sequence(&now, 1);
+	/* Both directions in TRACK so the 1 s floor applies to the new cycle. */
+	ss.estimator.rx.phase = ESTIMATOR_TRACK;
+	ss.estimator.tx.phase = ESTIMATOR_TRACK;
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.last_probe_ns = 1;
+	ss.estimator.rx.sample = 15;
+	ss.estimator.tx.sample = 25;
+
+	mux_estimator_add(&ss, 40000);
+
+	/* The stale cycle is abandoned and a fresh probe goes out. */
+	T_EXPECT_EQ(g_send_oob_calls, 1);
+	T_EXPECT_EQ(g_last_oob_extra, (uint_fast8_t)MUX_CTRL_PING);
+	T_EXPECT(ss.estimator.ping_in_flight);
+	T_EXPECT_EQ(ss.estimator.last_probe_ns, now);
+	/* Samples from the abandoned cycle have no RTT to pair with, so the new
+	 * cycle starts from this call's bytes alone. */
+	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)40000);
+	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)0);
 }
 
 T_DECLARE_CASE(test_estimator_add_starts_cycle_after_rate_limit)
@@ -926,6 +960,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_estimator_init_resets_all_state),
 	T_CASE(test_estimator_suspend_clears_probe_preserves_learned),
 	T_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight),
+	T_CASE(test_estimator_abandons_unanswered_probe),
 	T_CASE(test_estimator_add_starts_cycle_after_rate_limit),
 	T_CASE(test_estimator_add_track_enforces_rate_limit),
 	T_CASE(test_estimator_add_startup_enforces_rate_limit),

@@ -27,7 +27,7 @@
  * with the real definition in frame.c (16384 - MUX_FRAME_HEADER_SIZE): it feeds
  * make_session's ss.max_payload, the DRR quantum, so the fairness tests must run
  * against the same quantum the daemon uses. */
-const struct mux_config mux_conf_default = {
+const struct mux_session_config mux_session_config_default = {
 	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 	.readahead = 128 * 1024,
 };
@@ -205,8 +205,8 @@ static void make_session(struct mux_session *restrict ss)
 	*ss = (struct mux_session){
 		.loop = ev_loop_new(EVFLAG_AUTO),
 		.state = SESSION_ESTABLISHED,
-		.max_payload =
-			(uint_least32_t)mux_conf_default.max_frame_payload,
+		.max_payload = (uint_least32_t)mux_session_config_default
+				       .max_frame_payload,
 		.session_window = 8,
 		.stream_window = 4,
 		.tag = "[test]:",
@@ -392,7 +392,7 @@ T_DECLARE_CASE(test_sched_free_streams_clears_stream_counter)
 	ss.unacked.stalled = true;
 
 	mux_sched_free_streams(&ss);
-	T_EXPECT(ss.cnt.num_stream_failed == NULL);
+	T_EXPECT(ss.cnt.stream.num_stream_failed == NULL);
 	T_EXPECT_EQ(g_stream_free_calls, 2);
 	T_EXPECT(ss.sched.streams == NULL);
 	/* The send-stall gate is not the scheduler's to clear: it belongs to the

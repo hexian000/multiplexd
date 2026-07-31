@@ -465,7 +465,7 @@ const struct table_opts mux_stream_table_opts = {
 
 /* frame.c data global the header-inline framing helpers reference; stubbed here
  * since this white-box TU does not link frame.c. */
-const struct mux_config mux_conf_default = {
+const struct mux_session_config mux_session_config_default = {
 	.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE,
 	.readahead = 128 * 1024,
 };
@@ -499,9 +499,9 @@ static int rf_setup(struct recv_fixture *restrict fx)
 	fx->ss = (struct mux_session){
 		.loop = fx->loop,
 		.state = SESSION_ESTABLISHED,
-		.max_payload =
-			(uint_least32_t)mux_conf_default.max_frame_payload,
-		.readahead = (size_t)mux_conf_default.readahead,
+		.max_payload = (uint_least32_t)mux_session_config_default
+				       .max_frame_payload,
+		.readahead = (size_t)mux_session_config_default.readahead,
 		.session_window = 8,
 		.stream_window = 4,
 		.wire = { .rx_open = true },

@@ -14,11 +14,12 @@
  * waiting for the next EV_WRITE.
  */
 
+#include "mux/recv.h"
+
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
 #include "mux/mux.h"
-#include "mux/recv.h"
 #include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.h"
@@ -771,7 +772,7 @@ static void dispatch_frame(struct mux_session *ss)
 		}
 
 		if (hdr.flags & MUX_FLAG_RST) {
-			COUNTER_ADD(ss->cnt.num_rst_recv, 1);
+			COUNTER_ADD(ss->cnt.errors.num_rst_recv, 1);
 		}
 
 		struct mux_stream *const s =

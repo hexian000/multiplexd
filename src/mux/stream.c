@@ -6,12 +6,14 @@
  * @brief Internal mux stream state machine implementation.
  */
 
+#include "mux/stream.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.h"
-#include "mux/stream.h"
+#include "mux/stream_io.h"
 #include "shim/util.h"
 
 #include "meta/minmax.h"
@@ -123,12 +125,12 @@ static void stream_set_state(
 	if (!s->halfopen_counted && new_halfopen) {
 		s->session->num_halfopen++;
 		s->halfopen_counted = true;
-		COUNTER_ADD(s->session->cnt.num_stream_halfopen, 1);
+		COUNTER_ADD(s->session->cnt.stream.num_stream_halfopen, 1);
 	} else if (s->halfopen_counted && !new_halfopen) {
 		ASSERT(s->session->num_halfopen > 0);
 		s->session->num_halfopen--;
 		s->halfopen_counted = false;
-		COUNTER_SUB(s->session->cnt.num_stream_halfopen, 1);
+		COUNTER_SUB(s->session->cnt.stream.num_stream_halfopen, 1);
 	}
 	if (oldstate == newstate) {
 		return;
@@ -138,7 +140,7 @@ static void stream_set_state(
 		stream_state_str[newstate]);
 	s->state = newstate;
 	if (newstate == STREAM_ESTABLISHED) {
-		COUNTER_ADD(s->session->cnt.num_stream_established, 1);
+		COUNTER_ADD(s->session->cnt.stream.num_stream_established, 1);
 	}
 }
 
@@ -166,10 +168,34 @@ static void stream_stop(struct mux_stream *s)
 	ev_timer_stop(loop, &s->socket.w_timeout);
 }
 
+/* Discard the stream's payload storage and hand its bytes back to the session
+ * gauges (spec §4.3.4 requires dropping pending outbound data on an abortive
+ * close; a tombstone needs only the stream ID). Idempotent: the paths that
+ * already reset the receive buffer leave nothing for this to subtract. */
+static void stream_release_buffers(struct mux_stream *restrict s)
+{
+	struct mux_session *const restrict ss = s->session;
+	ASSERT(ss->send_buffered_frames >= s->send_queue.count);
+	ss->send_buffered_frames -= s->send_queue.count;
+	COUNTER_SUB(ss->cnt.buffers.send_buffered_frames, s->send_queue.count);
+	mux_frame_list_clear(&s->send_queue, &ss->pool);
+	s->queued_send_bytes = 0;
+	ASSERT(ss->recv_buffered_bytes >= s->recvbuf->len);
+	ss->recv_buffered_bytes -= s->recvbuf->len;
+	COUNTER_SUB(ss->cnt.buffers.recv_buffered_bytes, s->recvbuf->len);
+	bytebuf_reset(s->recvbuf);
+	s->buffered_bytes = 0;
+	/* Release capacity grown for oversized frames; nothing writes to a
+	 * CLOSED stream's receive buffer, so no regrowth follows. */
+	mux_bytebuf_shrink(&s->recvbuf, 0);
+}
+
 static inline void stream_mark_closed(struct mux_stream *restrict s)
 {
 	const bool was_init = (s->state == STREAM_INIT);
 	stream_stop(s);
+	/* Before the check_no_active_streams cascade below, which may free s. */
+	stream_release_buffers(s);
 	/* The tombstone only needs the stream ID for late-frame suppression. */
 	if (!s->is_direct && s->socket.w_io.fd != -1) {
 		socket_close(s->socket.w_io.fd);
@@ -180,9 +206,9 @@ static inline void stream_mark_closed(struct mux_stream *restrict s)
 	 * aborted stream whose RST could not be enqueued now has rst_sent == false
 	 * and would otherwise be miscounted as a success. */
 	if (s->rst_received || s->rst_sent || s->aborted) {
-		COUNTER_ADD(s->session->cnt.num_stream_failed, 1);
+		COUNTER_ADD(s->session->cnt.stream.num_stream_failed, 1);
 	} else {
-		COUNTER_ADD(s->session->cnt.num_stream_succeeded, 1);
+		COUNTER_ADD(s->session->cnt.stream.num_stream_succeeded, 1);
 	}
 	stream_set_state(s, STREAM_CLOSED);
 	if (!was_init) {
@@ -252,7 +278,7 @@ static void update_watcher(struct mux_stream *restrict s)
 	}
 	if (s->socket.w_io.fd == -1) {
 		/* Socket-mode stream not yet attached (it can reach SYN_SENT
-		 * unattached; mux_stream_attach_fd sanctions it). modify_io_events
+		 * unattached; mux_stream_do_attach_fd sanctions it). modify_io_events
 		 * below ASSERTs fd != -1 -- compiled out under NDEBUG -- so guard
 		 * here rather than drive ev_io with -1 in a release build. */
 		return;
@@ -331,7 +357,7 @@ void mux_stream_abort(struct mux_stream *restrict s, const enum mux_status code)
 		return;
 	}
 	STREAM_LOG(DEBUG, s, "aborting (RST)");
-	COUNTER_ADD(s->session->cnt.num_stream_errors, 1);
+	COUNTER_ADD(s->session->cnt.errors.num_stream_errors, 1);
 	s->aborted = true;
 	mux_session_discard_stream_frames(s->session, s->id);
 	if (!s->rst_sent) {
@@ -437,7 +463,8 @@ static void stream_flush_local(struct mux_stream *s)
 		ASSERT(s->session->recv_buffered_bytes >= nwrite);
 		s->buffered_bytes -= nwrite;
 		s->session->recv_buffered_bytes -= nwrite;
-		COUNTER_SUB(s->session->cnt.recv_buffered_bytes, nwrite);
+		COUNTER_SUB(
+			s->session->cnt.buffers.recv_buffered_bytes, nwrite);
 		STREAM_LOG_F(
 			VERBOSE, s,
 			"local send: %zu bytes, buffered=%" PRIuLEAST32, nwrite,
@@ -639,7 +666,7 @@ struct mux_stream *mux_stream_new(
 	if (s == NULL) {
 		return NULL;
 	}
-	const struct mux_config *const restrict conf = &ss->conf;
+	const struct mux_session_config *const restrict conf = &ss->conf;
 	*s = (struct mux_stream){
 		.id = id,
 		.state = STREAM_INIT,
@@ -662,11 +689,11 @@ struct mux_stream *mux_stream_new(
 		return NULL;
 	}
 	if (active_open) {
-		COUNTER_ADD(ss->cnt.num_stream_opened, 1);
+		COUNTER_ADD(ss->cnt.stream.num_stream_opened, 1);
 	} else {
-		COUNTER_ADD(ss->cnt.num_stream_accepted, 1);
+		COUNTER_ADD(ss->cnt.stream.num_stream_accepted, 1);
 	}
-	COUNTER_ADD(ss->cnt.num_streams, 1);
+	COUNTER_ADD(ss->cnt.stream.num_streams, 1);
 	stream_set_state(s, active_open ? STREAM_INIT : STREAM_SYN_RECEIVED);
 	ev_timer_init(&s->w_tombstone, tombstone_cb, 0.0, 0.0);
 	s->w_tombstone.data = s;
@@ -684,20 +711,23 @@ void mux_stream_free(struct mux_stream *s)
 		ASSERT(s->session->num_halfopen > 0);
 		s->session->num_halfopen--;
 		s->halfopen_counted = false;
-		COUNTER_SUB(s->session->cnt.num_stream_halfopen, 1);
+		COUNTER_SUB(s->session->cnt.stream.num_stream_halfopen, 1);
 	}
-	COUNTER_SUB(s->session->cnt.num_streams, 1);
+	COUNTER_SUB(s->session->cnt.stream.num_streams, 1);
 
 	/* Safety net: detach/stop without invoking callbacks. */
 	stream_detach_user(s);
 	stream_stop(s);
 	ASSERT(s->session->send_buffered_frames >= s->send_queue.count);
 	s->session->send_buffered_frames -= s->send_queue.count;
-	COUNTER_SUB(s->session->cnt.send_buffered_frames, s->send_queue.count);
+	COUNTER_SUB(
+		s->session->cnt.buffers.send_buffered_frames,
+		s->send_queue.count);
 	mux_frame_list_clear(&s->send_queue, &s->session->pool);
 	ASSERT(s->session->recv_buffered_bytes >= s->recvbuf->len);
 	s->session->recv_buffered_bytes -= s->recvbuf->len;
-	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, s->recvbuf->len);
+	COUNTER_SUB(
+		s->session->cnt.buffers.recv_buffered_bytes, s->recvbuf->len);
 	bytebuf_free(s->recvbuf);
 	if (!s->is_direct && s->socket.w_io.fd != -1) {
 		socket_close(s->socket.w_io.fd);
@@ -705,7 +735,7 @@ void mux_stream_free(struct mux_stream *s)
 	free(s);
 }
 
-void mux_stream_attach_fd(struct mux_stream *s, const int fd)
+void mux_stream_do_attach_fd(struct mux_stream *s, const int fd)
 {
 	if (s->state != STREAM_SYN_RECEIVED && s->state != STREAM_INIT &&
 	    s->state != STREAM_SYN_SENT) {
@@ -778,7 +808,7 @@ bool mux_stream_do_io_start(struct ev_loop *loop, struct mux_stream_io *w)
 	}
 	if (s->state != STREAM_SYN_RECEIVED && s->state != STREAM_INIT &&
 	    s->state != STREAM_SYN_SENT) {
-		/* Same race as mux_stream_attach_fd -- the stream may have already
+		/* Same race as mux_stream_do_attach_fd -- the stream may have already
 		 * left every attachable state (e.g. a peer RST) by the time the
 		 * application starts direct I/O. Sever the binding and report
 		 * failure so the caller does not wait forever for an event that
@@ -897,7 +927,7 @@ void mux_stream_queue_send(struct mux_stream *s, struct mux_frame *frame)
 		(uint_least32_t)(frame->len - MUX_FRAME_HEADER_SIZE);
 	mux_frame_list_push(&s->send_queue, frame);
 	s->session->send_buffered_frames++;
-	COUNTER_ADD(s->session->cnt.send_buffered_frames, 1);
+	COUNTER_ADD(s->session->cnt.buffers.send_buffered_frames, 1);
 }
 
 struct mux_frame *mux_stream_dequeue_send(struct mux_stream *restrict s)
@@ -953,7 +983,7 @@ struct mux_frame *mux_stream_dequeue_send(struct mux_stream *restrict s)
 	s->queued_send_bytes -=
 		(uint_least32_t)(frame->len - MUX_FRAME_HEADER_SIZE);
 	s->session->send_buffered_frames--;
-	COUNTER_SUB(s->session->cnt.send_buffered_frames, 1);
+	COUNTER_SUB(s->session->cnt.buffers.send_buffered_frames, 1);
 	return frame;
 }
 
@@ -1059,7 +1089,7 @@ void mux_stream_recv_copy(
 			return;
 		}
 		if (nwrite > 0) {
-			s->bytes_received += nwrite;
+			s->bytes_received += (uint_least32_t)nwrite;
 			payload += nwrite;
 			payload_len -= nwrite;
 			mux_stream_check_ack(s);
@@ -1087,9 +1117,9 @@ void mux_stream_recv_copy(
 	memcpy(bytebuf_write_ptr(s->recvbuf), payload, payload_len);
 	bytebuf_produce(s->recvbuf, payload_len);
 	s->session->recv_buffered_bytes += payload_len;
-	COUNTER_ADD(s->session->cnt.recv_buffered_bytes, payload_len);
-	s->bytes_received += payload_len;
-	s->buffered_bytes += payload_len;
+	COUNTER_ADD(s->session->cnt.buffers.recv_buffered_bytes, payload_len);
+	s->bytes_received += (uint_least32_t)payload_len;
+	s->buffered_bytes += (uint_least32_t)payload_len;
 
 	STREAM_LOG_F(
 		VERYVERBOSE, s,
@@ -1254,6 +1284,14 @@ void mux_stream_mark_fin_sent(struct mux_stream *s)
 
 void mux_stream_recv_fin(struct mux_stream *s)
 {
+	/* PUSH/ACK processing of this same frame may have aborted the stream
+	 * without freeing it (recv-window overflow, §6.6 excessive credit,
+	 * bytebuf OOM). The teardown is complete and the local fd already closed,
+	 * so a piggybacked FIN has nothing left to do here. */
+	if (s->state == STREAM_CLOSED) {
+		STREAM_LOG(VERBOSE, s, "discarding FIN in CLOSED state");
+		return;
+	}
 	if (s->state == STREAM_CLOSE_WAIT || s->state == STREAM_CLOSING) {
 		return;
 	}
@@ -1307,7 +1345,7 @@ void mux_stream_recv_fin(struct mux_stream *s)
 static void stream_rst_notify_socket(struct mux_stream *restrict s)
 {
 	if (s->socket.w_io.fd == -1) {
-		/* Not yet attached (e.g. a peer RST before mux_stream_attach_fd);
+		/* Not yet attached (e.g. a peer RST before mux_stream_do_attach_fd);
 		 * no socket to abortively close. */
 		return;
 	}
@@ -1350,7 +1388,8 @@ void mux_stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
 	mux_session_discard_stream_frames(s->session, s->id);
 	ASSERT(s->session->recv_buffered_bytes >= s->recvbuf->len);
 	s->session->recv_buffered_bytes -= s->recvbuf->len;
-	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, s->recvbuf->len);
+	COUNTER_SUB(
+		s->session->cnt.buffers.recv_buffered_bytes, s->recvbuf->len);
 	bytebuf_reset(s->recvbuf);
 	s->buffered_bytes = 0;
 	stream_mark_closed(s);
@@ -1367,7 +1406,8 @@ void mux_stream_do_close(struct mux_stream *s)
 		ASSERT(s->session->recv_buffered_bytes >= s->recvbuf->len);
 		s->session->recv_buffered_bytes -= s->recvbuf->len;
 		COUNTER_SUB(
-			s->session->cnt.recv_buffered_bytes, s->recvbuf->len);
+			s->session->cnt.buffers.recv_buffered_bytes,
+			s->recvbuf->len);
 		bytebuf_reset(s->recvbuf);
 		s->buffered_bytes = 0;
 		mux_session_discard_stream_frames(s->session, s->id);
@@ -1423,9 +1463,16 @@ int mux_stream_format_tag(
 	const bool peer_initiated = (bool)(s->id & 1u) == ss->accepted;
 	const char *const arrow = peer_initiated ? " <- " : " -> ";
 
+	/* Either endpoint may be an identity: this node's own is config-supplied
+	 * and the peer's claim is only NUL-excluded per doc/spec.md 5.2.3.2, so a
+	 * CR/LF or ESC in it would forge a log record or drive the terminal of
+	 * whoever reads the log (CWE-117 / CWE-150). Escape both before they reach
+	 * the tag, matching tunnel_set_tag(); the address and fd fallbacks are
+	 * self-generated and need none. */
 	char me[64];
 	if (ss->handshake.identity != NULL) {
-		(void)snprintf(me, sizeof(me), "%s", ss->handshake.identity);
+		escape_identity(
+			me, sizeof(me), ss->handshake.identity, ESCAPE_PLAIN);
 	} else {
 		union sockaddr_max addr;
 		if (socket_get_addr(ss->w_socket.fd, &addr)) {
@@ -1443,10 +1490,13 @@ int mux_stream_format_tag(
 
 	char peer[64];
 	if (ss->handshake.peer_identity != NULL) {
-		(void)snprintf(
-			peer, sizeof(peer), "%s", ss->handshake.peer_identity);
+		escape_identity(
+			peer, sizeof(peer), ss->handshake.peer_identity,
+			ESCAPE_PLAIN);
 	} else if (ss->handshake.peer_id != NULL) {
-		(void)snprintf(peer, sizeof(peer), "%s", ss->handshake.peer_id);
+		escape_identity(
+			peer, sizeof(peer), ss->handshake.peer_id,
+			ESCAPE_PLAIN);
 	} else if (ss->peer_addr.sa.sa_family != AF_UNSPEC) {
 		if (sa_format(peer, sizeof(peer), &ss->peer_addr.sa) < 0) {
 			peer[0] = '\0';

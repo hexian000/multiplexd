@@ -5,12 +5,15 @@
  * and mux_handshake_process_hello). Dependencies: handshake.c #included; real
  * frame.c/proto_schema.gen.c linked; session/unacked/sched mocked. */
 
-#include "mux/frame.h"
 #include "mux/handshake.h"
+
+#include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
+#include "mux/unacked.h"
 
 #include "algo/hashtable.h"
+#include "meta/arraysize.h"
 #include "utils/testing.h"
 
 #include <inttypes.h>
@@ -48,6 +51,11 @@ static bool g_resume_handled;
  * cases need, and spares them a full setup_session fixture. */
 static const struct mux_session k_parse_test_session;
 
+static int g_verify_calls;
+static bool g_verify_result;
+static bool g_verify_saw_null;
+static char g_verify_identity[256];
+
 static void handshake_mock_reset(void)
 {
 	g_resume_seq = 0;
@@ -59,6 +67,25 @@ static void handshake_mock_reset(void)
 	g_update_watcher_calls = 0;
 	g_resume_ack_result = true;
 	g_resume_handled = false;
+	g_verify_calls = 0;
+	g_verify_result = true;
+	g_verify_saw_null = false;
+	g_verify_identity[0] = '\0';
+}
+
+static bool
+verify_identity_cb(void *data, struct mux_session *ss, const char *identity)
+{
+	(void)data;
+	(void)ss;
+	g_verify_calls++;
+	g_verify_saw_null = (identity == NULL);
+	if (identity != NULL) {
+		(void)snprintf(
+			g_verify_identity, sizeof(g_verify_identity), "%s",
+			identity);
+	}
+	return g_verify_result;
 }
 
 static struct mux_frame *handshake_test_alloc(void *data, const size_t size)
@@ -118,17 +145,21 @@ bool mux_unacked_resume_ack_recv(
 	return g_resume_ack_result;
 }
 
+/* Mirrors unacked.c's teardown field for field: the gauge payback, the
+ * unacked_set_replay_off routing (which also zeroes retransmitted_frames) and
+ * retransmit_copy_count all belong to the contract handshake_client_fresh
+ * relies on, so a double that skipped any of them would model behavior
+ * production does not have. */
 void mux_unacked_free_all(struct mux_session *ss)
 {
 	mux_frame_ring_free(&ss->unacked.ring, &ss->pool);
+	COUNTER_SUB(ss->cnt.buffers.unacked_frames, ss->unacked.frames);
 	ss->unacked.frames = 0;
 	ss->unacked.bytes = 0;
 	ss->unacked.partial_offset = 0;
-	ss->unacked.retransmit_off = SIZE_MAX;
-	/* The real one owns clearing these two (unacked.c); handshake_client_fresh
-	 * relies on it rather than doing it itself, so a double that skipped them
-	 * would model the pre-fix contract. */
+	unacked_set_replay_off(&ss->unacked, SIZE_MAX);
 	ss->unacked.retransmit_copy = NULL;
+	ss->unacked.retransmit_copy_count = 0;
 	ss->unacked.stalled = false;
 }
 
@@ -169,8 +200,8 @@ static void setup_session(
 		.state = SESSION_HANDSHAKE,
 		.accepted = accepted,
 		.pool = make_pool(pool_ctx),
-		.max_payload =
-			(uint_least32_t)mux_conf_default.max_frame_payload,
+		.max_payload = (uint_least32_t)mux_session_config_default
+				       .max_frame_payload,
 		.tag = "[test]:",
 	};
 	ss->w_socket.fd = 11;
@@ -486,6 +517,107 @@ T_DECLARE_CASE(test_handshake_enqueue_hello_omits_oversized_identity)
 		(size_t)MUX_MAX_PAYLOAD_SIZE)] = { 0 };                        \
 	struct mux_frame *const name = (struct mux_frame *)name##_buf_
 
+/* Feed one ClientHello into a server-role session with on_verify_identity
+ * installed.  @p session_id, when non-NULL, makes it a resume hello. */
+T_DECLARE_SUBCASE(
+	run_verify_identity_hello, const char *restrict identity,
+	const bool resume, bool *restrict ok_out)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss;
+	TEST_FRAME(frame);
+	struct mux_header hdr;
+	struct proto_hello hello = {
+		.msgid = PROTO_MSG_CLIENT_HELLO,
+		.has_identity = identity != NULL,
+		.has_session_id = resume,
+	};
+
+	setup_session(&ss, &pool_ctx, true);
+	ss.callbacks.on_verify_identity = verify_identity_cb;
+	ss.callbacks.on_resume = resume_lookup_cb;
+	if (identity != NULL) {
+		(void)snprintf(
+			hello.identity, sizeof(hello.identity), "%s", identity);
+	}
+	if (resume) {
+		memset(hello.session_id, 0x55, sizeof(hello.session_id));
+	}
+	T_CHECK(build_hello_frame(frame, &hdr, &hello));
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
+	T_CHECK(ss.wire.recvbuf != NULL);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
+
+	*ok_out = mux_handshake_process_hello(&ss, &hdr, frame->len);
+	teardown_session(&ss);
+	/* Every frame the hello path allocated was returned to the pool. */
+	T_EXPECT_EQ(pool_ctx.alloc_calls, pool_ctx.free_calls);
+}
+
+/* A rejecting on_verify_identity resets the session and never completes the
+ * handshake, so no stream can be admitted (spec Section 10.1). */
+T_DECLARE_CASE(test_handshake_verify_identity_rejects)
+{
+	handshake_mock_reset();
+	g_verify_result = false;
+	bool ok = true;
+	T_CALL_SUBCASE(run_verify_identity_hello, "svc-a", false, &ok);
+
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(g_verify_calls, 1);
+	T_EXPECT_STREQ(g_verify_identity, "svc-a");
+	T_EXPECT_EQ(g_reset_calls, 1);
+	T_EXPECT_EQ(g_handshake_done_calls, 0);
+}
+
+/* The accepting path is unchanged: the callback sees the claimed identity and
+ * the handshake completes. */
+T_DECLARE_CASE(test_handshake_verify_identity_accepts)
+{
+	handshake_mock_reset();
+	g_verify_result = true;
+	bool ok = false;
+	T_CALL_SUBCASE(run_verify_identity_hello, "svc-a", false, &ok);
+
+	T_EXPECT(ok);
+	T_EXPECT_EQ(g_verify_calls, 1);
+	T_EXPECT_STREQ(g_verify_identity, "svc-a");
+	T_EXPECT_EQ(g_reset_calls, 0);
+	T_EXPECT_EQ(g_handshake_done_calls, 1);
+}
+
+/* A peer claiming no identity still fires the callback, with NULL, so a policy
+ * that wants to reject anonymous peers can. */
+T_DECLARE_CASE(test_handshake_verify_identity_null_when_unclaimed)
+{
+	handshake_mock_reset();
+	bool ok = false;
+	T_CALL_SUBCASE(run_verify_identity_hello, NULL, false, &ok);
+
+	T_EXPECT(ok);
+	T_EXPECT_EQ(g_verify_calls, 1);
+	T_EXPECT(g_verify_saw_null);
+}
+
+/* The check runs before process_hello_server(), so a rejected resume hello
+ * never reaches on_resume and its transport is never handed off. */
+T_DECLARE_CASE(test_handshake_verify_identity_precedes_resume)
+{
+	handshake_mock_reset();
+	g_verify_result = false;
+	g_resume_handled = true;
+	bool ok = true;
+	T_CALL_SUBCASE(run_verify_identity_hello, "svc-a", true, &ok);
+
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(g_verify_calls, 1);
+	T_EXPECT_EQ(g_resume_calls, 0);
+	T_EXPECT_EQ(g_reset_calls, 1);
+	T_EXPECT_EQ(g_handshake_done_calls, 0);
+}
+
 T_DECLARE_CASE(test_handshake_process_server_hello_assigns_peer_identity)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
@@ -545,6 +677,64 @@ T_DECLARE_CASE(test_handshake_process_server_hello_assigns_peer_identity)
 	T_EXPECT(session_id_match);
 	T_EXPECT(has_peer_identity);
 	T_EXPECT_STREQ(peer_identity, "srv-a");
+}
+
+/* The client's fresh-session fallback delegates the whole unacked teardown to
+ * mux_unacked_free_all, so this pins the field set that contract owns: the
+ * replay cursor routed through unacked_set_replay_off (which also zeroes
+ * retransmitted_frames), retransmit_copy_count cleared, and the unacked_frames
+ * gauge paid back. A double that skipped any of them would let a case here
+ * pass against behavior production does not have. */
+T_DECLARE_CASE(test_handshake_client_fresh_clears_unacked_replay_state)
+{
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session ss;
+	TEST_FRAME(frame);
+	struct mux_header hdr;
+	struct proto_hello hello = {
+		.msgid = PROTO_MSG_SERVER_HELLO,
+		.has_session_id = true,
+	};
+	mux_gauge unacked_gauge = 7;
+
+	handshake_mock_reset();
+	setup_session(&ss, &pool_ctx, false);
+	/* Server answers with an id of its own: not a confirmed resume, so the
+	 * client falls back to a fresh session. */
+	memset(hello.session_id, 0x44, sizeof(hello.session_id));
+	ss.cnt.buffers.unacked_frames = &unacked_gauge;
+	ss.unacked.frames = 7;
+	ss.unacked.retransmit_off = 0;
+	ss.unacked.retransmitted_frames = 3;
+	ss.unacked.retransmit_copy_count = 5;
+	T_CHECK(build_hello_frame(frame, &hdr, &hello));
+	bytebuf_free(ss.wire.recvbuf);
+	ss.wire.recvbuf = bytebuf_new(frame->len);
+	T_CHECK(ss.wire.recvbuf != NULL);
+	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data, frame->len);
+	bytebuf_produce(ss.wire.recvbuf, frame->len);
+
+	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
+	const size_t frames = ss.unacked.frames;
+	const size_t replay_off = ss.unacked.retransmit_off;
+	const size_t retransmitted = ss.unacked.retransmitted_frames;
+	const size_t copy_count = ss.unacked.retransmit_copy_count;
+	const size_t gauge =
+		(size_t)COUNTER_LOAD(ss.cnt.buffers.unacked_frames);
+
+	if (ss.sched.streams != NULL) {
+		table_free(ss.sched.streams);
+		ss.sched.streams = NULL;
+	}
+	free(ss.handshake.peer_identity);
+	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(ok);
+	T_EXPECT_EQ(frames, (size_t)0);
+	T_EXPECT_EQ(replay_off, SIZE_MAX);
+	T_EXPECT_EQ(retransmitted, (size_t)0);
+	T_EXPECT_EQ(copy_count, (size_t)0);
+	T_EXPECT_EQ(gauge, (size_t)0);
 }
 
 T_DECLARE_CASE(test_handshake_process_resume_hello_calls_on_resume_match)
@@ -922,6 +1112,61 @@ T_DECLARE_CASE(test_handshake_process_invalid_version_resets_session)
 	T_EXPECT(!ok);
 	T_EXPECT_EQ(reset_calls, 1);
 	T_EXPECT_EQ(done_calls, 0);
+}
+
+/* A worst-case hello -- resume form, claiming MUX_MAX_CLAIM_LEN octets of
+ * control characters, each of which JSON-escapes to \u00XX -- must still build
+ * into the smallest configurable frame. It did not when a claim could reach the
+ * spec's 255 octets: proto_hello_build failed, mux_handshake_enqueue_hello
+ * reset the session, and every reconnect repeated it. Also pins
+ * MUX_MAX_HELLO_JSON_SIZE against the real marshaller, since the floor's
+ * static_assert is only as good as that constant. */
+T_DECLARE_CASE(test_worst_case_hello_fits_minimum_frame)
+{
+	TEST_FRAME(frame);
+	struct proto_hello msg = {
+		.msgid = PROTO_MSG_CLIENT_HELLO,
+		.reject_inbound = true,
+		.has_session_id = true,
+		.has_resume_seq = true,
+		.resume_seq = UINT32_MAX,
+		.has_identity = true,
+	};
+	memset(msg.session_id, 0xFF, sizeof(msg.session_id));
+	memset(msg.identity, 0x01, MUX_MAX_CLAIM_LEN);
+	msg.identity[MUX_MAX_CLAIM_LEN] = '\0';
+
+	T_EXPECT(proto_hello_build(frame, MUX_MIN_FRAME_PAYLOAD, &msg));
+	const size_t json_len = frame->len - MUX_FRAME_HEADER_SIZE;
+	T_EXPECT_EQ(json_len, (size_t)MUX_MAX_HELLO_JSON_SIZE);
+}
+
+/* Spec §5.2.2 admits only the canonical decimal version, and a strict peer
+ * closes on anything else. strtoumax accepts leading whitespace, a '+' sign and
+ * leading zeros, and each of those is an RFC 2045 token character, so these
+ * forms parsed as a plain 1 and established. */
+T_DECLARE_CASE(test_proto_parse_type_requires_canonical_version)
+{
+	static const char k_good[] =
+		"application/x-multiplexd-proto; version=1";
+	static const char *const k_bad[] = {
+		"application/x-multiplexd-proto; version=01",
+		"application/x-multiplexd-proto; version=001",
+		"application/x-multiplexd-proto; version=+1",
+		"application/x-multiplexd-proto; version=\" 1\"",
+	};
+
+	int version = 0;
+	T_EXPECT(proto_parse_type(
+		&k_parse_test_session, k_good, strlen(k_good), &version));
+	T_EXPECT_EQ(version, 1);
+
+	for (size_t i = 0; i < ARRAY_SIZE(k_bad); i++) {
+		version = 0;
+		T_EXPECT(!proto_parse_type(
+			&k_parse_test_session, k_bad[i], strlen(k_bad[i]),
+			&version));
+	}
 }
 
 /* proto_hello_parse rejects a frame whose declared length exceeds the protocol
@@ -1480,6 +1725,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_handshake_enqueue_hello_includes_session_identity_and_resume),
 	T_CASE(test_handshake_enqueue_hello_omits_oversized_identity),
 	T_CASE(test_handshake_process_server_hello_assigns_peer_identity),
+	T_CASE(test_handshake_client_fresh_clears_unacked_replay_state),
+	T_CASE(test_handshake_verify_identity_rejects),
+	T_CASE(test_handshake_verify_identity_accepts),
+	T_CASE(test_handshake_verify_identity_null_when_unclaimed),
+	T_CASE(test_handshake_verify_identity_precedes_resume),
 	T_CASE(test_handshake_process_resume_hello_calls_on_resume_match),
 	T_CASE(test_handshake_process_resume_hello_on_resume_miss_falls_back_fresh),
 	T_CASE(test_handshake_process_confirmed_resume_calls_resume_ack_recv),
@@ -1488,6 +1738,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_handshake_process_confirmed_resume_ack_rejected),
 	T_CASE(test_handshake_process_confirmed_resume_rearms_write_watcher),
 	T_CASE(test_handshake_process_invalid_version_resets_session),
+	T_CASE(test_worst_case_hello_fits_minimum_frame),
+	T_CASE(test_proto_parse_type_requires_canonical_version),
 	T_CASE(test_proto_hello_parse_rejects_oversized_json),
 	T_CASE(test_handshake_process_hello_outside_handshake_resets),
 	T_CASE(test_handshake_fuzz),

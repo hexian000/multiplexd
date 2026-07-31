@@ -4,11 +4,12 @@
 /**
  * @file frame.c
  * @brief Out-of-line mux frame support: the stream-table hash options,
- *        mux_status_str, mux_conf_default, and the bytebuf / frame-ring bodies.
+ *        mux_status_str, mux_session_config_default, and the bytebuf / frame-ring bodies.
  *        (The frame serialization/parsing helpers are static inline in frame.h.)
  */
 
 #include "mux/frame.h"
+
 #include "mux/mux.h"
 #include "mux/session.h"
 
@@ -62,7 +63,7 @@ const char *mux_status_str(const uint_fast16_t status)
 
 /* Defined here, with the leaf frame allocator, so it resolves in any TU that
  * links frame.c without the full session state machine. */
-const struct mux_config mux_conf_default = {
+const struct mux_session_config mux_session_config_default = {
 	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 	.readahead = 128 * 1024,
 };
@@ -149,8 +150,7 @@ struct mux_frame_ring *mux_frame_ring_new(const size_t cap)
 
 struct mux_frame_ring *mux_frame_ring_grow(struct mux_frame_ring *r)
 {
-	ASSERT(r == NULL || r->capacity == 0 ||
-	       (r->capacity & (r->capacity - 1)) == 0);
+	ASSERT(r == NULL || (r->capacity & (r->capacity - 1)) == 0);
 	const size_t old_cap = r != NULL ? r->capacity : 0;
 	const size_t old_count = r != NULL ? r->count : 0;
 	const size_t new_cap =

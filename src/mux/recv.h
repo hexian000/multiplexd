@@ -33,7 +33,8 @@ void mux_session_on_recv(struct mux_session *ss);
  * suspension), so no peer ACK is coming to trigger a fresh EV_READ. */
 void mux_session_dispatch_pending(struct mux_session *ss);
 
-/* Process an inbound PING: send PONG if rate limit permits. */
+/* Process an inbound PING: send PONG if rate limit permits.  A PING longer than
+ * max_payload cannot be echoed and resets the session (spec §5.3.2). */
 void mux_session_recv_ping(
 	struct mux_session *ss, const struct mux_header *hdr,
 	size_t frame_size);

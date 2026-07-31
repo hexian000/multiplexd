@@ -5,11 +5,12 @@
  * §5.7); unacked.c #included, real frame.c linked; benches opt-in via
  * TESTING_BENCH env. */
 
+#include "mux/unacked.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/unacked.c"
-#include "mux/unacked.h"
 
 #include "utils/slog.h"
 #include "utils/testing.h"
@@ -62,7 +63,7 @@ void mux_session_reset(struct mux_session *ss)
 struct unacked_fixture {
 	struct mux_session ss;
 	struct frame_pool_ctx pool_ctx;
-	/* Backs ss.cnt.unacked_frames so the frames <-> gauge mirror invariant
+	/* Backs ss.cnt.buffers.unacked_frames so the frames <-> gauge mirror invariant
 	 * (unacked.h) is observable; without it COUNTER_ADD/SUB are NULL no-ops
 	 * and the mirror can drift undetected. */
 	mux_gauge unacked_frames;
@@ -81,7 +82,7 @@ static void uf_setup(struct unacked_fixture *restrict fx)
 	fx->ss.max_payload = MUX_MAX_PAYLOAD_SIZE;
 	fx->ss.session_window = 4;
 	fx->ss.unacked.retransmit_off = SIZE_MAX;
-	fx->ss.cnt.unacked_frames = &fx->unacked_frames;
+	fx->ss.cnt.buffers.unacked_frames = &fx->unacked_frames;
 }
 
 /* Drain any frames left in the ring; returns true when every allocation was
@@ -269,6 +270,9 @@ T_DECLARE_CASE(test_track_sent_retransmit_copy_advances_cursor)
 	mux_unacked_track_sent(&fx.ss, copy);
 
 	T_EXPECT(fx.ss.unacked.retransmit_copy == NULL);
+	/* The count is retired with the copy it describes, so no stale value
+	 * outlives it. */
+	T_EXPECT_EQ(fx.ss.unacked.retransmit_copy_count, (size_t)0);
 	T_EXPECT_EQ(fx.ss.unacked.retransmit_off, (size_t)1);
 	/* The single entry is now retransmitted: the counter folds in its count. */
 	T_EXPECT_EQ(fx.ss.unacked.retransmitted_frames, (size_t)1);
@@ -424,7 +428,8 @@ T_DECLARE_CASE(test_ack_trim_full_pop)
 	T_EXPECT(mux_frame_ring_size(fx.ss.unacked.ring) == 1);
 	/* The server-wide gauge tracks unacked.frames through push and trim. */
 	T_EXPECT_EQ(
-		COUNTER_LOAD(fx.ss.cnt.unacked_frames), fx.ss.unacked.frames);
+		COUNTER_LOAD(fx.ss.cnt.buffers.unacked_frames),
+		fx.ss.unacked.frames);
 
 	T_EXPECT(uf_teardown(&fx));
 }
@@ -942,7 +947,7 @@ T_DECLARE_CASE(test_free_all_resets_state)
 	/* mux_unacked_free_all must decrement the gauge by the frames it drops, not
 	 * just zero the local mirror (regression: it left the server-wide gauge
 	 * permanently inflated). */
-	T_EXPECT_EQ(COUNTER_LOAD(fx.ss.cnt.unacked_frames), (size_t)0);
+	T_EXPECT_EQ(COUNTER_LOAD(fx.ss.cnt.buffers.unacked_frames), (size_t)0);
 
 	T_EXPECT(uf_teardown(&fx));
 }

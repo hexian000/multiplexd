@@ -40,34 +40,26 @@ struct tls_connection;
 /* --- Protocol constants --- */
 
 /* Frame wire layout: an 8-byte header followed by the payload.  The per-session
- * payload cap is configurable (mux_config.max_frame_payload). */
+ * payload cap is configurable (mux_session_config.max_frame_payload). */
 #define MUX_FRAME_HEADER_SIZE 8u
 
 /* Compile-time frame-buffer cap: the payload length is a 16-bit wire field, so
  * the largest legal payload is 65535 bytes.  The runtime per-session frame size
- * is configured up to this via mux_config.max_frame_payload. */
+ * is configured up to this via mux_session_config.max_frame_payload. */
 #define MUX_MAX_PAYLOAD_SIZE 65535u
-#define MUX_MAX_FRAME_SIZE (MUX_FRAME_HEADER_SIZE + MUX_MAX_PAYLOAD_SIZE)
 
 /* Wire Extra field counts window credit in units of this many bytes. */
 #define MUX_WINDOW_UNIT 16384u
 
-/* Auto stream/session receive-window floor (bytes) before BDP estimation
- * converges: the smallest value the auto stream_window/session_window and the
- * estimator's WNDSIZE_MIN are clamped up to. Despite the historical name it is
- * not a send window -- mux_stream_new sets each stream's send window from
- * MUX_DEFAULT_SEND_WINDOW. */
-#define MUX_INITIAL_SEND_WINDOW 65536u
-
 /* The payload length is carried in a 16-bit wire field, so a full frame must
- * fit; and the receive-window floor must admit one max-size frame, otherwise a
- * just-read frame could exceed every credit grant and never drain (deadlock). */
+ * fit. */
 static_assert(
 	MUX_MAX_PAYLOAD_SIZE <= UINT16_MAX,
 	"frame payload exceeds 16-bit length field");
-static_assert(
-	MUX_INITIAL_SEND_WINDOW >= MUX_MAX_PAYLOAD_SIZE,
-	"receive-window floor must admit one max-size frame");
+
+/* The derived frame-buffer cap MUX_MAX_FRAME_SIZE and the receive-window floor
+ * MUX_INITIAL_SEND_WINDOW are internal to the mux stack; see frame.h and
+ * estimator.h respectively. */
 
 /* Session identity length in bytes; transmitted as Base64 in the hello JSON. */
 #define MUX_SESSION_ID_LEN 16u
@@ -86,8 +78,16 @@ struct mux_frame_allocator {
 	void *data;
 };
 
+/* Longest identity this implementation claims. Spec §5.2.2 allows 255 octets,
+ * but JSON escaping expands a control character to \u00XX, so a claim at the
+ * wire limit marshals past the smallest configurable frame and the hello could
+ * never be sent. Bounding what we claim keeps the floor below honest; a
+ * received identity is still accepted up to the spec's 255. */
+#define MUX_MAX_CLAIM_LEN 63u
+
 /* Smallest configurable frame payload: a 1 KiB minimum frame minus the header.
- * Must comfortably exceed the hello handshake JSON. */
+ * Must comfortably exceed the hello handshake JSON; the invariant against the
+ * largest possible hello (MUX_MAX_HELLO_JSON_SIZE) is asserted in handshake.h. */
 #define MUX_MIN_FRAME_PAYLOAD (1024u - MUX_FRAME_HEADER_SIZE)
 
 /**
@@ -118,36 +118,52 @@ struct mux_traffic_counters {
 
 /* Pointer-block into server_stats for direct session-thread updates.
  * Pointer fields point to atomic or plain counters by build mode.
- * NULL pointers are silently skipped by COUNTER_*. */
+ * NULL pointers are silently skipped by COUNTER_*.  Grouped by subject so the
+ * ~20 pointers stay legible and the caller wires one sub-block at a time; each
+ * field is still an independent pointer, so a field may target per-session,
+ * per-tunnel, or server-global storage as the caller chooses. */
 struct mux_session_counters {
-	mux_counter *num_session_created;
-	mux_counter *num_session_connect;
-	mux_counter *num_session_connected;
-	mux_counter *num_session_disconnected;
-	mux_counter *num_session_finalized;
-	mux_gauge *num_sessions;
-	mux_gauge *num_session_halfopen;
-	mux_gauge *num_streams;
-	mux_gauge *num_stream_halfopen;
-	mux_counter *num_stream_opened;
-	mux_counter *num_stream_accepted;
-	mux_counter *num_stream_fastopen;
-	mux_counter *num_stream_established;
-	mux_counter *num_stream_succeeded;
-	mux_counter *num_stream_failed;
-	mux_counter *num_rst_sent;
-	mux_counter *num_rst_recv;
-	mux_counter *num_stream_errors;
-	mux_gauge *recv_buffered_bytes;
-	mux_gauge *send_buffered_frames;
-	mux_gauge *unacked_frames;
+	/* Session lifecycle: cumulative counters plus the live/half-open gauges. */
+	struct {
+		mux_counter *num_session_created;
+		mux_counter *num_session_connect;
+		mux_counter *num_session_connected;
+		mux_counter *num_session_disconnected;
+		mux_counter *num_session_finalized;
+		mux_gauge *num_sessions;
+		mux_gauge *num_session_halfopen;
+	} session;
+	/* Stream lifecycle: the live/half-open gauges plus cumulative counters. */
+	struct {
+		mux_gauge *num_streams;
+		mux_gauge *num_stream_halfopen;
+		mux_counter *num_stream_opened;
+		mux_counter *num_stream_accepted;
+		mux_counter *num_stream_fastopen;
+		mux_counter *num_stream_established;
+		mux_counter *num_stream_succeeded;
+		mux_counter *num_stream_failed;
+	} stream;
+	/* Reset and stream-error counters. */
+	struct {
+		mux_counter *num_rst_sent;
+		mux_counter *num_rst_recv;
+		mux_counter *num_stream_errors;
+	} errors;
+	/* Buffer-occupancy gauges. */
+	struct {
+		mux_gauge *recv_buffered_bytes;
+		mux_gauge *send_buffered_frames;
+		mux_gauge *unacked_frames;
+	} buffers;
+	/* Traffic byte counters. */
 	struct mux_traffic_counters traffic;
 };
 
 /* --- Mux configuration subset --- */
 
 /* Configuration snapshot copied from the caller at session creation. */
-struct mux_config {
+struct mux_session_config {
 	/* Maximum number of concurrent streams per session. */
 	int max_streams;
 	/* Maximum number of half-open (unacknowledged SYN) streams. */
@@ -199,15 +215,13 @@ struct mux_config {
 	bool reject_inbound : 1;
 
 #if WITH_TLS
-	/* TLS context for outbound reconnects; NULL leaves the existing context unchanged. */
-	struct tls_context *tlsctx;
 	/* Let the TLS library own the socket fd. When false, wire.c drives the
 	 * socket and shuttles ciphertext through the library (memory transport). */
 	bool tls_socket_offload : 1;
 #endif
 };
 
-extern const struct mux_config mux_conf_default;
+extern const struct mux_session_config mux_session_config_default;
 
 /* --- Session creation options --- */
 
@@ -219,8 +233,9 @@ extern const struct mux_config mux_conf_default;
 struct mux_session_opts {
 	const struct mux_callbacks *callbacks;
 	void *userdata;
-	const struct mux_config *conf;
+	const struct mux_session_config *conf;
 	int fd;
+	/* Session ID of MUX_SESSION_ID_LEN octets; required, never NULL. */
 	const unsigned char *id;
 	/* Identity claimed in hello; copied if non-NULL. */
 	const char *identity;
@@ -297,14 +312,17 @@ void mux_start(struct mux_session *ss);
  */
 void mux_attach_fd(struct mux_session *ss, int fd);
 
-/* --- Session accessors --- */
+/* --- Session accessors: owning ev_loop thread only ---
+ *
+ * Every accessor in this group reads the session object directly, with no
+ * atomic mirror, so it must be called only from the session's own ev_loop
+ * thread, per struct mux_session's threading invariant.  The any-thread
+ * accessors that read relaxed-atomic mirrors are grouped separately below. */
 
 /**
  * @brief The session's transport fd.
  * @param ss Target session.
  * @return The fd, or -1 when none is attached.
- * @note Reads ss directly (no atomic mirror): call only from the owning
- * ev_loop thread, per struct mux_session's threading invariant.
  */
 int mux_fd(const struct mux_session *ss);
 
@@ -314,8 +332,6 @@ int mux_fd(const struct mux_session *ss);
  * @param ss Target session.
  * @return The connection, owned by the session (do not free), or NULL when TLS
  * is not in use.
- * @note Reads ss directly (no atomic mirror): call only from the owning
- * ev_loop thread, per struct mux_session's threading invariant.
  */
 struct tls_connection *mux_tls_conn(const struct mux_session *ss);
 #endif /* WITH_TLS */
@@ -324,26 +340,8 @@ struct tls_connection *mux_tls_conn(const struct mux_session *ss);
  * @brief The peer's socket address.
  * @param ss Target session.
  * @return The peer address, or NULL before SESSION_ESTABLISHED.
- * @note Reads ss directly (no atomic mirror): call only from the owning
- * ev_loop thread, per struct mux_session's threading invariant.
  */
 const struct sockaddr *mux_peer_addr(const struct mux_session *ss);
-
-enum mux_state {
-	MUX_STATE_ESTABLISHED,
-	MUX_STATE_CONNECT,
-	MUX_STATE_CLOSED,
-	MUX_STATE_SUSPENDED,
-};
-
-/**
- * @brief The session's coarse lifecycle state.
- * @param ss Target session.
- * @return The current ::mux_state.
- * @note Reads a relaxed-atomic mirror: safe to call from any thread, unlike
- * most other accessors in this section.
- */
-enum mux_state mux_state(const struct mux_session *ss);
 
 /**
  * @brief The session identity (MUX_SESSION_ID_LEN bytes).
@@ -351,19 +349,59 @@ enum mux_state mux_state(const struct mux_session *ss);
  * @return Pointer to the identity. For accepted sessions this equals the id
  * passed to mux_new(); for dialed sessions it starts as the local id and is
  * replaced by the server-assigned value when ServerHello arrives.
- * @note Reads ss directly (no atomic mirror): call only from the owning
- * ev_loop thread, per struct mux_session's threading invariant.
  */
 const unsigned char *mux_session_id(const struct mux_session *ss);
+
+/**
+ * @brief The identity claimed by the peer in its hello.
+ * @return The identity, or NULL when the peer claimed none. Owned by the
+ * session; valid until the next hello is processed.
+ * @note Available as soon as the hello is parsed, which is earlier than the
+ * ::MUX_EVENT_CONNECTED that publishes it elsewhere.
+ */
+const char *mux_peer_identity(const struct mux_session *ss);
 
 /**
  * @brief The session's configuration snapshot.
  * @param ss Target session.
  * @return Read-only pointer to the config.
- * @note Reads ss directly (no atomic mirror): call only from the owning
- * ev_loop thread, per struct mux_session's threading invariant.
  */
-const struct mux_config *mux_conf(const struct mux_session *ss);
+const struct mux_session_config *mux_conf(const struct mux_session *ss);
+
+/* --- Session accessors: safe from any thread ---
+ *
+ * These read relaxed-atomic mirrors published by the session thread, so unlike
+ * the owning-loop-only accessors above they may be called from any thread (the
+ * server thread's /stats path relies on this). */
+
+/* Coarse lifecycle reported by mux_state(); the internal state machine
+ * (doc/impl.md §4.1) collapses onto these.  CLOSING is distinct from CLOSED
+ * because the two admit different operations: a CLOSED session can be redialed
+ * and a SUSPENDED one resumed, while a CLOSING one still owns its transport and
+ * accepts neither. */
+enum mux_state {
+	/* Usable: streams may be opened and carried. */
+	MUX_STATE_ESTABLISHED,
+	/* Coming up (INIT, CONNECT or HANDSHAKE): not usable yet. */
+	MUX_STATE_CONNECT,
+	/* Gone.  Accepted by mux_attach_fd(), so a dialed session here may be
+	 * redialed on demand. */
+	MUX_STATE_CLOSED,
+	/* Transport lost but resumable: streams and unacked frames are held for
+	 * replay.  Accepted by mux_attach_fd() and eligible as a resume target. */
+	MUX_STATE_SUSPENDED,
+	/* Shutting down (CLOSING or CLOSE_WAIT): no longer usable, but not yet
+	 * gone.  Rejected by mux_attach_fd(), and never a resume target -- the
+	 * attach would be dropped and the peer's fresh transport discarded. */
+	MUX_STATE_CLOSING,
+};
+
+/**
+ * @brief The session's coarse lifecycle state.
+ * @param ss Target session.
+ * @return The current ::mux_state.
+ */
+enum mux_state mux_state(const struct mux_session *ss);
 
 /* Snapshot of per-session estimator state.  Filled by mux_session_stats(). */
 struct mux_session_stats {
@@ -385,8 +423,6 @@ struct mux_session_stats {
  * @brief Snapshot the session's estimator state.
  * @param ss Target session.
  * @param[out] out Receives a consistent snapshot.
- * @note Reads relaxed-atomic mirrors: safe to call from any thread, unlike
- * most other accessors in this section.
  */
 void mux_session_stats(
 	const struct mux_session *ss, struct mux_session_stats *restrict out);
@@ -396,11 +432,22 @@ void mux_session_stats(
 /**
  * @brief Replace the session's configuration snapshot (config reload).
  * @param ss Target session.
- * @param[in] conf New config. When WITH_TLS, a non-NULL conf->tlsctx also
- * replaces the TLS context for outbound reconnects; NULL leaves it unchanged.
+ * @param[in] conf New config. A pure value replace; to swap the TLS context
+ * used for outbound reconnects, use mux_set_tlsctx() separately.
  */
 void mux_set_config(
-	struct mux_session *ss, const struct mux_config *restrict conf);
+	struct mux_session *ss, const struct mux_session_config *restrict conf);
+
+#if WITH_TLS
+/**
+ * @brief Replace the TLS context used for the session's outbound reconnects.
+ * @param ss Target session.
+ * @param[in] tlsctx New TLS context. Borrowed: the session stores the pointer
+ * for future reconnects, so it must outlive that use; the caller keeps
+ * ownership.
+ */
+void mux_set_tlsctx(struct mux_session *ss, struct tls_context *tlsctx);
+#endif /* WITH_TLS */
 
 /**
  * @brief Signal the session to drain: reject new inbound streams and shut down
@@ -475,7 +522,7 @@ union mux_event_data {
 struct mux_callbacks {
 	/**
 	 * @brief Called for each new inbound stream.
-	 * @return true to accept (after mux_stream_attach() or
+	 * @return true to accept (after mux_stream_attach_fd() or
 	 * mux_stream_io_start()), false to reject.
 	 */
 	bool (*on_accept)(
@@ -488,6 +535,19 @@ struct mux_callbacks {
 	void (*on_event)(
 		void *data, struct mux_session *, enum mux_event,
 		union mux_event_data);
+	/**
+	 * @brief Called once the peer's claimed identity is known, before the
+	 * handshake completes and before any stream can be admitted.
+	 * @param identity Identity claimed in the peer's hello, or NULL when the
+	 * peer claimed none.
+	 * @return true to accept the session; false to reject it, which resets
+	 * the session without admitting a stream.
+	 * @note Fires on every hello, a resume hello included, so each new
+	 * transport is checked rather than only the first. A NULL callback
+	 * accepts unconditionally.
+	 */
+	bool (*on_verify_identity)(
+		void *data, struct mux_session *ss, const char *identity);
 	/**
 	 * @brief Called on the transient session @p new_ss when a resume hello
 	 * arrives.
@@ -505,10 +565,21 @@ struct mux_callbacks {
 
 /* Transport (socket fd + TLS connection) detached from a transient session for
  * a resume handoff.  A plain value type so the owner can carry it across a loop
- * boundary; the mux layer performs no thread/loop operations on it. */
+ * boundary; the mux layer performs no thread/loop operations on it.
+ * Carries no buffered ciphertext: mux_transport_detach requires the transient's
+ * outbound memory-transport buffer to be empty, which holds while no
+ * post-handshake records can arrive before the resume hello. */
 struct mux_transport {
 	int fd;
 	int_least64_t connect_started;
+	/* Extensions from the resume hello (spec §5.2.2 defines the active set
+	 * from the hello exchange, and a resume is one). The transient session
+	 * that parsed them is discarded, so they ride across to the resumed
+	 * session here. Owned: mux_resume_attach consumes it,
+	 * mux_transport_discard frees it. NULL when the hello claimed none, in
+	 * which case the resumed session keeps its current identity. */
+	char *peer_identity;
+	bool reject_inbound;
 #if WITH_TLS
 	struct tls_connection *tlsconn;
 #endif
@@ -545,88 +616,28 @@ void mux_resume_attach(
  */
 void mux_transport_discard(struct mux_transport *restrict transport);
 
-/* --- Stream I/O watcher --- */
-
-/**
- * @brief Per-stream I/O event watcher for direct (non-attach-fd) mode.
- * @note EV_READ fires on data available, peer FIN (recv returns 0), or a peer
- * RST or local abort (recv returns -1/ECONNRESET); EV_WRITE fires when the
- * send window opens.
- */
-typedef struct mux_stream_io mux_stream_io;
-struct mux_stream_io {
-	EV_WATCHER(mux_stream_io)
-	/* private */
-	struct ev_loop *loop;
-	struct mux_stream *stream;
-	/* EV_READ | EV_WRITE */
-	int events;
-};
-
-#define mux_stream_io_init(w, cb_, s_, events_)                                \
-	do {                                                                   \
-		ev_init((w), (cb_));                                           \
-		mux_stream_io_set((w), (s_), (events_));                       \
-	} while (0)
-
-#define mux_stream_io_set(w, s_, events_)                                      \
-	do {                                                                   \
-		(w)->stream = (s_);                                            \
-		(w)->events = (events_);                                       \
-	} while (0)
-
-/**
- * @brief Activate the watcher, entering direct I/O mode.
- * @param loop Event loop.
- * @param[in] w Stream I/O watcher.
- * @note For passive-open streams this sends SYN|ACK and transitions to
- * ESTABLISHED.
- * @return true if the watcher is now bound and will deliver events; false if the
- * stream had already left every attachable state (a peer-triggerable race, e.g.
- * a peer RST): the binding is severed (w->stream cleared) and no event will ever
- * fire, so the caller must not keep waiting on @p w.
- */
-bool mux_stream_io_start(struct ev_loop *loop, mux_stream_io *restrict w);
-
-/**
- * @brief Change the events a stream I/O watcher reports.
- * @param loop Event loop.
- * @param[in] w Stream I/O watcher.
- * @param events New event mask (EV_READ | EV_WRITE).
- */
-void mux_stream_io_modify(
-	struct ev_loop *loop, mux_stream_io *restrict w, int events);
-
-/**
- * @brief Permanently detach a stream I/O watcher from its stream.
- * @note This is terminal, not a reversible pause: it severs the watcher from
- * the stream (and the stream from the watcher), so the watcher cannot be
- * re-armed with mux_stream_io_start afterwards. The application still owns the
- * stream and must still mux_stream_close() it. To merely pause/resume delivery,
- * use mux_stream_io_modify(loop, w, 0) instead.
- * @param loop Event loop.
- * @param[in] w Stream I/O watcher.
- */
-void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w);
-
 /* --- Stream operations --- */
 
 /**
  * @brief Open a new outbound stream.
  * @param ss Target session.
- * @return The new stream, or NULL when the session is not established or the
- * halfopen backlog is full.
+ * @return The new stream, or NULL when it cannot be opened right now: the
+ * session is not established or is draining, the peer rejects inbound streams,
+ * the halfopen backlog or the stream cap is full, stream IDs are exhausted, or
+ * allocation failed.
  */
-struct mux_stream *mux_open_stream(struct mux_session *ss);
+struct mux_stream *mux_stream_open(struct mux_session *ss);
 
 /**
  * @brief Attach a local socket fd to a stream; takes ownership of @p fd.
  * @param s Target stream.
  * @param fd Local socket; data transfer is blocked until the peer replies
  * SYN|ACK.
- * @note Mutually exclusive with mux_stream_io_start().
+ * @note This is socket mode. It is mutually exclusive with direct mode, whose
+ * watcher and data-transfer API (mux_stream_io_start() etc.) live in the
+ * companion header mux/stream_io.h.
  */
-void mux_stream_attach(struct mux_stream *s, int fd);
+void mux_stream_attach_fd(struct mux_stream *s, int fd);
 
 /**
  * @brief The stream's wire id.
@@ -635,55 +646,10 @@ void mux_stream_attach(struct mux_stream *s, int fd);
  */
 uint_least16_t mux_stream_id(const struct mux_stream *s);
 
-/**
- * @brief Queue up to *len bytes for sending.
- * @param s Target stream.
- * @param[in] buf Source bytes.
- * @param[inout] len In: bytes to queue. Out: bytes queued (may be less when the
- * window is partially full, or zero when exhausted — retry after EV_WRITE).
- * @return 0 on success; -1/EINVAL when not writable, -1/EAGAIN when the frame
- * pool is exhausted before any data is queued.
- */
-int mux_stream_send(
-	struct mux_stream *restrict s, const void *restrict buf,
-	size_t *restrict len);
-
-/**
- * @brief Copy up to *len bytes from the receive buffer.
- * @param s Target stream.
- * @param[out] buf Destination.
- * @param[inout] len In: buffer capacity. Out: bytes copied (zero means peer
- * FIN).
- * @return 0 on success; -1/ECONNRESET on a peer RST or local abort (e.g. a
- * local I/O failure), -1/EAGAIN when no data is available.
- * @note If the local side has also sent FIN (CLOSING) and the buffer drains,
- * the stream closes inside this call — do not use @p s again after a zero
- * return. In CLOSE_WAIT (local FIN not yet sent) @p s stays valid; follow up
- * with mux_stream_shutdown() or mux_stream_close().
- */
-int mux_stream_recv(
-	struct mux_stream *restrict s, void *restrict buf,
-	size_t *restrict len);
-
-/**
- * @brief Half-close the write side (shutdown(fd, SHUT_WR)).
- * @param s Target stream.
- */
-void mux_stream_shutdown(struct mux_stream *s);
-
-/**
- * @brief Close with close(fd) semantics.
- * @param s Target stream.
- * @note Sends RST (abortive close) if the receive buffer has unread data;
- * otherwise initiates a graceful FIN, as mux_stream_shutdown() does. No RST is
- * sent for a stream that already received one -- spec §4.3.4 requires the
- * receiver answer an RST with no frame at all -- so closing from an
- * ECONNRESET notification is silent even with data still buffered.
- * @note The caller relinquishes @p s: it must not be used again, and in direct
- * mode mux_stream_recv() will not be called for it, so the library stops
- * deferring the stream's final transition to that call.
- */
-void mux_stream_close(struct mux_stream *s);
+/* Direct-mode stream I/O -- the ::mux_stream_io watcher plus mux_stream_send(),
+ * mux_stream_recv(), mux_stream_shutdown() and mux_stream_close() -- is the
+ * alternative to attaching a socket fd. Its API lives in mux/stream_io.h so the
+ * everyday socket-mode surface here stays small. */
 
 /** @} */
 

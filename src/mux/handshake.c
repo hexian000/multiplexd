@@ -6,8 +6,9 @@
  * @brief Internal mux hello and resume handshake implementation.
  */
 
-#include "mux/frame.h"
 #include "mux/handshake.h"
+
+#include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/proto_schema.gen.h"
 #include "mux/sched.h"
@@ -145,6 +146,15 @@ static bool proto_parse_type(
 	}
 	if (version == NULL) {
 		MUX_LOG(ERROR, ss, "protocol version not specified");
+		goto done;
+	}
+	/* strtoumax admits leading whitespace, a '+' sign and leading zeros, and
+	 * all of those are RFC 2045 token characters, so "01", "+1" and a quoted
+	 * " 1" would each parse as 1. Spec §5.2.2 admits only the canonical
+	 * decimal, and a strict peer closes on the rest. */
+	if (version[0] < '1' || version[0] > '9') {
+		MUX_LOG_F(
+			ERROR, ss, "invalid protocol version: %.64s", version);
 		goto done;
 	}
 	errno = 0;
@@ -530,6 +540,23 @@ bool mux_handshake_process_hello(
 		}
 		free(ss->handshake.peer_identity);
 		ss->handshake.peer_identity = dup;
+	}
+	/* Verify before anything else acts on this hello.  Running here puts the
+	 * check ahead of the resume handoff in process_hello_server() -- so the
+	 * transport is still ours to reject -- and ahead of
+	 * mux_session_handshake_done(), so a rejected peer never reaches a stream
+	 * (spec Section 10.1).  The same call site covers both directions: the
+	 * server sees a ClientHello here, the client a ServerHello.
+	 *
+	 * The effective identity is passed, not merely a claim carried by this
+	 * hello, so an identity inherited from an earlier transport is re-proved
+	 * against the certificate presented on this one. */
+	if (ss->callbacks.on_verify_identity != NULL &&
+	    !ss->callbacks.on_verify_identity(
+		    ss->userdata, ss, ss->handshake.peer_identity)) {
+		MUX_LOG(ERROR, ss, "peer identity rejected");
+		mux_session_reset(ss);
+		return false;
 	}
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 

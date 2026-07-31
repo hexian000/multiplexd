@@ -17,7 +17,7 @@ add_library(mux OBJECT
     sched.c sched.h
     send.c send.h
     session.c session.h
-    stream.c stream.h
+    stream.c stream.h stream_io.h
     unacked.c unacked.h
     wire.c wire.h
 )

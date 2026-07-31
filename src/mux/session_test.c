@@ -5,6 +5,8 @@
  * re-arming, graceful/forced shutdown, drain, socket-option helper);
  * session.c #included; all sibling-module collaborators mocked below. */
 
+#include "mux/session.h"
+
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
@@ -13,7 +15,6 @@
 #include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.c"
-#include "mux/session.h"
 #include "mux/stream.h"
 #include "mux/unacked.h"
 #include "mux/wire.h"
@@ -28,6 +29,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -37,6 +39,8 @@
  * test, then restores the inert default.  Declared here so the mock bodies
  * below can read them. */
 static bool g_session_send_oob_result = true;
+static int g_session_send_oob_calls;
+static uint_fast8_t g_last_send_oob_extra;
 static enum wire_shutdown_state g_wire_shutdown_result = WIRE_SHUTDOWN_DONE;
 static enum wire_eof_result g_wire_wait_eof_result = WIRE_EOF_CONFIRMED;
 static bool g_wire_tls_start_result = true;
@@ -208,9 +212,10 @@ bool mux_session_send_oob(
 	const unsigned char *payload, size_t payload_len)
 {
 	(void)ss;
-	(void)extra;
 	(void)payload;
 	(void)payload_len;
+	g_session_send_oob_calls++;
+	g_last_send_oob_extra = extra;
 	return g_session_send_oob_result;
 }
 
@@ -236,12 +241,15 @@ bool mux_unacked_resume_ack_recv(struct mux_session *ss, uint_least32_t peer_ack
 }
 
 static int g_unacked_track_sent_calls = 0;
+static const struct mux_frame *g_last_track_sent_frame;
 
 void mux_unacked_track_sent(struct mux_session *ss, struct mux_frame *frame)
 {
 	/* Real mux_unacked_track_sent takes ownership; reclaim here to avoid leaks
-	 * when a test routes a captured sendbuf frame through this path. */
+	 * when a test routes a captured sendbuf frame through this path. Record
+	 * the frame: the count alone cannot tell which one was tracked. */
 	g_unacked_track_sent_calls++;
+	g_last_track_sent_frame = frame;
 	mux_frame_put(&ss->pool, frame);
 }
 
@@ -335,6 +343,7 @@ session_test_io_cb(struct ev_loop *loop, ev_io *w, const int revents)
 }
 
 static int g_closed_event_count = 0;
+static bool g_last_closed_clean;
 
 static void session_test_on_event(
 	void *data, struct mux_session *ss, const enum mux_event event,
@@ -342,9 +351,9 @@ static void session_test_on_event(
 {
 	(void)data;
 	(void)ss;
-	(void)edata;
 	if (event == MUX_EVENT_CLOSED) {
 		g_closed_event_count++;
+		g_last_closed_clean = edata.closed.clean;
 	}
 }
 
@@ -399,7 +408,7 @@ static int setup_fixture(struct session_fixture *restrict fx)
 		.loop = fx->loop,
 		.state = SESSION_ESTABLISHED,
 		.pool = make_pool(&fx->pool_ctx),
-		.max_payload = (uint_least32_t)mux_conf_default.max_frame_payload,
+		.max_payload = (uint_least32_t)mux_session_config_default.max_frame_payload,
 		.session_window = 8,
 		.stream_window = 4,
 		.wire = {
@@ -655,7 +664,7 @@ T_DECLARE_CASE(test_session_set_config_preserves_suspended_resume_deadline)
 	ev_timer_set(&fx.ss.w_connect_timeout, 30.0, 0.0);
 	ev_timer_start(fx.ss.loop, &fx.ss.w_connect_timeout);
 
-	const struct mux_config conf = {
+	const struct mux_session_config conf = {
 		.timeout = 30,
 		.keepalive = 15,
 		.send_timeout = 10,
@@ -710,7 +719,7 @@ T_DECLARE_CASE(test_session_set_config_preserves_graceful_close_deadline)
 			ev_timer_set(&fx.ss.w_connect_timeout, 30.0, 0.0);
 			ev_timer_start(fx.ss.loop, &fx.ss.w_connect_timeout);
 
-			const struct mux_config conf = {
+			const struct mux_session_config conf = {
 				.timeout = 30,
 				.keepalive = 15,
 				.send_timeout = 10,
@@ -863,6 +872,41 @@ T_DECLARE_CASE(test_close_wait_cb_unexpected)
 	teardown_fixture(&fx);
 }
 
+/* MUX_EVENT_CLOSED's `clean` flag means "peer FIN or TLS close_notify". On a
+ * locally-initiated graceful close, close_wait_cb's WIRE_EOF_CONFIRMED arm is
+ * the only place that observation is made, so a completed close handshake must
+ * report clean -- it reported false for every such close before. */
+T_DECLARE_CASE(test_close_wait_cb_confirmed_reports_clean)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_CLOSE_WAIT;
+	fx.ss.wire.rx_eof =
+		false; /* locally-initiated close: no inbound EOF yet */
+	fx.ss.callbacks.on_event = session_test_on_event;
+	g_closed_event_count = 0;
+	g_last_closed_clean = false;
+
+	g_wire_wait_eof_result = WIRE_EOF_CONFIRMED;
+	/* Drive the ev_io callback, not close_wait_cb directly: socket_cb is
+	 * where the CLOSED event is emitted from wire.rx_eof. */
+	fx.ss.w_socket.data = &fx.ss;
+	socket_cb(fx.ss.loop, &fx.ss.w_socket, EV_READ);
+
+	const int closed_events = g_closed_event_count;
+	const bool clean = g_last_closed_clean;
+	fx.ss.callbacks.on_event = NULL;
+
+	fx.fds[0] = -1;
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(closed_events, 1);
+	T_EXPECT(clean);
+}
+
 /* WIRE_EOF_PENDING (a spurious wakeup with nothing confirmed yet, e.g. EAGAIN)
  * is a distinct outcome from WIRE_EOF_CONFIRMED and WIRE_EOF_ERROR, newly
  * reachable now that mux_wire_wait_eof no longer conflates it into a single
@@ -950,9 +994,23 @@ T_DECLARE_CASE(test_dead_link_suspend_for_resume)
 	mux_frame_list_push(&fx.ss.wire.sendbuf, copy);
 	mux_frame_list_push(&fx.ss.wire.sendbuf, tracked);
 	fx.ss.unacked.retransmit_copy = copy;
+	g_unacked_track_sent_calls = 0;
+	g_last_track_sent_frame = NULL;
+	const int frees_before = fx.pool_ctx.free_calls;
 
 	session_on_dead_link(&fx.ss, "send timeout");
+	const int track_calls = g_unacked_track_sent_calls;
+	const struct mux_frame *const tracked_frame = g_last_track_sent_frame;
+	const int frees_after = fx.pool_ctx.free_calls;
+
 	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_SUSPENDED);
+	/* Only `tracked` enters the resume ring: `copy` is already the replay
+	 * copy, so re-tracking it would double-enter it. */
+	T_EXPECT_EQ(track_calls, 1);
+	T_EXPECT(tracked_frame == tracked);
+	/* Both frames released exactly once -- `copy` straight back to the pool,
+	 * `tracked` through the mock that stands in for the ring. */
+	T_EXPECT_EQ(frees_after - frees_before, 2);
 
 	fx.fds[0] = -1; /* mux_session_suspend closed it */
 	teardown_fixture(&fx);
@@ -1222,12 +1280,35 @@ T_DECLARE_CASE(test_keepalive_cb_emits_and_rearms)
 	}
 	fx.ss.state = SESSION_ESTABLISHED;
 	fx.ss.conf.keepalive = 5;
+	/* mux_keepalive_interval jitters the base down by up to
+	 * MUX_KEEPALIVE_JITTER, so the re-armed period is bounded, not exact. */
+	const double lo = 5.0 * (1.0 - MUX_KEEPALIVE_JITTER);
+	g_session_send_oob_calls = 0;
 
 	g_session_send_oob_result = false; /* exhausted-pool skip branch */
 	keepalive_cb(fx.ss.loop, &fx.ss.w_keepalive, EV_TIMER);
+	const int calls_after_skip = g_session_send_oob_calls;
+	const bool armed_after_skip = ev_is_active(&fx.ss.w_keepalive);
+	const double repeat_after_skip = fx.ss.w_keepalive.repeat;
+
 	g_session_send_oob_result = true; /* normal PROBE branch */
 	keepalive_cb(fx.ss.loop, &fx.ss.w_keepalive, EV_TIMER);
+	const int calls_after_probe = g_session_send_oob_calls;
+	const uint_fast8_t probe_extra = g_last_send_oob_extra;
+	const bool armed_after_probe = ev_is_active(&fx.ss.w_keepalive);
+	const double repeat_after_probe = fx.ss.w_keepalive.repeat;
+
 	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_ESTABLISHED);
+	/* A PROBE is emitted on both branches; only the pool result differs. */
+	T_EXPECT_EQ(calls_after_skip, 1);
+	T_EXPECT_EQ(calls_after_probe, 2);
+	T_EXPECT_EQ(probe_extra, (uint_fast8_t)MUX_CTRL_PROBE);
+	/* Re-armed for the next cycle on both branches -- a skipped PROBE must
+	 * not stop keepalive. */
+	T_EXPECT(armed_after_skip);
+	T_EXPECT(armed_after_probe);
+	T_EXPECT(repeat_after_skip > lo && repeat_after_skip <= 5.0);
+	T_EXPECT(repeat_after_probe > lo && repeat_after_probe <= 5.0);
 
 	teardown_fixture(&fx);
 }
@@ -1316,7 +1397,7 @@ T_DECLARE_CASE(test_session_suspend_pays_back_halfopen_from_handshake)
 	/* num_session_halfopen is a mux_gauge* (atomic_size_t), not mux_counter*;
 	 * declare the backing storage with the matching type. */
 	mux_gauge halfopen = 1; /* simulates the earlier CONNECT-entry +1 */
-	fx.ss.cnt.num_session_halfopen = &halfopen;
+	fx.ss.cnt.session.num_session_halfopen = &halfopen;
 	fx.ss.accepted = false;
 	fx.ss.handshake.has_session_id = true;
 
@@ -1389,6 +1470,90 @@ T_DECLARE_CASE(test_session_suspend_migrates_pending_oobbuf_frame)
 
 	fx.fds[0] = -1; /* mux_session_suspend closed it */
 	teardown_fixture(&fx);
+}
+
+/* session_resume_attach must clear wire.rx_eof the way the fresh-attach path
+ * does: the FIN that suspended the session belongs to the transport that just
+ * died, so carrying it across makes every later teardown of the resumed session
+ * report MUX_EVENT_CLOSED with clean=true. */
+T_DECLARE_CASE(test_resume_attach_clears_stale_rx_eof)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.handshake.has_session_id = true;
+	mux_session_suspend(&fx.ss);
+	fx.fds[0] = -1; /* mux_session_suspend closed it */
+	T_CHECK(fx.ss.state == SESSION_SUSPENDED);
+	/* Suspended by a peer FIN: send_handle_rx_closed left rx_eof set. */
+	fx.ss.wire.rx_eof = true;
+
+	struct mux_transport t = { .fd = fx.fds[1] };
+	session_resume_attach(&fx.ss, &t, 0);
+
+	const bool rx_eof = fx.ss.wire.rx_eof;
+	const enum session_state state = fx.ss.state;
+
+	fx.fds[1] = -1; /* the resumed session owns it now */
+	teardown_fixture(&fx);
+
+	T_EXPECT(state != (enum session_state)SESSION_SUSPENDED);
+	T_EXPECT(!rx_eof);
+}
+
+/* Spec §5.2.2 defines the active extension set from the hello exchange, and a
+ * resume is one. The resume ClientHello's extensions are parsed into the
+ * transient session that mux_transport_detach then discards, so they ride
+ * across on the transport: otherwise a client toggling reject_inbound or
+ * changing its claim across a reconnect is silently ignored, and the resumed
+ * session keeps reporting the original hello's identity. */
+T_DECLARE_CASE(test_resume_attach_adopts_hello_extensions)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.handshake.has_session_id = true;
+	fx.ss.handshake.peer_rejects_inbound_streams = false;
+	fx.ss.handshake.peer_identity = strdup("old-peer");
+	T_CHECK(fx.ss.handshake.peer_identity != NULL);
+	mux_session_suspend(&fx.ss);
+	fx.fds[0] = -1; /* mux_session_suspend closed it */
+	T_CHECK(fx.ss.state == SESSION_SUSPENDED);
+
+	char *const fresh = strdup("new-peer");
+	T_CHECK(fresh != NULL);
+	struct mux_transport t = {
+		.fd = fx.fds[1],
+		.peer_identity = fresh,
+		.reject_inbound = true,
+	};
+	session_resume_attach(&fx.ss, &t, 0);
+
+	const bool rejects = fx.ss.handshake.peer_rejects_inbound_streams;
+	char identity[32] = { 0 };
+	if (fx.ss.handshake.peer_identity != NULL) {
+		(void)snprintf(
+			identity, sizeof(identity), "%s",
+			fx.ss.handshake.peer_identity);
+	}
+	/* Ownership moved to the session, so the transport must not free it. */
+	const bool transport_consumed = (t.peer_identity == NULL);
+
+	fx.fds[1] = -1; /* the resumed session owns it now */
+	free(fx.ss.handshake.peer_identity);
+	fx.ss.handshake.peer_identity = NULL;
+	mux_transport_discard(&t);
+	teardown_fixture(&fx);
+
+	T_EXPECT(rejects);
+	T_EXPECT_STREQ(identity, "new-peer");
+	T_EXPECT(transport_consumed);
 }
 
 /* A stream can independently abort/close while a session is SUSPENDED, queuing
@@ -1536,8 +1701,9 @@ T_DECLARE_CASE(test_connect_timeout_cb_reentrant_reconnect_reaches_connect)
 	teardown_fixture(&fx);
 }
 
-/* mux_session_open_stream rejection paths: closed, not-established, peer rejects
- * inbound, stream-id exhaustion, mux_stream_new OOM, and sched_add failure. */
+/* mux_session_open_stream rejection paths: closed, not-established, draining,
+ * peer rejects inbound, halfopen backlog full, max_streams cap, stream-id
+ * exhaustion, mux_stream_new OOM, and sched_add failure. */
 T_DECLARE_CASE(test_open_stream_rejections)
 {
 	struct session_fixture fx;
@@ -1546,6 +1712,15 @@ T_DECLARE_CASE(test_open_stream_rejections)
 		return;
 	}
 
+	/* Open the success path first -- a valid stream id, a stream that
+	 * allocates, a sched_add that succeeds -- so each gate below is the sole
+	 * cause of the NULL it returns; g_alloc_stream_id_result's inert default
+	 * would otherwise short-circuit every one of them into ID exhaustion. */
+	struct mux_stream dummy = { .id = 5 };
+	g_alloc_stream_id_result = 5;
+	g_stream_new_result = &dummy;
+	g_sched_add_stream_result = true;
+
 	fx.ss.state = SESSION_CLOSED;
 	T_EXPECT(mux_session_open_stream(&fx.ss) == NULL);
 
@@ -1553,9 +1728,32 @@ T_DECLARE_CASE(test_open_stream_rejections)
 	T_EXPECT(mux_session_open_stream(&fx.ss) == NULL);
 
 	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.draining = true;
+	T_EXPECT(mux_session_open_stream(&fx.ss) == NULL);
+	fx.ss.draining = false;
+
 	fx.ss.handshake.peer_rejects_inbound_streams = true;
 	T_EXPECT(mux_session_open_stream(&fx.ss) == NULL);
 	fx.ss.handshake.peer_rejects_inbound_streams = false;
+
+	fx.ss.conf.max_halfopen = 1;
+	fx.ss.num_halfopen = 1;
+	T_EXPECT(mux_session_open_stream(&fx.ss) == NULL);
+	fx.ss.conf.max_halfopen = 0;
+	fx.ss.num_halfopen = 0;
+
+	/* One live stream in the table, no tombstone: the max_streams cap bites. */
+	void *elem = (void *)(uintptr_t)1;
+	fx.ss.sched.streams = table_set(
+		fx.ss.sched.streams, (const void *)(uintptr_t)7, &elem);
+	T_CHECK(fx.ss.sched.streams != NULL);
+	fx.ss.conf.max_streams = 1;
+	T_EXPECT(mux_session_open_stream(&fx.ss) == NULL);
+	fx.ss.conf.max_streams = 0;
+
+	/* Positive control: every gate clear now yields a stream, so each NULL
+	 * above was its gate rather than a fixture that can never succeed. */
+	T_EXPECT(mux_session_open_stream(&fx.ss) == &dummy);
 
 	/* mux_sched_alloc_stream_id returns STREAMID_CTRL: IDs exhausted. */
 	g_alloc_stream_id_result = STREAMID_CTRL;
@@ -1567,7 +1765,6 @@ T_DECLARE_CASE(test_open_stream_rejections)
 	T_EXPECT(mux_session_open_stream(&fx.ss) == NULL);
 
 	/* mux_stream_new succeeds, but mux_sched_add_stream fails. */
-	struct mux_stream dummy = { .id = 5 };
 	g_stream_new_result = &dummy;
 	g_sched_add_stream_result = false;
 	T_EXPECT(mux_session_open_stream(&fx.ss) == NULL);
@@ -1599,7 +1796,7 @@ T_DECLARE_CASE(test_set_config_live_session_branches)
 	ev_timer_set(&fx.ss.w_idle_timeout, 0.0, 5.0);
 	ev_timer_again(fx.ss.loop, &fx.ss.w_idle_timeout);
 
-	struct mux_config conf = fx.ss.conf;
+	struct mux_session_config conf = fx.ss.conf;
 	conf.session_window =
 		0; /* auto: enforce floor (covers the floor branch) */
 	conf.stream_window = 4; /* manual */
@@ -1720,6 +1917,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_session_log_frame_header_formats_flags),
 	T_CASE(test_closing_cb_pending_then_error),
 	T_CASE(test_close_wait_cb_unexpected),
+	T_CASE(test_close_wait_cb_confirmed_reports_clean),
 	T_CASE(test_close_wait_cb_pending),
 	T_CASE(test_connect_cb_tls_paths),
 	T_CASE(test_dead_link_suspend_for_resume),
@@ -1737,6 +1935,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_session_suspend_pays_back_halfopen_from_handshake),
 	T_CASE(test_session_suspend_skips_resume_deadline_when_disabled),
 	T_CASE(test_session_suspend_migrates_pending_oobbuf_frame),
+	T_CASE(test_resume_attach_clears_stale_rx_eof),
+	T_CASE(test_resume_attach_adopts_hello_extensions),
 	T_CASE(test_session_attach_fd_captures_pending_sendbuf_frame),
 	T_CASE(test_session_attach_fd_captures_pending_oobbuf_frame),
 	T_CASE(test_dead_link_reentrant_reconnect_reaches_connect),

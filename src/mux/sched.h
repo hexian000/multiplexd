@@ -100,8 +100,8 @@ void mux_sched_delay(
 	const uint_fast8_t ticks);
 
 /* Scan the DRR ready queue and stage at most one PUSH frame into sendbuf,
- * skipping streams that cannot produce (credit, queue empty, Nagle, or
- * non-ESTABLISHED).  Returns true if a frame was produced. */
+ * skipping streams that cannot produce (credit, queue empty, Nagle, or a state
+ * stream_can_send_data() rejects).  Returns true if a frame was produced. */
 bool mux_sched_next_data(struct mux_session *restrict ss);
 
 /* Emit pending per-stream ACK/FIN control headers for all DRR-queued streams,

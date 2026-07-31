@@ -6,12 +6,14 @@
  * @brief Public mux API wrappers over the internal session machinery.
  */
 
+#include "mux/mux.h"
+
 #include "mux/estimator.h"
 #include "mux/frame.h"
-#include "mux/mux.h"
 #include "mux/sched.h"
 #include "mux/session.h"
 #include "mux/stream.h"
+#include "mux/stream_io.h"
 #include "mux/wire.h"
 
 #include "meta/minmax.h"
@@ -90,9 +92,10 @@ enum mux_state mux_state(const struct mux_session *ss)
 	/* Read the relaxed-atomic mirror: callable from the server thread. */
 	switch ((enum session_state)PUB_LOAD(ss->_pub_state)) {
 	case SESSION_ESTABLISHED:
+		return MUX_STATE_ESTABLISHED;
 	case SESSION_CLOSING:
 	case SESSION_CLOSE_WAIT:
-		return MUX_STATE_ESTABLISHED;
+		return MUX_STATE_CLOSING;
 	case SESSION_SUSPENDED:
 		return MUX_STATE_SUSPENDED;
 	case SESSION_INIT:
@@ -109,7 +112,12 @@ const unsigned char *mux_session_id(const struct mux_session *ss)
 	return ss->handshake.session_id;
 }
 
-const struct mux_config *mux_conf(const struct mux_session *ss)
+const char *mux_peer_identity(const struct mux_session *ss)
+{
+	return ss->handshake.peer_identity;
+}
+
+const struct mux_session_config *mux_conf(const struct mux_session *ss)
 {
 	return &ss->conf;
 }
@@ -129,15 +137,17 @@ void mux_session_stats(
 /* --- Session mutators --- */
 
 void mux_set_config(
-	struct mux_session *ss, const struct mux_config *restrict conf)
+	struct mux_session *ss, const struct mux_session_config *restrict conf)
 {
 	mux_session_set_config(ss, conf);
-#if WITH_TLS
-	if (conf->tlsctx != NULL) {
-		mux_wire_set_tlsctx(ss, conf->tlsctx);
-	}
-#endif
 }
+
+#if WITH_TLS
+void mux_set_tlsctx(struct mux_session *ss, struct tls_context *tlsctx)
+{
+	mux_wire_set_tlsctx(ss, tlsctx);
+}
+#endif
 
 void mux_drain(struct mux_session *ss)
 {
@@ -204,14 +214,14 @@ void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w)
 
 /* --- Stream operations --- */
 
-struct mux_stream *mux_open_stream(struct mux_session *ss)
+struct mux_stream *mux_stream_open(struct mux_session *ss)
 {
 	return mux_session_open_stream(ss);
 }
 
-void mux_stream_attach(struct mux_stream *s, const int fd)
+void mux_stream_attach_fd(struct mux_stream *s, const int fd)
 {
-	mux_stream_attach_fd(s, fd);
+	mux_stream_do_attach_fd(s, fd);
 }
 
 uint_least16_t mux_stream_id(const struct mux_stream *s)
@@ -303,7 +313,7 @@ int mux_stream_recv(
 	ASSERT(s->session->recv_buffered_bytes >= copied);
 	s->buffered_bytes -= (uint_least32_t)copied;
 	s->session->recv_buffered_bytes -= copied;
-	COUNTER_SUB(s->session->cnt.recv_buffered_bytes, copied);
+	COUNTER_SUB(s->session->cnt.buffers.recv_buffered_bytes, copied);
 
 	mux_stream_check_ack(s);
 

@@ -146,7 +146,7 @@ enum session_state {
 /* All fields of mux_session are accessed only from the owning ev_loop thread. */
 struct mux_session {
 	struct ev_loop *loop;
-	struct mux_config conf;
+	struct mux_session_config conf;
 	/* Frame allocator; set at creation time and never changed. */
 	struct mux_frame_allocator pool;
 	/* Authoritative logical max outbound frame payload, frozen from conf at
@@ -324,7 +324,7 @@ void mux_session_close(struct mux_session *restrict ss);
 /* Apply a new configuration snapshot; safe to call on a running session. */
 void mux_session_set_config(
 	struct mux_session *restrict ss,
-	const struct mux_config *restrict conf);
+	const struct mux_session_config *restrict conf);
 
 /* Begin I/O: accepted -> start handshake; client (fd=-1) -> no-op;
  * call mux_attach_fd() afterward to supply a connected fd. */

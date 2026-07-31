@@ -6,10 +6,11 @@
  * @brief Internal mux session-level reliability implementation (spec §5.7).
  */
 
+#include "mux/unacked.h"
+
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
-#include "mux/unacked.h"
 
 #include "binary/serial.h"
 #include "utils/debug.h"
@@ -32,7 +33,7 @@ static bool ring_push(
 		return false;
 	}
 	ss->unacked.frames += count;
-	COUNTER_ADD(ss->cnt.unacked_frames, count);
+	COUNTER_ADD(ss->cnt.buffers.unacked_frames, count);
 	ss->unacked.bytes += frame->len - count * MUX_FRAME_HEADER_SIZE;
 	return true;
 }
@@ -90,7 +91,6 @@ void mux_unacked_track_sent(
 	 * the replay cursor past it and free the copy (the original stays in the
 	 * ring until the peer ACKs it). */
 	if (ss->unacked.retransmit_copy == frame) {
-		ss->unacked.retransmit_copy = NULL;
 		ASSERT(ss->unacked.ring != NULL &&
 		       ss->unacked.retransmit_off < ss->unacked.ring->count);
 		/* This entry has now been retransmitted; fold its logical count
@@ -99,6 +99,10 @@ void mux_unacked_track_sent(
 		ss->unacked.retransmitted_frames +=
 			ss->unacked.retransmit_copy_count;
 		ss->unacked.retransmit_off++;
+		/* Retire the copy only after its count is consumed: the count is
+		 * live only while retransmit_copy is (unacked.h). */
+		ss->unacked.retransmit_copy = NULL;
+		ss->unacked.retransmit_copy_count = 0;
 		mux_frame_put(&ss->pool, frame);
 		return;
 	}
@@ -206,7 +210,7 @@ mux_unacked_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
 	}
 	const uint_fast32_t trim = count;
 	ss->unacked.frames -= trim;
-	COUNTER_SUB(ss->cnt.unacked_frames, trim);
+	COUNTER_SUB(ss->cnt.buffers.unacked_frames, trim);
 	ss->unacked.last_ack_recv =
 		(uint_least32_t)serial_add32(ss->unacked.last_ack_recv, trim);
 	/* Walk physical frames from head; advance for fully-consumed entries,
@@ -234,7 +238,7 @@ mux_unacked_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
 				" %zu frame(s) still unaccounted for",
 				remaining);
 			ss->unacked.frames += remaining;
-			COUNTER_ADD(ss->cnt.unacked_frames, remaining);
+			COUNTER_ADD(ss->cnt.buffers.unacked_frames, remaining);
 			ss->unacked.bytes = 0;
 			ss->unacked.partial_offset = 0;
 			break;
@@ -412,7 +416,7 @@ void mux_unacked_free_all(struct mux_session *restrict ss)
 	 * other frames mutation pairs with a COUNTER_ADD/SUB, and this teardown
 	 * can run with frames > 0 (rejected resume, session cleanup, graceful
 	 * close dropping in-flight data). */
-	COUNTER_SUB(ss->cnt.unacked_frames, ss->unacked.frames);
+	COUNTER_SUB(ss->cnt.buffers.unacked_frames, ss->unacked.frames);
 	ss->unacked.frames = 0;
 	ss->unacked.bytes = 0;
 	ss->unacked.partial_offset = 0;
