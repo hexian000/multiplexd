@@ -16,9 +16,10 @@
 #include "net/url.h"
 #include "os/clock.h"
 #include "os/socket.h"
-#include "utils/ctype_ascii.h"
-#include "utils/buffer.h"
 #include "strings/format.h"
+#include "strings/time.h"
+#include "utils/buffer.h"
+#include "utils/ctype_ascii.h"
 #include "utils/slog.h"
 
 #include <ev.h>
@@ -475,7 +476,8 @@ static void append_eventlog(
 		char ts[32] = "(unknown)";
 		if (e->timestamp != (time_t)-1) {
 			(void)format_rfc3339(
-				ts, sizeof(ts), e->timestamp, false);
+				ts, sizeof(ts), e->timestamp,
+				local_tzoff(e->timestamp));
 		}
 		if (e->count == 1) {
 			VBUF_APPENDF(ctx->cbuf, "%s %s\n", ts, e->message);
@@ -518,7 +520,8 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 	char timestamp[32] = "(unknown)";
 	if (server_time != (time_t)-1) {
 		(void)format_rfc3339(
-			timestamp, sizeof(timestamp), server_time, false);
+			timestamp, sizeof(timestamp), server_time,
+			local_tzoff(server_time));
 	}
 	FORMAT_DURATION(str_uptime, make_duration_nanos(now - s->started));
 
