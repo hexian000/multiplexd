@@ -3,7 +3,8 @@
 
 /**
  * @file util.c
- * @brief CSPRNG bytes, address-resolution, and ALPN list-tokenizing helpers.
+ * @brief CSPRNG bytes, address-resolution, MIME media-type, and ALPN
+ * list-tokenizing helpers.
  */
 
 #include "shim/util.h"
@@ -12,6 +13,7 @@
 #include "codec/csv.h"
 #endif
 #include "net/addr.h"
+#include "net/mime.h"
 #include "os/socket.h"
 #include "utils/slog.h"
 
@@ -39,10 +41,10 @@ bool csprng_bytes(unsigned char *buf, const size_t len)
 	while (off < len) {
 		const ssize_t n = read(fd, buf + off, len - off);
 		if (n < 0) {
-			if (errno == EINTR) {
+			const int err = errno;
+			if (err == EINTR) {
 				continue;
 			}
-			const int err = errno;
 			LOGE_F("read /dev/urandom: (%d) %s", err,
 			       strerror(err));
 			(void)close(fd);
@@ -102,6 +104,36 @@ bool sock_would_block(const int err)
 {
 	return err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS ||
 	       err == ENOMEM;
+}
+
+enum mime_check_result mime_check_media(
+	char *const buf, const char *const subtype,
+	const char **const version_out)
+{
+	char *media_type, *media_subtype;
+	char *next = mime_parse(buf, &media_type, &media_subtype);
+	if (next == NULL || strcmp(media_type, "application") != 0 ||
+	    strcmp(media_subtype, subtype) != 0) {
+		return MIME_CHECK_BAD_TYPE;
+	}
+	const char *version = NULL;
+	char *key, *value;
+	for (;;) {
+		next = mime_parseparam(next, &key, &value);
+		if (next == NULL) {
+			/* mime_parseparam returns NULL only on a parse error; a
+			 * clean end sets *key = NULL with a non-NULL return. */
+			return MIME_CHECK_MALFORMED;
+		}
+		if (key == NULL) {
+			break; /* clean end of parameters */
+		}
+		if (strcmp(key, "version") == 0) {
+			version = value;
+		}
+	}
+	*version_out = version;
+	return MIME_CHECK_OK;
 }
 
 #if WITH_TLS

@@ -3,8 +3,8 @@
 
 /**
  * @file util.h
- * @brief CSPRNG bytes, address resolution, ALPN list tokenizing, and
- * event/thread assertion macros.
+ * @brief CSPRNG bytes, address resolution, MIME media-type validation, ALPN
+ * list tokenizing, and event/thread assertion macros.
  */
 
 #ifndef SHIM_UTIL_H
@@ -84,6 +84,27 @@ bool resolve_bindaddr(
  * (EAGAIN/EWOULDBLOCK, or a full kernel buffer: ENOBUFS/ENOMEM) rather than a
  * permanent failure. */
 bool sock_would_block(int err);
+
+/* Result of mime_check_media(). */
+enum mime_check_result {
+	MIME_CHECK_OK,
+	MIME_CHECK_BAD_TYPE, /* media type is not application/<subtype> */
+	MIME_CHECK_MALFORMED, /* malformed parameter tail */
+};
+
+/**
+ * @brief Validate an "application/<subtype>" MIME media type (RFC 2045),
+ * tokenizing buf in place, and report its "version" parameter.
+ * @param[inout] buf Media-type string; tokenized in place. Caller owns it and
+ * keeps the original intact elsewhere for logging.
+ * @param subtype Required subtype after "application/" (lowercase).
+ * @param[out] version_out Set, only on MIME_CHECK_OK, to the "version"
+ * parameter value (NULL if the parameter is absent).
+ * @return MIME_CHECK_OK on a match, else the failing stage. Version
+ * interpretation and all logging are left to the caller.
+ */
+enum mime_check_result
+mime_check_media(char *buf, const char *subtype, const char **version_out);
 
 #if WITH_TLS
 /**

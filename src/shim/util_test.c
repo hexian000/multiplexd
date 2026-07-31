@@ -2,7 +2,8 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* util_test.c - black-box tests for util.c's public API: address resolution
- * (resolve_addr, resolve_bindaddr) and CSPRNG byte generation (csprng_bytes).
+ * (resolve_addr, resolve_bindaddr), CSPRNG byte generation (csprng_bytes), and
+ * MIME media-type validation (mime_check_media).
  * Dependencies: links the real util.c (+ TLS backend). */
 
 #include "shim/util.h"
@@ -199,6 +200,81 @@ T_DECLARE_CASE(test_csprng_bytes_fails_when_fd_exhausted)
 	T_EXPECT(!ok);
 }
 
+T_DECLARE_CASE(test_mime_check_media_ok_with_version)
+{
+	char buf[] = "application/x-multiplexd-config; version=1";
+	const char *version = NULL;
+	const enum mime_check_result r =
+		mime_check_media(buf, "x-multiplexd-config", &version);
+	T_EXPECT(r == MIME_CHECK_OK);
+	T_EXPECT(version != NULL && strcmp(version, "1") == 0);
+}
+
+T_DECLARE_CASE(test_mime_check_media_case_and_whitespace_insensitive)
+{
+	/* mime_parse lowercases the type, subtype, and parameter names and trims
+	 * surrounding whitespace; the parameter value is preserved verbatim. */
+	char buf[] = "  Application / X-Multiplexd-Proto ; Version=7 ";
+	const char *version = NULL;
+	const enum mime_check_result r =
+		mime_check_media(buf, "x-multiplexd-proto", &version);
+	T_EXPECT(r == MIME_CHECK_OK);
+	T_EXPECT(version != NULL && strcmp(version, "7") == 0);
+}
+
+T_DECLARE_CASE(test_mime_check_media_extra_params_ignored)
+{
+	char buf[] =
+		"application/x-multiplexd-config; charset=utf-8; version=1";
+	const char *version = NULL;
+	const enum mime_check_result r =
+		mime_check_media(buf, "x-multiplexd-config", &version);
+	T_EXPECT(r == MIME_CHECK_OK);
+	T_EXPECT(version != NULL && strcmp(version, "1") == 0);
+}
+
+T_DECLARE_CASE(test_mime_check_media_missing_version_is_ok)
+{
+	/* Absent "version" is not the helper's concern -- it returns OK with a
+	 * NULL version and leaves the presence check to the caller. */
+	char buf[] = "application/x-multiplexd-config";
+	const char *version = NULL;
+	const enum mime_check_result r =
+		mime_check_media(buf, "x-multiplexd-config", &version);
+	T_EXPECT(r == MIME_CHECK_OK);
+	T_EXPECT(version == NULL);
+}
+
+T_DECLARE_CASE(test_mime_check_media_wrong_subtype)
+{
+	char buf[] = "application/x-multiplexd-proto; version=1";
+	const char *version = NULL;
+	const enum mime_check_result r =
+		mime_check_media(buf, "x-multiplexd-config", &version);
+	T_EXPECT(r == MIME_CHECK_BAD_TYPE);
+}
+
+T_DECLARE_CASE(test_mime_check_media_wrong_type)
+{
+	char buf[] = "text/plain; version=1";
+	const char *version = NULL;
+	const enum mime_check_result r =
+		mime_check_media(buf, "x-multiplexd-config", &version);
+	T_EXPECT(r == MIME_CHECK_BAD_TYPE);
+}
+
+T_DECLARE_CASE(test_mime_check_media_malformed_tail)
+{
+	/* A bare parameter name with no '=' value: mime_parseparam reports a
+	 * parse error, surfaced as MIME_CHECK_MALFORMED rather than silently
+	 * accepting the valid prefix. */
+	char buf[] = "application/x-multiplexd-config; version";
+	const char *version = NULL;
+	const enum mime_check_result r =
+		mime_check_media(buf, "x-multiplexd-config", &version);
+	T_EXPECT(r == MIME_CHECK_MALFORMED);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_resolve_addr_ipv4_parses_correctly),
 	T_CASE(test_resolve_addr_ipv6_parses_correctly),
@@ -212,6 +288,13 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_csprng_bytes_fills_buffer),
 	T_CASE(test_csprng_bytes_not_repeating),
 	T_CASE(test_csprng_bytes_fails_when_fd_exhausted),
+	T_CASE(test_mime_check_media_ok_with_version),
+	T_CASE(test_mime_check_media_case_and_whitespace_insensitive),
+	T_CASE(test_mime_check_media_extra_params_ignored),
+	T_CASE(test_mime_check_media_missing_version_is_ok),
+	T_CASE(test_mime_check_media_wrong_subtype),
+	T_CASE(test_mime_check_media_wrong_type),
+	T_CASE(test_mime_check_media_malformed_tail),
 	T_SUITE_END,
 };
 
