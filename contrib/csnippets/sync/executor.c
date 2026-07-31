@@ -1,12 +1,11 @@
 /* csnippets (c) 2019-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-#include "sync/executor.h"
+#include "executor.h"
 
-#include "sync/task.h"
-#include "sync/thrd.h"
+#include "task.h"
+#include "thrd.h"
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -155,7 +154,7 @@ static bool enqueue(struct executor *e, const struct task *task)
 	 * and for the same reason: once the lock is released a concurrent
 	 * detach can let the workers drain this item, exit, and (as the last
 	 * one) free the executor, so touching e->cond after the unlock would be
-	 * a use-after-free. Note executor.h disclaims concurrent submit, and
+	 * a use-after-free. Note executor.h disclaims concurrent invocation, and
 	 * this does not make that case safe on its own -- the mtx_lock above
 	 * can land on an already-freed executor just the same -- but it removes
 	 * the window that is ours to remove and matches the module's other
@@ -165,7 +164,7 @@ static bool enqueue(struct executor *e, const struct task *task)
 	return true;
 }
 
-bool executor_submit(struct executor *e, const struct task task)
+bool executor_invoke(struct executor *e, const struct task task)
 {
 	return enqueue(e, &task);
 }

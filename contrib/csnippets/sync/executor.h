@@ -28,19 +28,22 @@ struct executor;
 struct executor *executor_create(size_t nworkers, size_t capacity);
 
 /**
- * @brief Submit a task to executor.
+ * @brief Enqueue a task for asynchronous execution (thread-safe).
  * @param[in] e The executor.
  * @param[in] task Task to be scheduled.
  * @return true on success, false if the queue is full or the executor is
  * shutting down (executor_join/executor_detach has been called).
- * @note Submitting concurrently with or after executor_join/executor_detach
+ * @note Calling this concurrently with or after executor_join/executor_detach
  * returns is not supported and may still crash; this only covers the
  * case where exit_flag is already observably set.
  */
-bool executor_submit(struct executor *e, struct task task);
+bool executor_invoke(struct executor *e, struct task task);
 
 /**
  * @brief Blocks the current thread until the executor finishes and free all resources used by it.
+ * @details Every task already submitted runs before this returns; the queue is
+ * drained rather than dropped, which is what keeps a packaged_task's closure
+ * from leaking (see packaged_task.h).
  * @param[in] e The executor.
  */
 void executor_join(struct executor *e);

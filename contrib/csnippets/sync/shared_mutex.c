@@ -3,7 +3,7 @@
 
 #include "shared_mutex.h"
 
-#include "sync/thrd.h"
+#include "thrd.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -33,7 +33,7 @@ int smtx_init(smtx_t *mutex)
 
 int smtx_lock(smtx_t *mutex)
 {
-	int status = mtx_lock(&mutex->state_mu);
+	const int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
 		return status;
 	}
@@ -49,7 +49,7 @@ int smtx_lock(smtx_t *mutex)
 
 int smtx_trylock(smtx_t *mutex)
 {
-	int status = mtx_lock(&mutex->state_mu);
+	const int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
 		return status;
 	}
@@ -67,7 +67,7 @@ int smtx_trylock(smtx_t *mutex)
 
 int smtx_unlock(smtx_t *mutex)
 {
-	int status = mtx_lock(&mutex->state_mu);
+	const int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
 		return status;
 	}
@@ -91,7 +91,7 @@ int smtx_unlock(smtx_t *mutex)
 
 int smtx_sharedlock(smtx_t *mutex)
 {
-	int status = mtx_lock(&mutex->state_mu);
+	const int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
 		return status;
 	}
@@ -104,7 +104,7 @@ int smtx_sharedlock(smtx_t *mutex)
 
 int smtx_trysharedlock(smtx_t *mutex)
 {
-	int status = mtx_lock(&mutex->state_mu);
+	const int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
 		return status;
 	}
@@ -118,7 +118,7 @@ int smtx_trysharedlock(smtx_t *mutex)
 
 int smtx_sharedunlock(smtx_t *mutex)
 {
-	int status = mtx_lock(&mutex->state_mu);
+	const int status = mtx_lock(&mutex->state_mu);
 	if (status != thrd_success) {
 		return status;
 	}
