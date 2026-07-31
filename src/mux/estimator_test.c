@@ -6,7 +6,6 @@
  * mux_session_send_oob is the only other mocked collaborator; no siblings linked. */
 
 #include "mux/estimator.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"

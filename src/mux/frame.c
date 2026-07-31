@@ -9,7 +9,6 @@
  */
 
 #include "mux/frame.h"
-
 #include "mux/mux.h"
 #include "mux/session.h"
 

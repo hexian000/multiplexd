@@ -5,12 +5,11 @@
  * window/credit accounting, half-close/RST); stream.c #included, sched/send
  * collaborators mocked below. */
 
-#include "mux/stream.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/stream.c"
+#include "mux/stream.h"
 
 #include "algo/hashtable.h"
 #include "utils/slog.h"

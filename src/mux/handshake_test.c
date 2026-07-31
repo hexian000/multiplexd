@@ -5,9 +5,8 @@
  * and mux_handshake_process_hello). Dependencies: handshake.c #included; real
  * frame.c/proto_schema.gen.c linked; session/unacked/sched mocked. */
 
-#include "mux/handshake.h"
-
 #include "mux/frame.h"
+#include "mux/handshake.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 

@@ -2,7 +2,6 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 #include "mux/estimator.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/send.h"

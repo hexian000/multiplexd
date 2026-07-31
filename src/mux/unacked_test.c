@@ -5,12 +5,11 @@
  * §5.7); unacked.c #included, real frame.c linked; benches opt-in via
  * TESTING_BENCH env. */
 
-#include "mux/unacked.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/unacked.c"
+#include "mux/unacked.h"
 
 #include "utils/slog.h"
 #include "utils/testing.h"

@@ -6,8 +6,6 @@
  * @brief Internal mux session state machine implementation.
  */
 
-#include "mux/session.h"
-
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
@@ -15,6 +13,7 @@
 #include "mux/recv.h"
 #include "mux/sched.h"
 #include "mux/send.h"
+#include "mux/session.h"
 #include "mux/stream.h"
 #include "mux/unacked.h"
 #include "mux/wire.h"

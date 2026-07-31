@@ -6,11 +6,10 @@
  * @brief Internal mux session-level reliability implementation (spec §5.7).
  */
 
-#include "mux/unacked.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
+#include "mux/unacked.h"
 
 #include "binary/serial.h"
 #include "utils/debug.h"

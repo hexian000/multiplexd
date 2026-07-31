@@ -5,8 +5,6 @@
  * re-arming, graceful/forced shutdown, drain, socket-option helper);
  * session.c #included; all sibling-module collaborators mocked below. */
 
-#include "mux/session.h"
-
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
@@ -15,6 +13,7 @@
 #include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.c"
+#include "mux/session.h"
 #include "mux/stream.h"
 #include "mux/unacked.h"
 #include "mux/wire.h"

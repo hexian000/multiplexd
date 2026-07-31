@@ -6,10 +6,9 @@
  * @brief Public mux API wrappers over the internal session machinery.
  */
 
-#include "mux/mux.h"
-
 #include "mux/estimator.h"
 #include "mux/frame.h"
+#include "mux/mux.h"
 #include "mux/sched.h"
 #include "mux/session.h"
 #include "mux/stream.h"

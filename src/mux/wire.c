@@ -6,11 +6,10 @@
  * @brief Internal mux transport I/O implementation.
  */
 
-#include "mux/wire.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/session.h"
+#include "mux/wire.h"
 #if WITH_TLS
 #include "shim/tls.h"
 #endif

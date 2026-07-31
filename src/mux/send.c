@@ -14,12 +14,11 @@
  * mux_session_flush_resp).
  */
 
-#include "mux/send.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/recv.h"
 #include "mux/sched.h"
+#include "mux/send.h"
 #include "mux/session.h"
 #include "mux/stream.h"
 #include "mux/unacked.h"

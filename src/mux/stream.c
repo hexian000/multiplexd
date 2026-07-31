@@ -6,13 +6,12 @@
  * @brief Internal mux stream state machine implementation.
  */
 
-#include "mux/stream.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
 #include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.h"
+#include "mux/stream.h"
 #include "shim/util.h"
 
 #include "meta/minmax.h"

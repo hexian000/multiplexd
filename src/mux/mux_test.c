@@ -5,11 +5,10 @@
  * Uses the public mux API; local proto_hello_build crafts raw hello bytes
  * for the raw-peer driver. */
 
-#include "mux/mux.h"
-
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
+#include "mux/mux.h"
 #include "mux/proto_schema.gen.h"
 #include "mux/recv.h"
 #include "mux/sched.h"
@@ -410,10 +409,11 @@ stream_io_cb(struct ev_loop *loop, mux_stream_io *w, const int revents)
 			const int ret = mux_stream_recv(
 				ts->s, ts->recv_buf + ts->recv_len, &cap);
 			if (ret < 0) {
-				if (errno == EAGAIN) {
+				const int err = errno;
+				if (err == EAGAIN) {
 					break;
 				}
-				if (errno == ECONNRESET) {
+				if (err == ECONNRESET) {
 					ts->got_error = true;
 					if (!ts->closed) {
 						ts->closed = true;

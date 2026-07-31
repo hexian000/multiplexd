@@ -14,10 +14,9 @@
  * delay list uses delay_prev/next; drr_active is off-FIFO while spending its
  * budget. */
 
-#include "mux/sched.h"
-
 #include "mux/frame.h"
 #include "mux/mux.h"
+#include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.h"
 #include "mux/stream.h"

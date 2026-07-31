@@ -14,12 +14,11 @@
  * waiting for the next EV_WRITE.
  */
 
-#include "mux/recv.h"
-
 #include "mux/estimator.h"
 #include "mux/frame.h"
 #include "mux/handshake.h"
 #include "mux/mux.h"
+#include "mux/recv.h"
 #include "mux/sched.h"
 #include "mux/send.h"
 #include "mux/session.h"
