@@ -21,13 +21,13 @@
 #include "os/daemon.h"
 #include "os/signal.h"
 #include "os/socket.h"
+#include "strings/format.h"
 #if WITH_THREADS
 #include "sync/dispatcher.h"
 #include "sync/shared_mutex.h"
 #include "sync/task.h"
 #endif
 #include "utils/debug.h"
-#include "strings/format.h"
 #include "utils/slog.h"
 
 #include <ev.h>
