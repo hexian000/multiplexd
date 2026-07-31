@@ -5,9 +5,9 @@
  * gencerts.c via its public API. Dependencies: links the real gencerts.c + TLS
  * backend (no-op when TLS disabled). */
 
-#include "gencerts.h"
-
 #if WITH_OPENSSL
+
+#include "gencerts.h"
 
 #include "utils/slog.h"
 #include "utils/testing.h"
@@ -110,7 +110,8 @@ static void
 leave_tmpdir(const char *restrict origdir, const char *restrict tmpl)
 {
 	if (chdir(origdir) != 0) {
-		LOGW_F("chdir: (%d) %s", errno, strerror(errno));
+		const int err = errno;
+		LOGW_F("chdir: (%d) %s", err, strerror(err));
 	}
 	rm_tmpdir(tmpl);
 }

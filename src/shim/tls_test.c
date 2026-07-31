@@ -589,7 +589,8 @@ static char *setup_cert_dir(
 	}
 	if (!make_test_certs()) {
 		if (chdir(origdir) != 0) {
-			LOGW_F("chdir: (%d) %s", errno, strerror(errno));
+			const int err = errno;
+			LOGW_F("chdir: (%d) %s", err, strerror(err));
 		}
 		rm_tmpdir(tmpl);
 		free(origdir);
@@ -599,7 +600,8 @@ static char *setup_cert_dir(
 	(void)snprintf(cert_out, cert_sz, "@%s/t-cert.pem", tmpl);
 	(void)snprintf(key_out, key_sz, "@%s/t-key.pem", tmpl);
 	if (chdir(origdir) != 0) {
-		LOGW_F("chdir: (%d) %s", errno, strerror(errno));
+		const int err = errno;
+		LOGW_F("chdir: (%d) %s", err, strerror(err));
 	}
 	return origdir;
 }
