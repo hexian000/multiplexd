@@ -14,9 +14,8 @@
 
 #include "codec/json.h"
 #include "meta/minmax.h"
-#include "net/mime.h"
-#include "utils/ctype_ascii.h"
 #include "utils/buffer.h"
+#include "utils/ctype_ascii.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
 
@@ -477,13 +476,12 @@ static void conf_normalize(struct config *restrict conf)
 	}
 }
 
-/* Validate conf->type as a MIME media type (RFC 2045), mirroring
- * proto_parse_type in mux/handshake.c: type/subtype compare
- * case-insensitively, "version" may appear alongside other (ignored)
- * parameters in any order, and surrounding whitespace is insignificant --
- * none of which a literal string comparison (as the schema's old "const"
- * constraint did) would tolerate. mime_parse tokenizes its input in place,
- * so parse a private copy and keep conf->type intact for logging. */
+/* Validate conf->type as a MIME media type (RFC 2045): it must be
+ * application/x-multiplexd-config carrying a matching "version" parameter, in
+ * any order and tolerant of case and whitespace -- none of which a literal
+ * string comparison (as the schema's old "const" constraint did) would accept.
+ * mime_check_media tokenizes its input in place, so validate a private copy and
+ * keep conf->type intact for logging. */
 static bool conf_check_type(const struct config *restrict conf)
 {
 	if (conf->type == NULL) {
@@ -495,23 +493,14 @@ static bool conf_check_type(const struct config *restrict conf)
 		return false;
 	}
 	bool ok = false;
-	char *media_type, *media_subtype;
-	char *next = mime_parse(buf, &media_type, &media_subtype);
-	if (next == NULL || strcmp(media_type, "application") != 0 ||
-	    strcmp(media_subtype, "x-multiplexd-config") != 0) {
+	const char *version = NULL;
+	switch (mime_check_media(buf, "x-multiplexd-config", &version)) {
+	case MIME_CHECK_OK:
+		break;
+	case MIME_CHECK_BAD_TYPE:
 		LOGE_F("unsupported config type: \"%s\"", conf->type);
 		goto done;
-	}
-	const char *version = NULL;
-	char *key, *value;
-	next = mime_parseparam(next, &key, &value);
-	while (next != NULL && key != NULL) {
-		if (strcmp(key, "version") == 0) {
-			version = value;
-		}
-		next = mime_parseparam(next, &key, &value);
-	}
-	if (next == NULL) {
+	case MIME_CHECK_MALFORMED:
 		LOGE_F("malformed config type: \"%s\"", conf->type);
 		goto done;
 	}
