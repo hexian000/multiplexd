@@ -724,7 +724,7 @@ static struct config *make_config(
 				.max_streams = 32,
 				.stream_window = 2,
 				.session_window = 256,
-				.max_frame_payload = mux_conf_default.max_frame_payload,
+				.max_frame_payload = mux_session_config_default.max_frame_payload,
 			},
 		.mux_tcp =
 			{
@@ -801,7 +801,7 @@ static struct wait_stats wait_stats_snapshot(const struct server *restrict s)
 		(size_t)(session_connected - session_disconnected);
 	st.num_halfopen_sessions =
 		(size_t)(session_connect - session_connected);
-	struct server_stats *const restrict snap = server_stats(s);
+	struct server_stats *const restrict snap = server_stats(s, true);
 	if (snap != NULL) {
 		st.num_streams = (size_t)((snap->num_stream_opened +
 					   snap->num_stream_accepted) -
@@ -1167,10 +1167,6 @@ static uint_least64_t ol_alloc_index(void *user)
 {
 	return ++((struct server *)user)->next_tunnel_index;
 }
-static void ol_inc_reconnect(void *user)
-{
-	(void)user;
-}
 #if WITH_THREADS
 static bool ol_post_task(void *user, struct task task)
 {
@@ -1189,7 +1185,7 @@ ol_make_established_tunnel(struct server *restrict srv, const char *peer_id)
 {
 	static const struct tunnel_callbacks cb = { 0 };
 	static const unsigned char session_id[MUX_SESSION_ID_LEN] = { 0 };
-	const struct mux_config mux_cfg = conf_get_mux(srv->conf);
+	const struct mux_session_config mux_cfg = conf_get_mux(srv->conf);
 	const struct tunnel_session_counters cnts = {
 		.num_session_created = &srv->counters.num_session_created,
 		.num_session_connect = &srv->counters.num_session_connect,
@@ -1199,12 +1195,6 @@ ol_make_established_tunnel(struct server *restrict srv, const char *peer_id)
 		.num_session_finalized = &srv->counters.num_session_finalized,
 		.num_sessions = &srv->counters.num_sessions,
 		.num_session_halfopen = &srv->counters.num_session_halfopen,
-		.num_rst_sent = &srv->counters.num_rst_sent,
-		.num_rst_recv = &srv->counters.num_rst_recv,
-		.num_stream_errors = &srv->counters.num_stream_errors,
-		.recv_buffered_bytes = &srv->counters.recv_buffered_bytes,
-		.send_buffered_frames = &srv->counters.send_buffered_frames,
-		.unacked_frames = &srv->counters.unacked_frames,
 	};
 	const struct tunnel_context ctx = {
 #if WITH_THREADS
@@ -1213,7 +1203,6 @@ ol_make_established_tunnel(struct server *restrict srv, const char *peer_id)
 #endif
 		.verify_peer = ol_verify_peer,
 		.alloc_index = ol_alloc_index,
-		.inc_reconnect = ol_inc_reconnect,
 		.user = srv,
 #if !WITH_THREADS
 		.loop = srv->loop,
@@ -1422,15 +1411,16 @@ cleanup:
 }
 
 /* Regression: server_stop()'s force-close sweep must fold a still-open tunnel's
- * cumulative traffic into the server-wide traffic_byt_* counters before
- * tunnel_close() frees it, so a force-closed session's bytes survive in the
- * /stats and /metrics totals instead of being silently dropped. Drive traffic
- * over the client mux link (srv_b dials srv_a, so its mux_tunnel carries the
- * wire bytes), snapshot the live totals, force-close srv_b, then confirm the
- * post-stop snapshot still accounts for those bytes -- they now live in
- * srv->counters, not in any live tunnel. Without the fold the totals would read
- * back as zero. */
-T_DECLARE_CASE(test_server_force_close_folds_tunnel_traffic)
+ * monotonic counters into server_counters.closed before tunnel_close() frees it,
+ * so a force-closed session's traffic and stream history survive in the /stats
+ * and /metrics totals instead of being silently dropped. Drive traffic over the
+ * client mux link (srv_b dials srv_a, so its mux_tunnel carries the wire bytes),
+ * snapshot the live totals, force-close srv_b, then confirm the post-stop
+ * snapshot still accounts for them -- they now live in srv->counters, not in any
+ * live tunnel. Without the fold the totals would read back as zero. The buffer
+ * gauges must go the other way and reach zero, since the closing session drains
+ * them and they are deliberately excluded from the fold. */
+T_DECLARE_CASE(test_server_force_close_folds_tunnel_counters)
 {
 	struct test_fixture fx;
 	int cl = -1;
@@ -1449,24 +1439,39 @@ T_DECLARE_CASE(test_server_force_close_folds_tunnel_traffic)
 		FIXTURE_FATAL(&fx, "wait_for_streams_ready failed");
 	}
 
-	struct server_stats *const before = server_stats(fx.srv_b);
+	struct server_stats *const before = server_stats(fx.srv_b, true);
 	if (before == NULL) {
 		(void)close(cl);
-		FIXTURE_FATAL(&fx, "server_stats(before) OOM");
+		FIXTURE_FATAL(&fx, "server_stats(before, true) OOM");
 	}
 	const uint_least64_t live_mux_recv = before->traffic_byt_mux_recv;
 	const uint_least64_t live_mux_sent = before->traffic_byt_mux_sent;
+	const uint_least64_t live_stream_opened = before->num_stream_opened;
+	/* Streams still open at force-close, and the outcomes recorded so far:
+	 * tearing the session down must give every one of them an outcome. */
+	const size_t live_streams = before->num_streams;
+	const uint_least64_t live_outcomes =
+		before->num_stream_succeeded + before->num_stream_failed;
+	const size_t live_buffered = before->send_buffered_frames +
+				     before->recv_buffered_bytes +
+				     before->unacked_frames;
 	free(before);
 
 	/* Force-close srv_b; its mux_tunnel is swept and its bytes folded. */
 	server_stop(fx.srv_b);
-	struct server_stats *const after = server_stats(fx.srv_b);
+	struct server_stats *const after = server_stats(fx.srv_b, true);
 	if (after == NULL) {
 		(void)close(cl);
-		FIXTURE_FATAL(&fx, "server_stats(after) OOM");
+		FIXTURE_FATAL(&fx, "server_stats(after, true) OOM");
 	}
 	const uint_least64_t folded_mux_recv = after->traffic_byt_mux_recv;
 	const uint_least64_t folded_mux_sent = after->traffic_byt_mux_sent;
+	const uint_least64_t folded_stream_opened = after->num_stream_opened;
+	const uint_least64_t folded_outcomes =
+		after->num_stream_succeeded + after->num_stream_failed;
+	const size_t folded_buffered = after->send_buffered_frames +
+				       after->recv_buffered_bytes +
+				       after->unacked_frames;
 	free(after);
 
 	/* srv_b is already stopped; free it here and let teardown skip it. */
@@ -1482,6 +1487,20 @@ T_DECLARE_CASE(test_server_force_close_folds_tunnel_traffic)
 	T_EXPECT(live_mux_sent > 0);
 	T_EXPECT(folded_mux_recv >= live_mux_recv);
 	T_EXPECT(folded_mux_sent >= live_mux_sent);
+	/* Stream lifecycle counters are folded too, not just traffic bytes. */
+	T_EXPECT(live_stream_opened > 0);
+	T_EXPECT(folded_stream_opened >= live_stream_opened);
+	/* The sweep tore down a session with live_streams still open, and the
+	 * fold happens after the tunnel thread is joined, so mux_close()'s own
+	 * per-stream outcome counting is included: every stream that was open
+	 * must now be accounted for as succeeded or failed. Folding a snapshot
+	 * taken before the close instead drops all of them. */
+	T_EXPECT(live_streams > 0);
+	T_EXPECT(folded_outcomes >= live_outcomes + live_streams);
+	/* Gauges are deliberately not folded -- server_counters.closed has no
+	 * gauge fields at all -- so a closing session cannot leave the totals
+	 * permanently overstated the way a folded gauge would. */
+	T_EXPECT(live_buffered >= folded_buffered);
 }
 
 T_DECLARE_CASE(test_half_close_b_to_a)
@@ -2319,7 +2338,7 @@ T_DECLARE_CASE(test_server_reload_removes_identity_peer_closes_tunnel)
 
 	/* Defer assertions until after teardown; failing early would leak the
 	 * loop's signal watchers and corrupt later tests in this process. */
-	struct server_stats *const before = server_stats(fx.srv_a);
+	struct server_stats *const before = server_stats(fx.srv_a, true);
 	bool found_before = false;
 	if (before != NULL) {
 		for (size_t i = 0; i < before->num_tunnels; i++) {
@@ -2352,7 +2371,7 @@ T_DECLARE_CASE(test_server_reload_removes_identity_peer_closes_tunnel)
 
 	/* No loop iteration has run since reload, so disappearance here comes
 	 * from identity_listener_discard(), not asynchronous drain dispatch. */
-	struct server_stats *const after = server_stats(fx.srv_a);
+	struct server_stats *const after = server_stats(fx.srv_a, true);
 	const size_t num_tunnels_after =
 		after != NULL ? after->num_tunnels : SIZE_MAX;
 	free(after);
@@ -2380,7 +2399,7 @@ struct identity_pool_wait_ctx {
 static int identity_pool_wait_predicate(void *ptr)
 {
 	struct identity_pool_wait_ctx *const restrict ctx = ptr;
-	struct server_stats *const stats = server_stats(ctx->srv_a);
+	struct server_stats *const stats = server_stats(ctx->srv_a, true);
 	if (stats == NULL) {
 		return 0;
 	}
@@ -2494,7 +2513,7 @@ T_DECLARE_CASE(test_server_identity_pool_holds_concurrent_tunnels_same_peer)
 
 	/* Snapshot the pool state (whatever it is, even after a wait timeout)
 	 * before any cleanup runs below. */
-	struct server_stats *const stats = server_stats(srv_a);
+	struct server_stats *const stats = server_stats(srv_a, true);
 	if (stats != NULL) {
 		for (size_t i = 0; i < stats->num_tunnels; i++) {
 			if (stats->tunnels[i].peer_identity != NULL &&
@@ -2693,6 +2712,288 @@ T_DECLARE_CASE(test_server_reload_keeps_established_identity_mux_connect_tunnel)
 	 * the fix it held a freshly-dialed duplicate, or NULL). */
 	T_EXPECT_EQ(slots_after_reload, (size_t)1);
 	T_EXPECT(slot_after_reload == slot_after_established);
+}
+
+/* Like build_identity_dialer_conf, but registers both peer identities the
+ * dialer is pointed at in turn, so a pool exists for each. */
+static bool build_two_peer_dialer_conf(
+	struct config *restrict conf, const char *restrict connect_addr)
+{
+	conf->identity.claim = strdup("node-b");
+	if (conf->identity.claim == NULL) {
+		return false;
+	}
+	conf->identity.mux_connect =
+		(char **)malloc(sizeof(*conf->identity.mux_connect));
+	if (conf->identity.mux_connect == NULL) {
+		return false;
+	}
+	conf->identity.mux_connect_count = 1;
+	conf->identity.mux_connect[0] = strdup(connect_addr);
+	if (conf->identity.mux_connect[0] == NULL) {
+		return false;
+	}
+	conf->identity.peers = malloc(2 * sizeof(*conf->identity.peers));
+	if (conf->identity.peers == NULL) {
+		return false;
+	}
+	conf->identity.peers_count = 2;
+	conf->identity.peers[0] = (struct identity_peer){
+		.id = strdup("node-a"),
+		.listen = NULL,
+	};
+	conf->identity.peers[1] = (struct identity_peer){
+		.id = strdup("node-c"),
+		.listen = NULL,
+	};
+	return conf->identity.peers[0].id != NULL &&
+	       conf->identity.peers[1].id != NULL;
+}
+
+/* Tunnels pooled under peer_identity, or SIZE_MAX when no such pool exists.
+ * Pools are only mutated on the server loop thread, which is the thread
+ * wait_until drives, so reading them between iterations races nothing. */
+static size_t identity_pool_size(
+	const struct server *restrict srv, const char *restrict peer_identity)
+{
+	void *elem = NULL;
+	if (!table_find(srv->identities, peer_identity, &elem)) {
+		return SIZE_MAX;
+	}
+	return ((const struct identity_listener *)elem)->num_tunnels;
+}
+
+/* Pool memberships summed over every identity pool. The single-pool invariant
+ * makes this the tunnel count; a double-pooled tunnel counts twice. */
+static size_t identity_pool_total(const struct server *restrict srv)
+{
+	size_t total = 0;
+	size_t cursor = 0;
+	void *elem;
+	while (table_next(srv->identities, &cursor, NULL, &elem)) {
+		total += ((const struct identity_listener *)elem)->num_tunnels;
+	}
+	return total;
+}
+
+struct pool_size_wait_ctx {
+	const struct server *srv;
+	const char *peer_identity;
+	size_t expected;
+};
+
+static int pool_size_wait_predicate(void *ptr)
+{
+	const struct pool_size_wait_ctx *const restrict ctx = ptr;
+	return identity_pool_size(ctx->srv, ctx->peer_identity) ==
+			       ctx->expected ?
+		       1 :
+		       0;
+}
+
+/* Regression (#248): a tunnel belongs to at most one identity pool, even when
+ * the identity its peer announces changes across a fresh re-establishment.
+ *
+ * A dialed tunnel re-enters MUX_EVENT_ESTABLISHED on every non-resumed
+ * reconnect, and whoever answers then may claim a different identity. Drive
+ * exactly that: a reload repoints srv_b's single identity.mux_connect slot from
+ * srv_a ("node-a") to srv_c ("node-c"). tunnel_set_reload_connect() retargets
+ * the *same* struct tunnel rather than dialing a new one, and srv_c holds no
+ * matching session, so the resume is refused and the handshake falls back to
+ * fresh -- running establishment a second time on that tunnel under a different
+ * peer identity.
+ *
+ * The pooling pass previously consulted only the pool it was about to add to,
+ * and nothing dropped the earlier membership, so the tunnel stayed in
+ * "node-a"'s pool as well: identity_listener_pick() would forward "node-a"
+ * traffic over a peer that now claims "node-c", and the close path -- which
+ * stopped at the first pool holding the tunnel -- left the other pool pointing
+ * at freed memory. */
+T_DECLARE_CASE(test_server_identity_pool_single_membership_across_reclaim)
+{
+	struct ev_loop *loop = NULL;
+	struct config *conf_a = NULL;
+	struct config *conf_c = NULL;
+	struct config *conf_b = NULL;
+	struct server *srv_a = NULL;
+	struct server *srv_c = NULL;
+	struct server *srv_b = NULL;
+	struct test_fixture fx = { 0 };
+	int mux_port_a = -1;
+	int mux_port_c = -1;
+	char mux_connect_a[64];
+	char mux_connect_c[64];
+	struct tunnel *tunnel_on_a = NULL;
+	struct tunnel *tunnel_on_c = NULL;
+	int wait_a_rc = -1;
+	int wait_c_rc = -1;
+	size_t pool_a_after = SIZE_MAX;
+	size_t pool_c_after = SIZE_MAX;
+	size_t total_after = SIZE_MAX;
+	bool applied = false;
+	bool setup_ok = false;
+
+	loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.loop = loop;
+
+	/* Two peers with distinct claims, each accepting mux connections. */
+	conf_a = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	conf_c = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf_a == NULL || conf_c == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	conf_a->identity.claim = strdup("node-a");
+	conf_c->identity.claim = strdup("node-c");
+	if (conf_a->identity.claim == NULL || conf_c->identity.claim == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+
+	srv_a = server_new(loop, conf_a);
+	if (srv_a == NULL || !server_start(srv_a)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	srv_c = server_new(loop, conf_c);
+	if (srv_c == NULL || !server_start(srv_c)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	if (wait_for_listener_port(
+		    &fx, &srv_a->mux_listener, &mux_port_a,
+		    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) != 0 ||
+	    wait_for_listener_port(
+		    &fx, &srv_c->mux_listener, &mux_port_c,
+		    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	(void)snprintf(
+		mux_connect_a, sizeof(mux_connect_a), "127.0.0.1:%d",
+		mux_port_a);
+	(void)snprintf(
+		mux_connect_c, sizeof(mux_connect_c), "127.0.0.1:%d",
+		mux_port_c);
+
+	/* srv_b dials srv_a and knows a pool for both identities. */
+	conf_b = make_config(NULL, NULL, NULL, NULL);
+	if (conf_b == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	if (!build_two_peer_dialer_conf(conf_b, mux_connect_a)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	srv_b = server_new(loop, conf_b);
+	if (srv_b == NULL || !server_start(srv_b)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	conf_b = NULL; /* owned by srv_b from here; freed via srv_b->conf */
+
+	struct pool_size_wait_ctx wait_a = {
+		.srv = srv_b,
+		.peer_identity = "node-a",
+		.expected = 1,
+	};
+	wait_a_rc = wait_until(
+		&fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		pool_size_wait_predicate, &wait_a);
+	if (wait_a_rc != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	tunnel_on_a = srv_b->num_identity_tunnels == 1 ?
+			      srv_b->identity_tunnels[0] :
+			      NULL;
+
+	/* Repoint the slot at the other peer: same tunnel, new claim. */
+	struct config *const new_conf = make_config(NULL, NULL, NULL, NULL);
+	if (new_conf == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	if (!build_two_peer_dialer_conf(new_conf, mux_connect_c)) {
+		conf_free(new_conf);
+		T_FAIL();
+		goto cleanup;
+	}
+	applied = server_apply_config(srv_b, new_conf);
+	if (!applied) {
+		T_FAIL();
+		goto cleanup;
+	}
+
+	struct pool_size_wait_ctx wait_c = {
+		.srv = srv_b,
+		.peer_identity = "node-c",
+		.expected = 1,
+	};
+	wait_c_rc = wait_until(
+		&fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		pool_size_wait_predicate, &wait_c);
+	if (wait_c_rc != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+
+	/* The state under test, sampled with no loop iteration in between. */
+	pool_a_after = identity_pool_size(srv_b, "node-a");
+	pool_c_after = identity_pool_size(srv_b, "node-c");
+	total_after = identity_pool_total(srv_b);
+	tunnel_on_c = srv_b->num_identity_tunnels == 1 ?
+			      srv_b->identity_tunnels[0] :
+			      NULL;
+	setup_ok = true;
+
+cleanup:
+	if (srv_b != NULL) {
+		server_stop(srv_b);
+		struct config *const final_conf_b = srv_b->conf;
+		server_free(srv_b);
+		conf_free(final_conf_b);
+	}
+	if (srv_c != NULL) {
+		server_stop(srv_c);
+		server_free(srv_c);
+	}
+	if (srv_a != NULL) {
+		server_stop(srv_a);
+		server_free(srv_a);
+	}
+	if (conf_b != NULL) {
+		conf_free(conf_b);
+	}
+	if (conf_c != NULL) {
+		conf_free(conf_c);
+	}
+	if (conf_a != NULL) {
+		conf_free(conf_a);
+	}
+	if (loop != NULL) {
+		ev_loop_destroy(loop);
+	}
+
+	/* Assertions deferred past teardown: a fatal T_EXPECT before the
+	 * servers/loop are freed would leak a live ev_loop with registered signal
+	 * watchers and wedge later tests in this process. */
+	if (setup_ok) {
+		T_EXPECT(applied);
+		/* Re-establishment reused the tunnel instead of dialing a new
+		 * one -- otherwise the double-pooling this guards never arises. */
+		T_EXPECT(tunnel_on_a != NULL);
+		T_EXPECT(tunnel_on_c == tunnel_on_a);
+		/* The whole point: it left the pool it no longer belongs to. */
+		T_EXPECT_EQ(pool_a_after, (size_t)0);
+		T_EXPECT_EQ(pool_c_after, (size_t)1);
+		T_EXPECT_EQ(total_after, (size_t)1);
+	}
 }
 
 /* Regression: once an identity.mux_connect slot is freed -- e.g. a draining
@@ -2998,13 +3299,35 @@ struct establish_count_ctx {
 static int stream_establish_recorded_predicate(void *ptr)
 {
 	const struct establish_count_ctx *const restrict ctx = ptr;
-	struct server_stats *const st = server_stats(ctx->srv);
+	struct server_stats *const st = server_stats(ctx->srv, true);
 	if (st == NULL) {
 		return 0;
 	}
 	const bool ok = st->stream_establish_count > 0;
 	free(st);
 	return ok ? 1 : 0;
+}
+
+/* Count the snapshot's tunnels that hold ring samples, and how many of those
+ * carry derived percentiles.  With want_tunnel_latency the two must agree;
+ * without it the second must be zero. */
+static void count_tunnel_percentiles(
+	const struct server_stats *restrict st, size_t *restrict sampled,
+	size_t *restrict derived)
+{
+	*sampled = 0;
+	*derived = 0;
+	for (size_t i = 0; i < st->num_tunnels; i++) {
+		const struct tunnel_stats *const restrict ts = &st->tunnels[i];
+		if (ts->stream_establish_count > 0) {
+			(*sampled)++;
+		}
+		if (ts->stream_establish_p50 != 0 ||
+		    ts->stream_establish_p90 != 0 ||
+		    ts->stream_establish_p99 != 0) {
+			(*derived)++;
+		}
+	}
 }
 
 /* calc_stream_percentiles (ring-merge -> qsort -> percentile-index selection)
@@ -3031,16 +3354,28 @@ T_DECLARE_CASE(test_server_stream_establish_percentiles)
 		&fx, (double)STREAM_WAIT_TIMEOUT_MS / 1000.0,
 		stream_establish_recorded_predicate, &ctx);
 
-	struct server_stats *const st = server_stats(fx.srv_b);
+	struct server_stats *const st = server_stats(fx.srv_b, true);
 	size_t count = 0;
 	int_least64_t p50 = 0, p90 = 0, p99 = 0, pmax = 0;
+	/* Per-tunnel percentiles are derived only when asked for. */
+	size_t sampled = 0, derived = 0, unasked_derived = 0;
 	if (st != NULL) {
 		count = st->stream_establish_count;
 		p50 = st->stream_establish_p50;
 		p90 = st->stream_establish_p90;
 		p99 = st->stream_establish_p99;
 		pmax = st->stream_establish_pmax;
+		count_tunnel_percentiles(st, &sampled, &derived);
 		free(st);
+	}
+	/* The same snapshot without want_tunnel_latency must leave them zero --
+	 * every route but GET /metrics discards them, so none should pay the
+	 * per-tunnel sort. */
+	struct server_stats *const st_plain = server_stats(fx.srv_b, false);
+	if (st_plain != NULL) {
+		size_t ignored = 0;
+		count_tunnel_percentiles(st_plain, &ignored, &unasked_derived);
+		free(st_plain);
 	}
 	for (size_t i = 0; i < 4; i++) {
 		if (cls[i] >= 0) {
@@ -3054,6 +3389,62 @@ T_DECLARE_CASE(test_server_stream_establish_percentiles)
 	T_EXPECT(p50 <= p90);
 	T_EXPECT(p90 <= p99);
 	T_EXPECT(p99 <= pmax);
+	/* Asked for: every tunnel holding samples gets its own percentiles. */
+	T_EXPECT(sampled > 0);
+	T_EXPECT_EQ(derived, sampled);
+	/* Not asked for: none does. */
+	T_EXPECT_EQ(unasked_derived, (size_t)0);
+}
+
+/* The sibling case above drives the dialing side only, which is what let
+ * tunnel.h claim the ring is "populated only for dialed tunnels" and server.c
+ * claim the merge covers "all dialed tunnels". Neither is true: the ring is fed
+ * by every active open regardless of session role, and srv_a -- which accepted
+ * srv_b's connection -- round-robins its own local connections over
+ * accepted_tunnels. A reader trusting those comments could drop accepted
+ * tunnels from the /stats percentiles, so pin that they contribute. */
+T_DECLARE_CASE(test_server_stream_establish_percentiles_accepted_side)
+{
+	struct test_fixture fx;
+	int cls[4] = { -1, -1, -1, -1 };
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	/* srv_a accepted the session; these open streams over that accepted
+	 * tunnel. */
+	for (size_t i = 0; i < 4; i++) {
+		if (connect_and_wait_echo(
+			    &fx, fx.tcp_port_a, "estab-accepted", &cls[i]) !=
+		    0) {
+			FIXTURE_FATAL(&fx, "connect_and_wait_echo failed");
+		}
+	}
+	struct establish_count_ctx ctx = { .srv = fx.srv_a };
+	const int waited = wait_until(
+		&fx, (double)STREAM_WAIT_TIMEOUT_MS / 1000.0,
+		stream_establish_recorded_predicate, &ctx);
+
+	struct server_stats *const st = server_stats(fx.srv_a, true);
+	size_t count = 0;
+	size_t sampled = 0, derived = 0;
+	if (st != NULL) {
+		count = st->stream_establish_count;
+		count_tunnel_percentiles(st, &sampled, &derived);
+		free(st);
+	}
+	for (size_t i = 0; i < 4; i++) {
+		if (cls[i] >= 0) {
+			(void)close(cls[i]);
+		}
+	}
+	fixture_teardown(&fx);
+
+	T_EXPECT_EQ(waited, 0);
+	/* The accepted side's samples reach the merged percentiles. */
+	T_EXPECT(count > 0);
+	T_EXPECT(sampled > 0);
+	T_EXPECT_EQ(derived, sampled);
 }
 
 /* server_evlog is a documented diagnostic ring, but no test read it. Two
@@ -3095,7 +3486,7 @@ T_DECLARE_CASE(test_server_evlog_dedups_consecutive_reload_events)
 		fx.conf_a = fx.srv_a->conf; /* old conf freed by apply */
 	}
 
-	struct server_stats *const st = server_stats(fx.srv_a);
+	struct server_stats *const st = server_stats(fx.srv_a, true);
 	size_t len = 0;
 	size_t last_count = 0;
 	char last_msg[256] = { 0 };
@@ -3124,7 +3515,7 @@ T_DECLARE_CASE(test_server_evlog_dedups_consecutive_reload_events)
 static int srv_a_sessions_drained_predicate(void *ptr)
 {
 	const struct test_fixture *const restrict fx = ptr;
-	struct server_stats *const st = server_stats(fx->srv_a);
+	struct server_stats *const st = server_stats(fx->srv_a, true);
 	if (st == NULL) {
 		return 0;
 	}
@@ -3217,15 +3608,18 @@ T_DECLARE_CASE(test_server_apply_config_honors_cli_loglevel_override)
 	T_EXPECT_EQ(level_override, LOG_LEVEL_DEBUG);
 }
 
-/* Read srv's client-mode reconnect counter (a relaxed atomic under threads). */
+/* Read srv's client-mode reconnect total: the counter is per-tunnel, so this
+ * goes through the same aggregate the /stats page reports.  Returns 0 if the
+ * snapshot cannot be allocated. */
 static uint_least64_t server_num_reconnects(const struct server *restrict s)
 {
-#if WITH_THREADS
-	return (uint_least64_t)atomic_load_explicit(
-		&s->counters.num_reconnects, memory_order_relaxed);
-#else
-	return s->counters.num_reconnects;
-#endif
+	struct server_stats *const restrict stats = server_stats(s, true);
+	if (stats == NULL) {
+		return 0;
+	}
+	const uint_least64_t n = stats->num_reconnects;
+	free(stats);
+	return n;
 }
 
 struct reconnect_wait_ctx {
@@ -3353,6 +3747,91 @@ cleanup:
 	T_EXPECT(!safety_fired);
 }
 
+#if WITH_THREADS
+/* server_apply_config() creates and starts tunnels on its own, so threads that
+ * signal srv->w_async through server_post_task() can exist before (or without)
+ * server_start() ever running. ev_async_start() is also what makes libev arm the
+ * loop's internal pipe watcher, so arming w_async only in server_start() left
+ * that send writing a pipe nothing watched, aborting the next ev_run() from
+ * inside libev. Drive exactly that sequence deterministically -- no threads: a
+ * server that was never started, one send, one loop iteration. */
+T_DECLARE_CASE(test_server_new_arms_async_before_start)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct config *const conf =
+		make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf == NULL) {
+		T_FAIL();
+		ev_loop_destroy(loop);
+		return;
+	}
+	struct server *const srv = server_new(loop, conf);
+	if (srv == NULL) {
+		T_FAIL();
+		conf_free(conf);
+		ev_loop_destroy(loop);
+		return;
+	}
+
+	/* The deterministic check: the armed watcher is what makes the send below
+	 * safe, and it is what regressed. */
+	T_EXPECT(ev_is_active(&srv->w_async));
+	/* Exactly what server_post_task() does from a tunnel thread, followed by
+	 * one loop iteration. Reproducing the abort itself needs a loop carrying
+	 * other active watchers, which is what the real failure had; here this
+	 * just walks the path. */
+	ev_async_send(loop, &srv->w_async);
+	ev_run(loop, EVRUN_NOWAIT);
+
+	server_stop(srv);
+	struct config *const final_conf = srv->conf;
+	server_free(srv);
+	conf_free(final_conf);
+	ev_loop_destroy(loop);
+}
+
+/* w_async stays armed for the object's whole lifetime, so the destructor -- not
+ * only server_stop() -- has to hand its loop registration back; otherwise a
+ * server freed without a stop leaves a dangling entry in the loop's async array.
+ * Send before freeing so the ev_run() below actually walks that array, which is
+ * where the stale entry gets dereferenced. */
+T_DECLARE_CASE(test_server_free_releases_async_without_stop)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct config *const conf =
+		make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf == NULL) {
+		T_FAIL();
+		ev_loop_destroy(loop);
+		return;
+	}
+	struct server *const srv = server_new(loop, conf);
+	if (srv == NULL) {
+		T_FAIL();
+		conf_free(conf);
+		ev_loop_destroy(loop);
+		return;
+	}
+	/* Precondition: without an armed watcher the free below releases nothing
+	 * and the case would pass vacuously. */
+	T_EXPECT(ev_is_active(&srv->w_async));
+
+	ev_async_send(loop, &srv->w_async);
+	/* Deliberately no server_stop(): the destructor alone must release it. */
+	server_free(srv);
+	conf_free(conf);
+
+	ev_run(loop, EVRUN_NOWAIT);
+	ev_loop_destroy(loop);
+}
+#endif /* WITH_THREADS */
+
 struct pool_used_wait_ctx {
 	const struct server *srv;
 	const char *peer_identity;
@@ -3364,7 +3843,7 @@ struct pool_used_wait_ctx {
 static int pool_both_tunnels_used_predicate(void *ptr)
 {
 	const struct pool_used_wait_ctx *const restrict ctx = ptr;
-	struct server_stats *const stats = server_stats(ctx->srv);
+	struct server_stats *const stats = server_stats(ctx->srv, true);
 	if (stats == NULL) {
 		return 0;
 	}
@@ -3672,12 +4151,247 @@ cleanup:
 	}
 }
 
+/* Regression: an API connection still mid-request when the server stops must be
+ * reclaimed by server_stop(), not left behind with its context and open fd. The
+ * client sends a request whose body it withholds under Expect: 100-continue; the
+ * interim response proves the server parsed the headers and is now waiting, and
+ * that it consumed every byte sent, so the close that follows is an orderly FIN
+ * the client reads as EOF. Untracked contexts outlived the server, and no EOF
+ * ever arrived. */
+T_DECLARE_CASE(test_server_stop_frees_inflight_api_connection)
+{
+	static const char req[] = "POST /config HTTP/1.1\r\n"
+				  "Content-Length: 4\r\n"
+				  "Expect: 100-continue\r\n"
+				  "\r\n";
+	static const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
+
+	struct ev_loop *loop = NULL;
+	struct config *conf = NULL;
+	struct server *srv = NULL;
+	struct test_fixture fx = { 0 };
+	int api_port = -1;
+	int cl = -1;
+	int interim_rc = -1;
+	int eof_rc = -1;
+	bool setup_ok = false;
+
+	loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.loop = loop;
+
+	conf = make_config(NULL, NULL, NULL, NULL);
+	if (conf == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	conf->api_listen = strdup("127.0.0.1:0");
+	if (conf->api_listen == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+
+	srv = server_new(loop, conf);
+	if (srv == NULL || !server_start(srv)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	api_port = get_listener_port(&srv->api_listener);
+	if (api_port <= 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+
+	cl = connect_local(&fx, api_port);
+	if (cl < 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	if (write_full(&fx, cl, req, sizeof(req) - 1) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	setup_ok = true;
+
+	/* expect_echo() reads exactly this many bytes and compares them. */
+	interim_rc = expect_echo(
+		&fx, cl, interim, sizeof(interim) - 1,
+		(double)IO_WAIT_TIMEOUT_MS / 1000.0);
+	if (interim_rc != 0) {
+		goto cleanup;
+	}
+
+	server_stop(srv);
+	server_free(srv);
+	srv = NULL;
+	eof_rc = wait_for_peer_eof(
+		&fx, cl, (double)PEER_EOF_WAIT_TIMEOUT_MS / 1000.0);
+
+cleanup:
+	if (cl >= 0) {
+		(void)close(cl);
+	}
+	if (srv != NULL) {
+		server_stop(srv);
+		server_free(srv);
+	}
+	if (conf != NULL) {
+		conf_free(conf);
+	}
+	if (loop != NULL) {
+		ev_loop_destroy(loop);
+	}
+
+	if (setup_ok) {
+		T_EXPECT_EQ(interim_rc, 0);
+		T_EXPECT_EQ(eof_rc, 0);
+	}
+}
+
+/* Collects every log record slog emits while registered as its writer sink. */
+struct log_capture {
+	size_t len;
+	bool overflow;
+	char buf[8192];
+};
+
+static void
+log_capture_write(void *ud, const unsigned char *buf, const size_t len)
+{
+	struct log_capture *const restrict cap = ud;
+	/* One byte is reserved for the NUL the string searches below need. */
+	if (cap->len + len >= sizeof(cap->buf)) {
+		cap->overflow = true;
+		return;
+	}
+	memcpy(cap->buf + cap->len, buf, len);
+	cap->len += len;
+	cap->buf[cap->len] = '\0';
+}
+
+static int evlog_nonempty_predicate(void *ctx)
+{
+	const struct server_evlog *const restrict evlog = ctx;
+	return evlog->len > 0 ? 1 : 0;
+}
+
+/* Regression: an identity is peer-supplied and, per doc/spec.md 5.2.3.2, only
+ * NUL-excluded, so a claim carrying CR/LF or ESC would forge whole log records
+ * and drive the terminal of whoever reads the log or GET /stats (CWE-117/150).
+ * srv_a claims such an identity and srv_b dials it while pooling nothing under
+ * it, which drives both output paths at once: the "matches no configured
+ * identity.listen entry" warning, and the session event log that the /stats body
+ * renders verbatim. Neither may carry a raw control byte, and the escaped
+ * spelling must appear in its place. */
+T_DECLARE_CASE(test_server_escapes_peer_identity_in_output)
+{
+	static const char crafted[] = "a\r\nE forged\x1b[31m";
+
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct test_fixture fx = {
+		.loop = loop,
+		.mux_port_a = -1,
+		.tcp_port_a = -1,
+		.tcp_port_b = -1,
+		.backend_a = { .listen_fd = -1, .port = -1 },
+		.backend_b = { .listen_fd = -1, .port = -1 },
+	};
+
+	fx.conf_a = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (fx.conf_a == NULL) {
+		FIXTURE_FATAL(&fx, "make_config(conf_a) failed");
+	}
+	fx.conf_a->identity.claim = strdup(crafted);
+	if (fx.conf_a->identity.claim == NULL) {
+		FIXTURE_FATAL(&fx, "OOM building conf_a identity");
+	}
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		FIXTURE_FATAL(&fx, "srv_a start failed");
+	}
+	if (wait_for_listener_port(
+		    &fx, &fx.srv_a->mux_listener, &fx.mux_port_a,
+		    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) != 0) {
+		FIXTURE_FATAL(&fx, "srv_a mux port wait failed");
+	}
+
+	char mux_connect_a[64];
+	(void)snprintf(
+		mux_connect_a, sizeof(mux_connect_a), "127.0.0.1:%d",
+		fx.mux_port_a);
+	fx.conf_b = make_config(NULL, NULL, NULL, NULL);
+	if (fx.conf_b == NULL) {
+		FIXTURE_FATAL(&fx, "make_config(conf_b) failed");
+	}
+	if (!build_identity_dialer_conf(fx.conf_b, mux_connect_a)) {
+		FIXTURE_FATAL(&fx, "OOM building conf_b identity");
+	}
+
+	/* The suite runs at LOG_LEVEL_SILENCE with no sink; both are put back
+	 * that way once the exchange is over. */
+	struct log_capture cap = { 0 };
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_capture_write, &cap);
+	/* NOTICE, not WARNING: the mux layer prefixes every record with the
+	 * session tag, which carries the claim too, and its establishment record
+	 * is a NOTICE. */
+	slog_setlevel(LOG_LEVEL_NOTICE);
+
+	fx.srv_b = server_new(fx.loop, fx.conf_b);
+	if (fx.srv_b == NULL || !server_start(fx.srv_b)) {
+		slog_setlevel(LOG_LEVEL_SILENCE);
+		slog_setoutput(SLOG_OUTPUT_DISCARD);
+		FIXTURE_FATAL(&fx, "srv_b start failed");
+	}
+	const int wait_rc = wait_until(
+		&fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		evlog_nonempty_predicate, &fx.srv_b->evlog);
+
+	char evmsg[sizeof(fx.srv_b->evlog.entries[0].message)] = { 0 };
+	for (size_t i = 0; i < fx.srv_b->evlog.len; i++) {
+		const char *const msg = fx.srv_b->evlog.entries[i].message;
+		if (strstr(msg, "session established") != NULL) {
+			memcpy(evmsg, msg, sizeof(evmsg));
+			break;
+		}
+	}
+
+	/* Teardown joins every tunnel thread, so no further record can reach
+	 * cap once the sink is dropped right after it. */
+	fixture_teardown(&fx);
+	slog_setlevel(LOG_LEVEL_SILENCE);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+
+	T_EXPECT_EQ(wait_rc, 0);
+	T_EXPECT(!cap.overflow);
+	/* The warning that names the claimed identity was emitted, as was a
+	 * record carrying the session tag the claim also feeds... */
+	T_EXPECT(strstr(cap.buf, "dialed session identity") != NULL);
+	T_EXPECT(strstr(cap.buf, "node-b => a\\r\\n") != NULL);
+	/* ...carrying the escaped spelling and no byte the peer could have used
+	 * to end the record early or move the reader's cursor. */
+	T_EXPECT(strstr(cap.buf, "\\r\\n") != NULL);
+	T_EXPECT(strstr(cap.buf, "\\x1b") != NULL);
+	T_EXPECT(memchr(cap.buf, '\r', cap.len) == NULL);
+	T_EXPECT(memchr(cap.buf, '\x1b', cap.len) == NULL);
+	/* The event log GET /stats renders verbatim holds the same. */
+	T_EXPECT(strstr(evmsg, "session established") != NULL);
+	T_EXPECT(strstr(evmsg, "\\r\\n") != NULL);
+	T_EXPECT(strchr(evmsg, '\r') == NULL);
+	T_EXPECT(strchr(evmsg, '\x1b') == NULL);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_server_apply_config_honors_cli_loglevel_override),
 	T_CASE(test_server_offline_listeners_idle_timeout_scoped_to_mux_connect),
 	T_CASE(test_server_offline_listeners_identity_branch),
 	T_CASE(test_bidirectional_stream_and_forward),
-	T_CASE(test_server_force_close_folds_tunnel_traffic),
+	T_CASE(test_server_force_close_folds_tunnel_counters),
 	T_CASE(test_half_close_b_to_a),
 	T_CASE(test_half_close_a_to_b),
 	T_CASE(test_multi_stream_churn_and_workload),
@@ -3697,12 +4411,20 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_server_max_sessions_rejects_at_exact_limit),
 	T_CASE(test_server_startup_limit_zero_start_throttles_first_connection),
 	T_CASE(test_server_stream_establish_percentiles),
+	T_CASE(test_server_stream_establish_percentiles_accepted_side),
 	T_CASE(test_server_evlog_dedups_consecutive_reload_events),
 	T_CASE(test_server_graceful_shutdown_via_signal),
 	T_CASE(test_server_maintenance_suspend_drops_transports_and_reconnects),
 	T_CASE(test_server_maintenance_shutdown_deadline_breaks_loop),
+#if WITH_THREADS
+	T_CASE(test_server_new_arms_async_before_start),
+	T_CASE(test_server_free_releases_async_without_stop),
+#endif
+	T_CASE(test_server_identity_pool_single_membership_across_reclaim),
 	T_CASE(test_server_identity_listener_forwards_over_pool),
 	T_CASE(test_server_identity_listener_empty_pool_closes_conn),
+	T_CASE(test_server_stop_frees_inflight_api_connection),
+	T_CASE(test_server_escapes_peer_identity_in_output),
 	T_SUITE_END,
 };
 

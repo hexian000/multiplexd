@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <time.h>
 
+struct api_ctx;
 struct config;
 struct hashtable;
 struct tls_context;
@@ -101,56 +102,32 @@ struct server_counters {
 #endif /* WITH_THREADS */
 	};
 
-	/* error and control counters */
+	/* Monotonic per-tunnel counters accumulated from closed tunnels
+	 * (server_close_and_fold); live tunnels are summed at snapshot time
+	 * via tunnel_stats().  Server-thread only, so plain.  The per-tunnel
+	 * gauges have no base here: they drain to zero as a session tears down,
+	 * so summing live tunnels is already exact. */
 	struct {
-#if WITH_THREADS
-		/* client-mode reconnect attempts */
-		atomic_uint_least64_t num_reconnects;
-		/* RST frames sent (aggregated) */
-		atomic_uint_least64_t num_rst_sent;
-		/* RST frames received (aggregated) */
-		atomic_uint_least64_t num_rst_recv;
-		/* stream_abort() calls (aggregated) */
-		atomic_uint_least64_t num_stream_errors;
-#else /* WITH_THREADS */
+		uint_least64_t num_stream_opened;
+		uint_least64_t num_stream_accepted;
+		uint_least64_t num_stream_fastopen;
+		uint_least64_t num_stream_established;
+		uint_least64_t num_stream_succeeded;
+		uint_least64_t num_stream_failed;
 		/* client-mode reconnect attempts */
 		uint_least64_t num_reconnects;
-		/* RST frames sent (aggregated) */
 		uint_least64_t num_rst_sent;
-		/* RST frames received (aggregated) */
 		uint_least64_t num_rst_recv;
-		/* stream_abort() calls (aggregated) */
+		/* stream_abort() calls */
 		uint_least64_t num_stream_errors;
-#endif /* WITH_THREADS */
-	};
-
-	/* per-stream buffer gauges (aggregated) */
-	struct {
-#if WITH_THREADS
-		/* bytes currently buffered in per-stream recvbuf rings */
-		atomic_size_t recv_buffered_bytes;
-		/* frames currently queued in per-stream send_queue */
-		atomic_size_t send_buffered_frames;
-		/* frames held in the session unacked list (spec §5.7.2) */
-		atomic_size_t unacked_frames;
-#else /* WITH_THREADS */
-		/* bytes currently buffered in per-stream recvbuf rings */
-		size_t recv_buffered_bytes;
-		/* frames currently queued in per-stream send_queue */
-		size_t send_buffered_frames;
-		/* frames held in the session unacked list (spec §5.7.2) */
-		size_t unacked_frames;
-#endif /* WITH_THREADS */
-	};
-
-	/* Traffic bytes for closed tunnels (accumulated in handle_closed); active
-	 * tunnels summed at snapshot time via tunnel_stats(). */
-	struct {
+		/* establishment-latency observations, i.e. the monotonic
+		 * tunnel_stats::stream_establish_count write index */
+		uint_least64_t num_stream_establish_samples;
 		uint_least64_t traffic_byt_mux_recv;
 		uint_least64_t traffic_byt_mux_sent;
 		uint_least64_t traffic_byt_push_recv;
 		uint_least64_t traffic_byt_push_sent;
-	};
+	} closed;
 };
 
 /* Snapshot of server statistics; plain (non-atomic) fields, safe to read
@@ -194,10 +171,17 @@ struct server_stats {
 	uint_least64_t traffic_byt_mux_sent;
 	uint_least64_t traffic_byt_push_recv;
 	uint_least64_t traffic_byt_push_sent;
+	/* Monotonic count of establishment-latency observations over every
+	 * tunnel, live and closed.  This is how many samples the percentiles
+	 * below summarize over the process's life, unlike the windowed
+	 * stream_establish_count; only active opens are observed, so it tracks
+	 * neither num_stream_established nor num_stream_opened. */
+	uint_least64_t num_stream_establish_samples;
 
 	/* --- stats route snapshot --- */
 	/* merged sample count across all tunnels (<=256 per tunnel, so up to
-	 * 256*num_tunnels); 0 = no data */
+	 * 256*num_tunnels); 0 = no data.  A window occupancy, not a total: it
+	 * drops as tunnels close, so never expose it as a Prometheus _count. */
 	size_t stream_establish_count;
 	/* SYN->SYN|ACK latency percentiles (ns); valid when count > 0 */
 	int_least64_t stream_establish_p50;
@@ -241,6 +225,9 @@ struct server {
 #if WITH_TLS
 	/* TLS context for accepted mux connections (server role). */
 	struct tls_context *server_tlsctx;
+	/* Decoded tls.psk table; NULL in certificate mode.  Backs the TLS
+	 * lookup callback and the tunnel layer's label -> identity mapping. */
+	struct psk_table *psk;
 	/* TLS context for initiated mux connections (client role). */
 	struct tls_context *client_tlsctx;
 #endif
@@ -248,6 +235,9 @@ struct server {
 	struct listener mux_listener;
 	struct listener local_listener;
 	struct listener api_listener;
+	/* Head of the live api_listener connections, an intrusive list owned by
+	 * api_server.c and swept by api_server_stop(). */
+	struct api_ctx *api_conns;
 
 	/* Per-identity listeners keyed by peer_identity string.
 	 * Each value is a heap-allocated struct identity_listener *. */
@@ -323,17 +313,32 @@ struct server *server_new(struct ev_loop *loop, struct config *conf);
 /* Start listeners, background workers, and outbound sessions; false on failure. */
 bool server_start(struct server *s);
 
-/* Stop listeners and initiate shutdown of active sessions. */
+/* Stop listeners, drop any connection the management API still holds, and
+ * initiate shutdown of active sessions. */
 void server_stop(struct server *s);
 
-/* Free a stopped server and all owned resources; NULL is allowed. Does not free
- * s->conf -- the caller owns the config (see server_new) and must free it
- * separately, using the current s->conf since a reload may have replaced it. */
+/* Free a stopped server and all owned resources; NULL is allowed. Releases the
+ * async watcher server_new() armed, so the ev_loop must outlive this call and a
+ * server that never had a config applied needs no server_stop() first. Once
+ * server_apply_config() has run, tunnels exist and are started even if
+ * server_start() never was, and only server_stop() tears them down: freeing
+ * without it leaves live tunnel threads posting into a destroyed dispatcher.
+ * Does not free s->conf --
+ * the caller owns the config (see server_new) and must free it separately, using
+ * the current s->conf since a reload may have replaced it. */
 void server_free(struct server *s);
 
 /* Allocate a consistent snapshot of all server statistics (caller frees);
- * NULL on OOM (logged). */
-struct server_stats *server_stats(const struct server *restrict s);
+ * NULL on OOM (logged).
+ *
+ * @p want_tunnel_latency additionally derives each tunnel's own
+ * stream_establish_p50/p90/p99 from its latency ring, which sorts up to
+ * TUNNEL_ESTABLISH_RING_SIZE samples per tunnel on the server thread.  Only GET
+ * /metrics exposes those per-tunnel percentiles; every other caller passes
+ * false and leaves the fields zero.  The merged process-wide percentiles are
+ * always derived -- /stats reports them too. */
+struct server_stats *
+server_stats(const struct server *restrict s, bool want_tunnel_latency);
 
 /* Report forwarding listeners that currently have no established tunnel to
  * forward over (e.g. the peer is unreachable).  For each such listener @p cb is
@@ -346,5 +351,36 @@ struct server_stats *server_stats(const struct server *restrict s);
 size_t server_offline_listeners(
 	const struct server *restrict s,
 	void (*cb)(void *data, const char *identifier), void *data);
+
+#if WITH_TLS
+/* One decoded tls.psk entry: the peer identity it belongs to, the key itself,
+ * and the wire label derived from that key.  The label is what a peer offers
+ * in its ClientHello; mapping it back to the identity is what lets the tunnel
+ * layer check a claimed identity against the one that actually authenticated. */
+struct psk_table_entry {
+	char identity[MUX_MAX_CLAIM_LEN + 1];
+	char label[TLS_PSK_LABEL_MAX + 1];
+	unsigned char key[TLS_PSK_MAX_LEN];
+	size_t key_len;
+};
+
+/* Built once at startup and owned by the server; outlives the TLS contexts,
+ * whose lookup callback reads it during every handshake. */
+struct psk_table {
+	size_t count;
+	struct psk_table_entry entries[];
+};
+
+/* Decode conf->tls_psk and derive each label; NULL when none are configured
+ * or on failure (which is logged). */
+struct psk_table *server_psk_table_new(const struct config *restrict conf);
+void server_psk_table_free(struct psk_table *restrict t);
+
+/* The peer identity owning @p label, or NULL when no entry matches.  The
+ * caller has an authenticated label from tls_peer_psk_label(), so a non-NULL
+ * result names the peer that proved possession of that key. */
+const char *server_psk_identity_of(
+	const struct psk_table *restrict t, const char *restrict label);
+#endif /* WITH_TLS */
 
 #endif /* SERVER_H */
