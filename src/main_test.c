@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Rename the daemon entry point so the test owns main().  main.c's body is
@@ -192,6 +193,40 @@ T_DECLARE_CASE(test_parse_args_gencerts_options)
 }
 #endif /* WITH_OPENSSL */
 
+/* Regression: --dump-config's guard must reject a write that only reached the
+ * stdio buffer.  A stream on /dev/full is fully buffered and fails every actual
+ * write, so a payload smaller than the buffer leaves fwrite/fputc reporting
+ * success and the error surfacing only at flush time -- exactly what exit()'s
+ * implicit flush would swallow, handing the caller truncated JSON under a zero
+ * exit status. */
+T_DECLARE_CASE(test_write_dump_reports_flush_failure)
+{
+	static const char json[] = "{\"type\":\"x\"}";
+
+	FILE *const f = fopen("/dev/full", "w");
+	if (f == NULL) {
+		/* No always-failing sink on this platform. */
+		T_SKIPNOW();
+	}
+	const bool written = write_dump(f, json, sizeof(json) - 1);
+	(void)fclose(f);
+	T_EXPECT(!written);
+}
+
+/* The same helper reports success on a stream that accepts the whole payload. */
+T_DECLARE_CASE(test_write_dump_accepts_a_complete_write)
+{
+	static const char json[] = "{\"type\":\"x\"}";
+
+	FILE *const f = fopen("/dev/null", "w");
+	if (f == NULL) {
+		T_SKIPNOW();
+	}
+	const bool written = write_dump(f, json, sizeof(json) - 1);
+	(void)fclose(f);
+	T_EXPECT(written);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_parse_args_config_short_and_long),
 	T_CASE(test_parse_args_loglevel_parses_number),
@@ -205,6 +240,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_drop_privileges_requests_group_only),
 	T_CASE(test_drop_privileges_requests_numeric_forms),
 	T_CASE(test_parse_args_double_dash_stops_parsing),
+	T_CASE(test_write_dump_reports_flush_failure),
+	T_CASE(test_write_dump_accepts_a_complete_write),
 #if WITH_OPENSSL
 	T_CASE(test_parse_args_gencerts_options),
 #endif

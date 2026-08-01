@@ -9,6 +9,7 @@
 
 #include "gencerts.h"
 
+#include "meta/arraysize.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
@@ -123,7 +124,7 @@ T_DECLARE_CASE(test_gencerts_ed25519)
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
 	const bool ok =
-		gencerts("testcert", "test.example", NULL, "ed25519", 0);
+		gencerts("testcert", "test.example", NULL, "ed25519", 0, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("testcert-cert.pem", F_OK), 0);
@@ -139,7 +140,8 @@ T_DECLARE_CASE(test_gencerts_ecdsa)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("ec256", "ec.example", NULL, "ecdsa", 256);
+	const bool ok =
+		gencerts("ec256", "ec.example", NULL, "ecdsa", 256, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("ec256-cert.pem", F_OK), 0);
@@ -156,7 +158,8 @@ T_DECLARE_CASE(test_gencerts_rsa)
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
 	/* Use 2048-bit RSA to keep the test reasonably fast. */
-	const bool ok = gencerts("rsa2048", "rsa.example", NULL, "rsa", 2048);
+	const bool ok =
+		gencerts("rsa2048", "rsa.example", NULL, "rsa", 2048, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("rsa2048-cert.pem", F_OK), 0);
@@ -172,7 +175,7 @@ T_DECLARE_CASE(test_gencerts_invalid_keytype)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("x", "test", NULL, "nosuchthing", 0);
+	const bool ok = gencerts("x", "test", NULL, "nosuchthing", 0, NULL);
 	T_EXPECT(!ok);
 
 	leave_tmpdir(origdir, tmpl);
@@ -184,7 +187,8 @@ T_DECLARE_CASE(test_gencerts_invalid_ecdsa_keysize)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("ecbad", "ec.example", NULL, "ecdsa", 255);
+	const bool ok =
+		gencerts("ecbad", "ec.example", NULL, "ecdsa", 255, NULL);
 	T_EXPECT(!ok);
 
 	leave_tmpdir(origdir, tmpl);
@@ -199,7 +203,8 @@ T_DECLARE_CASE(test_gencerts_ed25519_rejects_keysize)
 	/* ed25519 has no variable key size; a non-zero request (e.g. a
 	 * copy-pasted RSA/ECDSA invocation) must fail, not be silently
 	 * ignored. */
-	const bool ok = gencerts("edbad", "ed.example", NULL, "ed25519", 256);
+	const bool ok =
+		gencerts("edbad", "ed.example", NULL, "ed25519", 256, NULL);
 	T_EXPECT(!ok);
 
 	leave_tmpdir(origdir, tmpl);
@@ -211,8 +216,8 @@ T_DECLARE_CASE(test_gencerts_missing_signing_cert_fails)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok =
-		gencerts("server", "server.example", "missing", "ed25519", 0);
+	const bool ok = gencerts(
+		"server", "server.example", "missing", "ed25519", 0, NULL);
 	T_EXPECT(!ok);
 
 	leave_tmpdir(origdir, tmpl);
@@ -224,9 +229,9 @@ T_DECLARE_CASE(test_gencerts_refuses_overwrite_existing_files)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	bool ok = gencerts("dup", "dup.example", NULL, "ed25519", 0);
+	bool ok = gencerts("dup", "dup.example", NULL, "ed25519", 0, NULL);
 	T_CHECK(ok);
-	ok = gencerts("dup", "dup.example", NULL, "ed25519", 0);
+	ok = gencerts("dup", "dup.example", NULL, "ed25519", 0, NULL);
 	T_EXPECT(!ok);
 
 	leave_tmpdir(origdir, tmpl);
@@ -238,8 +243,8 @@ T_DECLARE_CASE(test_gencerts_multiple_names)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok =
-		gencerts("alpha, beta", "multi.example", NULL, "ed25519", 0);
+	const bool ok = gencerts(
+		"alpha, beta", "multi.example", NULL, "ed25519", 0, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("alpha-cert.pem", F_OK), 0);
@@ -260,8 +265,8 @@ T_DECLARE_CASE(test_gencerts_skips_all_space_name_token)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok =
-		gencerts("alpha, ,beta", "multi.example", NULL, "ed25519", 0);
+	const bool ok = gencerts(
+		"alpha, ,beta", "multi.example", NULL, "ed25519", 0, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("alpha-cert.pem", F_OK), 0);
@@ -284,9 +289,10 @@ T_DECLARE_CASE(test_gencerts_empty_name_list_fails)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool empty_ok = gencerts("", "none.example", NULL, "ed25519", 0);
+	const bool empty_ok =
+		gencerts("", "none.example", NULL, "ed25519", 0, NULL);
 	const bool blank_ok =
-		gencerts(" , , ", "none.example", NULL, "ed25519", 0);
+		gencerts(" , , ", "none.example", NULL, "ed25519", 0, NULL);
 
 	/* The false return alone would also be satisfied by a run that wrote a
 	 * file and then failed for some other reason, so pin the claim this case
@@ -309,10 +315,10 @@ T_DECLARE_CASE(test_gencerts_with_signing_cert)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	bool ok = gencerts("ca", "ca.example", NULL, "ed25519", 0);
+	bool ok = gencerts("ca", "ca.example", NULL, "ed25519", 0, NULL);
 	T_CHECK(ok);
 
-	ok = gencerts("server", "server.example", "ca", "ed25519", 0);
+	ok = gencerts("server", "server.example", "ca", "ed25519", 0, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("server-cert.pem", F_OK), 0);
@@ -328,7 +334,8 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p224)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("p224", "p224.example", NULL, "ecdsa", 224);
+	const bool ok =
+		gencerts("p224", "p224.example", NULL, "ecdsa", 224, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("p224-cert.pem", F_OK), 0);
@@ -344,7 +351,8 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p384)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("p384", "p384.example", NULL, "ecdsa", 384);
+	const bool ok =
+		gencerts("p384", "p384.example", NULL, "ecdsa", 384, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("p384-cert.pem", F_OK), 0);
@@ -360,7 +368,8 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p521)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("p521", "p521.example", NULL, "ecdsa", 521);
+	const bool ok =
+		gencerts("p521", "p521.example", NULL, "ecdsa", 521, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("p521-cert.pem", F_OK), 0);
@@ -384,8 +393,8 @@ T_DECLARE_CASE(test_gencerts_key_write_failure_removes_cert)
 		(void)fclose(stale);
 	}
 
-	const bool ok =
-		gencerts("rollback", "rollback.example", NULL, "ed25519", 0);
+	const bool ok = gencerts(
+		"rollback", "rollback.example", NULL, "ed25519", 0, NULL);
 	T_EXPECT(!ok);
 	T_EXPECT(access("rollback-cert.pem", F_OK) != 0);
 
@@ -406,7 +415,7 @@ T_DECLARE_CASE(test_gencerts_sni_too_long_rejected)
 	memset(long_sni, 'a', HUGE_SNI_LEN);
 	long_sni[HUGE_SNI_LEN] = '\0';
 
-	const bool ok = gencerts("toolong", long_sni, NULL, "ed25519", 0);
+	const bool ok = gencerts("toolong", long_sni, NULL, "ed25519", 0, NULL);
 	free(long_sni);
 	T_EXPECT(!ok);
 	T_EXPECT(access("toolong-cert.pem", F_OK) != 0);
@@ -420,7 +429,8 @@ T_DECLARE_CASE(test_gencerts_rsa_keysize_too_large_rejected)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("hugersa", "rsa.example", NULL, "rsa", 999999);
+	const bool ok =
+		gencerts("hugersa", "rsa.example", NULL, "rsa", 999999, NULL);
 	T_EXPECT(!ok);
 	T_EXPECT(access("hugersa-cert.pem", F_OK) != 0);
 
@@ -434,7 +444,8 @@ T_DECLARE_CASE(test_gencerts_rsa_keysize_too_small_rejected)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("smallrsa", "rsa.example", NULL, "rsa", 1024);
+	const bool ok =
+		gencerts("smallrsa", "rsa.example", NULL, "rsa", 1024, NULL);
 	T_EXPECT(!ok);
 	T_EXPECT(access("smallrsa-cert.pem", F_OK) != 0);
 
@@ -449,7 +460,7 @@ T_DECLARE_CASE(test_gencerts_ecdsa_default_keysize)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("ecdef", "ec.example", NULL, "ecdsa", 0);
+	const bool ok = gencerts("ecdef", "ec.example", NULL, "ecdsa", 0, NULL);
 	T_EXPECT(ok);
 	if (ok) {
 		T_EXPECT_EQ(access("ecdef-cert.pem", F_OK), 0);
@@ -467,13 +478,14 @@ T_DECLARE_CASE(test_gencerts_signing_cert_key_mismatch_fails)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	T_CHECK(gencerts("ca1", "ca1.example", NULL, "ed25519", 0));
-	T_CHECK(gencerts("ca2", "ca2.example", NULL, "ed25519", 0));
+	T_CHECK(gencerts("ca1", "ca1.example", NULL, "ed25519", 0, NULL));
+	T_CHECK(gencerts("ca2", "ca2.example", NULL, "ed25519", 0, NULL));
 	/* Replace ca1's key with ca2's so ca1-cert.pem and ca1-key.pem no longer
 	 * match. */
 	T_CHECK(rename("ca2-key.pem", "ca1-key.pem") == 0);
 
-	const bool ok = gencerts("srv", "srv.example", "ca1", "ed25519", 0);
+	const bool ok =
+		gencerts("srv", "srv.example", "ca1", "ed25519", 0, NULL);
 	T_EXPECT(!ok);
 
 	leave_tmpdir(origdir, tmpl);
@@ -490,7 +502,8 @@ T_DECLARE_CASE(test_gencerts_file_permissions)
 	 * 0640/0600 and fail the exact assertions below. Clear the umask around
 	 * generation so the created modes are exactly what gencerts requested. */
 	const mode_t old_umask = umask(0);
-	const bool ok = gencerts("perms", "perms.example", NULL, "ed25519", 0);
+	const bool ok =
+		gencerts("perms", "perms.example", NULL, "ed25519", 0, NULL);
 	(void)umask(old_umask);
 	T_EXPECT(ok);
 	if (ok) {
@@ -551,6 +564,151 @@ static bool cert_has_dns_san(X509 *restrict cert, const char *restrict expect)
 	return found;
 }
 
+/* Count URI subjectAltNames, optionally requiring one to equal @p expect.
+ * The expected form is spelled out literally rather than built from
+ * IDENTITY_URI_SCHEME, so this pins the on-certificate wire format that
+ * identity.verify reads back. */
+static bool cert_has_uri_san(
+	X509 *restrict cert, const char *restrict expect, int *restrict n_uri)
+{
+	*n_uri = 0;
+	GENERAL_NAMES *const san =
+		X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+	if (san == NULL) {
+		return false;
+	}
+	bool found = false;
+	const int count = sk_GENERAL_NAME_num(san);
+	for (int i = 0; i < count; i++) {
+		const GENERAL_NAME *const gn = sk_GENERAL_NAME_value(san, i);
+		if (gn->type != GEN_URI) {
+			continue;
+		}
+		(*n_uri)++;
+		const ASN1_IA5STRING *const uri =
+			gn->d.uniformResourceIdentifier;
+		const int len = ASN1_STRING_length(uri);
+		const unsigned char *const data = ASN1_STRING_get0_data(uri);
+		if (expect != NULL && len == (int)strlen(expect) &&
+		    memcmp(data, expect, (size_t)len) == 0) {
+			found = true;
+		}
+	}
+	GENERAL_NAMES_free(san);
+	return found;
+}
+
+/* Without --identity a certificate carries no identity at all: an identity is a
+ * deployment fact, never inferred from the certificate's file name. */
+T_DECLARE_CASE(test_gencerts_identity_absent_omits_san)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok = gencerts(
+		"alpha,beta", "multi.example", NULL, "ed25519", 0, NULL);
+	T_EXPECT(ok);
+	if (ok) {
+		X509 *const alpha = read_cert_file("alpha-cert.pem");
+		X509 *const beta = read_cert_file("beta-cert.pem");
+		T_EXPECT(alpha != NULL);
+		T_EXPECT(beta != NULL);
+		int n = -1;
+		if (alpha != NULL) {
+			T_EXPECT(!cert_has_uri_san(alpha, NULL, &n));
+			T_EXPECT_EQ(n, 0);
+			/* Omitting the identity must not drop the DNS name. */
+			T_EXPECT(cert_has_dns_san(alpha, "multi.example"));
+		}
+		if (beta != NULL) {
+			T_EXPECT(!cert_has_uri_san(beta, NULL, &n));
+			T_EXPECT_EQ(n, 0);
+		}
+		X509_free(alpha);
+		X509_free(beta);
+	}
+
+	leave_tmpdir(origdir, tmpl);
+}
+
+/* An explicit list is paired positionally, and an empty entry names the empty
+ * identity -- a claim a peer may make (doc/spec.md 5.2.3.2), so it earns a URI
+ * name of its own rather than none, which identity.verify then matches. */
+T_DECLARE_CASE(test_gencerts_identity_explicit_list)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok = gencerts(
+		"blank,peer", "id.example", NULL, "ed25519", 0, ",east-1");
+	T_EXPECT(ok);
+	if (ok) {
+		X509 *const blank = read_cert_file("blank-cert.pem");
+		X509 *const peer = read_cert_file("peer-cert.pem");
+		T_EXPECT(blank != NULL);
+		T_EXPECT(peer != NULL);
+		int n = -1;
+		if (blank != NULL) {
+			T_EXPECT(cert_has_uri_san(blank, "multiplexd:", &n));
+			T_EXPECT_EQ(n, 1);
+			/* The identity does not displace the DNS name. */
+			T_EXPECT(cert_has_dns_san(blank, "id.example"));
+		}
+		if (peer != NULL) {
+			T_EXPECT(cert_has_uri_san(
+				peer, "multiplexd:east-1", &n));
+			T_EXPECT_EQ(n, 1);
+		}
+		X509_free(blank);
+		X509_free(peer);
+	}
+
+	leave_tmpdir(origdir, tmpl);
+}
+
+/* RFC 5280 requires the URI name to be an IA5String, so a UTF-8 identity and
+ * the URI-reserved characters must be percent-encoded.  A space becomes %20,
+ * not '+': that would be form encoding, not a URI. */
+T_DECLARE_CASE(test_gencerts_identity_percent_encoded)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok = gencerts(
+		"enc", "id.example", NULL, "ed25519", 0, "caf\xC3\xA9 a/b");
+	T_EXPECT(ok);
+	if (ok) {
+		X509 *const cert = read_cert_file("enc-cert.pem");
+		T_EXPECT(cert != NULL);
+		if (cert != NULL) {
+			int n = 0;
+			T_EXPECT(cert_has_uri_san(
+				cert, "multiplexd:caf%C3%A9%20a%2Fb", &n));
+			T_EXPECT_EQ(n, 1);
+		}
+		X509_free(cert);
+	}
+
+	leave_tmpdir(origdir, tmpl);
+}
+
+/* An --identity list that does not pair one-to-one with the names is an error
+ * in both directions, rather than silently mislabelling a certificate. */
+T_DECLARE_CASE(test_gencerts_identity_count_mismatch)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	T_EXPECT(!gencerts("a,b", "id.example", NULL, "ed25519", 0, "x"));
+	T_EXPECT(!gencerts("c", "id.example", NULL, "ed25519", 0, "x,y"));
+
+	leave_tmpdir(origdir, tmpl);
+}
+
 /* A generated cert must be a usable, correct certificate, not merely a file
  * that exists: verify the leaf's CN and DNS SAN, that its issuer is the CA's
  * subject, and that its signature verifies against the CA's public key. */
@@ -560,9 +718,9 @@ T_DECLARE_CASE(test_gencerts_produces_verifiable_cert)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	bool ok = gencerts("ca", "ca.example", NULL, "ed25519", 0);
+	bool ok = gencerts("ca", "ca.example", NULL, "ed25519", 0, NULL);
 	T_CHECK(ok);
-	ok = gencerts("server", "server.example", "ca", "ed25519", 0);
+	ok = gencerts("server", "server.example", "ca", "ed25519", 0, NULL);
 	T_CHECK(ok);
 
 	X509 *const ca = read_cert_file("ca-cert.pem");
@@ -598,6 +756,153 @@ T_DECLARE_CASE(test_gencerts_produces_verifiable_cert)
 	T_EXPECT_EQ(verify_rc, 1);
 }
 
+/* A server name of 65-255 octets is a legal FQDN and inside this tool's own
+ * documented bound, but the subject CN is built with MBSTRING_ASC, so OpenSSL
+ * enforces ub_common_name (64) on it: such a name used to fail in set_subject_cn
+ * with a raw error-queue dump, before the SAN builder's length gate could give
+ * the intended diagnostic. The name must now generate, with the full value in
+ * the subjectAltName -- which is what verifiers actually match on. */
+T_DECLARE_CASE(test_gencerts_long_server_name_lands_in_san)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	/* 100 octets: past ub_common_name, well inside the 255 bound. */
+	char sni[101];
+	memset(sni, 'a', sizeof(sni) - 1);
+	sni[sizeof(sni) - 1] = '\0';
+	memcpy(sni, "long.", 5);
+
+	const bool ok = gencerts("longcn", sni, NULL, "ed25519", 0, NULL);
+	X509 *const cert = ok ? read_cert_file("longcn-cert.pem") : NULL;
+	const bool cert_ok = cert != NULL;
+	bool san_ok = false, cn_within_bound = false;
+	if (cert_ok) {
+		/* The full name is reachable where it matters. */
+		san_ok = cert_has_dns_san(cert, sni);
+		/* The subject stays non-empty and within OpenSSL's CN bound. */
+		char cn[256] = { 0 };
+		const int cn_len = X509_NAME_get_text_by_NID(
+			X509_get_subject_name(cert), NID_commonName, cn,
+			(int)sizeof(cn));
+		cn_within_bound = cn_len > 0 && cn_len <= 64 &&
+				  strncmp(cn, sni, (size_t)cn_len) == 0;
+	}
+	X509_free(cert);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ok);
+	T_EXPECT(cert_ok);
+	T_EXPECT(san_ok);
+	T_EXPECT(cn_within_bound);
+}
+
+/* write_keypair appends the signing CA to a --sign'ed leaf's cert file so the
+ * file is a complete chain -- what a TLS peer needs to present the intermediate.
+ * test_gencerts_with_signing_cert only access()-checks the files exist and
+ * test_gencerts_produces_verifiable_cert reads a single certificate, so
+ * deleting the append block passed the whole suite. Read the leaf's PEM back
+ * and require two certificates, the second being the CA. */
+T_DECLARE_CASE(test_gencerts_signed_cert_file_contains_chain)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	bool ok = gencerts("ca", "ca.example", NULL, "ed25519", 0, NULL);
+	T_CHECK(ok);
+	ok = gencerts("server", "server.example", "ca", "ed25519", 0, NULL);
+	T_CHECK(ok);
+
+	X509 *const ca = read_cert_file("ca-cert.pem");
+	/* Read every certificate in the leaf's file, in order. */
+	X509 *chain[4] = { NULL, NULL, NULL, NULL };
+	size_t chain_len = 0;
+	FILE *const fp = fopen("server-cert.pem", "re");
+	if (fp != NULL) {
+		while (chain_len < ARRAY_SIZE(chain)) {
+			X509 *const c = PEM_read_X509(fp, NULL, NULL, NULL);
+			if (c == NULL) {
+				break;
+			}
+			chain[chain_len++] = c;
+		}
+		(void)fclose(fp);
+	}
+
+	const bool ca_ok = ca != NULL;
+	bool leaf_is_server = false, appended_is_ca = false;
+	if (ca_ok && chain_len == 2) {
+		leaf_is_server = cert_cn_equals(chain[0], "server.example");
+		appended_is_ca = X509_cmp(chain[1], ca) == 0;
+	}
+	for (size_t i = 0; i < chain_len; i++) {
+		X509_free(chain[i]);
+	}
+	X509_free(ca);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ca_ok);
+	/* Leaf plus the appended signing CA, and nothing else. */
+	T_EXPECT_EQ(chain_len, (size_t)2);
+	T_EXPECT(leaf_is_server);
+	T_EXPECT(appended_is_ca);
+}
+
+/* reject_password_cb exists so a password-protected signing key fails cleanly
+ * instead of blocking on OpenSSL's interactive prompt in a scripted run. No
+ * case supplied an encrypted key, so passing NULL for the callback again --
+ * which makes OpenSSL read the passphrase from the controlling TTY -- would
+ * reintroduce a hang in provisioning with nothing to catch it. Write a real
+ * encrypted signing key and require gencerts to fail rather than prompt. */
+T_DECLARE_CASE(test_gencerts_encrypted_signing_key_fails_cleanly)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	bool ok = gencerts("ca", "ca.example", NULL, "ed25519", 0, NULL);
+	T_CHECK(ok);
+
+	/* Re-write ca-key.pem encrypted, leaving ca-cert.pem as generated. */
+	EVP_PKEY *key = NULL;
+	FILE *fp = fopen("ca-key.pem", "re");
+	if (fp != NULL) {
+		key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+		(void)fclose(fp);
+	}
+	T_CHECK(key != NULL);
+	bool rewrote = false;
+	fp = fopen("ca-key.pem", "we");
+	if (fp != NULL) {
+		static const char passphrase[] = "test-passphrase";
+		rewrote =
+			PEM_write_PrivateKey(
+				fp, key, EVP_aes_256_cbc(),
+				(const unsigned char *)passphrase,
+				(int)(sizeof(passphrase) - 1), NULL, NULL) == 1;
+		(void)fclose(fp);
+	}
+	EVP_PKEY_free(key);
+	T_CHECK(rewrote);
+
+	/* Must return false without ever reading from the terminal. stdin is
+	 * the test runner's, so a regression that prompts would block here
+	 * rather than fail -- the ctest timeout is the backstop. */
+	const bool signed_ok =
+		gencerts("srv", "srv.example", "ca", "ed25519", 0, NULL);
+	const int cert_exists = access("srv-cert.pem", F_OK);
+	const int key_exists = access("srv-key.pem", F_OK);
+
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(!signed_ok);
+	/* A failed run leaves no half-written output behind. */
+	T_EXPECT_EQ(cert_exists, -1);
+	T_EXPECT_EQ(key_exists, -1);
+}
+
 /* A generated CA certificate must carry keyUsage with keyCertSign, critical,
  * per RFC 5280 4.2.1.3 -- without it a strict verifier rejects every chain
  * beneath it. digitalSignature must be asserted too: the same self-signed
@@ -612,7 +917,8 @@ T_DECLARE_CASE(test_gencerts_ca_key_usage)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("kuca", "ku.example", NULL, "ed25519", 0);
+	const bool ok =
+		gencerts("kuca", "ku.example", NULL, "ed25519", 0, NULL);
 	X509 *const cert = ok ? read_cert_file("kuca-cert.pem") : NULL;
 
 	/* Capture before teardown so a failing assertion cannot leak the X509. */
@@ -653,7 +959,8 @@ T_DECLARE_CASE(test_gencerts_default_keytype)
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
-	const bool ok = gencerts("rsadef", "rsa.example", NULL, NULL, 2048);
+	const bool ok =
+		gencerts("rsadef", "rsa.example", NULL, NULL, 2048, NULL);
 	X509 *const cert = ok ? read_cert_file("rsadef-cert.pem") : NULL;
 
 	/* Capture before teardown so a failing assertion cannot leak the X509. */
@@ -699,6 +1006,13 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_signing_cert_key_mismatch_fails),
 	T_CASE(test_gencerts_file_permissions),
 	T_CASE(test_gencerts_produces_verifiable_cert),
+	T_CASE(test_gencerts_long_server_name_lands_in_san),
+	T_CASE(test_gencerts_signed_cert_file_contains_chain),
+	T_CASE(test_gencerts_encrypted_signing_key_fails_cleanly),
+	T_CASE(test_gencerts_identity_absent_omits_san),
+	T_CASE(test_gencerts_identity_explicit_list),
+	T_CASE(test_gencerts_identity_percent_encoded),
+	T_CASE(test_gencerts_identity_count_mismatch),
 	T_CASE(test_gencerts_ca_key_usage),
 	T_SUITE_END,
 };

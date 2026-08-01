@@ -10,6 +10,10 @@
 
 #if WITH_OPENSSL
 
+#include "shim/util.h"
+
+#include "net/url.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
 #include <openssl/asn1.h>
@@ -23,14 +27,11 @@
 #include <openssl/x509v3.h>
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #define LOG_SSLERROR(s)                                                        \
 	do {                                                                   \
@@ -58,11 +59,36 @@ static bool format_pem_filename(
 	return true;
 }
 
+/* Build the subjectAltName extension value: the server name as a DNS entry,
+ * plus -- when an identity is given -- the identity as a URI entry in the
+ * opaque IDENTITY_URI_SCHEME form that identity.verify checks for.  Only NULL
+ * omits the URI entry: "" is an identity a peer may claim (doc/spec.md
+ * 5.2.3.2), not a way to ask for none.
+ *
+ * The identity is percent-encoded with url_escape_path_segment(), which escapes
+ * every octet outside the RFC 3986 unreserved/sub-delims set, so a non-ASCII
+ * (UTF-8) identity still satisfies the IA5String requirement RFC 5280 places on
+ * a uniformResourceIdentifier.  Not url_escape_query(): that form encodes a
+ * space as '+', which is form encoding rather than a URI. */
 static bool format_subject_alt_name(
 	char *restrict buf, const size_t buflen,
-	const char *restrict server_name)
+	const char *restrict server_name, const char *restrict identity)
 {
-	const int len = snprintf(buf, buflen, "DNS:%s", server_name);
+	int len;
+	if (identity == NULL) {
+		len = snprintf(buf, buflen, "DNS:%s", server_name);
+	} else {
+		char encoded[IDENTITY_ENCODED_MAX + 1];
+		const int n = url_escape_path_segment(
+			encoded, sizeof(encoded), identity);
+		if (n < 0 || (size_t)n >= sizeof(encoded)) {
+			LOGE_F("identity too long: %s", identity);
+			return false;
+		}
+		len = snprintf(
+			buf, buflen, "DNS:%s,URI:" IDENTITY_URI_SCHEME "%s",
+			server_name, encoded);
+	}
 	if (len < 0 || (size_t)len >= buflen) {
 		LOGE_F("subjectAltName too long: %s", server_name);
 		return false;
@@ -169,7 +195,9 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 
 	FILE *fp = fopen(cert_file, "r");
 	if (fp == NULL) {
-		LOGE_F("failed to open %s", cert_file);
+		const int err = errno;
+		LOGE_F("failed to open %s: (%d) %s", cert_file, err,
+		       strerror(err));
 		return false;
 	}
 	*out_cert = PEM_read_X509(fp, NULL, NULL, NULL);
@@ -181,7 +209,9 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 
 	fp = fopen(key_file, "r");
 	if (fp == NULL) {
-		LOGE_F("failed to open %s", key_file);
+		const int err = errno;
+		LOGE_F("failed to open %s: (%d) %s", key_file, err,
+		       strerror(err));
 		X509_free(*out_cert);
 		*out_cert = NULL;
 		return false;
@@ -234,6 +264,10 @@ static bool set_random_serial(X509 *restrict cert)
 	ASN1_INTEGER_free(serial);
 	return true;
 }
+/* RFC 5280 A.1 ub-common-name: OpenSSL enforces this on NID_commonName. */
+#define GENCERTS_CN_MAX 64
+/* Longest server name the tool accepts; the SAN buffer is sized from it. */
+#define GENCERTS_NAME_MAX 255
 
 /* Sets the subject CN to server_name. On failure the caller still owns and
  * frees `cert` itself. */
@@ -245,9 +279,22 @@ set_subject_cn(X509 *restrict cert, const char *restrict server_name)
 		LOG_SSLERROR("X509_NAME_new");
 		return false;
 	}
+	/* MBSTRING_ASC makes OpenSSL enforce ub_common_name (RFC 5280 A.1) on
+	 * NID_commonName, so a name past 64 octets is refused outright. Verifiers
+	 * key on the SAN (RFC 6125 deprecated the CN fallback), so keep the
+	 * subject non-empty with as much of the name as fits rather than fail a
+	 * server name the tool otherwise accepts. */
+	size_t cn_len = strlen(server_name);
+	if (cn_len > GENCERTS_CN_MAX) {
+		LOGW_F("subject CN truncated to %d octets; the full name is in"
+		       " the subjectAltName, which is what verifiers use",
+		       GENCERTS_CN_MAX);
+		cn_len = GENCERTS_CN_MAX;
+	}
 	if (X509_NAME_add_entry_by_txt(
 		    name, "CN", MBSTRING_ASC,
-		    (const unsigned char *)server_name, -1, -1, 0) == 0) {
+		    (const unsigned char *)server_name, (int)cn_len, -1,
+		    0) == 0) {
 		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
 		X509_NAME_free(name);
 		return false;
@@ -284,16 +331,22 @@ add_ext(X509 *restrict cert, X509V3_CTX *v3ctx, const int nid,
 
 static bool add_subject_alt_name_ext(
 	X509 *restrict cert, X509V3_CTX *v3ctx,
-	const char *restrict server_name)
+	const char *restrict server_name, const char *restrict identity)
 {
 	const size_t server_name_len = strlen(server_name);
-	if (server_name_len >= 256) {
-		LOGE_F("server name too long: %zu bytes", server_name_len);
-		return false;
-	}
-	char san_value[server_name_len + 5];
+	/* create_certificate gates the name before reaching here; bound the VLA
+	 * against that guarantee rather than taking it from the caller. */
+	ASSERT(server_name_len <= GENCERTS_NAME_MAX);
+	/* "DNS:" + server name + ",URI:" + scheme + the percent-encoded identity.
+	 * Each sizeof carries its own NUL, so this is comfortably above the exact
+	 * requirement.  Sized from server_name_len rather than GENCERTS_NAME_MAX
+	 * so the length stays load-bearing: under NDEBUG the ASSERT above expands
+	 * to nothing, and a constant-sized buffer would leave it unused. */
+	char san_value
+		[server_name_len + sizeof("DNS:") +
+		 sizeof(",URI:" IDENTITY_URI_SCHEME) + IDENTITY_ENCODED_MAX];
 	if (!format_subject_alt_name(
-		    san_value, sizeof(san_value), server_name)) {
+		    san_value, sizeof(san_value), server_name, identity)) {
 		return false;
 	}
 	return add_ext(cert, v3ctx, NID_subject_alt_name, san_value);
@@ -301,8 +354,19 @@ static bool add_subject_alt_name_ext(
 
 static bool create_certificate(
 	X509 *parent, EVP_PKEY *sign_key, const char *server_name,
-	EVP_PKEY *pkey, X509 **out_cert)
+	const char *identity, EVP_PKEY *pkey, X509 **out_cert)
 {
+	/* Gate the length once, here, before anything consumes the name: the CN
+	 * entry below would otherwise refuse a 65-255 octet name on OpenSSL's own
+	 * ub_common_name bound, reporting a raw error-queue dump instead of this
+	 * diagnostic. */
+	const size_t server_name_len = strlen(server_name);
+	if (server_name_len > GENCERTS_NAME_MAX) {
+		LOGE_F("server name too long: %zu bytes (limit %d)",
+		       server_name_len, GENCERTS_NAME_MAX);
+		return false;
+	}
+
 	X509 *const cert = X509_new();
 	if (cert == NULL) {
 		LOG_SSLERROR("X509_new");
@@ -367,7 +431,7 @@ static bool create_certificate(
 		ca ? "critical,CA:TRUE" : "keyid:always,issuer:always";
 	if (!add_ext(cert, &v3ctx, NID_ext_key_usage, "serverAuth,clientAuth") ||
 	    !add_ext(cert, &v3ctx, ca_ext_nid, ca_ext_value) ||
-	    !add_subject_alt_name_ext(cert, &v3ctx, server_name) ||
+	    !add_subject_alt_name_ext(cert, &v3ctx, server_name, identity) ||
 	    !add_ext(cert, &v3ctx, NID_subject_key_identifier, "hash")) {
 		X509_free(cert);
 		return false;
@@ -407,39 +471,6 @@ static bool create_certificate(
 
 	*out_cert = cert;
 	return true;
-}
-
-/* Best-effort cleanup after a later step fails; the caller is already
- * returning an error, so a failed unlink here is only logged. */
-static void discard_file(const char *path)
-{
-	if (unlink(path) != 0) {
-		const int err = errno;
-		LOGW_F("failed to remove %s: (%d) %s", path, err,
-		       strerror(err));
-	}
-}
-
-/* Create `path` exclusively (O_EXCL refuses to overwrite an existing file)
- * and wrap it in a stream, discarding the file if fdopen fails. mode is
- * masked by umask (POSIX semantics): an upper bound, not a guarantee. */
-static FILE *create_exclusive(const char *path, mode_t mode)
-{
-	const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
-	if (fd < 0) {
-		const int err = errno;
-		LOGE_F("failed to open %s: (%d) %s", path, err, strerror(err));
-		return NULL;
-	}
-	FILE *const fp = fdopen(fd, "w");
-	if (fp == NULL) {
-		const int err = errno;
-		LOGE_F("fdopen %s: (%d) %s", path, err, strerror(err));
-		(void)close(fd);
-		discard_file(path);
-		return NULL;
-	}
-	return fp;
 }
 
 static bool
@@ -503,9 +534,68 @@ write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 	return true;
 }
 
+/* Next comma-separated field from *cursor, trimmed of surrounding spaces, or
+ * NULL once the list is exhausted.  Unlike the strtok_r() used for the name
+ * list, an empty field is returned as "" rather than skipped: "" is a valid
+ * identity, and every field of an --identity list names one.  A certificate
+ * with no identity at all is spelled by omitting --identity. */
+static char *next_field(char **cursor)
+{
+	char *p = *cursor;
+	if (p == NULL) {
+		return NULL;
+	}
+	char *const comma = strchr(p, ',');
+	if (comma != NULL) {
+		*comma = '\0';
+		*cursor = comma + 1;
+	} else {
+		*cursor = NULL;
+	}
+	while (*p == ' ') {
+		p++;
+	}
+	char *end = p + strlen(p);
+	while (end > p && end[-1] == ' ') {
+		*--end = '\0';
+	}
+	return p;
+}
+
+/* Generate and write one certificate/key pair for @p name, carrying @p identity
+ * as its URI subjectAltName (NULL omits it).  Owns nothing on return:
+ * everything allocated here is released on every path. */
+static bool generate_one(
+	const char *restrict name, const char *restrict server_name,
+	const char *restrict identity, X509 *const parent_cert,
+	EVP_PKEY *const sign_key, const char *restrict keytype,
+	const int keysize)
+{
+	EVP_PKEY *const pkey = generate_key(keytype, keysize);
+	if (pkey == NULL) {
+		LOGE_F("failed to generate key for %s", name);
+		return false;
+	}
+	X509 *cert = NULL;
+	if (!create_certificate(
+		    parent_cert, sign_key, server_name, identity, pkey,
+		    &cert)) {
+		LOGE_F("failed to create certificate for %s", name);
+		EVP_PKEY_free(pkey);
+		return false;
+	}
+	const bool ok = write_keypair(name, cert, pkey, parent_cert);
+	if (!ok) {
+		LOGE_F("failed to write key pair for %s", name);
+	}
+	X509_free(cert);
+	EVP_PKEY_free(pkey);
+	return ok;
+}
+
 bool gencerts(
 	const char *names, const char *server_name, const char *sign_cert,
-	const char *keytype, int keysize)
+	const char *keytype, int keysize, const char *identities)
 {
 	if (names == NULL) {
 		LOGE("invalid options");
@@ -549,6 +639,25 @@ bool gencerts(
 		return false;
 	}
 
+	/* A NULL list means "default each certificate's identity to its own
+	 * name"; a non-NULL one is paired positionally with the names. */
+	char *identities_copy = NULL;
+	if (identities != NULL) {
+		identities_copy = strdup(identities);
+		if (identities_copy == NULL) {
+			LOGOOM();
+			free(names_copy);
+			if (parent_cert != NULL) {
+				X509_free(parent_cert);
+			}
+			if (sign_key != NULL) {
+				EVP_PKEY_free(sign_key);
+			}
+			return false;
+		}
+	}
+	char *id_cursor = identities_copy;
+
 	bool success = true;
 	size_t generated = 0;
 	char *saveptr = NULL;
@@ -566,37 +675,36 @@ bool gencerts(
 			end--;
 		}
 
-		EVP_PKEY *const pkey = generate_key(keytype, keysize);
-		if (pkey == NULL) {
-			LOGE_F("failed to generate key for %s", name);
+		/* No --identity means no identity, never inferred from a file
+		 * name.  Consumed after the empty-name skip above, so blank
+		 * name fields do not shift the pairing. */
+		const char *identity = NULL;
+		if (identities_copy != NULL) {
+			identity = next_field(&id_cursor);
+			if (identity == NULL) {
+				LOGE("--identity has fewer entries than"
+				     " --gencerts");
+				success = false;
+				break;
+			}
+		}
+
+		if (!generate_one(
+			    name, server_name_val, identity, parent_cert,
+			    sign_key, keytype, keysize)) {
 			success = false;
 			break;
 		}
-
-		X509 *cert = NULL;
-		if (!create_certificate(
-			    parent_cert, sign_key, server_name_val, pkey,
-			    &cert)) {
-			LOGE_F("failed to create certificate for %s", name);
-			EVP_PKEY_free(pkey);
-			success = false;
-			break;
-		}
-
-		if (!write_keypair(name, cert, pkey, parent_cert)) {
-			LOGE_F("failed to write key pair for %s", name);
-			X509_free(cert);
-			EVP_PKEY_free(pkey);
-			success = false;
-			break;
-		}
-
-		X509_free(cert);
-		EVP_PKEY_free(pkey);
 		generated++;
 	}
 
+	if (success && id_cursor != NULL) {
+		LOGE("--identity has more entries than --gencerts");
+		success = false;
+	}
+
 	free(names_copy);
+	free(identities_copy);
 
 	if (parent_cert != NULL) {
 		X509_free(parent_cert);

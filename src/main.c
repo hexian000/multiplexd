@@ -10,6 +10,11 @@
 #if WITH_OPENSSL
 #include "gencerts.h"
 #endif
+#if WITH_TLS
+/* Key generation needs only randomness and the label derivation, so unlike
+ * gencerts it is available on every TLS backend. */
+#include "genpsk.h"
+#endif
 #include "server.h"
 #if WITH_TLS
 #include "shim/tls.h"
@@ -45,9 +50,13 @@
 static struct {
 	const char *conf_path;
 	const char *user_name;
+#if WITH_TLS
+	const char *genpsk;
+#endif
 #if WITH_OPENSSL
 	const char *gencerts;
 	const char *server_name;
+	const char *identities;
 	const char *sign;
 	const char *keytype;
 	int keysize;
@@ -81,6 +90,11 @@ static void print_usage(const char *argv0)
 		"                             as <name>-cert.pem, <name>-key.pem\n"
 		"  --sni <name>               server name for generated certs\n"
 		"                             (default: example.com)\n"
+		"  --identity <name>[,<name>...]\n"
+		"                             identity URI subjectAltName per cert,\n"
+		"                             paired with --gencerts (default: no\n"
+		"                             identity; an empty entry is the empty\n"
+		"                             identity, which is a valid one)\n"
 		"  --sign <name>              sign certificates with <name>-cert.pem,\n"
 		"                             <name>-key.pem\n"
 		"  --keytype <type>           key type: rsa, ecdsa, or ed25519\n"
@@ -89,6 +103,13 @@ static void print_usage(const char *argv0)
 		"                             ECDSA: 224/256/384/521)\n"
 		"\n"
 #endif /* WITH_OPENSSL */
+#if WITH_TLS
+		"Pre-shared key generation options:\n"
+		"  --genpsk <name>[,<name>...]\n"
+		"                             generate pre-shared keys as <name>.psk\n"
+		"                             for tls.psk; one key per peer pair\n"
+		"\n"
+#endif /* WITH_TLS */
 	);
 	(void)fflush(stderr);
 }
@@ -144,6 +165,11 @@ static bool parse_gencerts_arg(const int argc, char *const *argv, int *i)
 		args.server_name = argv[++*i];
 		return true;
 	}
+	if (strcmp(argv[*i], "--identity") == 0) {
+		OPT_REQUIRE_ARG(argc, argv, *i);
+		args.identities = argv[++*i];
+		return true;
+	}
 	if (strcmp(argv[*i], "--sign") == 0) {
 		OPT_REQUIRE_ARG(argc, argv, *i);
 		args.sign = argv[++*i];
@@ -189,6 +215,16 @@ static void parse_args(const int argc, char *const *argv)
 			args.user_name = argv[++i];
 			continue;
 		}
+#if WITH_TLS
+		/* Not in parse_gencerts_arg(): key generation needs only
+		 * randomness and the label derivation, so it is available on
+		 * every TLS backend, while gencerts is OpenSSL-only. */
+		if (strcmp(argv[i], "--genpsk") == 0) {
+			OPT_REQUIRE_ARG(argc, argv, i);
+			args.genpsk = argv[++i];
+			continue;
+		}
+#endif /* WITH_TLS */
 		if (strcmp(argv[i], "--loglevel") == 0) {
 			OPT_REQUIRE_ARG(argc, argv, i);
 			++i;
@@ -340,6 +376,17 @@ static void unloadlibs(void)
 	LOGD("library cleanup complete");
 }
 
+/* Write the dumped config and its terminating newline to f. The flush is part
+ * of the check, not cleanup: on a buffered stream the writes above only reach
+ * the buffer, and the real write(2) then happens in exit()'s implicit flush,
+ * whose failure the C runtime discards. */
+static bool
+write_dump(FILE *restrict f, const char *restrict json, const size_t len)
+{
+	return fwrite(json, 1, len, f) == len && fputc('\n', f) != EOF &&
+	       fflush(f) == 0;
+}
+
 int main(int argc, char **argv)
 {
 	init();
@@ -365,11 +412,20 @@ int main(int argc, char **argv)
 	slog_setlevel(args.loglevel >= 0 ? args.loglevel : LOG_LEVEL_NOTICE);
 	loadlibs();
 
+#if WITH_TLS
+	if (args.genpsk != NULL) {
+		if (!genpsk(args.genpsk)) {
+			LOGF("failed to generate pre-shared keys");
+			return EXIT_FAILURE;
+		}
+		return EXIT_SUCCESS;
+	}
+#endif /* WITH_TLS */
 #if WITH_OPENSSL
 	if (args.gencerts != NULL) {
 		if (!gencerts(
 			    args.gencerts, args.server_name, args.sign,
-			    args.keytype, args.keysize)) {
+			    args.keytype, args.keysize, args.identities)) {
 			LOGF("failed to generate certificates");
 			return EXIT_FAILURE;
 		}
@@ -417,13 +473,15 @@ int main(int argc, char **argv)
 		}
 		/* A short write would hand the caller truncated JSON, so report it
 		 * rather than exiting 0 on output nothing can parse. */
-		const bool written =
-			fwrite(dump_json, 1, dump_len, stdout) == dump_len &&
-			fputc('\n', stdout) != EOF;
+		const bool written = write_dump(stdout, dump_json, dump_len);
+		/* Snapshot before the frees below: both may clobber errno, and the
+		 * diagnostic must report the failing write's. */
+		const int err = errno;
 		free(dump_json);
 		conf_free(conf);
 		if (!written) {
-			LOGF_F("failed to write config: %s", strerror(errno));
+			LOGF_F("failed to write config: (%d) %s", err,
+			       strerror(err));
 			return EXIT_FAILURE;
 		}
 		return EXIT_SUCCESS;

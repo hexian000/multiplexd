@@ -1,5 +1,6 @@
 add_executable(multiplexd
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
+    genpsk.c genpsk.h
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
@@ -290,6 +291,7 @@ target_link_libraries(api_server_test PRIVATE mux)
 # resolves, but only parse_args/print_usage are exercised.
 add_src_test(main_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
+    genpsk.c genpsk.h
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
