@@ -47,6 +47,27 @@
 
 #define TUNNEL_LOG(level, t, message) TUNNEL_LOG_F(level, t, "%s", message)
 
+/* Server-thread counterpart of TUNNEL_LOG_F. t->tag is the session thread's
+ * private working buffer, rewritten in place by tunnel_set_tag on every
+ * establish, so reading it from the server thread is a data race; go through
+ * the pub.mu-guarded snapshot the design already provides for cross-thread
+ * reads, as tunnel_stats/tunnel_fd do. Defined here beside its sibling; every
+ * use is below tunnel_pub_lock's definition. */
+#define TUNNEL_LOG_PUB_F(level, t, format, ...)                                \
+	do {                                                                   \
+		if (!LOGLEVEL(level)) {                                        \
+			break;                                                 \
+		}                                                              \
+		char pub_tag_[TUNNEL_TAG_SIZE];                                \
+		tunnel_pub_lock(t);                                            \
+		(void)memcpy(pub_tag_, (t)->pub.tag, sizeof(pub_tag_));        \
+		tunnel_pub_unlock(t);                                          \
+		LOG_F(level, "%s: " format, pub_tag_, __VA_ARGS__);            \
+	} while (0)
+
+#define TUNNEL_LOG_PUB(level, t, message)                                      \
+	TUNNEL_LOG_PUB_F(level, t, "%s", message)
+
 /* Number of frames retained in the per-tunnel allocator cache. */
 #define TUNNEL_FRAME_CACHE_SIZE 16
 
@@ -62,11 +83,20 @@ static void tunnel_set_tag_part(
 	}
 }
 
+/* The tag prefixes every log record this session emits, and either half of it
+ * may be an identity -- the peer's is only NUL-excluded by doc/spec.md 5.2.3.2,
+ * so a claim holding CR/LF or ESC would forge records through every one of
+ * them.  Escape both halves here, the single point where the tag is built. */
 static void tunnel_set_tag(
 	char *restrict tag, const size_t taglen, const char *restrict my,
 	const char *restrict arrow, const char *restrict peer)
 {
-	const int ret = snprintf(tag, taglen, "%s%s%s", my, arrow, peer);
+	char my_esc[IDENTITY_ESCAPED_MAX];
+	char peer_esc[IDENTITY_ESCAPED_MAX];
+	escape_identity(my_esc, sizeof(my_esc), my, ESCAPE_PLAIN);
+	escape_identity(peer_esc, sizeof(peer_esc), peer, ESCAPE_PLAIN);
+	const int ret =
+		snprintf(tag, taglen, "%s%s%s", my_esc, arrow, peer_esc);
 	if (ret < 0) {
 		tag[0] = '\0';
 	}
@@ -119,6 +149,14 @@ struct tunnel {
 	bool shutting_down;
 	/* true for passively-accepted (server-role) sessions; set at creation. */
 	bool accepted;
+	/* identity.verify: a claimed peer identity must be named by the
+	 * certificate presented on this transport.  Set at creation, refreshed by
+	 * reload_task, and read on this tunnel's thread at each hello. */
+	bool verify_identity;
+	/* PSK mode: resolves an authenticated label to its peer identity; NULL
+	 * in certificate mode.  Same lifetime rules as verify_identity. */
+	const char *(*psk_identity_of)(void *ctx, const char *label);
+	void *psk_ctx;
 	/* Server-wide monotonic index, never reused. */
 	uint_least64_t tunnel_index;
 	/* Owned copies of session metadata strings. */
@@ -192,6 +230,23 @@ struct tunnel {
 			uint_least64_t byt_push_sent;
 #endif /* WITH_THREADS */
 		} traffic_cnt;
+		/* Per-tunnel error and control counters.  The session thread bumps
+		 * the RST and stream-error fields through the
+		 * mux_session_counters block; num_reconnects is bumped by this
+		 * tunnel's own thread. */
+		struct {
+			mux_counter num_reconnects;
+			mux_counter num_rst_sent;
+			mux_counter num_rst_recv;
+			mux_counter num_stream_errors;
+		} error_cnt;
+		/* Per-tunnel buffer gauges; updated by the session thread via the
+		 * mux_session_counters pointer-block. */
+		struct {
+			mux_gauge recv_buffered_bytes;
+			mux_gauge send_buffered_frames;
+			mux_gauge unacked_frames;
+		} buf_gauge;
 		/* SYN->SYN|ACK latency ring; written per stream-established on the
 		 * session thread (handle_stream_established), read on the server
 		 * thread (tunnel_stats).  High-frequency, so relaxed-atomic. */
@@ -224,16 +279,20 @@ struct tunnel {
 	} pub;
 };
 
-/* TPUB_STORE/TPUB_LOAD: relaxed-atomic access to a session-thread-owned scalar
- * tunnel field (last_changed, stream_establish ring/count) read by the server
- * thread.  Operate on the field lvalue. */
+/* TPUB_STORE/TPUB_LOAD/TPUB_ADD: relaxed-atomic access to a scalar tunnel field
+ * owned by one thread (last_changed, stream_establish ring/count, the counters
+ * this tunnel bumps itself) and read by the server thread.  Operate on the field
+ * lvalue. */
 #if WITH_THREADS
 #define TPUB_STORE(field, v)                                                   \
 	atomic_store_explicit(&(field), (v), memory_order_relaxed)
 #define TPUB_LOAD(field) atomic_load_explicit(&(field), memory_order_relaxed)
+#define TPUB_ADD(field, v)                                                     \
+	((void)atomic_fetch_add_explicit(&(field), (v), memory_order_relaxed))
 #else
 #define TPUB_STORE(field, v) ((void)((field) = (v)))
 #define TPUB_LOAD(field) (field)
+#define TPUB_ADD(field, v) ((void)((field) += (v)))
 #endif /* WITH_THREADS */
 
 /* Lock/unlock the per-tunnel stats-snapshot mutex.  Takes const because the
@@ -338,7 +397,7 @@ static bool stream_connect(
 			"stream %" PRIuLEAST16 ": connecting [fd:%d] to %s",
 			mux_stream_id(stream), fd, addr_str);
 	}
-	mux_stream_attach(stream, fd);
+	mux_stream_attach_fd(stream, fd);
 	return true;
 }
 
@@ -427,6 +486,9 @@ static void relay_connected(
 		t->relay.parent.user,
 		(struct task){ .func = relay_dispatch_connected, .data = arg });
 	if (!posted) {
+		TUNNEL_LOG(
+			ERROR, t,
+			"failed to dispatch relay connected event (queue full)");
 		free(arg);
 		return;
 	}
@@ -451,7 +513,7 @@ static void tunnel_schedule_reconnect(struct tunnel *restrict t)
 	const double delay =
 		tunnel_reconnect_delays[idx] * (0.8 + frand() * 0.4);
 	t->reconnect_count++;
-	t->relay.parent.inc_reconnect(t->relay.parent.user);
+	TPUB_ADD(t->error_cnt.num_reconnects, 1);
 	TUNNEL_LOG_F(
 		INFO, t, "reconnect scheduled in %.1fs (attempt %d)", delay,
 		t->reconnect_count);
@@ -527,6 +589,12 @@ tunnel_reconnect_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	ASSERT(loop == t->loop);
 	(void)loop;
 	ev_timer_stop(loop, &t->w_reconnect);
+	if (t->connect_addr == NULL) {
+		/* Nothing to dial: an accepted tunnel, or one whose address a
+		 * reload cleared. Matches the guard every other reconnect entry
+		 * point already has. */
+		return;
+	}
 	if (tunnel_do_connect(t)) {
 		return;
 	}
@@ -534,7 +602,7 @@ tunnel_reconnect_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	tunnel_schedule_reconnect(t);
 }
 
-static const struct mux_config *tunnel_conf(const struct tunnel *t)
+static const struct mux_session_config *tunnel_conf(const struct tunnel *t)
 {
 	return mux_conf(t->ss);
 }
@@ -550,7 +618,7 @@ static void handle_transport_lost(struct tunnel *restrict t)
 	}
 	TUNNEL_LOG(INFO, t, "transport lost, reconnecting");
 	ev_timer_stop(t->loop, &t->w_reconnect);
-	t->relay.parent.inc_reconnect(t->relay.parent.user);
+	TPUB_ADD(t->error_cnt.num_reconnects, 1);
 	if (!tunnel_do_connect(t)) {
 		TUNNEL_LOG(WARNING, t, "connect failed, scheduling retry");
 		tunnel_schedule_reconnect(t);
@@ -711,6 +779,17 @@ static void tunnel_on_event(
 				.data = arg,
 			});
 		if (!posted) {
+			/* Unrecoverable for MUX_EVENT_CLOSED: the tunnel thread
+			 * exits right after, so nothing re-posts it and the
+			 * server never runs handle_closed for this tunnel --
+			 * an accepted tunnel stays in accepted_tunnels and a
+			 * dialed identity tunnel wedges its staging slot until
+			 * the next peers-changed reload. Log loudly; the
+			 * sibling tunnel_post sites all do. */
+			TUNNEL_LOG_F(
+				ERROR, t,
+				"failed to dispatch relay event %d (queue full)",
+				(int)event);
 			free(arg);
 			return;
 		}
@@ -827,6 +906,127 @@ static void tunnel_handoff_resume(
 #endif /* WITH_THREADS */
 }
 
+/* mux on_verify_identity: enforce identity.verify.  A peer that claims an
+ * identity must present a certificate naming it (spec Section 10.1); a peer
+ * claiming none is left unidentified, which is the behavior without this
+ * option, and reaches only the root forwarding target. */
+static bool tunnel_on_verify_identity(
+	void *data, struct mux_session *ss, const char *identity)
+{
+	const struct tunnel *restrict t = data;
+#if WITH_TLS
+	/* PSK mode binds identity without a switch: the binder already proved
+	 * the peer holds the key its label names, so all that remains is to
+	 * confirm the claim agrees with the peer that actually authenticated.
+	 * A peer claiming nothing stays unidentified, as in certificate mode. */
+	if (t->psk_identity_of != NULL) {
+		if (identity == NULL) {
+			return true;
+		}
+		struct tls_connection *const conn = mux_tls_conn(ss);
+		char label[TLS_PSK_LABEL_MAX + 1];
+		size_t label_len = sizeof(label);
+		if (conn == NULL ||
+		    !tls_peer_psk_label(conn, label, &label_len)) {
+			char esc[IDENTITY_ESCAPED_MAX];
+			escape_identity(
+				esc, sizeof(esc), identity, ESCAPE_PLAIN);
+			LOGE_F("[fd:%d] identity \"%s\" cannot be verified:"
+			       " session did not authenticate with a PSK",
+			       tunnel_fd(t), esc);
+			return false;
+		}
+		const char *const owner = t->psk_identity_of(t->psk_ctx, label);
+		if (owner == NULL || strcmp(owner, identity) != 0) {
+			char esc[IDENTITY_ESCAPED_MAX];
+			escape_identity(
+				esc, sizeof(esc), identity, ESCAPE_PLAIN);
+			LOGE_F("[fd:%d] peer claims identity \"%s\" but"
+			       " authenticated with the key of \"%s\"",
+			       tunnel_fd(t), esc,
+			       owner != NULL ? owner : "(unknown)");
+			return false;
+		}
+		return true;
+	}
+#endif /* WITH_TLS */
+	if (!t->verify_identity || identity == NULL) {
+		return true;
+	}
+#if WITH_TLS
+	struct tls_connection *const conn = mux_tls_conn(ss);
+	if (conn == NULL) {
+		/* conf validation rejects identity.verify without TLS creds, so
+		 * reaching a plaintext session here would mean the option is
+		 * silently doing nothing.  Fail closed instead. */
+		char esc[IDENTITY_ESCAPED_MAX];
+		escape_identity(esc, sizeof(esc), identity, ESCAPE_PLAIN);
+		LOGE_F("[fd:%d] identity \"%s\" cannot be verified: session is"
+		       " not using TLS",
+		       tunnel_fd(t), esc);
+		return false;
+	}
+	if (!identity_matches_cert(conn, identity)) {
+		char esc[IDENTITY_ESCAPED_MAX];
+		escape_identity(esc, sizeof(esc), identity, ESCAPE_PLAIN);
+		LOGE_F("[fd:%d] peer claims identity \"%s\" but its certificate"
+		       " does not name it",
+		       tunnel_fd(t), esc);
+		return false;
+	}
+	return true;
+#else /* WITH_TLS */
+	(void)ss;
+	char esc[IDENTITY_ESCAPED_MAX];
+	escape_identity(esc, sizeof(esc), identity, ESCAPE_PLAIN);
+	LOGE_F("[fd:%d] identity \"%s\" cannot be verified: built without TLS",
+	       tunnel_fd(t), esc);
+	return false;
+#endif /* WITH_TLS */
+}
+
+/* True when identity.verify permits attaching new_ss's transport to old_t: the
+ * identity claimed on the new transport must equal the one the session being
+ * resumed already carries, with both-absent counting as equal.
+ *
+ * The new claim was already checked against this transport's certificate at
+ * hello time (tunnel_on_verify_identity, which runs before the resume handoff),
+ * so requiring equality here is what stops a resume from carrying a session's
+ * verified identity onto a transport that never proved it -- including a resume
+ * hello that drops the identity extension entirely.
+ *
+ * The claim is read from the session rather than old_t's published snapshot:
+ * that snapshot is only refreshed on MUX_EVENT_CONNECTED, which has not fired
+ * for new_ss yet.  old_t's snapshot is pinned by the caller's lookup and is
+ * pub-locked, so reading it from this thread is safe.
+ *
+ * Must run before mux_transport_detach(), which moves new_ss's identity onto
+ * the transport and leaves NULL behind; afterwards this would compare against
+ * an absent claim.  Requiring equality here is also what keeps that move safe
+ * under identity.verify: the identity the resumed session adopts is then the
+ * one just proved against the certificate on the new transport. */
+static bool tunnel_resume_identity_ok(
+	const struct tunnel *restrict t,
+	const struct mux_session *restrict new_ss,
+	const struct tunnel *restrict old_t)
+{
+	if (!t->verify_identity) {
+		return true;
+	}
+	const char *const claimed = mux_peer_identity(new_ss);
+	char resumed[256];
+	const bool has_resumed =
+		tunnel_peer_identity_copy(old_t, resumed, sizeof(resumed));
+	const bool ok = has_resumed == (claimed != NULL) &&
+			(claimed == NULL || strcmp(claimed, resumed) == 0);
+	if (!ok) {
+		LOGW_F("[fd:%d] resume rejected: claimed identity does not match"
+		       " the session being resumed",
+		       tunnel_fd(t));
+	}
+	return ok;
+}
+
 /* mux on_resume: a resume hello arrived on the transient session new_ss.  Find
  * the suspended tunnel, detach new_ss's transport and hand it off, returning
  * true so the mux layer tears new_ss down. */
@@ -840,6 +1040,14 @@ static bool tunnel_on_resume(
 	}
 	struct tunnel *restrict old_t =
 		t->relay.cb.on_resume_lookup(t->callback_data, t, session_id);
+	if (old_t != NULL && !tunnel_resume_identity_ok(t, new_ss, old_t)) {
+		/* Release the pin the lookup took before dropping the match, so
+		 * the unpin stays paired one-to-one with a non-NULL lookup. */
+		if (t->relay.cb.on_resume_unpin != NULL) {
+			t->relay.cb.on_resume_unpin(t->callback_data, t);
+		}
+		old_t = NULL;
+	}
 	bool handled = false;
 	if (old_t != NULL) {
 		struct mux_transport transport;
@@ -926,7 +1134,7 @@ struct tunnel *tunnel_new(
 {
 	const struct tunnel_callbacks *const cb = opts->cb;
 	void *const data = opts->data;
-	const struct mux_config *const conf = opts->mux_conf;
+	const struct mux_session_config *const conf = opts->mux_conf;
 	const int fd = opts->fd;
 	const unsigned char *const id = opts->id;
 	const char *const connect_addr = opts->connect_addr;
@@ -980,9 +1188,13 @@ struct tunnel *tunnel_new(
 	 * shared, ref-counted handle the caller still needs for other tunnels. */
 	t->tlsctx = tlsctx;
 #endif
+	t->verify_identity = opts->verify_identity;
+	t->psk_identity_of = opts->psk_identity_of;
+	t->psk_ctx = opts->psk_ctx;
 	t->cb = (struct mux_callbacks){
 		.on_accept = tunnel_on_accept,
 		.on_event = tunnel_on_event,
+		.on_verify_identity = tunnel_on_verify_identity,
 		.on_resume =
 			cb->on_resume_lookup != NULL ? tunnel_on_resume : NULL,
 	};
@@ -1082,32 +1294,52 @@ struct tunnel *tunnel_new(
 		.identity = identity,
 		.peer_id = peer_id,
 		.cnt = {
-			.num_session_created = cnt->num_session_created,
-			.num_session_connect = cnt->num_session_connect,
-			.num_session_connected = cnt->num_session_connected,
-			.num_session_disconnected = cnt->num_session_disconnected,
-			.num_session_finalized = cnt->num_session_finalized,
-			.num_sessions = cnt->num_sessions,
-			.num_session_halfopen = cnt->num_session_halfopen,
-			.num_streams = &t->stream_cnt.num_streams,
-			.num_stream_halfopen =
-				&t->stream_cnt.num_stream_halfopen,
-			.num_stream_opened = &t->stream_cnt.num_stream_opened,
-			.num_stream_accepted =
-				&t->stream_cnt.num_stream_accepted,
-			.num_stream_fastopen =
-				&t->stream_cnt.num_stream_fastopen,
-			.num_stream_established =
-				&t->stream_cnt.num_stream_established,
-			.num_stream_succeeded =
-				&t->stream_cnt.num_stream_succeeded,
-			.num_stream_failed = &t->stream_cnt.num_stream_failed,
-			.num_rst_sent = cnt->num_rst_sent,
-			.num_rst_recv = cnt->num_rst_recv,
-			.num_stream_errors = cnt->num_stream_errors,
-			.recv_buffered_bytes = cnt->recv_buffered_bytes,
-			.send_buffered_frames = cnt->send_buffered_frames,
-			.unacked_frames = cnt->unacked_frames,
+			.session = {
+				.num_session_created =
+					cnt->num_session_created,
+				.num_session_connect =
+					cnt->num_session_connect,
+				.num_session_connected =
+					cnt->num_session_connected,
+				.num_session_disconnected =
+					cnt->num_session_disconnected,
+				.num_session_finalized =
+					cnt->num_session_finalized,
+				.num_sessions = cnt->num_sessions,
+				.num_session_halfopen =
+					cnt->num_session_halfopen,
+			},
+			.stream = {
+				.num_streams = &t->stream_cnt.num_streams,
+				.num_stream_halfopen =
+					&t->stream_cnt.num_stream_halfopen,
+				.num_stream_opened =
+					&t->stream_cnt.num_stream_opened,
+				.num_stream_accepted =
+					&t->stream_cnt.num_stream_accepted,
+				.num_stream_fastopen =
+					&t->stream_cnt.num_stream_fastopen,
+				.num_stream_established =
+					&t->stream_cnt.num_stream_established,
+				.num_stream_succeeded =
+					&t->stream_cnt.num_stream_succeeded,
+				.num_stream_failed =
+					&t->stream_cnt.num_stream_failed,
+			},
+			.errors = {
+				.num_rst_sent = &t->error_cnt.num_rst_sent,
+				.num_rst_recv = &t->error_cnt.num_rst_recv,
+				.num_stream_errors =
+					&t->error_cnt.num_stream_errors,
+			},
+			.buffers = {
+				.recv_buffered_bytes =
+					&t->buf_gauge.recv_buffered_bytes,
+				.send_buffered_frames =
+					&t->buf_gauge.send_buffered_frames,
+				.unacked_frames =
+					&t->buf_gauge.unacked_frames,
+			},
 			.traffic = {
 				.byt_mux_recv = &t->traffic_cnt.byt_mux_recv,
 				.byt_mux_sent = &t->traffic_cnt.byt_mux_sent,
@@ -1214,7 +1446,60 @@ static void task_tunnel_teardown(void *p)
 }
 #endif /* WITH_THREADS */
 
+/* The single place the monotonic counters are loaded from their storage, so
+ * tunnel_stats() and tunnel_close_final() cannot drift on which of them are
+ * atomic mirrors and which are published under the pub lock.  Touches no mux
+ * session state, so it stays valid after the session is closed. */
+static void tunnel_load_counters(
+	const struct tunnel *restrict t,
+	struct tunnel_final_counters *restrict out)
+{
+#if WITH_THREADS
+	out->num_stream_opened = (uint_least64_t)atomic_load_explicit(
+		&t->stream_cnt.num_stream_opened, memory_order_relaxed);
+	out->num_stream_accepted = (uint_least64_t)atomic_load_explicit(
+		&t->stream_cnt.num_stream_accepted, memory_order_relaxed);
+	out->num_stream_fastopen = (uint_least64_t)atomic_load_explicit(
+		&t->stream_cnt.num_stream_fastopen, memory_order_relaxed);
+	out->num_stream_established = (uint_least64_t)atomic_load_explicit(
+		&t->stream_cnt.num_stream_established, memory_order_relaxed);
+	out->num_stream_succeeded = (uint_least64_t)atomic_load_explicit(
+		&t->stream_cnt.num_stream_succeeded, memory_order_relaxed);
+	out->num_stream_failed = (uint_least64_t)atomic_load_explicit(
+		&t->stream_cnt.num_stream_failed, memory_order_relaxed);
+	out->byt_mux_recv = (uint_least64_t)atomic_load_explicit(
+		&t->traffic_cnt.byt_mux_recv, memory_order_relaxed);
+	out->byt_mux_sent = (uint_least64_t)atomic_load_explicit(
+		&t->traffic_cnt.byt_mux_sent, memory_order_relaxed);
+	out->byt_push_recv = (uint_least64_t)atomic_load_explicit(
+		&t->traffic_cnt.byt_push_recv, memory_order_relaxed);
+	out->byt_push_sent = (uint_least64_t)atomic_load_explicit(
+		&t->traffic_cnt.byt_push_sent, memory_order_relaxed);
+#else /* WITH_THREADS */
+	out->num_stream_opened = t->stream_cnt.num_stream_opened;
+	out->num_stream_accepted = t->stream_cnt.num_stream_accepted;
+	out->num_stream_fastopen = t->stream_cnt.num_stream_fastopen;
+	out->num_stream_established = t->stream_cnt.num_stream_established;
+	out->num_stream_succeeded = t->stream_cnt.num_stream_succeeded;
+	out->num_stream_failed = t->stream_cnt.num_stream_failed;
+	out->byt_mux_recv = t->traffic_cnt.byt_mux_recv;
+	out->byt_mux_sent = t->traffic_cnt.byt_mux_sent;
+	out->byt_push_recv = t->traffic_cnt.byt_push_recv;
+	out->byt_push_sent = t->traffic_cnt.byt_push_sent;
+#endif /* WITH_THREADS */
+	out->num_reconnects = TPUB_LOAD(t->error_cnt.num_reconnects);
+	out->num_rst_sent = TPUB_LOAD(t->error_cnt.num_rst_sent);
+	out->num_rst_recv = TPUB_LOAD(t->error_cnt.num_rst_recv);
+	out->num_stream_errors = TPUB_LOAD(t->error_cnt.num_stream_errors);
+	out->stream_establish_count = TPUB_LOAD(t->stream_establish_count);
+}
+
 void tunnel_close(struct tunnel *t)
+{
+	tunnel_close_final(t, NULL);
+}
+
+void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 {
 #if WITH_THREADS
 	/* Disconnect the relay so any queued or in-flight relay tasks become
@@ -1235,10 +1520,16 @@ void tunnel_close(struct tunnel *t)
 			/* thrd_join() below would hang the caller forever, since
 			 * the worker loop has no other way to learn it should
 			 * stop; detach and leave it running instead. */
-			TUNNEL_LOG(
+			TUNNEL_LOG_PUB(
 				ERROR, t,
 				"failed to dispatch teardown after retry"
 				" (OOM), abandoning tunnel thread");
+			/* Sample before detaching: the abandoned thread keeps
+			 * counting, and t is never freed, so this is the last
+			 * point the caller can account for any of it. */
+			if (out != NULL) {
+				tunnel_load_counters(t, out);
+			}
 			THRD_ASSERT(thrd_detach(t->thread));
 			return;
 		}
@@ -1276,6 +1567,13 @@ void tunnel_close(struct tunnel *t)
 	ev_timer_stop(t->loop, &t->w_maintenance);
 	mux_close(t->ss);
 #endif /* WITH_THREADS */
+	/* After the join and every mux_close() path above, so the counters
+	 * teardown bumped -- one num_stream_failed per stream still open -- are
+	 * part of the sample.  The counters live in t, not in the session, so
+	 * reading them here is safe although t->ss is already gone. */
+	if (out != NULL) {
+		tunnel_load_counters(t, out);
+	}
 	free(t->forward_addr);
 	free(t->connect_addr);
 	free(t->identity);
@@ -1312,10 +1610,10 @@ void tunnel_shutdown(struct tunnel *t)
 	 * of the first outcome (matching a plain no-throw dispatch) and report
 	 * each failure instead of leaking silently. */
 	if (!tunnel_post(t, (struct task){ task_set_shutting_down, t })) {
-		TUNNEL_LOG(ERROR, t, "failed to dispatch shutdown (OOM)");
+		TUNNEL_LOG_PUB(ERROR, t, "failed to dispatch shutdown (OOM)");
 	}
 	if (!tunnel_post(t, (struct task){ task_mux_shutdown, t->ss })) {
-		TUNNEL_LOG(ERROR, t, "failed to dispatch shutdown (OOM)");
+		TUNNEL_LOG_PUB(ERROR, t, "failed to dispatch shutdown (OOM)");
 	}
 }
 
@@ -1340,7 +1638,8 @@ static void task_drop_transport(void *p)
 void tunnel_drop_transport(struct tunnel *t)
 {
 	if (!tunnel_post(t, (struct task){ task_drop_transport, t })) {
-		TUNNEL_LOG(ERROR, t, "failed to dispatch drop_transport (OOM)");
+		TUNNEL_LOG_PUB(
+			ERROR, t, "failed to dispatch drop_transport (OOM)");
 	}
 }
 
@@ -1413,6 +1712,8 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 {
 	/* mux_state/mux_session_stats read relaxed-atomic mirrors; safe here. */
 	out->established = mux_state(t->ss) == MUX_STATE_ESTABLISHED;
+	/* fixed at creation and never rewritten, so plain. */
+	out->accepted = t->accepted;
 	out->tunnel_index = t->tunnel_index;
 	/* tag is a string, so copy it from the published snapshot under the lock. */
 	tunnel_pub_lock(t);
@@ -1431,41 +1732,31 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 		&t->stream_cnt.num_streams, memory_order_relaxed);
 	out->num_stream_halfopen = (size_t)atomic_load_explicit(
 		&t->stream_cnt.num_stream_halfopen, memory_order_relaxed);
-	out->num_stream_opened = (uint_least64_t)atomic_load_explicit(
-		&t->stream_cnt.num_stream_opened, memory_order_relaxed);
-	out->num_stream_accepted = (uint_least64_t)atomic_load_explicit(
-		&t->stream_cnt.num_stream_accepted, memory_order_relaxed);
-	out->num_stream_fastopen = (uint_least64_t)atomic_load_explicit(
-		&t->stream_cnt.num_stream_fastopen, memory_order_relaxed);
-	out->num_stream_established = (uint_least64_t)atomic_load_explicit(
-		&t->stream_cnt.num_stream_established, memory_order_relaxed);
-	out->num_stream_succeeded = (uint_least64_t)atomic_load_explicit(
-		&t->stream_cnt.num_stream_succeeded, memory_order_relaxed);
-	out->num_stream_failed = (uint_least64_t)atomic_load_explicit(
-		&t->stream_cnt.num_stream_failed, memory_order_relaxed);
-	out->byt_mux_recv = (uint_least64_t)atomic_load_explicit(
-		&t->traffic_cnt.byt_mux_recv, memory_order_relaxed);
-	out->byt_mux_sent = (uint_least64_t)atomic_load_explicit(
-		&t->traffic_cnt.byt_mux_sent, memory_order_relaxed);
-	out->byt_push_recv = (uint_least64_t)atomic_load_explicit(
-		&t->traffic_cnt.byt_push_recv, memory_order_relaxed);
-	out->byt_push_sent = (uint_least64_t)atomic_load_explicit(
-		&t->traffic_cnt.byt_push_sent, memory_order_relaxed);
 #else /* WITH_THREADS */
 	out->num_streams = t->stream_cnt.num_streams;
 	out->num_stream_halfopen = t->stream_cnt.num_stream_halfopen;
-	out->num_stream_opened = t->stream_cnt.num_stream_opened;
-	out->num_stream_accepted = t->stream_cnt.num_stream_accepted;
-	out->num_stream_fastopen = t->stream_cnt.num_stream_fastopen;
-	out->num_stream_established = t->stream_cnt.num_stream_established;
-	out->num_stream_succeeded = t->stream_cnt.num_stream_succeeded;
-	out->num_stream_failed = t->stream_cnt.num_stream_failed;
-	out->byt_mux_recv = t->traffic_cnt.byt_mux_recv;
-	out->byt_mux_sent = t->traffic_cnt.byt_mux_sent;
-	out->byt_push_recv = t->traffic_cnt.byt_push_recv;
-	out->byt_push_sent = t->traffic_cnt.byt_push_sent;
 #endif /* WITH_THREADS */
-	out->stream_establish_count = TPUB_LOAD(t->stream_establish_count);
+	struct tunnel_final_counters cnt;
+	tunnel_load_counters(t, &cnt);
+	out->num_stream_opened = cnt.num_stream_opened;
+	out->num_stream_accepted = cnt.num_stream_accepted;
+	out->num_stream_fastopen = cnt.num_stream_fastopen;
+	out->num_stream_established = cnt.num_stream_established;
+	out->num_stream_succeeded = cnt.num_stream_succeeded;
+	out->num_stream_failed = cnt.num_stream_failed;
+	out->num_reconnects = cnt.num_reconnects;
+	out->num_rst_sent = cnt.num_rst_sent;
+	out->num_rst_recv = cnt.num_rst_recv;
+	out->num_stream_errors = cnt.num_stream_errors;
+	out->stream_establish_count = cnt.stream_establish_count;
+	out->byt_mux_recv = cnt.byt_mux_recv;
+	out->byt_mux_sent = cnt.byt_mux_sent;
+	out->byt_push_recv = cnt.byt_push_recv;
+	out->byt_push_sent = cnt.byt_push_sent;
+	out->recv_buffered_bytes = TPUB_LOAD(t->buf_gauge.recv_buffered_bytes);
+	out->send_buffered_frames =
+		TPUB_LOAD(t->buf_gauge.send_buffered_frames);
+	out->unacked_frames = TPUB_LOAD(t->buf_gauge.unacked_frames);
 	for (size_t i = 0; i < ARRAY_SIZE(t->stream_establish_ns); i++) {
 		out->stream_establish_ns[i] =
 			TPUB_LOAD(t->stream_establish_ns[i]);
@@ -1483,7 +1774,7 @@ static void open_stream_task(void *p)
 	struct open_stream_arg *const restrict arg = p;
 	struct tunnel *const restrict t = arg->t;
 	const int fd = arg->fd;
-	struct mux_stream *const stream = mux_open_stream(arg->ss);
+	struct mux_stream *const stream = mux_stream_open(arg->ss);
 	if (stream == NULL) {
 		/* Demand-triggered reconnect: when idle-closed/suspended with
 		 * idle_timeout set, reconnect so the next open_stream succeeds.
@@ -1506,7 +1797,7 @@ static void open_stream_task(void *p)
 	}
 	/* Start reading from local socket immediately.  One frame may be read
 	 * before the SYN is sent and piggybacked as SYN|PUSH (fast open). */
-	mux_stream_attach(stream, fd);
+	mux_stream_attach_fd(stream, fd);
 	TUNNEL_LOG_F(
 		DEBUG, t, "[fd:%d] new stream %" PRIuLEAST16, fd,
 		mux_stream_id(stream));
@@ -1523,7 +1814,8 @@ void tunnel_open_stream(struct tunnel *t, const int fd)
 	}
 	*arg = (struct open_stream_arg){ .t = t, .ss = t->ss, .fd = fd };
 	if (!tunnel_post(t, (struct task){ open_stream_task, arg })) {
-		TUNNEL_LOG(ERROR, t, "failed to dispatch open_stream (OOM)");
+		TUNNEL_LOG_PUB(
+			ERROR, t, "failed to dispatch open_stream (OOM)");
 		free(arg);
 		socket_close(fd);
 	}
@@ -1532,7 +1824,12 @@ void tunnel_open_stream(struct tunnel *t, const int fd)
 struct reload_arg {
 	struct tunnel *t;
 	struct mux_session *ss;
-	struct mux_config conf;
+	struct mux_session_config conf;
+#if WITH_TLS
+	/* New per-tunnel TLS context; owned (adopted in reload_task, freed on the
+	 * failure paths). NULL leaves the current context in place. */
+	struct tls_context *tlsctx;
+#endif
 	struct conf_socket_opts mux_socket;
 	struct conf_socket_opts local_socket;
 	bool drain;
@@ -1543,6 +1840,9 @@ struct reload_arg {
 	bool update_forward_addr;
 	/* Owned; NULL is valid. */
 	char *forward_addr;
+	bool verify_identity;
+	const char *(*psk_identity_of)(void *ctx, const char *label);
+	void *psk_ctx;
 };
 
 static void reload_task(void *p)
@@ -1552,6 +1852,13 @@ static void reload_task(void *p)
 	if (arg->update_connect_addr) {
 		free(t->connect_addr);
 		t->connect_addr = arg->connect_addr;
+		if (t->connect_addr == NULL) {
+			/* tunnel.h documents a NULL address as also disabling
+			 * reconnect. Stop the backoff timer here or a pending
+			 * tick would reach tunnel_do_connect with no address --
+			 * it has no NULL guard, unlike every other caller. */
+			ev_timer_stop(t->loop, &t->w_reconnect);
+		}
 	}
 	if (arg->disable_reconnect) {
 		t->shutting_down = true;
@@ -1561,18 +1868,26 @@ static void reload_task(void *p)
 		free(t->forward_addr);
 		t->forward_addr = arg->forward_addr;
 	}
+	/* Read at the next hello, so this takes effect on the session's next
+	 * handshake rather than mid-session. */
+	t->verify_identity = arg->verify_identity;
+	t->psk_identity_of = arg->psk_identity_of;
+	t->psk_ctx = arg->psk_ctx;
 #if WITH_TLS
 	/* Adopt the new per-tunnel TLS context (ownership transferred via the
-	 * reload).  mux_set_config() below repoints the wire to it, after which the
+	 * reload).  mux_set_tlsctx() below repoints the wire to it, after which the
 	 * old one is safe to free here on this (the owning) thread. */
 	struct tls_context *old_tlsctx = NULL;
-	if (arg->conf.tlsctx != NULL) {
+	if (arg->tlsctx != NULL) {
 		old_tlsctx = t->tlsctx;
-		t->tlsctx = arg->conf.tlsctx;
+		t->tlsctx = arg->tlsctx;
 	}
 #endif /* WITH_TLS */
 	mux_set_config(arg->ss, &arg->conf);
 #if WITH_TLS
+	if (arg->tlsctx != NULL) {
+		mux_set_tlsctx(arg->ss, arg->tlsctx);
+	}
 	tls_ctx_free(old_tlsctx);
 #endif
 	if (arg->drain) {
@@ -1590,7 +1905,7 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		LOGOOM();
 #if WITH_TLS
 		/* Ownership of the new context transferred to us; release it. */
-		tls_ctx_free(opts->conf.tlsctx);
+		tls_ctx_free(opts->tlsctx);
 #endif
 		return;
 	}
@@ -1598,12 +1913,18 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		.t = t,
 		.ss = t->ss,
 		.conf = opts->conf,
+#if WITH_TLS
+		.tlsctx = opts->tlsctx,
+#endif
 		.mux_socket = opts->mux_socket,
 		.local_socket = opts->local_socket,
 		.drain = opts->drain,
 		.update_connect_addr = opts->update_connect_addr,
 		.disable_reconnect = opts->disable_reconnect,
 		.update_forward_addr = opts->update_forward_addr,
+		.verify_identity = opts->verify_identity,
+		.psk_identity_of = opts->psk_identity_of,
+		.psk_ctx = opts->psk_ctx,
 	};
 	if (opts->update_connect_addr && opts->connect_addr != NULL) {
 		arg->connect_addr = strdup(opts->connect_addr);
@@ -1611,7 +1932,7 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 			LOGOOM();
 			free(arg);
 #if WITH_TLS
-			tls_ctx_free(opts->conf.tlsctx);
+			tls_ctx_free(opts->tlsctx);
 #endif
 			return;
 		}
@@ -1623,17 +1944,17 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 			free(arg->connect_addr);
 			free(arg);
 #if WITH_TLS
-			tls_ctx_free(opts->conf.tlsctx);
+			tls_ctx_free(opts->tlsctx);
 #endif
 			return;
 		}
 	}
 	if (!tunnel_post(t, (struct task){ reload_task, arg })) {
-		TUNNEL_LOG(ERROR, t, "failed to dispatch reload (OOM)");
+		TUNNEL_LOG_PUB(ERROR, t, "failed to dispatch reload (OOM)");
 		free(arg->connect_addr);
 		free(arg->forward_addr);
 #if WITH_TLS
-		tls_ctx_free(arg->conf.tlsctx);
+		tls_ctx_free(arg->tlsctx);
 #endif
 		free(arg);
 	}

@@ -24,11 +24,6 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
-#if WITH_THREADS
-#include <stdatomic.h>
-#include <threads.h>
-#include <time.h>
-#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -36,9 +31,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#if WITH_THREADS
+#include <threads.h>
+#include <time.h>
+#endif
 #include <unistd.h>
 
-static const struct mux_config g_conf = {
+static const struct mux_session_config g_conf = {
 	.timeout = 30,
 	.keepalive = 1,
 	.send_timeout = 1,
@@ -85,17 +84,6 @@ static uint_least64_t test_alloc_index(void *user)
 	return ++((struct server *)user)->next_tunnel_index;
 }
 
-static void test_inc_reconnect(void *user)
-{
-#if WITH_THREADS
-	(void)atomic_fetch_add_explicit(
-		&((struct server *)user)->counters.num_reconnects,
-		(uint_least64_t)1, memory_order_relaxed);
-#else
-	((struct server *)user)->counters.num_reconnects++;
-#endif
-}
-
 static struct tunnel_session_counters
 test_make_tunnel_counters(struct server *restrict srv)
 {
@@ -108,12 +96,6 @@ test_make_tunnel_counters(struct server *restrict srv)
 		.num_session_finalized = &srv->counters.num_session_finalized,
 		.num_sessions = &srv->counters.num_sessions,
 		.num_session_halfopen = &srv->counters.num_session_halfopen,
-		.num_rst_sent = &srv->counters.num_rst_sent,
-		.num_rst_recv = &srv->counters.num_rst_recv,
-		.num_stream_errors = &srv->counters.num_stream_errors,
-		.recv_buffered_bytes = &srv->counters.recv_buffered_bytes,
-		.send_buffered_frames = &srv->counters.send_buffered_frames,
-		.unacked_frames = &srv->counters.unacked_frames,
 	};
 }
 
@@ -127,7 +109,6 @@ test_make_tunnel_context(struct server *restrict srv)
 #endif
 		.verify_peer = test_verify_peer,
 		.alloc_index = test_alloc_index,
-		.inc_reconnect = test_inc_reconnect,
 		.user = srv,
 #if !WITH_THREADS
 		.loop = srv->loop,
@@ -139,14 +120,11 @@ test_make_tunnel_context(struct server *restrict srv)
 
 static const unsigned char g_zero_id[MUX_SESSION_ID_LEN];
 
-static uint_least64_t test_num_reconnects(const struct server *srv)
+static uint_least64_t test_num_reconnects(const struct tunnel *t)
 {
-#if WITH_THREADS
-	return atomic_load_explicit(
-		&srv->counters.num_reconnects, memory_order_relaxed);
-#else
-	return srv->counters.num_reconnects;
-#endif
+	struct tunnel_stats snap;
+	tunnel_stats(t, &snap);
+	return snap.num_reconnects;
 }
 
 #if !WITH_THREADS
@@ -159,20 +137,20 @@ static void reconnect_timeout_cb(struct ev_loop *loop, ev_timer *w, int revents)
 #endif /* !WITH_THREADS */
 
 static bool wait_for_reconnects(
-	struct ev_loop *loop, const struct server *srv, uint_least64_t minimum)
+	struct ev_loop *loop, const struct tunnel *t, uint_least64_t minimum)
 {
 #if WITH_THREADS
 	(void)loop;
 	/* Tunnel runs in its own thread; poll with bounded sleep — unavoidable
 	 * without timer mocking or production-code synchronization hooks. */
 	for (int i = 0; i < 1000; i++) {
-		if (test_num_reconnects(srv) >= minimum) {
+		if (test_num_reconnects(t) >= minimum) {
 			return true;
 		}
 		(void)thrd_sleep(
 			&(struct timespec){ .tv_nsec = 10000000L }, NULL);
 	}
-	return test_num_reconnects(srv) >= minimum;
+	return test_num_reconnects(t) >= minimum;
 #else /* WITH_THREADS */
 	/* Drive the shared event loop with EVRUN_ONCE so no sleep is needed;
 	 * a 10-second guard prevents an infinite hang if no reconnect fires. */
@@ -181,11 +159,11 @@ static bool wait_for_reconnects(
 	tw.data = &timed_out;
 	ev_timer_init(&tw, reconnect_timeout_cb, 10.0, 0.0);
 	ev_timer_start(loop, &tw);
-	while (!timed_out && test_num_reconnects(srv) < minimum) {
+	while (!timed_out && test_num_reconnects(t) < minimum) {
 		ev_run(loop, EVRUN_ONCE);
 	}
 	ev_timer_stop(loop, &tw);
-	return !timed_out && test_num_reconnects(srv) >= minimum;
+	return !timed_out && test_num_reconnects(t) >= minimum;
 #endif /* WITH_THREADS */
 }
 
@@ -331,7 +309,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 	/* Capture the reconnect result while the tunnel thread is live, then join
 	 * it via tunnel_close before asserting: a failed assertion must not
 	 * longjmp out with the thread still writing into this frame. */
-	const bool reconnected = wait_for_reconnects(srv.loop, &srv, 2);
+	const bool reconnected = wait_for_reconnects(srv.loop, t, 2);
 
 	tunnel_close(t);
 
@@ -342,6 +320,76 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 #endif
 
 	T_EXPECT(reconnected);
+}
+
+/* tunnel.h documents update_connect_addr with a NULL address as "clears and
+ * disables reconnect", but reload_task only cleared it -- a backoff timer armed
+ * before the reload then fired into tunnel_do_connect with no address, and that
+ * is the one reconnect entry point with no NULL guard, so resolve_addr walked
+ * into strlen(NULL). Drive exactly the documented usage: reconnect-loop a
+ * tunnel so the timer is pending, clear the address, then let the loop run past
+ * the backoff. */
+T_DECLARE_CASE(test_tunnel_reload_null_addr_disables_reconnect)
+{
+	struct server srv;
+	memset(&srv, 0, sizeof(srv));
+
+#if WITH_THREADS
+	srv.disp = dispatcher_create(4);
+	T_CHECK(srv.disp != NULL);
+#else
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	srv.loop = loop;
+#endif
+
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.data = NULL,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+		.connect_addr = "invalid",
+		.cnt = &cnts,
+	};
+
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+	T_CHECK(tunnel_start(t));
+	/* Let it fail and arm the backoff timer at least once. */
+	const bool reconnected = wait_for_reconnects(srv.loop, t, 1);
+
+	/* The documented "clears and disables reconnect" form. */
+	struct tunnel_reload_opts reload = {
+		.conf = g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.update_connect_addr = true,
+		.connect_addr = NULL,
+	};
+	tunnel_reload(t, &reload);
+	/* Run well past the shortest backoff so a surviving timer would fire. */
+	const uint_least64_t before = test_num_reconnects(t);
+	(void)wait_for_reconnects(srv.loop, t, before + 2);
+	const uint_least64_t after = test_num_reconnects(t);
+
+	tunnel_close(t);
+
+#if WITH_THREADS
+	dispatcher_destroy(srv.disp);
+#else
+	ev_loop_destroy(loop);
+#endif
+
+	T_EXPECT(reconnected);
+	/* No further dial attempts: the timer was stopped, and had it fired the
+	 * NULL address would have crashed rather than counted. */
+	T_EXPECT_EQ(after, before);
 }
 
 T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
@@ -430,7 +478,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 	/* MUX_EVENT_CLOSED fires: tunnel_on_event schedules a reconnect.  Capture
 	 * the results while the tunnel thread is live, then join it via
 	 * tunnel_close before asserting. */
-	const bool reconnected = wait_for_reconnects(srv.loop, &srv, 1);
+	const bool reconnected = wait_for_reconnects(srv.loop, t, 1);
 
 	tunnel_close(t);
 
@@ -516,7 +564,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 				(void)close(cfd);
 			}
 		}
-		if (test_num_reconnects(&srv) >= 2) {
+		if (test_num_reconnects(t) >= 2) {
 			ok = true;
 			break;
 		}
@@ -534,7 +582,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 		tw.data = &timed_out;
 		ev_timer_init(&tw, reconnect_timeout_cb, 10.0, 0.0);
 		ev_timer_start(srv.loop, &tw);
-		while (!timed_out && test_num_reconnects(&srv) < 2) {
+		while (!timed_out && test_num_reconnects(t) < 2) {
 			const int cfd = accept(lfd, NULL, NULL);
 			if (cfd >= 0) {
 				if (num_held < (int)ARRAY_SIZE(held_fds)) {
@@ -546,7 +594,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_after_connect_timeout)
 			ev_run(srv.loop, EVRUN_ONCE);
 		}
 		ev_timer_stop(srv.loop, &tw);
-		ok = !timed_out && test_num_reconnects(&srv) >= 2;
+		ok = !timed_out && test_num_reconnects(t) >= 2;
 	}
 #endif /* WITH_THREADS */
 	/* ok was captured above while the tunnel thread was live; join the thread
@@ -657,12 +705,20 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 	T_EXPECT_EQ(stats.num_stream_opened, (uint_least64_t)0);
 	T_EXPECT_EQ(stats.byt_mux_recv, (uint_least64_t)0);
 	T_EXPECT_EQ(stats.byt_mux_sent, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.num_reconnects, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.num_rst_sent, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.num_rst_recv, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.num_stream_errors, (uint_least64_t)0);
+	T_EXPECT_EQ(stats.recv_buffered_bytes, (size_t)0);
+	T_EXPECT_EQ(stats.send_buffered_frames, (size_t)0);
+	T_EXPECT_EQ(stats.unacked_frames, (size_t)0);
 }
 
 static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_new_close_no_start),
 	T_CASE(test_tunnel_accessors_after_new),
 	T_CASE(test_tunnel_reconnect_rearms_after_failed_retry),
+	T_CASE(test_tunnel_reload_null_addr_disables_reconnect),
 	T_CASE(test_tunnel_reconnect_on_transport_lost),
 	T_CASE(test_tunnel_reconnect_after_connect_timeout),
 	T_CASE(test_tunnel_state_returns_connecting_after_new),
