@@ -16,6 +16,7 @@
 #include "tunnel.h"
 
 #include "algo/hashtable.h"
+#include "meta/arraysize.h"
 #include "os/clock.h"
 #include "os/socket.h"
 #include "strings/format.h"
@@ -37,13 +38,6 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-#if WITH_THREADS
-#define STORE_STAT(field, value)                                               \
-	atomic_store_explicit(&(field), (value), memory_order_relaxed)
-#else
-#define STORE_STAT(field, value) ((field) = (value))
-#endif
 
 /* Constants */
 
@@ -73,11 +67,6 @@ static uint_least64_t test_alloc_index(void *user)
 	return ++((struct server *)user)->next_tunnel_index;
 }
 
-static void test_inc_reconnect(void *user)
-{
-	(void)user;
-}
-
 #if WITH_THREADS
 static bool test_post_task(void *user, struct task task)
 {
@@ -104,12 +93,6 @@ test_make_tunnel_counters(struct server *srv)
 		.num_session_finalized = &srv->counters.num_session_finalized,
 		.num_sessions = &srv->counters.num_sessions,
 		.num_session_halfopen = &srv->counters.num_session_halfopen,
-		.num_rst_sent = &srv->counters.num_rst_sent,
-		.num_rst_recv = &srv->counters.num_rst_recv,
-		.num_stream_errors = &srv->counters.num_stream_errors,
-		.recv_buffered_bytes = &srv->counters.recv_buffered_bytes,
-		.send_buffered_frames = &srv->counters.send_buffered_frames,
-		.unacked_frames = &srv->counters.unacked_frames,
 	};
 }
 
@@ -122,7 +105,6 @@ static struct tunnel_context test_make_tunnel_context(struct server *srv)
 #endif
 		.verify_peer = test_verify_peer,
 		.alloc_index = test_alloc_index,
-		.inc_reconnect = test_inc_reconnect,
 		.user = srv,
 #if !WITH_THREADS
 		.loop = srv->loop,
@@ -144,9 +126,11 @@ struct apifx {
 	int cli_fd;
 };
 
-static struct tunnel *make_established_tunnel(
+/* fd < 0 fabricates a dialed (client-role) tunnel; a non-negative fd is adopted
+ * by tunnel_new and makes the tunnel accepted (server-role). */
+static struct tunnel *make_tunnel(
 	struct apifx *restrict fx, const char *restrict peer_id,
-	const size_t num_streams)
+	const size_t num_streams, const int fd)
 {
 	static const struct tunnel_callbacks cb = { 0 };
 	static const unsigned char session_id[MUX_SESSION_ID_LEN] = { 0 };
@@ -160,7 +144,7 @@ static struct tunnel *make_established_tunnel(
 	fx->conf.mux.max_halfopen = 16;
 	fx->conf.mux.nodelay = true;
 
-	const struct mux_config mux_cfg = conf_get_mux(&fx->conf);
+	const struct mux_session_config mux_cfg = conf_get_mux(&fx->conf);
 	const struct tunnel_session_counters cnts =
 		test_make_tunnel_counters(&fx->srv);
 	const struct tunnel_context ctx = test_make_tunnel_context(&fx->srv);
@@ -168,7 +152,7 @@ static struct tunnel *make_established_tunnel(
 		.cb = &cb,
 		.data = NULL,
 		.mux_conf = &mux_cfg,
-		.fd = -1,
+		.fd = fd,
 		.id = session_id,
 		.connect_addr = "127.0.0.1:1",
 		.forward_addr = NULL,
@@ -203,6 +187,81 @@ static struct tunnel *make_established_tunnel(
 	return t;
 }
 
+static struct tunnel *make_established_tunnel(
+	struct apifx *restrict fx, const char *restrict peer_id,
+	const size_t num_streams)
+{
+	return make_tunnel(fx, peer_id, num_streams, -1);
+}
+
+/* Fabricate a server-role tunnel.  tunnel_new only derives the tag from the fd
+ * here (the tunnel's own loop never runs), so a socketpair end is enough to
+ * make it accepted; tunnel_close() owns and closes it. */
+static struct tunnel *
+make_accepted_tunnel(struct apifx *restrict fx, const char *restrict peer_id)
+{
+	int fds[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+		return NULL;
+	}
+	(void)close(fds[1]);
+	/* tunnel_new fully owns fds[0] from here, including on failure. */
+	return make_tunnel(fx, peer_id, 0, fds[0]);
+}
+
+/* Register t in an identity pool keyed by peer_identity, creating the identities
+ * table on first use, so the per-tunnel metric path treats t as identified.
+ * peer_identity must outlive the fixture (a string literal).  Returns false on
+ * allocation failure; apifx_teardown frees everything registered here. */
+static bool pool_tunnel(
+	struct apifx *restrict fx, struct tunnel *restrict t,
+	const char *restrict peer_identity)
+{
+	if (fx->srv.identities == NULL) {
+		fx->srv.identities = table_new(&(struct table_opts){
+			.hash = TABLE_OPTS_STR.hash,
+			.eq = TABLE_OPTS_STR.eq,
+			.flags = TABLE_FAST,
+		});
+		if (fx->srv.identities == NULL) {
+			return false;
+		}
+	}
+	void *elem = NULL;
+	struct identity_listener *sl = NULL;
+	if (table_find(fx->srv.identities, peer_identity, &elem)) {
+		sl = elem;
+	} else {
+		sl = calloc(1, sizeof(*sl));
+		if (sl == NULL) {
+			return false;
+		}
+		sl->peer_identity = peer_identity;
+		void *slot = sl;
+		fx->srv.identities =
+			table_set(fx->srv.identities, peer_identity, &slot);
+		if (slot != NULL) {
+			free(sl);
+			return false;
+		}
+	}
+	/* cap_tunnels must stay a power of two (struct identity_listener), so grow
+	 * geometrically the way identity_listener_add does. */
+	if (sl->num_tunnels >= sl->cap_tunnels) {
+		const size_t new_cap =
+			sl->cap_tunnels > 0 ? sl->cap_tunnels * 2 : 4;
+		struct tunnel **const tunnels = (struct tunnel **)realloc(
+			(void *)sl->tunnels, new_cap * sizeof(*tunnels));
+		if (tunnels == NULL) {
+			return false;
+		}
+		sl->tunnels = tunnels;
+		sl->cap_tunnels = new_cap;
+	}
+	sl->tunnels[sl->num_tunnels++] = t;
+	return true;
+}
+
 static int apifx_setup(struct apifx *restrict fx)
 {
 	*fx = (struct apifx){
@@ -217,7 +276,7 @@ static int apifx_setup(struct apifx *restrict fx)
 	fx->conf = (struct config){
 		.mux_listen = NULL,
 		.mux = { .max_frame_payload =
-				 mux_conf_default.max_frame_payload },
+				 mux_session_config_default.max_frame_payload },
 	};
 
 	fx->srv = (struct server){
@@ -284,7 +343,21 @@ static void apifx_teardown(struct apifx *restrict fx)
 		while (table_next(fx->srv.identities, &cursor, NULL, &elem)) {
 			struct identity_listener *const sl = elem;
 			for (size_t j = 0; j < sl->num_tunnels; j++) {
-				tunnel_close(sl->tunnels[j]);
+				struct tunnel *const t = sl->tunnels[j];
+				/* A pooled tunnel may also occupy the mux_tunnel
+				 * or a staging slot; clear both so the sweeps
+				 * below cannot close it a second time. */
+				if (fx->srv.mux_tunnel == t) {
+					fx->srv.mux_tunnel = NULL;
+				}
+				for (size_t k = 0;
+				     k < fx->srv.num_identity_tunnels; k++) {
+					if (fx->srv.identity_tunnels[k] == t) {
+						fx->srv.identity_tunnels[k] =
+							NULL;
+					}
+				}
+				tunnel_close(t);
 			}
 			free((void *)sl->tunnels);
 			sl->tunnels = NULL;
@@ -293,6 +366,19 @@ static void apifx_teardown(struct apifx *restrict fx)
 		}
 		table_free(fx->srv.identities);
 		fx->srv.identities = NULL;
+	}
+	for (size_t i = 0; i < fx->srv.num_identity_tunnels; i++) {
+		if (fx->srv.identity_tunnels[i] != NULL) {
+			tunnel_close(fx->srv.identity_tunnels[i]);
+			fx->srv.identity_tunnels[i] = NULL;
+		}
+	}
+	free((void *)fx->srv.identity_tunnels);
+	fx->srv.identity_tunnels = NULL;
+	fx->srv.num_identity_tunnels = 0;
+	if (fx->srv.mux_tunnel != NULL) {
+		tunnel_close(fx->srv.mux_tunnel);
+		fx->srv.mux_tunnel = NULL;
 	}
 	if (fx->cli_fd >= 0) {
 		(void)close(fx->cli_fd);
@@ -778,6 +864,33 @@ static bool resp_date_is_english_imf_fixdate(const char *restrict buf)
 	"Content-Length: 0\r\n"                                                \
 	"\r\n"
 
+/* /healthy took any method; HEAD in particular got a body-bearing 503. */
+#define REQ_HEALTHY_HEAD                                                       \
+	"HEAD /healthy HTTP/1.1\r\n"                                           \
+	"Host: test\r\n"                                                       \
+	"Connection: close\r\n"                                                \
+	"\r\n"
+
+#define REQ_HEALTHY_PUT                                                        \
+	"PUT /healthy HTTP/1.1\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Connection: close\r\n"                                                \
+	"Content-Length: 0\r\n"                                                \
+	"\r\n"
+
+#define REQ_METRICS_DELETE                                                     \
+	"DELETE /metrics HTTP/1.1\r\n"                                         \
+	"Host: test\r\n"                                                       \
+	"Connection: close\r\n"                                                \
+	"\r\n"
+
+#define REQ_EXPECT_UNKNOWN                                                     \
+	"GET /healthy HTTP/1.1\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Connection: close\r\n"                                                \
+	"Expect: something-else\r\n"                                           \
+	"\r\n"
+
 /* Helper — perform a single HTTP exchange on fx and fill rctx.
  * Returns 0 on success, -1 on timeout or error. */
 
@@ -876,8 +989,15 @@ T_DECLARE_CASE(test_stats_buffered_data_uses_configured_frame_size)
 		T_FATAL("apifx_setup failed");
 	}
 	fx.conf.mux.max_frame_payload = 65536 - MUX_FRAME_HEADER_SIZE;
-	STORE_STAT(fx.srv.counters.send_buffered_frames, 10);
-	STORE_STAT(fx.srv.counters.unacked_frames, 0);
+	/* The buffer gauges live on the tunnel, so the figure has to come from one.
+	 * Poking through the session's own counter block exercises the production
+	 * write path and so also proves tunnel_new() wired the block per-tunnel.
+	 * The tunnel carries no streams, so nothing decrements the gauge again. */
+	struct tunnel *const t = make_established_tunnel(&fx, "peer-buf", 0);
+	T_CHECK(t != NULL);
+	fx.srv.mux_tunnel = t;
+	struct mux_session *const ss = tunnel_session(t);
+	COUNTER_ADD(ss->cnt.buffers.send_buffered_frames, 10);
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_GET);
@@ -1482,7 +1602,7 @@ T_DECLARE_CASE(test_server_stats_dedups_mux_tunnel_in_identity_pool)
 		T_CHECK(slot == NULL);
 	}
 
-	struct server_stats *const snap = server_stats(&fx.srv);
+	struct server_stats *const snap = server_stats(&fx.srv, true);
 	const size_t num_tunnels = snap != NULL ? snap->num_tunnels : 0;
 	free(snap);
 	fx.srv.mux_tunnel = NULL; /* freed via the pool by teardown */
@@ -1785,8 +1905,8 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	}
 
 	fx.srv.started = clock_monotonic_ns() - 5LL * 1000 * 1000 * 1000;
-	fx.srv.counters.traffic_byt_mux_recv = 2048;
-	fx.srv.counters.traffic_byt_mux_sent = 4096;
+	fx.srv.counters.closed.traffic_byt_mux_recv = 2048;
+	fx.srv.counters.closed.traffic_byt_mux_sent = 4096;
 
 	struct resp_wait_ctx rctx1;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx1, REQ_STATS_POST);
@@ -1797,8 +1917,8 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	const uint_least64_t rt1_recv = fx.srv.rate_tracker.byt_mux_recv;
 	const uint_least64_t rt1_sent = fx.srv.rate_tracker.byt_mux_sent;
 
-	fx.srv.counters.traffic_byt_mux_recv = 3072;
-	fx.srv.counters.traffic_byt_mux_sent = 6144;
+	fx.srv.counters.closed.traffic_byt_mux_recv = 3072;
+	fx.srv.counters.closed.traffic_byt_mux_sent = 6144;
 	fx.srv.rate_tracker.timestamp =
 		clock_monotonic_ns() - 2LL * 1000 * 1000 * 1000;
 
@@ -1824,6 +1944,342 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	T_EXPECT_EQ(rt2_sent, (uint_least64_t)6144);
 }
 
+/* The buffer gauges are per-tunnel state, so every sample must name the tunnel
+ * it belongs to; the unlabeled name stays as the process-wide total. */
+T_DECLARE_CASE(test_metrics_buffer_gauges_are_labeled)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct tunnel *const t = make_established_tunnel(&fx, "peer-buf", 0);
+	T_CHECK(t != NULL);
+	T_CHECK(pool_tunnel(&fx, t, "peer-buf"));
+	struct mux_session *const ss = tunnel_session(t);
+	COUNTER_ADD(ss->cnt.buffers.send_buffered_frames, 5);
+	COUNTER_ADD(ss->cnt.buffers.recv_buffered_bytes, 4096);
+	COUNTER_ADD(ss->cnt.buffers.unacked_frames, 3);
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_send_buffered_frames{identity=\"peer-buf\",tunnel=\"1\"} 5"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_recv_buffered_bytes{identity=\"peer-buf\",tunnel=\"1\"} 4096"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_unacked_frames{identity=\"peer-buf\",tunnel=\"1\"} 3"));
+	/* The tunnel is the only one alive, so each total equals its sample. */
+	T_EXPECT(resp_contains(
+		rctx.buf, "\nmultiplexd_send_buffered_frames 5\n"));
+	T_EXPECT(resp_contains(
+		rctx.buf, "\nmultiplexd_recv_buffered_bytes 4096\n"));
+	T_EXPECT(resp_contains(rctx.buf, "\nmultiplexd_unacked_frames 3\n"));
+}
+
+/* Stream lifecycle counters are per-tunnel data that used to be emitted only in
+ * aggregate; num_stream_succeeded/failed were never emitted at all. */
+T_DECLARE_CASE(test_metrics_stream_lifecycle_counters_are_labeled)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct tunnel *const t = make_established_tunnel(&fx, "peer-life", 0);
+	T_CHECK(t != NULL);
+	T_CHECK(pool_tunnel(&fx, t, "peer-life"));
+	struct mux_session *const ss = tunnel_session(t);
+	COUNTER_ADD(ss->cnt.stream.num_stream_opened, 23);
+	COUNTER_ADD(ss->cnt.stream.num_stream_accepted, 29);
+	COUNTER_ADD(ss->cnt.stream.num_stream_fastopen, 31);
+	COUNTER_ADD(ss->cnt.stream.num_stream_succeeded, 37);
+	COUNTER_ADD(ss->cnt.stream.num_stream_failed, 41);
+	COUNTER_ADD(ss->cnt.stream.num_stream_established, 43);
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_open_total{identity=\"peer-life\",tunnel=\"1\"} 23"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_accept_total{identity=\"peer-life\",tunnel=\"1\"} 29"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_fastopen_total{identity=\"peer-life\",tunnel=\"1\"} 31"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_succeeded_total{identity=\"peer-life\",tunnel=\"1\"} 37"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_failed_total{identity=\"peer-life\",tunnel=\"1\"} 41"));
+	/* The summary's sample count is per-tunnel too, and no unlabeled form of
+	 * it survives.  Its value is the latency ring's observation count, which
+	 * no stream here ever fed -- not the 43 established streams above, which
+	 * include passive opens the ring never observes. */
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-life\",tunnel=\"1\"} 0"));
+	T_EXPECT(!resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-life\",tunnel=\"1\"} 43"));
+	T_EXPECT(!resp_contains(
+		rctx.buf,
+		"\nmultiplexd_session_stream_establish_latency_seconds_count 43"));
+	/* The process-wide summary counts the same observations, so it must not
+	 * follow num_stream_established either. */
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"\nmultiplexd_stream_establish_latency_seconds_count 0\n"));
+	T_EXPECT(!resp_contains(
+		rctx.buf,
+		"\nmultiplexd_stream_establish_latency_seconds_count 43\n"));
+	/* The totals still carry the same values, succeeded/failed included. */
+	T_EXPECT(resp_contains(
+		rctx.buf, "\nmultiplexd_stream_succeeded_total 37\n"));
+	T_EXPECT(resp_contains(
+		rctx.buf, "\nmultiplexd_stream_failed_total 41\n"));
+}
+
+/* Only the dial path bumps num_reconnects, so a server-role tunnel's reconnect
+ * series would be zero for its whole life; it must be left out entirely rather
+ * than spend a series on a constant. */
+T_DECLARE_CASE(test_metrics_reconnects_series_skips_accepted_tunnel)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct tunnel *const acc = make_accepted_tunnel(&fx, "peer-acc");
+	T_CHECK(acc != NULL);
+	T_CHECK(pool_tunnel(&fx, acc, "peer-acc"));
+	struct tunnel *const dial =
+		make_established_tunnel(&fx, "peer-dial", 0);
+	T_CHECK(dial != NULL);
+	T_CHECK(pool_tunnel(&fx, dial, "peer-dial"));
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	/* The dialed tunnel keeps its series ... */
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_reconnects_total{identity=\"peer-dial\""));
+	/* ... and the accepted one has none, though it is otherwise labeled. */
+	T_EXPECT(!resp_contains(
+		rctx.buf,
+		"multiplexd_session_reconnects_total{identity=\"peer-acc\""));
+	T_EXPECT(resp_contains(
+		rctx.buf, "multiplexd_session_streams{identity=\"peer-acc\""));
+}
+
+/* A tunnel with no identity pool is anonymous: it gets no labeled series, but
+ * its counters must still reach the process-wide totals. */
+T_DECLARE_CASE(test_metrics_anonymous_tunnel_counted_in_totals_only)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	/* mux_tunnel is never in an identity pool, so tunnel_stats leaves its
+	 * peer_identity NULL -- exactly the plain client-mode shape. */
+	struct tunnel *const anon =
+		make_established_tunnel(&fx, "peer-anon", 0);
+	T_CHECK(anon != NULL);
+	fx.srv.mux_tunnel = anon;
+	COUNTER_ADD(tunnel_session(anon)->cnt.stream.num_stream_opened, 6);
+
+	struct tunnel *const named =
+		make_established_tunnel(&fx, "peer-named", 0);
+	T_CHECK(named != NULL);
+	T_CHECK(pool_tunnel(&fx, named, "peer-named"));
+	COUNTER_ADD(tunnel_session(named)->cnt.stream.num_stream_opened, 4);
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	/* Only the identified tunnel is labeled; the anonymous one has index 1. */
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_open_total{identity=\"peer-named\",tunnel=\"2\"} 4"));
+	T_EXPECT(!resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_open_total{identity=\"\""));
+	/* Index 1 belongs to the anonymous tunnel, so it must not appear in any
+	 * label set -- neither the plain form nor the rx/tx one. */
+	T_EXPECT(!resp_contains(rctx.buf, "tunnel=\"1\""));
+	/* The total covers both. */
+	T_EXPECT(
+		resp_contains(rctx.buf, "\nmultiplexd_stream_open_total 10\n"));
+}
+
+/* Regression: an identity.mux_connect dial-out is wired into an identity pool
+ * only once it establishes and its peer names a configured identity.  Until
+ * then it lives solely in identity_tunnels[], and the aggregate must still find
+ * it there -- otherwise a peer that never comes up (the case reconnects_total
+ * exists to expose) contributes nothing at all. */
+T_DECLARE_CASE(test_metrics_staged_identity_tunnel_counted_in_totals)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct tunnel *const staged =
+		make_established_tunnel(&fx, "peer-staged", 0);
+	T_CHECK(staged != NULL);
+	fx.srv.identity_tunnels =
+		(struct tunnel **)calloc(1, sizeof(struct tunnel *));
+	T_CHECK(fx.srv.identity_tunnels != NULL);
+	fx.srv.identity_tunnels[0] = staged;
+	fx.srv.num_identity_tunnels = 1;
+	struct mux_session *const ss = tunnel_session(staged);
+	COUNTER_ADD(ss->cnt.stream.num_stream_opened, 9);
+	COUNTER_ADD(ss->cnt.errors.num_rst_sent, 3);
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+	T_EXPECT(resp_contains(rctx.buf, "\nmultiplexd_stream_open_total 9\n"));
+	T_EXPECT(resp_contains(rctx.buf, "\nmultiplexd_rst_sent_total 3\n"));
+	/* Unpooled, so it stays anonymous: totals only, no labeled series. */
+	T_EXPECT(!resp_contains(rctx.buf, "tunnel=\"1\""));
+}
+
+/* Copy the metric name at the start of line into buf: everything up to the
+ * label brace or the value separator.  Returns false if it does not fit. */
+static bool parse_metric_name(
+	char *restrict buf, const size_t buflen, const char *restrict line)
+{
+	size_t n = 0;
+	while (line[n] != '\0' && line[n] != '\n' && line[n] != '{' &&
+	       line[n] != ' ') {
+		n++;
+	}
+	if (n == 0 || n >= buflen) {
+		return false;
+	}
+	(void)memcpy(buf, line, n);
+	buf[n] = '\0';
+	return true;
+}
+
+/* Strip the summary/histogram sample suffixes, which share their family's TYPE
+ * line rather than declaring one of their own. */
+static void strip_sample_suffix(char *restrict name)
+{
+	static const char *const suffixes[] = { "_count", "_sum", "_bucket" };
+	const size_t len = strlen(name);
+	for (size_t i = 0; i < ARRAY_SIZE(suffixes); i++) {
+		const size_t slen = strlen(suffixes[i]);
+		if (len > slen && strcmp(name + len - slen, suffixes[i]) == 0) {
+			name[len - slen] = '\0';
+			return;
+		}
+	}
+}
+
+/* Start of the line following *line, or NULL at the end of the buffer. */
+static const char *next_line(const char *restrict line)
+{
+	const char *const eol = strchr(line, '\n');
+	return eol != NULL ? eol + 1 : NULL;
+}
+
+/* Prometheus requires one TYPE line per metric name and a declared type for
+ * every sample.  The per-tunnel macros derive the header and the sample lines
+ * from a single spelling of the name, but a mis-parameterized invocation would
+ * still compile -- leaving a TYPE naming a series with no samples, or samples
+ * carrying an undeclared name.  Scan the whole exposition rather than trusting
+ * any single metric. */
+T_DECLARE_CASE(test_metrics_help_type_emitted_once_per_name)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	/* Two pooled tunnels plus an anonymous one, so every family that can be
+	 * emitted is emitted, with more than one sample per name. */
+	struct tunnel *const t1 = make_established_tunnel(&fx, "peer-a", 1);
+	T_CHECK(t1 != NULL);
+	T_CHECK(pool_tunnel(&fx, t1, "peer-a"));
+	struct tunnel *const t2 = make_established_tunnel(&fx, "peer-b", 1);
+	T_CHECK(t2 != NULL);
+	T_CHECK(pool_tunnel(&fx, t2, "peer-b"));
+	struct tunnel *const anon = make_established_tunnel(&fx, "peer-c", 1);
+	T_CHECK(anon != NULL);
+	fx.srv.mux_tunnel = anon;
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+
+	/* Collected TYPE names; sized well above the emitted family count so a
+	 * newly added metric trips the T_CHECK below rather than silently
+	 * truncating the set this test validates against. */
+	char declared[64][96];
+	size_t num_declared = 0;
+	bool dup_type = false;
+	for (const char *line = rctx.buf; line != NULL;
+	     line = next_line(line)) {
+		static const char pfx[] = "# TYPE ";
+		if (strncmp(line, pfx, sizeof(pfx) - 1u) != 0) {
+			continue;
+		}
+		T_CHECK(num_declared < ARRAY_SIZE(declared));
+		char *const name = declared[num_declared];
+		T_CHECK(parse_metric_name(
+			name, sizeof(declared[0]), line + sizeof(pfx) - 1u));
+		for (size_t i = 0; i < num_declared; i++) {
+			if (strcmp(declared[i], name) == 0) {
+				T_LOGF("duplicate # TYPE for %s", name);
+				dup_type = true;
+			}
+		}
+		num_declared++;
+	}
+	T_EXPECT(!dup_type);
+	T_EXPECT(num_declared > 0);
+
+	bool undeclared_sample = false;
+	for (const char *line = strstr(rctx.buf, "\r\n\r\n"); line != NULL;
+	     line = next_line(line)) {
+		if (line[0] == '#' || line[0] == '\r' || line[0] == '\n' ||
+		    line[0] == '\0') {
+			continue;
+		}
+		char name[96];
+		if (!parse_metric_name(name, sizeof(name), line)) {
+			continue;
+		}
+		strip_sample_suffix(name);
+		bool found = false;
+		for (size_t i = 0; i < num_declared && !found; i++) {
+			found = strcmp(declared[i], name) == 0;
+		}
+		if (!found) {
+			T_LOGF("sample %s has no # TYPE line", name);
+			undeclared_sample = true;
+		}
+	}
+	T_EXPECT(!undeclared_sample);
+}
+
 T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 {
 	struct apifx fx;
@@ -1831,12 +2287,20 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 		T_FATAL("apifx_setup failed");
 	}
 
-	STORE_STAT(fx.srv.counters.num_reconnects, 7);
-	STORE_STAT(fx.srv.counters.num_rst_sent, 11);
-	STORE_STAT(fx.srv.counters.num_rst_recv, 17);
-	STORE_STAT(fx.srv.counters.num_stream_errors, 19);
-	fx.srv.counters.traffic_byt_mux_recv = 1234;
-	fx.srv.counters.traffic_byt_mux_sent = 2345;
+	/* Counters that closed tunnels left behind still show up in the totals. */
+	fx.srv.counters.closed.num_reconnects = 7;
+	fx.srv.counters.closed.traffic_byt_mux_recv = 1234;
+	fx.srv.counters.closed.traffic_byt_mux_sent = 2345;
+
+	/* The rest come from a live tunnel, poked through the session's own counter
+	 * block so the production write path is what feeds the totals. */
+	struct tunnel *const t = make_established_tunnel(&fx, "peer-cnt", 0);
+	T_CHECK(t != NULL);
+	T_CHECK(pool_tunnel(&fx, t, "peer-cnt"));
+	struct mux_session *const ss = tunnel_session(t);
+	COUNTER_ADD(ss->cnt.errors.num_rst_sent, 11);
+	COUNTER_ADD(ss->cnt.errors.num_rst_recv, 17);
+	COUNTER_ADD(ss->cnt.errors.num_stream_errors, 19);
 
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
@@ -1848,6 +2312,16 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_rst_sent_total 11"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_rst_recv_total 17"));
 	T_EXPECT(resp_contains(rctx.buf, "multiplexd_stream_errors_total 19"));
+	/* The same values are attributed to the tunnel that produced them. */
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_rst_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"rx\"} 17"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_rst_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} 11"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_stream_errors_total{identity=\"peer-cnt\",tunnel=\"1\"} 19"));
 }
 
 T_DECLARE_CASE(test_not_found_keepalive_followed_by_success)
@@ -2191,6 +2665,9 @@ T_DECLARE_CASE(test_config_put_success)
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, req);
 	T_EXPECT_EQ(parse_status(rctx.buf), 204);
+	/* RFC 7230 3.3.2 forbids Content-Length on a 204; respond_status used to
+	 * emit it unconditionally, and this is the only 204 the server produces. */
+	T_EXPECT(strstr(rctx.buf, "Content-Length") == NULL);
 
 	(void)close(fds[1]);
 	server_stop(srv);
@@ -2200,6 +2677,162 @@ T_DECLARE_CASE(test_config_put_success)
 	server_free(srv);
 	conf_free(final_conf);
 	ev_loop_destroy(loop);
+}
+
+/* RFC 7231 6.5.5: a 405 MUST carry Allow listing the resource's supported
+ * methods. respond_status emitted only Date/Connection/Content-Length, so no
+ * 405 told the client what it could have used. */
+T_DECLARE_CASE(test_method_not_allowed_carries_allow)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_DELETE);
+	T_EXPECT_EQ(parse_status(rctx.buf), 405);
+	T_EXPECT(strstr(rctx.buf, "Allow: GET\r\n") != NULL);
+
+	apifx_teardown(&fx);
+}
+
+/* /stats accepts GET and POST, so its Allow must name both -- the header is
+ * per-resource, not a single constant. */
+T_DECLARE_CASE(test_method_not_allowed_allow_is_per_resource)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_STATS_DELETE);
+	T_EXPECT_EQ(parse_status(rctx.buf), 405);
+	T_EXPECT(strstr(rctx.buf, "Allow: GET, POST\r\n") != NULL);
+
+	apifx_teardown(&fx);
+}
+
+/* /healthy was the only route dispatched without a method gate, so every
+ * method ran the health check. HEAD was the damaging case: handle_healthy
+ * answers through respond_body, so an unhealthy server returned a 503 with a
+ * body -- forbidden by RFC 7231 4.3.2, and on a kept-alive connection those
+ * bytes are parsed as the next response's status line. */
+T_DECLARE_CASE(test_healthy_rejects_non_get)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_HEAD);
+	T_EXPECT_EQ(parse_status(rctx.buf), 405);
+	T_EXPECT(strstr(rctx.buf, "Allow: GET\r\n") != NULL);
+	/* A 405 is bodiless, so nothing follows the header terminator. */
+	const char *const body = strstr(rctx.buf, "\r\n\r\n");
+	T_EXPECT(body != NULL && body[4] == '\0');
+
+	apifx_teardown(&fx);
+}
+
+T_DECLARE_CASE(test_healthy_rejects_put)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_PUT);
+	T_EXPECT_EQ(parse_status(rctx.buf), 405);
+
+	apifx_teardown(&fx);
+}
+
+/* RFC 7231 5.1.1: an origin server receiving a 100-continue expectation must
+ * answer with 100 or a final status before the body. The server used to ignore
+ * the header entirely and just wait, so curl -- which sends Expect for bodies
+ * over 1 KiB, i.e. any PEM-inlined config PUT -- ate its 1 s expect timeout on
+ * every hot reload, and a client that strictly waits hung until the API
+ * timeout with no response at all. Send the headers first, with the body
+ * withheld, and require the interim response before providing it. */
+T_DECLARE_CASE(test_expect_100_continue_gets_interim_response)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	struct config *const conf = conf_new_default();
+	T_CHECK(conf != NULL);
+	struct server *const srv = server_new(loop, conf);
+	T_CHECK(srv != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(socket_set_nonblock(fds[0]));
+	T_CHECK(socket_set_nonblock(fds[1]));
+	api_serve(&srv->api_listener, loop, fds[0], NULL);
+	struct apifx fx = { .loop = loop, .cli_fd = fds[1] };
+
+	static const char body[] = "{\"mux_connect\":\"127.0.0.1:1\"}";
+	char headers[256];
+	const int hdr_len = snprintf(
+		headers, sizeof(headers),
+		"PUT /config HTTP/1.1\r\n"
+		"Host: test\r\n"
+		"Connection: close\r\n"
+		"Expect: 100-continue\r\n"
+		"Content-Length: %zu\r\n"
+		"\r\n",
+		sizeof(body) - 1);
+	T_CHECK(hdr_len > 0 && (size_t)hdr_len < sizeof(headers));
+
+	/* Headers only: the server must answer before it has the body. */
+	struct resp_wait_ctx rctx = { .fd = fx.cli_fd, .nread = 0 };
+	int interim = -1, final = -1;
+	if (do_send(&fx, fx.cli_fd, headers, (size_t)hdr_len) == 0 &&
+	    wait_until(
+		    &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+		    resp_wait_predicate, &rctx) == 0) {
+		interim = parse_status(rctx.buf);
+	}
+	/* Provide the body the interim response invited and complete the
+	 * exchange: leaving the request half-sent would strand the connection's
+	 * api_ctx, and the final status confirms the interim did not disturb
+	 * the normal response that follows it. */
+	rctx = (struct resp_wait_ctx){ .fd = fx.cli_fd, .nread = 0 };
+	if (do_send(&fx, fx.cli_fd, body, sizeof(body) - 1) == 0 &&
+	    wait_until(
+		    &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+		    resp_wait_predicate, &rctx) == 0) {
+		final = parse_status(rctx.buf);
+	}
+
+	(void)close(fds[1]);
+	server_stop(srv);
+	struct config *const final_conf = srv->conf;
+	server_free(srv);
+	conf_free(final_conf);
+	ev_loop_destroy(loop);
+
+	T_EXPECT_EQ(interim, 100);
+	T_EXPECT_EQ(final, 204);
+}
+
+/* RFC 7231 6.5.14: an expectation the server cannot meet is refused with 417,
+ * not ignored -- ignoring leaves a client waiting for an interim response that
+ * will never come. */
+T_DECLARE_CASE(test_unknown_expectation_rejected)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_EXPECT_UNKNOWN);
+	T_EXPECT_EQ(parse_status(rctx.buf), 417);
+
+	apifx_teardown(&fx);
 }
 
 /* main */
@@ -2231,6 +2864,12 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_metrics_escapes_special_chars_in_identity),
 	T_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity),
 	T_CASE(test_stats_post_tracks_rate_deltas),
+	T_CASE(test_metrics_buffer_gauges_are_labeled),
+	T_CASE(test_metrics_stream_lifecycle_counters_are_labeled),
+	T_CASE(test_metrics_reconnects_series_skips_accepted_tunnel),
+	T_CASE(test_metrics_anonymous_tunnel_counted_in_totals_only),
+	T_CASE(test_metrics_staged_identity_tunnel_counted_in_totals),
+	T_CASE(test_metrics_help_type_emitted_once_per_name),
 	T_CASE(test_metrics_reports_non_zero_mux_counters),
 	T_CASE(test_not_found_keepalive_followed_by_success),
 	T_CASE(test_connection_close_on_non_keepalive_request),
@@ -2245,6 +2884,12 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_config_put_empty_body_rejected),
 	T_CASE(test_config_put_large_body_not_rejected_for_size),
 	T_CASE(test_config_put_success),
+	T_CASE(test_method_not_allowed_carries_allow),
+	T_CASE(test_method_not_allowed_allow_is_per_resource),
+	T_CASE(test_healthy_rejects_non_get),
+	T_CASE(test_healthy_rejects_put),
+	T_CASE(test_expect_100_continue_gets_interim_response),
+	T_CASE(test_unknown_expectation_rejected),
 	T_SUITE_END,
 };
 

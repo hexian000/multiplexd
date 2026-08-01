@@ -49,6 +49,8 @@ enum {
 
 struct api_ctx {
 	struct server *s;
+	/* Links in server::api_conns; every live context is on that list. */
+	struct api_ctx *prev_conn, *next_conn;
 	int fd;
 	ev_io w_recv, w_send;
 	ev_timer w_timeout;
@@ -57,6 +59,9 @@ struct api_ctx {
 	bool hdr_done : 1;
 	bool keepalive : 1;
 	bool content_length_seen : 1;
+	/* Client sent Expect: 100-continue and the interim response is
+	 * still owed; cleared once it has been written. */
+	bool expect_continue : 1;
 	/* Sticky OR of connection_has_close() over every Connection header, set
 	 * at parse time.  Replaces a fixed value buffer so neither a token list
 	 * longer than the buffer (dropping a trailing "close") nor a repeated
@@ -78,6 +83,14 @@ struct api_ctx {
 
 static void api_ctx_free(struct ev_loop *loop, struct api_ctx *restrict ctx)
 {
+	if (ctx->prev_conn != NULL) {
+		ctx->prev_conn->next_conn = ctx->next_conn;
+	} else {
+		ctx->s->api_conns = ctx->next_conn;
+	}
+	if (ctx->next_conn != NULL) {
+		ctx->next_conn->prev_conn = ctx->prev_conn;
+	}
 	ev_io_stop(loop, &ctx->w_recv);
 	ev_io_stop(loop, &ctx->w_send);
 	ev_timer_stop(loop, &ctx->w_timeout);
@@ -98,6 +111,7 @@ static void api_ctx_reset(struct ev_loop *loop, struct api_ctx *restrict ctx)
 	ctx->hdr_done = false;
 	ctx->keepalive = false;
 	ctx->content_length_seen = false;
+	ctx->expect_continue = false;
 	ctx->close_requested = false;
 	ctx->content_length = 0;
 	BUF_RESET(ctx->wbuf);
@@ -169,7 +183,11 @@ static size_t http_date_safe(char *restrict buf, const size_t buf_size)
 }
 
 /* Writes an HTTP response with the given status code and empty body. */
-static void respond_status(struct api_ctx *restrict ctx, const int code)
+/* Emit a bodiless response.  @p allow, when non-NULL, is the comma-separated
+ * method list for the Allow header RFC 7231 6.5.5 requires on a 405. */
+static void respond_status_allow(
+	struct api_ctx *restrict ctx, const int code,
+	const char *restrict allow)
 {
 	char date_str[32];
 	const size_t date_len = http_date_safe(date_str, sizeof(date_str));
@@ -185,11 +203,23 @@ static void respond_status(struct api_ctx *restrict ctx, const int code)
 		ctx->wbuf,
 		"HTTP/1.1 %d %s\r\n"
 		"Date: %.*s\r\n"
-		"Connection: %s\r\n"
-		"Content-Length: 0\r\n"
-		"\r\n",
+		"Connection: %s\r\n",
 		code, status ? status : "", (int)date_len, date_str,
 		ctx->keepalive ? "keep-alive" : "close");
+	if (allow != NULL) {
+		BUF_APPENDF(ctx->wbuf, "Allow: %s\r\n", allow);
+	}
+	/* RFC 7230 3.3.2 forbids Content-Length on a 204; every other bodiless
+	 * response declares its empty body explicitly. */
+	if (code != HTTP_NO_CONTENT) {
+		BUF_APPENDSTR(ctx->wbuf, "Content-Length: 0\r\n");
+	}
+	BUF_APPENDSTR(ctx->wbuf, "\r\n");
+}
+
+static void respond_status(struct api_ctx *restrict ctx, const int code)
+{
+	respond_status_allow(ctx, code, NULL);
 }
 
 /* Writes a response with the given status code and headers only; the body is
@@ -223,78 +253,6 @@ static void respond_ok(
 	const size_t body_len)
 {
 	respond_body(ctx, HTTP_OK, content_type, body_len);
-}
-
-/* A peer identity is peer-controlled (config or PUT /config) and only
- * NUL-excluded per spec (doc/spec.md 5.2.3.2), so it may contain quotes,
- * backslashes, newlines, or other control bytes. Escape those before
- * interpolating into a Prometheus label value or a plaintext status line, or a
- * crafted identity could corrupt the /metrics exposition or inject spoofed
- * /stats /healthy lines. Max identity is 255 octets; a plaintext control byte
- * escapes to \xNN (4 bytes, the worst case -- the metric context never exceeds
- * 2x), plus a NUL. */
-enum { IDENTITY_ESCAPED_MAX = 4 * 255 + 1 };
-
-/* escape_identity target. The Prometheus 0.0.4 text format accepts only \\, \",
- * and \n as backslash escapes inside a label value; any other escape (e.g. \t
- * or \r) is an "invalid escape sequence" that makes the whole scrape
- * unparseable, so TAB and CR are emitted literally there -- both are valid
- * label-value bytes. A plaintext status line has no such grammar, so it escapes
- * every control byte: TAB and CR as \t and \r, and any other C0 byte (e.g. ESC)
- * as an inert \xNN -- denying a crafted identity the terminal cursor motion it
- * could otherwise use to spoof a status row. */
-enum escape_ctx { ESCAPE_METRIC, ESCAPE_PLAIN };
-
-static void escape_identity(
-	char *restrict out, const size_t outsize, const char *restrict in,
-	const enum escape_ctx ctx)
-{
-	size_t o = 0;
-	for (size_t i = 0; in[i] != '\0'; i++) {
-		const unsigned char c = (unsigned char)in[i];
-		char esc = '\0';
-		switch (c) {
-		case '\\':
-		case '"':
-			esc = (char)c;
-			break;
-		case '\n':
-			esc = 'n';
-			break;
-		case '\t':
-			esc = ctx == ESCAPE_PLAIN ? 't' : '\0';
-			break;
-		case '\r':
-			esc = ctx == ESCAPE_PLAIN ? 'r' : '\0';
-			break;
-		default:
-			break;
-		}
-		if (esc != '\0') {
-			if (o + 2 >= outsize) {
-				break;
-			}
-			out[o++] = '\\';
-			out[o++] = esc;
-		} else if (ctx == ESCAPE_PLAIN && c < 0x20) {
-			/* Any remaining C0 control byte (e.g. ESC) would let a
-			 * crafted identity drive terminal cursor motion in the
-			 * plaintext status output; emit an inert \xNN escape. */
-			if (o + 4 >= outsize) {
-				break;
-			}
-			out[o++] = '\\';
-			out[o++] = 'x';
-			tohexlower(&out[o], c);
-			o += 2;
-		} else {
-			if (o + 1 >= outsize) {
-				break;
-			}
-			out[o++] = (char)c;
-		}
-	}
-	out[o] = '\0';
 }
 
 /* Active session count = created - finalized, clamped to 0. server_stats reads
@@ -509,7 +467,7 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 
 	struct server *const restrict s = ctx->s;
 	const struct config *const restrict conf = s->conf;
-	struct server_stats *const restrict stats = server_stats(s);
+	struct server_stats *const restrict stats = server_stats(s, false);
 	if (stats == NULL) {
 		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
 		return;
@@ -729,6 +687,14 @@ static struct vbuffer *append_stream_metrics(
 		"stream_fastopen_total", "counter",
 		"Total active-open streams whose first flight used SYN|PUSH",
 		"%" PRIuLEAST64, stats->num_stream_fastopen);
+	APPEND_METRIC(
+		"stream_succeeded_total", "counter",
+		"Total streams closed after a successful exchange",
+		"%" PRIuLEAST64, stats->num_stream_succeeded);
+	APPEND_METRIC(
+		"stream_failed_total", "counter",
+		"Total streams closed without a successful exchange",
+		"%" PRIuLEAST64, stats->num_stream_failed);
 	APPEND_METRIC_HDR(
 		"stream_establish_latency_seconds", "summary",
 		"Active-open stream establishment latency from SYN to SYN|ACK");
@@ -748,11 +714,12 @@ static struct vbuffer *append_stream_metrics(
 	}
 	APPEND_METRIC_VAL(
 		"stream_establish_latency_seconds_count", "%" PRIuLEAST64,
-		stats->num_stream_established);
+		stats->num_stream_establish_samples);
 	return cbuf;
 }
 
-/* Appends connection-lifecycle and error/backlog counters. */
+/* Appends connection-lifecycle and error/backlog counters, plus the
+ * recv_buffered_bytes / send_buffered_frames / unacked_frames gauges. */
 static struct vbuffer *append_connection_metrics(
 	struct vbuffer *restrict cbuf,
 	const struct server_stats *restrict stats)
@@ -803,70 +770,142 @@ static struct vbuffer *append_connection_metrics(
 	return cbuf;
 }
 
-/* Appends all per-tunnel Prometheus metrics. */
-static struct vbuffer *append_tunnel_metrics(
-	struct vbuffer *restrict cbuf,
+/* offset[] entry for a tunnel with no identity pool: it is anonymous and emits
+ * no labeled series at all. */
+#define NO_LABEL SIZE_MAX
+
+/* The identity/tunnel label set each per-tunnel series carries, built once per
+ * scrape for every stats->tunnels[] entry.  Every family below interpolates the
+ * same pair, so building it here replaces the escape_identity() call and index
+ * conversion that each family otherwise repeated for every tunnel it emitted.
+ *
+ * The Prometheus 0.0.4 text format requires all samples of a metric to form one
+ * group under a single HELP/TYPE pair, so the families must stay separate
+ * passes and cannot be merged into one pass per tunnel. */
+struct tunnel_labels {
+	/* label sets packed back to back, each NUL-terminated */
+	struct vbuffer *buf;
+	/* per-tunnel offset into buf, or NO_LABEL; NULL when num_tunnels == 0 */
+	size_t *offset;
+};
+
+static void tunnel_labels_free(struct tunnel_labels *restrict labels)
+{
+	VBUF_FREE(labels->buf);
+	free(labels->offset);
+	labels->offset = NULL;
+}
+
+/* Build the label sets for stats->tunnels[].  On failure *labels is still safe
+ * to pass to tunnel_labels_free(). */
+static bool tunnel_labels_build(
+	struct tunnel_labels *restrict labels,
 	const struct server_stats *restrict stats)
 {
-/* Emit a paired rx/tx sample (one series per direction) for every kept
- * tunnel. The metric name is spelled once (@p name): the header and both
- * sample lines all derive their "multiplexd_<name>" prefix from it via the
- * runtime %s, so # TYPE and the samples cannot silently diverge. @p valfmt is
- * the value's printf conversion (a string literal, e.g. "%zu"). */
-#define APPEND_TUNNEL_METRIC_RXTX(                                                     \
-	name, help, type, valfmt, keep_cond, rx_val, tx_val)                           \
-	do {                                                                           \
-		bool hdr = false;                                                      \
-		for (size_t i = 0; i < stats->num_tunnels; i++) {                      \
-			const struct tunnel_stats *restrict t =                        \
-				&stats->tunnels[i];                                    \
-			if (!(keep_cond) || t->peer_identity == NULL) {                \
-				continue;                                              \
-			}                                                              \
-			if (!hdr) {                                                    \
-				APPEND_METRIC_HDR(name, type, help);                   \
-				hdr = true;                                            \
-			}                                                              \
-			char esc_id[IDENTITY_ESCAPED_MAX];                             \
-			escape_identity(                                               \
-				esc_id, sizeof(esc_id), t->peer_identity,              \
-				ESCAPE_METRIC);                                        \
-			VBUF_APPENDF(                                                  \
-				cbuf,                                                  \
-				"multiplexd_%s{identity=\"%s\",tunnel=\"%" PRIuLEAST64 \
-				"\",direction=\"rx\"} " valfmt "\n"                    \
-				"multiplexd_%s{identity=\"%s\",tunnel=\"%" PRIuLEAST64 \
-				"\",direction=\"tx\"} " valfmt "\n",                   \
-				name, esc_id, t->tunnel_index, (rx_val), name,         \
-				esc_id, t->tunnel_index, (tx_val));                    \
-		}                                                                      \
-	} while (0)
+	labels->buf = NULL;
+	labels->offset = NULL;
+	if (stats->num_tunnels == 0) {
+		return true;
+	}
+	size_t *const restrict offset =
+		malloc(stats->num_tunnels * sizeof(offset[0]));
+	if (offset == NULL) {
+		LOGOOM();
+		return false;
+	}
+	labels->offset = offset;
+	struct vbuffer *buf = VBUF_NEW(256);
+	if (buf == NULL) {
+		LOGOOM();
+		return false;
+	}
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		const struct tunnel_stats *const restrict t =
+			&stats->tunnels[i];
+		if (t->peer_identity == NULL) {
+			offset[i] = NO_LABEL;
+			continue;
+		}
+		char esc_id[IDENTITY_ESCAPED_MAX];
+		escape_identity(
+			esc_id, sizeof(esc_id), t->peer_identity,
+			ESCAPE_METRIC);
+		offset[i] = VBUF_LEN(buf);
+		VBUF_APPENDF(
+			buf, "identity=\"%s\",tunnel=\"%" PRIuLEAST64 "\"",
+			esc_id, t->tunnel_index);
+		/* VBUF_APPENDF keeps its trailing NUL outside len, where the
+		 * next append overwrites it; terminate each set explicitly. */
+		VBUF_APPEND(buf, "", 1);
+	}
+	/* Assigned after the loop: every append above may reallocate buf. */
+	labels->buf = buf;
+	if (VBUF_HAS_OOM(buf)) {
+		LOGOOM();
+		return false;
+	}
+	return true;
+}
 
-#define APPEND_TUNNEL_METRIC(name, help, extra_skip, fmt, val, keep_cond)      \
+/* The per-tunnel metric emitters below share these macros.  Each expects the
+ * enclosing function to name its parameters cbuf, stats and labels. */
+
+/* Walk the kept tunnels of one metric, running @p body for each with t and lbl
+ * in scope. The metric name is spelled once (@p name): the header and every
+ * sample line derive their "multiplexd_<name>" prefix from it via the runtime
+ * %s, so # TYPE and the samples cannot silently diverge. The header is emitted
+ * lazily, so a metric with no kept tunnel emits nothing at all. */
+#define TUNNEL_METRIC_FOREACH(name, help, type, keep_cond, body)               \
 	do {                                                                   \
 		bool hdr = false;                                              \
 		for (size_t i = 0; i < stats->num_tunnels; i++) {              \
 			const struct tunnel_stats *restrict t =                \
 				&stats->tunnels[i];                            \
-			if (!(keep_cond) || t->peer_identity == NULL ||        \
-			    (extra_skip)) {                                    \
+			if (labels->offset[i] == NO_LABEL || !(keep_cond)) {   \
 				continue;                                      \
 			}                                                      \
 			if (!hdr) {                                            \
-				APPEND_METRIC_HDR(name, "gauge", help);        \
+				APPEND_METRIC_HDR(name, type, help);           \
 				hdr = true;                                    \
 			}                                                      \
-			char esc_id[IDENTITY_ESCAPED_MAX];                     \
-			escape_identity(                                       \
-				esc_id, sizeof(esc_id), t->peer_identity,      \
-				ESCAPE_METRIC);                                \
-			APPEND_METRIC_L(                                       \
-				name,                                          \
-				"identity=\"%s\",tunnel=\"%" PRIuLEAST64 "\"", \
-				fmt, esc_id, t->tunnel_index, (val));          \
+			const char *const lbl =                                \
+				(const char *)VBUF_DATA(labels->buf) +         \
+				labels->offset[i];                             \
+			body;                                                  \
 		}                                                              \
 	} while (0)
 
+/* Emit one sample per kept tunnel. @p valfmt is the value's printf conversion
+ * (a string literal, e.g. "%zu"). */
+#define APPEND_TUNNEL_METRIC(name, help, type, valfmt, keep_cond, val)         \
+	TUNNEL_METRIC_FOREACH(                                                 \
+		name, help, type, keep_cond,                                   \
+		APPEND_METRIC_L(name, "%s", valfmt, lbl, (val)))
+
+/* Emit a paired rx/tx sample (one series per direction) per kept tunnel. */
+#define APPEND_TUNNEL_METRIC_RXTX(                                             \
+	name, help, type, valfmt, keep_cond, rx_val, tx_val)                   \
+	TUNNEL_METRIC_FOREACH(                                                 \
+		name, help, type, keep_cond,                                   \
+		VBUF_APPENDF(                                                  \
+			cbuf,                                                  \
+			"multiplexd_%s{%s,direction=\"rx\"} " valfmt "\n"      \
+			"multiplexd_%s{%s,direction=\"tx\"} " valfmt "\n",     \
+			name, lbl, (rx_val), name, lbl, (tx_val)))
+
+/* One quantile sample of the per-tunnel establishment-latency summary. */
+#define APPEND_TUNNEL_QUANTILE(q, val)                                         \
+	APPEND_METRIC_L(                                                       \
+		"session_stream_establish_latency_seconds",                    \
+		"%s,quantile=\"%s\"", "%g", lbl, q, (double)(val) * 1e-9)
+
+/* Appends the per-tunnel view of the mux link itself: bytes carried, and the
+ * flow-control state governing them. */
+static struct vbuffer *append_session_link_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats,
+	const struct tunnel_labels *restrict labels)
+{
 	APPEND_TUNNEL_METRIC_RXTX(
 		"session_bytes_total",
 		"Wire bytes on the mux link per identity session", "counter",
@@ -882,16 +921,139 @@ static struct vbuffer *append_tunnel_metrics(
 		t->established, t->rx_window, t->tx_window);
 	APPEND_TUNNEL_METRIC(
 		"session_rtt_seconds", "Round-trip time per identity session",
-		t->rtt_ns <= 0, "%g", (double)t->rtt_ns * 1e-9, t->established);
+		"gauge", "%g", t->established && t->rtt_ns > 0,
+		(double)t->rtt_ns * 1e-9);
 	APPEND_TUNNEL_METRIC_RXTX(
 		"session_bdp_bytes",
 		"Bandwidth-delay product per identity session", "gauge", "%zu",
 		t->established && (t->bdp_rx != 0 || t->bdp_tx != 0), t->bdp_rx,
 		t->bdp_tx);
+	return cbuf;
+}
 
+/* Appends the per-tunnel stream lifecycle counters and the establishment-latency
+ * summary. */
+static struct vbuffer *append_session_stream_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats,
+	const struct tunnel_labels *restrict labels)
+{
+	APPEND_TUNNEL_METRIC(
+		"session_streams", "Active mux streams per identity session",
+		"gauge", "%zu", true, t->num_streams);
+	APPEND_TUNNEL_METRIC(
+		"session_streams_halfopen",
+		"Half-open mux streams per identity session", "gauge", "%zu",
+		true, t->num_stream_halfopen);
+	APPEND_TUNNEL_METRIC(
+		"session_stream_open_total",
+		"Active-open stream creations per identity session", "counter",
+		"%" PRIuLEAST64, true, t->num_stream_opened);
+	APPEND_TUNNEL_METRIC(
+		"session_stream_accept_total",
+		"Passive-open stream creations per identity session", "counter",
+		"%" PRIuLEAST64, true, t->num_stream_accepted);
+	APPEND_TUNNEL_METRIC(
+		"session_stream_fastopen_total",
+		"Active-open streams whose first flight used SYN|PUSH per identity session",
+		"counter", "%" PRIuLEAST64, true, t->num_stream_fastopen);
+	APPEND_TUNNEL_METRIC(
+		"session_stream_succeeded_total",
+		"Streams closed after a successful exchange per identity session",
+		"counter", "%" PRIuLEAST64, true, t->num_stream_succeeded);
+	APPEND_TUNNEL_METRIC(
+		"session_stream_failed_total",
+		"Streams closed without a successful exchange per identity session",
+		"counter", "%" PRIuLEAST64, true, t->num_stream_failed);
+	return cbuf;
+}
+
+/* Appends the per-tunnel establishment-latency summary.  Quantiles come from the
+ * tunnel's bounded latency ring, so they appear only once it holds a sample.
+ * The _count is stream_establish_count, the monotonic number of observations
+ * the quantiles summarize -- not num_stream_established, which also counts the
+ * passive opens the ring never observes.  There is no _sum: the ring is a
+ * sliding window and cannot produce one. */
+static struct vbuffer *append_session_latency_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats,
+	const struct tunnel_labels *restrict labels)
+{
+	TUNNEL_METRIC_FOREACH(
+		"session_stream_establish_latency_seconds",
+		"Active-open stream establishment latency from SYN to SYN|ACK per identity session",
+		"summary", true, {
+			if (t->stream_establish_count > 0) {
+				APPEND_TUNNEL_QUANTILE(
+					"0.5", t->stream_establish_p50);
+				APPEND_TUNNEL_QUANTILE(
+					"0.9", t->stream_establish_p90);
+				APPEND_TUNNEL_QUANTILE(
+					"0.99", t->stream_establish_p99);
+			}
+			APPEND_METRIC_L(
+				"session_stream_establish_latency_seconds_count",
+				"%s", "%zu", lbl, t->stream_establish_count);
+		});
+	return cbuf;
+}
+
+/* Appends the per-tunnel error counters and buffer-occupancy gauges. */
+static struct vbuffer *append_session_health_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats,
+	const struct tunnel_labels *restrict labels)
+{
+	/* Dialed sessions only: an accepted one never reconnects, so emitting it
+	 * there would add a series that is zero for the tunnel's whole life. */
+	APPEND_TUNNEL_METRIC(
+		"session_reconnects_total",
+		"Reconnect attempts per identity session", "counter",
+		"%" PRIuLEAST64, !t->accepted, t->num_reconnects);
+	APPEND_TUNNEL_METRIC_RXTX(
+		"session_rst_total", "RST frames per identity session",
+		"counter", "%" PRIuLEAST64, true, t->num_rst_recv,
+		t->num_rst_sent);
+	APPEND_TUNNEL_METRIC(
+		"session_stream_errors_total",
+		"Streams aborted due to local I/O errors per identity session",
+		"counter", "%" PRIuLEAST64, true, t->num_stream_errors);
+	APPEND_TUNNEL_METRIC(
+		"session_recv_buffered_bytes",
+		"Bytes buffered in per-stream receive rings per identity session",
+		"gauge", "%zu", true, t->recv_buffered_bytes);
+	APPEND_TUNNEL_METRIC(
+		"session_send_buffered_frames",
+		"Frames queued in per-stream send buffers per identity session",
+		"gauge", "%zu", true, t->send_buffered_frames);
+	APPEND_TUNNEL_METRIC(
+		"session_unacked_frames",
+		"Frames held in the session unacked list (spec §5.7.2) per identity session",
+		"gauge", "%zu", true, t->unacked_frames);
+	return cbuf;
+}
+
+#undef APPEND_TUNNEL_QUANTILE
 #undef APPEND_TUNNEL_METRIC_RXTX
 #undef APPEND_TUNNEL_METRIC
+#undef TUNNEL_METRIC_FOREACH
+#undef NO_LABEL
 
+/* Appends all per-tunnel Prometheus metrics.
+ *
+ * Every series here is scoped to one identity session and carries the
+ * identity/tunnel label pair.  A tunnel with no identity pool is anonymous: it
+ * gets no series and shows up only in the unlabeled process-wide totals emitted
+ * by the functions above. */
+static struct vbuffer *append_tunnel_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats,
+	const struct tunnel_labels *restrict labels)
+{
+	cbuf = append_session_link_metrics(cbuf, stats, labels);
+	cbuf = append_session_stream_metrics(cbuf, stats, labels);
+	cbuf = append_session_latency_metrics(cbuf, stats, labels);
+	cbuf = append_session_health_metrics(cbuf, stats, labels);
 	return cbuf;
 }
 
@@ -899,8 +1061,17 @@ static struct vbuffer *append_tunnel_metrics(
 static void handle_metrics(struct api_ctx *restrict ctx)
 {
 	struct server *const restrict s = ctx->s;
-	struct server_stats *const restrict stats = server_stats(s);
+	/* The only route exposing the per-tunnel establishment-latency
+	 * quantiles, so the only one that pays to derive them. */
+	struct server_stats *const restrict stats = server_stats(s, true);
 	if (stats == NULL) {
+		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
+		return;
+	}
+	struct tunnel_labels labels;
+	if (!tunnel_labels_build(&labels, stats)) {
+		tunnel_labels_free(&labels);
+		free(stats);
 		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
 		return;
 	}
@@ -923,7 +1094,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	cbuf = append_gauge_metrics(cbuf, stats, uptime);
 	cbuf = append_stream_metrics(cbuf, stats);
 	cbuf = append_connection_metrics(cbuf, stats);
-	cbuf = append_tunnel_metrics(cbuf, stats);
+	cbuf = append_tunnel_metrics(cbuf, stats, &labels);
 	{
 		struct timespec cpu_ts;
 		if (clock_process(&cpu_ts)) {
@@ -939,6 +1110,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 		freelocale(c_numeric);
 	}
 
+	tunnel_labels_free(&labels);
 	ctx->cbuf = cbuf;
 	if (VBUF_HAS_OOM(ctx->cbuf)) {
 		free(stats);
@@ -1020,11 +1192,21 @@ static void api_handle(struct api_ctx *restrict ctx)
 		} else if (strcmp(method, "PUT") == 0) {
 			handle_config_put(ctx);
 		} else {
-			respond_status(ctx, HTTP_METHOD_NOT_ALLOWED);
+			respond_status_allow(
+				ctx, HTTP_METHOD_NOT_ALLOWED, "GET, PUT");
 		}
 		return;
 	}
 	if (strcmp(path, "healthy") == 0) {
+		/* Gated like its siblings: without this every method ran the
+		 * health check, and HEAD got a 503 carrying respond_body's
+		 * offline-listener lines -- forbidden by RFC 7231 4.3.2, and on a
+		 * kept-alive connection those bytes desynchronize framing. */
+		if (strcmp(method, "GET") != 0) {
+			respond_status_allow(
+				ctx, HTTP_METHOD_NOT_ALLOWED, "GET");
+			return;
+		}
 		handle_healthy(ctx);
 		return;
 	}
@@ -1035,7 +1217,8 @@ static void api_handle(struct api_ctx *restrict ctx)
 		} else if (strcmp(method, "POST") == 0) {
 			stateless = false;
 		} else {
-			respond_status(ctx, HTTP_METHOD_NOT_ALLOWED);
+			respond_status_allow(
+				ctx, HTTP_METHOD_NOT_ALLOWED, "GET, POST");
 			return;
 		}
 		handle_stats(ctx, stateless, parsed_url.query);
@@ -1045,7 +1228,8 @@ static void api_handle(struct api_ctx *restrict ctx)
 		if (strcmp(method, "GET") == 0) {
 			handle_metrics(ctx);
 		} else {
-			respond_status(ctx, HTTP_METHOD_NOT_ALLOWED);
+			respond_status_allow(
+				ctx, HTTP_METHOD_NOT_ALLOWED, "GET");
 		}
 		return;
 	}
@@ -1132,6 +1316,28 @@ static void send_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			api_ctx_free(loop, ctx);
 		}
 	}
+}
+
+/* Write the interim 100 Continue. Not routed through wbuf/send_cb: those own
+ * the final response and tear the connection down after it, while this is
+ * interim and reading continues. Returns false only when the message was left
+ * half-written, which cannot be recovered -- a truncated status line would
+ * desync the client's parser; having written nothing is survivable, and just
+ * leaves the client to its own expect timeout as before. */
+static bool send_continue(struct api_ctx *restrict ctx)
+{
+	static const char msg[] = "HTTP/1.1 100 Continue\r\n\r\n";
+	size_t off = 0;
+	while (off < sizeof(msg) - 1) {
+		size_t n = sizeof(msg) - 1 - off;
+		const int err = socket_send(
+			ctx->fd, (const unsigned char *)msg + off, &n);
+		if (err != 0 || n == 0) {
+			return off == 0;
+		}
+		off += n;
+	}
+	return true;
 }
 
 static void
@@ -1231,6 +1437,17 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			}
 			ctx->content_length = (size_t)cl;
 			ctx->content_length_seen = true;
+		} else if (strcasecmp(key, "Expect") == 0) {
+			/* RFC 7231 5.1.1: 100-continue is the only defined
+			 * expectation, and 6.5.14 says an unsupported one gets
+			 * 417 rather than being ignored -- ignoring it leaves a
+			 * client that waits for the interim response hanging
+			 * until the API timeout. */
+			if (strcasecmp(value, "100-continue") != 0) {
+				recv_error(loop, ctx, HTTP_EXPECTATION_FAILED);
+				return;
+			}
+			ctx->expect_continue = true;
 		} else if (strcasecmp(key, "Transfer-Encoding") == 0) {
 			/* RFC 7230 3.3.3: reject a transfer-coding this server
 			 * cannot decode instead of misparsing the body. */
@@ -1251,6 +1468,17 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			return;
 		}
 		if (ctx->rbuf.len - body_off < ctx->content_length) {
+			/* About to wait: the client is owed its interim response
+			 * now. Deferred to here so the 413 above can be sent as
+			 * a final status instead, and so a body that already
+			 * arrived with the headers needs no interim at all. */
+			if (ctx->expect_continue) {
+				ctx->expect_continue = false;
+				if (!send_continue(ctx)) {
+					api_ctx_free(loop, ctx);
+					return;
+				}
+			}
 			return; /* wait for more body data */
 		}
 	}
@@ -1308,6 +1536,12 @@ static struct api_ctx *api_ctx_new(struct server *restrict s, const int fd)
 	ctx->w_send.data = ctx;
 	ev_timer_init(&ctx->w_timeout, timeout_cb, 0.0, API_TIMEOUT);
 	ctx->w_timeout.data = ctx;
+
+	ctx->next_conn = s->api_conns;
+	if (ctx->next_conn != NULL) {
+		ctx->next_conn->prev_conn = ctx;
+	}
+	s->api_conns = ctx;
 	return ctx;
 }
 
@@ -1325,4 +1559,14 @@ void api_serve(
 	s->counters.num_served_api++;
 	ev_io_start(loop, &ctx->w_recv);
 	ev_timer_again(loop, &ctx->w_timeout);
+}
+
+void api_server_stop(struct server *s, struct ev_loop *loop)
+{
+	/* Freeing the head unlinks it, so s->api_conns ends up NULL. */
+	struct api_ctx *next;
+	for (struct api_ctx *ctx = s->api_conns; ctx != NULL; ctx = next) {
+		next = ctx->next_conn;
+		api_ctx_free(loop, ctx);
+	}
 }
