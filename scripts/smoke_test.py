@@ -689,18 +689,61 @@ def build_plain_client(
     }
 
 
-def build_identity_server(
+def _psk(peer: str, key_file: str) -> Dict[str, object]:
+    return {"psk": {peer: "@%s" % key_file}}
+
+
+def build_psk_server(
     *, mux_port: int, echo_port: int, reverse_listen: int, api_port: int,
-    window: Optional[int], loglevel: int,
+    key_file: str, loglevel: int,
 ) -> Dict[str, object]:
     return {
         "mux_listen": "127.0.0.1:%d" % mux_port,
         "connect": "127.0.0.1:%d" % echo_port,
         "api_listen": "127.0.0.1:%d" % api_port,
         "identity": {
-            "claim": "server",
-            "listen": {"client": "127.0.0.1:%d" % reverse_listen},
+            "claim": "psk-hub",
+            "listen": {"psk-spoke": "127.0.0.1:%d" % reverse_listen},
         },
+        "tls": _psk("psk-spoke", key_file),
+        "mux": _mux(None),
+        "loglevel": loglevel,
+    }
+
+
+def build_psk_client(
+    *, mux_port: int, echo_port: int, forward_listen: int, api_port: int,
+    key_file: str, claim: str, loglevel: int,
+) -> Dict[str, object]:
+    return {
+        "connect": "127.0.0.1:%d" % echo_port,
+        "api_listen": "127.0.0.1:%d" % api_port,
+        "identity": {
+            "claim": claim,
+            "mux_connect": ["127.0.0.1:%d" % mux_port],
+            "listen": {"psk-hub": "127.0.0.1:%d" % forward_listen},
+        },
+        "tls": _psk("psk-hub", key_file),
+        "mux": _mux(None),
+        "loglevel": loglevel,
+    }
+
+
+def build_identity_server(
+    *, mux_port: int, echo_port: int, reverse_listen: int, api_port: int,
+    window: Optional[int], loglevel: int, verify: bool = False,
+) -> Dict[str, object]:
+    identity: Dict[str, object] = {
+        "claim": "server",
+        "listen": {"client": "127.0.0.1:%d" % reverse_listen},
+    }
+    if verify:
+        identity["verify"] = True
+    return {
+        "mux_listen": "127.0.0.1:%d" % mux_port,
+        "connect": "127.0.0.1:%d" % echo_port,
+        "api_listen": "127.0.0.1:%d" % api_port,
+        "identity": identity,
         "tls": _tls("server", "client"),
         "mux": _mux(window),
         "loglevel": loglevel,
@@ -710,15 +753,19 @@ def build_identity_server(
 def build_identity_client(
     *, mux_port: int, echo_port: int, forward_listen: int, api_port: int,
     tunnels: int, window: Optional[int], loglevel: int,
+    verify: bool = False, claim: str = "client",
 ) -> Dict[str, object]:
+    identity: Dict[str, object] = {
+        "claim": claim,
+        "mux_connect": ["127.0.0.1:%d" % mux_port] * tunnels,
+        "listen": {"server": "127.0.0.1:%d" % forward_listen},
+    }
+    if verify:
+        identity["verify"] = True
     return {
         "connect": "127.0.0.1:%d" % echo_port,
         "api_listen": "127.0.0.1:%d" % api_port,
-        "identity": {
-            "claim": "client",
-            "mux_connect": ["127.0.0.1:%d" % mux_port] * tunnels,
-            "listen": {"server": "127.0.0.1:%d" % forward_listen},
-        },
+        "identity": identity,
         "tls": _tls("client", "server"),
         "mux": _mux(window),
         "loglevel": loglevel,
@@ -757,6 +804,15 @@ class Daemons:
         log("+ %s" % quote_command(cmd))
         return subprocess.Popen(
             cmd, cwd=str(self.log_dir), stdout=fh, stderr=subprocess.STDOUT)
+
+    def spawn(self) -> None:
+        """Start both processes without waiting for either to become healthy.
+
+        For scenarios where one peer is expected to stay offline, so start()'s
+        health gate would report the intended outcome as a failure.
+        """
+        self.server = self._spawn(self._server_cfg, "server")
+        self.client = self._spawn(self._client_cfg, "client")
 
     def start(self) -> bool:
         self.server = self._spawn(self._server_cfg, "server")
@@ -1435,6 +1491,209 @@ def run_load_topology(binary: Path, log_dir: Path, suite: Suite,
         er.stop()
 
 
+def run_psk_topology(binary: Path, log_dir: Path, suite: Suite,
+                     rng: random.Random, sizes: Sizes, *,
+                     loglevel: int) -> None:
+    """External-PSK mode: no certificate is sent in either direction.
+
+    Unlike the certificate scenarios this runs on every TLS backend, because
+    --genpsk needs only randomness and the label derivation.
+    """
+    key_file = "smoke~psk.psk"
+    if not (log_dir / key_file).exists():
+        cmd = [str(binary), "--genpsk", "smoke~psk"]
+        log("+ %s" % quote_command(cmd))
+        r = subprocess.run(cmd, cwd=str(log_dir), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=30.0)
+        if r.returncode != 0:
+            suite.results.append(ScenarioResult(
+                "psk_genkey", False, r.stderr.decode(errors="replace")[:200],
+                0.0, "FAIL"))
+            return
+
+    # --- honest pair -------------------------------------------------------
+    (echo_f, echo_r, mux, srv_api, cli_api, fwd, rev) = free_ports(7)
+    ef, er = EchoServer(echo_f, "k-echo-fwd"), EchoServer(echo_r, "k-echo-rev")
+    ef.start()
+    er.start()
+    daemons = Daemons(
+        binary, log_dir,
+        server_cfg=build_psk_server(
+            mux_port=mux, echo_port=echo_f, reverse_listen=rev,
+            api_port=srv_api, key_file=key_file, loglevel=loglevel),
+        client_cfg=build_psk_client(
+            mux_port=mux, echo_port=echo_r, forward_listen=fwd,
+            api_port=cli_api, key_file=key_file, claim="psk-spoke",
+            loglevel=loglevel),
+        server_api=srv_api, client_api=cli_api, tag="psk-ok")
+    try:
+        if not daemons.start():
+            suite.results.append(ScenarioResult(
+                "psk_match", False, "daemons not healthy", 0.0, "FAIL"))
+        else:
+            suite.run("psk_match", lambda: scen_integrity(
+                fwd, rng, sizes.stream_msg, "forward"))
+    finally:
+        daemons.shutdown()
+        ef.stop()
+        er.stop()
+
+    # --- impostor: same key, a claim it does not own -----------------------
+    (echo_f2, echo_r2, mux2, srv_api2, cli_api2, fwd2, rev2) = free_ports(7)
+    ef2 = EchoServer(echo_f2, "k-echo-fwd2")
+    er2 = EchoServer(echo_r2, "k-echo-rev2")
+    ef2.start()
+    er2.start()
+    bad = Daemons(
+        binary, log_dir,
+        server_cfg=build_psk_server(
+            mux_port=mux2, echo_port=echo_f2, reverse_listen=rev2,
+            api_port=srv_api2, key_file=key_file, loglevel=loglevel),
+        client_cfg=build_psk_client(
+            mux_port=mux2, echo_port=echo_r2, forward_listen=fwd2,
+            api_port=cli_api2, key_file=key_file, claim="impostor",
+            loglevel=loglevel),
+        server_api=srv_api2, client_api=cli_api2, tag="psk-bad")
+
+    def mismatch() -> Tuple[bool, str]:
+        # Both peers own a forwarding listener, so with the impostor refused
+        # neither reports healthy; observe the steady state instead of gating
+        # on wait_healthy.
+        bad.spawn()
+        assert bad.server is not None and bad.client is not None
+        deadline = time.monotonic() + 15.0
+        server_log = log_dir / "psk-bad-server.log"
+        rejected = False
+        while time.monotonic() < deadline and not rejected:
+            if bad.server.poll() is not None:
+                return False, "server exited (%s)" % bad.server.returncode
+            if bad.client.poll() is not None:
+                return False, "client exited (%s)" % bad.client.returncode
+            try:
+                rejected = "authenticated with the key of" in \
+                    server_log.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+            if not rejected:
+                time.sleep(0.2)
+        if not rejected:
+            return False, "server never rejected the mismatched claim"
+        status, _body = api_request(cli_api2, "/healthy")
+        if status == 200:
+            return False, "impostor established a tunnel anyway"
+        return True, ("claim refused despite a valid key; client "
+                      "/healthy=%d" % status)
+
+    try:
+        suite.run("psk_mismatch", mismatch)
+    finally:
+        bad.kill()
+        ef2.stop()
+        er2.stop()
+
+
+def run_identity_verify_topology(binary: Path, log_dir: Path, suite: Suite,
+                                 rng: random.Random, sizes: Sizes, *,
+                                 window: Optional[int], loglevel: int) -> None:
+    """identity.verify end to end: the claim must be named by the certificate.
+
+    Relies on the caller's --identity server,client pairing, which is exactly
+    what the identity topology claims, so the honest pair needs no extra
+    certificates.  The caller only invokes this when --gencerts produced the
+    certificate set.
+    """
+    # --- honest peer: claim matches the certificate, traffic flows ----------
+    (echo_f, echo_r, mux, srv_api, cli_api, fwd_listen,
+     rev_listen) = free_ports(7)
+    log("identity-verify topology ports: echoF=%d echoR=%d mux=%d" % (
+        echo_f, echo_r, mux))
+    ef, er = EchoServer(echo_f, "v-echo-fwd"), EchoServer(echo_r, "v-echo-rev")
+    ef.start()
+    er.start()
+    daemons = Daemons(
+        binary, log_dir,
+        server_cfg=build_identity_server(
+            mux_port=mux, echo_port=echo_f, reverse_listen=rev_listen,
+            api_port=srv_api, window=window, loglevel=loglevel, verify=True),
+        client_cfg=build_identity_client(
+            mux_port=mux, echo_port=echo_r, forward_listen=fwd_listen,
+            api_port=cli_api, tunnels=1, window=window, loglevel=loglevel,
+            verify=True),
+        server_api=srv_api, client_api=cli_api, tag="idverify-ok")
+    try:
+        if not daemons.start():
+            suite.results.append(ScenarioResult(
+                "identity_verify_match", False,
+                "daemons not healthy with a matching identity", 0.0, "FAIL"))
+        else:
+            suite.run("identity_verify_match", lambda: scen_integrity(
+                fwd_listen, rng, sizes.stream_msg, "forward"))
+    finally:
+        daemons.shutdown()
+        ef.stop()
+        er.stop()
+
+    # --- impostor: same certificate, a claim it does not name ---------------
+    # The certificate still chains to authcerts, so the TLS handshake succeeds
+    # and only the post-handshake identity check rejects it.  That is the whole
+    # point: without identity.verify this peer would be routed as "server".
+    (echo_f2, echo_r2, mux2, srv_api2, cli_api2, fwd_listen2,
+     rev_listen2) = free_ports(7)
+    ef2 = EchoServer(echo_f2, "v-echo-fwd2")
+    er2 = EchoServer(echo_r2, "v-echo-rev2")
+    ef2.start()
+    er2.start()
+    bad = Daemons(
+        binary, log_dir,
+        server_cfg=build_identity_server(
+            mux_port=mux2, echo_port=echo_f2, reverse_listen=rev_listen2,
+            api_port=srv_api2, window=window, loglevel=loglevel, verify=True),
+        client_cfg=build_identity_client(
+            mux_port=mux2, echo_port=echo_r2, forward_listen=fwd_listen2,
+            api_port=cli_api2, tunnels=1, window=window, loglevel=loglevel,
+            verify=True, claim="impostor"),
+        server_api=srv_api2, client_api=cli_api2, tag="idverify-bad")
+
+    def mismatch() -> Tuple[bool, str]:
+        # Neither peer can report healthy here: both sides own a forwarding
+        # listener, and with the impostor rejected no tunnel is established
+        # for either.  That 503 is the expected outcome, so the usual
+        # wait_healthy() gate would report success as failure -- spawn both
+        # and observe the steady state instead.
+        bad.spawn()
+        assert bad.server is not None and bad.client is not None
+        deadline = time.monotonic() + 15.0
+        server_log_path = log_dir / "idverify-bad-server.log"
+        rejected = False
+        while time.monotonic() < deadline and not rejected:
+            if bad.server.poll() is not None:
+                return False, "server exited (code %s)" % bad.server.returncode
+            if bad.client.poll() is not None:
+                return False, "client exited (code %s)" % bad.client.returncode
+            try:
+                rejected = "does not name it" in server_log_path.read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+            if not rejected:
+                time.sleep(0.2)
+        if not rejected:
+            return False, "server never logged an identity rejection"
+        status, _body = api_request(cli_api2, "/healthy")
+        if status == 200:
+            return False, ("server rejected the claim yet the client reports "
+                           "healthy, so a tunnel was established anyway")
+        return True, ("mismatched claim rejected before any stream; "
+                      "client /healthy=%d" % status)
+
+    try:
+        suite.run("identity_verify_mismatch", mismatch)
+    finally:
+        bad.kill()
+        ef2.stop()
+        er2.stop()
+
+
 def run_parallel_topology(binary: Path, log_dir: Path, suite: Suite,
                           rng: random.Random, sizes: Sizes, *,
                           window: Optional[int], loglevel: int) -> None:
@@ -1707,10 +1966,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # builds; when the build under test does not provide it, fall back to the
     # builtin self-signed RSA-4096 cert/key (works with every TLS backend) used
     # for both peers, exactly as the unit tests do.
-    if binary_supports_gencerts(binary):
+    # identity.verify needs certificates carrying an identity URI
+    # subjectAltName; only --gencerts produces those, so the builtin-cert
+    # fallback below cannot exercise it.  --identity is spelled out because
+    # certificates carry no identity unless asked; the values match what the
+    # identity topology claims.
+    have_identity_certs = binary_supports_gencerts(binary)
+    if have_identity_certs:
         log("")
         log("generating certificates (ed25519)")
         cmd = [str(binary), "--gencerts", "server,client",
+               "--identity", "server,client",
                "--sni", "smoke.test.local", "--keytype", "ed25519"]
         log("+ %s" % quote_command(cmd))
         result = subprocess.run(cmd, cwd=str(log_dir), stdout=subprocess.PIPE,
@@ -1735,6 +2001,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       window=args.window, loglevel=args.loglevel)
     run_parallel_topology(binary, log_dir, suite, rng, sizes,
                           window=args.window, loglevel=args.loglevel)
+    if build_has_tls(build_dir) is not False:
+        run_psk_topology(binary, log_dir, suite, rng, sizes,
+                         loglevel=args.loglevel)
+    if have_identity_certs:
+        run_identity_verify_topology(binary, log_dir, suite, rng, sizes,
+                                     window=args.window,
+                                     loglevel=args.loglevel)
+    else:
+        log("")
+        log("skipping identity-verify topology: the builtin certificate "
+            "carries no identity subjectAltName")
     run_resumption_topology(binary, log_dir, suite, rng, sizes,
                             window=args.window, loglevel=args.loglevel)
 
