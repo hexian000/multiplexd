@@ -9,6 +9,7 @@
 /xbuild/
 /cmake-build-*/
 /compile_commands.json
+/.agents/worktrees/
 
 *.pem
 
