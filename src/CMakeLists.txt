@@ -48,6 +48,10 @@ if(LIBM)
     target_link_libraries(multiplexd PRIVATE m)
 endif()
 
+if(LIBATOMIC)
+    target_link_libraries(multiplexd PRIVATE ${LIBATOMIC})
+endif()
+
 if(WITH_THREADS)
     target_link_libraries(multiplexd PRIVATE Threads::Threads)
 endif()
@@ -219,6 +223,10 @@ function(add_src_test target_name)
 
     if(LIBM)
         target_link_libraries(${target_name} PRIVATE m)
+    endif()
+
+    if(LIBATOMIC)
+        target_link_libraries(${target_name} PRIVATE ${LIBATOMIC})
     endif()
 
     target_link_libraries(${target_name} PRIVATE csnippets shim)

@@ -38,6 +38,9 @@ target_link_libraries(mux PUBLIC csnippets shim ${LIBEV_LIBRARY})
 if(LIBM)
     target_link_libraries(mux PUBLIC m)
 endif()
+if(LIBATOMIC)
+    target_link_libraries(mux PUBLIC ${LIBATOMIC})
+endif()
 
 function(add_mux_test target_name)
     add_executable(${target_name} ${ARGN})
@@ -59,6 +62,10 @@ function(add_mux_test target_name)
 
     if(LIBM)
         target_link_libraries(${target_name} PRIVATE m)
+    endif()
+
+    if(LIBATOMIC)
+        target_link_libraries(${target_name} PRIVATE ${LIBATOMIC})
     endif()
 
     target_link_libraries(${target_name} PRIVATE csnippets shim)

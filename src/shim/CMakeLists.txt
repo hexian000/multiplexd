@@ -49,6 +49,10 @@ function(add_shim_test target_name)
         target_link_libraries(${target_name} PRIVATE m)
     endif()
 
+    if(LIBATOMIC)
+        target_link_libraries(${target_name} PRIVATE ${LIBATOMIC})
+    endif()
+
     target_link_libraries(${target_name} PRIVATE csnippets shim)
     if(Threads_FOUND)
         target_link_libraries(${target_name} PRIVATE Threads::Threads)
