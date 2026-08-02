@@ -202,10 +202,18 @@ stateDiagram-v2
 The enum names are less important than the control handoff: outbound reconnect
 returns through CONNECT, inbound resume re-enters HANDSHAKE on a different
 transport, and terminal `session_reset` skips the suspend path entirely.
-The public API exposes a simplified `enum mux_state` with four externally
-visible states (`ESTABLISHED`, `CONNECT`, `CLOSED`, `SUSPENDED`) via
-`mux_state()`, which collapses the internal `SESSION_HANDSHAKE` → `CONNECT`,
-`SESSION_CLOSING`/`SESSION_CLOSE_WAIT` → `CLOSED`, and `SESSION_INIT` → `CONNECT`.
+The public API exposes a simplified `enum mux_state` with five externally
+visible states (`ESTABLISHED`, `CONNECT`, `CLOSED`, `SUSPENDED`, `CLOSING`) via
+`mux_state()`, which collapses the internal `SESSION_INIT`/`SESSION_HANDSHAKE` →
+`CONNECT` and `SESSION_CLOSING`/`SESSION_CLOSE_WAIT` → `CLOSING`.
+`CLOSING` is deliberately not folded into either neighbour: consumers treat
+`CLOSED` as redialable (`mux_attach_fd()` accepts it) and `ESTABLISHED` as
+usable, and a shutting-down session is neither. Folding it into `ESTABLISHED`
+would let `server_on_resume_lookup` pick a closing tunnel as a resume target,
+whose `session_resume_attach` then drops the handoff and discards the peer's
+fresh transport; folding it into `CLOSED` would let `open_stream_task`'s
+demand-reconnect call `mux_attach_fd()` on a closing session and trip its
+`CHECKMSGF`.
 Entering `SESSION_SUSPENDED` is observable on both roles: dialed and accepted
 sessions both emit `MUX_EVENT_SUSPENDED`, while reconnect policy remains a
 tunnel-layer decision.
@@ -1083,8 +1091,9 @@ session hot paths never need to know the owning struct.
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `mux_session_counters`        | `mux.h` stores pointer fields that a session writes through via `COUNTER_ADD`/`COUNTER_SUB`; pointer types are atomic under `WITH_THREADS` and plain otherwise. Not every pointer targets the same owner — see Update path. |
 | Traffic subgroup              | `traffic` groups `byt_mux_recv`, `byt_mux_sent`, `byt_push_recv`, and `byt_push_sent`, wired to the owning tunnel's own counters (see Update path), not the server's.       |
-| Update path                   | Two scopes, wired in `tunnel.c`: session/error/buffer-gauge fields (`num_session_*`, `num_rst_sent`, `num_rst_recv`, `num_stream_errors`, `recv_buffered_bytes`, `send_buffered_frames`, `unacked_frames`) point straight at the server's flat `server_counters`, so reading them needs no aggregation. Stream-lifecycle fields (`num_streams`, `num_stream_halfopen`, `num_stream_opened`/`accepted`/`fastopen`/`established`/`succeeded`/`failed`) and the traffic subgroup instead point at the *owning tunnel's own* counters (`tunnel_stats`); `server_stats()` sums these across every currently-live tunnel at snapshot time. Traffic additionally folds a closing tunnel's final snapshot into `server_counters.traffic_byt_*` in `handle_closed()` before the tunnel is freed, so past traffic is never lost; the stream-lifecycle fields have no equivalent fold, so they reflect only currently-live tunnels. |
-| Stream-establish latency ring | `server_stats` keeps a fixed 256-entry ring and a monotonic counter; samples are written eagerly on `MUX_EVENT_STREAM_ESTABLISHED`.   |
+| Update path                   | Two scopes, wired in `tunnel.c`: only the session-lifecycle fields (`num_session_*`, `num_sessions`, `num_session_halfopen`) point at the server's flat `server_counters`, so reading them needs no aggregation. Every other field — stream lifecycle, the traffic subgroup, `num_rst_sent`/`num_rst_recv`/`num_stream_errors`, and the `recv_buffered_bytes`/`send_buffered_frames`/`unacked_frames` gauges — points at the *owning tunnel's own* counters (`tunnel_stats`), which is what lets `/metrics` label them per tunnel; `server_stats()` sums them across every currently-live tunnel at snapshot time. `num_reconnects` is per-tunnel too, but the tunnel thread bumps it directly rather than through the pointer block. |
+| Closed-tunnel fold            | `server_close_and_fold()` closes a tunnel via `tunnel_close_final()` and folds the counters it returns into `server_counters.closed`, so the monotonic totals survive tunnel churn; `server_stats()` seeds each total from that base and adds the live tunnels on top. `tunnel_close_final()` samples after joining the tunnel thread, so the increments teardown itself makes — `mux_close()` fails every stream still open — are folded too. Gauges are excluded — a closing session drains them to zero, so folding would leave the totals permanently overstated. Fold, container removal and `server_stats()` all run on the server thread, so no snapshot can see a tunnel both folded and still live; `server_force_close_snapshot()` folds while the pools still reference the tunnel, and relies on `server_stop()` clearing them in the same turn. The one gap left is the OOM path where the tunnel thread cannot be told to stop and is abandoned rather than joined: there the sample is taken before detaching. |
+| Stream-establish latency ring | Each tunnel keeps a fixed 256-entry ring and a monotonic counter; samples are written eagerly on `MUX_EVENT_STREAM_ESTABLISHED`. `server_stats()` derives per-tunnel percentiles from each ring and merges every ring for the process-wide figures.   |
 | Read path                     | All aggregate reads go through `server_stats()`; per-session diagnostics are delivered by `on_event`, not by polling session objects. |
 
 ## 19. Identity Extension
@@ -1101,11 +1110,47 @@ is that identity becomes a routing key.
 | Config role: `identity.claim`       | local node identity, sent in every hello                                                                       |
 | Config role: `identity.mux_connect` | one outbound mux session per entry                                                                             |
 | Config role: `identity.listen`      | local listener keyed by peer identity                                                                          |
+| Config role: `identity.verify`      | bind the claim to the peer certificate; carried per-tunnel in `tunnel.verify_identity` (set at creation, refreshed by `reload_task`) |
 | Inbound mux streams                 | always forward to the root `connect` target regardless of advertised peer identity                             |
 
 In client mode, one mux session per `identity.mux_connect` entry is created at
 `server_start`; sessions are torn down in `server_stop` after the identity-based
 wiring has been removed.
+
+### 19.1 Certificate Binding (`identity.verify`)
+
+Implements the optional identity-specific certificate pinning of
+[spec.md](spec.md) §10.1. Nothing on the wire changes: the check is local, and
+an enforcing node interoperates with a non-enforcing one in either direction.
+
+| Item              | Implementation note                                                                                                                                 |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Name form         | URI subjectAltName (RFC 5280 §4.2.1.6 `uniformResourceIdentifier`), opaque form `multiplexd:<percent-encoded identity>`. No authority component: that would invoke the "host MUST be an FQDN or IP" rule, and an identity is neither. |
+| Extraction        | `tls_peer_cert_uri_sans()` walks the peer certificate's `GeneralName [6]` entries in each backend and returns them as one allocation. It fails the whole call on an embedded NUL rather than truncating — accepting the prefix is the null-prefix certificate attack, and neither backend checks it for us. |
+| Comparison        | `identity_matches_cert()` (`shim/util.c`) matches the literal lowercase scheme, then decodes the tail with `url_unescape_path()` and compares octets. Decode-then-compare, not encode-then-compare: percent-encoding is not canonical, so a certificate issued by other tooling may escape a different but equally valid set of octets. The decoder's rejection of control characters (including `%00`) is what makes the final `strcmp()` sound. |
+| Hook point        | `mux_callbacks.on_verify_identity`, fired from `mux_handshake_process_hello()` right after the peer's identity is latched and before the server/client dispatch. That is ahead of both `mux_session_handshake_done()` (so no stream is admitted) and the resume handoff (so the transport is still ours to reject), and one site covers both roles. |
+| Effective identity | The value passed is the session's latched identity, not merely a claim present on this hello, so an identity inherited from an earlier transport is re-proved against the certificate presented on the current one. |
+| Resume            | `tunnel_resume_identity_ok()` additionally requires the claim on the new transport to equal the resumed session's, both-absent counting as equal. The claim is read via `mux_peer_identity()` rather than the tunnel's published snapshot, which is only refreshed on `MUX_EVENT_CONNECTED` and so is not yet populated at lookup time. A mismatch releases the lookup's pin and falls back to a fresh session. |
+| Plaintext         | `conf_check` rejects `identity.verify` without TLS credentials, and in a `WITH_TLS=0` build, as a hard error rather than ignoring it — unlike a performance hint such as `tcp.notsent_lowat`. `tunnel_on_verify_identity()` still fails closed if it ever sees a plaintext session. |
+
+### 19.2 PSK Binding (`tls.psk`)
+
+An alternative credential mode. No certificate is sent in either direction, so
+the disclosure that `identity.verify` cannot avoid — a hub's certificate being
+readable by any scanner that completes a key exchange — does not arise.
+
+| Item | Implementation note |
+| - | - |
+| Label | `tls_psk_label()`: HKDF-SHA256 over the key, info `"multiplexd psk id v1"`, 16 octets hex. Derived from the *key*, not the identity: the label is cleartext in the ClientHello, and identities are low-entropy names that an unsalted hash would surrender to a wordlist. The hash is fixed at SHA-256 regardless of the negotiated suite, since both peers must agree without negotiating. Verified identical across backends against an independent HKDF. |
+| Entropy | Publishing a one-way function of the key gives an offline oracle, so `TLS_PSK_MIN_LEN` is a floor on *length*, not entropy. `--genpsk` is the only supported source; a passphrase-derived key of legal length is still unsafe. |
+| Key exchange | `psk_dhe_ke` only, set explicitly on both backends rather than left to library defaults. Bare `psk_ke` would drop forward secrecy. |
+| Suite hash | A TLS 1.3 PSK binds to one hash. The suite is picked after `tls.ciphersuites` is applied (first configured suite wins; SHA-256 when unset, *not* OpenSSL's default first preference of SHA-384), then the list is narrowed to that hash so negotiation cannot mismatch. |
+| Offered identity | Treated as hostile in both backends: unterminated and attacker-chosen, so length-bounded, with an embedded NUL rejected rather than truncated — a truncated label could resolve to another peer's key. |
+| Callback plumbing | OpenSSL hangs credentials off the `SSL_CTX` via ex_data, as ALPN does, because `SSL_new` up-refs the `SSL_CTX` and not the wrapper. mbedTLS takes an opaque pointer but passes the `ssl` object, so the wrapper is recovered by cast, guarded by a `static_assert` that it is the first member. |
+| Negotiated label | OpenSSL exposes no getter, so both backends record it as the handshake selects it; `tls_peer_psk_label()` reads that. |
+| Identity binding | Implicit, unlike `identity.verify`: the binder already proves possession, so `tunnel_on_verify_identity()` only has to confirm the claim matches the peer owning that label. The resolver reaches the tunnel as a callback, since `server.h` includes `tunnel.h`. |
+| Reload | The decoded table is rebuilt from the new config and freed only after the old TLS contexts, whose lookup callback referenced it; tunnels are handed the new resolver through `tunnel_reload`. |
+| Storage | `struct config` keeps keys hex-encoded so the `strlen`-based erase in `server_cleanse_tls_config()` stays valid; decoded copies live in `struct psk_table` and are erased with it. Format is validated in `conf_inline_pem()`, after `@path` resolution — `conf_check()` runs first and would only see the reference. |
 
 ## 20. Tunnel Layer Threading Model
 

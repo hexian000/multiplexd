@@ -1219,6 +1219,15 @@ TLS 1.3 transport encryption is OPTIONAL.  When enabled:
 -  Mutual authentication (mTLS) is enforced.  Both endpoints MUST present a
    certificate.
 
+-  An implementation MAY additionally offer authentication with an external
+   pre-shared key ([RFC8446] Section 4.2.11) in place of certificates, using
+   the psk_dhe_ke key exchange mode only, so that forward secrecy is retained.
+   No Certificate message is then sent in either direction.  Certificate
+   mutual authentication remains what every implementation MUST provide, so
+   two peers interoperate on it unless both are configured for a pre-shared
+   key; how such keys are distributed and named is a local matter outside the
+   scope of this protocol.
+
 -  The system certificate authority store is not consulted.  Authentication is
    performed exclusively by certificate pinning: each endpoint maintains an
    explicit list of trusted peer certificates.

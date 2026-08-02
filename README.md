@@ -160,6 +160,9 @@ multiplexd --gencerts ca
 
 # Then generate certificates signed by the CA, so only the CA certificate needs to be listed in authcerts for verification
 multiplexd --gencerts client1,client2,client3 --sign ca
+
+# For identity.verify, name each peer's identity explicitly; certificates carry none by default
+multiplexd --gencerts client1,client2,client3 --sign ca --identity east-1,east-2,west-1
 ```
 
 ### Certificate Options
@@ -168,11 +171,32 @@ multiplexd --gencerts client1,client2,client3 --sign ca
 | ------------ | ------------------- | ----------------------------------------------------------------------------------------------------- |
 | `--gencerts` | name[,name...]      | Comma-separated list of certificate names to generate                                                 |
 | `--sni`      | hostname            | Server name for certificates (default: example.com)                                                   |
+| `--identity` | name[,name...]      | Identity URI subjectAltName (`multiplexd:<identity>`) per certificate, paired positionally with `--gencerts`. Omitting the option generates certificates carrying no identity, which is the default; an empty entry is the empty identity, itself a valid one. Required by `identity.verify`. |
 | `--sign`     | name                | Sign generated certificates with the named signer (uses `<name>-cert.pem` and `<name>-key.pem`)       |
 | `--keytype`  | rsa, ecdsa, ed25519 | Key algorithm (default: rsa)                                                                          |
 | `--keysize`  | bits                | Key size in bits: RSA 4096 (default, range 2048-16384); ECDSA NIST P-224/256/384/521. Ignored when `--keytype ed25519`. |
 
 Generated files: `<name>-cert.pem` and `<name>-key.pem`.
+
+### Generating Pre-Shared Keys
+
+`--genpsk` writes one key per name as `<name>.psk`, owner-readable only, and
+logs each key's identity label so a packet capture can be matched back to a
+peer. Unlike `--gencerts` it works on every TLS backend, not just OpenSSL.
+
+```sh
+# One key per peer *pair* -- both ends hold the same file.
+multiplexd --genpsk 'hub-east~spoke-1,hub-east~spoke-2'
+```
+
+An existing file is never overwritten: regenerating a key silently would lock
+out the peer still holding the old one.
+
+**Always generate keys this way.** The identity label a peer puts on the wire
+is derived from its key, so publishing it hands an attacker an offline oracle:
+against 32 random octets that is meaningless, against a passphrase it is fatal.
+The 32-octet minimum checks *length, not entropy* — `sha256("hunter2")` in hex
+passes it and is worth about 20 bits.
 
 ## Configuration
 
@@ -212,15 +236,60 @@ Omit the `tls` object on trusted networks if the lower overhead outweighs the lo
 
 **TLS**: `cert`, `key`, and `authcerts` must all be present or all absent. The `@path` prefix loads a PEM file at startup; bare strings are treated as inline PEM. Mutual authentication (mTLS) is always enforced — the system CA store is never consulted.
 
+**Pre-shared keys**: `tls.psk` replaces certificates entirely — it is mutually
+exclusive with `cert`, `key` and `authcerts`, and a PSK handshake sends no
+certificate in either direction. It maps a peer identity to the key shared with
+that peer:
+
+```json
+{
+    "mux_listen": "0.0.0.0:9000",
+    "connect": "127.0.0.1:8080",
+    "identity": {
+        "claim": "hub-east",
+        "listen": { "spoke-1": "127.0.1.1:8022" }
+    },
+    "tls": { "psk": { "spoke-1": "@hub-east~spoke-1.psk" } }
+}
+```
+
+The spoke names the same file after *its* peer, since one key belongs to a
+pair rather than to either end:
+
+```json
+{
+    "identity": {
+        "claim": "spoke-1",
+        "mux_connect": ["hub-east.example:9000"],
+        "listen": { "hub-east": "127.0.0.2:1080" }
+    },
+    "tls": { "psk": { "hub-east": "@hub-east~spoke-1.psk" } }
+}
+```
+
+Notes:
+
+- Identity binding is automatic; `identity.verify` is a certificate-mode option
+  and is rejected alongside `tls.psk`. A peer proves possession of the key its
+  label names, so a claim that disagrees with the key used is refused before
+  any stream. A peer claiming no identity stays unidentified, as in certificate
+  mode.
+- **When dialing, only the first entry is offered** — both TLS backends accept
+  a single client-side PSK. A node that dials while holding several keys logs a
+  warning naming the one it will use.
+- Values are lowercase hex or `@path`; a loaded file may end with a newline.
+  `tls.sni` has no effect, since there is no certificate to select.
+
 ### Multi-Peer Routing (`identity` block)
 
 The `identity` block lets a node advertise its own identity and maintain simultaneous sessions with multiple named peers.
 
-- `identity.claim` is this node's identity string, sent in every mux hello. Limited to 255 octets (UTF-8, NUL excluded), the wire limit of the hello's identity extension; a longer value is rejected at config load or reload time.
+- `identity.claim` is this node's identity string, sent in every mux hello. Limited to 63 octets (UTF-8, NUL excluded); a longer value is rejected at config load or reload time. The hello's identity extension allows 255 octets on the wire and a peer's claim is still accepted up to that, but JSON escaping expands a claim by up to six bytes per octet, so claiming at the wire limit could outgrow the smallest configurable frame and leave the hello unsendable. The same 63-octet limit applies to `identity.listen` keys, which must match a peer's claim.
 - `identity.mux_connect` is a list of mux endpoint addresses to dial. One outbound session is created per address, and the peer's identity is learned from the `ServerHello`.
 - `identity.listen` maps peer identities to local TCP listen addresses. Each listener routes accepted connections over the session whose peer announced that identity.
 - All inbound mux streams, regardless of peer identity, are forwarded to the root `connect` target.
 - If `identity.mux_connect` or `identity.listen` is configured, `identity.claim` is required.
+- `identity.verify` (default `false`) binds the claim to the certificate: a peer that claims an identity is accepted only if the certificate it presented carries `multiplexd:<identity>` (percent-encoded) as a URI subjectAltName. A peer claiming no identity is unaffected and stays unidentified. It requires TLS — enabling it without `tls.cert`, `tls.key` and `tls.authcerts`, or in a build without TLS, is a startup error rather than being ignored. Generate matching certificates with `--identity`.
 
 **Hub node** — accepts inbound mux sessions from multiple clients and exposes each remote peer as a dedicated local listener:
 
@@ -330,6 +399,19 @@ Same as `GET /stats`, plus per-interval bandwidth rates and server CPU load deri
 #### `GET /metrics`
 
 Returns metrics in Prometheus exposition format, including cumulative counters and gauges for current session/stream counts and server load.
+
+Metrics come in two flavours:
+
+- **Process-wide totals** — the unlabeled series, e.g. `multiplexd_send_buffered_frames`. These cover every tunnel, and monotonic counters keep accumulating across tunnel closures.
+- **Per-tunnel series** — the `multiplexd_session_*` family, labeled `identity` (the peer's identity) and `tunnel` (a monotonic, never-reused per-process index that stays stable across a tunnel's reconnects). Paired directional values carry `direction="rx"` / `direction="tx"`.
+
+A tunnel is only labeled once its peer's announced identity names an `identity.listen` entry — whether the session was accepted on that listener or dialed from `identity.mux_connect`. Tunnels outside any identity, such as the top-level `mux_connect` session, inbound sessions from unconfigured peers, and dial-outs to a peer with no `identity.listen` entry, are counted in the totals but emit no per-tunnel series. Configuring `identity.listen` is therefore what turns per-tunnel breakdown on, and it also bounds label cardinality to what the configuration declares.
+
+Aggregate across tunnels with `sum()`, e.g. `sum(multiplexd_session_stream_open_total)`. Note this counts only live tunnels, whereas `multiplexd_stream_open_total` also includes tunnels that have since closed.
+
+`multiplexd_session_stream_establish_latency_seconds` is a summary over each tunnel's most recent 256 **active-open** stream establishments — a passive open records no SYN-to-SYN|ACK latency and is never observed. Quantiles come from that sliding window; `_count` is the monotonic number of observations behind them, so it tracks neither `multiplexd_session_stream_open_total` nor the established-stream total. A server-role tunnel that only accepts streams therefore reports `_count 0` and no quantiles. There is no `_sum`, since the sliding window cannot produce one.
+
+`multiplexd_session_reconnects_total` is emitted only for dialed tunnels: a session the peer opened never reconnects, so it would report a constant zero.
 
 #### `GET /config`
 
@@ -468,7 +550,34 @@ Operational requirements:
 - A CA certificate in `authcerts` authorizes every peer certificate issued by that CA; a leaf certificate entry authorizes only that specific peer.
 - Compromise of a trusted CA key or an endpoint private key compromises peer authentication.
 - `*-key.pem` files and `--dump-config` output contain private key material and must be protected accordingly.
-- The `identity` extension (`identity.claim`) is a self-declared routing key, not cryptographically bound to the presenting certificate. If `authcerts` is a shared CA, any peer holding a certificate issued by that CA can claim any identity string; use per-peer leaf certificates in `authcerts` instead of a shared CA where distinct peers must not be able to impersonate each other's identity.
+- By default the `identity` extension (`identity.claim`) is a self-declared routing key, not cryptographically bound to the presenting certificate. If `authcerts` is a shared CA, any peer holding a certificate issued by that CA can claim any identity string. Close this either by setting `identity.verify` (below) or by listing per-peer leaf certificates in `authcerts` instead of a shared CA.
+- `identity.verify` binds the claim to the certificate: a claimed identity must appear as a URI subjectAltName `multiplexd:<identity>` (percent-encoded, RFC 5280 §4.2.1.6) in the certificate the peer presented on that transport. This makes a shared CA safe against peer-to-peer impersonation, since the CA decides which identity each certificate may claim. Enforcement is local and per-direction: an enforcing node interoperates with a non-enforcing one, and each side independently decides whether to check the other. The check runs before any stream is admitted, and again on every resume, so a reconnecting transport cannot inherit a session's verified identity without proving it.
+- `identity.verify` does not deny an *unidentified* peer. A peer that claims nothing is still accepted if its certificate chains to `authcerts`, and reaches the root `connect` target; only identity-routed access is gated. Claiming the empty string is not the same as claiming nothing: it is an identity like any other, so it must be named by the certificate (`--identity ""`) to pass.
+- Rolling `identity.verify` out: upgrade binaries first, then reissue certificates, then enable the option. The `identity` config object rejects unknown keys, so a config containing `identity.verify` fails to load on an older binary; adding the URI subjectAltName is inert on every version, since nothing reads subjectAltNames unless the option is on.
+
+#### Certificate disclosure, and what PSK mode changes
+
+TLS 1.3 encrypts both `Certificate` messages, so a passive eavesdropper learns
+nothing. An *active* one does: the server sends its certificate in the first
+encrypted flight, before it has seen the client's, so **anyone who can reach
+`mux_listen` and complete a key exchange can read it** — no client certificate
+needed. A hub's `identity.verify` subjectAltName is therefore public to
+scanners. Spoke certificates are not: a dialing client verifies the server
+against its own `authcerts` and aborts before sending its own.
+
+There is no way around this within certificate mode. TLS 1.3 has no
+post-handshake *server* authentication, no anonymous suites, and a fixed flight
+order, so a server cannot defer its certificate until the client proves itself.
+
+`tls.psk` removes the exposure at the root, sending no certificate at all. If
+you must keep certificates, use opaque identity strings so a harvested SAN
+reveals no topology, or restrict who can reach the listener at all (an address
+allowlist, or an authenticated underlay).
+
+Note that pinning per-peer leaf certificates in `authcerts` does **not** stop
+one trusted peer from claiming another's identity: `authcerts` is a flat trust
+list with no identity binding. Only `identity.verify` (or `tls.psk`) binds a
+claim to the key that made it.
 
 ### Connection Backoff
 
@@ -490,6 +599,7 @@ On reload, all existing sessions drain: each session stops accepting new inbound
 - Listener bind addresses (`listen`, `mux_listen`, `api_listen`): the listener is stopped and restarted on the new address.
 - Forward target (`connect`) and outbound addresses (`mux_connect`, `identity.mux_connect`): reconnects after drain use the new address.
 - TLS certificates, keys, trust roots, and TLS 1.3 cipher suites: applied to newly accepted sessions and future outbound reconnects.
+- `identity.verify`: read when a hello is processed, so it applies to newly accepted sessions and to the next handshake (resume or reconnect) of an existing one, never mid-session.
 
 ## Credits
 
