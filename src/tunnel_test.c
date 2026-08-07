@@ -714,6 +714,84 @@ T_DECLARE_CASE(test_tunnel_stats_initial_zero)
 	T_EXPECT_EQ(stats.unacked_frames, (size_t)0);
 }
 
+T_DECLARE_CASE(test_tunnel_open_stream_burst_not_dropped)
+{
+#if !WITH_THREADS
+	(void)_t_;
+	/* Without threads tunnel_open_stream opens inline; there is no bounded task
+	 * ring to overflow, so the drop this pins cannot occur. */
+	T_SKIPNOW();
+#else
+	/* A burst of concurrent opens larger than the tunnel's task-ring capacity
+	 * (16) must not drop any accepted connection.  Create an accepted tunnel but
+	 * do NOT start its thread, so nothing drains the queue, then hand it a burst
+	 * well above the ring capacity and confirm every accepted connection is
+	 * still open (held for later service), not closed.  Pre-fix, each open was
+	 * posted onto the 16-slot ring and the fd was closed once the ring filled,
+	 * dropping the burst's tail; the peer end then saw EOF. */
+	enum { BURST = 64 };
+	struct server srv;
+	memset(&srv, 0, sizeof(srv));
+	srv.disp = dispatcher_create(4);
+	T_CHECK(srv.disp != NULL);
+
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
+	int tpair[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, tpair) == 0);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.data = NULL,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = tpair[0],
+		.id = g_zero_id,
+		.cnt = &cnts,
+	};
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+	(void)close(tpair[1]);
+
+	/* ours[] is the end we keep (to observe closure); sp[1] is handed to the
+	 * tunnel, which now owns and eventually closes it. */
+	int ours[BURST];
+	int made = 0;
+	for (; made < BURST; made++) {
+		int sp[2];
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
+			break;
+		}
+		ours[made] = sp[0];
+		tunnel_open_stream(t, sp[1]);
+	}
+
+	/* Probe every handed-off connection via the retained peer while the tunnel
+	 * is still live -- immune to fd-number reuse, unlike probing the handed-off
+	 * descriptor directly.  A closed (dropped) peer reads EOF (recv == 0); a
+	 * held one would block, so recv returns -1/EAGAIN. */
+	int dropped = 0;
+	for (int i = 0; i < made; i++) {
+		char b;
+		if (recv(ours[i], &b, 1, MSG_DONTWAIT) == 0) {
+			dropped++;
+		}
+	}
+
+	tunnel_close(t); /* flushes and closes any still-queued opens */
+	for (int i = 0; i < made; i++) {
+		(void)close(ours[i]);
+	}
+	dispatcher_destroy(srv.disp);
+
+	/* The whole burst was issued, and none of it was dropped. */
+	T_EXPECT_EQ(made, (int)BURST);
+	T_EXPECT_EQ(dropped, 0);
+#endif /* WITH_THREADS */
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_new_close_no_start),
 	T_CASE(test_tunnel_accessors_after_new),
@@ -723,6 +801,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_reconnect_after_connect_timeout),
 	T_CASE(test_tunnel_state_returns_connecting_after_new),
 	T_CASE(test_tunnel_stats_initial_zero),
+	T_CASE(test_tunnel_open_stream_burst_not_dropped),
 	T_SUITE_END,
 };
 

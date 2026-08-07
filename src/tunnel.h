@@ -181,7 +181,7 @@ void tunnel_shutdown(struct tunnel *t);
  * resume (or for the resume timeout); a dialed one with idle_timeout == 0
  * re-dials immediately via handle_transport_lost(), w_reconnect being only the
  * failure backoff; a dialed one with idle_timeout > 0 reconnects on demand from
- * open_stream_task(). */
+ * tunnel_open_fd(). */
 void tunnel_drop_transport(struct tunnel *t);
 
 /* --- Accessors --- */

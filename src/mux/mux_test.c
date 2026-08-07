@@ -5584,7 +5584,7 @@ T_DECLARE_CASE(test_mux_state_maps_internal_states)
  * them into ESTABLISHED lets server_on_resume_lookup pick a closing tunnel as a
  * resume target, whose dropped handoff then closes the peer's fresh transport
  * with no ServerHello sent; folding them into CLOSED instead lets
- * open_stream_task's demand-reconnect attach to one and trip that CHECKMSGF.
+ * tunnel_open_fd's demand-reconnect attach to one and trip that CHECKMSGF.
  * Pin all three consumer predicates against both states. */
 T_DECLARE_CASE(test_mux_state_closing_is_neither_usable_nor_attachable)
 {
@@ -5603,7 +5603,7 @@ T_DECLARE_CASE(test_mux_state_closing_is_neither_usable_nor_attachable)
 	T_EXPECT(
 		close_wait != MUX_STATE_SUSPENDED &&
 		close_wait != MUX_STATE_ESTABLISHED);
-	/* open_stream_task: never demand-reconnected into. */
+	/* tunnel_open_fd: never demand-reconnected into. */
 	T_EXPECT(closing != MUX_STATE_SUSPENDED && closing != MUX_STATE_CLOSED);
 	T_EXPECT(
 		close_wait != MUX_STATE_SUSPENDED &&

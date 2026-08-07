@@ -102,13 +102,33 @@ static void tunnel_set_tag(
 	}
 }
 
+#if WITH_THREADS
+/* Intrusive FIFO node for a local connection accepted on the parent loop and
+ * awaiting a stream open on the owning tunnel's thread; see
+ * struct tunnel::open_head. */
+struct pending_open {
+	int fd;
+	struct pending_open *next;
+};
+#endif
+
 struct tunnel {
 #if WITH_THREADS
 	thrd_t thread;
 	bool started;
 	ev_async w_async;
 	struct dispatcher *disp;
-#endif
+	/* Local connections accepted on the parent loop and awaiting a stream
+	 * open on this tunnel's own thread.  The bounded task ring (disp) cannot
+	 * hold a concurrent-open burst larger than its capacity, so opens are
+	 * queued here instead of posted onto it and drained by tunnel_async_cb --
+	 * decoupling the number of simultaneous opens from the ring size so no
+	 * accepted connection is dropped.  open_mu guards the list between the
+	 * parent thread (producer) and this tunnel's thread (consumer). */
+	mtx_t open_mu;
+	struct pending_open *open_head;
+	struct pending_open *open_tail;
+#endif /* WITH_THREADS */
 	struct ev_loop *loop;
 	/* Wrapped callbacks registered with the mux session. */
 	struct mux_callbacks cb;
@@ -695,7 +715,7 @@ static bool handle_closed(struct tunnel *restrict t)
 		return true;
 	}
 	if (tunnel_conf(t)->idle_timeout != 0) {
-		/* On-demand tunnel: no backoff timer; open_stream_task()
+		/* On-demand tunnel: no backoff timer; tunnel_open_fd()
 		 * redials on the next inbound connection. */
 		ev_timer_stop(t->loop, &t->w_reconnect);
 		return false;
@@ -802,12 +822,18 @@ static void tunnel_on_event(
 }
 
 #if WITH_THREADS
+static void tunnel_drain_pending_opens(struct tunnel *t);
+static void tunnel_flush_pending_opens(struct tunnel *t);
+
 static void tunnel_async_cb(struct ev_loop *loop, ev_async *w, int revents)
 {
 	(void)loop;
 	(void)revents;
 	struct tunnel *const restrict t = w->data;
 	dispatcher_tick(t->disp);
+	/* After the ring: a queued task may have been task_tunnel_teardown, which
+	 * clears t->ss, so the drain must tolerate a torn-down session. */
+	tunnel_drain_pending_opens(t);
 }
 
 static int tunnel_thread(void *arg)
@@ -1360,9 +1386,14 @@ struct tunnel *tunnel_new(
 		return NULL;
 	}
 #if WITH_THREADS
-	/* Init the stats-snapshot mutex last so the failure paths above need no
-	 * mtx_destroy; only tunnel_close pairs with this. */
+	/* Init the mutexes last so the failure paths above need no mtx_destroy;
+	 * only tunnel_close pairs with these. */
 	if (mtx_init(&t->pub.mu, mtx_plain) != thrd_success) {
+		tunnel_new_cleanup(t, ss, false, opts);
+		return NULL;
+	}
+	if (mtx_init(&t->open_mu, mtx_plain) != thrd_success) {
+		mtx_destroy(&t->pub.mu);
 		tunnel_new_cleanup(t, ss, false, opts);
 		return NULL;
 	}
@@ -1421,12 +1452,13 @@ bool tunnel_start(struct tunnel *t)
 	 * payload (just t/t->ss), so a failed dispatch has nothing to free --
 	 * only report it. */
 	if (!tunnel_post(t, (struct task){ task_mux_start, t->ss })) {
-		TUNNEL_LOG(ERROR, t, "failed to dispatch startup (OOM)");
+		TUNNEL_LOG(ERROR, t, "failed to dispatch startup (queue full)");
 	}
 	if (t->connect_addr != NULL &&
 	    !tunnel_post(t, (struct task){ tunnel_initial_connect_task, t })) {
 		TUNNEL_LOG(
-			ERROR, t, "failed to dispatch initial connect (OOM)");
+			ERROR, t,
+			"failed to dispatch initial connect (queue full)");
 	}
 	return true;
 }
@@ -1523,7 +1555,7 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 			TUNNEL_LOG_PUB(
 				ERROR, t,
 				"failed to dispatch teardown after retry"
-				" (OOM), abandoning tunnel thread");
+				" (queue full), abandoning tunnel thread");
 			/* Sample before detaching: the abandoned thread keeps
 			 * counting, and t is never freed, so this is the last
 			 * point the caller can account for any of it. */
@@ -1560,6 +1592,9 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 		mux_close(t->ss);
 	}
 	ev_async_stop(t->loop, &t->w_async);
+	/* The tunnel thread is stopped (joined) or never ran, so no drain can race
+	 * this: close any opens still queued -- they can no longer be served. */
+	tunnel_flush_pending_opens(t);
 	dispatcher_destroy(t->disp);
 	ev_loop_destroy(t->loop);
 #else /* WITH_THREADS */
@@ -1584,6 +1619,7 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 	tls_ctx_free(t->tlsctx);
 #endif
 #if WITH_THREADS
+	mtx_destroy(&t->open_mu);
 	mtx_destroy(&t->pub.mu);
 #endif
 	/* After mux_close: any frames released during teardown are now back in
@@ -1610,10 +1646,12 @@ void tunnel_shutdown(struct tunnel *t)
 	 * of the first outcome (matching a plain no-throw dispatch) and report
 	 * each failure instead of leaking silently. */
 	if (!tunnel_post(t, (struct task){ task_set_shutting_down, t })) {
-		TUNNEL_LOG_PUB(ERROR, t, "failed to dispatch shutdown (OOM)");
+		TUNNEL_LOG_PUB(
+			ERROR, t, "failed to dispatch shutdown (queue full)");
 	}
 	if (!tunnel_post(t, (struct task){ task_mux_shutdown, t->ss })) {
-		TUNNEL_LOG_PUB(ERROR, t, "failed to dispatch shutdown (OOM)");
+		TUNNEL_LOG_PUB(
+			ERROR, t, "failed to dispatch shutdown (queue full)");
 	}
 }
 
@@ -1639,7 +1677,8 @@ void tunnel_drop_transport(struct tunnel *t)
 {
 	if (!tunnel_post(t, (struct task){ task_drop_transport, t })) {
 		TUNNEL_LOG_PUB(
-			ERROR, t, "failed to dispatch drop_transport (OOM)");
+			ERROR, t,
+			"failed to dispatch drop_transport (queue full)");
 	}
 }
 
@@ -1763,18 +1802,11 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	}
 }
 
-struct open_stream_arg {
-	struct tunnel *t;
-	struct mux_session *ss;
-	int fd;
-};
-
-static void open_stream_task(void *p)
+/* Open one accepted local connection as a new stream.  Runs on this tunnel's
+ * own thread (or inline without threads); the caller guarantees t->ss is live. */
+static void tunnel_open_fd(struct tunnel *restrict t, const int fd)
 {
-	struct open_stream_arg *const restrict arg = p;
-	struct tunnel *const restrict t = arg->t;
-	const int fd = arg->fd;
-	struct mux_stream *const stream = mux_stream_open(arg->ss);
+	struct mux_stream *const stream = mux_stream_open(t->ss);
 	if (stream == NULL) {
 		/* Demand-triggered reconnect: when idle-closed/suspended with
 		 * idle_timeout set, reconnect so the next open_stream succeeds.
@@ -1792,7 +1824,6 @@ static void open_stream_task(void *p)
 		TUNNEL_LOG_F(
 			DEBUG, t, "[fd:%d] session not ready, closing", fd);
 		socket_close(fd);
-		free(arg);
 		return;
 	}
 	/* Start reading from local socket immediately.  One frame may be read
@@ -1801,24 +1832,73 @@ static void open_stream_task(void *p)
 	TUNNEL_LOG_F(
 		DEBUG, t, "[fd:%d] new stream %" PRIuLEAST16, fd,
 		mux_stream_id(stream));
-	free(arg);
 }
+
+#if WITH_THREADS
+/* Detach the queued opens and either open each (session live) or close it
+ * (session already torn down earlier in this async tick).  Runs on the tunnel
+ * thread. */
+static void tunnel_drain_pending_opens(struct tunnel *restrict t)
+{
+	THRD_ASSERT(mtx_lock(&t->open_mu));
+	struct pending_open *node = t->open_head;
+	t->open_head = t->open_tail = NULL;
+	THRD_ASSERT(mtx_unlock(&t->open_mu));
+	while (node != NULL) {
+		struct pending_open *const restrict next = node->next;
+		if (t->ss != NULL) {
+			tunnel_open_fd(t, node->fd);
+		} else {
+			socket_close(node->fd);
+		}
+		free(node);
+		node = next;
+	}
+}
+
+/* Close every still-queued open and free its node.  Called once the tunnel
+ * thread has stopped (or never started), when the pending connections can no
+ * longer be served. */
+static void tunnel_flush_pending_opens(struct tunnel *restrict t)
+{
+	struct pending_open *node = t->open_head;
+	t->open_head = t->open_tail = NULL;
+	while (node != NULL) {
+		struct pending_open *const restrict next = node->next;
+		socket_close(node->fd);
+		free(node);
+		node = next;
+	}
+}
+#endif /* WITH_THREADS */
 
 void tunnel_open_stream(struct tunnel *t, const int fd)
 {
-	struct open_stream_arg *const restrict arg = malloc(sizeof(*arg));
-	if (arg == NULL) {
+#if WITH_THREADS
+	/* Queue the open and wake the tunnel thread rather than posting onto the
+	 * fixed-capacity task ring: a burst of simultaneous opens larger than the
+	 * ring would otherwise overflow it and the accepted connection would be
+	 * dropped.  The queue grows with the burst, so none is lost. */
+	struct pending_open *const restrict node = malloc(sizeof(*node));
+	if (node == NULL) {
 		LOGOOM();
 		socket_close(fd);
 		return;
 	}
-	*arg = (struct open_stream_arg){ .t = t, .ss = t->ss, .fd = fd };
-	if (!tunnel_post(t, (struct task){ open_stream_task, arg })) {
-		TUNNEL_LOG_PUB(
-			ERROR, t, "failed to dispatch open_stream (OOM)");
-		free(arg);
-		socket_close(fd);
+	node->fd = fd;
+	node->next = NULL;
+	THRD_ASSERT(mtx_lock(&t->open_mu));
+	if (t->open_tail != NULL) {
+		t->open_tail->next = node;
+	} else {
+		t->open_head = node;
 	}
+	t->open_tail = node;
+	THRD_ASSERT(mtx_unlock(&t->open_mu));
+	ev_async_send(t->loop, &t->w_async);
+#else /* WITH_THREADS */
+	tunnel_open_fd(t, fd);
+#endif /* WITH_THREADS */
 }
 
 struct reload_arg {
@@ -1950,7 +2030,8 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		}
 	}
 	if (!tunnel_post(t, (struct task){ reload_task, arg })) {
-		TUNNEL_LOG_PUB(ERROR, t, "failed to dispatch reload (OOM)");
+		TUNNEL_LOG_PUB(
+			ERROR, t, "failed to dispatch reload (queue full)");
 		free(arg->connect_addr);
 		free(arg->forward_addr);
 #if WITH_TLS
