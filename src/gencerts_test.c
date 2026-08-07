@@ -529,12 +529,39 @@ static X509 *read_cert_file(const char *restrict path)
 	return cert;
 }
 
+/* Copy the first commonName text of @p name into @p buf (NUL-terminated, up to
+ * @p len bytes), returning the entry's byte length or -1 when absent.  A local
+ * stand-in for X509_NAME_get_text_by_NID(), which OpenSSL 4.0 deprecated, built
+ * on the non-deprecated entry accessors so it compiles clean on 3.x and 4.x
+ * alike; @p name is taken const because X509_get_subject_name() returns const
+ * as of 4.0. */
+static int
+name_get_cn(const X509_NAME *const name, char *const buf, const size_t len)
+{
+	const int idx = X509_NAME_get_index_by_NID(name, NID_commonName, -1);
+	if (idx < 0) {
+		return -1;
+	}
+	const ASN1_STRING *const data =
+		X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, idx));
+	if (data == NULL) {
+		return -1;
+	}
+	const int dlen = ASN1_STRING_length(data);
+	if (len > 0) {
+		const size_t n = (dlen >= 0 && (size_t)dlen < len) ?
+					 (size_t)dlen :
+					 len - 1;
+		memcpy(buf, ASN1_STRING_get0_data(data), n);
+		buf[n] = '\0';
+	}
+	return dlen;
+}
+
 static bool cert_cn_equals(X509 *restrict cert, const char *restrict expect)
 {
-	X509_NAME *const subj = X509_get_subject_name(cert);
 	char cn[256] = { 0 };
-	const int n = X509_NAME_get_text_by_NID(
-		subj, NID_commonName, cn, (int)sizeof(cn));
+	const int n = name_get_cn(X509_get_subject_name(cert), cn, sizeof(cn));
 	return n > 0 && strcmp(cn, expect) == 0;
 }
 
@@ -783,9 +810,8 @@ T_DECLARE_CASE(test_gencerts_long_server_name_lands_in_san)
 		san_ok = cert_has_dns_san(cert, sni);
 		/* The subject stays non-empty and within OpenSSL's CN bound. */
 		char cn[256] = { 0 };
-		const int cn_len = X509_NAME_get_text_by_NID(
-			X509_get_subject_name(cert), NID_commonName, cn,
-			(int)sizeof(cn));
+		const int cn_len = name_get_cn(
+			X509_get_subject_name(cert), cn, sizeof(cn));
 		cn_within_bound = cn_len > 0 && cn_len <= 64 &&
 				  strncmp(cn, sni, (size_t)cn_len) == 0;
 	}

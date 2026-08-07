@@ -65,16 +65,25 @@ static X509 *make_cert(
 	if (x == NULL) {
 		return NULL;
 	}
-	X509_NAME *const subject = X509_get_subject_name(x);
-	bool ok =
-		X509_set_version(x, 2L) == 1 &&
-		ASN1_INTEGER_set(X509_get_serialNumber(x), 1L) == 1 &&
-		X509_gmtime_adj(X509_getm_notBefore(x), 0) != NULL &&
-		X509_gmtime_adj(X509_getm_notAfter(x), 3600) != NULL &&
-		X509_set_pubkey(x, key) == 1 &&
-		X509_NAME_add_entry_by_txt(
-			subject, "CN", MBSTRING_ASC,
-			(const unsigned char *)"strength.test", -1, -1, 0) == 1;
+	/* Build the subject name separately and set it rather than mutating the
+	 * certificate's internal name in place: OpenSSL 4.0 made
+	 * X509_get_subject_name() return a const pointer, so an in-place
+	 * X509_NAME_add_entry_by_txt() on its result no longer compiles.  Both
+	 * X509_set_subject_name() and X509_set_issuer_name() copy the name, so
+	 * this one @c subject is freed once below and also serves as the
+	 * self-signed issuer.  This mirrors the @c issuer path below. */
+	X509_NAME *const subject = X509_NAME_new();
+	bool ok = subject != NULL &&
+		  X509_NAME_add_entry_by_txt(
+			  subject, "CN", MBSTRING_ASC,
+			  (const unsigned char *)"strength.test", -1, -1,
+			  0) == 1 &&
+		  X509_set_subject_name(x, subject) == 1 &&
+		  X509_set_version(x, 2L) == 1 &&
+		  ASN1_INTEGER_set(X509_get_serialNumber(x), 1L) == 1 &&
+		  X509_gmtime_adj(X509_getm_notBefore(x), 0) != NULL &&
+		  X509_gmtime_adj(X509_getm_notAfter(x), 3600) != NULL &&
+		  X509_set_pubkey(x, key) == 1;
 	if (ok && issuer_cn != NULL) {
 		X509_NAME *const issuer = X509_NAME_new();
 		ok = issuer != NULL &&
@@ -87,6 +96,7 @@ static X509 *make_cert(
 	} else if (ok) {
 		ok = X509_set_issuer_name(x, subject) == 1;
 	}
+	X509_NAME_free(subject);
 	if (!ok || X509_sign(x, key, md) <= 0) {
 		X509_free(x);
 		return NULL;
