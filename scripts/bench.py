@@ -45,6 +45,9 @@ class Scenario:
 class ResourceUsage:
     name: str
     cpu_percent: float
+    real_seconds: float
+    user_seconds: float
+    sys_seconds: float
     peak_rss_bytes: int
 
 
@@ -85,8 +88,8 @@ def quote_command(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
-def read_proc_cpu_ticks(pid: int) -> Optional[int]:
-    """Return cumulative utime+stime (clock ticks) for all threads of pid."""
+def read_proc_cpu_ticks(pid: int) -> Optional[tuple[int, int]]:
+    """Return cumulative (utime, stime) in clock ticks for all threads of pid."""
     try:
         with open("/proc/%d/stat" % pid, "r", encoding="ascii") as handle:
             data = handle.read()
@@ -103,7 +106,7 @@ def read_proc_cpu_ticks(pid: int) -> Optional[int]:
         stime = int(fields[12])  # field 15
     except (IndexError, ValueError):
         return None
-    return utime + stime
+    return utime, stime
 
 
 def read_proc_rss_bytes(pid: int) -> Optional[int]:
@@ -140,8 +143,8 @@ class ProcSampler:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._peak_rss: Dict[str, int] = {name: 0 for name, _ in self._procs}
-        self._start_ticks: Dict[str, Optional[int]] = {}
-        self._end_ticks: Dict[str, Optional[int]] = {}
+        self._start_ticks: Dict[str, Optional[tuple[int, int]]] = {}
+        self._end_ticks: Dict[str, Optional[tuple[int, int]]] = {}
         self._start_time = 0.0
         self._end_time = 0.0
 
@@ -180,13 +183,18 @@ class ProcSampler:
             start = self._start_ticks.get(name)
             end = self._end_ticks.get(name)
             if start is None or end is None:
-                cpu_percent = 0.0
+                user_seconds = sys_seconds = cpu_percent = 0.0
             else:
-                cpu_percent = (end - start) / CLK_TCK / wall * 100.0
+                user_seconds = (end[0] - start[0]) / CLK_TCK
+                sys_seconds = (end[1] - start[1]) / CLK_TCK
+                cpu_percent = (user_seconds + sys_seconds) / wall * 100.0
             usage.append(
                 ResourceUsage(
                     name=name,
                     cpu_percent=cpu_percent,
+                    real_seconds=wall,
+                    user_seconds=user_seconds,
+                    sys_seconds=sys_seconds,
                     peak_rss_bytes=self._peak_rss[name],
                 )
             )
@@ -951,20 +959,25 @@ def render_markdown_report(
     lines.extend(["", "## Resource Usage", ""])
     lines.append(
         "CPU is average utilisation over the scenario "
-        "(100%% = one core); RSS is the peak resident set size sampled "
-        "every %.0f ms from /proc." % (RESOURCE_SAMPLE_INTERVAL * 1000.0)
+        "(100%% = one core); Real is the scenario wall-clock, User/Sys the "
+        "process CPU time (utime/stime from /proc/<pid>/stat, all threads); "
+        "RSS is the peak resident set size sampled every %.0f ms from /proc."
+        % (RESOURCE_SAMPLE_INTERVAL * 1000.0)
     )
     lines.append("")
-    lines.append("| Scenario | Process | CPU | Peak RSS |")
-    lines.append("| --- | --- | ---: | ---: |")
+    lines.append("| Scenario | Process | CPU | Real | User | Sys | Peak RSS |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
     for result in results:
         for usage in result.resource_usage:
             lines.append(
-                "| %s | %s | %.1f%% | %s |"
+                "| %s | %s | %.1f%% | %.2f s | %.2f s | %.2f s | %s |"
                 % (
                     result.scenario.label,
                     usage.name,
                     usage.cpu_percent,
+                    usage.real_seconds,
+                    usage.user_seconds,
+                    usage.sys_seconds,
                     format_bytes(usage.peak_rss_bytes),
                 )
             )
