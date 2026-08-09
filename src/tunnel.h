@@ -107,8 +107,9 @@ struct tunnel_opts {
 	const char *(*psk_identity_of)(void *ctx, const char *label);
 	void *psk_ctx;
 #if WITH_TLS
-	/* Borrowed; the caller retains ownership on both success and failure
-	 * (may be a shared, ref-counted handle reused across tunnels). */
+	/* Adopted on success and freed by tunnel_close(); left to the caller
+	 * only when tunnel_new() fails, since it may be a shared, ref-counted
+	 * handle still needed by other tunnels. */
 	struct tls_context *tlsctx;
 	/* Owned; freed by tunnel_new itself on failure (see below). */
 	struct tls_connection *conn;
@@ -119,8 +120,9 @@ struct tunnel_opts {
  * the tunnel thread (call tunnel_start() after registration).  Takes
  * ownership of opts->fd (when fd >= 0) and opts->conn (when set) on both
  * success and failure; the caller must not close fd or free conn itself,
- * before or after the call.  opts->tlsctx is not owned; see struct
- * tunnel_opts.  Returns NULL on allocation failure. */
+ * before or after the call.  opts->tlsctx is adopted on success only, and
+ * freed by tunnel_close(); see struct tunnel_opts.  Returns NULL on allocation
+ * failure, leaving opts->tlsctx with the caller. */
 struct tunnel *tunnel_new(
 	const struct tunnel_context *parent,
 	const struct tunnel_opts *restrict opts);
