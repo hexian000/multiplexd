@@ -261,6 +261,12 @@ add_src_test(gencerts_test
     gencerts_test.c
 )
 
+# Always registered; no-op when TLS disabled.
+add_src_test(genpsk_test
+    genpsk.c genpsk.h
+    genpsk_test.c
+)
+
 add_src_test(tunnel_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     ${GENCERTS_SOURCES}
