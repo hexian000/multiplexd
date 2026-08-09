@@ -132,13 +132,19 @@ mime_check_media(char *buf, const char *subtype, const char **version_out);
  * metric context never exceeds 2x. */
 enum { IDENTITY_ESCAPED_MAX = 4 * 255 + 1 };
 
+/* Stands in for a C0 byte the metric grammar cannot escape. Printable, so it
+ * survives interpolation inertly. Lossy by design: identities differing only in
+ * which control byte they carry collapse onto one label value. */
+#define IDENTITY_METRIC_PLACEHOLDER '?'
+
 /* escape_identity() target grammar. The Prometheus 0.0.4 text format accepts
  * only \\, \" and \n as backslash escapes inside a label value; any other
  * escape (e.g. \t or \r) is an "invalid escape sequence" that makes the whole
- * scrape unparseable, so TAB and CR are emitted literally there -- both are
- * valid label-value bytes. Plaintext -- a log record or a status line -- has no
- * such grammar, so it escapes every control byte: TAB and CR as \t and \r, and
- * any other C0 byte (e.g. ESC) as an inert \xNN. */
+ * scrape unparseable. A C0 byte with no valid escape -- TAB and CR as much as
+ * ESC -- is therefore substituted with IDENTITY_METRIC_PLACEHOLDER rather than
+ * escaped or passed through. Plaintext -- a log record or a status line -- has
+ * no such grammar, so it escapes every control byte: TAB and CR as \t and \r,
+ * and any other C0 byte (e.g. ESC) as an inert \xNN. */
 enum escape_ctx { ESCAPE_METRIC, ESCAPE_PLAIN };
 
 /**

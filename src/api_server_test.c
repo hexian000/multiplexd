@@ -1793,9 +1793,10 @@ T_DECLARE_CASE(test_metrics_session_counter_type_matches_samples)
 /* A peer identity containing structural characters must be escaped in the
  * Prometheus label value; an unescaped one could corrupt the /metrics
  * exposition or inject spoofed lines. The Prometheus 0.0.4 text format defines
- * escapes for only \\, \", and \n -- \t and \r are NOT valid escapes and would
- * make the whole scrape unparseable, so they must be emitted as literal bytes,
- * not backslash-escaped. */
+ * escapes for only \\, \", and \n -- \t, \r and \xNN are NOT valid escapes and
+ * would make the whole scrape unparseable, so every other control byte is
+ * substituted instead, keeping a scraped exposition inert on the terminal of
+ * whoever curls the endpoint. */
 T_DECLARE_CASE(test_metrics_escapes_special_chars_in_identity)
 {
 	struct apifx fx;
@@ -1804,8 +1805,9 @@ T_DECLARE_CASE(test_metrics_escapes_special_chars_in_identity)
 	}
 
 	/* Exercises every escape class: quote, newline, backslash (all
-	 * Prometheus-legal) plus TAB and CR (must stay literal in a label). */
-	static const char evil_id[] = "a\"b\nc\\d\te\rf";
+	 * Prometheus-legal) plus TAB, CR and a full ANSI colour sequence, whose
+	 * ESC is the byte that drives the reader's terminal. */
+	static const char evil_id[] = "a\"b\nc\\d\te\rf\x1b[31m";
 	fx.srv.identities = table_new(&(struct table_opts){
 		.hash = TABLE_OPTS_STR.hash,
 		.eq = TABLE_OPTS_STR.eq,
@@ -1833,13 +1835,19 @@ T_DECLARE_CASE(test_metrics_escapes_special_chars_in_identity)
 	/* Teardown before asserting so a failing T_EXPECT can't skip it. */
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
-	/* Quote/newline/backslash escaped; TAB and CR left as literal bytes. */
-	T_EXPECT(resp_contains(rctx.buf, "identity=\"a\\\"b\\nc\\\\d\te\rf\""));
+	/* No ESC anywhere in the response, so no cursor motion reaches the
+	 * terminal reading it. Checked over the whole response rather than the
+	 * label, which would miss an ESC reaching it by another interpolation. */
+	T_EXPECT(!resp_contains(rctx.buf, "\x1b"));
+	/* Quote/newline/backslash escaped; TAB, CR and ESC substituted. */
+	T_EXPECT(resp_contains(
+		rctx.buf, "identity=\"a\\\"b\\nc\\\\d?e?f?[31m\""));
 	/* The raw (injection-capable) quote form absent. */
 	T_EXPECT(!resp_contains(rctx.buf, "identity=\"a\"b"));
-	/* No invalid Prometheus escape sequence for TAB or CR anywhere. */
+	/* No invalid Prometheus escape sequence anywhere. */
 	T_EXPECT(!resp_contains(rctx.buf, "\\t"));
 	T_EXPECT(!resp_contains(rctx.buf, "\\r"));
+	T_EXPECT(!resp_contains(rctx.buf, "\\x"));
 }
 
 T_DECLARE_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity)

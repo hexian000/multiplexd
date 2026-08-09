@@ -2,8 +2,9 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* util_test.c - black-box tests for util.c's public API: address resolution
- * (resolve_addr, resolve_bindaddr), CSPRNG byte generation (csprng_bytes), and
- * MIME media-type validation (mime_check_media).
+ * (resolve_addr, resolve_bindaddr), CSPRNG byte generation (csprng_bytes),
+ * MIME media-type validation (mime_check_media), and identity escaping
+ * (escape_identity).
  * Dependencies: links the real util.c (+ TLS backend). */
 
 #include "shim/util.h"
@@ -293,6 +294,103 @@ T_DECLARE_CASE(test_mime_check_media_malformed_tail)
 	T_EXPECT(r == MIME_CHECK_MALFORMED);
 }
 
+/* Every escape class of the plaintext grammar in one identity: the two
+ * verbatim escapes, the shared \n, the two ESCAPE_PLAIN-only escapes, and a
+ * remaining C0 byte -- ESC, the one that drives a reader's terminal -- as an
+ * inert \xNN. */
+T_DECLARE_CASE(test_escape_identity_plain_escapes_every_class)
+{
+	char out[IDENTITY_ESCAPED_MAX];
+	escape_identity(
+		out, sizeof(out), "a\"b\nc\\d\te\rf\x1b[", ESCAPE_PLAIN);
+	T_EXPECT_STREQ(out, "a\\\"b\\nc\\\\d\\te\\rf\\x1b[");
+}
+
+/* The same identity in the Prometheus grammar, where \\, \" and \n are the
+ * only valid label-value escapes: every other C0 byte -- TAB and CR as much as
+ * the terminal-driving ESC -- becomes the placeholder, since \t, \r and \xNN
+ * alike would make the scrape unparseable and passing the byte through would
+ * put it on the operator's terminal. */
+T_DECLARE_CASE(test_escape_identity_metric_substitutes_remaining_c0)
+{
+	char out[IDENTITY_ESCAPED_MAX];
+	escape_identity(
+		out, sizeof(out), "a\"b\nc\\d\te\rf\x1b[", ESCAPE_METRIC);
+	T_EXPECT_STREQ(out, "a\\\"b\\nc\\\\d?e?f?[");
+}
+
+/* Each truncation guard at its exact boundary: the result breaks at a whole
+ * escape and is always NUL-terminated. The plaintext call sites escape into
+ * 64-byte stack buffers, so an off-by-one here writes past one of them --
+ * hence the smallest fitting size is driven too, where the buffer is exact and
+ * the sanitizer sees the overflow no assertion could. */
+T_DECLARE_CASE(test_escape_identity_truncates_and_terminates)
+{
+	/* Two-byte escape: "a\n" needs 4 bytes with the terminator. */
+	{
+		char out[3];
+		escape_identity(out, sizeof(out), "a\nb", ESCAPE_PLAIN);
+		T_EXPECT_STREQ(out, "a");
+	}
+	{
+		char out[4];
+		escape_identity(out, sizeof(out), "a\nb", ESCAPE_PLAIN);
+		T_EXPECT_STREQ(out, "a\\n");
+	}
+	/* Four-byte hex escape: "a\x1b" needs 6 bytes with the terminator.
+	 * The trailing 'z' is not a hex digit, so it ends the \x escape. */
+	{
+		char out[5];
+		escape_identity(out, sizeof(out), "a\x1bz", ESCAPE_PLAIN);
+		T_EXPECT_STREQ(out, "a");
+	}
+	{
+		char out[6];
+		escape_identity(out, sizeof(out), "a\x1bz", ESCAPE_PLAIN);
+		T_EXPECT_STREQ(out, "a\\x1b");
+	}
+	/* Verbatim byte: one byte with the terminator. */
+	{
+		char out[3];
+		escape_identity(out, sizeof(out), "abc", ESCAPE_PLAIN);
+		T_EXPECT_STREQ(out, "ab");
+	}
+	/* Metric placeholder: one byte, as a verbatim byte is, but written
+	 * through a guard of its own. */
+	{
+		char out[2];
+		escape_identity(out, sizeof(out), "a\x1bz", ESCAPE_METRIC);
+		T_EXPECT_STREQ(out, "a");
+	}
+	{
+		char out[3];
+		escape_identity(out, sizeof(out), "a\x1bz", ESCAPE_METRIC);
+		T_EXPECT_STREQ(out, "a?");
+	}
+	/* Only the terminator fits. */
+	{
+		char out[1];
+		escape_identity(out, sizeof(out), "abc", ESCAPE_PLAIN);
+		T_EXPECT_STREQ(out, "");
+	}
+}
+
+/* IDENTITY_ESCAPED_MAX is sized against the worst case, so a full-length
+ * identity of the costliest byte -- a C0 control, 4 output bytes each -- must
+ * come back whole rather than truncated. */
+T_DECLARE_CASE(test_escape_identity_worst_case_fits_escaped_max)
+{
+	/* The longest identity the constant budgets for, derived from it. */
+	enum { IDENTITY_MAX = (IDENTITY_ESCAPED_MAX - 1) / 4 };
+	char in[IDENTITY_MAX + 1];
+	memset(in, '\x1b', IDENTITY_MAX);
+	in[IDENTITY_MAX] = '\0';
+
+	char out[IDENTITY_ESCAPED_MAX];
+	escape_identity(out, sizeof(out), in, ESCAPE_PLAIN);
+	T_EXPECT_EQ(strlen(out), (size_t)(4 * IDENTITY_MAX));
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_resolve_addr_ipv4_parses_correctly),
 	T_CASE(test_resolve_addr_ipv6_parses_correctly),
@@ -314,6 +412,10 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_mime_check_media_wrong_subtype),
 	T_CASE(test_mime_check_media_wrong_type),
 	T_CASE(test_mime_check_media_malformed_tail),
+	T_CASE(test_escape_identity_plain_escapes_every_class),
+	T_CASE(test_escape_identity_metric_substitutes_remaining_c0),
+	T_CASE(test_escape_identity_truncates_and_terminates),
+	T_CASE(test_escape_identity_worst_case_fits_escaped_max),
 	T_SUITE_END,
 };
 

@@ -68,6 +68,35 @@ bool csprng_bytes(unsigned char *buf, const size_t len)
 	return true;
 }
 
+/* Best-effort: the caller is already returning an error. */
+void discard_file(const char *path)
+{
+	if (unlink(path) != 0) {
+		const int err = errno;
+		LOGW_F("failed to remove %s: (%d) %s", path, err,
+		       strerror(err));
+	}
+}
+
+FILE *create_exclusive(const char *path, mode_t mode)
+{
+	const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+	if (fd < 0) {
+		const int err = errno;
+		LOGE_F("failed to open %s: (%d) %s", path, err, strerror(err));
+		return NULL;
+	}
+	FILE *const fp = fdopen(fd, "w");
+	if (fp == NULL) {
+		const int err = errno;
+		LOGE_F("fdopen %s: (%d) %s", path, err, strerror(err));
+		(void)close(fd);
+		discard_file(path);
+		return NULL;
+	}
+	return fp;
+}
+
 /* Split addrstr into hoststr/portstr via buf (capacity buflen); false if
  * addrstr doesn't fit or has no valid host:port syntax. */
 static bool split_addr(
@@ -183,7 +212,12 @@ void escape_identity(
 			}
 			out[o++] = '\\';
 			out[o++] = esc;
-		} else if (ctx == ESCAPE_PLAIN && c < 0x20) {
+		} else if (c >= 0x20) {
+			if (o + 1 >= outsize) {
+				break;
+			}
+			out[o++] = (char)c;
+		} else if (ctx == ESCAPE_PLAIN) {
 			/* Any remaining C0 control byte (e.g. ESC) would let a
 			 * crafted identity drive terminal cursor motion; emit an
 			 * inert \xNN escape. */
@@ -195,10 +229,12 @@ void escape_identity(
 			tohexlower(&out[o], c);
 			o += 2;
 		} else {
+			/* The metric grammar spells no escape for a remaining C0
+			 * byte, so substitute the inert placeholder instead. */
 			if (o + 1 >= outsize) {
 				break;
 			}
-			out[o++] = (char)c;
+			out[o++] = IDENTITY_METRIC_PLACEHOLDER;
 		}
 	}
 	out[o] = '\0';
@@ -299,36 +335,3 @@ bool identity_matches_cert(
 	return matched;
 }
 #endif /* WITH_TLS */
-
-/* Best-effort cleanup after a later step fails; the caller is already
- * returning an error, so a failed unlink here is only logged. */
-void discard_file(const char *path)
-{
-	if (unlink(path) != 0) {
-		const int err = errno;
-		LOGW_F("failed to remove %s: (%d) %s", path, err,
-		       strerror(err));
-	}
-}
-
-/* Create `path` exclusively (O_EXCL refuses to overwrite an existing file)
- * and wrap it in a stream, discarding the file if fdopen fails. mode is
- * masked by umask (POSIX semantics): an upper bound, not a guarantee. */
-FILE *create_exclusive(const char *path, mode_t mode)
-{
-	const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
-	if (fd < 0) {
-		const int err = errno;
-		LOGE_F("failed to open %s: (%d) %s", path, err, strerror(err));
-		return NULL;
-	}
-	FILE *const fp = fdopen(fd, "w");
-	if (fp == NULL) {
-		const int err = errno;
-		LOGE_F("fdopen %s: (%d) %s", path, err, strerror(err));
-		(void)close(fd);
-		discard_file(path);
-		return NULL;
-	}
-	return fp;
-}
