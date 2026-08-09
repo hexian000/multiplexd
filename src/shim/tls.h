@@ -139,7 +139,8 @@ enum tls_error {
  * @param[in] cert_data "@filename" to read a file, else a NUL-terminated PEM blob.
  * @return true on success.
  */
-bool tls_load_cert(struct tls_context *ctx, const char *cert_data);
+bool tls_load_cert(
+	struct tls_context *restrict ctx, const char *restrict cert_data);
 
 /**
  * @brief Load a private key.
@@ -147,7 +148,8 @@ bool tls_load_cert(struct tls_context *ctx, const char *cert_data);
  * @param[in] key_data "@filename" to read a file, else a NUL-terminated PEM blob.
  * @return true on success.
  */
-bool tls_load_key(struct tls_context *ctx, const char *key_data);
+bool tls_load_key(
+	struct tls_context *restrict ctx, const char *restrict key_data);
 
 /**
  * @brief Load authorized certificates, each "@filename" or a PEM blob.
@@ -157,7 +159,8 @@ bool tls_load_key(struct tls_context *ctx, const char *key_data);
  * @return true on success; a no-op success when @p authcerts is NULL or @p count is 0.
  */
 bool tls_load_authcerts(
-	struct tls_context *ctx, char *const *authcerts, size_t count);
+	struct tls_context *restrict ctx, char *const *restrict authcerts,
+	size_t count);
 
 /**
  * @brief Zero a memory region via the TLS library.
@@ -186,7 +189,8 @@ void tls_secure_erase(void *ptr, size_t len);
  * generator, not only during a handshake.
  */
 bool tls_psk_label(
-	const unsigned char *psk, size_t psk_len, char *buf, size_t *len);
+	const unsigned char *restrict psk, size_t psk_len, char *restrict buf,
+	size_t *restrict len);
 
 /**
  * @brief Create a TLS 1.3 server context.
@@ -224,13 +228,13 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf);
  * succeeds. A portable caller must not assume a server context can be shared,
  * and must not read the NULL as an allocation failure.
  */
-struct tls_context *tls_ctx_ref(struct tls_context *ctx);
+struct tls_context *tls_ctx_ref(struct tls_context *restrict ctx);
 
 /**
  * @brief Free a TLS context.
  * @param ctx Context to free; NULL is safe.
  */
-void tls_ctx_free(struct tls_context *ctx);
+void tls_ctx_free(struct tls_context *restrict ctx);
 
 /**
  * @brief New server-mode (accept) connection; performs no I/O or handshake.
@@ -265,7 +269,7 @@ struct tls_connection *tls_client(struct tls_context *ctx, int fd);
  * @param[in] cb Notifier (copied by reference); NULL clears it.
  */
 void tls_set_callback(
-	struct tls_connection *conn, const struct tls_callback *cb);
+	struct tls_connection *restrict conn, const struct tls_callback *cb);
 
 /**
  * @brief Memory-backed only: feed received ciphertext for tls_recv() / tls_handshake().
@@ -274,7 +278,9 @@ void tls_set_callback(
  * @param len Byte count.
  * @return true on success.
  */
-bool tls_input(struct tls_connection *conn, const void *data, size_t len);
+bool tls_input(
+	struct tls_connection *restrict conn, const void *restrict data,
+	size_t len);
 
 /**
  * @brief Memory-backed only: drain pending outbound ciphertext.
@@ -283,7 +289,8 @@ bool tls_input(struct tls_connection *conn, const void *data, size_t len);
  * @param len Destination capacity.
  * @return Bytes copied (0 if none); the on_send notifier reports availability.
  */
-size_t tls_output(struct tls_connection *conn, void *buf, size_t len);
+size_t tls_output(
+	struct tls_connection *restrict conn, void *restrict buf, size_t len);
 
 /**
  * @brief Drive the non-blocking handshake (optional; tls_send/tls_recv complete it lazily).
@@ -291,7 +298,7 @@ size_t tls_output(struct tls_connection *conn, void *buf, size_t len);
  * @return NONE when done; WANT_READ/WANT_WRITE while in progress on that
  * direction; else fatal.
  */
-enum tls_error tls_handshake(struct tls_connection *conn);
+enum tls_error tls_handshake(struct tls_connection *restrict conn);
 
 /**
  * @brief Send plaintext with partial writes.
@@ -324,7 +331,7 @@ enum tls_error tls_recv(
  * @note To observe the peer's close, keep calling tls_recv() until
  * TLS_ERROR_ZERO_RETURN.
  */
-enum tls_error tls_shutdown(struct tls_connection *conn);
+enum tls_error tls_shutdown(struct tls_connection *restrict conn);
 
 /**
  * @brief Free a TLS connection.
@@ -382,7 +389,9 @@ bool tls_peer_cert_uri_sans(
  * is -- unlike a certificate's subjectAltName, nothing further need be
  * checked to trust it.
  */
-bool tls_peer_psk_label(struct tls_connection *conn, char *buf, size_t *len);
+bool tls_peer_psk_label(
+	struct tls_connection *restrict conn, char *restrict buf,
+	size_t *restrict len);
 
 /** @} */
 

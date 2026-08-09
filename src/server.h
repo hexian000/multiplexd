@@ -311,7 +311,7 @@ bool server_apply_config(struct server *restrict s, struct config *new_conf);
 struct server *server_new(struct ev_loop *loop, struct config *conf);
 
 /* Start listeners, background workers, and outbound sessions; false on failure. */
-bool server_start(struct server *s);
+bool server_start(struct server *restrict s);
 
 /* Stop listeners, drop any connection the management API still holds, and
  * initiate shutdown of active sessions. */

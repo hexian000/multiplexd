@@ -65,32 +65,34 @@ void mux_sched_init(struct mux_session *restrict ss)
 	ss->sched.w_coalesce.data = ss;
 }
 
-void mux_sched_coalesce_arm(struct mux_session *ss)
+void mux_sched_coalesce_arm(struct mux_session *restrict ss)
 {
 	if (!ev_is_active(&ss->sched.w_coalesce)) {
 		ev_timer_start(ss->loop, &ss->sched.w_coalesce);
 	}
 }
 
-void mux_sched_schedule(struct mux_session *ss)
+void mux_sched_schedule(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
-void mux_sched_wake(struct mux_session *ss, struct mux_stream *s)
+void mux_sched_wake(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;
 }
 
-bool mux_sched_add_stream(struct mux_session *ss, struct mux_stream *s)
+bool mux_sched_add_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;
 	return g_sched_add_stream_result;
 }
 
-uint_least16_t mux_sched_alloc_stream_id(struct mux_session *ss)
+uint_least16_t mux_sched_alloc_stream_id(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return g_alloc_stream_id_result;
@@ -142,7 +144,7 @@ void mux_wire_discard_buffers(struct mux_session *restrict ss)
 	}
 }
 
-void mux_unacked_free_all(struct mux_session *ss)
+void mux_unacked_free_all(struct mux_session *restrict ss)
 {
 	mux_frame_ring_free(&ss->unacked.ring, &ss->pool);
 	ss->unacked.frames = 0;
@@ -156,7 +158,7 @@ void mux_unacked_free_all(struct mux_session *ss)
 	ss->unacked.stalled = false;
 }
 
-void mux_wire_conn_free(struct mux_session *ss)
+void mux_wire_conn_free(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
@@ -192,24 +194,24 @@ bool mux_handshake_enqueue_hello(
 	return true;
 }
 
-void mux_session_flush_oob(struct mux_session *ss)
+void mux_session_flush_oob(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
-void mux_session_on_recv(struct mux_session *ss)
+void mux_session_on_recv(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
-void mux_session_on_send(struct mux_session *ss)
+void mux_session_on_send(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
 bool mux_session_send_oob(
-	struct mux_session *ss, uint_fast8_t extra,
-	const unsigned char *payload, size_t payload_len)
+	struct mux_session *restrict ss, uint_fast8_t extra,
+	const unsigned char *restrict payload, size_t payload_len)
 {
 	(void)ss;
 	(void)payload;
@@ -233,7 +235,8 @@ void mux_stream_free(struct mux_stream *s)
 	(void)s;
 }
 
-bool mux_unacked_resume_ack_recv(struct mux_session *ss, uint_least32_t peer_ack)
+bool mux_unacked_resume_ack_recv(
+	struct mux_session *restrict ss, uint_least32_t peer_ack)
 {
 	(void)ss;
 	(void)peer_ack;
@@ -243,7 +246,8 @@ bool mux_unacked_resume_ack_recv(struct mux_session *ss, uint_least32_t peer_ack
 static int g_unacked_track_sent_calls = 0;
 static const struct mux_frame *g_last_track_sent_frame;
 
-void mux_unacked_track_sent(struct mux_session *ss, struct mux_frame *frame)
+void mux_unacked_track_sent(
+	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
 	/* Real mux_unacked_track_sent takes ownership; reclaim here to avoid leaks
 	 * when a test routes a captured sendbuf frame through this path. Record
@@ -260,29 +264,29 @@ void mux_wire_adopt_tlsconn(
 	(void)conn;
 }
 
-void mux_wire_tlsconn_free(struct tls_connection *conn)
+void mux_wire_tlsconn_free(struct tls_connection *restrict conn)
 {
 	(void)conn;
 }
 
-enum wire_shutdown_state mux_wire_shutdown(struct mux_session *ss)
+enum wire_shutdown_state mux_wire_shutdown(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return g_wire_shutdown_result;
 }
 
-void mux_wire_tls_log_status(struct mux_session *ss)
+void mux_wire_tls_log_status(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
-bool mux_wire_tls_start(struct mux_session *ss)
+bool mux_wire_tls_start(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return g_wire_tls_start_result;
 }
 
-enum wire_eof_result mux_wire_wait_eof(struct mux_session *ss)
+enum wire_eof_result mux_wire_wait_eof(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return g_wire_wait_eof_result;

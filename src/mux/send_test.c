@@ -92,7 +92,7 @@ static void spies_reset(void)
 	g_dispatch_pending_calls = 0;
 }
 
-void mux_sched_schedule(struct mux_session *ss)
+void mux_sched_schedule(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g_sched_schedule_calls++;
@@ -145,7 +145,7 @@ bool mux_sched_next_data(struct mux_session *restrict ss)
 
 /* Benign no-op stubs for the remaining session.c collaborators */
 
-void mux_session_dispatch_pending(struct mux_session *ss)
+void mux_session_dispatch_pending(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g_dispatch_pending_calls++;
@@ -192,32 +192,34 @@ bool mux_handshake_enqueue_hello(
 	return true;
 }
 
-bool mux_sched_add_stream(struct mux_session *ss, struct mux_stream *s)
+bool mux_sched_add_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;
 	return true;
 }
 
-uint_least16_t mux_sched_alloc_stream_id(struct mux_session *ss)
+uint_least16_t mux_sched_alloc_stream_id(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return STREAMID_CTRL;
 }
 
-void mux_sched_coalesce_arm(struct mux_session *ss)
+void mux_sched_coalesce_arm(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
-void mux_sched_delay_remove(struct mux_session *ss, struct mux_stream *s)
+void mux_sched_delay_remove(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;
 	g_delay_remove_calls++;
 }
 
-void mux_sched_free_streams(struct mux_session *ss)
+void mux_sched_free_streams(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
@@ -227,7 +229,8 @@ void mux_sched_init(struct mux_session *restrict ss)
 	(void)ss;
 }
 
-void mux_sched_wake(struct mux_session *ss, struct mux_stream *s)
+void mux_sched_wake(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;
@@ -243,7 +246,7 @@ void mux_stream_free(struct mux_stream *s)
 	(void)s;
 }
 
-uint_fast32_t mux_stream_grant_inc(const struct mux_stream *s)
+uint_fast32_t mux_stream_grant_inc(const struct mux_stream *restrict s)
 {
 	(void)s;
 	return g_grant_inc;
@@ -264,17 +267,17 @@ struct mux_stream *mux_stream_new(
 	return NULL;
 }
 
-void mux_wire_conn_free(struct mux_session *ss)
+void mux_wire_conn_free(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
-void mux_wire_discard_buffers(struct mux_session *ss)
+void mux_wire_discard_buffers(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
-bool mux_wire_has_pending(const struct mux_session *ss)
+bool mux_wire_has_pending(const struct mux_session *restrict ss)
 {
 	(void)ss;
 	return false;
@@ -290,7 +293,9 @@ bool mux_wire_recv(
 	return false;
 }
 
-bool mux_wire_send(struct mux_session *ss, const unsigned char *buf, size_t *len)
+bool mux_wire_send(
+	struct mux_session *restrict ss, const unsigned char *restrict buf,
+	size_t *restrict len)
 {
 	(void)ss;
 	(void)buf;
@@ -304,7 +309,8 @@ bool mux_wire_send(struct mux_session *ss, const unsigned char *buf, size_t *len
 	return true;
 }
 
-void mux_wire_sendbuf_push(struct mux_session *ss, struct mux_frame *frame)
+void mux_wire_sendbuf_push(
+	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
 	/* Functional enough for the producer tests: take ownership by appending
 	 * to the real sendbuf list so the written header can be inspected and the
@@ -320,26 +326,26 @@ void mux_wire_sendbuf_push(struct mux_session *ss, struct mux_frame *frame)
 	mux_frame_list_push(&ss->wire.sendbuf, frame);
 }
 
-enum wire_flush_result mux_wire_flush(struct mux_session *ss)
+enum wire_flush_result mux_wire_flush(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return g_wire_flush_result;
 }
 
-enum wire_shutdown_state mux_wire_shutdown(struct mux_session *ss)
+enum wire_shutdown_state mux_wire_shutdown(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return WIRE_SHUTDOWN_DONE;
 }
 
-enum wire_eof_result mux_wire_wait_eof(struct mux_session *ss)
+enum wire_eof_result mux_wire_wait_eof(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return WIRE_EOF_ERROR;
 }
 
 #if WITH_TLS
-bool mux_wire_tls_start(struct mux_session *ss)
+bool mux_wire_tls_start(struct mux_session *restrict ss)
 {
 	(void)ss;
 	return true;
@@ -352,7 +358,7 @@ void mux_wire_adopt_tlsconn(
 	(void)conn;
 }
 
-void mux_wire_tls_log_status(struct mux_session *ss)
+void mux_wire_tls_log_status(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
@@ -401,7 +407,7 @@ void mux_session_set_state(struct mux_session *ss, enum session_state newstate)
 	ss->state = newstate;
 }
 
-void mux_session_suspend(struct mux_session *ss)
+void mux_session_suspend(struct mux_session *restrict ss)
 {
 	g_suspend_calls++;
 	ss->state = SESSION_SUSPENDED;
@@ -415,7 +421,7 @@ void mux_session_reset(struct mux_session *ss)
 
 /* Mirrors production mux_session_suspend_or_reset so these white-box tests still
  * observe the suspend-vs-reset decision via the stubs above. */
-void mux_session_suspend_or_reset(struct mux_session *ss)
+void mux_session_suspend_or_reset(struct mux_session *restrict ss)
 {
 	if (ss->handshake.has_session_id &&
 	    (ss->state == SESSION_ESTABLISHED ||
@@ -450,7 +456,8 @@ void mux_session_log_frame_header(
 
 /* unacked collaborators referenced by the send pipeline (never reached in these
  * cases: no frame is produced, so the retransmit/track paths stay idle). */
-void mux_unacked_track_sent(struct mux_session *ss, struct mux_frame *frame)
+void mux_unacked_track_sent(
+	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
 	/* The real implementation takes ownership; mirror that so the flush
 	 * tests, which fully send a frame, do not leak it. */
@@ -458,7 +465,7 @@ void mux_unacked_track_sent(struct mux_session *ss, struct mux_frame *frame)
 	mux_frame_put(&ss->pool, frame);
 }
 
-void mux_unacked_ack_emitted(struct mux_session *ss, uint_fast32_t emit)
+void mux_unacked_ack_emitted(struct mux_session *restrict ss, uint_fast32_t emit)
 {
 	(void)ss;
 	g_ack_emitted_calls++;
@@ -468,7 +475,7 @@ void mux_unacked_ack_emitted(struct mux_session *ss, uint_fast32_t emit)
 /* Mirror the real mux_unacked_free_all's teardown of the retransmit state so
  * test_send_handle_rx_closed_terminal can assert the branch dropped the
  * dangling replay pointer; the ring itself is mocked away in this TU. */
-void mux_unacked_free_all(struct mux_session *ss)
+void mux_unacked_free_all(struct mux_session *restrict ss)
 {
 	ss->unacked.retransmit_copy = NULL;
 	ss->unacked.retransmit_off = SIZE_MAX;

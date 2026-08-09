@@ -124,8 +124,8 @@ static void spies_reset(void)
  * bind to these definitions. */
 
 bool mux_session_send_ctrl(
-	struct mux_session *ss, uint_fast16_t stream_id, uint_fast8_t flags,
-	uint_fast32_t extra)
+	struct mux_session *restrict ss, uint_fast16_t stream_id,
+	uint_fast8_t flags, uint_fast32_t extra)
 {
 	(void)ss;
 	g.send_ctrl_calls++;
@@ -136,8 +136,8 @@ bool mux_session_send_ctrl(
 }
 
 bool mux_session_send_oob(
-	struct mux_session *ss, uint_fast8_t extra,
-	const unsigned char *payload, size_t payload_len)
+	struct mux_session *restrict ss, uint_fast8_t extra,
+	const unsigned char *restrict payload, size_t payload_len)
 {
 	(void)ss;
 	(void)payload;
@@ -147,25 +147,25 @@ bool mux_session_send_oob(
 	return g.send_oob_ret;
 }
 
-void mux_session_flush_oob(struct mux_session *ss)
+void mux_session_flush_oob(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g.flush_oob_calls++;
 }
 
-void mux_session_flush_resp(struct mux_session *ss)
+void mux_session_flush_resp(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g.flush_resp_calls++;
 }
 
-void mux_session_emit_ack(struct mux_session *ss)
+void mux_session_emit_ack(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g.emit_ack_calls++;
 }
 
-void mux_notify_write(struct mux_session *ss)
+void mux_notify_write(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g.notify_write_calls++;
@@ -177,7 +177,7 @@ void mux_session_reset(struct mux_session *ss)
 	ss->state = SESSION_CLOSED;
 }
 
-void mux_session_suspend(struct mux_session *ss)
+void mux_session_suspend(struct mux_session *restrict ss)
 {
 	g.suspend_calls++;
 	ss->state = SESSION_SUSPENDED;
@@ -185,7 +185,7 @@ void mux_session_suspend(struct mux_session *ss)
 
 /* Mirrors production mux_session_suspend_or_reset so these white-box tests still
  * observe the suspend-vs-reset decision via the stubs above. */
-void mux_session_suspend_or_reset(struct mux_session *ss)
+void mux_session_suspend_or_reset(struct mux_session *restrict ss)
 {
 	if (ss->handshake.has_session_id &&
 	    (ss->state == SESSION_ESTABLISHED ||
@@ -197,8 +197,9 @@ void mux_session_suspend_or_reset(struct mux_session *ss)
 }
 
 void mux_session_log_frame_header(
-	const struct mux_session *ss, const char *what,
-	const unsigned char *raw, const struct mux_header *hdr)
+	const struct mux_session *restrict ss, const char *restrict what,
+	const unsigned char *restrict raw,
+	const struct mux_header *restrict hdr)
 {
 	(void)ss;
 	(void)what;
@@ -206,7 +207,7 @@ void mux_session_log_frame_header(
 	(void)hdr;
 }
 
-double mux_keepalive_interval(const struct mux_session *ss)
+double mux_keepalive_interval(const struct mux_session *restrict ss)
 {
 	(void)ss;
 	return g.keepalive_ret;
@@ -229,7 +230,8 @@ void mux_stream_abort(struct mux_stream *restrict s, const enum mux_status code)
 }
 
 void mux_stream_recv_copy(
-	struct mux_stream *s, const unsigned char *payload, size_t payload_len)
+	struct mux_stream *restrict s, const unsigned char *restrict payload,
+	size_t payload_len)
 {
 	(void)payload;
 	g.recv_copy_calls++;
@@ -279,7 +281,7 @@ void mux_stream_recv_window(struct mux_stream *s, uint_fast32_t window_inc)
 	}
 }
 
-void mux_stream_check_ack(struct mux_stream *s)
+void mux_stream_check_ack(struct mux_stream *restrict s)
 {
 	(void)s;
 	g.check_ack_calls++;
@@ -307,8 +309,8 @@ void mux_stream_do_close(struct mux_stream *s)
 	g.stream_close_calls++;
 }
 
-struct mux_stream *
-mux_stream_new(struct mux_session *ss, uint_fast16_t id, bool active_open)
+struct mux_stream *mux_stream_new(
+	struct mux_session *restrict ss, uint_fast16_t id, bool active_open)
 {
 	(void)ss;
 	(void)id;
@@ -317,14 +319,15 @@ mux_stream_new(struct mux_session *ss, uint_fast16_t id, bool active_open)
 	return g.stream_new_ret;
 }
 
-int mux_stream_format_tag(char *buf, size_t buflen, const struct mux_stream *s)
+int mux_stream_format_tag(
+	char *restrict buf, size_t buflen, const struct mux_stream *restrict s)
 {
 	(void)s;
 	return snprintf(buf, buflen, "[test]");
 }
 
 struct mux_stream *
-mux_sched_find_stream(struct mux_session *ss, uint_fast16_t id)
+mux_sched_find_stream(struct mux_session *restrict ss, uint_fast16_t id)
 {
 	(void)ss;
 	(void)id;
@@ -332,7 +335,8 @@ mux_sched_find_stream(struct mux_session *ss, uint_fast16_t id)
 	return g.find_stream_ret;
 }
 
-bool mux_sched_add_stream(struct mux_session *ss, struct mux_stream *s)
+bool mux_sched_add_stream(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;
@@ -340,47 +344,49 @@ bool mux_sched_add_stream(struct mux_session *ss, struct mux_stream *s)
 	return g.add_stream_ret;
 }
 
-void mux_sched_coalesce_arm(struct mux_session *ss)
+void mux_sched_coalesce_arm(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g.coalesce_arm_calls++;
 }
 
-void mux_estimator_add(struct mux_session *ss, uint_fast64_t bytes)
+void mux_estimator_add(struct mux_session *restrict ss, uint_fast64_t bytes)
 {
 	(void)ss;
 	g.est_add_calls++;
 	g.est_add_bytes = bytes;
 }
 
-void mux_estimator_add_acked(struct mux_session *ss, uint_fast64_t bytes)
+void mux_estimator_add_acked(
+	struct mux_session *restrict ss, uint_fast64_t bytes)
 {
 	(void)ss;
 	g.est_add_acked_calls++;
 	g.est_add_acked_bytes = bytes;
 }
 
-void mux_estimator_calculate(struct mux_session *ss, int_fast64_t sent_ns)
+void mux_estimator_calculate(
+	struct mux_session *restrict ss, int_fast64_t sent_ns)
 {
 	(void)ss;
 	g.est_calc_calls++;
 	g.est_calc_sent_ns = sent_ns;
 }
 
-size_t mux_estimator_rx_window_size(const struct estimator_ctx *est)
+size_t mux_estimator_rx_window_size(const struct estimator_ctx *restrict est)
 {
 	(void)est;
 	return g.est_window_ret;
 }
 
-size_t mux_estimator_tx_window_size(const struct estimator_ctx *est)
+size_t mux_estimator_tx_window_size(const struct estimator_ctx *restrict est)
 {
 	(void)est;
 	return g.est_window_ret;
 }
 
 struct unacked_ack_result
-mux_unacked_ack_recv(struct mux_session *ss, uint_fast32_t count)
+mux_unacked_ack_recv(struct mux_session *restrict ss, uint_fast32_t count)
 {
 	(void)ss;
 	g.ack_trim_calls++;
@@ -389,7 +395,8 @@ mux_unacked_ack_recv(struct mux_session *ss, uint_fast32_t count)
 }
 
 bool mux_handshake_process_hello(
-	struct mux_session *ss, const struct mux_header *hdr, size_t frame_size)
+	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	size_t frame_size)
 {
 	(void)hdr;
 	g.hello_calls++;
@@ -417,7 +424,7 @@ bool mux_wire_recv(
 	return true;
 }
 
-bool mux_wire_has_pending(const struct mux_session *ss)
+bool mux_wire_has_pending(const struct mux_session *restrict ss)
 {
 	(void)ss;
 	if (g.wire_has_pending_remaining > 0) {

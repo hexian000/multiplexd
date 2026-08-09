@@ -116,13 +116,15 @@ void mux_sched_delay(
 	(void)ticks;
 }
 
-void mux_sched_delay_remove(struct mux_session *ss, struct mux_stream *s)
+void mux_sched_delay_remove(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;
 }
 
-void mux_sched_wake(struct mux_session *ss, struct mux_stream *s)
+void mux_sched_wake(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;
@@ -133,7 +135,7 @@ static int g_sched_check_no_active_streams_calls;
  * file's mux_sched_free_streams() mock. */
 static bool g_free_streams_on_check;
 
-void mux_sched_check_no_active_streams(struct mux_session *ss)
+void mux_sched_check_no_active_streams(struct mux_session *restrict ss)
 {
 	g_sched_check_no_active_streams_calls++;
 	if (g_free_streams_on_check) {
@@ -148,8 +150,8 @@ void mux_sched_check_no_active_streams(struct mux_session *ss)
 static bool g_session_send_ctrl_fail = false;
 
 bool mux_session_send_ctrl(
-	struct mux_session *ss, uint_fast16_t stream_id, uint_fast8_t flags,
-	uint_fast32_t extra)
+	struct mux_session *restrict ss, uint_fast16_t stream_id,
+	uint_fast8_t flags, uint_fast32_t extra)
 {
 	if (g_session_send_ctrl_fail) {
 		return false;
@@ -174,18 +176,19 @@ bool mux_session_send_ctrl(
 }
 
 void mux_session_discard_stream_frames(
-	struct mux_session *ss, uint_fast16_t stream_id)
+	struct mux_session *restrict ss, uint_fast16_t stream_id)
 {
 	(void)ss;
 	(void)stream_id;
 }
 
-void mux_session_flush(struct mux_session *ss)
+void mux_session_flush(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
 
-void mux_session_eager_flush(struct mux_session *ss, struct mux_stream *s)
+void mux_session_eager_flush(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
 {
 	(void)ss;
 	(void)s;

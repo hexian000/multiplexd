@@ -119,7 +119,7 @@ bool mux_session_send_ctrl(
 	return true;
 }
 
-uint_fast32_t mux_stream_grant_inc(const struct mux_stream *s)
+uint_fast32_t mux_stream_grant_inc(const struct mux_stream *restrict s)
 {
 	(void)s;
 	return g_stream_grant_inc;
@@ -157,7 +157,7 @@ void mux_stream_notify_recv(struct mux_stream *restrict s)
 	g_notify_recv_calls++;
 }
 
-void mux_session_flush(struct mux_session *ss)
+void mux_session_flush(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g_flush_calls++;
@@ -180,19 +180,19 @@ void mux_stream_do_close(struct mux_stream *s)
 	(void)s;
 }
 
-void mux_session_emit_ack(struct mux_session *ss)
+void mux_session_emit_ack(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g_emit_ack_calls++;
 }
 
-void mux_stream_check_ack(struct mux_stream *s)
+void mux_stream_check_ack(struct mux_stream *restrict s)
 {
 	(void)s;
 	g_stream_check_ack_calls++;
 }
 
-void mux_session_initiate_shutdown(struct mux_session *ss)
+void mux_session_initiate_shutdown(struct mux_session *restrict ss)
 {
 	(void)ss;
 	g_session_initiate_shutdown_calls++;

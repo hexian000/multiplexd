@@ -150,7 +150,7 @@ bool mux_unacked_resume_ack_recv(
  * retransmit_copy_count all belong to the contract handshake_client_fresh
  * relies on, so a double that skipped any of them would model behavior
  * production does not have. */
-void mux_unacked_free_all(struct mux_session *ss)
+void mux_unacked_free_all(struct mux_session *restrict ss)
 {
 	mux_frame_ring_free(&ss->unacked.ring, &ss->pool);
 	COUNTER_SUB(ss->cnt.buffers.unacked_frames, ss->unacked.frames);

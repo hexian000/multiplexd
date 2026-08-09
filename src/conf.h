@@ -136,7 +136,9 @@ struct config *conf_parsefile(const char *path);
 /* Serialize config to a heap JSON string (caller frees); @p lenp optionally
  * receives the length excluding NUL. @p indent is the per-level indent string
  * for pretty output, or NULL for compact. NULL on failure. */
-char *conf_dump(const struct config *conf, size_t *lenp, const char *indent);
+char *conf_dump(
+	const struct config *restrict conf, size_t *restrict lenp,
+	const char *restrict indent);
 
 #if WITH_TLS
 /* Replace "@path" PEM references with in-memory PEM strings, in place.
@@ -145,7 +147,7 @@ bool conf_inline_pem(struct config *conf);
 #endif
 
 /* Free a configuration; NULL is allowed. */
-void conf_free(struct config *conf);
+void conf_free(struct config *restrict conf);
 
 /* Build a struct mux_session_config from the config: copies conf->mux, sets
  * reject_inbound from conf->connect, and (with TLS) carries in

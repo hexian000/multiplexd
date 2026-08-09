@@ -91,35 +91,37 @@ struct unacked_ack_result {
 /* Hand a fully-sent sendbuf frame to the unacked ring: strip stream-0 controls
  * and hello frames, retire retransmit copies (advancing the replay cursor), and
  * push the rest for possible resume replay.  Takes ownership of frame. */
-void mux_unacked_track_sent(struct mux_session *ss, struct mux_frame *frame);
+void mux_unacked_track_sent(
+	struct mux_session *restrict ss, struct mux_frame *restrict frame);
 
 /* Trim count logical frames from the unacked ring; see struct
  * unacked_ack_result.  Internal primitive shared by mux_unacked_ack_recv and
  * mux_unacked_resume_ack_recv; callers processing a peer frame should use
  * mux_unacked_ack_recv instead (see below). */
 struct unacked_ack_result
-mux_unacked_ack_trim(struct mux_session *ss, uint_fast32_t count);
+mux_unacked_ack_trim(struct mux_session *restrict ss, uint_fast32_t count);
 
 /* Handle a session-level ACK from a peer frame received during normal
  * operation (dispatch_ctrl_frame's MUX_FLAG_ACK path). Bounds count by what
  * has actually been retransmitted so far when mid-replay, then trims via
  * mux_unacked_ack_trim; see struct unacked_ack_result. */
 struct unacked_ack_result
-mux_unacked_ack_recv(struct mux_session *ss, uint_fast32_t count);
+mux_unacked_ack_recv(struct mux_session *restrict ss, uint_fast32_t count);
 
 /* Apply the peer's resume_seq from a resume hello: trim the ring and position
  * the retransmit cursor.  Returns false on protocol violation; the ring may be
  * partially trimmed by then, so the caller must tear the session down. */
 bool mux_unacked_resume_ack_recv(
-	struct mux_session *ss, uint_least32_t peer_ack);
+	struct mux_session *restrict ss, uint_least32_t peer_ack);
 
 /* Record that a session ACK covering emit frames was emitted. */
-void mux_unacked_ack_emitted(struct mux_session *ss, uint_fast32_t emit);
+void mux_unacked_ack_emitted(
+	struct mux_session *restrict ss, uint_fast32_t emit);
 
 /* Discard all frames in the unacked ring, free the ring array, and reset the
  * ring's derived state (frame/byte totals, the send-stall gate, the retransmit
  * cursor and copy). The sequence counters (recv_seq, unreported,
  * last_ack_recv, ack_ticks) are left untouched for the caller to reset. */
-void mux_unacked_free_all(struct mux_session *ss);
+void mux_unacked_free_all(struct mux_session *restrict ss);
 
 #endif /* MUX_UNACKED_H */
