@@ -117,15 +117,20 @@ _FEATURES = frozenset({"structs", "unmarshal", "marshal", "lookup"})
 
 
 def to_c_ident(s: str) -> str:
-    """Return *s* sanitized into a valid C identifier."""
+    """Return *s* sanitized into a valid, non-reserved C identifier."""
     ident = re.sub(r"[^A-Za-z0-9_]", "_", s)
-    if not ident:
-        # The empty string is a legal JSON key but not a legal C identifier;
-        # map it to "_".  _make_field_map still resolves any collision this
-        # creates (e.g. with a key like ",") by appending a numeric suffix.
-        return "_"
-    if ident[0].isdigit():
-        ident = "_" + ident
+    # A name that does not start with a letter needs repairing, and the repair
+    # must not be an underscore: ISO C11 §7.1.3 reserves every identifier
+    # beginning with one for file scope -- where the schema prefix seeds the
+    # struct/enum tags and functions -- and reserves '_' + uppercase for any
+    # use, which the uppercased header guard would produce.  A leading letter
+    # keeps the result out of both namespaces.  The same substitution can leave
+    # a leading '_' without any digit involved ('.env' -> '_env'), so key off
+    # "not a letter", not "digit".  The empty string is a legal JSON key and
+    # maps to "x"; _make_field_map still resolves any collision that creates
+    # (e.g. with a key like ",") by appending a numeric suffix.
+    if not ident or not ident[0].isalpha():
+        ident = "x" + ident
     return ident
 
 
@@ -217,8 +222,8 @@ def _make_field_map(keys: list, _node: dict) -> dict:
     shares the uniform ``(keys, node)`` calling convention.
 
     Handles three cases in order:
-    1. Non-identifier characters replaced with '_'; leading digits prefixed
-       with '_' (both via to_c_ident).
+    1. Non-identifier characters replaced with '_'; a name not starting with
+       a letter prefixed with 'x' (both via to_c_ident).
     2. C reserved-word conflicts: append '_' suffix (e.g. 'int' → 'int_').
     3. Duplicate names after steps 1-2: append '_2', '_3', ... sorted by
        (C identifier, JSON key) so the result is deterministic: all colliding
@@ -3083,7 +3088,8 @@ def process(schema_path: Path, opts: argparse.Namespace) -> None:
     # by --prefix -- e.g. a fast and a size variant side by side.  The basename
     # seeds the header guard, so it too is run through to_c_ident(): otherwise a
     # leading-digit --output-name (or schema stem) yields a guard macro that
-    # begins with a digit and will not compile.
+    # begins with a digit and will not compile, and a leading '.' or '-' yields
+    # one beginning with an underscore, which is reserved.
     out_stem = to_c_ident(opts.output_name) if opts.output_name \
         else to_c_ident(stem)
     guard = re.sub(r"[^A-Za-z0-9_]", "_",
