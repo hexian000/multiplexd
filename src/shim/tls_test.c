@@ -1825,6 +1825,93 @@ T_DECLARE_CASE(test_tls_alpn_negotiation)
 	rm_tmpdir(tmpl);
 }
 
+/* Drive one handshake whose client side comes from tls_ctx_ref(), with the
+ * source context released first: that is server.c's shape, where every dialed
+ * tunnel holds a reference that outlives the reload which made it. */
+static bool alpn_handshake_via_ctx_ref(
+	const char *restrict cert_path, const char *restrict key_path,
+	char *const *restrict authcerts, const char *restrict srv_alpn,
+	const char *restrict cli_alpn)
+{
+	struct tls_context *const srv_ctx =
+		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1,
+						     .alpn = srv_alpn });
+	struct tls_context *const cli_ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1,
+						     .alpn = cli_alpn });
+	bool ok = false;
+	int fds[2] = { -1, -1 };
+	struct tls_context *cli_ref = NULL;
+	struct tls_connection *srv_conn = NULL, *cli_conn = NULL;
+	if (srv_ctx == NULL || cli_ctx == NULL) {
+		goto cleanup;
+	}
+	cli_ref = tls_ctx_ref(cli_ctx);
+	tls_ctx_free(cli_ctx);
+	if (cli_ref == NULL) {
+		goto cleanup;
+	}
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0 ||
+	    fcntl(fds[0], F_SETFL, O_NONBLOCK) != 0 ||
+	    fcntl(fds[1], F_SETFL, O_NONBLOCK) != 0) {
+		goto cleanup;
+	}
+	srv_conn = tls_server(srv_ctx, fds[0]);
+	cli_conn = tls_client(cli_ref, fds[1]);
+	if (srv_conn == NULL || cli_conn == NULL) {
+		goto cleanup;
+	}
+	ok = drive_handshake(srv_conn, cli_conn, 20);
+cleanup:
+	tls_conn_free(cli_conn);
+	tls_conn_free(srv_conn);
+	tls_ctx_free(cli_ref);
+	tls_ctx_free(srv_ctx);
+	if (fds[0] >= 0) {
+		(void)close(fds[0]);
+	}
+	if (fds[1] >= 0) {
+		(void)close(fds[1]);
+	}
+	return ok;
+}
+
+/* A client context obtained through tls_ctx_ref() must offer exactly the ALPN
+ * list its source was configured with; the offer lives in the refcounted
+ * SSL_CTX both wrappers share, put there by SSL_CTX_set_alpn_protos().
+ *
+ * Success alone would not show the list was offered -- a server that
+ * advertises ALPN still completes with a client that sends no ALPN extension
+ * at all (test_tls_alpn_negotiation pins that).  The disjoint pair is what
+ * discriminates: it can only fail if the reference really sent an offer, and
+ * a reference that lost the list would negotiate nothing and succeed. */
+T_DECLARE_CASE(test_tls_alpn_offered_through_ctx_ref)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char *authcerts[] = { cert_path };
+	/* The offer went out and shares no protocol with the server's list. */
+	T_EXPECT(!alpn_handshake_via_ctx_ref(
+		cert_path, key_path, authcerts, "h2", "http/1.1"));
+	/* ...and the same reference negotiates when the lists do overlap. */
+	T_EXPECT(alpn_handshake_via_ctx_ref(
+		cert_path, key_path, authcerts, "h2,http/1.1", "http/1.1"));
+
+	rm_tmpdir(tmpl);
+}
+
 /* csv_scanfield's "need more data" check could not distinguish a
  * genuinely incomplete quoted field (ran off the end of the buffer
  * without ever finding a closing quote) from a complete one whose
@@ -2205,6 +2292,42 @@ T_DECLARE_CASE(test_tls_psk_unknown_rejected)
 	T_EXPECT(!ok);
 	/* The server authenticated nobody, so it reports no label. */
 	T_EXPECT_STREQ(srv_label, "");
+}
+
+/* Regression: a context that configures no client PSK must never hand its
+ * connections a label.  The mbedTLS backend allocated its context with
+ * malloc() and initialized every field except the PSK credentials, so a
+ * connection read an indeterminate psk_len at creation, copied indeterminate
+ * bytes into its own label, and tls_peer_psk_label() then reported that
+ * garbage -- with no terminator among them it ran strlen() off the field and
+ * overflowed the caller's TLS_PSK_LABEL_MAX + 1 buffer, the same buffer shape
+ * tunnel_on_verify_identity() passes.
+ *
+ * An uninitialized read only misbehaves when the allocator hands back
+ * something other than zeros, which the sanitizer build guarantees (it fills
+ * fresh malloc'd memory); elsewhere this pins the contract itself, which any
+ * unconditional copy onto the connection breaks in every build. */
+T_DECLARE_CASE(test_tls_no_psk_context_reports_no_label)
+{
+	struct tls_context *const ctx = tls_ctx_server(
+		&(struct tls_config){ .psk_lookup = psk_test_lookup });
+	T_CHECK(ctx != NULL);
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	struct tls_connection *const conn = tls_server(ctx, fds[0]);
+	T_CHECK(conn != NULL);
+
+	/* Nothing has handshaked, so no peer has authenticated with anything. */
+	char label[TLS_PSK_LABEL_MAX + 1];
+	size_t len = sizeof(label);
+	const bool has_label = tls_peer_psk_label(conn, label, &len);
+
+	tls_conn_free(conn);
+	tls_ctx_free(ctx);
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+
+	T_EXPECT(!has_label);
 }
 
 T_DECLARE_CASE(test_tls_peer_cert_uri_sans)
@@ -2930,6 +3053,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tls_shutdown_syscall_on_broken_transport),
 	T_CASE(test_tls_recv_syscall_on_abrupt_peer_close),
 	T_CASE(test_tls_alpn_negotiation),
+	T_CASE(test_tls_alpn_offered_through_ctx_ref),
 	T_CASE(test_tls_alpn_quoted_entry_at_list_end),
 	T_CASE(test_tls_alpn_malformed_list_fails_ctx),
 #if WITH_OPENSSL
@@ -2940,6 +3064,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tls_psk_label),
 	T_CASE(test_tls_psk_handshake),
 	T_CASE(test_tls_psk_unknown_rejected),
+	T_CASE(test_tls_no_psk_context_reports_no_label),
 	T_CASE(test_tls_peer_cert_uri_sans),
 	T_CASE(test_tls_peer_cert_uri_sans_absent),
 	T_CASE(test_identity_matches_cert),

@@ -669,7 +669,11 @@ static bool tls_ctx_set_psk(
 static struct tls_context *
 tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 {
-	struct tls_ctx_impl *const c = malloc(sizeof(*c));
+	/* Zero-initialized, like the connection below and both of the OpenSSL
+	 * backend's allocations: the PSK credentials have no constructor of
+	 * their own -- only the role that uses them fills them in, and
+	 * tls_conn_alloc() reads psk_len for every connection regardless. */
+	struct tls_ctx_impl *const c = calloc(1, sizeof(*c));
 	if (c == NULL) {
 		LOGOOM();
 		return NULL;

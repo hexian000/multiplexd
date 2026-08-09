@@ -85,10 +85,6 @@ struct tls_ctx_impl {
 	SSL_CTX *ssl_ctx;
 	/* Client SNI hostname (heap, owned); NULL omits the extension. */
 	char *sni;
-	/* ALPN protocol list in wire format (1-byte length prefix per entry,
-	 * heap, owned).  Used to offer (client) or select (server). */
-	unsigned char *alpn;
-	size_t alpn_len;
 	/* true once the server ALPN select callback is registered on ssl_ctx.
 	 * Its callback argument is an SSL_CTX-lifetime struct alpn_wire (hung
 	 * off ex_data), not this wrapper, so sharing ssl_ctx would no longer
@@ -215,11 +211,6 @@ static bool alpn_wire_from_list(
 	return true;
 }
 
-/* Owns the server ALPN wire buffer read by alpn_select_cb.  Hung off the
- * SSL_CTX via ex_data (below) so its lifetime is the refcounted SSL_CTX's, not
- * the tls_ctx_impl wrapper's: SSL_new up-refs only the SSL_CTX, and tls_ctx_free
- * frees the wrapper while accepted connections may still be mid-handshake, so
- * the callback must not reach into the wrapper. */
 /* Info string for tls_psk_label()'s HKDF-Expand.  Versioned: changing the
  * derivation changes every deployment's wire labels, so a future revision must
  * bump this rather than silently reinterpret the same input. */
@@ -278,6 +269,11 @@ bool tls_psk_label(
 	return true;
 }
 
+/* Owns the server ALPN wire buffer read by alpn_select_cb.  Hung off the
+ * SSL_CTX via ex_data (below) so its lifetime is the refcounted SSL_CTX's, not
+ * the tls_ctx_impl wrapper's: SSL_new up-refs only the SSL_CTX, and tls_ctx_free
+ * frees the wrapper while accepted connections may still be mid-handshake, so
+ * the callback must not reach into the wrapper. */
 struct alpn_wire {
 	unsigned char *buf;
 	size_t len;
@@ -520,29 +516,31 @@ static bool tls_ctx_set_alpn(
 	struct tls_ctx_impl *restrict c, const bool is_server,
 	const char *restrict alpn)
 {
-	if (!alpn_wire_from_list(alpn, &c->alpn, &c->alpn_len)) {
+	unsigned char *wire = NULL;
+	size_t wire_len = 0;
+	if (!alpn_wire_from_list(alpn, &wire, &wire_len)) {
 		return false;
 	}
-	if (c->alpn == NULL) {
+	if (wire == NULL) {
 		return true;
 	}
 	if (is_server) {
 		if (!alpn_ex_idx_ready()) {
 			LOGE("tls_ctx_set_alpn: no ALPN ex_data slot");
+			free(wire);
 			return false;
 		}
 		struct alpn_wire *const w = malloc(sizeof(*w));
 		if (w == NULL) {
 			LOGOOM();
+			free(wire);
 			return false;
 		}
 		/* Move the wire buffer into an SSL_CTX-lifetime object so
 		 * alpn_select_cb never reads the wrapper tls_ctx_free may free
 		 * out from under a still-live handshake. */
-		w->buf = c->alpn;
-		w->len = c->alpn_len;
-		c->alpn = NULL;
-		c->alpn_len = 0;
+		w->buf = wire;
+		w->len = wire_len;
 		if (SSL_CTX_set_ex_data(c->ssl_ctx, g_alpn_ex_idx, w) != 1) {
 			LOG_SSLERROR(ERROR, "SSL_CTX_set_ex_data");
 			free(w->buf);
@@ -555,9 +553,13 @@ static bool tls_ctx_set_alpn(
 	}
 	/* SSL_CTX_set_alpn_protos copies the buffer and, unusually, returns 0
 	 * on success. Fail closed (matching the mbedTLS backend) instead of
-	 * silently proceeding without the ALPN the caller configured. */
-	if (SSL_CTX_set_alpn_protos(
-		    c->ssl_ctx, c->alpn, (unsigned int)c->alpn_len) != 0) {
+	 * silently proceeding without the ALPN the caller configured.  The copy
+	 * lives in the refcounted SSL_CTX every tls_ctx_ref() sibling shares, so
+	 * nothing outlives this function. */
+	const int ret = SSL_CTX_set_alpn_protos(
+		c->ssl_ctx, wire, (unsigned int)wire_len);
+	free(wire);
+	if (ret != 0) {
 		LOG_SSLERROR(ERROR, "SSL_CTX_set_alpn_protos");
 		return false;
 	}
@@ -1328,7 +1330,9 @@ struct tls_context *tls_ctx_ref(struct tls_context *restrict ctx)
 		return NULL;
 	}
 	c->ssl_ctx = src->ssl_ctx;
-	/* sni/alpn are owned per-wrapper (freed in tls_ctx_free), so copy them. */
+	/* sni is owned per-wrapper (freed in tls_ctx_free), so copy it.  The ALPN
+	 * list needs no copy: SSL_CTX_set_alpn_protos() put it in the shared
+	 * ssl_ctx, and a server's list lives in that ssl_ctx's ex_data. */
 	if (src->sni != NULL) {
 		c->sni = OPENSSL_strdup(src->sni);
 		if (c->sni == NULL) {
@@ -1336,16 +1340,6 @@ struct tls_context *tls_ctx_ref(struct tls_context *restrict ctx)
 			tls_ctx_free((struct tls_context *)c);
 			return NULL;
 		}
-	}
-	if (src->alpn != NULL && src->alpn_len > 0) {
-		c->alpn = malloc(src->alpn_len);
-		if (c->alpn == NULL) {
-			LOGOOM();
-			tls_ctx_free((struct tls_context *)c);
-			return NULL;
-		}
-		memcpy(c->alpn, src->alpn, src->alpn_len);
-		c->alpn_len = src->alpn_len;
 	}
 	return (struct tls_context *)c;
 }
@@ -1358,7 +1352,6 @@ void tls_ctx_free(struct tls_context *restrict ctx)
 	struct tls_ctx_impl *const c = tls_ctx_raw(ctx);
 	SSL_CTX_free(c->ssl_ctx);
 	OPENSSL_free(c->sni);
-	free(c->alpn);
 	free(c);
 }
 
