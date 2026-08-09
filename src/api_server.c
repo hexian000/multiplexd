@@ -1,6 +1,12 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/**
+ * @file api_server.c
+ * @brief HTTP management API: request routing and the /healthy, /stats,
+ *        /config and Prometheus /metrics handlers.
+ */
+
 #include "api_server.h"
 
 #include "conf.h"

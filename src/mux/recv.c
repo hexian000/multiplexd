@@ -788,11 +788,6 @@ static void dispatch_frame(struct mux_session *ss)
 	}
 }
 
-void mux_session_dispatch_pending(struct mux_session *restrict ss)
-{
-	dispatch_frame(ss);
-}
-
 /* Contiguous recvbuf window offered to one transport read.  The floor is one
  * full frame; mux.readahead widens it so a single recv() drains several frames
  * per syscall.  With socket_offload the TLS library owns the socket reads (its
@@ -882,6 +877,11 @@ void mux_session_on_recv(struct mux_session *restrict ss)
 	/* Flush responses (PONG, ACKs, credit) immediately rather than waiting
 	 * for EV_WRITE; prompt PONG avoids inflating the peer's RTT sample. */
 	mux_session_flush_resp(ss);
+}
+
+void mux_session_dispatch_pending(struct mux_session *restrict ss)
+{
+	dispatch_frame(ss);
 }
 
 /* Handle an inbound PING (spec §5.3.2): queue a PONG echoing the payload

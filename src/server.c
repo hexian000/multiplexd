@@ -1,6 +1,13 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/**
+ * @file server.c
+ * @brief Server implementation: the listeners and their accept paths, the
+ *        registry of live tunnels and the per-identity pools they are routed
+ *        through, TLS/PSK credential setup, and the single-pass config reload.
+ */
+
 #include "server.h"
 
 #include "api_server.h"
@@ -48,11 +55,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
-
-#if WITH_TLS
-/* Defined below; used by the tunnel_opts literals before its definition. */
-static const char *server_psk_identity_cb(void *ctx, const char *label);
-#endif
 
 static uint_fast32_t sid_hash(const void *key, const uint_fast32_t seed)
 {
@@ -993,6 +995,15 @@ static bool server_register_session(struct server *restrict s, struct tunnel *t)
 	return true;
 }
 
+#if WITH_TLS
+/* tunnel_opts.psk_identity_of adapter: the table is opaque there, so the
+ * typed accessor is reached through a void * context. */
+static const char *server_psk_identity_cb(void *ctx, const char *label)
+{
+	return server_psk_identity_of(ctx, label);
+}
+#endif /* WITH_TLS */
+
 static void mux_serve(
 	struct listener *l, struct ev_loop *loop, const int fd,
 	const struct sockaddr *sa)
@@ -1165,74 +1176,6 @@ static void server_cleanse_tls_config(const struct config *restrict conf)
 	}
 }
 
-/* Build fresh server and client TLS contexts from conf; shared by startup and
- * reload. True on success, false on failure (any partial context freed).
- * conf's plaintext credentials are erased before returning either way. */
-/* Decode the configured hex keys and derive each one's wire label.  The table
- * outlives the TLS contexts (it backs the server's lookup callback) and is the
- * same map the tunnel layer uses to turn an authenticated label back into a
- * peer identity, so it is built once and owned by struct server. */
-struct psk_table *server_psk_table_new(const struct config *restrict conf)
-{
-	if (conf->tls_psk_count == 0) {
-		return NULL;
-	}
-	struct psk_table *const t = calloc(
-		1, sizeof(*t) + conf->tls_psk_count * sizeof(t->entries[0]));
-	if (t == NULL) {
-		LOGOOM();
-		return NULL;
-	}
-	t->count = conf->tls_psk_count;
-	for (size_t i = 0; i < t->count; i++) {
-		const struct psk_entry *const restrict src = &conf->tls_psk[i];
-		struct psk_table_entry *const restrict e = &t->entries[i];
-		const size_t hex_len = strlen(src->hex);
-		/* conf_check_psk already validated length, parity and alphabet. */
-		e->key_len = hex_len / 2u;
-		for (size_t j = 0; j < e->key_len; j++) {
-			const int hi = unhex(src->hex[j * 2]);
-			const int lo = unhex(src->hex[j * 2 + 1]);
-			ASSERT(hi >= 0 && lo >= 0);
-			e->key[j] = (unsigned char)((hi << 4) | lo);
-		}
-		size_t label_len = sizeof(e->label);
-		if (!tls_psk_label(e->key, e->key_len, e->label, &label_len)) {
-			LOGE_F("tls.psk.%s: failed to derive the identity label",
-			       src->id);
-			server_psk_table_free(t);
-			return NULL;
-		}
-		(void)snprintf(e->identity, sizeof(e->identity), "%s", src->id);
-	}
-	return t;
-}
-
-void server_psk_table_free(struct psk_table *restrict t)
-{
-	if (t == NULL) {
-		return;
-	}
-	for (size_t i = 0; i < t->count; i++) {
-		tls_secure_erase(t->entries[i].key, sizeof(t->entries[i].key));
-	}
-	free(t);
-}
-
-const char *server_psk_identity_of(
-	const struct psk_table *restrict t, const char *restrict label)
-{
-	if (t == NULL) {
-		return NULL;
-	}
-	for (size_t i = 0; i < t->count; i++) {
-		if (strcmp(t->entries[i].label, label) == 0) {
-			return t->entries[i].identity;
-		}
-	}
-	return NULL;
-}
-
 /* tls_psk_lookup_fn: resolve a label the client offered to its key. */
 static bool server_psk_lookup(
 	void *ctx, const char *identity, unsigned char *key, size_t *key_len)
@@ -1253,13 +1196,9 @@ static bool server_psk_lookup(
 	return false;
 }
 
-/* tunnel_opts.psk_identity_of adapter: the table is opaque there, so the
- * typed accessor is reached through a void * context. */
-static const char *server_psk_identity_cb(void *ctx, const char *label)
-{
-	return server_psk_identity_of(ctx, label);
-}
-
+/* Build fresh server and client TLS contexts from conf; shared by startup and
+ * reload. True on success, false on failure (any partial context freed).
+ * conf's plaintext credentials are erased before returning either way. */
 static bool server_make_tls_contexts(
 	const struct config *restrict conf,
 	const struct psk_table *restrict psk,
@@ -1321,9 +1260,6 @@ static bool server_make_tls_contexts(
 }
 #endif /* WITH_TLS */
 
-/* Single-pass reload: update addresses and apply drain config per tunnel.
- * Sessions drain when their last stream closes; outbound tunnels then
- * reconnect with the fresh config. */
 /* Set opts' connect/reconnect fields for tunnel t per the config delta. */
 static void tunnel_set_reload_connect(
 	struct tunnel_reload_opts *restrict opts, struct server *restrict s,
@@ -1439,6 +1375,9 @@ static void drain_tunnel_cb(struct tunnel *t, void *ctx)
 	tunnel_reload(t, &opts);
 }
 
+/* Single-pass reload: update addresses and apply drain config per tunnel.
+ * Sessions drain when their last stream closes; outbound tunnels then
+ * reconnect with the fresh config. */
 static void server_drain_tunnels(
 	struct server *restrict s, const struct config *restrict old_conf,
 	const struct config *restrict new_conf
@@ -3096,3 +3035,70 @@ size_t server_offline_listeners(
 	}
 	return offline;
 }
+
+#if WITH_TLS
+/* Decode the configured hex keys and derive each one's wire label.  The table
+ * outlives the TLS contexts (it backs the server's lookup callback) and is the
+ * same map the tunnel layer uses to turn an authenticated label back into a
+ * peer identity, so it is built once and owned by struct server. */
+struct psk_table *server_psk_table_new(const struct config *restrict conf)
+{
+	if (conf->tls_psk_count == 0) {
+		return NULL;
+	}
+	struct psk_table *const t = calloc(
+		1, sizeof(*t) + conf->tls_psk_count * sizeof(t->entries[0]));
+	if (t == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	t->count = conf->tls_psk_count;
+	for (size_t i = 0; i < t->count; i++) {
+		const struct psk_entry *const restrict src = &conf->tls_psk[i];
+		struct psk_table_entry *const restrict e = &t->entries[i];
+		const size_t hex_len = strlen(src->hex);
+		/* conf_check_psk already validated length, parity and alphabet. */
+		e->key_len = hex_len / 2u;
+		for (size_t j = 0; j < e->key_len; j++) {
+			const int hi = unhex(src->hex[j * 2]);
+			const int lo = unhex(src->hex[j * 2 + 1]);
+			ASSERT(hi >= 0 && lo >= 0);
+			e->key[j] = (unsigned char)((hi << 4) | lo);
+		}
+		size_t label_len = sizeof(e->label);
+		if (!tls_psk_label(e->key, e->key_len, e->label, &label_len)) {
+			LOGE_F("tls.psk.%s: failed to derive the identity label",
+			       src->id);
+			server_psk_table_free(t);
+			return NULL;
+		}
+		(void)snprintf(e->identity, sizeof(e->identity), "%s", src->id);
+	}
+	return t;
+}
+
+void server_psk_table_free(struct psk_table *restrict t)
+{
+	if (t == NULL) {
+		return;
+	}
+	for (size_t i = 0; i < t->count; i++) {
+		tls_secure_erase(t->entries[i].key, sizeof(t->entries[i].key));
+	}
+	free(t);
+}
+
+const char *server_psk_identity_of(
+	const struct psk_table *restrict t, const char *restrict label)
+{
+	if (t == NULL) {
+		return NULL;
+	}
+	for (size_t i = 0; i < t->count; i++) {
+		if (strcmp(t->entries[i].label, label) == 0) {
+			return t->entries[i].identity;
+		}
+	}
+	return NULL;
+}
+#endif /* WITH_TLS */

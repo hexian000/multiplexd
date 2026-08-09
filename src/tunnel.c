@@ -1,6 +1,14 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/**
+ * @file tunnel.c
+ * @brief Tunnel implementation: one mux session, its connect/reconnect and
+ *        drain lifecycle, local stream opens, and the relay of session events
+ *        back to the server.  WITH_THREADS gives each tunnel its own event loop
+ *        and thread; otherwise it runs on the server's loop.
+ */
+
 #include "tunnel.h"
 
 #include "conf.h"
@@ -73,34 +81,6 @@
 
 /* Interval between frame_cache trims, in seconds. */
 #define TUNNEL_MAINTENANCE_INTERVAL 10.0
-
-static void tunnel_set_tag_part(
-	char *restrict buf, const size_t buflen, const char *restrict text)
-{
-	const int ret = snprintf(buf, buflen, "%s", text);
-	if (ret < 0) {
-		buf[0] = '\0';
-	}
-}
-
-/* The tag prefixes every log record this session emits, and either half of it
- * may be an identity -- the peer's is only NUL-excluded by doc/spec.md 5.2.3.2,
- * so a claim holding CR/LF or ESC would forge records through every one of
- * them.  Escape both halves here, the single point where the tag is built. */
-static void tunnel_set_tag(
-	char *restrict tag, const size_t taglen, const char *restrict my,
-	const char *restrict arrow, const char *restrict peer)
-{
-	char my_esc[IDENTITY_ESCAPED_MAX];
-	char peer_esc[IDENTITY_ESCAPED_MAX];
-	escape_identity(my_esc, sizeof(my_esc), my, ESCAPE_PLAIN);
-	escape_identity(peer_esc, sizeof(peer_esc), peer, ESCAPE_PLAIN);
-	const int ret =
-		snprintf(tag, taglen, "%s%s%s", my_esc, arrow, peer_esc);
-	if (ret < 0) {
-		tag[0] = '\0';
-	}
-}
 
 #if WITH_THREADS
 /* Intrusive FIFO node for a local connection accepted on the parent loop and
@@ -645,6 +625,34 @@ static void handle_transport_lost(struct tunnel *restrict t)
 	}
 }
 
+static void tunnel_set_tag_part(
+	char *restrict buf, const size_t buflen, const char *restrict text)
+{
+	const int ret = snprintf(buf, buflen, "%s", text);
+	if (ret < 0) {
+		buf[0] = '\0';
+	}
+}
+
+/* The tag prefixes every log record this session emits, and either half of it
+ * may be an identity -- the peer's is only NUL-excluded by doc/spec.md 5.2.3.2,
+ * so a claim holding CR/LF or ESC would forge records through every one of
+ * them.  Escape both halves here, the single point where the tag is built. */
+static void tunnel_set_tag(
+	char *restrict tag, const size_t taglen, const char *restrict my,
+	const char *restrict arrow, const char *restrict peer)
+{
+	char my_esc[IDENTITY_ESCAPED_MAX];
+	char peer_esc[IDENTITY_ESCAPED_MAX];
+	escape_identity(my_esc, sizeof(my_esc), my, ESCAPE_PLAIN);
+	escape_identity(peer_esc, sizeof(peer_esc), peer, ESCAPE_PLAIN);
+	const int ret =
+		snprintf(tag, taglen, "%s%s%s", my_esc, arrow, peer_esc);
+	if (ret < 0) {
+		tag[0] = '\0';
+	}
+}
+
 static void handle_connected(
 	struct tunnel *restrict t, struct mux_session *restrict ss,
 	const union mux_event_data edata)
@@ -821,9 +829,59 @@ static void tunnel_on_event(
 #endif /* WITH_THREADS */
 }
 
+/* Open one accepted local connection as a new stream.  Runs on this tunnel's
+ * own thread (or inline without threads); the caller guarantees t->ss is live. */
+static void tunnel_open_fd(struct tunnel *restrict t, const int fd)
+{
+	struct mux_stream *const stream = mux_stream_open(t->ss);
+	if (stream == NULL) {
+		/* Demand-triggered reconnect: when idle-closed/suspended with
+		 * idle_timeout set, reconnect so the next open_stream succeeds.
+		 * Suppressed once shutting_down: a reload that removed this slot
+		 * must not redial the now-stale connect_addr. */
+		if (!t->shutting_down && t->connect_addr != NULL &&
+		    tunnel_conf(t)->idle_timeout > 0 &&
+		    !ev_is_active(&t->w_reconnect) &&
+		    (mux_state(t->ss) == MUX_STATE_SUSPENDED ||
+		     mux_state(t->ss) == MUX_STATE_CLOSED)) {
+			if (!tunnel_do_connect(t)) {
+				tunnel_schedule_reconnect(t);
+			}
+		}
+		TUNNEL_LOG_F(
+			DEBUG, t, "[fd:%d] session not ready, closing", fd);
+		socket_close(fd);
+		return;
+	}
+	/* Start reading from local socket immediately.  One frame may be read
+	 * before the SYN is sent and piggybacked as SYN|PUSH (fast open). */
+	mux_stream_attach_fd(stream, fd);
+	TUNNEL_LOG_F(
+		DEBUG, t, "[fd:%d] new stream %" PRIuLEAST16, fd,
+		mux_stream_id(stream));
+}
+
 #if WITH_THREADS
-static void tunnel_drain_pending_opens(struct tunnel *t);
-static void tunnel_flush_pending_opens(struct tunnel *t);
+/* Detach the queued opens and either open each (session live) or close it
+ * (session already torn down earlier in this async tick).  Runs on the tunnel
+ * thread. */
+static void tunnel_drain_pending_opens(struct tunnel *restrict t)
+{
+	THRD_ASSERT(mtx_lock(&t->open_mu));
+	struct pending_open *node = t->open_head;
+	t->open_head = t->open_tail = NULL;
+	THRD_ASSERT(mtx_unlock(&t->open_mu));
+	while (node != NULL) {
+		struct pending_open *const restrict next = node->next;
+		if (t->ss != NULL) {
+			tunnel_open_fd(t, node->fd);
+		} else {
+			socket_close(node->fd);
+		}
+		free(node);
+		node = next;
+	}
+}
 
 static void tunnel_async_cb(struct ev_loop *loop, ev_async *w, int revents)
 {
@@ -1526,10 +1584,22 @@ static void tunnel_load_counters(
 	out->stream_establish_count = TPUB_LOAD(t->stream_establish_count);
 }
 
-void tunnel_close(struct tunnel *t)
+#if WITH_THREADS
+/* Close every still-queued open and free its node.  Called once the tunnel
+ * thread has stopped (or never started), when the pending connections can no
+ * longer be served. */
+static void tunnel_flush_pending_opens(struct tunnel *restrict t)
 {
-	tunnel_close_final(t, NULL);
+	struct pending_open *node = t->open_head;
+	t->open_head = t->open_tail = NULL;
+	while (node != NULL) {
+		struct pending_open *const restrict next = node->next;
+		socket_close(node->fd);
+		free(node);
+		node = next;
+	}
 }
+#endif /* WITH_THREADS */
 
 void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 {
@@ -1626,6 +1696,11 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 	 * the cache, so it is safe to drop. */
 	mcache_free(t->frame_cache);
 	free(t);
+}
+
+void tunnel_close(struct tunnel *t)
+{
+	tunnel_close_final(t, NULL);
 }
 
 static void task_mux_shutdown(void *p)
@@ -1801,76 +1876,6 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 			TPUB_LOAD(t->stream_establish_ns[i]);
 	}
 }
-
-/* Open one accepted local connection as a new stream.  Runs on this tunnel's
- * own thread (or inline without threads); the caller guarantees t->ss is live. */
-static void tunnel_open_fd(struct tunnel *restrict t, const int fd)
-{
-	struct mux_stream *const stream = mux_stream_open(t->ss);
-	if (stream == NULL) {
-		/* Demand-triggered reconnect: when idle-closed/suspended with
-		 * idle_timeout set, reconnect so the next open_stream succeeds.
-		 * Suppressed once shutting_down: a reload that removed this slot
-		 * must not redial the now-stale connect_addr. */
-		if (!t->shutting_down && t->connect_addr != NULL &&
-		    tunnel_conf(t)->idle_timeout > 0 &&
-		    !ev_is_active(&t->w_reconnect) &&
-		    (mux_state(t->ss) == MUX_STATE_SUSPENDED ||
-		     mux_state(t->ss) == MUX_STATE_CLOSED)) {
-			if (!tunnel_do_connect(t)) {
-				tunnel_schedule_reconnect(t);
-			}
-		}
-		TUNNEL_LOG_F(
-			DEBUG, t, "[fd:%d] session not ready, closing", fd);
-		socket_close(fd);
-		return;
-	}
-	/* Start reading from local socket immediately.  One frame may be read
-	 * before the SYN is sent and piggybacked as SYN|PUSH (fast open). */
-	mux_stream_attach_fd(stream, fd);
-	TUNNEL_LOG_F(
-		DEBUG, t, "[fd:%d] new stream %" PRIuLEAST16, fd,
-		mux_stream_id(stream));
-}
-
-#if WITH_THREADS
-/* Detach the queued opens and either open each (session live) or close it
- * (session already torn down earlier in this async tick).  Runs on the tunnel
- * thread. */
-static void tunnel_drain_pending_opens(struct tunnel *restrict t)
-{
-	THRD_ASSERT(mtx_lock(&t->open_mu));
-	struct pending_open *node = t->open_head;
-	t->open_head = t->open_tail = NULL;
-	THRD_ASSERT(mtx_unlock(&t->open_mu));
-	while (node != NULL) {
-		struct pending_open *const restrict next = node->next;
-		if (t->ss != NULL) {
-			tunnel_open_fd(t, node->fd);
-		} else {
-			socket_close(node->fd);
-		}
-		free(node);
-		node = next;
-	}
-}
-
-/* Close every still-queued open and free its node.  Called once the tunnel
- * thread has stopped (or never started), when the pending connections can no
- * longer be served. */
-static void tunnel_flush_pending_opens(struct tunnel *restrict t)
-{
-	struct pending_open *node = t->open_head;
-	t->open_head = t->open_tail = NULL;
-	while (node != NULL) {
-		struct pending_open *const restrict next = node->next;
-		socket_close(node->fd);
-		free(node);
-		node = next;
-	}
-}
-#endif /* WITH_THREADS */
 
 void tunnel_open_stream(struct tunnel *t, const int fd)
 {

@@ -87,6 +87,21 @@ const struct sockaddr *mux_peer_addr(const struct mux_session *ss)
 	return &ss->peer_addr.sa;
 }
 
+const unsigned char *mux_session_id(const struct mux_session *ss)
+{
+	return ss->handshake.session_id;
+}
+
+const char *mux_peer_identity(const struct mux_session *ss)
+{
+	return ss->handshake.peer_identity;
+}
+
+const struct mux_session_config *mux_conf(const struct mux_session *ss)
+{
+	return &ss->conf;
+}
+
 enum mux_state mux_state(const struct mux_session *ss)
 {
 	/* Read the relaxed-atomic mirror: callable from the server thread. */
@@ -105,21 +120,6 @@ enum mux_state mux_state(const struct mux_session *ss)
 	default:
 		return MUX_STATE_CLOSED;
 	}
-}
-
-const unsigned char *mux_session_id(const struct mux_session *ss)
-{
-	return ss->handshake.session_id;
-}
-
-const char *mux_peer_identity(const struct mux_session *ss)
-{
-	return ss->handshake.peer_identity;
-}
-
-const struct mux_session_config *mux_conf(const struct mux_session *ss)
-{
-	return &ss->conf;
 }
 
 void mux_session_stats(

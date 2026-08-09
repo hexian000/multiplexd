@@ -1,6 +1,13 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
+/**
+ * @file estimator.c
+ * @brief BDP estimator: windowed delivery-rate and min-RTT filters, probed by
+ *        PING/PONG, driving receive-window credit through a startup/track
+ *        phase pair per direction.
+ */
+
 #include "mux/estimator.h"
 
 #include "mux/frame.h"

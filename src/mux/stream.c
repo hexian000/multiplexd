@@ -350,43 +350,6 @@ static void stream_rst_notify_direct(struct mux_stream *restrict s)
 	ev_invoke(w->loop, w, EV_READ);
 }
 
-/* Abort the stream locally and emit one peer-visible RST. */
-void mux_stream_abort(struct mux_stream *restrict s, const enum mux_status code)
-{
-	if (s->state == STREAM_CLOSED) {
-		return;
-	}
-	STREAM_LOG(DEBUG, s, "aborting (RST)");
-	COUNTER_ADD(s->session->cnt.errors.num_stream_errors, 1);
-	s->aborted = true;
-	mux_session_discard_stream_frames(s->session, s->id);
-	if (!s->rst_sent) {
-		/* Only latch rst_sent when the RST was actually enqueued: on
-		 * frame-pool OOM mux_session_send_ctrl returns false without sending,
-		 * and a latched rst_sent would gate off every later retry (and
-		 * recv.c's late-frame handler, which also keys on !rst_sent),
-		 * leaving the peer's PUSH frames to the dead stream unanswered for
-		 * the whole tombstone window. */
-		s->rst_sent = mux_session_send_ctrl(
-			s->session, s->id, MUX_FLAG_RST, code);
-	}
-	if (s->is_direct) {
-		/* Fire EV_READ before detach so the callback sees `aborted`; it may
-		 * call mux_stream_close(). On the last active stream of a draining
-		 * session that cascades into mux_session_initiate_shutdown ->
-		 * mux_sched_free_streams and frees s (the session object survives), so
-		 * capture it and stop touching s -- the plain STREAM_CLOSED read
-		 * below would otherwise be a use-after-free -- once the free shows. */
-		struct mux_session *const restrict ss = s->session;
-		stream_rst_notify_direct(s);
-		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
-			return;
-		}
-		stream_detach_user(s);
-	}
-	stream_mark_closed(s);
-}
-
 /* Update the send-side timeout after a flush (socket mode): stop when the
  * recv queue is empty, else re-arm on progress or when first blocked. */
 static void
@@ -1022,6 +985,43 @@ static inline void stream_notify_readable(struct mux_stream *restrict s)
 	}
 	update_watcher(s);
 	stream_feed_user(s, EV_READ);
+}
+
+/* Abort the stream locally and emit one peer-visible RST. */
+void mux_stream_abort(struct mux_stream *restrict s, const enum mux_status code)
+{
+	if (s->state == STREAM_CLOSED) {
+		return;
+	}
+	STREAM_LOG(DEBUG, s, "aborting (RST)");
+	COUNTER_ADD(s->session->cnt.errors.num_stream_errors, 1);
+	s->aborted = true;
+	mux_session_discard_stream_frames(s->session, s->id);
+	if (!s->rst_sent) {
+		/* Only latch rst_sent when the RST was actually enqueued: on
+		 * frame-pool OOM mux_session_send_ctrl returns false without sending,
+		 * and a latched rst_sent would gate off every later retry (and
+		 * recv.c's late-frame handler, which also keys on !rst_sent),
+		 * leaving the peer's PUSH frames to the dead stream unanswered for
+		 * the whole tombstone window. */
+		s->rst_sent = mux_session_send_ctrl(
+			s->session, s->id, MUX_FLAG_RST, code);
+	}
+	if (s->is_direct) {
+		/* Fire EV_READ before detach so the callback sees `aborted`; it may
+		 * call mux_stream_close(). On the last active stream of a draining
+		 * session that cascades into mux_session_initiate_shutdown ->
+		 * mux_sched_free_streams and frees s (the session object survives), so
+		 * capture it and stop touching s -- the plain STREAM_CLOSED read
+		 * below would otherwise be a use-after-free -- once the free shows. */
+		struct mux_session *const restrict ss = s->session;
+		stream_rst_notify_direct(s);
+		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
+			return;
+		}
+		stream_detach_user(s);
+	}
+	stream_mark_closed(s);
 }
 
 void mux_stream_recv_copy(
