@@ -51,6 +51,13 @@ enum {
 	HTTP_MAX_RESPONSE_HDR = 1024,
 };
 
+enum {
+	/* RFC 9112 2.3: the status for a well-formed request whose HTTP major
+	 * version this server cannot process. contrib's read-only
+	 * http_status_code enum does not define it. */
+	HTTP_VERSION_NOT_SUPPORTED = 505,
+};
+
 #define API_TIMEOUT 30.0
 
 struct api_ctx {
@@ -206,11 +213,16 @@ static void respond_status_allow(
 	 * actually sent. */
 	VBUF_RESET(ctx->cbuf);
 	BUF_APPENDF(
-		ctx->wbuf,
-		"HTTP/1.1 %d %s\r\n"
-		"Date: %.*s\r\n"
-		"Connection: %s\r\n",
-		code, status ? status : "", (int)date_len, date_str,
+		ctx->wbuf, "HTTP/1.1 %d %s\r\n", code, status ? status : "");
+	/* RFC 7231 7.1.1.2: a server without a clock capable of a reasonable
+	 * date must omit the Date header rather than send a syntactically empty
+	 * value that does not match the HTTP-date grammar. */
+	if (date_len > 0) {
+		BUF_APPENDF(
+			ctx->wbuf, "Date: %.*s\r\n", (int)date_len, date_str);
+	}
+	BUF_APPENDF(
+		ctx->wbuf, "Connection: %s\r\n",
 		ctx->keepalive ? "keep-alive" : "close");
 	if (allow != NULL) {
 		BUF_APPENDF(ctx->wbuf, "Allow: %s\r\n", allow);
@@ -239,16 +251,21 @@ static void respond_body(
 	const char *const status = http_status((uint_fast16_t)code);
 	BUF_RESET(ctx->wbuf);
 	BUF_APPENDF(
+		ctx->wbuf, "HTTP/1.1 %d %s\r\n", code, status ? status : "");
+	/* RFC 7231 7.1.1.2: omit Date entirely when no valid date is available
+	 * rather than emit a syntactically empty value. */
+	if (date_len > 0) {
+		BUF_APPENDF(
+			ctx->wbuf, "Date: %.*s\r\n", (int)date_len, date_str);
+	}
+	BUF_APPENDF(
 		ctx->wbuf,
-		"HTTP/1.1 %d %s\r\n"
-		"Date: %.*s\r\n"
 		"Connection: %s\r\n"
 		"Content-Type: %s\r\n"
 		"X-Content-Type-Options: nosniff\r\n"
 		"Cache-Control: no-store\r\n"
 		"Content-Length: %zu\r\n"
 		"\r\n",
-		code, status ? status : "", (int)date_len, date_str,
 		ctx->keepalive ? "keep-alive" : "close", content_type,
 		body_len);
 }
@@ -1275,7 +1292,11 @@ static bool connection_has_close(const char *restrict value)
 static bool api_should_keepalive(const struct api_ctx *restrict ctx)
 {
 	const char *const version = ctx->msg.req.version;
-	if (version == NULL || strncmp(version, "HTTP/1.1", 8) != 0) {
+	/* recv_cb() has already validated the version grammar, so an exact
+	 * match against the whole token (not a prefix that "HTTP/1.1junk" would
+	 * also satisfy) decides persistence: only HTTP/1.1 defaults to
+	 * keep-alive. */
+	if (version == NULL || strcmp(version, "HTTP/1.1") != 0) {
 		return false;
 	}
 	return !ctx->close_requested;
@@ -1354,6 +1375,26 @@ recv_error(struct ev_loop *loop, struct api_ctx *restrict ctx, const int code)
 	ev_io_start(loop, &ctx->w_send);
 }
 
+/* Validate the request HTTP-version, which http_parse() copies verbatim
+ * without interpreting.  RFC 9112 2.6 fixes the grammar as
+ *   HTTP-version = "HTTP/" DIGIT "." DIGIT
+ * so a well-formed token is exactly eight characters.  Returns 0 for a
+ * supported HTTP/1.x version, or the HTTP status to reject with: 400 for a
+ * token that does not match the grammar, 505 for a well-formed but
+ * unsupported major version (RFC 9112 2.3). */
+static int check_http_version(const char *restrict version)
+{
+	if (version == NULL || strncmp(version, "HTTP/", 5) != 0 ||
+	    !isdigit((unsigned char)version[5]) || version[6] != '.' ||
+	    !isdigit((unsigned char)version[7]) || version[8] != '\0') {
+		return HTTP_BAD_REQUEST;
+	}
+	if (version[5] != '1') {
+		return HTTP_VERSION_NOT_SUPPORTED;
+	}
+	return 0;
+}
+
 /* Read and parse the request incrementally; dispatch to api_handle() when headers are complete. */
 static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 {
@@ -1400,6 +1441,14 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			return; /* Partial line, wait for more data */
 		}
 		ctx->next = parsed;
+		/* http_parse() accepts the version token without interpreting
+		 * it; reject a malformed or unsupported version here before the
+		 * request is dispatched or keepalive is derived from it. */
+		const int vstatus = check_http_version(ctx->msg.req.version);
+		if (vstatus != 0) {
+			recv_error(loop, ctx, vstatus);
+			return;
+		}
 	}
 
 	while (!ctx->hdr_done) {

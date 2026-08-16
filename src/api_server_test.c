@@ -37,7 +37,34 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
+
+/* Test seam for the clock-failure path of the Date header.  api_server.c's
+ * http_date_safe() calls time() then gmtime_r(), and gmtime_r() cannot be
+ * driven to fail from the black-box API surface while the wall clock is real.
+ * Defining time() here resolves ahead of libc's for every reference in this
+ * test executable (ordinary static-link symbol resolution), so a case can set
+ * the flag to force a value large enough that gmtime_r() overflows struct tm's
+ * tm_year and returns NULL.  With the flag clear it returns the real wall clock
+ * via clock_gettime(), so every other test's Date header is unaffected. */
+static bool g_force_clock_failure = false;
+
+time_t time(time_t *tloc)
+{
+	time_t now;
+	if (g_force_clock_failure) {
+		now = (time_t)INT64_MAX;
+	} else {
+		struct timespec ts = { 0, 0 };
+		(void)clock_gettime(CLOCK_REALTIME, &ts);
+		now = ts.tv_sec;
+	}
+	if (tloc != NULL) {
+		*tloc = now;
+	}
+	return now;
+}
 
 /* Constants */
 
@@ -889,6 +916,30 @@ static bool resp_date_is_english_imf_fixdate(const char *restrict buf)
 	"Host: test\r\n"                                                       \
 	"Connection: close\r\n"                                                \
 	"Expect: something-else\r\n"                                           \
+	"\r\n"
+
+/* http_parse() copies the request-line version verbatim without interpreting
+ * it; recv_cb() must reject a token that is not a supported HTTP/1.x version
+ * rather than dispatch it as a normal request. */
+
+/* Trailing garbage on an otherwise HTTP/1.1 token: pre-fix, the prefix match
+ * in api_should_keepalive() even treated it as a persistent HTTP/1.1. */
+#define REQ_VERSION_JUNK_SUFFIX                                                \
+	"GET /healthy HTTP/1.1junk\r\n"                                        \
+	"Host: test\r\n"                                                       \
+	"\r\n"
+
+/* Empty version field: http_parse() accepts an empty third request-line field
+ * and leaves the version check to the caller (see net/http.c). */
+#define REQ_VERSION_EMPTY                                                      \
+	"GET /healthy \r\n"                                                    \
+	"Host: test\r\n"                                                       \
+	"\r\n"
+
+/* Well-formed grammar but an unsupported major version (RFC 9112 2.3 -> 505). */
+#define REQ_VERSION_HTTP2                                                      \
+	"GET /healthy HTTP/2.0\r\n"                                            \
+	"Host: test\r\n"                                                       \
 	"\r\n"
 
 /* Helper — perform a single HTTP exchange on fx and fill rctx.
@@ -2843,6 +2894,95 @@ T_DECLARE_CASE(test_unknown_expectation_rejected)
 	apifx_teardown(&fx);
 }
 
+/* Trailing garbage after HTTP/1.1 is not the HTTP-version grammar; recv_cb()
+ * must reject it (400) instead of dispatching a normal 200 -- pre-fix it was
+ * both served and, via the prefix match, treated as keep-alive. */
+T_DECLARE_CASE(test_http_version_junk_suffix_rejected)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_VERSION_JUNK_SUFFIX);
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
+}
+
+/* An empty version field is malformed syntax; reject with 400 rather than
+ * dispatch (pre-fix served a 200). */
+T_DECLARE_CASE(test_http_version_empty_rejected)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_VERSION_EMPTY);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
+}
+
+/* A well-formed but unsupported major version must be rejected with 505 (RFC
+ * 9112 2.3), not processed as a normal request (pre-fix served a 200). */
+T_DECLARE_CASE(test_http_version_unsupported_major_rejected)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_VERSION_HTTP2);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 505);
+}
+
+/* When http_date_safe() cannot produce a valid IMF-fixdate, both response
+ * builders must omit the Date header entirely (RFC 7231 7.1.1.2) rather than
+ * emit a syntactically empty "Date: \r\n".  /healthy exercises
+ * respond_status_allow(); /metrics exercises respond_body(). */
+T_DECLARE_CASE(test_date_header_omitted_when_clock_unavailable)
+{
+	/* The forced failure needs a time_t large enough that gmtime_r()
+	 * overflows; where it cannot represent one (e.g. 32-bit time_t), the
+	 * defect is unreachable and there is nothing to pin. */
+	{
+		const time_t poison = (time_t)INT64_MAX;
+		struct tm probe;
+		if (gmtime_r(&poison, &probe) != NULL) {
+			T_SKIPNOW();
+		}
+	}
+
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	g_force_clock_failure = true;
+	struct resp_wait_ctx rctx_status;
+	const int rc_status = do_exchange(&fx, &rctx_status, REQ_HEALTHY_GET);
+	struct resp_wait_ctx rctx_body;
+	const int rc_body = do_exchange(&fx, &rctx_body, REQ_METRICS_GET);
+	g_force_clock_failure = false;
+
+	/* Teardown before asserting so a failing T_EXPECT can't skip it (both
+	 * rctx buffers and the return codes are captured above). */
+	apifx_teardown(&fx);
+
+	/* respond_status_allow(): a valid response with no Date header at all. */
+	T_EXPECT_EQ(rc_status, 0);
+	T_EXPECT_EQ(parse_status(rctx_status.buf), 200);
+	T_EXPECT(!resp_contains(rctx_status.buf, "\r\nDate:"));
+
+	/* respond_body(): same contract. */
+	T_EXPECT_EQ(rc_body, 0);
+	T_EXPECT_EQ(parse_status(rctx_body.buf), 200);
+	T_EXPECT(!resp_contains(rctx_body.buf, "\r\nDate:"));
+}
+
 /* main */
 
 static const struct testing_suite suite[] = {
@@ -2898,6 +3038,10 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_healthy_rejects_put),
 	T_CASE(test_expect_100_continue_gets_interim_response),
 	T_CASE(test_unknown_expectation_rejected),
+	T_CASE(test_http_version_junk_suffix_rejected),
+	T_CASE(test_http_version_empty_rejected),
+	T_CASE(test_http_version_unsupported_major_rejected),
+	T_CASE(test_date_header_omitted_when_clock_unavailable),
 	T_SUITE_END,
 };
 
