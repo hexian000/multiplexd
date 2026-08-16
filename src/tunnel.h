@@ -103,7 +103,9 @@ struct tunnel_opts {
 	 * that owns it, or NULL when the label is unknown.  NULL in certificate
 	 * mode.  Set instead of verify_identity, never alongside it: a PSK binder
 	 * proves possession of the key its label names, so the binding is
-	 * intrinsic rather than opt-in.  Borrowed; must outlive the tunnel. */
+	 * intrinsic rather than opt-in.  Borrowed rather than held, tunnel_new()
+	 * having adopted it before it returns: the owner must keep psk_ctx alive
+	 * until tunnel_psk_ctx() stops reporting it, or the tunnel is closed. */
 	const char *(*psk_identity_of)(void *ctx, const char *label);
 	void *psk_ctx;
 #if WITH_TLS
@@ -323,16 +325,41 @@ struct tunnel_reload_opts {
 	 * effect on the session's next handshake (resume or reconnect) rather
 	 * than mid-session. */
 	bool verify_identity;
-	/* New PSK resolver.  Must be refreshed together with the config: the
-	 * table the old one closed over is freed once the reload completes. */
+	/* New PSK resolver.  Must be refreshed together with the config.  The
+	 * tunnel only adopts it once the dispatched reload runs, so the caller
+	 * keeps the table it replaces alive until tunnel_psk_ctx() stops
+	 * reporting it -- a dropped dispatch leaves the tunnel on the old one
+	 * indefinitely.  psk_ctx carries one hold of the caller's, transferred
+	 * with the dispatch and given back through psk_ctx_release (NULL when the
+	 * context needs no hold) once the dispatch runs or is dropped: between the
+	 * two the resolver is named by nothing the owner can see. */
 	const char *(*psk_identity_of)(void *ctx, const char *label);
 	void *psk_ctx;
+	void (*psk_ctx_release)(void *ctx);
 };
 
 /* Dispatch a single-pass reload to the session's tunnel loop; address
  * updates, drain config, socket options, and TLS context applied atomically.
- * Takes ownership of opts->tlsctx either way: on OOM the dispatch is
- * skipped, the context is freed, and the error is logged. */
+ * Takes ownership of opts->tlsctx and of the hold on opts->psk_ctx either way:
+ * on OOM the dispatch is skipped, the context is freed, the hold given back,
+ * and the error is logged. */
 void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts);
+
+/* Dispatch a PSK resolver repoint to the session's tunnel loop.  Narrower than
+ * tunnel_reload(): it carries nothing but the resolver and allocates nothing
+ * the tunnel keeps, so an owner whose reload dispatch was dropped can re-offer
+ * the current table on its own schedule.  Returns false when the dispatch
+ * could not be queued, leaving the tunnel on the resolver it already has.
+ * Takes ownership of the hold on @p psk_ctx either way, as tunnel_reload()
+ * does. */
+bool tunnel_set_psk(
+	struct tunnel *t, const char *(*psk_identity_of)(void *, const char *),
+	void *psk_ctx, void (*psk_ctx_release)(void *ctx));
+
+/* The PSK resolver context the tunnel is currently using, readable from any
+ * thread.  An owner of the tables compares it against the current one to tell
+ * whether a dispatched reload has been adopted yet; the value it returns must
+ * be kept alive until the tunnel reports a different one or is closed. */
+const void *tunnel_psk_ctx(const struct tunnel *t);
 
 #endif /* TUNNEL_H */

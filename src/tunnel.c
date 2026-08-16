@@ -156,7 +156,15 @@ struct tunnel {
 	/* PSK mode: resolves an authenticated label to its peer identity; NULL
 	 * in certificate mode.  Same lifetime rules as verify_identity. */
 	const char *(*psk_identity_of)(void *ctx, const char *label);
+	/* Context handed to psk_identity_of, borrowed from the server.  Written
+	 * on this tunnel's thread only, but published (see TPSK_STORE) so the
+	 * server thread can tell which table this tunnel still resolves through
+	 * and hold that table alive for exactly as long. */
+#if WITH_THREADS
+	_Atomic(void *) psk_ctx;
+#else
 	void *psk_ctx;
+#endif
 	/* Server-wide monotonic index, never reused. */
 	uint_least64_t tunnel_index;
 	/* Owned copies of session metadata strings. */
@@ -293,6 +301,20 @@ struct tunnel {
 #define TPUB_STORE(field, v) ((void)((field) = (v)))
 #define TPUB_LOAD(field) (field)
 #define TPUB_ADD(field, v) ((void)((field) += (v)))
+#endif /* WITH_THREADS */
+
+/* TPSK_STORE/TPSK_LOAD: publish and observe t->psk_ctx.  Ordered rather than
+ * relaxed, unlike the TPUB_* fields, because the observer acts on the value by
+ * freeing the table it names: the release store puts this thread's lookups
+ * *through* the old table before it, and the acquire load puts the server's
+ * free() after it, so a free can never overtake a lookup already in flight. */
+#if WITH_THREADS
+#define TPSK_STORE(field, v)                                                   \
+	atomic_store_explicit(&(field), (v), memory_order_release)
+#define TPSK_LOAD(field) atomic_load_explicit(&(field), memory_order_acquire)
+#else
+#define TPSK_STORE(field, v) ((void)((field) = (v)))
+#define TPSK_LOAD(field) (field)
 #endif /* WITH_THREADS */
 
 /* Lock/unlock the per-tunnel stats-snapshot mutex.  Takes const because the
@@ -502,10 +524,34 @@ static const double tunnel_reconnect_delays[] = {
 	15.0, 60.0, 60.0, 120.0, 300.0, 600.0,
 };
 
-static void tunnel_schedule_reconnect(struct tunnel *restrict t)
+/* Index of the first 15s rung in tunnel_reconnect_delays[]. */
+enum { TUNNEL_RECONNECT_UNREACHABLE_IDX = 5 };
+
+/* connect(2) reporting that the local network path is gone, as opposed to the
+ * peer declining or not answering.  Nothing below the 15s rung can succeed
+ * while it holds, and on a mobile link each attempt is a radio wakeup. */
+static bool path_unreachable(const int err)
+{
+	switch (err) {
+	case ENETDOWN:
+	case ENETUNREACH:
+	case EHOSTUNREACH:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* err is the connect(2) errno the failed attempt reported, or 0 where the
+ * caller has none (a close, or a failure before the connect). */
+static void tunnel_schedule_reconnect(struct tunnel *restrict t, const int err)
 {
 	if (t->connect_addr == NULL || t->shutting_down) {
 		return;
+	}
+	if (path_unreachable(err) &&
+	    t->reconnect_count < TUNNEL_RECONNECT_UNREACHABLE_IDX) {
+		t->reconnect_count = TUNNEL_RECONNECT_UNREACHABLE_IDX;
 	}
 	const int idx =
 		CLAMP(t->reconnect_count, 0,
@@ -521,9 +567,13 @@ static void tunnel_schedule_reconnect(struct tunnel *restrict t)
 	ev_timer_again(t->loop, &t->w_reconnect);
 }
 
-static bool tunnel_do_connect(struct tunnel *restrict t)
+/* Dials t->connect_addr and hands the pending socket to the mux session.
+ * On failure *err_out carries the reporting call's errno, or 0 where the
+ * failure produced none. */
+static bool tunnel_do_connect(struct tunnel *restrict t, int *restrict err_out)
 {
 	const char *const addr_str = t->connect_addr;
+	*err_out = 0;
 
 	union sockaddr_max addr;
 	if (!resolve_addr(&addr, addr_str, SA_RESOLVE_TCP)) {
@@ -535,6 +585,7 @@ static bool tunnel_do_connect(struct tunnel *restrict t)
 	if (fd < 0) {
 		const int err = errno;
 		LOGE_F("socket: (%d) %s", err, strerror(err));
+		*err_out = err;
 		return false;
 	}
 	(void)socket_set_cloexec(fd);
@@ -566,6 +617,7 @@ static bool tunnel_do_connect(struct tunnel *restrict t)
 		if (err != EINPROGRESS) {
 			LOGE_F("connect: (%d) %s", err, strerror(err));
 			socket_close(fd);
+			*err_out = err;
 			return false;
 		}
 	}
@@ -595,11 +647,12 @@ tunnel_reconnect_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		 * point already has. */
 		return;
 	}
-	if (tunnel_do_connect(t)) {
+	int err;
+	if (tunnel_do_connect(t, &err)) {
 		return;
 	}
 	TUNNEL_LOG(WARNING, t, "connect failed, scheduling retry");
-	tunnel_schedule_reconnect(t);
+	tunnel_schedule_reconnect(t, err);
 }
 
 static const struct mux_session_config *tunnel_conf(const struct tunnel *t)
@@ -619,9 +672,10 @@ static void handle_transport_lost(struct tunnel *restrict t)
 	TUNNEL_LOG(INFO, t, "transport lost, reconnecting");
 	ev_timer_stop(t->loop, &t->w_reconnect);
 	TPUB_ADD(t->error_cnt.num_reconnects, 1);
-	if (!tunnel_do_connect(t)) {
+	int err;
+	if (!tunnel_do_connect(t, &err)) {
 		TUNNEL_LOG(WARNING, t, "connect failed, scheduling retry");
-		tunnel_schedule_reconnect(t);
+		tunnel_schedule_reconnect(t, err);
 	}
 }
 
@@ -716,7 +770,7 @@ static void handle_connected(
 /* Returns false when the event should not be relayed to the server: the
  * tunnel persists locally and reconnects later instead of being torn down,
  * either via the backoff timer or, for idle_timeout tunnels, on demand. */
-static bool handle_closed(struct tunnel *restrict t)
+static bool handle_closed(struct tunnel *restrict t, const int err)
 {
 	if (t->connect_addr == NULL || t->shutting_down) {
 		ev_timer_stop(t->loop, &t->w_reconnect);
@@ -729,8 +783,10 @@ static bool handle_closed(struct tunnel *restrict t)
 		return false;
 	}
 	/* Both clean and dirty closes schedule a backoff reconnect; no
-	 * immediate attempt to avoid CLOSED-event busy loops. */
-	tunnel_schedule_reconnect(t);
+	 * immediate attempt to avoid CLOSED-event busy loops.  err is the
+	 * session's transport errno, so a connect that failed after the SYN went
+	 * out is paced like one that failed on the call itself. */
+	tunnel_schedule_reconnect(t, err);
 	return false;
 }
 
@@ -768,7 +824,7 @@ static void tunnel_on_event(
 		handle_stream_established(t, edata.stream_established.ns);
 		return;
 	case MUX_EVENT_CLOSED:
-		if (!handle_closed(t)) {
+		if (!handle_closed(t, edata.closed.err)) {
 			return;
 		}
 		break;
@@ -844,8 +900,9 @@ static void tunnel_open_fd(struct tunnel *restrict t, const int fd)
 		    !ev_is_active(&t->w_reconnect) &&
 		    (mux_state(t->ss) == MUX_STATE_SUSPENDED ||
 		     mux_state(t->ss) == MUX_STATE_CLOSED)) {
-			if (!tunnel_do_connect(t)) {
-				tunnel_schedule_reconnect(t);
+			int err;
+			if (!tunnel_do_connect(t, &err)) {
+				tunnel_schedule_reconnect(t, err);
 			}
 		}
 		TUNNEL_LOG_F(
@@ -1020,7 +1077,8 @@ static bool tunnel_on_verify_identity(
 			       tunnel_fd(t), esc);
 			return false;
 		}
-		const char *const owner = t->psk_identity_of(t->psk_ctx, label);
+		const char *const owner =
+			t->psk_identity_of(TPSK_LOAD(t->psk_ctx), label);
 		if (owner == NULL || strcmp(owner, identity) != 0) {
 			char esc[IDENTITY_ESCAPED_MAX];
 			escape_identity(
@@ -1069,15 +1127,19 @@ static bool tunnel_on_verify_identity(
 #endif /* WITH_TLS */
 }
 
-/* True when identity.verify permits attaching new_ss's transport to old_t: the
- * identity claimed on the new transport must equal the one the session being
- * resumed already carries, with both-absent counting as equal.
+/* True when peer-identity binding permits attaching new_ss's transport to
+ * old_t: the identity claimed on the new transport must equal the one the
+ * session being resumed already carries, with both-absent counting as equal.
  *
- * The new claim was already checked against this transport's certificate at
- * hello time (tunnel_on_verify_identity, which runs before the resume handoff),
- * so requiring equality here is what stops a resume from carrying a session's
- * verified identity onto a transport that never proved it -- including a resume
- * hello that drops the identity extension entirely.
+ * The new claim was already authenticated at hello time
+ * (tunnel_on_verify_identity, which runs before the resume handoff) -- against
+ * this transport's certificate under identity.verify, or against the
+ * authenticated PSK label under PSK identity binding -- so requiring equality
+ * here is what stops a resume from carrying a session's proven identity onto a
+ * transport that authenticated as a different principal, including a resume
+ * hello that drops the identity extension entirely.  PSK mode binds identity
+ * with verify_identity clear, so the guard below covers both mechanisms; a
+ * session with neither has no identity to keep continuous.
  *
  * The claim is read from the session rather than old_t's published snapshot:
  * that snapshot is only refreshed on MUX_EVENT_CONNECTED, which has not fired
@@ -1086,15 +1148,15 @@ static bool tunnel_on_verify_identity(
  *
  * Must run before mux_transport_detach(), which moves new_ss's identity onto
  * the transport and leaves NULL behind; afterwards this would compare against
- * an absent claim.  Requiring equality here is also what keeps that move safe
- * under identity.verify: the identity the resumed session adopts is then the
- * one just proved against the certificate on the new transport. */
+ * an absent claim.  Requiring equality here is also what keeps that move safe:
+ * the identity the resumed session adopts is then the one just authenticated on
+ * the new transport. */
 static bool tunnel_resume_identity_ok(
 	const struct tunnel *restrict t,
 	const struct mux_session *restrict new_ss,
 	const struct tunnel *restrict old_t)
 {
-	if (!t->verify_identity) {
+	if (!t->verify_identity && t->psk_identity_of == NULL) {
 		return true;
 	}
 	const char *const claimed = mux_peer_identity(new_ss);
@@ -1147,15 +1209,22 @@ static bool tunnel_on_resume(
 
 static struct mux_frame *tunnel_frame_alloc(void *data, const size_t size)
 {
-	struct mcache *const restrict cache = data;
-	ASSERT(size == cache->elem_size);
+	struct tunnel *const restrict t = data;
+	ASSERT(size == t->frame_cache->elem_size);
 	(void)size;
-	return mcache_get(cache);
+	return mcache_get(t->frame_cache);
 }
 
+/* Refilling the cache is the only thing that gives the trim timer work, so it
+ * is also what arms it: teardown therefore stops the timer only after the last
+ * mux_close, or a released frame would revive it. */
 static void tunnel_frame_free(void *data, struct mux_frame *frame)
 {
-	mcache_put(data, frame);
+	struct tunnel *const restrict t = data;
+	mcache_put(t->frame_cache, frame);
+	if (!ev_is_active(&t->w_maintenance)) {
+		ev_timer_again(t->loop, &t->w_maintenance);
+	}
 }
 
 static void
@@ -1164,10 +1233,12 @@ tunnel_maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	CHECK_REVENTS(revents, EV_TIMER);
 	struct tunnel *const restrict t = w->data;
 	ASSERT(loop == t->loop);
-	(void)loop;
 	/* Release one cached frame per tick: a steady stream keeps refilling the
 	 * cache, while an idle tunnel drains it back to malloc over time. */
 	mcache_shrink(t->frame_cache, 1);
+	if (t->frame_cache->num_elem == 0) {
+		ev_timer_stop(loop, &t->w_maintenance);
+	}
 }
 
 /* Tear down a partially-initialized tunnel on any tunnel_new failure exit
@@ -1274,7 +1345,7 @@ struct tunnel *tunnel_new(
 #endif
 	t->verify_identity = opts->verify_identity;
 	t->psk_identity_of = opts->psk_identity_of;
-	t->psk_ctx = opts->psk_ctx;
+	TPSK_STORE(t->psk_ctx, opts->psk_ctx);
 	t->cb = (struct mux_callbacks){
 		.on_accept = tunnel_on_accept,
 		.on_event = tunnel_on_event,
@@ -1316,15 +1387,15 @@ struct tunnel *tunnel_new(
 		tunnel_new_cleanup(t, NULL, true, opts);
 		return NULL;
 	}
+	/* Left stopped: the first frame returned to the cache arms it. */
 	ev_timer_init(
 		&t->w_maintenance, tunnel_maintenance_cb,
 		TUNNEL_MAINTENANCE_INTERVAL, TUNNEL_MAINTENANCE_INTERVAL);
 	t->w_maintenance.data = t;
-	ev_timer_start(t->loop, &t->w_maintenance);
 	const struct mux_frame_allocator pool = {
 		.alloc = tunnel_frame_alloc,
 		.free = tunnel_frame_free,
-		.data = t->frame_cache,
+		.data = t,
 	};
 	{
 		char my[64];
@@ -1470,8 +1541,9 @@ static void task_mux_start(void *p)
 static void tunnel_initial_connect_task(void *p)
 {
 	struct tunnel *const restrict t = p;
-	if (!tunnel_do_connect(t)) {
-		tunnel_schedule_reconnect(t);
+	int err;
+	if (!tunnel_do_connect(t, &err)) {
+		tunnel_schedule_reconnect(t, err);
 	}
 }
 
@@ -1528,10 +1600,12 @@ static void task_tunnel_teardown(void *p)
 {
 	struct tunnel *const restrict t = p;
 	ev_timer_stop(t->loop, &t->w_reconnect);
-	ev_timer_stop(t->loop, &t->w_maintenance);
 	mux_set_callbacks(t->ss, &(struct mux_callbacks){ 0 });
 	mux_close(t->ss);
 	t->ss = NULL;
+	/* After mux_close, so a frame released during teardown cannot re-arm it
+	 * and leave this loop with a watcher that never lets ev_run return. */
+	ev_timer_stop(t->loop, &t->w_maintenance);
 	ev_async_stop(t->loop, &t->w_async);
 }
 #endif /* WITH_THREADS */
@@ -1658,9 +1732,11 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 	} else {
 		/* Thread never started; just release mux session resources. */
 		ev_timer_stop(t->loop, &t->w_reconnect);
-		ev_timer_stop(t->loop, &t->w_maintenance);
 		mux_close(t->ss);
 	}
+	/* After every mux_close above -- including the post-join one -- so a frame
+	 * released during teardown cannot re-arm it past ev_loop_destroy below. */
+	ev_timer_stop(t->loop, &t->w_maintenance);
 	ev_async_stop(t->loop, &t->w_async);
 	/* The tunnel thread is stopped (joined) or never ran, so no drain can race
 	 * this: close any opens still queued -- they can no longer be served. */
@@ -1669,8 +1745,11 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 	ev_loop_destroy(t->loop);
 #else /* WITH_THREADS */
 	ev_timer_stop(t->loop, &t->w_reconnect);
-	ev_timer_stop(t->loop, &t->w_maintenance);
 	mux_close(t->ss);
+	/* After mux_close: the loop here is the shared parent loop, which outlives
+	 * t, so a frame released during teardown must not leave a timer armed on
+	 * a tunnel that is about to be freed. */
+	ev_timer_stop(t->loop, &t->w_maintenance);
 #endif /* WITH_THREADS */
 	/* After the join and every mux_close() path above, so the counters
 	 * teardown bumped -- one num_stream_failed per stream still open -- are
@@ -1927,8 +2006,19 @@ struct reload_arg {
 	char *forward_addr;
 	bool verify_identity;
 	const char *(*psk_identity_of)(void *ctx, const char *label);
+	/* Carries the dispatch's hold on the resolver; see tunnel_reload_opts. */
 	void *psk_ctx;
+	void (*psk_ctx_release)(void *ctx);
 };
+
+/* Give back the hold a dispatch carried on its PSK resolver. */
+static void release_psk_ctx(void *restrict ctx, void (*release)(void *ctx))
+{
+	if (release == NULL) {
+		return;
+	}
+	release(ctx);
+}
 
 static void reload_task(void *p)
 {
@@ -1957,7 +2047,12 @@ static void reload_task(void *p)
 	 * handshake rather than mid-session. */
 	t->verify_identity = arg->verify_identity;
 	t->psk_identity_of = arg->psk_identity_of;
-	t->psk_ctx = arg->psk_ctx;
+	/* Publishes to the server that this tunnel is off the previous table. */
+	TPSK_STORE(t->psk_ctx, arg->psk_ctx);
+	/* Only now, with the tunnel reporting the resolver itself: the owner reads
+	 * the holds before it asks the tunnels, so one or the other covers the
+	 * resolver at every instant. */
+	release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
 #if WITH_TLS
 	/* Adopt the new per-tunnel TLS context (ownership transferred via the
 	 * reload).  mux_set_tlsctx() below repoints the wire to it, after which the
@@ -1988,6 +2083,7 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 	struct reload_arg *const restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
+		release_psk_ctx(opts->psk_ctx, opts->psk_ctx_release);
 #if WITH_TLS
 		/* Ownership of the new context transferred to us; release it. */
 		tls_ctx_free(opts->tlsctx);
@@ -2010,11 +2106,13 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		.verify_identity = opts->verify_identity,
 		.psk_identity_of = opts->psk_identity_of,
 		.psk_ctx = opts->psk_ctx,
+		.psk_ctx_release = opts->psk_ctx_release,
 	};
 	if (opts->update_connect_addr && opts->connect_addr != NULL) {
 		arg->connect_addr = strdup(opts->connect_addr);
 		if (arg->connect_addr == NULL) {
 			LOGOOM();
+			release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
 			free(arg);
 #if WITH_TLS
 			tls_ctx_free(opts->tlsctx);
@@ -2026,6 +2124,7 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		arg->forward_addr = strdup(opts->forward_addr);
 		if (arg->forward_addr == NULL) {
 			LOGOOM();
+			release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
 			free(arg->connect_addr);
 			free(arg);
 #if WITH_TLS
@@ -2037,6 +2136,7 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 	if (!tunnel_post(t, (struct task){ reload_task, arg })) {
 		TUNNEL_LOG_PUB(
 			ERROR, t, "failed to dispatch reload (queue full)");
+		release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
 		free(arg->connect_addr);
 		free(arg->forward_addr);
 #if WITH_TLS
@@ -2044,4 +2144,52 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 #endif
 		free(arg);
 	}
+}
+
+struct set_psk_arg {
+	struct tunnel *t;
+	const char *(*psk_identity_of)(void *ctx, const char *label);
+	/* Carries the dispatch's hold on the resolver; see tunnel_set_psk. */
+	void *psk_ctx;
+	void (*psk_ctx_release)(void *ctx);
+};
+
+static void set_psk_task(void *p)
+{
+	struct set_psk_arg *const restrict arg = p;
+	struct tunnel *const restrict t = arg->t;
+	t->psk_identity_of = arg->psk_identity_of;
+	TPSK_STORE(t->psk_ctx, arg->psk_ctx);
+	/* Ordered as in reload_task: publish first, then give the hold back. */
+	release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
+	free(arg);
+}
+
+bool tunnel_set_psk(
+	struct tunnel *t, const char *(*psk_identity_of)(void *, const char *),
+	void *psk_ctx, void (*psk_ctx_release)(void *ctx))
+{
+	struct set_psk_arg *const restrict arg = malloc(sizeof(*arg));
+	if (arg == NULL) {
+		LOGOOM();
+		release_psk_ctx(psk_ctx, psk_ctx_release);
+		return false;
+	}
+	*arg = (struct set_psk_arg){
+		.t = t,
+		.psk_identity_of = psk_identity_of,
+		.psk_ctx = psk_ctx,
+		.psk_ctx_release = psk_ctx_release,
+	};
+	if (!tunnel_post(t, (struct task){ set_psk_task, arg })) {
+		release_psk_ctx(psk_ctx, psk_ctx_release);
+		free(arg);
+		return false;
+	}
+	return true;
+}
+
+const void *tunnel_psk_ctx(const struct tunnel *t)
+{
+	return TPSK_LOAD(t->psk_ctx);
 }

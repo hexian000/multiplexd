@@ -1,15 +1,17 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* tunnel_test.c - black-box tests for tunnel lifecycle/accessors;
- * real util/conf/listener/server/tunnel/api_server + mux library linked;
- * exercised via the public API. */
+/* tunnel_test.c - tests for tunnel lifecycle/accessors, driven through the
+ * public API except for the reconnect backoff ladder, which tunnel.c is
+ * #included to reach; real util/conf/listener/server/api_server + mux library
+ * linked. */
 
 #include "tunnel.h"
 
 #include "conf.h"
 #include "mux/mux.h"
 #include "server.h"
+#include "tunnel.c"
 
 #include "meta/arraysize.h"
 #if WITH_THREADS
@@ -320,6 +322,183 @@ T_DECLARE_CASE(test_tunnel_reconnect_rearms_after_failed_retry)
 #endif
 
 	T_EXPECT(reconnected);
+}
+
+/* tunnel_schedule_reconnect jitters every rung by a factor in [0.8, 1.2). */
+static bool jittered_from(const double delay, const double rung)
+{
+	return delay >= rung * 0.8 && delay < rung * 1.2;
+}
+
+/* The ladder used to be driven by attempt count alone, so a dial that failed
+ * because the local path is gone was paced exactly like one the peer refused:
+ * its first rungs put eight attempts in the opening minute, every one of them
+ * futile, and on a mobile link every one a radio wakeup.  A connect(2) errno
+ * from the no-route family now enters the ladder at its first 15s rung. */
+T_DECLARE_CASE(test_tunnel_reconnect_backoff_skips_fast_rungs_when_unreachable)
+{
+	struct server srv;
+	memset(&srv, 0, sizeof(srv));
+
+#if !WITH_THREADS
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	srv.loop = loop;
+#endif
+
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.data = NULL,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+		.connect_addr = "invalid",
+		.cnt = &cnts,
+	};
+
+	/* Deliberately not started: tunnel_new leaves the loop and the backoff
+	 * timer initialised, and with no thread behind them the backoff state is
+	 * this thread's alone to drive and read. */
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+
+	/* A peer that answers with RST is reachable, so the fast rung stands. */
+	tunnel_schedule_reconnect(t, ECONNREFUSED);
+	const double refused_delay = t->w_reconnect.repeat;
+	const int refused_count = t->reconnect_count;
+
+	static const int no_route[] = { ENETDOWN, ENETUNREACH, EHOSTUNREACH };
+	double jumped_delay[ARRAY_SIZE(no_route)];
+	int jumped_count[ARRAY_SIZE(no_route)];
+	for (size_t i = 0; i < ARRAY_SIZE(no_route); i++) {
+		t->reconnect_count = 0;
+		tunnel_schedule_reconnect(t, no_route[i]);
+		jumped_delay[i] = t->w_reconnect.repeat;
+		jumped_count[i] = t->reconnect_count;
+	}
+
+	/* Having jumped, the ladder keeps climbing on the next failure instead
+	 * of dropping back to the rungs it just skipped. */
+	t->reconnect_count = 0;
+	tunnel_schedule_reconnect(t, ENETUNREACH);
+	tunnel_schedule_reconnect(t, ECONNREFUSED);
+	const double next_delay = t->w_reconnect.repeat;
+	const int next_count = t->reconnect_count;
+
+	const double fast_rung = tunnel_reconnect_delays[0];
+	const double no_route_rung =
+		tunnel_reconnect_delays[TUNNEL_RECONNECT_UNREACHABLE_IDX];
+
+	tunnel_close(t);
+
+#if !WITH_THREADS
+	ev_loop_destroy(loop);
+#endif
+
+	/* TUNNEL_RECONNECT_UNREACHABLE_IDX must still name a rung worth jumping to:
+	 * the first one at or above 15s. */
+	T_EXPECT(no_route_rung >= 15.0);
+	T_EXPECT(
+		tunnel_reconnect_delays[TUNNEL_RECONNECT_UNREACHABLE_IDX - 1] <
+		15.0);
+
+	T_LOGF("refused: %.3fs (rung %.1fs)", refused_delay, fast_rung);
+	T_EXPECT(jittered_from(refused_delay, fast_rung));
+	T_EXPECT_EQ(refused_count, 1);
+
+	for (size_t i = 0; i < ARRAY_SIZE(no_route); i++) {
+		T_LOGF("errno %d: %.3fs (rung %.1fs)", no_route[i],
+		       jumped_delay[i], no_route_rung);
+		T_EXPECT(jittered_from(jumped_delay[i], no_route_rung));
+		T_EXPECT_EQ(
+			jumped_count[i], TUNNEL_RECONNECT_UNREACHABLE_IDX + 1);
+	}
+
+	T_EXPECT(next_delay >= no_route_rung * 0.8);
+	T_EXPECT_EQ(next_count, TUNNEL_RECONNECT_UNREACHABLE_IDX + 2);
+}
+
+/* Only a failure the routing table settles comes back on connect(2) itself; a
+ * no-route error raised after the SYN went out arrives asynchronously and
+ * reaches the tunnel solely as MUX_EVENT_CLOSED.  While that event carried no
+ * errno the ladder had nothing to classify and restarted at 0.2 s, giving the
+ * offline case the very burst the synchronous path already avoids. */
+T_DECLARE_CASE(test_tunnel_reconnect_backoff_reads_closed_event_errno)
+{
+	struct server srv;
+	memset(&srv, 0, sizeof(srv));
+
+#if !WITH_THREADS
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	srv.loop = loop;
+#endif
+
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.data = NULL,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+		.connect_addr = "invalid",
+		.cnt = &cnts,
+	};
+
+	/* Never started, so the close handler and the backoff state it drives are
+	 * this thread's alone; g_conf leaves idle_timeout at 0, which is the mode
+	 * that arms the ladder from a close. */
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+
+	tunnel_on_event(
+		t, t->ss, MUX_EVENT_CLOSED,
+		(union mux_event_data){ .closed.err = ECONNREFUSED });
+	const double refused_delay = t->w_reconnect.repeat;
+	const int refused_count = t->reconnect_count;
+
+	t->reconnect_count = 0;
+	tunnel_on_event(
+		t, t->ss, MUX_EVENT_CLOSED,
+		(union mux_event_data){ .closed.err = ENETUNREACH });
+	const double jumped_delay = t->w_reconnect.repeat;
+	const int jumped_count = t->reconnect_count;
+
+	/* A close that names no errno keeps the fast rung: a clean peer FIN or a
+	 * timeout says nothing about the path. */
+	t->reconnect_count = 0;
+	tunnel_on_event(
+		t, t->ss, MUX_EVENT_CLOSED, (union mux_event_data){ 0 });
+	const double silent_delay = t->w_reconnect.repeat;
+
+	const double fast_rung = tunnel_reconnect_delays[0];
+	const double no_route_rung =
+		tunnel_reconnect_delays[TUNNEL_RECONNECT_UNREACHABLE_IDX];
+
+	tunnel_close(t);
+
+#if !WITH_THREADS
+	ev_loop_destroy(loop);
+#endif
+
+	T_LOGF("refused: %.3fs | unreachable: %.3fs | silent: %.3fs",
+	       refused_delay, jumped_delay, silent_delay);
+	T_EXPECT(jittered_from(refused_delay, fast_rung));
+	T_EXPECT_EQ(refused_count, 1);
+	T_EXPECT(jittered_from(jumped_delay, no_route_rung));
+	T_EXPECT_EQ(jumped_count, TUNNEL_RECONNECT_UNREACHABLE_IDX + 1);
+	T_EXPECT(jittered_from(silent_delay, fast_rung));
 }
 
 /* tunnel.h documents update_connect_addr with a NULL address as "clears and
@@ -792,16 +971,154 @@ T_DECLARE_CASE(test_tunnel_open_stream_burst_not_dropped)
 #endif /* WITH_THREADS */
 }
 
+#if WITH_THREADS
+/* Stands in for the owner's PSK table, which the tunnel only ever sees as an
+ * opaque resolver context: it counts the holds handed back through it. */
+struct psk_hold_probe {
+	size_t releases;
+};
+
+static const char *psk_probe_identity_of(void *ctx, const char *label)
+{
+	(void)ctx;
+	(void)label;
+	return NULL;
+}
+
+static void psk_probe_release(void *ctx)
+{
+	((struct psk_hold_probe *)ctx)->releases++;
+}
+#endif /* WITH_THREADS */
+
+T_DECLARE_CASE(test_tunnel_psk_dispatch_holds_resolver_until_adopted)
+{
+#if !WITH_THREADS
+	(void)_t_;
+	/* Without threads a dispatch runs inline, so it is never queued and the
+	 * window this pins does not exist. */
+	T_SKIPNOW();
+#else
+	/* A repoint the tunnel has been sent but not yet run names the resolver
+	 * while the tunnel itself still reports the previous one, so asking the
+	 * tunnel is not enough to tell whether the resolver has a reader left: the
+	 * dispatch must hold it, and give the hold back only once the tunnel
+	 * reports it.  Pre-fix the dispatch carried no hold, so an owner that
+	 * freed on the tunnel's answer alone freed a table this dispatch was about
+	 * to install. */
+	struct server srv;
+	memset(&srv, 0, sizeof(srv));
+	srv.disp = dispatcher_create(4);
+	T_CHECK(srv.disp != NULL);
+
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.data = NULL,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+		.connect_addr = "invalid",
+		.cnt = &cnts,
+	};
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+
+	/* Queued with no thread to run it yet. */
+	struct psk_hold_probe probe = { 0 };
+	T_CHECK(tunnel_set_psk(
+		t, psk_probe_identity_of, &probe, psk_probe_release));
+	const size_t releases_queued = probe.releases;
+
+	/* The thread drains the ring in order and tunnel_close() queues its
+	 * teardown behind the repoint, so the join it performs orders the count
+	 * read below after the repoint has run. */
+	T_CHECK(tunnel_start(t));
+	tunnel_close(t);
+	const size_t releases_adopted = probe.releases;
+
+	dispatcher_destroy(srv.disp);
+
+	/* Held for as long as the dispatch is queued... */
+	T_EXPECT_EQ(releases_queued, (size_t)0);
+	/* ...and handed back once the tunnel has the resolver itself. */
+	T_EXPECT_EQ(releases_adopted, (size_t)1);
+#endif /* WITH_THREADS */
+}
+
+T_DECLARE_CASE(test_tunnel_psk_dispatch_returns_hold_when_dropped)
+{
+#if !WITH_THREADS
+	(void)_t_;
+	/* Without threads a dispatch runs inline and cannot be refused. */
+	T_SKIPNOW();
+#else
+	/* A dispatch the ring refuses must give its hold back rather than take it
+	 * along: the owner is left holding the resolver on the tunnel's behalf
+	 * forever otherwise.  Nothing drains an unstarted tunnel's ring, so fill
+	 * it exactly with dispatches that carry no heap payload -- the ones left
+	 * queued at close are discarded, and only a payload-free one can be. */
+	enum { RING_CAPACITY = 16 };
+	struct server srv;
+	memset(&srv, 0, sizeof(srv));
+
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+
+	int tpair[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, tpair) == 0);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.data = NULL,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = tpair[0],
+		.id = g_zero_id,
+		.cnt = &cnts,
+	};
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+	(void)close(tpair[1]);
+
+	for (int i = 0; i < RING_CAPACITY; i++) {
+		tunnel_drop_transport(t);
+	}
+	struct psk_hold_probe probe = { 0 };
+	const bool queued = tunnel_set_psk(
+		t, psk_probe_identity_of, &probe, psk_probe_release);
+	const size_t releases = probe.releases;
+
+	tunnel_close(t);
+
+	/* The ring was full, so the repoint never reached the tunnel.  A failure
+	 * here means the ring grew past RING_CAPACITY, not that the dispatch was
+	 * accepted when it should not have been. */
+	T_EXPECT(!queued);
+	/* The hold went back to the caller rather than with the dispatch. */
+	T_EXPECT_EQ(releases, (size_t)1);
+#endif /* WITH_THREADS */
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_new_close_no_start),
 	T_CASE(test_tunnel_accessors_after_new),
 	T_CASE(test_tunnel_reconnect_rearms_after_failed_retry),
+	T_CASE(test_tunnel_reconnect_backoff_skips_fast_rungs_when_unreachable),
+	T_CASE(test_tunnel_reconnect_backoff_reads_closed_event_errno),
 	T_CASE(test_tunnel_reload_null_addr_disables_reconnect),
 	T_CASE(test_tunnel_reconnect_on_transport_lost),
 	T_CASE(test_tunnel_reconnect_after_connect_timeout),
 	T_CASE(test_tunnel_state_returns_connecting_after_new),
 	T_CASE(test_tunnel_stats_initial_zero),
 	T_CASE(test_tunnel_open_stream_burst_not_dropped),
+	T_CASE(test_tunnel_psk_dispatch_holds_resolver_until_adopted),
+	T_CASE(test_tunnel_psk_dispatch_returns_hold_when_dropped),
 	T_SUITE_END,
 };
 

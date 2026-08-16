@@ -267,12 +267,13 @@ add_src_test(genpsk_test
     genpsk_test.c
 )
 
+# White-box: compiles tunnel.c into the TU to reach the static reconnect
+# backoff ladder; every collaborator is linked real.
 add_src_test(tunnel_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
-    tunnel.c tunnel.h
     api_server.c api_server.h
     tunnel_test.c
 )
