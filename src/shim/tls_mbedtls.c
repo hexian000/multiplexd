@@ -97,6 +97,8 @@ struct tls_ctx_impl {
 	char psk_label[TLS_PSK_LABEL_MAX + 1];
 	tls_psk_lookup_fn psk_lookup;
 	void *psk_lookup_ctx;
+	/* Gives back the hold taken on psk_lookup_ctx; NULL when it needs none. */
+	void (*psk_lookup_ctx_release)(void *ctx);
 #ifdef MBEDTLS_LEGACY_RNG
 	mbedtls_ctr_drbg_context ctr_drbg;
 	mbedtls_entropy_context entropy;
@@ -478,6 +480,11 @@ static void tls_ctx_impl_init(struct tls_ctx_impl *restrict c)
 
 static void tls_ctx_impl_free(struct tls_ctx_impl *restrict c)
 {
+	/* Here rather than at the owner's tls_ctx_free(): every live connection
+	 * holds this config, and each of them can still run a handshake. */
+	if (c->psk_lookup_ctx_release != NULL) {
+		c->psk_lookup_ctx_release(c->psk_lookup_ctx);
+	}
 	/* Before freeing the config, which still points at c->psk. */
 	mbedtls_platform_zeroize(c->psk, sizeof(c->psk));
 	c->psk_len = 0;
@@ -641,6 +648,10 @@ static bool tls_ctx_set_psk(
 	if (is_server) {
 		c->psk_lookup = conf->psk_lookup;
 		c->psk_lookup_ctx = conf->psk_lookup_ctx;
+		c->psk_lookup_ctx_release = conf->psk_lookup_ctx_release;
+		if (conf->psk_lookup_ctx_hold != NULL) {
+			conf->psk_lookup_ctx_hold(c->psk_lookup_ctx);
+		}
 		mbedtls_ssl_conf_psk_cb(&c->conf, psk_lookup_cb, c);
 		return true;
 	}
@@ -1078,7 +1089,15 @@ static struct tls_connection *tls_conn_new(
 		 * the CN-mismatch flag. */
 		const int ret = mbedtls_ssl_set_hostname(&conn->ssl, c->sni);
 		if (ret != 0) {
-			LOG_MBEDERROR(WARNING, "mbedtls_ssl_set_hostname", ret);
+			/* A configured SNI that cannot be applied (allocation
+			 * failure clears the hostname; overlong input is rejected)
+			 * is a connection-construction failure, not an optional
+			 * setter: continuing would omit or retain the wrong server
+			 * name and mis-verify the peer.  Release the half-built
+			 * connection like the other required per-connection steps. */
+			LOG_MBEDERROR(ERROR, "mbedtls_ssl_set_hostname", ret);
+			tls_conn_free((struct tls_connection *)conn);
+			return NULL;
 		}
 	}
 	return (struct tls_connection *)conn;

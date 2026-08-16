@@ -823,6 +823,44 @@ T_DECLARE_CASE(test_tls_ctx_client_created)
 	rm_tmpdir(tmpl);
 }
 
+/* A configured SNI longer than the RFC 6066 server_name limit (255 octets)
+ * cannot be applied: both backends' hostname setters reject it, and the schema
+ * places no bound on tls.sni.  tls_client() must fail connection construction
+ * rather than return one that omits or retains the wrong server name. */
+T_DECLARE_CASE(test_tls_client_rejects_unappliable_sni)
+{
+	char tmpl[] = "/tmp/tls_test_XXXXXX";
+	char cert_path[PATH_MAX + 2];
+	char key_path[PATH_MAX + 2];
+	char *const origdir = setup_cert_dir(
+		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
+	T_CHECK(origdir != NULL);
+	free(origdir);
+
+	char long_sni[300];
+	memset(long_sni, 'a', sizeof(long_sni) - 1);
+	long_sni[sizeof(long_sni) - 1] = '\0';
+
+	char *authcerts[] = { cert_path };
+	struct tls_context *const ctx =
+		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
+						     .key = key_path,
+						     .authcerts = authcerts,
+						     .authcerts_count = 1,
+						     .sni = long_sni });
+	T_CHECK(ctx != NULL);
+
+	/* fd < 0 selects the in-memory BIO path, so no socket ownership is at
+	 * play; the SNI is applied for the client role regardless of transport. */
+	struct tls_connection *const conn = tls_client(ctx, -1);
+	T_EXPECT(conn == NULL);
+	if (conn != NULL) {
+		tls_conn_free(conn);
+	}
+	tls_ctx_free(ctx);
+	rm_tmpdir(tmpl);
+}
+
 T_DECLARE_CASE(test_tls_load_key_empty_fails)
 {
 	char tmpl[] = "/tmp/tls_test_XXXXXX";
@@ -3071,6 +3109,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_identity_matches_cert_rejects),
 	T_CASE(test_tls_buf_handshake_and_io),
 	T_CASE(test_tls_buf_recv_drains_stacked_records),
+	T_CASE(test_tls_client_rejects_unappliable_sni),
 	/* Opt-in throughput benchmarks (16 KiB/op, AES-128-GCM); skipped by the
 	 * default run.  Select with `--bench <ere>` or TESTING_BENCH. */
 	T_BENCH(bench_tcp_throughput),

@@ -816,9 +816,23 @@ struct psk_conf {
 	/* Server role. */
 	tls_psk_lookup_fn lookup;
 	void *lookup_ctx;
+	/* Gives back the hold taken on lookup_ctx; NULL when it needs none. */
+	void (*lookup_ctx_release)(void *ctx);
 	/* Suite whose handshake hash the PSK is bound to; see psk_pick_cipher. */
 	const SSL_CIPHER *cipher;
 };
+
+static void psk_conf_free(struct psk_conf *restrict pc)
+{
+	if (pc == NULL) {
+		return;
+	}
+	if (pc->lookup_ctx_release != NULL) {
+		pc->lookup_ctx_release(pc->lookup_ctx);
+	}
+	OPENSSL_cleanse(pc->psk, sizeof(pc->psk));
+	free(pc);
+}
 
 static void psk_conf_ex_free(
 	void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl,
@@ -829,11 +843,7 @@ static void psk_conf_ex_free(
 	(void)idx;
 	(void)argl;
 	(void)argp;
-	struct psk_conf *const pc = ptr;
-	if (pc != NULL) {
-		OPENSSL_cleanse(pc->psk, sizeof(pc->psk));
-		free(pc);
-	}
+	psk_conf_free(ptr);
 }
 
 static CRYPTO_ONCE g_psk_ex_idx_once = CRYPTO_ONCE_STATIC_INIT;
@@ -1104,11 +1114,17 @@ static bool tls_ctx_set_psk(
 	if (is_server) {
 		pc->lookup = conf->psk_lookup;
 		pc->lookup_ctx = conf->psk_lookup_ctx;
+		/* Held for as long as this SSL_CTX can serve a handshake, which
+		 * SSL_new() lets outlast the wrapper the caller frees. */
+		pc->lookup_ctx_release = conf->psk_lookup_ctx_release;
+		if (conf->psk_lookup_ctx_hold != NULL) {
+			conf->psk_lookup_ctx_hold(pc->lookup_ctx);
+		}
 	} else {
 		if (conf->psk_len < TLS_PSK_MIN_LEN ||
 		    conf->psk_len > TLS_PSK_MAX_LEN) {
 			LOGE("tls.psk: key length out of range");
-			free(pc);
+			psk_conf_free(pc);
 			return false;
 		}
 		memcpy(pc->psk, conf->psk, conf->psk_len);
@@ -1117,15 +1133,13 @@ static bool tls_ctx_set_psk(
 		if (!tls_psk_label(
 			    pc->psk, pc->psk_len, pc->label, &label_len)) {
 			LOGE("tls.psk: failed to derive the identity label");
-			OPENSSL_cleanse(pc->psk, sizeof(pc->psk));
-			free(pc);
+			psk_conf_free(pc);
 			return false;
 		}
 	}
 	if (SSL_CTX_set_ex_data(c->ssl_ctx, g_psk_ctx_ex_idx, pc) != 1) {
 		LOG_SSLERROR(ERROR, "SSL_CTX_set_ex_data(psk)");
-		OPENSSL_cleanse(pc->psk, sizeof(pc->psk));
-		free(pc);
+		psk_conf_free(pc);
 		return false;
 	}
 	if (is_server) {
@@ -1402,7 +1416,14 @@ static struct tls_connection *tls_conn_new(
 	}
 	if (!is_server && c->sni != NULL &&
 	    SSL_set_tlsext_host_name(ssl, c->sni) != 1) {
-		LOG_SSLERROR(WARNING, "SSL_set_tlsext_host_name");
+		/* A configured SNI that cannot be applied (e.g. overlong input,
+		 * or allocation failure) is a connection-construction failure,
+		 * not an optional setter: continuing would omit or retain the
+		 * wrong server name and select the wrong virtual host.  Release
+		 * the SSL like the SSL_set_fd/BIO failures above. */
+		LOG_SSLERROR(ERROR, "SSL_set_tlsext_host_name");
+		SSL_free(ssl);
+		return NULL;
 	}
 	struct tls_conn_impl *const conn = calloc(1, sizeof(*conn));
 	if (conn == NULL) {

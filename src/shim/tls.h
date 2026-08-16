@@ -98,6 +98,12 @@ struct tls_config {
 	 * handshakes unsupported on this context. */
 	tls_psk_lookup_fn psk_lookup;
 	void *psk_lookup_ctx;
+	/* Lifetime hooks for psk_lookup_ctx, both NULL when it needs none.  A
+	 * context that retains the lookup takes a hold and gives it back only when
+	 * the parsed context is destroyed, which outlasts tls_ctx_free() for as
+	 * long as one connection still runs handshakes over it. */
+	void (*psk_lookup_ctx_hold)(void *ctx);
+	void (*psk_lookup_ctx_release)(void *ctx);
 	/* Colon-separated TLS 1.3 cipher suites, or NULL for defaults. */
 	const char *ciphersuites;
 	/* Comma-separated ALPN list; NULL or empty omits the extension. */
