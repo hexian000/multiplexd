@@ -406,7 +406,7 @@ table_set(struct hashtable *restrict table, const void *key, void **element)
 	if (table == NULL) {
 		return NULL;
 	}
-	assert(element != NULL);
+	assert(element != NULL && *element != NULL);
 	const uint_fast32_t hash =
 		table->hash_fn(key, table->seed) & UINT32_C(0xFFFFFFFF);
 	size_t bucket = bucket_index(table, hash);

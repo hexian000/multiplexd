@@ -42,6 +42,87 @@ static bool parse_hex4(const char *restrict s, uint_fast32_t *restrict out)
 	return true;
 }
 
+/* check_escape: validate the escape sequence at s[0] == '\\' against RFC 8259,
+ * decoding it to a single Unicode code point in *cp.  len is the bytes available
+ * from the backslash.  Returns the input bytes consumed (>= 2), or 0 on a
+ * malformed escape (logged).  A high surrogate consumes its paired low
+ * surrogate, so a '\\uXXXX' run can span 12 bytes. */
+static size_t check_escape(
+	const char *restrict s, const size_t len, uint_fast32_t *restrict cp)
+{
+	assert(len >= 1 && s[0] == '\\');
+	if (len < 2) {
+		LOGE("json: truncated escape sequence");
+		return 0;
+	}
+	const unsigned char ec = (unsigned char)s[1];
+	switch (ec) {
+	case '"':
+		*cp = '"';
+		return 2;
+	case '\\':
+		*cp = '\\';
+		return 2;
+	case '/':
+		*cp = '/';
+		return 2;
+	case 'b':
+		*cp = '\b';
+		return 2;
+	case 'f':
+		*cp = '\f';
+		return 2;
+	case 'n':
+		*cp = '\n';
+		return 2;
+	case 'r':
+		*cp = '\r';
+		return 2;
+	case 't':
+		*cp = '\t';
+		return 2;
+	case 'u':
+		break;
+	default:
+		LOGE_F("json: invalid escape '\\%c'", (char)ec);
+		return 0;
+	}
+	/* \uXXXX */
+	if (len < 6) {
+		LOGE("json: truncated \\uXXXX escape");
+		return 0;
+	}
+	uint_fast32_t hi;
+	if (!parse_hex4(s + 2, &hi)) {
+		LOGE("json: invalid \\uXXXX escape");
+		return 0;
+	}
+	if (hi >= 0xD800 && hi <= 0xDBFF) {
+		/* handle surrogate pair */
+		if (len < 12 || s[6] != '\\' || s[7] != 'u') {
+			LOGE("json: high surrogate without low surrogate");
+			return 0;
+		}
+		uint_fast32_t low;
+		if (!parse_hex4(s + 8, &low)) {
+			LOGE("json: invalid low surrogate escape");
+			return 0;
+		}
+		if (low < 0xDC00 || low > 0xDFFF) {
+			LOGE("json: invalid surrogate pair");
+			return 0;
+		}
+		*cp = 0x10000 + ((hi - 0xD800) << 10) + (low - 0xDC00);
+		return 12;
+	}
+	if (hi >= 0xDC00 && hi <= 0xDFFF) {
+		LOGE("json: lone low surrogate");
+		return 0;
+	}
+	*cp = hi;
+	return 6;
+}
+
 /* scan_string_inplace: decode a JSON string in-place; s starts just past the
  * opening '"'.  *consumed counts through the closing '"'; output length is
  * always <= input length.  Returns false (and logs) on error. */
@@ -88,85 +169,18 @@ static bool scan_string_inplace(
 			continue;
 		}
 		/* escape sequence */
-		i++;
-		if (i >= len) {
-			LOGE("json: truncated escape sequence");
+		uint_fast32_t cp;
+		const size_t adv = check_escape(s + i, len - i, &cp);
+		if (adv == 0) {
 			return false;
 		}
-		const unsigned char ec = (unsigned char)s[i];
-		i++;
-		switch (ec) {
-		case '"':
-			s[opos++] = '"';
-			break;
-		case '\\':
-			s[opos++] = '\\';
-			break;
-		case '/':
-			s[opos++] = '/';
-			break;
-		case 'b':
-			s[opos++] = '\b';
-			break;
-		case 'f':
-			s[opos++] = '\f';
-			break;
-		case 'n':
-			s[opos++] = '\n';
-			break;
-		case 'r':
-			s[opos++] = '\r';
-			break;
-		case 't':
-			s[opos++] = '\t';
-			break;
-		case 'u': {
-			if (i + 4 > len) {
-				LOGE("json: truncated \\uXXXX escape");
-				return false;
-			}
-			uint_fast32_t cp;
-			if (!parse_hex4(s + i, &cp)) {
-				LOGE("json: invalid \\uXXXX escape");
-				return false;
-			}
-			i += 4;
-			/* handle surrogate pair */
-			if (cp >= 0xD800 && cp <= 0xDBFF) {
-				if (i + 6 > len || s[i] != '\\' ||
-				    s[i + 1] != 'u') {
-					LOGE("json: high surrogate without low surrogate");
-					return false;
-				}
-				i += 2;
-				uint_fast32_t low;
-				if (!parse_hex4(s + i, &low)) {
-					LOGE("json: invalid low surrogate escape");
-					return false;
-				}
-				if (low < 0xDC00 || low > 0xDFFF) {
-					LOGE("json: invalid surrogate pair");
-					return false;
-				}
-				i += 4;
-				cp = 0x10000 + ((cp - 0xD800) << 10) +
-				     (low - 0xDC00);
-			} else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-				LOGE("json: lone low surrogate");
-				return false;
-			}
-			const int nbytes = utf8_encode(s + opos, cp);
-			if (nbytes <= 0) {
-				LOGE("json: invalid Unicode codepoint");
-				return false;
-			}
-			opos += (size_t)nbytes;
-			break;
-		}
-		default:
-			LOGE_F("json: invalid escape '\\%c'", (char)ec);
+		const int nbytes = utf8_encode(s + opos, cp);
+		if (nbytes <= 0) {
+			LOGE("json: invalid Unicode codepoint");
 			return false;
 		}
+		opos += (size_t)nbytes;
+		i += adv;
 	}
 }
 
@@ -784,96 +798,208 @@ static int skip_delim(const char *restrict json, size_t len, size_t *restrict i)
 	return 1;
 }
 
-/* Scan one JSON value starting at buf[0] without decoding.
- * Returns the byte length of the value, or -1 on syntax error. */
-static ptrdiff_t skip_raw_value(const char *restrict buf, const size_t len)
+/* scan_string_raw: validate the JSON string at s[0] == '"' against RFC 8259
+ * without decoding it, returning the byte length through the closing '"', or -1
+ * on error.  Enforces the same grammar as scan_string_inplace -- escape
+ * sequences, control-byte rejection, and UTF-8 well-formedness -- but leaves the
+ * bytes untouched, so a raw fragment can be stored or re-emitted verbatim. */
+static ptrdiff_t scan_string_raw(const char *restrict s, const size_t len)
 {
-	if (len == 0) {
-		return -1;
+	size_t i = 1;
+	for (;;) {
+		if (i >= len) {
+			LOGE("json: unterminated string");
+			return -1;
+		}
+		const unsigned char c = (unsigned char)s[i];
+		if (c == '"') {
+			return (ptrdiff_t)(i + 1);
+		}
+		if (c < 0x20) {
+			LOGE("json: unescaped control character in string");
+			return -1;
+		}
+		if (c == '\\') {
+			uint_fast32_t cp;
+			const size_t adv = check_escape(s + i, len - i, &cp);
+			if (adv == 0) {
+				return -1;
+			}
+			i += adv;
+			continue;
+		}
+		if (c < 0x80) {
+			i++;
+			continue;
+		}
+		const int n = utf8_decode(NULL, s + i, len - i);
+		if (n == 0) {
+			LOGE("json: invalid UTF-8 sequence in string");
+			return -1;
+		}
+		i += (size_t)n;
 	}
+}
+
+/* scan_scalar: validate one non-container JSON value (string, number, or a
+ * null/true/false literal) at buf[0] without decoding, returning its byte
+ * length, or -1 on a syntax error. */
+static ptrdiff_t scan_scalar(const char *restrict buf, const size_t len)
+{
 	switch ((unsigned char)buf[0]) {
 	case 'n':
 		if (len >= 4 && memcmp(buf, "null", 4) == 0) {
 			return 4;
 		}
+		LOGE("json: invalid value 'n...'");
 		return -1;
 	case 't':
 		if (len >= 4 && memcmp(buf, "true", 4) == 0) {
 			return 4;
 		}
+		LOGE("json: invalid value 't...'");
 		return -1;
 	case 'f':
 		if (len >= 5 && memcmp(buf, "false", 5) == 0) {
 			return 5;
 		}
+		LOGE("json: invalid value 'f...'");
 		return -1;
-	case '"': {
-		size_t i = 1;
-		while (i < len) {
-			if (buf[i] == '\\') {
-				i += 2;
-				continue;
-			}
-			if (buf[i] == '"') {
-				return (ptrdiff_t)(i + 1);
-			}
-			i++;
-		}
-		return -1;
-	}
-	case '[':
-	case '{': {
-		/* Track nested brackets with a LIFO of expected closers so a '}'
-		 * can only close a '{' and a ']' only a '['.  A single depth
-		 * counter that ignores the other bracket type would accept
-		 * type-mismatched input such as "[}" or "{]" and mis-measure the
-		 * value's end (e.g. swallowing a sibling member).  The stack is a
-		 * fixed automatic array, so nesting is bounded; RFC 8259 §9
-		 * permits a maximum depth, and over-deep input is a syntax error. */
-		enum { max_depth = 256 };
-		char stack[max_depth];
-		stack[0] = (buf[0] == '[') ? ']' : '}';
-		size_t depth = 1;
-		size_t i = 1;
-		while (i < len && depth > 0) {
-			const char c = buf[i];
-			if (c == '"') {
-				i++;
-				while (i < len) {
-					if (buf[i] == '\\') {
-						i += 2;
-						continue;
-					}
-					if (buf[i] == '"') {
-						i++;
-						break;
-					}
-					i++;
-				}
-				continue;
-			}
-			if (c == '[' || c == '{') {
-				if (depth >= max_depth) {
-					return -1;
-				}
-				stack[depth++] = (c == '[') ? ']' : '}';
-			} else if (c == ']' || c == '}') {
-				if (c != stack[depth - 1]) {
-					return -1;
-				}
-				depth--;
-			}
-			i++;
-		}
-		return (depth == 0) ? (ptrdiff_t)i : -1;
-	}
+	case '"':
+		return scan_string_raw(buf, len);
 	default:
 		break;
 	}
-	/* number */
-	{
-		const size_t nlen = scan_number(buf, len);
-		return nlen ? (ptrdiff_t)nlen : -1;
+	const size_t nlen = scan_number(buf, len);
+	if (nlen == 0) {
+		LOGE_F("json: unexpected character '%c'", (char)buf[0]);
+		return -1;
+	}
+	return (ptrdiff_t)nlen;
+}
+
+/* Scan one JSON value starting at buf[0] without decoding it, validating the
+ * complete RFC 8259 value grammar and returning the value's byte length, or -1
+ * on a syntax error.  A container is walked with an explicit stack of expected
+ * closers -- not recursion whose depth the input would control -- so a '}' can
+ * only close a '{' and a ']' only a '[', and the member/element grammar
+ * (separators and the object "key":value structure) is checked at every level.
+ * The stack is a fixed automatic array: RFC 8259 §9 permits a maximum nesting
+ * depth, and input past the bound is a syntax error. */
+static ptrdiff_t skip_raw_value(const char *restrict buf, const size_t len)
+{
+	enum { max_depth = 256 };
+	/* the token expected next as the scanner advances */
+	enum vstate {
+		V_VALUE, /* a value (top level, or after ':') */
+		V_ARR_ELEM, /* an array element, or ']' to close an empty array */
+		V_ARR_ELEM_REQ, /* an array element after ',' (']' would trail) */
+		V_OBJ_KEY, /* an object key, or '}' to close an empty object */
+		V_OBJ_KEY_REQ, /* an object key after ',' ('}' would trail) */
+		V_OBJ_COLON, /* ':' after an object key */
+		V_AFTER, /* a value just completed; ',' or the closer follows */
+	};
+	char closer[max_depth];
+	size_t depth = 0;
+	size_t i = 0;
+	enum vstate state = V_VALUE;
+	for (;;) {
+		while (i < len && json_iswhitespace((unsigned char)buf[i])) {
+			i++;
+		}
+		if (i >= len) {
+			LOGE("json: unterminated value");
+			return -1;
+		}
+		const unsigned char c = (unsigned char)buf[i];
+		switch (state) {
+		case V_VALUE:
+		case V_ARR_ELEM:
+		case V_ARR_ELEM_REQ:
+			if (state == V_ARR_ELEM && c == ']') {
+				i++;
+				depth--;
+				if (depth == 0) {
+					return (ptrdiff_t)i;
+				}
+				state = V_AFTER;
+				break;
+			}
+			if (c == '{' || c == '[') {
+				if (depth >= max_depth) {
+					LOGE("json: nesting too deep");
+					return -1;
+				}
+				closer[depth++] = (c == '[') ? ']' : '}';
+				i++;
+				state = (c == '[') ? V_ARR_ELEM : V_OBJ_KEY;
+				break;
+			}
+			{
+				const ptrdiff_t n =
+					scan_scalar(buf + i, len - i);
+				if (n < 0) {
+					return -1;
+				}
+				i += (size_t)n;
+			}
+			if (depth == 0) {
+				return (ptrdiff_t)i;
+			}
+			state = V_AFTER;
+			break;
+		case V_OBJ_KEY:
+		case V_OBJ_KEY_REQ:
+			if (state == V_OBJ_KEY && c == '}') {
+				i++;
+				depth--;
+				if (depth == 0) {
+					return (ptrdiff_t)i;
+				}
+				state = V_AFTER;
+				break;
+			}
+			if (c != '"') {
+				LOGE("json: expected object key string");
+				return -1;
+			}
+			{
+				const ptrdiff_t n =
+					scan_string_raw(buf + i, len - i);
+				if (n < 0) {
+					return -1;
+				}
+				i += (size_t)n;
+			}
+			state = V_OBJ_COLON;
+			break;
+		case V_OBJ_COLON:
+			if (c != ':') {
+				LOGE("json: expected ':' after object key");
+				return -1;
+			}
+			i++;
+			state = V_VALUE;
+			break;
+		case V_AFTER:
+			if (c == closer[depth - 1]) {
+				i++;
+				depth--;
+				if (depth == 0) {
+					return (ptrdiff_t)i;
+				}
+				break;
+			}
+			if (c == ',') {
+				i++;
+				state = (closer[depth - 1] == '}') ?
+						V_OBJ_KEY_REQ :
+						V_ARR_ELEM_REQ;
+				break;
+			}
+			LOGE("json: expected ',' or closing bracket");
+			return -1;
+		}
 	}
 }
 
@@ -1007,7 +1133,7 @@ int json_arr_next(
 
 /* json_fmod: libm-free remainder of x divided by y for finite x and finite
  * y > 0; returns a value with the sign of x and magnitude < y.  Exact in
- * IEEE-754 (classic shift-and-subtract), used only for multipleOf on doubles. */
+ * IEEE-754 (classic shift-and-subtract), backing the multipleOf test below. */
 static double json_fmod(double x, double y)
 {
 	bool neg = false;
@@ -1029,6 +1155,28 @@ static double json_fmod(double x, double y)
 		yy /= 2.0;
 	}
 	return neg ? -x : x;
+}
+
+/* json_is_multiple: JSON Schema multipleOf test for doubles.  Decimal operands
+ * rarely divide exactly in binary (0.3 is not a binary multiple of 0.1), so a
+ * genuine multiple leaves json_fmod a remainder a few ULPs shy of 0 or of the
+ * whole divisor.  Accept when the nearer exact multiple lies within that
+ * rounding slack, scaled to the instance magnitude, rather than demanding an
+ * exact-zero binary remainder.  Requires finite v and finite mult > 0. */
+static bool json_is_multiple(const double v, const double mult)
+{
+	double r = json_fmod(v, mult);
+	if (r < 0.0) {
+		r = -r;
+	}
+	/* distance to the nearer of the two exact multiples bracketing v */
+	const double dist = r < mult - r ? r : mult - r;
+	/* the doubles nearest v and nearest mult each carry up to a half-ULP
+	 * error, so a genuine multiple's remainder can drift about this far;
+	 * a few ULPs of headroom stays far below any real non-multiple gap */
+	const double mag = v < 0.0 ? -v : v;
+	const double slack = mag * (4.0 * DBL_EPSILON);
+	return dist <= slack;
 }
 
 /* json_elem_size: size of one array element for a field of the given kind. */
@@ -1210,11 +1358,11 @@ json_check_double(const struct json_constraint *restrict c, double v)
 	if ((c->flags & JSON_C_EXCL_MAX) && v >= c->d.excl_max) {
 		return false;
 	}
-	/* json_fmod requires a positive divisor; a non-positive mult is a
-	 * malformed constraint (the generator drops it) that would otherwise spin
-	 * json_fmod forever, so skip it rather than hang */
+	/* multipleOf needs a positive divisor; a non-positive mult is a malformed
+	 * constraint (the generator drops it) that would otherwise spin json_fmod
+	 * forever, so skip it rather than hang */
 	if ((c->flags & JSON_C_MULT) && c->d.mult > 0.0 &&
-	    json_fmod(v, c->d.mult) != 0.0) {
+	    !json_is_multiple(v, c->d.mult)) {
 		return false;
 	}
 	if ((c->flags & JSON_C_CONST) && v != c->d.konst) {
@@ -1505,12 +1653,24 @@ fail:
 
 /* --- marshal ----------------------------------------------------------- */
 
+/* json_add: extend the running marshal length, saturating to the SIZE_MAX error
+ * sentinel once the total would exceed INT_MAX or wrap size_t.  Threading every
+ * addition through here keeps a large or cumulative length from wrapping to a
+ * small value that the final INT_MAX check would accept as a bogus success. */
+static size_t json_add(size_t n, size_t add)
+{
+	if (n > (size_t)INT_MAX || add > (size_t)INT_MAX - n) {
+		return SIZE_MAX;
+	}
+	return n + add;
+}
+
 static size_t json_emit_ch(char *restrict buf, size_t bufsz, size_t n, char c)
 {
 	if (buf != NULL && n < bufsz) {
 		buf[n] = c;
 	}
-	return n + 1;
+	return json_add(n, 1);
 }
 
 static size_t json_emit_raw(
@@ -1521,7 +1681,7 @@ static size_t json_emit_raw(
 		const size_t cap = bufsz - n;
 		memcpy(buf + n, s, len < cap ? len : cap);
 	}
-	return n + len;
+	return json_add(n, len);
 }
 
 static size_t json_emit_str(
@@ -1534,7 +1694,7 @@ static size_t json_emit_str(
 	if (r < 0) {
 		return SIZE_MAX;
 	}
-	return n + (size_t)r;
+	return json_add(n, (size_t)r);
 }
 
 static size_t json_emit_indent(
@@ -1648,7 +1808,7 @@ static size_t json_emit_value(
 		if (r2 == SIZE_MAX) {
 			return SIZE_MAX;
 		}
-		return n + r2;
+		return json_add(n, r2);
 	}
 	default:
 		return SIZE_MAX;

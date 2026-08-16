@@ -5,6 +5,7 @@
 
 #include "task.h"
 #include "thrd.h"
+#include "utils/debug.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -171,6 +172,16 @@ bool executor_invoke(struct executor *e, const struct task task)
 
 void executor_join(struct executor *e)
 {
+	/* A worker cannot join itself: thrd_join either fails (glibc reports
+	 * EDEADLK) or blocks forever, and on the error return the loop below
+	 * would go on to free the executor under the still-running task. */
+	const size_t nthreads = e->nthreads;
+	const thrd_t self = thrd_current();
+	for (size_t i = 0; i < nthreads; i++) {
+		CHECKMSG(
+			!thrd_equal(e->workers[i], self),
+			"executor_join called from a task running on this executor");
+	}
 	THRD_ASSERT(mtx_lock(&e->mu));
 	e->exit_flag = true;
 	/* Broadcast under the lock, as enqueue and executor_detach do. On this
@@ -179,7 +190,6 @@ void executor_join(struct executor *e)
 	 * notify sites in the module consistent and needs no such invariant. */
 	THRD_ASSERT(cnd_broadcast(&e->cond));
 	THRD_ASSERT(mtx_unlock(&e->mu));
-	const size_t nthreads = e->nthreads;
 	for (size_t i = 0; i < nthreads; i++) {
 		THRD_ASSERT(thrd_join(e->workers[i], NULL));
 	}

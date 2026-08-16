@@ -11,6 +11,7 @@
 /**
  * @defgroup hashtable
  * @brief An unordered map container implemented with a hash table.
+ * @details Elements must not be NULL, the API returns NULL for "no element".
  * @{
  */
 
@@ -95,12 +96,15 @@ table_reserve(struct hashtable *restrict table, size_t new_size);
  * lifetime of the element in the table; typically points into the element
  * itself. Mutating the key after insertion is undefined behavior.
  * @param[inout] element The new element in, the replaced element out.
+ * The new element must not be NULL.
  * If insertion succeeds and no previous element exists, returns NULL.
  * If the key already exists, returns the previous element.
  * If allocation failed, no operation is performed and the new element
- * is returned unchanged.
+ * is returned unchanged, which is how the caller detects failure.
  * @return Pointer to the modified table, or NULL if table was NULL
  * (no operation is performed).
+ * @warning Setting an element already stored under the same key returns that
+ * same pointer, indistinguishable from an allocation failure.
  */
 struct hashtable *
 table_set(struct hashtable *restrict table, const void *key, void **element);

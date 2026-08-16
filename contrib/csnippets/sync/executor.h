@@ -45,6 +45,9 @@ bool executor_invoke(struct executor *e, struct task task);
  * drained rather than dropped, which is what keeps a packaged_task's closure
  * from leaking (see packaged_task.h).
  * @param[in] e The executor.
+ * @warning Must not be called from a task running on this executor: joining a
+ * worker thread with itself can never complete. Checked in every build;
+ * violating it aborts. To shut down from within a task, use executor_detach().
  */
 void executor_join(struct executor *e);
 
