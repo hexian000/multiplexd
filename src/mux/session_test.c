@@ -348,6 +348,7 @@ session_test_io_cb(struct ev_loop *loop, ev_io *w, const int revents)
 
 static int g_closed_event_count = 0;
 static bool g_last_closed_clean;
+static int g_last_closed_err;
 
 static void session_test_on_event(
 	void *data, struct mux_session *ss, const enum mux_event event,
@@ -358,6 +359,7 @@ static void session_test_on_event(
 	if (event == MUX_EVENT_CLOSED) {
 		g_closed_event_count++;
 		g_last_closed_clean = edata.closed.clean;
+		g_last_closed_err = edata.closed.err;
 	}
 }
 
@@ -969,6 +971,83 @@ T_DECLARE_CASE(test_connect_cb_tls_paths)
 #else /* WITH_TLS */
 	T_SKIP();
 #endif /* WITH_TLS */
+}
+
+/* A connect that fails after the SYN is out reports its errno only through
+ * SO_ERROR at connect completion; connect_cb used to log it and drop it, so the
+ * CLOSED event told the owner nothing about why the transport never came up and
+ * its reconnect policy could not tell an unreachable path from a peer that
+ * declined.  Drive socket_cb (where the CLOSED emit lives) over a non-socket
+ * fd: getsockopt(SO_ERROR) fails on one, so socket_get_error reports a
+ * deterministic ENOTSOCK in place of a routing-dependent errno. */
+T_DECLARE_CASE(test_connect_cb_reports_socket_error_on_closed)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	int pipefd[2];
+	if (pipe(pipefd) != 0) {
+		teardown_fixture(&fx);
+		T_FATAL("pipe failed");
+		return;
+	}
+	fx.ss.state = SESSION_CONNECT;
+	ev_io_set(&fx.ss.w_socket, pipefd[0], EV_READ);
+	fx.ss.callbacks.on_event = session_test_on_event;
+	g_closed_event_count = 0;
+	g_last_closed_err = 0;
+
+	socket_cb(fx.ss.loop, &fx.ss.w_socket, EV_WRITE);
+
+	const int recorded = fx.ss.wire.err;
+	const int closed_events = g_closed_event_count;
+	const int reported = g_last_closed_err;
+	const enum session_state state = fx.ss.state;
+	fx.ss.callbacks.on_event = NULL;
+
+	/* mux_session_reset closed pipefd[0] with the rest of the transport. */
+	(void)close(pipefd[1]);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(state, (enum session_state)SESSION_CLOSED);
+	T_EXPECT_EQ(closed_events, 1);
+	/* Kept on the session... */
+	T_EXPECT_EQ(recorded, ENOTSOCK);
+	/* ...and handed to the owner with the close. */
+	T_EXPECT_EQ(reported, ENOTSOCK);
+}
+
+/* A stale transport errno must not outlive its transport: every attach clears
+ * it, or the next close of a session that dialed successfully would report the
+ * previous attempt's failure and mis-pace the retry after it. */
+T_DECLARE_CASE(test_attach_fd_clears_stale_transport_error)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	int fds[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+		teardown_fixture(&fx);
+		T_FATAL("socketpair failed");
+		return;
+	}
+	fx.ss.state = SESSION_CLOSED;
+	fx.ss.wire.err = EHOSTUNREACH;
+
+	mux_session_attach_fd(&fx.ss, fds[0]);
+
+	const int after_attach = fx.ss.wire.err;
+	const union mux_event_data data = session_closed_data(&fx.ss, false);
+
+	(void)close(fds[1]);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(after_attach, 0);
+	T_EXPECT_EQ(data.closed.err, 0);
 }
 
 /* session_on_dead_link: a negotiated session id suspends for resume; without
@@ -1924,6 +2003,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_close_wait_cb_confirmed_reports_clean),
 	T_CASE(test_close_wait_cb_pending),
 	T_CASE(test_connect_cb_tls_paths),
+	T_CASE(test_connect_cb_reports_socket_error_on_closed),
+	T_CASE(test_attach_fd_clears_stale_transport_error),
 	T_CASE(test_dead_link_suspend_for_resume),
 	T_CASE(test_capture_frame_list_skips_frames_once_session_closed),
 	T_CASE(test_dead_link_close_without_session_id),

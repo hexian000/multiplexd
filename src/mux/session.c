@@ -170,6 +170,9 @@ static void connect_cb(struct mux_session *ss)
 	const int err = socket_get_error(ss->w_socket.fd);
 	if (err != 0) {
 		MUX_LOG_F(WARNING, ss, "connect: (%d) %s", err, strerror(err));
+		/* The owner paces its retries by this; a connect that never
+		 * completes reports it nowhere else. */
+		ss->wire.err = err;
 		mux_session_reset(ss);
 		return;
 	}
@@ -242,10 +245,7 @@ static void socket_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	if (ss->state == SESSION_CLOSED) {
 		ss->last_modified = (int_least64_t)clock_monotonic_ns();
 		session_emit(
-			ss, MUX_EVENT_CLOSED,
-			(union mux_event_data){
-				.closed.clean = ss->wire.rx_eof,
-			});
+			ss, MUX_EVENT_CLOSED, session_closed_data(ss, false));
 		return;
 	}
 	/* Apply the final event mask; recv-side producers may have left residue. */
@@ -862,6 +862,7 @@ void mux_session_attach_fd(struct mux_session *restrict ss, const int fd)
 	ss->wire.tx_pending = false;
 	ss->wire.send_blocked = false;
 	ss->wire.rx_eof = false;
+	ss->wire.err = 0;
 #if WITH_TLS
 	ss->wire.tls_want = 0;
 #endif
@@ -1199,11 +1200,7 @@ void mux_session_notify_closed(
 	mux_session_reset(ss);
 	if (!was_closed && ss->state == SESSION_CLOSED) {
 		session_emit(
-			ss, MUX_EVENT_CLOSED,
-			(union mux_event_data){
-				.closed.clean = ss->wire.rx_eof,
-				.closed.expired = expired,
-			});
+			ss, MUX_EVENT_CLOSED, session_closed_data(ss, expired));
 	}
 }
 
@@ -1434,10 +1431,7 @@ static void session_resume_attach(
 		/* Now CLOSED but still in the caller's list; emit MUX_EVENT_CLOSED
 		 * so the owner removes it. */
 		session_emit(
-			ss, MUX_EVENT_CLOSED,
-			(union mux_event_data){
-				.closed.clean = ss->wire.rx_eof,
-			});
+			ss, MUX_EVENT_CLOSED, session_closed_data(ss, false));
 		return;
 	}
 
@@ -1480,6 +1474,7 @@ static void session_resume_attach(
 	/* The suspending FIN belongs to the transport that just died, not to the
 	 * resumed one; leaving it set reports every later teardown as clean. */
 	ss->wire.rx_eof = false;
+	ss->wire.err = 0;
 #if WITH_TLS
 	ss->wire.tls_want = 0;
 #endif
@@ -1498,9 +1493,12 @@ static void session_resume_attach(
 
 	/* Send ServerHello identifying the client back to itself. */
 	mux_session_set_state(ss, SESSION_HANDSHAKE);
-	/* Resume cancels any pending drain: the session is being
-	 * re-established and must accept new streams again. */
-	ss->draining = false;
+	/* Preserve draining across resume: a drain requested by a config reload
+	 * is independent of the transport failure, so a transport replacement
+	 * must not silently cancel it (the session would otherwise keep running
+	 * on stale pre-reload settings indefinitely).  This mirrors the client
+	 * reconnect path in mux_session_attach_fd(), which un-drains only a
+	 * genuinely fresh connect, never a resume from SESSION_SUSPENDED. */
 	ev_timer_again(ss->loop, &ss->w_connect_timeout);
 	if (!mux_handshake_enqueue_hello(ss, PROTO_MSG_SERVER_HELLO, true)) {
 		/* mux_handshake_enqueue_hello already called mux_session_reset(ss), which
@@ -1509,9 +1507,7 @@ static void session_resume_attach(
 		if (ss->state == SESSION_CLOSED) {
 			session_emit(
 				ss, MUX_EVENT_CLOSED,
-				(union mux_event_data){
-					.closed.clean = ss->wire.rx_eof,
-				});
+				session_closed_data(ss, false));
 		}
 		return;
 	}

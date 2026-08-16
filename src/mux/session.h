@@ -266,6 +266,19 @@ static inline void session_emit(
 	}
 }
 
+/* Build the CLOSED payload: how the transport ended, which is what the owner's
+ * reconnect policy reads.  expired marks a suspended session whose
+ * resume_timeout fired. */
+static inline union mux_event_data
+session_closed_data(const struct mux_session *restrict ss, const bool expired)
+{
+	return (union mux_event_data){
+		.closed.clean = ss->wire.rx_eof,
+		.closed.expired = expired,
+		.closed.err = ss->wire.err,
+	};
+}
+
 /* Set the local per-stream receive window and publish its mirror. */
 static inline void session_set_stream_window(
 	struct mux_session *restrict ss, const uint_least32_t frames)

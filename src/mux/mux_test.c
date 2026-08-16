@@ -3826,6 +3826,69 @@ T_DECLARE_CASE(test_resume_idle)
 	T_EXPECT(connected_ns > 0);
 }
 
+/* Regression: a drain requested by a config reload must survive a transport
+ * break + resume.  session_resume_attach() cleared ss->draining
+ * unconditionally, so a resumed server session silently accepted new streams
+ * again and kept running on stale pre-reload settings -- unlike the client
+ * reconnect path (mux_session_attach_fd), which preserves draining across a
+ * resume.  An open server stream keeps the session non-idle so mux_drain() does
+ * not shut it down; drain it, then break the transport and let the client
+ * reconnect and resume. */
+T_DECLARE_CASE(test_resume_preserves_drain)
+{
+	struct mux_test_fixture fx;
+	if (fixture_setup(&fx) != 0) {
+		T_FATAL("fixture_setup failed");
+		return;
+	}
+	if (wait_until(
+		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established,
+		    &fx) != 0) {
+		fixture_teardown(&fx);
+		T_FATAL("sessions did not establish");
+		return;
+	}
+
+	struct mux_stream *const s = mux_stream_open(fx.srv);
+	if (s == NULL) {
+		fixture_teardown(&fx);
+		T_FATAL("mux_stream_open(srv) returned NULL");
+		return;
+	}
+	struct test_stream *const ts = test_stream_new(&fx, s);
+	if (ts == NULL) {
+		fixture_teardown(&fx);
+		T_FATAL("test_stream_new failed");
+		return;
+	}
+	if (fx.n_srv_active_streams < MAX_ACCEPTED) {
+		fx.srv_active_streams[fx.n_srv_active_streams++] = ts;
+	}
+	mux_stream_io_start(fx.loop, &ts->w_io);
+
+	/* Request a graceful drain on the server, then lose its transport and
+	 * let the client reconnect + resume. */
+	mux_drain(fx.srv);
+	const bool draining_before = fx.srv->draining;
+
+	fx_break_transport(&fx);
+	const int ret =
+		wait_until(&fx, RESUME_TIMEOUT_MS / 1000.0, pred_resumed, &fx);
+	const bool srv_resumed = fx.srv_resumed;
+	const bool draining_after = fx.srv->draining;
+	const enum mux_state srv_state = mux_state(fx.srv);
+
+	/* Teardown first so a failing assert can't leak the fixture. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(ret == 0);
+	T_EXPECT(draining_before); /* mux_drain took effect */
+	T_EXPECT(srv_resumed); /* the server actually resumed */
+	T_EXPECT_EQ(srv_state, MUX_STATE_ESTABLISHED);
+	/* The drain must survive the resume, not be silently cancelled. */
+	T_EXPECT(draining_after);
+}
+
 /* transport break with a stream in flight.
  * Frames unacknowledged at suspension must be retransmitted after resume
  * and the echo must complete with exactly the original payload. */
@@ -6841,6 +6904,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_interop_i14_reserved_stream0_frame),
 	T_CASE(test_no_reconnect_with_idle_timeout),
 	T_CASE(test_resume_idle),
+	T_CASE(test_resume_preserves_drain),
 	T_CASE(test_resume_retransmit),
 	T_CASE(test_resume_stream_transparent),
 	T_CASE(test_resume_stream_unacked_retransmit),

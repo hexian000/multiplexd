@@ -453,15 +453,14 @@ void mux_set_tlsctx(struct mux_session *ss, struct tls_context *tlsctx);
  * @brief Signal the session to drain: reject new inbound streams and shut down
  * gracefully once the last active stream closes.
  * @param ss Target session; if already idle, shutdown begins immediately.
- * @note Cleared automatically on a genuinely fresh (re)connect via
- * mux_attach_fd(). A client reconnect that resumes from SESSION_SUSPENDED
- * deliberately preserves the pending drain (so a drained-then-suspended-then-
- * resumed session keeps draining and does not accept new streams), lest a
- * transport blip silently cancel a drain and leave the session running on stale
- * pre-reload settings. A server-side resume of an accepted session (the peer
- * reconnecting into it) instead cancels the drain: that path re-establishes the
- * session and must accept new streams again. The asymmetry is deliberate at
- * both sites.
+ * @note Cleared automatically only on a genuinely fresh (re)connect via
+ * mux_attach_fd(). Every resume preserves the pending drain, on both sides: a
+ * client reconnect that resumes from SESSION_SUSPENDED and a server-side resume
+ * of an accepted session (the peer reconnecting into it) both keep draining and
+ * keep rejecting new streams. A drain requested by a config reload is
+ * independent of the transport failure, so a transport blip must not silently
+ * cancel it and leave the session running on stale pre-reload settings
+ * indefinitely. The symmetry is deliberate at both sites.
  */
 void mux_drain(struct mux_session *ss);
 
@@ -513,6 +512,10 @@ union mux_event_data {
 		bool clean;
 		/* suspended session's resume_timeout fired (peer never reconnected) */
 		bool expired;
+		/* errno that ended the transport, or 0 when none was observed;
+		 * lets the owner's reconnect policy tell an unreachable path
+		 * from a peer that merely declined */
+		int err;
 	} closed;
 };
 

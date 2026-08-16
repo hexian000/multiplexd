@@ -767,10 +767,7 @@ static void session_flush_inline(struct mux_session *restrict ss)
 		 * the reset path already stopped the watchers. */
 		ss->last_modified = (int_least64_t)clock_monotonic_ns();
 		session_emit(
-			ss, MUX_EVENT_CLOSED,
-			(union mux_event_data){
-				.closed.clean = ss->wire.rx_eof,
-			});
+			ss, MUX_EVENT_CLOSED, session_closed_data(ss, false));
 		return;
 	}
 	mux_session_update_watcher(ss);

@@ -44,6 +44,10 @@ struct wire_ctx {
 	 * repeat, which update_send_timeout temporarily raises for an OOM stall the
 	 * kernel cannot see and must be able to restore afterward. */
 	bool kernel_send_timeout : 1;
+	/* errno that ended the transport, or 0 when none was observed (a clean
+	 * close, a timeout, or a failure the layer cannot attribute).  Set when
+	 * connect(2) completes with an error; cleared by every attach. */
+	int err;
 	/* Outbound frame list; the head is the current transport write target.
 	 * A frame that still fits the open tail within one TLS record
 	 * (MUX_MAX_RECORD) is packed onto it; others are appended by reference. */
