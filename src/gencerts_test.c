@@ -14,6 +14,7 @@
 #include "utils/testing.h"
 
 #include <openssl/asn1.h>
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/obj_mac.h>
 #include <openssl/pem.h>
@@ -1007,6 +1008,72 @@ T_DECLARE_CASE(test_gencerts_default_keytype)
 	T_EXPECT_EQ(key_type, EVP_PKEY_RSA);
 }
 
+/* set_random_serial() must yield an RFC 5280 4.1.2.2 positive (nonzero)
+ * serial. BN_RAND_TOP_ONE forces the most-significant of the 128 bits, so every
+ * serial is in [2^127, 2^128): positive, with a bit length of exactly 128. The
+ * pre-fix BN_RAND_TOP_ANY left that bit random, so a serial could (with
+ * negligible probability) be zero and, across many certificates, ~half fell
+ * below 128 bits. Generating a batch of ed25519 certificates (cheap keygen)
+ * turns that into a deterministic distinction: a run of samples all being
+ * exactly 128 bits is effectively impossible without the fix (~2^-N). */
+T_DECLARE_CASE(test_gencerts_serial_is_positive_and_128_bit)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	enum { SERIAL_SAMPLES = 32 };
+	bool gen_ok = true;
+	bool all_positive = true;
+	bool all_128_bit = true;
+	int worst_bits = -1;
+	for (int i = 0; i < SERIAL_SAMPLES; i++) {
+		char name[32];
+		(void)snprintf(name, sizeof(name), "serial%d", i);
+		if (!gencerts(
+			    name, "serial.example", NULL, "ed25519", 0, NULL)) {
+			gen_ok = false;
+			break;
+		}
+		char path[48];
+		(void)snprintf(path, sizeof(path), "%s-cert.pem", name);
+		X509 *const cert = read_cert_file(path);
+		if (cert == NULL) {
+			gen_ok = false;
+			break;
+		}
+		BIGNUM *const bn =
+			ASN1_INTEGER_to_BN(X509_get0_serialNumber(cert), NULL);
+		X509_free(cert);
+		if (bn == NULL) {
+			gen_ok = false;
+			break;
+		}
+		if (BN_is_zero(bn) || BN_is_negative(bn)) {
+			all_positive = false;
+		}
+		const int bits = BN_num_bits(bn);
+		if (bits != 128) {
+			all_128_bit = false;
+			worst_bits = bits;
+		}
+		BN_free(bn);
+	}
+
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(gen_ok);
+	/* The RFC 5280 contract: a positive, nonzero serial. */
+	T_EXPECT(all_positive);
+	/* The deterministic consequence of the fix that fails against pre-fix
+	 * code (BN_RAND_TOP_ANY left ~half the samples below 128 bits). */
+	if (!all_128_bit) {
+		T_LOGF("a serial had %d bits, expected 128 (top bit not forced)",
+		       worst_bits);
+	}
+	T_EXPECT(all_128_bit);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_ed25519),
 	T_CASE(test_gencerts_ecdsa),
@@ -1040,6 +1107,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_identity_percent_encoded),
 	T_CASE(test_gencerts_identity_count_mismatch),
 	T_CASE(test_gencerts_ca_key_usage),
+	T_CASE(test_gencerts_serial_is_positive_and_128_bit),
 	T_SUITE_END,
 };
 

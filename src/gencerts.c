@@ -229,8 +229,10 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 	return true;
 }
 
-/* RFC 5280 requires a positive serial number; use 128 random bits. On
- * failure the caller still owns and frees `cert` itself. */
+/* RFC 5280 4.1.2.2 requires a positive serial number; use 128 random bits
+ * with the most-significant bit forced set (BN_RAND_TOP_ONE), so the value is
+ * always in [2^127, 2^128) and can never be the forbidden zero. On failure the
+ * caller still owns and frees `cert` itself. */
 static bool set_random_serial(X509 *restrict cert)
 {
 	BIGNUM *const bn = BN_new();
@@ -238,7 +240,7 @@ static bool set_random_serial(X509 *restrict cert)
 		LOG_SSLERROR("BN_new");
 		return false;
 	}
-	if (BN_rand(bn, 128, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) == 0) {
+	if (BN_rand(bn, 128, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY) == 0) {
 		LOG_SSLERROR("BN_rand");
 		BN_free(bn);
 		return false;
@@ -639,8 +641,9 @@ bool gencerts(
 		return false;
 	}
 
-	/* A NULL list means "default each certificate's identity to its own
-	 * name"; a non-NULL one is paired positionally with the names. */
+	/* A NULL list omits the identity from every certificate; it is never
+	 * inferred from the file name. Only a non-NULL list is paired
+	 * positionally with the names. */
 	char *identities_copy = NULL;
 	if (identities != NULL) {
 		identities_copy = strdup(identities);
