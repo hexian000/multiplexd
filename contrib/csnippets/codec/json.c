@@ -899,7 +899,7 @@ static ptrdiff_t skip_raw_value(const char *restrict buf, const size_t len)
 		V_OBJ_COLON, /* ':' after an object key */
 		V_AFTER, /* a value just completed; ',' or the closer follows */
 	};
-	char closer[max_depth];
+	unsigned char closer[max_depth];
 	size_t depth = 0;
 	size_t i = 0;
 	enum vstate state = V_VALUE;
