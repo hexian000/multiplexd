@@ -228,9 +228,14 @@ struct server {
 	/* Decoded tls.psk table; NULL in certificate mode.  Backs the TLS
 	 * lookup callback and the tunnel layer's label -> identity mapping. */
 	struct psk_table *psk;
+	/* Tables replaced by earlier reloads, linked through retired_next.  A
+	 * reload only dispatches the new table to each tunnel, so the previous
+	 * one stays allocated here until the maintenance tick observes that no
+	 * live tunnel resolves through it any more. */
+	struct psk_table *retired_psk;
 	/* TLS context for initiated mux connections (client role). */
 	struct tls_context *client_tlsctx;
-#endif
+#endif /* WITH_TLS */
 
 	struct listener mux_listener;
 	struct listener local_listener;
@@ -262,27 +267,45 @@ struct server {
 	ev_signal w_sighup;
 	ev_signal w_sigint;
 	ev_signal w_sigterm;
-	/* Maintenance timer: runs every second for system suspend detection,
-	 * re-dialing drained identity slots, and (when shutting_down) the 2 s
-	 * force-exit deadline. */
+	/* Maintenance timer: armed only while a task has outstanding work --
+	 * releasing the PSK tables a reload retired, re-dialing drained identity
+	 * slots -- and stopped again by the first pass that finds none. While
+	 * shutting_down it is instead the one-shot force-exit deadline. */
 	ev_timer w_maintenance;
-	/* Set by signal_cb on SIGINT/SIGTERM; suppresses non-shutdown tasks in
-	 * maintenance_cb and gates the early-exit check in handle_closed. */
+	/* Completed maintenance passes; the tick has no other visible trace when
+	 * it finds nothing to do. */
+	uint_least64_t maintenance_passes;
+	/* Suspend detection. Rides loop iterations that already happen rather
+	 * than polling, so an idle server never wakes for it. */
+	ev_check w_suspend;
+	/* Loop time of the previous suspend check, throttling it to roughly one
+	 * check per second without a clock read of its own. */
+	ev_tstamp last_check_at;
+	/* Baselines for the previous suspend check.  A suspend advances the boot
+	 * (or wall) clock while the monotonic one stands still, so the two
+	 * deltas disagree; comparing deltas rather than one absolute gap keeps
+	 * the test valid however far apart two checks fall. */
+	int_least64_t last_check_mono_ns;
+	int_least64_t last_check_elapsed_ns;
+	/* Cleared once the boot clock proves unavailable, pinning the check to
+	 * the wall-clock fallback. */
+	bool check_uses_boottime;
+	/* Set by signal_cb on SIGINT/SIGTERM; makes w_maintenance the force-exit
+	 * deadline and gates the early-exit check in handle_closed. */
 	bool shutting_down;
-	/* Monotonic timestamp (ns) when shutdown was initiated; used by
-	 * maintenance_cb to enforce the 2 s force-exit deadline. */
-	int_least64_t shutdown_start_ns;
-	/* Wall-clock timestamp of the previous maintenance tick; used to detect
-	 * large time jumps (system suspend/resume) for transport reconnection. */
-	time_t last_maintenance_wall;
 	/* Cross-thread relay: ev_async + dispatcher for session threads. */
 #if WITH_THREADS
 	ev_async w_async;
+	/* Set on a tunnel thread when a relay task is dropped, since a lost
+	 * CLOSED event can strand an identity slot that only the maintenance
+	 * sweep reclaims.  Carries no data, so relaxed ordering suffices; the
+	 * relay async is what actually wakes the server loop to read it. */
+	atomic_bool sweep_pending;
 	struct dispatcher *disp;
 	/* Shared mutex protecting accepted_tunnels; exclusive on the server thread
 	 * for add/remove, shared on worker threads for lookups. */
 	smtx_t accepted_mu;
-#endif
+#endif /* WITH_THREADS */
 
 	struct server_counters counters;
 
@@ -365,8 +388,29 @@ struct psk_table_entry {
 };
 
 /* Built once at startup and owned by the server; outlives the TLS contexts,
- * whose lookup callback reads it during every handshake. */
+ * whose lookup callback reads it during every handshake.  A config reload
+ * retires the table it replaces rather than freeing it: tunnels resolve labels
+ * through it on their own threads, and a reload only dispatches the new
+ * pointer to them, so the table must stay readable until every tunnel is
+ * observed to have moved off it. */
 struct psk_table {
+	/* Intrusive link through the server's retired list; NULL while the table
+	 * is the current one. */
+	struct psk_table *retired_next;
+	/* Holders naming this table that asking the tunnels cannot reveal: a
+	 * repoint the tunnel has been sent but not yet run, and every TLS context
+	 * registered with it as the PSK lookup context.  Taken on the server
+	 * thread, dropped by whichever thread finishes with the holder; a drop
+	 * never frees, so no holder can pull a table out from under the sweep. */
+#if WITH_THREADS
+	atomic_size_t holds;
+#else
+	size_t holds;
+#endif
+	/* Scratch mark for the retired-list sweep, set while a hold is out or a
+	 * live tunnel is still resolving through this table; meaningless between
+	 * sweeps. */
+	bool retired_in_use;
 	size_t count;
 	struct psk_table_entry entries[];
 };
@@ -375,6 +419,16 @@ struct psk_table {
  * or on failure (which is logged). */
 struct psk_table *server_psk_table_new(const struct config *restrict conf);
 void server_psk_table_free(struct psk_table *restrict t);
+
+/* Mark @p t as named by a holder the retirement sweep cannot see: a repoint
+ * dispatched to a tunnel, or a TLS context built over it.  Server thread only,
+ * and before the holder becomes reachable from any other one; NULL is a no-op. */
+void server_psk_table_hold(struct psk_table *restrict t);
+
+/* Give back a hold, from any thread.  Never frees: a retired table is released
+ * by the server's own sweep, so a table only outlives its last holder by a
+ * maintenance tick, never the reverse. */
+void server_psk_table_release(struct psk_table *restrict t);
 
 /* The peer identity owning @p label, or NULL when no entry matches.  The
  * caller has an authenticated label from tls_peer_psk_label(), so a non-NULL

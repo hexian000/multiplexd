@@ -11,11 +11,13 @@
 #include "listener.h"
 #include "mux/mux.h"
 #include "mux/session.h"
+#if WITH_TLS
+#include "shim/tls.h"
+#endif
 #include "shim/util.h"
 #include "tunnel.h"
 
 #include "algo/hashtable.h"
-#include "os/clock.h"
 #include "os/socket.h"
 #include "sync/task.h"
 #include "utils/slog.h"
@@ -1503,6 +1505,49 @@ T_DECLARE_CASE(test_server_force_close_folds_tunnel_counters)
 	T_EXPECT(live_buffered >= folded_buffered);
 }
 
+/* Regression: the live tunnel count is unbounded (max_sessions defaults to
+ * unlimited and accepts values above any fixed cap), so server_snapshot_cap()
+ * must size the force-close snapshot from the real count rather than assert an
+ * arbitrary 65536 ceiling. Grow identity_tunnels[] with NULL slots so the cap
+ * exceeds that bound (tunnel_iter_next skips NULL slots, so the snapshot still
+ * yields only the real tunnels); pre-fix, server_stop()'s snapshot aborted the
+ * debug build here. */
+T_DECLARE_CASE(test_server_snapshot_cap_allows_many_tunnels)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+
+	/* Push num_identity_tunnels past the old assertion's 65536 bound with
+	 * NULL slots; server_stop() frees this array, taking ownership. */
+	const size_t pad = 65537;
+	const size_t old_n = fx.srv_b->num_identity_tunnels;
+	const size_t new_n = old_n + pad;
+	struct tunnel **const grown = (struct tunnel **)realloc(
+		(void *)fx.srv_b->identity_tunnels,
+		new_n * sizeof(struct tunnel *));
+	if (grown == NULL) {
+		FIXTURE_FATAL(&fx, "realloc identity_tunnels failed");
+	}
+	for (size_t i = old_n; i < new_n; i++) {
+		grown[i] = NULL;
+	}
+	fx.srv_b->identity_tunnels = grown;
+	fx.srv_b->num_identity_tunnels = new_n;
+
+	/* Pre-fix this aborts inside server_snapshot_cap (ASSERT n <= 65536);
+	 * with the fix the snapshot is sized from the real count and returns. */
+	server_stop(fx.srv_b);
+	server_free(fx.srv_b);
+	fx.srv_b = NULL;
+
+	fixture_teardown(&fx);
+	/* Reaching here (no abort) with a cap past the old bound is the check. */
+	T_EXPECT(new_n > 65536);
+}
+
 T_DECLARE_CASE(test_half_close_b_to_a)
 {
 	struct test_fixture fx;
@@ -2569,6 +2614,173 @@ cleanup:
 	}
 }
 
+/* Regression: reloading away two identity peers that each hold a pooled tunnel
+ * must not free a listener while it is still reachable through s->identities.
+ * In the discard loop, closing the second peer's tunnel calls
+ * server_tunnel_is_registered(), whose tunnel_iter_next() walks s->identities
+ * and dereferences the first, already-freed listener -- a heap-use-after-free
+ * this ASan build catches. Two peers each with a live tunnel guarantee the
+ * ordering that triggers it, regardless of the hash-table iteration order. */
+T_DECLARE_CASE(test_server_reload_drops_two_identity_peers_no_uaf)
+{
+	struct ev_loop *loop = NULL;
+	struct config *conf_a = NULL;
+	struct server *srv_a = NULL;
+	struct config *conf_c[2] = { NULL, NULL };
+	struct server *srv_c[2] = { NULL, NULL };
+	struct test_fixture fx = { 0 };
+	int mux_port_a = -1;
+	char mux_connect_a[64];
+	bool applied = false;
+	size_t num_tunnels_after = SIZE_MAX;
+	bool setup_ok = false;
+	static const char *const peer_ids[2] = { "peer-a", "peer-b" };
+
+	loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.loop = loop;
+
+	conf_a = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf_a == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	conf_a->identity.claim = strdup("server-a");
+	conf_a->identity.peers = malloc(2 * sizeof(*conf_a->identity.peers));
+	if (conf_a->identity.claim == NULL || conf_a->identity.peers == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	conf_a->identity.peers_count = 2;
+	for (size_t i = 0; i < 2; i++) {
+		conf_a->identity.peers[i] = (struct identity_peer){
+			.id = strdup(peer_ids[i]),
+			.listen = strdup("127.0.0.1:0"),
+		};
+		if (conf_a->identity.peers[i].id == NULL ||
+		    conf_a->identity.peers[i].listen == NULL) {
+			T_FAIL();
+			goto cleanup;
+		}
+	}
+
+	srv_a = server_new(loop, conf_a);
+	if (srv_a == NULL || !server_start(srv_a)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.srv_a = srv_a;
+
+	if (wait_for_listener_port(
+		    &fx, &srv_a->mux_listener, &mux_port_a,
+		    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	(void)snprintf(
+		mux_connect_a, sizeof(mux_connect_a), "127.0.0.1:%d",
+		mux_port_a);
+
+	/* One dialer per peer: each lands in a distinct identity pool. */
+	for (size_t i = 0; i < 2; i++) {
+		conf_c[i] = make_config(NULL, mux_connect_a, NULL, NULL);
+		if (conf_c[i] == NULL) {
+			T_FAIL();
+			goto cleanup;
+		}
+		conf_c[i]->identity.claim = strdup(peer_ids[i]);
+		if (conf_c[i]->identity.claim == NULL) {
+			T_FAIL();
+			goto cleanup;
+		}
+		srv_c[i] = server_new(loop, conf_c[i]);
+		if (srv_c[i] == NULL || !server_start(srv_c[i])) {
+			T_FAIL();
+			goto cleanup;
+		}
+	}
+
+	/* Wait until srv_a has pooled a tunnel for BOTH peers. */
+	bool pooled = true;
+	for (size_t i = 0; i < 2 && pooled; i++) {
+		struct identity_pool_wait_ctx wait_ctx = {
+			.srv_a = srv_a,
+			.peer_identity = peer_ids[i],
+			.expected = 1,
+		};
+		pooled = wait_until(
+				 &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+				 identity_pool_wait_predicate, &wait_ctx) == 0;
+	}
+	if (!pooled) {
+		T_FAIL();
+		goto cleanup;
+	}
+
+	/* Reload srv_a with a config that drops both peers. The discard loop
+	 * frees both listeners; pre-fix, the second discard reads the first
+	 * (freed) listener while walking s->identities. server_apply_config
+	 * owns new_conf (including on failure), and srv_a->conf is the survivor
+	 * afterward -- so the cleanup block frees exactly one config for srv_a. */
+	{
+		struct config *const new_conf =
+			make_config("127.0.0.1:0", NULL, NULL, NULL);
+		if (new_conf == NULL) {
+			T_FAIL();
+			goto cleanup;
+		}
+		new_conf->identity.claim = strdup("server-a");
+		if (new_conf->identity.claim == NULL) {
+			conf_free(new_conf);
+			T_FAIL();
+			goto cleanup;
+		}
+		applied = server_apply_config(srv_a, new_conf);
+		conf_a = srv_a->conf;
+	}
+
+	/* Sampled with no loop iteration in between: the discard ran
+	 * synchronously inside server_apply_config. */
+	{
+		struct server_stats *const after = server_stats(srv_a, true);
+		num_tunnels_after =
+			after != NULL ? after->num_tunnels : SIZE_MAX;
+		free(after);
+	}
+	setup_ok = true;
+
+cleanup:
+	for (size_t i = 0; i < 2; i++) {
+		if (srv_c[i] != NULL) {
+			server_stop(srv_c[i]);
+			server_free(srv_c[i]);
+		}
+	}
+	if (srv_a != NULL) {
+		server_stop(srv_a);
+		server_free(srv_a);
+	}
+	for (size_t i = 0; i < 2; i++) {
+		if (conf_c[i] != NULL) {
+			conf_free(conf_c[i]);
+		}
+	}
+	if (conf_a != NULL) {
+		conf_free(conf_a);
+	}
+	if (loop != NULL) {
+		ev_loop_destroy(loop);
+	}
+
+	if (setup_ok) {
+		T_EXPECT(applied);
+		T_EXPECT_EQ(num_tunnels_after, (size_t)0);
+	}
+}
+
 /* Populate conf as an identity dialer: claim "node-b", dial one
  * identity.mux_connect address, and pool the response under a routing-only
  * "node-a" identity (listen == NULL, so no extra TCP listener) so the
@@ -2713,6 +2925,249 @@ T_DECLARE_CASE(test_server_reload_keeps_established_identity_mux_connect_tunnel)
 	T_EXPECT_EQ(slots_after_reload, (size_t)1);
 	T_EXPECT(slot_after_reload == slot_after_established);
 }
+
+#if WITH_TLS
+/* Two distinct 32-octet keys as hex; only their labels have to differ. */
+#define RELOAD_PSK_HEX_A                                                       \
+	"0101010101010101010101010101010101010101010101010101010101010101"
+#define RELOAD_PSK_HEX_B                                                       \
+	"0202020202020202020202020202020202020202020202020202020202020202"
+#define RELOAD_PSK_ID "psk-peer"
+
+/* make_config() plus a single tls.psk entry, laid out the way conf.c's parser
+ * leaves one: the identity as the map key, the key itself hex-encoded. */
+static struct config *make_psk_config(
+	const char *const restrict mux_listen,
+	const char *const restrict mux_connect, const char *const restrict hex)
+{
+	struct config *const conf =
+		make_config(mux_listen, mux_connect, NULL, NULL);
+	if (conf == NULL) {
+		return NULL;
+	}
+	conf->tls_psk = malloc(sizeof(*conf->tls_psk));
+	if (conf->tls_psk == NULL) {
+		conf_free(conf);
+		return NULL;
+	}
+	conf->tls_psk_cap = 1;
+	/* Count first, so conf_free() reclaims the entry even half-built. */
+	conf->tls_psk_count = 1;
+	conf->tls_psk[0] = (struct psk_entry){
+		.id = strdup(RELOAD_PSK_ID),
+		.id_len = strlen(RELOAD_PSK_ID),
+		.hex = strdup(hex),
+	};
+	if (conf->tls_psk[0].id == NULL || conf->tls_psk[0].hex == NULL) {
+		conf_free(conf);
+		return NULL;
+	}
+	return conf;
+}
+
+struct psk_retire_wait_ctx {
+	const struct server *srv;
+	const struct tunnel *t;
+};
+
+/* Predicate: the tunnel resolves through the current table and the barrier has
+ * let go of everything the reload retired. */
+static int psk_retired_released_predicate(void *ptr)
+{
+	const struct psk_retire_wait_ctx *const restrict ctx = ptr;
+	return tunnel_psk_ctx(ctx->t) == ctx->srv->psk &&
+			       ctx->srv->retired_psk == NULL ?
+		       1 :
+		       0;
+}
+
+/* Regression: server_apply_config() freed the outgoing PSK table as soon as it
+ * had *queued* a reload to every tunnel.  A tunnel only stops resolving labels
+ * through that table when the queued task runs on its own thread -- or never,
+ * when the queue was full or the reload argument could not be allocated -- so
+ * the free raced, and could permanently outlive, the readers.
+ *
+ * Reading the outgoing table after the reload is exactly what
+ * tunnel_on_verify_identity() does for a hello arriving in that window, so
+ * against the pre-fix server.c this lands on the freed block and the sanitizer
+ * build reports a heap-use-after-free.  The tail of the case then holds the
+ * fix to the other half of its bargain: the retirement is a barrier, not a
+ * retention leak, and the maintenance tick must release the table once the
+ * tunnel reports the new one. */
+T_DECLARE_CASE(test_server_reload_retires_psk_table_for_live_tunnels)
+{
+	struct test_fixture fx = { 0 };
+	fx.loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(fx.loop != NULL);
+	/* mux_connect gives server_start() a dialed tunnel that borrows the
+	 * table; it never has to reach a peer to be a reader of it. */
+	struct config *const conf =
+		make_psk_config("127.0.0.1:0", "127.0.0.1:1", RELOAD_PSK_HEX_A);
+	T_CHECK(conf != NULL);
+	struct server *const srv = server_new(fx.loop, conf);
+	T_CHECK(srv != NULL);
+	T_CHECK(server_start(srv));
+
+	struct tunnel *const t = srv->mux_tunnel;
+	T_CHECK(t != NULL);
+	struct psk_table *const old_psk = srv->psk;
+	T_CHECK(old_psk != NULL);
+	/* Copied out before the reload: after it, reading the table is the very
+	 * thing under test and must not be needed to set the test up. */
+	char label[sizeof(old_psk->entries[0].label)];
+	(void)snprintf(label, sizeof(label), "%s", old_psk->entries[0].label);
+
+	struct config *const new_conf =
+		make_psk_config("127.0.0.1:0", "127.0.0.1:1", RELOAD_PSK_HEX_B);
+	T_CHECK(new_conf != NULL);
+	const bool applied = server_apply_config(srv, new_conf);
+	T_CHECK(applied);
+	T_CHECK(srv->psk != old_psk);
+
+	/* The defect, read back at the surface a tunnel meets it on.  Reduced to
+	 * a verdict here rather than carried to the assertions below: the result
+	 * points *into* the table, which the barrier is expected to release
+	 * before this case ends. */
+	const char *const owner = server_psk_identity_of(old_psk, label);
+	const bool owner_ok =
+		owner != NULL && strcmp(owner, RELOAD_PSK_ID) == 0;
+	/* Whichever table the tunnel reports -- the reload is asynchronous, so
+	 * either is legal -- resolving through it must not touch freed memory.
+	 * NULL is a legal answer once it holds the new table, whose label
+	 * differs; what matters is that the lookup stayed in bounds. */
+	const void *const held = tunnel_psk_ctx(t);
+	const bool held_live = (held == old_psk || held == srv->psk);
+	const char *const held_owner = server_psk_identity_of(held, label);
+	const bool held_owner_ok =
+		held_owner == NULL || strcmp(held_owner, RELOAD_PSK_ID) == 0;
+
+	struct psk_retire_wait_ctx wait_ctx = { .srv = srv, .t = t };
+	const int released_rc =
+		wait_until(&fx, 5.0, psk_retired_released_predicate, &wait_ctx);
+
+	server_stop(srv);
+	struct config *const final_conf = srv->conf;
+	server_free(srv);
+	conf_free(final_conf);
+	ev_loop_destroy(fx.loop);
+
+	T_EXPECT(owner_ok);
+	T_EXPECT(held_live);
+	T_EXPECT(held_owner_ok);
+	T_EXPECT_EQ(released_rc, 0);
+}
+
+/* Predicate: the tunnel resolves through the current table. */
+static int psk_repointed_predicate(void *ptr)
+{
+	const struct psk_retire_wait_ctx *const restrict ctx = ptr;
+	return tunnel_psk_ctx(ctx->t) == ctx->srv->psk ? 1 : 0;
+}
+
+struct psk_tick_wait_ctx {
+	const struct server *srv;
+	uint_least64_t before;
+};
+
+/* Predicate: a maintenance tick has run since @c before was sampled, so the
+ * retired-table sweep it carries has had its turn. */
+static int psk_maintenance_ticked_predicate(void *ptr)
+{
+	const struct psk_tick_wait_ctx *const restrict ctx = ptr;
+	return ctx->srv->maintenance_passes != ctx->before ? 1 : 0;
+}
+
+/* Regression: the barrier decided a retired table had no reader left from what
+ * the live tunnels report, which covers only the pointer a tunnel has already
+ * adopted.  A server TLS context registered with that table as its PSK lookup
+ * context is a reader too, and the reload freeing the context handle does not
+ * end it: SSL_new() (and the mbedTLS backend's per-connection reference) keeps
+ * the parsed context alive, so a connection accepted before the reload can
+ * still reach the lookup afterwards.  The sweep swept right past that holder.
+ *
+ * tls_ctx_ref() stands in for such a connection here -- it takes the same
+ * reference on the parsed context that an accepted one does -- and the table is
+ * then read at the surface the lookup meets it on, which lands on the freed
+ * block against the pre-fix server.c.  The tail holds the fix to the other half
+ * of its bargain: dropping the last reference must let the next tick go through
+ * with the release. */
+T_DECLARE_CASE(test_server_psk_retirement_waits_for_live_tls_context)
+{
+	struct test_fixture fx = { 0 };
+	fx.loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(fx.loop != NULL);
+	/* mux_listen builds the server-role context that registers the table;
+	 * mux_connect gives the barrier a live tunnel to ask about. */
+	struct config *const conf =
+		make_psk_config("127.0.0.1:0", "127.0.0.1:1", RELOAD_PSK_HEX_A);
+	T_CHECK(conf != NULL);
+	struct server *const srv = server_new(fx.loop, conf);
+	T_CHECK(srv != NULL);
+	T_CHECK(server_start(srv));
+
+	struct tunnel *const t = srv->mux_tunnel;
+	T_CHECK(t != NULL);
+	struct psk_table *const old_psk = srv->psk;
+	T_CHECK(old_psk != NULL);
+	char label[sizeof(old_psk->entries[0].label)];
+	(void)snprintf(label, sizeof(label), "%s", old_psk->entries[0].label);
+
+	/* The connection that outlives the reload: same reference an accepted one
+	 * holds, taken while the context is still the server's. */
+	T_CHECK(srv->server_tlsctx != NULL);
+	struct tls_context *const accepted_ctx =
+		tls_ctx_ref(srv->server_tlsctx);
+	T_CHECK(accepted_ctx != NULL);
+
+	struct config *const new_conf =
+		make_psk_config("127.0.0.1:0", "127.0.0.1:1", RELOAD_PSK_HEX_B);
+	T_CHECK(new_conf != NULL);
+	const bool applied = server_apply_config(srv, new_conf);
+	T_CHECK(applied);
+	T_CHECK(srv->psk != old_psk);
+
+	/* The barrier's own criterion, satisfied: every live tunnel reports the
+	 * new table.  The sweep that follows is the one that used to free the
+	 * table accepted_ctx still resolves through. */
+	struct psk_retire_wait_ctx wait_ctx = { .srv = srv, .t = t };
+	const int repointed_rc =
+		wait_until(&fx, 5.0, psk_repointed_predicate, &wait_ctx);
+	struct psk_tick_wait_ctx tick_ctx = {
+		.srv = srv,
+		.before = srv->maintenance_passes,
+	};
+	const int ticked_rc = wait_until(
+		&fx, 5.0, psk_maintenance_ticked_predicate, &tick_ctx);
+
+	/* Reduced to verdicts here, as in the case above: the reads point into a
+	 * table the fix must have kept, and it is released before the case ends. */
+	const bool still_retired = srv->retired_psk == old_psk;
+	const char *const owner = server_psk_identity_of(old_psk, label);
+	const bool owner_ok =
+		owner != NULL && strcmp(owner, RELOAD_PSK_ID) == 0;
+
+	/* The connection ends; nothing names the table any more. */
+	tls_ctx_free(accepted_ctx);
+	const int released_rc =
+		wait_until(&fx, 5.0, psk_retired_released_predicate, &wait_ctx);
+
+	server_stop(srv);
+	struct config *const final_conf = srv->conf;
+	server_free(srv);
+	conf_free(final_conf);
+	ev_loop_destroy(fx.loop);
+
+	T_EXPECT(applied);
+	T_EXPECT_EQ(repointed_rc, 0);
+	T_EXPECT_EQ(ticked_rc, 0);
+	/* The sweep ran with the tunnel already repointed and must still have
+	 * kept the table: the context is a reader it cannot see. */
+	T_EXPECT(still_retired);
+	T_EXPECT(owner_ok);
+	/* ...and kept it no longer than that. */
+	T_EXPECT_EQ(released_rc, 0);
+}
+#endif /* WITH_TLS */
 
 /* Like build_identity_dialer_conf, but registers both peer identities the
  * dialer is pointed at in turn, so a pool exists for each. */
@@ -3088,6 +3543,53 @@ T_DECLARE_CASE(test_server_maintenance_redials_emptied_identity_slot)
 	T_EXPECT(orphan != NULL);
 	T_EXPECT(redialed != NULL);
 	T_EXPECT(redialed != orphan);
+}
+
+/* The maintenance tick is deferred work, not a heartbeat: it must be disarmed
+ * on a freshly started server with nothing outstanding, and a pass that finds
+ * no work must stop it rather than leave a standing wakeup behind. */
+T_DECLARE_CASE(test_server_maintenance_timer_stops_when_idle)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct config *conf = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf == NULL) {
+		ev_loop_destroy(loop);
+		T_FATAL("make_config failed");
+	}
+	struct server *const srv = server_new(loop, conf);
+	if (srv == NULL || !server_start(srv)) {
+		if (srv != NULL) {
+			server_stop(srv);
+			server_free(srv);
+		}
+		conf_free(conf);
+		ev_loop_destroy(loop);
+		T_FATAL("server_start failed");
+	}
+
+	/* Nothing is outstanding, so starting the server must not arm it. */
+	const bool idle_after_start = !ev_is_active(&srv->w_maintenance);
+
+	/* Armed with no work behind it, the pass it runs must disarm it again. */
+	ev_timer_again(loop, &srv->w_maintenance);
+	const bool armed = ev_is_active(&srv->w_maintenance);
+	const uint_least64_t before = srv->maintenance_passes;
+	ev_invoke(loop, &srv->w_maintenance, EV_TIMER);
+	const bool stopped_itself = !ev_is_active(&srv->w_maintenance);
+	const uint_least64_t after = srv->maintenance_passes;
+
+	server_stop(srv);
+	server_free(srv);
+	conf_free(conf);
+	ev_loop_destroy(loop);
+
+	T_EXPECT(idle_after_start);
+	T_EXPECT(armed);
+	T_EXPECT(stopped_itself);
+	T_EXPECT(after == before + 1);
 }
 
 /* Regression for "server_start_identity_listeners crashes on a NULL
@@ -3634,11 +4136,11 @@ static int reconnect_moved_predicate(void *ptr)
 	return server_num_reconnects(ctx->srv) > ctx->baseline ? 1 : 0;
 }
 
-/* maintenance_cb()'s suspend-detection task: a wall-clock jump larger than
- * MAINTENANCE_WALLCLOCK_JUMP_S is read as a resume-from-suspend and drops every
- * transport, so each dialed tunnel reconnects. Back-date srv_b's
- * last_maintenance_wall by an hour, fire the maintenance watcher, and assert its
- * mux dial-out's transport was dropped and reconnected (the counter moved). */
+/* suspend_cb(): a suspend-clock advance that the monotonic clock did not match,
+ * larger than SUSPEND_JUMP_S, is read as a resume-from-suspend and drops every
+ * transport, so each dialed tunnel reconnects. Back-date srv_b's suspend-clock
+ * baseline by an hour, fire the check watcher, and assert its mux dial-out's
+ * transport was dropped and reconnected (the counter moved). */
 T_DECLARE_CASE(test_server_maintenance_suspend_drops_transports_and_reconnects)
 {
 	struct test_fixture fx;
@@ -3651,9 +4153,12 @@ T_DECLARE_CASE(test_server_maintenance_suspend_drops_transports_and_reconnects)
 	 * suspend handler must drop and reconnect. */
 	const uint_least64_t before = server_num_reconnects(fx.srv_b);
 
-	/* Make the next maintenance tick observe a >1h wall-clock jump. */
-	fx.srv_b->last_maintenance_wall = time(NULL) - 3600;
-	ev_invoke(fx.loop, &fx.srv_b->w_maintenance, EV_TIMER);
+	/* Make the next suspend check observe an hour the monotonic clock did
+	 * not see, and clear the throttle so the check actually runs. */
+	fx.srv_b->last_check_at = 0.0;
+	fx.srv_b->last_check_elapsed_ns -=
+		(int_least64_t)3600 * INT64_C(1000000000);
+	ev_invoke(fx.loop, &fx.srv_b->w_suspend, EV_CHECK);
 
 	struct reconnect_wait_ctx ctx = {
 		.srv = fx.srv_b,
@@ -3717,13 +4222,12 @@ T_DECLARE_CASE(test_server_maintenance_shutdown_deadline_breaks_loop)
 	ev_timer_start(loop, &w_safety);
 	have_safety = true;
 
-	/* Enter shutdown with the force-exit deadline already 3s in the past. */
+	/* Enter shutdown: from here the watcher IS the force-exit deadline, so
+	 * reaching it must break the loop. */
 	srv->shutting_down = true;
-	srv->shutdown_start_ns = (int_least64_t)clock_monotonic_ns() -
-				 (int_least64_t)3000000000LL;
 
-	/* Re-arm the maintenance timer to fire almost immediately rather than
-	 * after its full 1s period, then let the loop run it. */
+	/* Re-arm the deadline to fire almost immediately rather than after its
+	 * full 2s period, then let the loop run it. */
 	srv->w_maintenance.repeat = 0.01;
 	ev_timer_again(loop, &srv->w_maintenance);
 	ev_run(loop, 0);
@@ -4392,6 +4896,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_server_offline_listeners_identity_branch),
 	T_CASE(test_bidirectional_stream_and_forward),
 	T_CASE(test_server_force_close_folds_tunnel_counters),
+	T_CASE(test_server_snapshot_cap_allows_many_tunnels),
 	T_CASE(test_half_close_b_to_a),
 	T_CASE(test_half_close_a_to_b),
 	T_CASE(test_multi_stream_churn_and_workload),
@@ -4404,8 +4909,14 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_server_config_reload),
 	T_CASE(test_server_reload_removes_identity_peer_closes_tunnel),
 	T_CASE(test_server_identity_pool_holds_concurrent_tunnels_same_peer),
+	T_CASE(test_server_reload_drops_two_identity_peers_no_uaf),
 	T_CASE(test_server_reload_keeps_established_identity_mux_connect_tunnel),
+#if WITH_TLS
+	T_CASE(test_server_reload_retires_psk_table_for_live_tunnels),
+	T_CASE(test_server_psk_retirement_waits_for_live_tls_context),
+#endif
 	T_CASE(test_server_maintenance_redials_emptied_identity_slot),
+	T_CASE(test_server_maintenance_timer_stops_when_idle),
 	T_CASE(test_server_start_identity_peer_with_null_listen),
 	T_CASE(test_server_max_sessions_rejects),
 	T_CASE(test_server_max_sessions_rejects_at_exact_limit),

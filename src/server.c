@@ -73,6 +73,12 @@ static bool server_post_task(void *user, struct task task)
 {
 	struct server *const restrict s = user;
 	if (!dispatcher_invoke(s->disp, task)) {
+		/* Dropping a CLOSED event leaves its identity slot occupied by a
+		 * dead tunnel until the maintenance sweep reclaims it, so ask the
+		 * server loop for that sweep on the way out. */
+		atomic_store_explicit(
+			&s->sweep_pending, true, memory_order_relaxed);
+		ev_async_send(s->loop, &s->w_async);
 		return false;
 	}
 	ev_async_send(s->loop, &s->w_async);
@@ -433,8 +439,10 @@ static void identity_listener_discard(
  * per peer -- so the sum of num_tunnels, not table_size(identities)), every
  * identity_tunnels[] slot, and every accepted session. Single-sourced for all
  * four snapshot call sites: a drift between copies previously undersized the
- * buffer (the P0 fixed in f333738c). The ASSERT bounds one malloc() against the
- * 16-bit stream-ID space. */
+ * buffer (the P0 fixed in f333738c). The count is a size_t sized from the live
+ * tables; the live tunnel count is unbounded in principle (max_sessions
+ * defaults to unlimited and accepts values above any fixed cap), so this
+ * imposes no arbitrary ceiling of its own. */
 static size_t server_snapshot_cap(const struct server *restrict s)
 {
 	size_t identity_pool_tunnels = 0;
@@ -444,12 +452,9 @@ static size_t server_snapshot_cap(const struct server *restrict s)
 		const struct identity_listener *const restrict sl = elem;
 		identity_pool_tunnels += sl->num_tunnels;
 	}
-	const size_t n =
-		(s->accepted_tunnels != NULL ? table_size(s->accepted_tunnels) :
-					       0) +
-		1 + identity_pool_tunnels + s->num_identity_tunnels;
-	ASSERT(n <= 65536);
-	return n;
+	return (s->accepted_tunnels != NULL ? table_size(s->accepted_tunnels) :
+					      0) +
+	       1 + identity_pool_tunnels + s->num_identity_tunnels;
 }
 
 /* Total order on tunnel pointers for the snapshot dedup. Compares the
@@ -750,6 +755,18 @@ static bool server_has_live_peer(const struct server *restrict s)
 	return false;
 }
 
+/* Arm the maintenance tick.  Every site that leaves deferred work behind calls
+ * this; the tick itself stops once a pass finds nothing left, so between them
+ * an idle server holds no timer at all.  A no-op while shutting down, where the
+ * watcher is the force-exit deadline instead. */
+static void server_maintenance_kick(struct server *restrict srv)
+{
+	if (srv->shutting_down || ev_is_active(&srv->w_maintenance)) {
+		return;
+	}
+	ev_timer_again(srv->loop, &srv->w_maintenance);
+}
+
 static void handle_closed(
 	struct server *restrict srv, struct tunnel *restrict t,
 	const union mux_event_data edata)
@@ -768,7 +785,12 @@ static void handle_closed(
 	    srv->mux_tunnel == NULL && !server_has_live_peer(srv)) {
 		ev_timer_stop(srv->loop, &srv->w_maintenance);
 		ev_break(srv->loop, EVBREAK_ALL);
+		return;
 	}
+
+	/* This is the one place an identity slot empties, so it is also where
+	 * the re-dial that maintenance owns becomes outstanding. */
+	server_maintenance_kick(srv);
 }
 
 static void server_relay_event(
@@ -1196,6 +1218,19 @@ static bool server_psk_lookup(
 	return false;
 }
 
+/* tls_config.psk_lookup_ctx_hold/_release adapters: the table is opaque to the
+ * TLS backend, which holds it for as long as a context registered with it can
+ * still be reached by a handshake. */
+static void server_psk_hold_cb(void *ctx)
+{
+	server_psk_table_hold(ctx);
+}
+
+static void server_psk_release_cb(void *ctx)
+{
+	server_psk_table_release(ctx);
+}
+
 /* Build fresh server and client TLS contexts from conf; shared by startup and
  * reload. True on success, false on failure (any partial context freed).
  * conf's plaintext credentials are erased before returning either way. */
@@ -1226,6 +1261,8 @@ static bool server_make_tls_contexts(
 		.psk_len = is_psk ? psk->entries[0].key_len : 0,
 		.psk_lookup = is_psk ? server_psk_lookup : NULL,
 		.psk_lookup_ctx = (void *)(uintptr_t)psk,
+		.psk_lookup_ctx_hold = is_psk ? server_psk_hold_cb : NULL,
+		.psk_lookup_ctx_release = is_psk ? server_psk_release_cb : NULL,
 		.ciphersuites = conf->tls_ciphersuites,
 		.alpn = conf->tls_alpn,
 		.sni = conf->tls_sni,
@@ -1307,9 +1344,12 @@ static void tunnel_set_reload_connect(
 /* Snapshot the live tunnels (deduped) and invoke fn(t, ctx) for each. Owns the
  * server_snapshot_cap/malloc/server_snapshot_tunnels/free scaffolding and the
  * cap-to-count sizing invariant (a prior open-coded copy of which drifted into
- * a P0). On allocation failure it logs and skips the pass; a caller that needs
- * an OOM fallback (server_stop) keeps its own scaffolding. */
-static void server_for_each_tunnel(
+ * a P0). On allocation failure it logs and skips the pass, returning false; a
+ * caller that needs an OOM fallback (server_stop) keeps its own scaffolding.
+ * Returns whether every live tunnel was visited -- a caller that draws a
+ * conclusion from the absence of a match (the PSK reload barrier) must not
+ * mistake a skipped pass for an empty one. */
+static bool server_for_each_tunnel(
 	struct server *restrict s, void (*fn)(struct tunnel *t, void *ctx),
 	void *ctx)
 {
@@ -1320,14 +1360,118 @@ static void server_for_each_tunnel(
 		(struct tunnel **)malloc(n * sizeof(struct tunnel *));
 	if (snapshot == NULL) {
 		LOGOOM();
-		return;
+		return false;
 	}
 	const size_t count = server_snapshot_tunnels(s, snapshot, n);
 	for (size_t i = 0; i < count; i++) {
 		fn(snapshot[i], ctx);
 	}
 	free((void *)snapshot);
+	return true;
 }
+
+#if WITH_TLS
+/* Context for psk_barrier_cb over server_for_each_tunnel. */
+struct psk_barrier_ctx {
+	struct server *s;
+	/* Live tunnels not yet resolving through s->psk. */
+	size_t stale;
+};
+
+static void psk_barrier_cb(struct tunnel *t, void *ctx)
+{
+	struct psk_barrier_ctx *const restrict c = ctx;
+	struct server *const restrict s = c->s;
+	const void *const cur = tunnel_psk_ctx(t);
+	if (cur == s->psk) {
+		return;
+	}
+	c->stale++;
+	/* Whichever retired table it is still on has to outlive this sweep. */
+	for (struct psk_table *p = s->retired_psk; p != NULL;
+	     p = p->retired_next) {
+		if (p == cur) {
+			p->retired_in_use = true;
+			break;
+		}
+	}
+	/* Nothing else will move this tunnel forward: the reload it was sent
+	 * never reached its queue (full, or its argument could not be
+	 * allocated), so re-offer the resolver alone until one lands. */
+	server_psk_table_hold(s->psk);
+	if (!tunnel_set_psk(
+		    t, s->psk != NULL ? server_psk_identity_cb : NULL, s->psk,
+		    server_psk_release_cb)) {
+		LOGD("failed to dispatch a psk repoint; retrying next tick");
+	}
+}
+
+/* Acquire, pairing with the release in server_psk_table_release(). */
+static bool psk_table_held(const struct psk_table *restrict t)
+{
+#if WITH_THREADS
+	return atomic_load_explicit(&t->holds, memory_order_acquire) > 0;
+#else
+	return t->holds > 0;
+#endif
+}
+
+/* Free every retired table nothing names any more, and re-dispatch the current
+ * resolver to the tunnels that still name an older one.  Runs on the
+ * maintenance tick and costs nothing while the retired list is empty, which is
+ * every moment outside the window a reload opens. */
+static void server_psk_release_retired(struct server *restrict s)
+{
+	if (s->retired_psk == NULL) {
+		return;
+	}
+	/* Holds first, tunnels second, and never the other way round: a tunnel
+	 * gives back the hold on a repoint only after publishing the resolver it
+	 * carried, so a table this pass finds unheld is one the next loop is
+	 * guaranteed to see reported if the tunnel is on it. */
+	for (struct psk_table *p = s->retired_psk; p != NULL;
+	     p = p->retired_next) {
+		p->retired_in_use = psk_table_held(p);
+	}
+	struct psk_barrier_ctx ctx = { .s = s, .stale = 0 };
+	if (!server_for_each_tunnel(s, psk_barrier_cb, &ctx)) {
+		/* No tunnel was visited, so no table may be assumed unused. */
+		return;
+	}
+	if (ctx.stale > 0) {
+		LOGD_F("psk reload barrier: %zu tunnel(s) not yet repointed",
+		       ctx.stale);
+	}
+	struct psk_table **link = &s->retired_psk;
+	while (*link != NULL) {
+		struct psk_table *const p = *link;
+		if (p->retired_in_use) {
+			link = &p->retired_next;
+			continue;
+		}
+		*link = p->retired_next;
+		p->retired_next = NULL;
+		server_psk_table_free(p);
+	}
+}
+
+/* Hand a table replaced by a reload to the barrier rather than freeing it: the
+ * reload only *dispatches* the new one to each tunnel, and every tunnel keeps
+ * resolving labels through this table on its own thread until that dispatch
+ * runs -- or forever, if it was dropped. */
+static void
+server_retire_psk(struct server *restrict s, struct psk_table *restrict old)
+{
+	if (old == NULL) {
+		return;
+	}
+	old->retired_next = s->retired_psk;
+	s->retired_psk = old;
+	/* The barrier can only be re-polled, not waited on, so retiring a table
+	 * is what puts maintenance back on the clock until the list drains. */
+	server_maintenance_kick(s);
+}
+#endif /* WITH_TLS */
 
 /* Context for drain_tunnel_cb over server_for_each_tunnel. */
 struct drain_ctx {
@@ -1340,7 +1484,7 @@ struct drain_ctx {
 	size_t new_ni;
 #if WITH_TLS
 	struct tls_context *new_client_tlsctx;
-	const struct psk_table *new_psk;
+	struct psk_table *new_psk;
 #endif
 };
 
@@ -1356,20 +1500,27 @@ static void drain_tunnel_cb(struct tunnel *t, void *ctx)
 		.forward_addr = d->new_conf->connect,
 		.verify_identity = d->new_conf->identity.verify,
 #if WITH_TLS
-		/* Refreshed with the config: the old table is freed at the end of
-		 * server_apply_config, so a tunnel must not keep pointing at it. */
+		/* Refreshed with the config: the table this replaces is retired
+		 * at the end of server_apply_config, and released once no tunnel
+		 * reports it any more. */
 		.psk_identity_of =
 			d->new_psk != NULL ? server_psk_identity_cb : NULL,
-		.psk_ctx = (void *)(uintptr_t)d->new_psk,
+		.psk_ctx = d->new_psk,
+		.psk_ctx_release = server_psk_release_cb,
 #endif
 	};
 #if WITH_TLS
+	/* Held for the dispatch, which gives it back when it runs or is dropped:
+	 * until then this table is named by nothing else -- the tunnel still
+	 * reports the previous one, and a reload after this one would retire this
+	 * table while the dispatch is still in the ring. */
+	server_psk_table_hold(d->new_psk);
 	/* Per-dialed-tunnel TLS handle (ownership transferred to tunnel_reload);
 	 * on OOM the tunnel keeps its current context. */
 	if (!tunnel_is_accepted(t) && d->new_client_tlsctx != NULL) {
 		opts.tlsctx = tls_ctx_ref(d->new_client_tlsctx);
 	}
-#endif
+#endif /* WITH_TLS */
 	tunnel_set_reload_connect(
 		&opts, d->s, t, d->old_conf, d->new_conf, d->old_ni, d->new_ni);
 	tunnel_reload(t, &opts);
@@ -1383,7 +1534,7 @@ static void server_drain_tunnels(
 	const struct config *restrict new_conf
 #if WITH_TLS
 	,
-	struct tls_context *new_client_tlsctx, const struct psk_table *new_psk
+	struct tls_context *new_client_tlsctx, struct psk_table *new_psk
 #endif
 )
 {
@@ -1413,7 +1564,7 @@ static void server_drain_tunnels(
 		.new_psk = new_psk,
 #endif
 	};
-	server_for_each_tunnel(s, drain_tunnel_cb, &dctx);
+	(void)server_for_each_tunnel(s, drain_tunnel_cb, &dctx);
 }
 
 /* Resolve addr, optionally warn if it is a non-local (public) bind address,
@@ -1633,28 +1784,41 @@ static void server_reload_identities_changed(
 		}
 	}
 
-	/* Free orphaned old entries: identity_listener_discard() closes and
-	 * unregisters any tunnel a removed peer's sl still owns; a migrated
-	 * sl's tunnels[] is already empty, so this just frees it. */
-	{
-		size_t cursor = 0;
-		void *elem;
-		while (table_next(s->identities, &cursor, NULL, &elem)) {
-			struct identity_listener *restrict sl = elem;
-			identity_listener_discard(s, sl);
-		}
-	}
-	/* Session threads read s->identities under accepted_mu (shared) in
-	 * tunnel handle_connected; hold it exclusive across the free+swap so a
-	 * concurrent lookup never observes a freed or half-swapped table. */
+	/* Publish the rebuilt table BEFORE discarding the orphaned old entries.
+	 * identity_listener_discard() closes each removed peer's tunnels, and a
+	 * close can synchronously flush the shared dispatcher and run another
+	 * tunnel's queued handle_closed(), reaching identity_pools_remove_except()
+	 * or server_tunnel_is_registered() -- both traverse s->identities. Freeing
+	 * a listener while it is still reachable through s->identities would leave
+	 * those reentrant traversals (and a concurrent session-thread lookup)
+	 * dereferencing freed memory: a distinct case behind the reentrancy
+	 * hardening in #268. Swapping first keeps every traversal on the new table,
+	 * which holds no freed listener; discard's own liveness re-validation uses
+	 * accepted_tunnels/identity_tunnels[]/mux_tunnel, not the identities pool,
+	 * so it is unaffected. A migrated sl's tunnels[] is already empty, so
+	 * discarding it merely frees it.
+	 *
+	 * Session threads read s->identities under accepted_mu (shared) in tunnel
+	 * handle_connected; hold it exclusive across the swap so a concurrent
+	 * lookup never observes a half-swapped table. The old table has no reader
+	 * once the swap is published, so it is discarded and freed after. */
+	struct hashtable *const old_tbl = s->identities;
 #if WITH_THREADS
 	THRD_ASSERT(smtx_lock(&s->accepted_mu));
 #endif
-	table_free(s->identities);
 	s->identities = new_tbl;
 #if WITH_THREADS
 	THRD_ASSERT(smtx_unlock(&s->accepted_mu));
 #endif
+	{
+		size_t cursor = 0;
+		void *elem;
+		while (table_next(old_tbl, &cursor, NULL, &elem)) {
+			struct identity_listener *restrict sl = elem;
+			identity_listener_discard(s, sl);
+		}
+	}
+	table_free(old_tbl);
 }
 
 /* Rebuild the identity-listener hashtable if the peer table changed; else fix
@@ -1712,7 +1876,17 @@ static void server_reload_identities(
 				/* OOM: sl not inserted into the rebuilt table.
 				 * Discard it (stopping the listener and closing
 				 * its tunnels), or it becomes an unreachable
-				 * "ghost" once s->identities is swapped below. */
+				 * "ghost" once s->identities is swapped below.
+				 * Detach it from s->identities first: discard
+				 * closes tunnels, which can reentrantly traverse
+				 * s->identities (see server_reload_identities_
+				 * changed), so a freed sl must not stay reachable
+				 * there -- across repeated OOM discards this is the
+				 * same use-after-free. */
+				void *removed = NULL;
+				(void)table_del(
+					s->identities, sl->peer_identity,
+					&removed);
 				identity_listener_discard(s, sl);
 				LOGOOM();
 			} else {
@@ -1826,6 +2000,7 @@ static void server_start_identity_tunnel(
 		s, conf, conf->identity.mux_connect[i]);
 	if (t == NULL) {
 		LOGE_F("failed to create identity tunnel[%zu]", i);
+		server_maintenance_kick(s);
 		return;
 	}
 	s->identity_tunnels[i] = t;
@@ -1835,6 +2010,7 @@ static void server_start_identity_tunnel(
 		 * "closed"). */
 		s->identity_tunnels[i] = NULL;
 		tunnel_close(t);
+		server_maintenance_kick(s);
 	}
 }
 
@@ -1962,9 +2138,11 @@ bool server_apply_config(struct server *restrict s, struct config *new_conf)
 	if (old_client_tlsctx != NULL) {
 		tls_ctx_free(old_client_tlsctx);
 	}
-	/* Only now: the old contexts' lookup callback pointed at this table, and
-	 * a mid-handshake connection could still have reached it above. */
-	server_psk_table_free(old_psk);
+	/* Not freed here: server_drain_tunnels above only *dispatched* the new
+	 * table to each tunnel, and every one of them keeps resolving labels
+	 * through this one -- on its own thread -- until that dispatch runs.
+	 * The barrier releases it once no tunnel reports it any more. */
+	server_retire_psk(s, old_psk);
 #endif /* WITH_TLS */
 
 	/* An explicit --loglevel (loglevel_override >= 0) wins over the config's
@@ -2000,9 +2178,15 @@ static void server_reload(struct server *restrict s)
 	(void)systemd_notify(DAEMON_SYSTEMD_STATE_READY);
 }
 
-/* Wall-clock jump larger than this (seconds) is treated as resume from system
- * suspend. */
-#define MAINTENANCE_WALLCLOCK_JUMP_S 15
+/* Clock disagreement larger than this (seconds) is treated as resume from
+ * system suspend. */
+#define SUSPEND_JUMP_S 15
+/* Loop-time spacing between suspend checks, in seconds. */
+#define SUSPEND_CHECK_INTERVAL 1.0
+/* Force-exit deadline once a shutdown signal has been handled, in seconds. */
+#define SHUTDOWN_DEADLINE 2.0
+/* Retry spacing while a maintenance task still has outstanding work. */
+#define MAINTENANCE_INTERVAL 1.0
 
 static void drop_transport_cb(struct tunnel *t, void *ctx)
 {
@@ -2010,74 +2194,138 @@ static void drop_transport_cb(struct tunnel *t, void *ctx)
 	tunnel_drop_transport(t);
 }
 
+/* Read a clock that keeps running across system suspend, preferring the boot
+ * clock and falling back to the wall clock. */
+static bool
+read_elapsed(struct server *restrict srv, int_fast64_t *restrict out)
+{
+	struct timespec ts;
+	if (srv->check_uses_boottime) {
+		if (clock_boot(&ts)) {
+			*out = TIMESPEC_NANO(ts);
+			return true;
+		}
+		/* CLOCK_BOOTTIME is a Linux extension; stop probing it once it
+		 * proves unavailable. */
+		srv->check_uses_boottime = false;
+	}
+	if (!clock_unix(&ts)) {
+		return false;
+	}
+	*out = TIMESPEC_NANO(ts);
+	return true;
+}
+
+/* Detect resume from system suspend and reconnect every transport.  Runs on
+ * loop iterations that happen anyway, so an idle server never wakes for it;
+ * a suspend leaves the timers that would wake it overdue, and the first
+ * iteration after resume is where this notices. */
+static void suspend_cb(struct ev_loop *loop, ev_check *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_CHECK);
+	struct server *const restrict srv = w->data;
+
+	/* ev_now is the loop time libev already refreshed this iteration, so
+	 * throttling on it costs no clock read.  It follows the wall clock, so
+	 * a suspend opens the gate at once; a backward step opens it too rather
+	 * than stalling the check until the clock catches up. */
+	const ev_tstamp now = ev_now(loop);
+	const ev_tstamp since = now - srv->last_check_at;
+	if (since >= 0.0 && since < SUSPEND_CHECK_INTERVAL) {
+		return;
+	}
+	srv->last_check_at = now;
+
+	const int_fast64_t mono_ns = clock_monotonic_ns();
+	int_fast64_t elapsed_ns;
+	if (mono_ns < 0 || !read_elapsed(srv, &elapsed_ns)) {
+		LOGE("suspend check: no usable clock");
+		return;
+	}
+	const int_fast64_t mono_delta = mono_ns - srv->last_check_mono_ns;
+	const int_fast64_t elapsed_delta =
+		elapsed_ns - srv->last_check_elapsed_ns;
+	srv->last_check_mono_ns = (int_least64_t)mono_ns;
+	srv->last_check_elapsed_ns = (int_least64_t)elapsed_ns;
+
+	/* The monotonic clock stands still across suspend while the boot (or
+	 * wall) clock keeps advancing, so their disagreement is the suspended
+	 * duration.  Comparing the two deltas -- rather than one absolute gap --
+	 * is what lets this run on an irregular cadence. */
+	const int_fast64_t jump_ns = elapsed_delta - mono_delta;
+	if (jump_ns <= (int_fast64_t)SUSPEND_JUMP_S * INT64_C(1000000000)) {
+		return;
+	}
+	LOGW_F("system suspend of %" PRIdFAST64
+	       "s detected, dropping all transports",
+	       jump_ns / INT64_C(1000000000));
+	/* On OOM server_for_each_tunnel skips this round; the baselines have
+	 * already advanced, so only a later suspend retries. */
+	(void)server_for_each_tunnel(srv, drop_transport_cb, NULL);
+}
+
+/* Run the deferred work the kick sites arm this timer for, reporting whether
+ * any of it is still outstanding. */
+static bool maintenance_pass(struct server *restrict srv)
+{
+	bool more = false;
+#if WITH_TLS
+	/* Release the PSK tables a reload retired, once no tunnel is resolving
+	 * through them, and re-offer the current one to any tunnel whose reload
+	 * dispatch was dropped. */
+	server_psk_release_retired(srv);
+	more = srv->retired_psk != NULL;
+#endif
+
+	/* Re-dial any configured identity slot left empty. A slot goes NULL only
+	 * when its tunnel permanently closes (handle_closed); if the current
+	 * config still wants a tunnel there -- e.g. a slot freed by a drained
+	 * orphan that had shadowed a reconfigured target, or a start that failed
+	 * on reload -- dial it now instead of waiting for the next reload.
+	 * The array high-water mark bounds the index; conf may configure fewer. */
+	const struct config *const restrict conf = srv->conf;
+	for (size_t i = 0; i < srv->num_identity_tunnels; i++) {
+		struct tunnel *const slot = srv->identity_tunnels[i];
+		if (slot != NULL) {
+			/* A slot normally empties through handle_closed, but
+			 * that runs off a relay event the shared dispatcher
+			 * drops when full -- and for CLOSED there is no retry,
+			 * since the tunnel thread exits right after. Such a slot
+			 * would stay occupied by a dead tunnel until the next
+			 * peers-changed reload, silently losing a configured
+			 * peer. Reclaim it here instead. */
+			if (tunnel_state(slot) != MUX_STATE_CLOSED) {
+				continue;
+			}
+			LOGW("identity tunnel reports CLOSED without a"
+			     " close notification; reclaiming its slot");
+			server_remove_and_close_tunnel(srv, slot);
+		}
+		if (i < conf->identity.mux_connect_count &&
+		    conf->identity.mux_connect[i] != NULL) {
+			server_start_identity_tunnel(srv, conf, i);
+			more = more || srv->identity_tunnels[i] == NULL;
+		}
+	}
+	return more;
+}
+
 static void maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
 	struct server *const restrict srv = w->data;
 
-	/* Task 1 (highest priority): shutdown deadline polling.
-	 * When shutting_down, check the force-exit deadline and return. */
+	/* While shutting down this watcher is the force-exit deadline rather
+	 * than the maintenance tick, and reaching it is the whole event. */
 	if (srv->shutting_down) {
-		const int_fast64_t elapsed_ns =
-			clock_monotonic_ns() - srv->shutdown_start_ns;
-		if (elapsed_ns >= (int_fast64_t)2000000000) {
-			LOGW("shutdown timeout: forcing exit");
-			ev_break(loop, EVBREAK_ALL);
-		}
+		LOGW("shutdown timeout: forcing exit");
+		ev_break(loop, EVBREAK_ALL);
 		return;
 	}
 
-	/* Task 2: detect system suspend via a wall-clock jump (CLOCK_REALTIME
-	 * advances across suspend, CLOCK_MONOTONIC does not); drop all
-	 * transports to reconnect. */
-	struct timespec now_ts;
-	if (clock_unix(&now_ts)) {
-		const time_t now_wall = now_ts.tv_sec;
-		const time_t delta = now_wall - srv->last_maintenance_wall;
-		srv->last_maintenance_wall = now_wall;
-		if (delta > (time_t)MAINTENANCE_WALLCLOCK_JUMP_S) {
-			LOGW_F("wall-clock jump of %" PRIdFAST64
-			       "s detected, dropping all transports",
-			       (int_fast64_t)delta);
-			/* On OOM server_for_each_tunnel skips this cycle; the
-			 * next tick re-evaluates the wall clock. */
-			server_for_each_tunnel(srv, drop_transport_cb, NULL);
-		}
-	} else {
-		LOGE("clock_unix failed");
-	}
-
-	/* Task 3: re-dial any configured identity slot left empty. A slot goes
-	 * NULL only when its tunnel permanently closes (handle_closed); if the
-	 * current config still wants a tunnel there -- e.g. a slot freed by a
-	 * drained orphan that had shadowed a reconfigured target, or a start that
-	 * failed on reload -- dial it now instead of waiting for the next reload.
-	 * The array high-water mark bounds the index; conf may configure fewer. */
-	{
-		const struct config *const restrict conf = srv->conf;
-		for (size_t i = 0; i < srv->num_identity_tunnels; i++) {
-			struct tunnel *const slot = srv->identity_tunnels[i];
-			if (slot != NULL) {
-				/* A slot normally empties through handle_closed,
-				 * but that runs off a relay event the shared
-				 * dispatcher drops when full -- and for CLOSED
-				 * there is no retry, since the tunnel thread
-				 * exits right after. Such a slot would stay
-				 * occupied by a dead tunnel until the next
-				 * peers-changed reload, silently losing a
-				 * configured peer. Reclaim it here instead. */
-				if (tunnel_state(slot) != MUX_STATE_CLOSED) {
-					continue;
-				}
-				LOGW("identity tunnel reports CLOSED without a"
-				     " close notification; reclaiming its slot");
-				server_remove_and_close_tunnel(srv, slot);
-			}
-			if (i < conf->identity.mux_connect_count &&
-			    conf->identity.mux_connect[i] != NULL) {
-				server_start_identity_tunnel(srv, conf, i);
-			}
-		}
+	srv->maintenance_passes++;
+	if (!maintenance_pass(srv)) {
+		ev_timer_stop(loop, w);
 	}
 }
 
@@ -2088,8 +2336,12 @@ static void relay_async_cb(struct ev_loop *loop, ev_async *w, const int revents)
 	(void)loop;
 	struct server *const restrict srv = w->data;
 	dispatcher_tick(srv->disp);
+	if (atomic_exchange_explicit(
+		    &srv->sweep_pending, false, memory_order_relaxed)) {
+		server_maintenance_kick(srv);
+	}
 }
-#endif
+#endif /* WITH_THREADS */
 
 static void shutdown_cb(struct tunnel *t, void *ctx)
 {
@@ -2128,7 +2380,7 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		 * invalidate a live iterator). On OOM server_for_each_tunnel skips
 		 * graceful dispatch this pass; server_stop()'s force-close loop
 		 * still guarantees every session gets closed. */
-		server_for_each_tunnel(s, shutdown_cb, NULL);
+		(void)server_for_each_tunnel(s, shutdown_cb, NULL);
 
 		if (s->mux_tunnel == NULL &&
 		    (s->accepted_tunnels == NULL ||
@@ -2139,9 +2391,12 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		}
 
 		/* Keep the event loop running until all sessions close or the
-		 * shutdown deadline fires. */
+		 * shutdown deadline fires.  From here w_maintenance is that
+		 * deadline, so re-arm it as a one-shot whatever it was doing. */
 		s->shutting_down = true;
-		s->shutdown_start_ns = (int_least64_t)clock_monotonic_ns();
+		ev_timer_stop(loop, &s->w_maintenance);
+		ev_timer_set(&s->w_maintenance, SHUTDOWN_DEADLINE, 0.0);
+		ev_timer_start(loop, &s->w_maintenance);
 		break;
 	default:
 		break;
@@ -2209,6 +2464,13 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 		return NULL;
 	}
 #endif /* WITH_TLS */
+
+	/* Initialised here rather than in server_start so that a start failing
+	 * partway can already kick it; it stays stopped until something does. */
+	ev_timer_init(
+		&srv->w_maintenance, maintenance_cb, MAINTENANCE_INTERVAL,
+		MAINTENANCE_INTERVAL);
+	srv->w_maintenance.data = srv;
 
 	ev_signal_init(&srv->w_sighup, signal_cb, SIGHUP);
 	srv->w_sighup.data = srv;
@@ -2426,10 +2688,23 @@ bool server_start(struct server *restrict s)
 	ev_signal_start(loop, &s->w_sigint);
 	ev_signal_start(loop, &s->w_sigterm);
 
-	s->last_maintenance_wall = time(NULL);
-	ev_timer_init(&s->w_maintenance, maintenance_cb, 1.0, 1.0);
-	s->w_maintenance.data = s;
-	ev_timer_start(loop, &s->w_maintenance);
+	s->check_uses_boottime = true;
+	s->last_check_at = ev_now(loop);
+	s->last_check_mono_ns = (int_least64_t)clock_monotonic_ns();
+	{
+		int_fast64_t elapsed_ns;
+		if (read_elapsed(s, &elapsed_ns)) {
+			s->last_check_elapsed_ns = (int_least64_t)elapsed_ns;
+		} else {
+			LOGE("suspend check: no usable clock");
+		}
+	}
+	ev_check_init(&s->w_suspend, suspend_cb);
+	s->w_suspend.data = s;
+	ev_check_start(loop, &s->w_suspend);
+	/* A hook on iterations driven by other watchers; it must not be what
+	 * keeps the loop alive. */
+	ev_unref(loop);
 
 	LOGN("server started");
 	return true;
@@ -2502,6 +2777,11 @@ void server_stop(struct server *srv)
 	ev_signal_stop(loop, &srv->w_sigint);
 	ev_signal_stop(loop, &srv->w_sigterm);
 	ev_timer_stop(loop, &srv->w_maintenance);
+	if (ev_is_active(&srv->w_suspend)) {
+		/* Balances the ev_unref that kept it from holding the loop open. */
+		ev_ref(loop);
+		ev_check_stop(loop, &srv->w_suspend);
+	}
 #if WITH_THREADS
 	ev_async_stop(loop, &srv->w_async);
 	dispatcher_tick(srv->disp);
@@ -2579,8 +2859,18 @@ void server_free(struct server *srv)
 	if (srv->client_tlsctx != NULL) {
 		tls_ctx_free(srv->client_tlsctx);
 	}
-	/* After the contexts: their PSK lookup callback reads this table. */
+	/* After the contexts: their PSK lookup callback reads this table, and
+	 * destroying the last of them is what gives back the hold on it. */
 	server_psk_table_free(srv->psk);
+	/* Every tunnel has been closed by now, so whatever the barrier was still
+	 * holding for them has no reader left -- including a repoint the tunnel
+	 * never ran, whose hold went with it. */
+	while (srv->retired_psk != NULL) {
+		struct psk_table *const p = srv->retired_psk;
+		srv->retired_psk = p->retired_next;
+		p->retired_next = NULL;
+		server_psk_table_free(p);
+	}
 #endif /* WITH_TLS */
 	table_free(srv->accepted_tunnels);
 #if WITH_THREADS
@@ -3052,6 +3342,11 @@ struct psk_table *server_psk_table_new(const struct config *restrict conf)
 		LOGOOM();
 		return NULL;
 	}
+#if WITH_THREADS
+	atomic_init(&t->holds, (size_t)0);
+#else
+	t->holds = 0;
+#endif
 	t->count = conf->tls_psk_count;
 	for (size_t i = 0; i < t->count; i++) {
 		const struct psk_entry *const restrict src = &conf->tls_psk[i];
@@ -3086,6 +3381,38 @@ void server_psk_table_free(struct psk_table *restrict t)
 		tls_secure_erase(t->entries[i].key, sizeof(t->entries[i].key));
 	}
 	free(t);
+}
+
+void server_psk_table_hold(struct psk_table *restrict t)
+{
+	if (t == NULL) {
+		return;
+	}
+#if WITH_THREADS
+	/* Relaxed: every hold is taken on the server thread, the same one that
+	 * reads them. */
+	(void)atomic_fetch_add_explicit(
+		&t->holds, (size_t)1, memory_order_relaxed);
+#else
+	t->holds++;
+#endif
+}
+
+void server_psk_table_release(struct psk_table *restrict t)
+{
+	if (t == NULL) {
+		return;
+	}
+#if WITH_THREADS
+	/* Release, paired with the sweep's acquire load: whatever the holder did
+	 * before giving the hold back -- a tunnel publishing the resolver it just
+	 * adopted, a TLS context finishing its last handshake -- is visible to the
+	 * sweep that sees the count reach zero. */
+	(void)atomic_fetch_sub_explicit(
+		&t->holds, (size_t)1, memory_order_release);
+#else
+	t->holds--;
+#endif /* WITH_THREADS */
 }
 
 const char *server_psk_identity_of(
