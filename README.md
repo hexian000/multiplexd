@@ -48,6 +48,7 @@ multiplexd is a TCP stream multiplexer that solves most of the problems of tunne
 - [Deployment Notes](#deployment-notes)
   - [TLS Security Model](#tls-security-model)
   - [Connection Backoff](#connection-backoff)
+  - [Battery-Constrained Deployment (Mobile)](#battery-constrained-deployment-mobile)
   - [API Server](#api-server)
   - [Configuration Reload](#configuration-reload)
 - [Credits](#credits)
@@ -582,6 +583,26 @@ claim to the key that made it.
 ### Connection Backoff
 
 The `max_startups` option (`start:rate:full` format, where `rate` is a percentage from 0 to 100) rate-limits incoming session attempts: the first `start` are accepted freely; beyond that, each new attempt is rejected with probability `rate%` until `full` is reached.
+
+### Battery-Constrained Deployment (Mobile)
+
+On a phone or other battery-powered device the dominant cost is usually the radio, not the CPU. Every packet sent after an idle gap drives a cellular modem from idle to connected and holds it there through a multi-second tail, so the number of times the tunnel transmits matters far more than how much work each transmission takes.
+
+An idle multiplexd holds no periodic timer of its own: the maintenance tick is armed only while a task has outstanding work, suspend detection rides loop iterations that already happen, and a tunnel's frame-cache trim stops once the cache is empty. What remains is whatever you configure below.
+
+Configuration:
+
+- **`mux.idle_timeout`** (default `0`, disabled) is the largest single lever. With no streams open, a dialed session closes completely — no keepalive frames, no socket, no timers, and no reconnect backoff — and the next connection redials on demand. A value of `60`–`300` suits interactive use. The cost is that the first connection after an idle period waits for a TCP and TLS handshake before its first byte.
+- **`mux.nodelay: false`** enables in-tunnel coalescing, batching small writes into fewer frames at up to 40 ms of added delay each. For interactive traffic this cuts the packet count substantially.
+- **`mux.keepalive`** should be as *high* as the path allows, not low. It exists to hold a NAT binding open, and each probe is one radio wakeup; carrier NAT typically tolerates `300`–`600`. Leave it at the default `7200` if nothing on the path requires less. The inactivity deadline is derived from it and is not separately configurable.
+- **`mux.tcp.keepalive`** should stay `false` (the default) — it would duplicate the mux keepalive at the kernel level.
+- **`tls.kernel_offload`** is harmless but generally inert on stock Android kernels, which do not register the `tls` upper-layer protocol; it is also OpenSSL-only.
+
+Build options:
+
+- Leave **`ENABLE_THREADS=OFF`** (the default). One session per device needs no per-session thread, and a single event loop avoids cross-thread dispatch and lets the scheduler park cores.
+- Do **not** set `FORCE_POSIX`. It disables the `TCP_USER_TIMEOUT` path, whose presence lets a session drop its userspace send-timeout watchdog entirely.
+- `MinSizeRel` with LTO (`./m.sh min`) produces the smallest resident binary.
 
 ### API Server
 
