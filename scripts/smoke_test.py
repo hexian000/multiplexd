@@ -565,10 +565,14 @@ def terminate_process(
     *,
     sigterm_timeout: float = 10.0,
     sigkill_timeout: float = 3.0,
-) -> int:
+) -> Optional[int]:
     """Send SIGTERM and wait.  Escalate to SIGKILL on timeout.
 
-    Returns the exit code, or ``-SIGKILL`` if a kill was necessary.
+    Returns the exit code (``-SIGKILL`` if a kill was necessary), or ``None``
+    when even SIGKILL did not reap the process -- e.g. it is wedged in an
+    uninterruptible kernel wait.  A ``None`` return means the process is still
+    alive: the caller must keep its handle so the live PID is not forgotten,
+    not treat it as successfully stopped.
     """
     rc = proc.poll()
     if rc is not None:
@@ -588,7 +592,11 @@ def terminate_process(
             pass
     rc = proc.poll()
     if rc is None:
-        rc = -int(signal.SIGKILL)
+        # The process outlived SIGKILL: do not fabricate an exit status or
+        # claim it was reaped.  Report the still-live PID and let the caller
+        # keep its handle for retry/reporting.
+        log("  %s [pid:%d] STILL ALIVE after SIGKILL" % (name, proc.pid))
+        return None
     log("  %s exited with code %d" % (name, rc))
     return rc
 
@@ -827,15 +835,23 @@ class Daemons:
         time.sleep(0.5)
         return True
 
-    def shutdown(self) -> Tuple[int, int]:
-        """Stop client then server; return (client_rc, server_rc)."""
-        client_rc = server_rc = 0
+    def shutdown(self) -> Tuple[Optional[int], Optional[int]]:
+        """Stop client then server; return (client_rc, server_rc).
+
+        A daemon that could not be reaped keeps its handle -- so the live PID
+        is not forgotten -- and yields a ``None`` rc, which the caller's
+        ``rc != 0`` check reports as a failure rather than a clean exit.
+        """
+        client_rc: Optional[int] = 0
+        server_rc: Optional[int] = 0
         if self.client is not None:
             client_rc = terminate_process(self.client, "%s client" % self.tag)
-            self.client = None
+            if client_rc is not None:
+                self.client = None
         if self.server is not None:
             server_rc = terminate_process(self.server, "%s server" % self.tag)
-            self.server = None
+            if server_rc is not None:
+                self.server = None
         for fh in self._fhs:
             try:
                 fh.close()  # type: ignore[attr-defined]
@@ -845,10 +861,16 @@ class Daemons:
         return client_rc, server_rc
 
     def kill(self) -> None:
-        for proc, role in ((self.client, "client"), (self.server, "server")):
-            if proc is not None:
-                terminate_process(proc, "%s %s" % (self.tag, role))
-        self.client = self.server = None
+        # Best-effort teardown: keep the handle of any process that outlived
+        # SIGKILL (terminate_process returns None) so it is not forgotten.
+        if self.client is not None:
+            rc = terminate_process(self.client, "%s client" % self.tag)
+            if rc is not None:
+                self.client = None
+        if self.server is not None:
+            rc = terminate_process(self.server, "%s server" % self.tag)
+            if rc is not None:
+                self.server = None
         for fh in self._fhs:
             try:
                 fh.close()  # type: ignore[attr-defined]
@@ -1480,7 +1502,7 @@ def run_load_topology(binary: Path, log_dir: Path, suite: Suite,
                 except OSError:
                     pass
             if client_rc != 0 or server_rc != 0:
-                return False, "client rc=%d server rc=%d (expected 0)" % (
+                return False, "client rc=%s server rc=%s (expected 0)" % (
                     client_rc, server_rc)
             return True, "clean exit with %d open connection(s)" % len(open_conns)
 
@@ -1745,7 +1767,7 @@ def run_parallel_topology(binary: Path, log_dir: Path, suite: Suite,
         def shutdown() -> Tuple[bool, str]:
             client_rc, server_rc = daemons.shutdown()
             if client_rc != 0 or server_rc != 0:
-                return False, "client rc=%d server rc=%d" % (
+                return False, "client rc=%s server rc=%s" % (
                     client_rc, server_rc)
             return True, "clean exit"
 
@@ -1793,7 +1815,7 @@ def run_resumption_topology(binary: Path, log_dir: Path, suite: Suite,
         def shutdown() -> Tuple[bool, str]:
             client_rc, server_rc = daemons.shutdown()
             if client_rc != 0 or server_rc != 0:
-                return False, "client rc=%d server rc=%d" % (
+                return False, "client rc=%s server rc=%s" % (
                     client_rc, server_rc)
             return True, "clean exit"
 

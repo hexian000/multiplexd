@@ -41,6 +41,7 @@ DEFAULT_BUILD_DIR = ROOT / "build"
 DEFAULT_REPORT = DEFAULT_BUILD_DIR / "linearity_report.md"
 IPERF3_PORT = 5201
 MUX_LISTEN = 5202
+SERVER_LISTEN = 5203
 MUX_PORT = 8443
 API_PORT = 9081
 
@@ -62,15 +63,23 @@ def run(cmd: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(list(cmd), **kwargs)
 
 
-def killall(*names: str) -> None:
-    # Match the process name, not the full command line. With -f, the repo path
-    # in this script's own argv -- and in a concurrent bench.py/smoke_test.py, a
-    # `cmake --build`, or an editor/tail -- matched too, so pkill would SIGKILL
-    # unrelated in-tree processes (dangerous on a shared worktree) and even this
-    # script when run by absolute path.
-    for n in names:
-        subprocess.run(["pkill", "-9", n],
-                       stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+def listening_conflicts(ports: Sequence[int]) -> Dict[int, str]:
+    """Return {port: ss-line} for each of *ports* already being listened on.
+
+    Used to detect a startup conflict without killing anything: a global
+    `pkill -9 iperf3/multiplexd` would also SIGKILL unrelated instances owned
+    by this user (a concurrent run, another checkout), so this run inspects
+    only the specific ports it is about to bind and reports the holder.
+    """
+    r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True)
+    conflicts: Dict[int, str] = {}
+    for line in r.stdout.splitlines():
+        for port in ports:
+            # Match ":<port> " in the local-address column, the same anchored
+            # form wait_port() uses, so e.g. :5201 does not match :45201.
+            if port not in conflicts and f":{port} " in line:
+                conflicts[port] = line.strip()
+    return conflicts
 
 
 def wait_port(port: int, timeout: float = 10.0) -> bool:
@@ -251,7 +260,7 @@ def run_iperf_json(
 SERVER_CONF = {
     "api_listen":      f"127.0.0.1:{API_PORT}",
     "mux_listen":      f"127.0.0.1:{MUX_PORT}",
-    "listen":          f"127.0.0.1:5203",
+    "listen":          f"127.0.0.1:{SERVER_LISTEN}",
     "connect":         f"127.0.0.1:{IPERF3_PORT}",
     "loglevel":        4,
     "mux": {
@@ -307,8 +316,18 @@ class LinearityTest:
     # -- setup / teardown ---------------------------------------------------
 
     def setup(self) -> None:
-        killall("iperf3", "multiplexd")
-        time.sleep(1)
+        # Refuse to start if any port this run binds is already taken, rather
+        # than SIGKILLing every same-named process to clear it: a leftover
+        # from a crashed run is worth a diagnostic, and an unrelated iperf3 or
+        # multiplexd owned by this user must not be collateral damage.
+        ports = [IPERF3_PORT, MUX_LISTEN, SERVER_LISTEN, MUX_PORT, API_PORT]
+        conflicts = listening_conflicts(ports)
+        if conflicts:
+            detail = "\n".join("  port %d in use: %s" % (p, conflicts[p])
+                               for p in sorted(conflicts))
+            raise SystemExit(
+                "required port(s) already in use; refusing to kill the "
+                "holder(s). Free them and retry:\n" + detail)
 
         if not self.binary.exists():
             raise SystemExit(f"multiplexd not found: {self.binary}")
@@ -363,20 +382,28 @@ class LinearityTest:
         log(f"multiplexd ready  srv={self._srv_pid}  cli={self._cli_pid}")
 
     def teardown(self) -> None:
-        for p in [self._cli, self._srv, self._iperf]:
-            if p is not None:
-                try:
-                    p.terminate()
-                except OSError:
-                    pass
-        time.sleep(1)
-        for p in [self._cli, self._srv, self._iperf]:
-            if p is not None:
+        # Tear down only the processes this run spawned -- never a global
+        # `pkill` by name, which also SIGKILLs unrelated iperf3/multiplexd
+        # instances (a concurrent run, another checkout) owned by this user.
+        procs = [p for p in (self._cli, self._srv, self._iperf)
+                 if p is not None]
+        for p in procs:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
                 try:
                     p.kill()
                 except OSError:
                     pass
-        killall("iperf3", "multiplexd")
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log(f"  pid {p.pid} still alive after SIGKILL")
 
     # -- single test step ---------------------------------------------------
 
