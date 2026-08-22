@@ -569,7 +569,8 @@ enum wire_shutdown_state mux_wire_shutdown(struct mux_session *restrict ss)
 	}
 #endif /* WITH_TLS */
 	LOGV_F("[fd:%d] shutdown: tcp", ss->w_socket.fd);
-	(void)socket_shutdown(ss->w_socket.fd, SHUT_WR);
+	LOG_SOCKOPT(
+		"socket_shutdown", socket_shutdown(ss->w_socket.fd, SHUT_WR));
 	return WIRE_SHUTDOWN_DONE;
 }
 

@@ -239,7 +239,9 @@ static void stream_shutdown_local_write(struct mux_stream *restrict s)
 		return;
 	}
 	if (!s->is_direct) {
-		(void)socket_shutdown(s->socket.w_io.fd, SHUT_WR);
+		LOG_SOCKOPT(
+			"socket_shutdown",
+			socket_shutdown(s->socket.w_io.fd, SHUT_WR));
 	}
 	s->tx_shutdown = true;
 }
@@ -1350,7 +1352,9 @@ static void stream_rst_notify_socket(struct mux_stream *restrict s)
 		return;
 	}
 	/* Abortively close the local socket to propagate RST to the peer. */
-	(void)socket_set_linger(s->socket.w_io.fd, true, 0);
+	LOG_SOCKOPT(
+		"socket_set_linger",
+		socket_set_linger(s->socket.w_io.fd, true, 0));
 }
 
 void mux_stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
@@ -1475,7 +1479,7 @@ int mux_stream_format_tag(
 			me, sizeof(me), ss->handshake.identity, ESCAPE_PLAIN);
 	} else {
 		union sockaddr_max addr;
-		if (socket_get_addr(ss->w_socket.fd, &addr)) {
+		if (socket_get_addr(ss->w_socket.fd, &addr) == 0) {
 			if (sa_format(me, sizeof(me), &addr.sa) < 0) {
 				me[0] = '\0';
 			}

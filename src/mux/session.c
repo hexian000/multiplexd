@@ -1147,7 +1147,9 @@ void mux_session_set_state(struct mux_session *ss, enum session_state newstate)
 		 * it distinguishes first establishment (CONNECT) from resume. */
 		const bool first_establish =
 			(ss->peer_addr.sa.sa_family == AF_UNSPEC);
-		(void)socket_get_peer(ss->w_socket.fd, &ss->peer_addr);
+		LOG_SOCKOPT(
+			"socket_get_peer",
+			socket_get_peer(ss->w_socket.fd, &ss->peer_addr));
 		ev_timer_again(ss->loop, &ss->w_keepalive);
 		COUNTER_ADD(ss->cnt.session.num_session_connected, 1);
 		COUNTER_SUB(ss->cnt.session.num_session_halfopen, 1);
