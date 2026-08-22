@@ -391,15 +391,21 @@ static bool stream_connect(
 
 	/* No exec() is ever performed in this codebase, so a cloexec failure
 	 * is harmless; only a failed nonblock switch must abort the connect. */
-	(void)socket_set_cloexec(fd);
-	if (!socket_set_nonblock(fd)) {
+	LOG_SOCKOPT("socket_set_cloexec", socket_set_cloexec(fd));
+	if (socket_set_nonblock(fd) != 0) {
+		const int err = errno;
+		LOGE_F("socket_set_nonblock: (%d) %s", err, strerror(err));
 		socket_close(fd);
 		return false;
 	}
-	(void)socket_set_buffer(
-		fd, t->local_socket.tcp_sndbuf, t->local_socket.tcp_rcvbuf);
-	(void)socket_set_tcp(
-		fd, t->local_socket.tcp_nodelay, t->local_socket.tcp_keepalive);
+	LOG_SOCKOPT(
+		"socket_set_buffer", socket_set_buffer(
+					     fd, t->local_socket.tcp_sndbuf,
+					     t->local_socket.tcp_rcvbuf));
+	LOG_SOCKOPT(
+		"socket_set_tcp", socket_set_tcp(
+					  fd, t->local_socket.tcp_nodelay,
+					  t->local_socket.tcp_keepalive));
 
 	const int ret = connect(fd, &connect_addr.sa, sa_len(&connect_addr.sa));
 	if (ret != 0) {
@@ -588,20 +594,29 @@ static bool tunnel_do_connect(struct tunnel *restrict t, int *restrict err_out)
 		*err_out = err;
 		return false;
 	}
-	(void)socket_set_cloexec(fd);
-	if (!socket_set_nonblock(fd)) {
+	LOG_SOCKOPT("socket_set_cloexec", socket_set_cloexec(fd));
+	if (socket_set_nonblock(fd) != 0) {
+		const int err = errno;
+		LOGE_F("socket_set_nonblock: (%d) %s", err, strerror(err));
 		socket_close(fd);
 		return false;
 	}
-	(void)socket_set_buffer(
-		fd, t->mux_socket.tcp_sndbuf, t->mux_socket.tcp_rcvbuf);
+	LOG_SOCKOPT(
+		"socket_set_buffer", socket_set_buffer(
+					     fd, t->mux_socket.tcp_sndbuf,
+					     t->mux_socket.tcp_rcvbuf));
 #if WITH_TCP_NOTSENT_LOWAT
 	if (t->mux_socket.tcp_notsent_lowat > 0) {
-		(void)socket_notsent_lowat(fd, t->mux_socket.tcp_notsent_lowat);
+		LOG_SOCKOPT(
+			"socket_notsent_lowat",
+			socket_notsent_lowat(
+				fd, t->mux_socket.tcp_notsent_lowat));
 	}
 #endif
-	(void)socket_set_tcp(
-		fd, t->mux_socket.tcp_nodelay, t->mux_socket.tcp_keepalive);
+	LOG_SOCKOPT(
+		"socket_set_tcp", socket_set_tcp(
+					  fd, t->mux_socket.tcp_nodelay,
+					  t->mux_socket.tcp_keepalive));
 
 	if (LOGLEVEL(DEBUG)) {
 		char log_addr_str[64];
@@ -750,7 +765,7 @@ static void handle_connected(
 					my, sizeof(my), t->identity);
 			} else {
 				union sockaddr_max addr;
-				if (socket_get_addr(mux_fd(ss), &addr)) {
+				if (socket_get_addr(mux_fd(ss), &addr) == 0) {
 					(void)sa_format(
 						my, sizeof(my), &addr.sa);
 				} else {
@@ -1405,7 +1420,7 @@ struct tunnel *tunnel_new(
 			 * identity, then local socket address. */
 			{
 				union sockaddr_max addr;
-				if (socket_get_peer(fd, &addr)) {
+				if (socket_get_peer(fd, &addr) == 0) {
 					(void)sa_format(
 						peer, sizeof(peer), &addr.sa);
 				} else {
@@ -1417,7 +1432,7 @@ struct tunnel *tunnel_new(
 				tunnel_set_tag_part(my, sizeof(my), identity);
 			} else {
 				union sockaddr_max addr;
-				if (socket_get_addr(fd, &addr)) {
+				if (socket_get_addr(fd, &addr) == 0) {
 					(void)sa_format(
 						my, sizeof(my), &addr.sa);
 				} else {
