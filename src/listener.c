@@ -77,20 +77,29 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 				w->fd, fd, addr_str);
 		}
 
-		(void)socket_set_cloexec(fd);
-		if (!socket_set_nonblock(fd)) {
+		LOG_SOCKOPT("socket_set_cloexec", socket_set_cloexec(fd));
+		if (socket_set_nonblock(fd) != 0) {
+			const int err = errno;
+			LOGE_F("socket_set_nonblock: (%d) %s", err,
+			       strerror(err));
 			socket_close(fd);
 			continue;
 		}
-		(void)socket_set_buffer(
-			fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf);
-		(void)socket_set_tcp(
-			fd, socket_opts->tcp_nodelay,
-			socket_opts->tcp_keepalive);
+		LOG_SOCKOPT(
+			"socket_set_buffer",
+			socket_set_buffer(
+				fd, socket_opts->tcp_sndbuf,
+				socket_opts->tcp_rcvbuf));
+		LOG_SOCKOPT(
+			"socket_set_tcp", socket_set_tcp(
+						  fd, socket_opts->tcp_nodelay,
+						  socket_opts->tcp_keepalive));
 #if WITH_TCP_NOTSENT_LOWAT
 		if (socket_opts->tcp_notsent_lowat > 0) {
-			(void)socket_notsent_lowat(
-				fd, socket_opts->tcp_notsent_lowat);
+			LOG_SOCKOPT(
+				"socket_notsent_lowat",
+				socket_notsent_lowat(
+					fd, socket_opts->tcp_notsent_lowat));
 		}
 #endif
 
@@ -132,19 +141,27 @@ bool listener_start(
 		return false;
 	}
 
-	(void)socket_set_cloexec(fd);
-	if (!socket_set_nonblock(fd)) {
+	LOG_SOCKOPT("socket_set_cloexec", socket_set_cloexec(fd));
+	if (socket_set_nonblock(fd) != 0) {
+		const int err = errno;
+		LOGE_F("socket_set_nonblock: (%d) %s", err, strerror(err));
 		socket_close(fd);
 		return false;
 	}
 
 	const struct conf_socket_opts *const restrict socket_opts =
 		l->socket_opts;
-	(void)socket_set_buffer(
-		fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf);
-	(void)socket_set_tcp(
-		fd, socket_opts->tcp_nodelay, socket_opts->tcp_keepalive);
-	(void)socket_set_reuseport(fd, socket_opts->tcp_reuseport);
+	LOG_SOCKOPT(
+		"socket_set_buffer",
+		socket_set_buffer(
+			fd, socket_opts->tcp_sndbuf, socket_opts->tcp_rcvbuf));
+	LOG_SOCKOPT(
+		"socket_set_tcp", socket_set_tcp(
+					  fd, socket_opts->tcp_nodelay,
+					  socket_opts->tcp_keepalive));
+	LOG_SOCKOPT(
+		"socket_set_reuseport",
+		socket_set_reuseport(fd, socket_opts->tcp_reuseport));
 
 	if (bind(fd, sa, sa_len(sa)) != 0) {
 		const int err = errno;
@@ -161,7 +178,9 @@ bool listener_start(
 	}
 
 #if WITH_TCP_FASTOPEN
-	(void)socket_set_fastopen(fd, socket_opts->backlog);
+	LOG_SOCKOPT(
+		"socket_set_fastopen",
+		socket_set_fastopen(fd, socket_opts->backlog));
 #endif
 
 	ev_io_set(&l->w_accept, fd, EV_READ);
