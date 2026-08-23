@@ -507,15 +507,44 @@ _STATIC_PROVIDERS: tuple[_Provider, ...] = (
         prefixes=None,
         note="POSIX wait-status symbol clang maps to <stdlib.h>",
     ),
-    # `errno` is a macro (*__errno_location()); clang can miss macro-only use
-    # and report <errno.h> unused even where errno is read.
+    # <errno.h> supplies `errno` and the whole E* error-value family, every one
+    # of them a macro. clang's standard-symbol map carries no entry for the E*
+    # names, so no header is ever credited for them and none is ever demanded
+    # either (a file using EAGAIN without <errno.h> draws a compiler error, not
+    # a "no header providing" finding) -- but a file that includes <errno.h>
+    # purely for those values and never reads `errno` is told its include is
+    # unused, when <errno.h> is the only header that portably provides them.
+    # `errno` itself stays listed: it is a macro too (*__errno_location()), and
+    # a clang that misses macro-only use would report the same for it.
+    # The set is POSIX.1-2017's complete <errno.h> value list, spelled out
+    # rather than matched by an "E" prefix because unrelated names share it
+    # (EOF, EVENT, EXPRDEBUG, ... all appear in this tree). A non-POSIX
+    # extension (ESHUTDOWN, EPFNOSUPPORT, ...) is absent by the same fail-safe
+    # rule the ICU entry follows: an unlisted symbol keeps its finding.
     _Provider(
         name="<errno.h>",
         include=_include_re(r"errno\.h"),
         unused_basename="errno.h",
-        symbols=frozenset({"errno"}),
+        symbols=frozenset({
+            "errno", "E2BIG", "EACCES", "EADDRINUSE", "EADDRNOTAVAIL",
+            "EAFNOSUPPORT", "EAGAIN", "EALREADY", "EBADF", "EBADMSG", "EBUSY",
+            "ECANCELED", "ECHILD", "ECONNABORTED", "ECONNREFUSED",
+            "ECONNRESET", "EDEADLK", "EDESTADDRREQ", "EDOM", "EDQUOT",
+            "EEXIST", "EFAULT", "EFBIG", "EHOSTUNREACH", "EIDRM", "EILSEQ",
+            "EINPROGRESS", "EINTR", "EINVAL", "EIO", "EISCONN", "EISDIR",
+            "ELOOP", "EMFILE", "EMLINK", "EMSGSIZE", "EMULTIHOP",
+            "ENAMETOOLONG", "ENETDOWN", "ENETRESET", "ENETUNREACH", "ENFILE",
+            "ENOBUFS", "ENODATA", "ENODEV", "ENOENT", "ENOEXEC", "ENOLCK",
+            "ENOLINK", "ENOMEM", "ENOMSG", "ENOPROTOOPT", "ENOSPC", "ENOSR",
+            "ENOSTR", "ENOSYS", "ENOTCONN", "ENOTDIR", "ENOTEMPTY",
+            "ENOTRECOVERABLE", "ENOTSOCK", "ENOTSUP", "ENOTTY", "ENXIO",
+            "EOPNOTSUPP", "EOVERFLOW", "EOWNERDEAD", "EPERM", "EPIPE",
+            "EPROTO", "EPROTONOSUPPORT", "EPROTOTYPE", "ERANGE", "EROFS",
+            "ESPIPE", "ESRCH", "ESTALE", "ETIME", "ETIMEDOUT", "ETXTBSY",
+            "EWOULDBLOCK", "EXDEV",
+        }),
         prefixes=None,
-        note="clang can miss macro-only <errno.h> use",
+        note="macro clang's symbol map does not credit to <errno.h>",
     ),
     # The socket-address structures and IP protocol/address constants are
     # declared only in <netinet/in.h>; clang misattributes them.
