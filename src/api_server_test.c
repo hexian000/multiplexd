@@ -320,7 +320,7 @@ static int apifx_setup(struct apifx *restrict fx)
 		return -1;
 	}
 	/* fds[0] = server side (transferred to api_serve), fds[1] = client side */
-	if (!socket_set_nonblock(fds[0]) || !socket_set_nonblock(fds[1])) {
+	if (socket_set_nonblock(fds[0]) != 0 || socket_set_nonblock(fds[1]) != 0) {
 		(void)close(fds[0]);
 		(void)close(fds[1]);
 		ev_loop_destroy(fx->loop);
@@ -2509,8 +2509,8 @@ T_DECLARE_CASE(test_content_length_plus_sign_rejected)
 
 	int fds[2];
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-	T_CHECK(socket_set_nonblock(fds[0]));
-	T_CHECK(socket_set_nonblock(fds[1]));
+	T_CHECK(socket_set_nonblock(fds[0]) == 0);
+	T_CHECK(socket_set_nonblock(fds[1]) == 0);
 	api_serve(&srv->api_listener, loop, fds[0], NULL);
 
 	struct apifx fx = { .loop = loop, .cli_fd = fds[1] };
@@ -2700,8 +2700,8 @@ T_DECLARE_CASE(test_config_put_success)
 
 	int fds[2];
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-	T_CHECK(socket_set_nonblock(fds[0]));
-	T_CHECK(socket_set_nonblock(fds[1]));
+	T_CHECK(socket_set_nonblock(fds[0]) == 0);
+	T_CHECK(socket_set_nonblock(fds[1]) == 0);
 	api_serve(&srv->api_listener, loop, fds[0], NULL);
 
 	/* do_exchange/wait_until only touch fx.loop and fx.cli_fd; the rest of
@@ -2828,8 +2828,8 @@ T_DECLARE_CASE(test_expect_100_continue_gets_interim_response)
 
 	int fds[2];
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-	T_CHECK(socket_set_nonblock(fds[0]));
-	T_CHECK(socket_set_nonblock(fds[1]));
+	T_CHECK(socket_set_nonblock(fds[0]) == 0);
+	T_CHECK(socket_set_nonblock(fds[1]) == 0);
 	api_serve(&srv->api_listener, loop, fds[0], NULL);
 	struct apifx fx = { .loop = loop, .cli_fd = fds[1] };
 

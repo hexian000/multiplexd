@@ -611,7 +611,7 @@ mock_server_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 			}
 			return;
 		}
-		if (!socket_set_nonblock(fd)) {
+		if (socket_set_nonblock(fd) != 0) {
 			socket_close(fd);
 			continue;
 		}
@@ -655,7 +655,7 @@ static int mock_server_start(
 		return -1;
 	}
 
-	if (!socket_set_nonblock(mock->listen_fd)) {
+	if (socket_set_nonblock(mock->listen_fd) != 0) {
 		socket_close(mock->listen_fd);
 		mock->listen_fd = -1;
 		return -1;
@@ -936,7 +936,7 @@ static int connect_local(struct test_fixture *restrict fx, const int port)
 		return -1;
 	}
 
-	if (!socket_set_nonblock(fd)) {
+	if (socket_set_nonblock(fd) != 0) {
 		(void)close(fd);
 		return -1;
 	}
