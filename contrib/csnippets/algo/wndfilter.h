@@ -29,9 +29,16 @@ struct wndfilter_sample {
  * @brief State for the windowed min/max tracker.
  * @details s[0] holds the best value, s[1] the 2nd-best, s[2] the 3rd-best.
  * All three are within the current window.
+ * @note Caller-allocated, with no init function: zero-initialize the state or
+ *   seed it with wndfilter_reset() before the first update. An update on an
+ *   indeterminate state reads @c ready; should that land non-zero, the seeding
+ *   is skipped and the slots pass for measurements, so the filter reports a
+ *   value it was never given until their timestamps age out of the window.
  */
 struct wndfilter {
 	struct wndfilter_sample s[3];
+	/* true once the slots hold measurements; they are undefined until
+	 * then */
 	bool ready;
 };
 
@@ -39,6 +46,8 @@ struct wndfilter {
  * @brief Get the current tracked min/max value.
  * @param w Pointer to the tracker state.
  * @return The best value in the current window.
+ * @note Meaningful only after wndfilter_reset() or at least one update; on a
+ *   zero-initialized state that has seen no measurement it returns 0.
  */
 static inline int_fast64_t wndfilter_get(const struct wndfilter *restrict w)
 {
@@ -50,6 +59,8 @@ static inline int_fast64_t wndfilter_get(const struct wndfilter *restrict w)
  * @param w Pointer to the tracker state.
  * @param t Timestamp of the measurement.
  * @param v The measured value.
+ * @note Writes every field and reads none, so it also seeds a state that was
+ *   never initialized.
  */
 void wndfilter_reset(
 	struct wndfilter *restrict w, int_fast64_t t, int_fast64_t v);

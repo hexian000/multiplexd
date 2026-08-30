@@ -3,8 +3,6 @@
 
 #include "shared_mutex.h"
 
-#include "thrd.h"
-
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
@@ -53,8 +51,16 @@ int smtx_lock(smtx_t *mutex)
 			 * registration so a later writer cannot be starved by a
 			 * count that never drains, then surface the failure */
 			mutex->state.exclusive_waiting--;
+			int notify = thrd_success;
+			if (!mutex->state.exclusive &&
+			    mutex->state.exclusive_waiting == 0) {
+				/* the rollback falsified the readers' predicate
+				 * (exclusive || exclusive_waiting > 0) with no
+				 * release to follow, so wake them here or never */
+				notify = cnd_broadcast(&mutex->shared_cond);
+			}
 			const int unlock = mtx_unlock(&mutex->state_mu);
-			return first_error(wait, unlock);
+			return first_error(wait, first_error(notify, unlock));
 		}
 	}
 	assert(mutex->state.exclusive_waiting > 0);
@@ -65,7 +71,7 @@ int smtx_lock(smtx_t *mutex)
 
 int smtx_trylock(smtx_t *mutex)
 {
-	const int status = mtx_lock(&mutex->state_mu);
+	const int status = mtx_trylock(&mutex->state_mu);
 	if (status != thrd_success) {
 		return status;
 	}
@@ -74,8 +80,10 @@ int smtx_trylock(smtx_t *mutex)
 		/* defer to a writer already blocked in smtx_lock(), matching
 		 * smtx_trysharedlock()'s writer-preference check, so a trylock
 		 * retry loop cannot starve the queued writer */
-		THRD_ASSERT(mtx_unlock(&mutex->state_mu));
-		return thrd_busy;
+		const int unlock = mtx_unlock(&mutex->state_mu);
+		/* a failed release must not be reported as thrd_busy: the
+		 * caller would retry against a state_mu that is still held */
+		return first_error(unlock, thrd_busy);
 	}
 	mutex->state.exclusive = true;
 	return mtx_unlock(&mutex->state_mu);
@@ -132,13 +140,13 @@ int smtx_sharedlock(smtx_t *mutex)
 
 int smtx_trysharedlock(smtx_t *mutex)
 {
-	const int status = mtx_lock(&mutex->state_mu);
+	const int status = mtx_trylock(&mutex->state_mu);
 	if (status != thrd_success) {
 		return status;
 	}
 	if (mutex->state.exclusive || mutex->state.exclusive_waiting > 0) {
-		THRD_ASSERT(mtx_unlock(&mutex->state_mu));
-		return thrd_busy;
+		const int unlock = mtx_unlock(&mutex->state_mu);
+		return first_error(unlock, thrd_busy);
 	}
 	mutex->state.shared_count++;
 	return mtx_unlock(&mutex->state_mu);

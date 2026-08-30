@@ -46,7 +46,12 @@ enum table_flags {
  */
 struct table_opts {
 	/** Hash function. NULL = default (cityhash on struct hashkey);
-	 * see the warning above before setting this without eq. */
+	 * see the warning above before setting this without eq.
+	 * Mix `seed` into the result: when a chain grows too long the table
+	 * picks a new seed and rehashes to break it up, which is its only defense
+	 * against collision flooding. A hash that ignores `seed` gets no benefit
+	 * from that rehash, and the table then repeats it at most once per
+	 * resize. */
 	uint_fast32_t (*hash)(const void *key, uint_fast32_t seed);
 	/** Equality function. NULL = default (memcmp on struct hashkey);
 	 * see the warning above before setting this without hash. */
@@ -67,7 +72,7 @@ extern const struct table_opts TABLE_OPTS_PTR;
 /**
  * @brief Create a new hash table.
  * @param opts Options, or NULL for defaults (&TABLE_OPTS_BYTES).
- * @return Pointer to the newly created table.
+ * @return Pointer to the newly created table, or NULL on allocation failure.
  */
 struct hashtable *table_new(const struct table_opts *opts);
 

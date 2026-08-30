@@ -22,8 +22,9 @@ struct executor;
  * @param[in] nworkers Number of worker threads; must be >= 1.
  * @param[in] capacity Maximum number of tasks the bounded queue can hold; must
  * be >= 1.
- * @return The new executor, or NULL if nworkers or capacity is 0, or on
- * allocation failure.
+ * @return The new executor, or NULL if nworkers or capacity is 0, an
+ * allocation or synchronization initialization fails, or a worker thread
+ * cannot be created.
  */
 struct executor *executor_create(size_t nworkers, size_t capacity);
 
@@ -35,7 +36,9 @@ struct executor *executor_create(size_t nworkers, size_t capacity);
  * shutting down (executor_join/executor_detach has been called).
  * @note Calling this concurrently with or after executor_join/executor_detach
  * returns is not supported and may still crash; this only covers the
- * case where exit_flag is already observably set.
+ * case where exit_flag is already observably set. The one exception is a task
+ * still running on this executor after executor_detach, which keeps it alive:
+ * there this returns false (see executor_detach).
  */
 bool executor_invoke(struct executor *e, struct task task);
 
@@ -53,7 +56,15 @@ void executor_join(struct executor *e);
 
 /**
  * @brief Detaches the executor. The resources held by the executor will be freed automatically once the executor finishes.
+ * @details As with executor_join, every task already submitted runs before the
+ * executor is freed; the queue is drained rather than dropped, so a
+ * packaged_task's closure does not leak (see packaged_task.h). Unlike
+ * executor_join, this may be called from a task running on this executor.
  * @param[in] e The executor.
+ * @warning After this returns the executor may be freed at any time, so the
+ * caller must not use @p e again. The one exception is a task still running on
+ * this executor, which keeps it alive until the task returns: executor_invoke
+ * from such a task returns false.
  */
 void executor_detach(struct executor *e);
 

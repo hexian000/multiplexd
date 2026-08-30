@@ -42,7 +42,7 @@ int smtx_lock(smtx_t *mutex);
  * @brief Try to acquire the exclusive (writer) lock without blocking.
  * @param mutex The mutex.
  * @return thrd_success if acquired; thrd_busy if a holder, reader, or waiting
- * writer prevents it; thrd_error on failure.
+ * writer or internal state contention prevents it; thrd_error on failure.
  */
 int smtx_trylock(smtx_t *mutex);
 
@@ -64,8 +64,8 @@ int smtx_sharedlock(smtx_t *mutex);
 /**
  * @brief Try to acquire a shared (reader) lock without blocking.
  * @param mutex The mutex.
- * @return thrd_success if acquired; thrd_busy if a writer holds or is waiting;
- * thrd_error on failure.
+ * @return thrd_success if acquired; thrd_busy if a writer holds or is waiting,
+ * or the internal state is contended; thrd_error on failure.
  */
 int smtx_trysharedlock(smtx_t *mutex);
 

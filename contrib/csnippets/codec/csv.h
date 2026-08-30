@@ -32,7 +32,9 @@ int csv_escape(char *restrict buf, size_t maxlen, const char *restrict field);
  * @brief Unescape a CSV field in-place.
  * @param[inout] field The field to unescape (modified in-place)
  * @return true if the field is valid and successfully unescaped, false otherwise
- * @note On failure, the content may be partially modified.
+ * @note On failure the content may be left partially unescaped, except when
+ *       the closing quote is missing: that is detected before any write, so
+ *       the buffer stays byte-for-byte intact.
  */
 bool csv_unescape(char *restrict field);
 
@@ -58,13 +60,28 @@ bool csv_unescape(char *restrict field);
  *             field) or no field was produced.
  * @return The start of the next field for continued parsing (not equal to buf).
  *         Equal to the input buf when more data is needed for a complete quoted
- *         field (with `field` NULL). NULL when no next field is returned: for
- *         the last field of the data (with `field` set) -- whether it ran to
- *         the end of the buffer or ended at a record separator that was the
- *         buffer's final byte(s) -- or when no field is produced at all --
- *         exhausted input or invalid data (both with `field` NULL). The
- *         last-field case is told apart by whether `field` was set, so a NULL
- *         return alone must not be treated as an error.
+ *         field (with `field` NULL); the buffer is then left byte-for-byte
+ *         intact, so the caller may append more data and call again. This is
+ *         the only resumable result, and it is given only while the quoted
+ *         field has no closing quote yet: the buffer ends inside its content,
+ *         including just after a doubled `""` pair. A lone `"` as the
+ *         buffer's final byte is taken as the closing quote -- the scanner
+ *         cannot tell it from the first half of a `""` pair still to come --
+ *         so the field is reported complete (`sep` '\0') and has already been
+ *         unescaped in place; appending to that buffer and calling again does
+ *         not reparse it. A field returned with `sep` '\0' is therefore
+ *         final: a streaming caller that may still append data hands over only
+ *         data that ends at a record separator, or otherwise accepts the last
+ *         field as final. A buffer ending in '\r' is likewise taken as a
+ *         lone-CR record separator, so such a caller must not split a CRLF
+ *         pair between two buffers.
+ *         NULL when no next field is returned: for the last field of the data
+ *         (with `field` set) -- whether it ran to the end of the buffer or
+ *         ended at a record separator that was the buffer's final byte(s) --
+ *         or when no field is produced at all -- exhausted input or invalid
+ *         data (both with `field` NULL). The last-field case is told apart by
+ *         whether `field` was set, so a NULL return alone must not be treated
+ *         as an error.
  */
 char *
 csv_scanfield(char *restrict buf, char **restrict field, char *restrict sep);
