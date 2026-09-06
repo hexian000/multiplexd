@@ -26,6 +26,14 @@
  * a longer thing for an operator to copy between hosts. */
 #define GENPSK_KEY_LEN TLS_PSK_MIN_LEN
 
+/* "<name>.psk" into buf; false when it does not fit. */
+static bool
+format_psk_path(char *restrict buf, const size_t size, const char *name)
+{
+	const int n = snprintf(buf, size, "%s.psk", name);
+	return n >= 0 && (size_t)n < size;
+}
+
 static bool genpsk_one(const char *restrict name)
 {
 	unsigned char key[GENPSK_KEY_LEN];
@@ -42,8 +50,7 @@ static bool genpsk_one(const char *restrict name)
 	}
 
 	char path[256];
-	const int n = snprintf(path, sizeof(path), "%s.psk", name);
-	if (n < 0 || (size_t)n >= sizeof(path)) {
+	if (!format_psk_path(path, sizeof(path), name)) {
 		LOGE_F("path too long: %s.psk", name);
 		tls_secure_erase(key, sizeof(key));
 		return false;
@@ -78,6 +85,29 @@ static bool genpsk_one(const char *restrict name)
 	return true;
 }
 
+/* A key file written by this call, so a later failure in the same list can
+ * take it back: a stray key would make the corrected retry fail on O_EXCL. */
+struct generated_name {
+	const char *name;
+	struct generated_name *next;
+};
+
+static void
+release_generated_names(struct generated_name *names, const bool discard)
+{
+	while (names != NULL) {
+		struct generated_name *const next = names->next;
+		if (discard) {
+			char path[256];
+			if (format_psk_path(path, sizeof(path), names->name)) {
+				discard_file(path);
+			}
+		}
+		free(names);
+		names = next;
+	}
+}
+
 bool genpsk(const char *names)
 {
 	if (names == NULL) {
@@ -90,9 +120,9 @@ bool genpsk(const char *names)
 		return false;
 	}
 	bool ok = true;
-	size_t generated = 0;
+	struct generated_name *generated_names = NULL;
 	char *saveptr = NULL;
-	for (char *name = strtok_r(copy, ",", &saveptr); name != NULL && ok;
+	for (char *name = strtok_r(copy, ",", &saveptr); name != NULL;
 	     name = strtok_r(NULL, ",", &saveptr)) {
 		while (*name == ' ') {
 			name++;
@@ -104,18 +134,31 @@ bool genpsk(const char *names)
 		if (*name == '\0') {
 			continue;
 		}
-		ok = genpsk_one(name);
-		if (ok) {
-			generated++;
+		struct generated_name *const node = malloc(sizeof(*node));
+		if (node == NULL) {
+			LOGOOM();
+			ok = false;
+			break;
 		}
+		if (!genpsk_one(name)) {
+			free(node);
+			ok = false;
+			break;
+		}
+		node->name = name;
+		node->next = generated_names;
+		generated_names = node;
 	}
-	free(copy);
-	if (ok && generated == 0) {
+	if (ok && generated_names == NULL) {
 		/* Every token was blank: nothing was written, so reporting
 		 * success would tell a provisioning script its keys exist. */
 		LOGE("no key names given");
-		return false;
+		ok = false;
 	}
+	/* All or nothing: a failure part-way through the list takes back the
+	 * keys this call already wrote, never a file that existed before it. */
+	release_generated_names(generated_names, !ok);
+	free(copy);
 	return ok;
 }
 

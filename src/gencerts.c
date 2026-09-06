@@ -10,6 +10,7 @@
 
 #if WITH_OPENSSL
 
+#include "mux/mux.h"
 #include "shim/util.h"
 
 #include "net/url.h"
@@ -18,6 +19,7 @@
 
 #include <openssl/asn1.h>
 #include <openssl/bn.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/obj_mac.h>
@@ -26,6 +28,8 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -132,9 +136,6 @@ static EVP_PKEY *generate_key(const char *type, int keysize)
 		}
 		const char *curve;
 		switch (keysize) {
-		case 224:
-			curve = "P-224";
-			break;
 		case 256:
 			curve = "P-256";
 			break;
@@ -229,6 +230,46 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 	return true;
 }
 
+/* Read the --sign keypair @p name and check it can issue certificates: its key
+ * must match its certificate, and the certificate must be a CA.  On failure
+ * nothing is returned and nothing is left allocated. */
+static bool read_signer(const char *name, X509 **out_cert, EVP_PKEY **out_key)
+{
+	X509 *cert = NULL;
+	EVP_PKEY *key = NULL;
+	if (!read_keypair(name, &cert, &key)) {
+		LOGE_F("failed to read signing certificate: %s", name);
+		return false;
+	}
+	if (X509_check_private_key(cert, key) != 1) {
+		LOGE_F("signing certificate and key do not match: %s", name);
+		/* Drain any error-queue entries this pushed, so they can't
+		 * bleed into a later, unrelated LOG_SSLERROR (gencerts() is a
+		 * reusable entry point invoked repeatedly in one process). */
+		LOG_SSLERROR("X509_check_private_key");
+		X509_free(cert);
+		EVP_PKEY_free(key);
+		return false;
+	}
+	/* A chain under a non-CA signer is rejected by every verifier (OpenSSL:
+	 * X509_V_ERR_INVALID_CA; mbedTLS requires the parent's ca_istrue), so
+	 * fail here rather than write certificates that only fail later, in a
+	 * handshake on a remote peer.  Only 1 -- basicConstraints CA:TRUE, with
+	 * keyCertSign if keyUsage is present -- is accepted: the V1-root and
+	 * keyUsage-only forms X509_check_ca() also reports as CAs fail mbedTLS's
+	 * ca_istrue check and OpenSSL's X509_V_FLAG_X509_STRICT. */
+	if (X509_check_ca(cert) != 1) {
+		LOGE_F("signing certificate is not a CA certificate: %s", name);
+		LOG_SSLERROR("X509_check_ca");
+		X509_free(cert);
+		EVP_PKEY_free(key);
+		return false;
+	}
+	*out_cert = cert;
+	*out_key = key;
+	return true;
+}
+
 /* RFC 5280 4.1.2.2 requires a positive serial number; use 128 random bits
  * with the most-significant bit forced set (BN_RAND_TOP_ONE), so the value is
  * always in [2^127, 2^128) and can never be the forbidden zero. On failure the
@@ -270,15 +311,89 @@ static bool set_random_serial(X509 *restrict cert)
 #define GENCERTS_CN_MAX 64
 /* Longest server name the tool accepts; the SAN buffer is sized from it. */
 #define GENCERTS_NAME_MAX 255
+/* Longest identity the hello's identity extension carries (doc/spec.md
+ * 5.2.3.2), and so the longest a peer can ever claim. */
+#define IDENTITY_WIRE_MAX 255
+static_assert(
+	IDENTITY_ENCODED_MAX == (size_t)IDENTITY_WIRE_MAX * 3,
+	"the escaped identity buffer must hold a fully escaped wire identity");
 
-/* Sets the subject CN to server_name. On failure the caller still owns and
- * frees `cert` itself. */
-static bool
-set_subject_cn(X509 *restrict cert, const char *restrict server_name)
+/* The subjectAltName value is parsed by OpenSSL as a comma-separated
+ * configuration list.  Keep the server name in the DNS hostname alphabet so
+ * punctuation cannot become another extension entry.  The total name bound
+ * is enforced by check_server_name(); label lengths are intentionally left
+ * unchanged for compatibility with the existing 255-byte limit. */
+static bool is_valid_server_name(
+	const char *restrict server_name, const size_t server_name_len)
 {
+	if (server_name_len == 0) {
+		return false;
+	}
+
+	bool label_has_char = false;
+	bool label_start = true;
+	for (size_t i = 0; i < server_name_len; i++) {
+		const unsigned char c = (unsigned char)server_name[i];
+		if (c == '.') {
+			/* Permit one trailing dot for an absolute DNS name, but no
+			 * empty label anywhere else. */
+			if (!label_has_char &&
+			    (i == 0 || i + 1 != server_name_len ||
+			     server_name[i - 1] == '.')) {
+				return false;
+			}
+			if (i + 1 == server_name_len) {
+				return true;
+			}
+			label_has_char = false;
+			label_start = true;
+			continue;
+		}
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		      (c >= '0' && c <= '9') || c == '-')) {
+			return false;
+		}
+		if (c == '-' && (label_start || i + 1 == server_name_len ||
+				 server_name[i + 1] == '.')) {
+			return false;
+		}
+		label_start = false;
+		label_has_char = true;
+	}
+
+	return label_has_char ||
+	       (server_name_len > 1 && server_name[server_name_len - 1] == '.');
+}
+
+/* Sets the subject to CN=<server_name>, dnQualifier=<certificate serial>.
+ * RFC 5280 4.1.2.6 requires a DN unique to each subject entity one CA
+ * certifies, yet every certificate from one invocation shares the server name.
+ * The CN alone would give a --sign'ed leaf the CA's own DN -- making it
+ * self-issued in every verifier's eyes -- and its sibling leaves one DN
+ * between them.  dnQualifier is the X.520 attribute for exactly this
+ * disambiguation, and the certificate's own random serial (already set) makes
+ * the DN unique without depending on the operator's file name, whose charset
+ * and length a PrintableString could not carry.  On failure the caller still
+ * owns and frees `cert` itself. */
+static bool
+set_subject_name(X509 *restrict cert, const char *restrict server_name)
+{
+	BIGNUM *const bn =
+		ASN1_INTEGER_to_BN(X509_get0_serialNumber(cert), NULL);
+	if (bn == NULL) {
+		LOG_SSLERROR("ASN1_INTEGER_to_BN");
+		return false;
+	}
+	char *const serial_hex = BN_bn2hex(bn);
+	BN_free(bn);
+	if (serial_hex == NULL) {
+		LOG_SSLERROR("BN_bn2hex");
+		return false;
+	}
 	X509_NAME *const name = X509_NAME_new();
 	if (name == NULL) {
 		LOG_SSLERROR("X509_NAME_new");
+		OPENSSL_free(serial_hex);
 		return false;
 	}
 	/* MBSTRING_ASC makes OpenSSL enforce ub_common_name (RFC 5280 A.1) on
@@ -293,11 +408,17 @@ set_subject_cn(X509 *restrict cert, const char *restrict server_name)
 		       GENCERTS_CN_MAX);
 		cn_len = GENCERTS_CN_MAX;
 	}
-	if (X509_NAME_add_entry_by_txt(
-		    name, "CN", MBSTRING_ASC,
-		    (const unsigned char *)server_name, (int)cn_len, -1,
-		    0) == 0) {
-		LOG_SSLERROR("X509_NAME_add_entry_by_txt");
+	const bool ok =
+		X509_NAME_add_entry_by_NID(
+			name, NID_commonName, MBSTRING_ASC,
+			(const unsigned char *)server_name, (int)cn_len, -1,
+			0) != 0 &&
+		X509_NAME_add_entry_by_NID(
+			name, NID_dnQualifier, MBSTRING_ASC,
+			(const unsigned char *)serial_hex, -1, -1, 0) != 0;
+	OPENSSL_free(serial_hex);
+	if (!ok) {
+		LOG_SSLERROR("X509_NAME_add_entry_by_NID");
 		X509_NAME_free(name);
 		return false;
 	}
@@ -336,8 +457,8 @@ static bool add_subject_alt_name_ext(
 	const char *restrict server_name, const char *restrict identity)
 {
 	const size_t server_name_len = strlen(server_name);
-	/* create_certificate gates the name before reaching here; bound the VLA
-	 * against that guarantee rather than taking it from the caller. */
+	/* check_server_name() gates the name before any key is generated; bound
+	 * the VLA against that guarantee rather than taking it from the caller. */
 	ASSERT(server_name_len <= GENCERTS_NAME_MAX);
 	/* "DNS:" + server name + ",URI:" + scheme + the percent-encoded identity.
 	 * Each sizeof carries its own NUL, so this is comfortably above the exact
@@ -354,21 +475,65 @@ static bool add_subject_alt_name_ext(
 	return add_ext(cert, v3ctx, NID_subject_alt_name, san_value);
 }
 
-static bool create_certificate(
-	X509 *parent, EVP_PKEY *sign_key, const char *server_name,
-	const char *identity, EVP_PKEY *pkey, X509 **out_cert)
+/* Checked once, before any key is generated, since every certificate of the
+ * run carries the same name.  The length gate is what bounds the
+ * subjectAltName buffer add_subject_alt_name_ext() sizes from the name (and
+ * ASSERTs against); a name over GENCERTS_NAME_MAX octets would otherwise size
+ * that stack buffer from untrusted input.  The CN is no reason for it:
+ * set_subject_name() truncates a name past GENCERTS_CN_MAX instead of failing. */
+static bool check_server_name(const char *restrict server_name)
 {
-	/* Gate the length once, here, before anything consumes the name: the CN
-	 * entry below would otherwise refuse a 65-255 octet name on OpenSSL's own
-	 * ub_common_name bound, reporting a raw error-queue dump instead of this
-	 * diagnostic. */
 	const size_t server_name_len = strlen(server_name);
 	if (server_name_len > GENCERTS_NAME_MAX) {
 		LOGE_F("server name too long: %zu bytes (limit %d)",
 		       server_name_len, GENCERTS_NAME_MAX);
 		return false;
 	}
+	if (!is_valid_server_name(server_name, server_name_len)) {
+		LOGE_F("invalid server name: %s", server_name);
+		return false;
+	}
+	return true;
+}
 
+/* Refuse an identity identity.verify can never match, before any key is
+ * generated: the verifier compares against a peer's claim, which the wire caps
+ * at IDENTITY_WIRE_MAX octets, and decodes the URI name with
+ * url_unescape_path(), which rejects every decoded control character (see
+ * identity_uri_matches() in shim/util.c).  Such a certificate would otherwise
+ * be written and reported "ok", failing only later on the remote peer.  Past
+ * MUX_MAX_CLAIM_LEN the identity is still claimable, just not by multiplexd.
+ * The value is not logged: it may hold the very control bytes refused here. */
+static bool
+check_identity(const char *restrict name, const char *restrict identity)
+{
+	const size_t len = strlen(identity);
+	if (len > IDENTITY_WIRE_MAX) {
+		LOGE_F("identity for %s is %zu octets, over the %d-octet limit"
+		       " a peer can claim",
+		       name, len, IDENTITY_WIRE_MAX);
+		return false;
+	}
+	for (size_t i = 0; i < len; i++) {
+		if (iscntrl((unsigned char)identity[i])) {
+			LOGE_F("identity for %s has a control character at"
+			       " octet %zu, which identity.verify never matches",
+			       name, i);
+			return false;
+		}
+	}
+	if (len > MUX_MAX_CLAIM_LEN) {
+		LOGW_F("identity for %s is %zu octets: multiplexd claims at"
+		       " most %u, so only another implementation can use it",
+		       name, len, (unsigned)MUX_MAX_CLAIM_LEN);
+	}
+	return true;
+}
+
+static bool create_certificate(
+	X509 *parent, EVP_PKEY *sign_key, const char *server_name,
+	const char *identity, EVP_PKEY *pkey, X509 **out_cert)
+{
 	X509 *const cert = X509_new();
 	if (cert == NULL) {
 		LOG_SSLERROR("X509_new");
@@ -394,7 +559,7 @@ static bool create_certificate(
 		return false;
 	}
 
-	if (!set_subject_cn(cert, server_name)) {
+	if (!set_subject_name(cert, server_name)) {
 		X509_free(cert);
 		return false;
 	}
@@ -536,6 +701,19 @@ write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 	return true;
 }
 
+/* Remove both files for a pair that was created by this invocation. */
+static void discard_keypair(const char *name)
+{
+	char cert_file[256], key_file[256];
+	if (format_pem_filename(
+		    cert_file, sizeof(cert_file), name, "-cert.pem")) {
+		discard_file(cert_file);
+	}
+	if (format_pem_filename(key_file, sizeof(key_file), name, "-key.pem")) {
+		discard_file(key_file);
+	}
+}
+
 /* Next comma-separated field from *cursor, trimmed of surrounding spaces, or
  * NULL once the list is exhausted.  Unlike the strtok_r() used for the name
  * list, an empty field is returned as "" rather than skipped: "" is a valid
@@ -595,76 +773,37 @@ static bool generate_one(
 	return ok;
 }
 
-bool gencerts(
-	const char *names, const char *server_name, const char *sign_cert,
-	const char *keytype, int keysize, const char *identities)
+/* One certificate to generate: its file-name stem and the identity paired
+ * with it (NULL for none). Both point into gencerts()'s own list copies. */
+struct cert_job {
+	const char *name;
+	const char *identity;
+	struct cert_job *next;
+};
+
+static void free_jobs(struct cert_job *jobs)
 {
-	if (names == NULL) {
-		LOGE("invalid options");
-		return false;
+	while (jobs != NULL) {
+		struct cert_job *const next = jobs->next;
+		free(jobs);
+		jobs = next;
 	}
+}
 
-	X509 *parent_cert = NULL;
-	EVP_PKEY *sign_key = NULL;
-
-	if (sign_cert != NULL) {
-		if (!read_keypair(sign_cert, &parent_cert, &sign_key)) {
-			LOGE_F("failed to read signing certificate: %s",
-			       sign_cert);
-			return false;
-		}
-		if (X509_check_private_key(parent_cert, sign_key) != 1) {
-			LOGE_F("signing certificate and key do not match: %s",
-			       sign_cert);
-			/* Drain any error-queue entries this pushed, so they can't
-			 * bleed into a later, unrelated LOG_SSLERROR (gencerts() is a
-			 * reusable entry point invoked repeatedly in one process). */
-			LOG_SSLERROR("X509_check_private_key");
-			X509_free(parent_cert);
-			EVP_PKEY_free(sign_key);
-			return false;
-		}
-	}
-
-	const char *server_name_val =
-		(server_name != NULL) ? server_name : "example.com";
-
-	char *const names_copy = strdup(names);
-	if (names_copy == NULL) {
-		LOGOOM();
-		if (parent_cert != NULL) {
-			X509_free(parent_cert);
-		}
-		if (sign_key != NULL) {
-			EVP_PKEY_free(sign_key);
-		}
-		return false;
-	}
-
-	/* A NULL list omits the identity from every certificate; it is never
-	 * inferred from the file name. Only a non-NULL list is paired
-	 * positionally with the names. */
-	char *identities_copy = NULL;
-	if (identities != NULL) {
-		identities_copy = strdup(identities);
-		if (identities_copy == NULL) {
-			LOGOOM();
-			free(names_copy);
-			if (parent_cert != NULL) {
-				X509_free(parent_cert);
-			}
-			if (sign_key != NULL) {
-				EVP_PKEY_free(sign_key);
-			}
-			return false;
-		}
-	}
-	char *id_cursor = identities_copy;
-
-	bool success = true;
-	size_t generated = 0;
+/* Split the --gencerts list into jobs, in list order, pairing each name
+ * positionally with its --identity entry and checking every identity, so that
+ * nothing is generated for an invocation that would be refused anyway.
+ * Tokenizes both lists in place. On success *out_jobs is the list (NULL when
+ * every name was blank), which the caller frees with free_jobs(). */
+static bool plan_jobs(
+	char *restrict names, char *restrict identities,
+	struct cert_job **restrict out_jobs)
+{
+	struct cert_job *jobs = NULL;
+	struct cert_job **tail = &jobs;
+	char *id_cursor = identities;
 	char *saveptr = NULL;
-	for (char *name = strtok_r(names_copy, ",", &saveptr); name != NULL;
+	for (char *name = strtok_r(names, ",", &saveptr); name != NULL;
 	     name = strtok_r(NULL, ",", &saveptr)) {
 		while (*name == ' ') {
 			name++;
@@ -682,52 +821,113 @@ bool gencerts(
 		 * name.  Consumed after the empty-name skip above, so blank
 		 * name fields do not shift the pairing. */
 		const char *identity = NULL;
-		if (identities_copy != NULL) {
+		if (identities != NULL) {
 			identity = next_field(&id_cursor);
 			if (identity == NULL) {
 				LOGE("--identity has fewer entries than"
 				     " --gencerts");
-				success = false;
-				break;
+				free_jobs(jobs);
+				return false;
+			}
+			if (!check_identity(name, identity)) {
+				free_jobs(jobs);
+				return false;
 			}
 		}
-
-		if (!generate_one(
-			    name, server_name_val, identity, parent_cert,
-			    sign_key, keytype, keysize)) {
-			success = false;
-			break;
+		struct cert_job *const job = malloc(sizeof(*job));
+		if (job == NULL) {
+			LOGOOM();
+			free_jobs(jobs);
+			return false;
 		}
-		generated++;
+		job->name = name;
+		job->identity = identity;
+		job->next = NULL;
+		*tail = job;
+		tail = &job->next;
 	}
 
-	if (success && id_cursor != NULL) {
+	if (id_cursor != NULL) {
 		LOGE("--identity has more entries than --gencerts");
-		success = false;
+		free_jobs(jobs);
+		return false;
+	}
+	*out_jobs = jobs;
+	return true;
+}
+
+bool gencerts(
+	const char *names, const char *server_name, const char *sign_cert,
+	const char *keytype, int keysize, const char *identities)
+{
+	if (names == NULL) {
+		LOGE("invalid options");
+		return false;
+	}
+	const char *server_name_val =
+		(server_name != NULL) ? server_name : "example.com";
+	if (!check_server_name(server_name_val)) {
+		return false;
 	}
 
-	free(names_copy);
-	free(identities_copy);
-
-	if (parent_cert != NULL) {
-		X509_free(parent_cert);
+	char *const names_copy = strdup(names);
+	/* A NULL list omits the identity from every certificate; it is never
+	 * inferred from the file name. Only a non-NULL list is paired
+	 * positionally with the names. */
+	char *const identities_copy =
+		(identities != NULL) ? strdup(identities) : NULL;
+	if (names_copy == NULL ||
+	    (identities != NULL && identities_copy == NULL)) {
+		LOGOOM();
+		free(identities_copy);
+		free(names_copy);
+		return false;
 	}
-	if (sign_key != NULL) {
-		EVP_PKEY_free(sign_key);
-	}
 
+	struct cert_job *jobs = NULL;
+	bool success = plan_jobs(names_copy, identities_copy, &jobs);
 	/* Every token was empty or blank (e.g. `--gencerts ""` from an unset
 	 * shell variable): nothing was written, so reporting success would tell a
 	 * provisioning script its certificates exist. */
-	if (success && generated == 0) {
+	if (success && jobs == NULL) {
 		LOGE_F("no certificate name in list: \"%s\"", names);
 		success = false;
 	}
 
+	X509 *parent_cert = NULL;
+	EVP_PKEY *sign_key = NULL;
+	if (success && sign_cert != NULL &&
+	    !read_signer(sign_cert, &parent_cert, &sign_key)) {
+		success = false;
+	}
+
+	/* Jobs before `pending` have been written. A failure part-way removes
+	 * them all, so a rerun is not refused by the survivors. */
+	const struct cert_job *pending = jobs;
+	for (; success && pending != NULL; pending = pending->next) {
+		if (!generate_one(
+			    pending->name, server_name_val, pending->identity,
+			    parent_cert, sign_key, keytype, keysize)) {
+			success = false;
+			break;
+		}
+	}
+	if (!success) {
+		for (const struct cert_job *job = jobs; job != pending;
+		     job = job->next) {
+			discard_keypair(job->name);
+		}
+	}
+
+	X509_free(parent_cert);
+	EVP_PKEY_free(sign_key);
+	free_jobs(jobs);
+	free(identities_copy);
+	free(names_copy);
+
 	if (success) {
 		LOGN("ok");
 	}
-
 	return success;
 }
 

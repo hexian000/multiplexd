@@ -68,14 +68,18 @@ bool csprng_bytes(unsigned char *buf, const size_t len)
 	return true;
 }
 
-/* Best-effort: the caller is already returning an error. */
+/* Best-effort: the caller is already returning an error. A removal that
+ * succeeds is logged too, since the caller may already have announced the
+ * file as written; without it the log would claim a file that is gone. */
 void discard_file(const char *path)
 {
 	if (unlink(path) != 0) {
 		const int err = errno;
 		LOGW_F("failed to remove %s: (%d) %s", path, err,
 		       strerror(err));
+		return;
 	}
+	LOGN_F("remove %s", path);
 }
 
 FILE *create_exclusive(const char *path, mode_t mode)

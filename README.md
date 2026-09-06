@@ -172,10 +172,10 @@ multiplexd --gencerts client1,client2,client3 --sign ca --identity east-1,east-2
 | ------------ | ------------------- | ----------------------------------------------------------------------------------------------------- |
 | `--gencerts` | name[,name...]      | Comma-separated list of certificate names to generate                                                 |
 | `--sni`      | hostname            | Server name for certificates (default: example.com)                                                   |
-| `--identity` | name[,name...]      | Identity URI subjectAltName (`multiplexd:<identity>`) per certificate, paired positionally with `--gencerts`. Omitting the option generates certificates carrying no identity, which is the default; an empty entry is the empty identity, itself a valid one. Required by `identity.verify`. |
-| `--sign`     | name                | Sign generated certificates with the named signer (uses `<name>-cert.pem` and `<name>-key.pem`)       |
+| `--identity` | name[,name...]      | Identity URI subjectAltName (`multiplexd:<identity>`) per certificate, paired positionally with `--gencerts`. Omitting the option generates certificates carrying no identity, which is the default; an empty entry is the empty identity, itself a valid one. An identity `identity.verify` could never match — over 255 octets, or holding a control character — is rejected before any key is generated; one over 63 octets is accepted with a warning, since multiplexd itself claims at most 63. Required by `identity.verify`. |
+| `--sign`     | name                | Sign generated certificates with the named signer (uses `<name>-cert.pem` and `<name>-key.pem`). The signer must be a CA certificate (basicConstraints `CA:TRUE`), such as one generated without `--sign`; signing with a leaf fails before anything is written. |
 | `--keytype`  | rsa, ecdsa, ed25519 | Key algorithm (default: rsa). `rsa` and `ecdsa` certificates load on either TLS backend; `ed25519` ones are usable only where OpenSSL is in use, since mbedTLS does not support Ed25519 in X.509 — a daemon built against it rejects the certificate at startup (`X509 - Requested OID is unknown`). |
-| `--keysize`  | bits                | Key size in bits: RSA 4096 (default, range 2048-16384); ECDSA NIST P-224/256/384/521. Ignored when `--keytype ed25519`. |
+| `--keysize`  | bits                | Key size in bits: RSA 4096 (default, range 2048-16384); ECDSA 256 (default), 384 or 521, selecting NIST P-256/384/521. Not accepted with `--keytype ed25519`, whose key size is fixed: giving one makes certificate generation fail. |
 
 Generated files: `<name>-cert.pem` and `<name>-key.pem`.
 

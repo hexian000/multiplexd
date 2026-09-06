@@ -20,6 +20,7 @@
 #include <openssl/pem.h>
 #include <openssl/types.h>
 #include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 
 #include <dirent.h>
@@ -329,7 +330,7 @@ T_DECLARE_CASE(test_gencerts_with_signing_cert)
 	leave_tmpdir(origdir, tmpl);
 }
 
-T_DECLARE_CASE(test_gencerts_ecdsa_p224)
+T_DECLARE_CASE(test_gencerts_ecdsa_p224_rejected)
 {
 	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
 	char origdir[PATH_MAX];
@@ -337,11 +338,9 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p224)
 
 	const bool ok =
 		gencerts("p224", "p224.example", NULL, "ecdsa", 224, NULL);
-	T_EXPECT(ok);
-	if (ok) {
-		T_EXPECT_EQ(access("p224-cert.pem", F_OK), 0);
-		T_EXPECT_EQ(access("p224-key.pem", F_OK), 0);
-	}
+	T_EXPECT(!ok);
+	T_EXPECT(access("p224-cert.pem", F_OK) != 0);
+	T_EXPECT(access("p224-key.pem", F_OK) != 0);
 
 	leave_tmpdir(origdir, tmpl);
 }
@@ -395,9 +394,12 @@ T_DECLARE_CASE(test_gencerts_key_write_failure_removes_cert)
 	}
 
 	const bool ok = gencerts(
-		"rollback", "rollback.example", NULL, "ed25519", 0, NULL);
+		"first,rollback", "rollback.example", NULL, "ed25519", 0, NULL);
 	T_EXPECT(!ok);
+	T_EXPECT(access("first-cert.pem", F_OK) != 0);
+	T_EXPECT(access("first-key.pem", F_OK) != 0);
 	T_EXPECT(access("rollback-cert.pem", F_OK) != 0);
+	T_EXPECT(access("rollback-key.pem", F_OK) == 0);
 
 	leave_tmpdir(origdir, tmpl);
 }
@@ -420,6 +422,25 @@ T_DECLARE_CASE(test_gencerts_sni_too_long_rejected)
 	free(long_sni);
 	T_EXPECT(!ok);
 	T_EXPECT(access("toolong-cert.pem", F_OK) != 0);
+
+	leave_tmpdir(origdir, tmpl);
+}
+
+/* The SAN extension value is an OpenSSL comma-separated configuration list.
+ * A punctuation-bearing SNI must be rejected rather than interpreted as an
+ * additional URI or other SAN entry. */
+T_DECLARE_CASE(test_gencerts_sni_san_injection_rejected)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok = gencerts(
+		"injected", "foo,URI:multiplexd:attacker", NULL, "ed25519", 0,
+		NULL);
+	T_EXPECT(!ok);
+	T_EXPECT(access("injected-cert.pem", F_OK) != 0);
+	T_EXPECT(access("injected-key.pem", F_OK) != 0);
 
 	leave_tmpdir(origdir, tmpl);
 }
@@ -732,7 +753,227 @@ T_DECLARE_CASE(test_gencerts_identity_count_mismatch)
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
 	T_EXPECT(!gencerts("a,b", "id.example", NULL, "ed25519", 0, "x"));
+	T_EXPECT(access("a-cert.pem", F_OK) != 0);
+	T_EXPECT(access("a-key.pem", F_OK) != 0);
 	T_EXPECT(!gencerts("c", "id.example", NULL, "ed25519", 0, "x,y"));
+	T_EXPECT(access("c-cert.pem", F_OK) != 0);
+	T_EXPECT(access("c-key.pem", F_OK) != 0);
+
+	leave_tmpdir(origdir, tmpl);
+}
+
+/* Collects the log lines gencerts() emits while registered as slog's sink. */
+struct log_capture {
+	size_t len;
+	bool overflow;
+	char buf[4096];
+};
+
+static void
+log_capture_write(void *ud, const unsigned char *buf, const size_t len)
+{
+	struct log_capture *const restrict cap = ud;
+	/* One byte is reserved for the NUL the string searches need. */
+	if (cap->len + len >= sizeof(cap->buf)) {
+		cap->overflow = true;
+		return;
+	}
+	memcpy(cap->buf + cap->len, buf, len);
+	cap->len += len;
+	cap->buf[cap->len] = '\0';
+}
+
+/* Run gencerts() with its NOTICE-and-above output captured into @p cap. The
+ * suite otherwise runs silent with no sink, which is how it is left. */
+static bool gencerts_captured(
+	struct log_capture *restrict cap, const char *restrict names,
+	const char *restrict server_name, const char *restrict identities)
+{
+	cap->len = 0;
+	cap->overflow = false;
+	cap->buf[0] = '\0';
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_capture_write, cap);
+	slog_setlevel(LOG_LEVEL_NOTICE);
+	const bool ok =
+		gencerts(names, server_name, NULL, "ed25519", 0, identities);
+	slog_setlevel(LOG_LEVEL_SILENCE);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+	return ok;
+}
+
+/* An invocation gencerts would refuse must be refused before any key is
+ * generated or any file written, not after generating keys only to roll the
+ * files back: with the default RSA-4096 that is seconds per wasted key.
+ * generate_key() logs "keytype=" for every key it starts, and write_keypair()
+ * logs "write" for every pair it lands, so neither may appear. */
+T_DECLARE_CASE(test_gencerts_validates_before_generating)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	static const struct {
+		const char *names;
+		const char *server_name;
+		const char *identities;
+	} cases[] = {
+		/* one identity too many, noticed only after the last name */
+		{ "a,b,c", "id.example", "x,y,z,EXTRA" },
+		/* the server name is shared by every certificate */
+		{ "a,b,c", "bad_name", NULL },
+		/* a bad identity paired with the last name only */
+		{ "a,b,c", "id.example", "x,y,\x01" },
+	};
+	struct log_capture cap;
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		const bool ok = gencerts_captured(
+			&cap, cases[i].names, cases[i].server_name,
+			cases[i].identities);
+		T_EXPECT(!ok);
+		T_EXPECT(!cap.overflow);
+		const bool generated = strstr(cap.buf, "keytype=") != NULL;
+		const bool written = strstr(cap.buf, "write ") != NULL;
+		if (generated || written) {
+			T_LOGF("case %zu generated before refusing: %s", i,
+			       cap.buf);
+		}
+		T_EXPECT(!generated);
+		T_EXPECT(!written);
+		T_EXPECT(access("a-cert.pem", F_OK) != 0);
+		T_EXPECT(access("a-key.pem", F_OK) != 0);
+	}
+
+	leave_tmpdir(origdir, tmpl);
+}
+
+/* A pair write_keypair() announced as written and a later name's failure then
+ * took back must be reported as removed, after the notice that claimed it:
+ * otherwise the log asserts files exist that do not. */
+T_DECLARE_CASE(test_gencerts_mid_list_failure_logs_removal)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	FILE *const stale = fopen("second-key.pem", "w");
+	T_CHECK(stale != NULL);
+	if (stale != NULL) {
+		(void)fclose(stale);
+	}
+	struct log_capture cap;
+	const bool ok =
+		gencerts_captured(&cap, "first,second", "id.example", NULL);
+	const bool left_cert = access("first-cert.pem", F_OK) == 0;
+	const bool left_key = access("first-key.pem", F_OK) == 0;
+
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(!ok);
+	T_EXPECT(!cap.overflow);
+	T_EXPECT(!left_cert);
+	T_EXPECT(!left_key);
+	const char *const written =
+		strstr(cap.buf, "write first-cert.pem, first-key.pem");
+	T_EXPECT(written != NULL);
+	if (written != NULL) {
+		const bool removed_cert =
+			strstr(written, "remove first-cert.pem") != NULL;
+		const bool removed_key =
+			strstr(written, "remove first-key.pem") != NULL;
+		if (!removed_cert || !removed_key) {
+			T_LOGF("rollback not logged: %s", cap.buf);
+		}
+		T_EXPECT(removed_cert);
+		T_EXPECT(removed_key);
+	}
+}
+
+/* A claimed identity is at most 255 octets on the wire (doc/spec.md 5.2.3.2),
+ * so a longer one can never verify and is refused; exactly 255 is claimable
+ * and accepted, and lands in the certificate whole. */
+T_DECLARE_CASE(test_gencerts_identity_wire_limit)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	/* The expected URI name, whose tail is the identity itself: room for
+	 * 256 identity octets after the scheme. */
+	char uri[sizeof("multiplexd:") + 256] = "multiplexd:";
+	char *const identity = uri + sizeof("multiplexd:") - 1;
+	struct log_capture cap;
+
+	memset(identity, 'a', 256);
+	identity[256] = '\0';
+	T_EXPECT(!gencerts_captured(&cap, "over", "id.example", identity));
+	T_EXPECT(access("over-cert.pem", F_OK) != 0);
+	T_EXPECT(access("over-key.pem", F_OK) != 0);
+
+	identity[255] = '\0';
+	const bool ok = gencerts_captured(&cap, "wire", "id.example", identity);
+	T_EXPECT(ok);
+	X509 *const cert = ok ? read_cert_file("wire-cert.pem") : NULL;
+	T_EXPECT(cert != NULL);
+	if (cert != NULL) {
+		int n = 0;
+		T_EXPECT(cert_has_uri_san(cert, uri, &n));
+		T_EXPECT_EQ(n, 1);
+	}
+	X509_free(cert);
+
+	leave_tmpdir(origdir, tmpl);
+}
+
+/* Past the 63 octets multiplexd itself claims, an identity is still written
+ * -- another implementation may claim it -- but with a warning; at 63 there
+ * is none. */
+T_DECLARE_CASE(test_gencerts_identity_past_claim_limit_warns)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	char identity[65];
+	memset(identity, 'a', sizeof(identity) - 1);
+	identity[64] = '\0';
+	struct log_capture cap;
+
+	T_EXPECT(gencerts_captured(&cap, "long", "id.example", identity));
+	T_EXPECT(access("long-cert.pem", F_OK) == 0);
+	T_EXPECT(strstr(cap.buf, "multiplexd claims at most 63") != NULL);
+
+	identity[63] = '\0';
+	T_EXPECT(gencerts_captured(&cap, "claim", "id.example", identity));
+	T_EXPECT(access("claim-cert.pem", F_OK) == 0);
+	T_EXPECT(strstr(cap.buf, "claims at most") == NULL);
+
+	leave_tmpdir(origdir, tmpl);
+}
+
+/* identity.verify decodes the URI name with url_unescape_path(), which refuses
+ * any decoded control character, so a certificate naming one could never
+ * match any claim.  It is refused up front, and the identity is not echoed
+ * into the log, where the raw control byte would land. */
+T_DECLARE_CASE(test_gencerts_identity_control_byte_rejected)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	static const char *const identities[] = {
+		"a\tb",
+		"a\nb",
+		"\x1b[31m",
+		"del\x7f",
+	};
+	struct log_capture cap;
+	for (size_t i = 0; i < ARRAY_SIZE(identities); i++) {
+		T_EXPECT(!gencerts_captured(
+			&cap, "ctl", "id.example", identities[i]));
+		T_EXPECT(access("ctl-cert.pem", F_OK) != 0);
+		T_EXPECT(access("ctl-key.pem", F_OK) != 0);
+		T_EXPECT(strstr(cap.buf, identities[i]) == NULL);
+	}
 
 	leave_tmpdir(origdir, tmpl);
 }
@@ -1074,6 +1315,285 @@ T_DECLARE_CASE(test_gencerts_serial_is_positive_and_128_bit)
 	T_EXPECT(all_128_bit);
 }
 
+/* Criticality of the @p nid extension on @p cert: 1 critical, 0 non-critical,
+ * -1 absent. */
+static int ext_criticality(const X509 *restrict cert, const int nid)
+{
+	const int idx = X509_get_ext_by_NID(cert, nid, -1);
+	if (idx < 0) {
+		return -1;
+	}
+	return X509_EXTENSION_get_critical(X509_get_ext(cert, idx));
+}
+
+/* Verify @p target against a store trusting only @p anchor, the way a strict
+ * TLS peer would: X509_V_FLAG_X509_STRICT and the SSL @p purpose. Returns the
+ * X509_V_* result, X509_V_OK on success, or -1 when the check could not run. */
+static int verify_strict(X509 *anchor, X509 *target, const int purpose)
+{
+	X509_STORE *const store = X509_STORE_new();
+	X509_STORE_CTX *const ctx = X509_STORE_CTX_new();
+	int result = -1;
+	if (store != NULL && ctx != NULL &&
+	    X509_STORE_add_cert(store, anchor) == 1 &&
+	    X509_STORE_CTX_init(ctx, store, target, NULL) == 1 &&
+	    X509_STORE_CTX_set_purpose(ctx, purpose) == 1) {
+		X509_STORE_CTX_set_flags(ctx, X509_V_FLAG_X509_STRICT);
+		(void)X509_verify_cert(ctx);
+		result = X509_STORE_CTX_get_error(ctx);
+	}
+	X509_STORE_CTX_free(ctx);
+	X509_STORE_free(store);
+	return result;
+}
+
+/* RFC 5280 4.1.2.6: the DN MUST be unique for each subject entity one CA
+ * certifies. Every certificate from one run shares the server name, so a
+ * CN-only subject gave the leaves of one --sign run a single DN between them,
+ * and made each equal to its issuer's -- a self-issued certificate in every
+ * verifier's eyes, chained only because the AKI keyid broke the tie. */
+T_DECLARE_CASE(test_gencerts_signed_leaves_have_unique_subjects)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ca_ok =
+		gencerts("ca", "dn.example", NULL, "ed25519", 0, NULL);
+	const bool leaves_ok =
+		ca_ok &&
+		gencerts("c1,c2", "dn.example", "ca", "ed25519", 0, NULL);
+	X509 *const ca = leaves_ok ? read_cert_file("ca-cert.pem") : NULL;
+	X509 *const c1 = leaves_ok ? read_cert_file("c1-cert.pem") : NULL;
+	X509 *const c2 = leaves_ok ? read_cert_file("c2-cert.pem") : NULL;
+
+	/* Capture before teardown so a failing assertion cannot leak the X509. */
+	const bool read_ok = ca != NULL && c1 != NULL && c2 != NULL;
+	bool leaves_differ = false, c1_not_ca = false, c2_not_ca = false;
+	bool c1_issued_by_ca = false, c1_not_self_issued = false;
+	bool c2_not_self_issued = false, cn_kept = false;
+	if (read_ok) {
+		const X509_NAME *const ca_dn = X509_get_subject_name(ca);
+		const X509_NAME *const c1_dn = X509_get_subject_name(c1);
+		const X509_NAME *const c2_dn = X509_get_subject_name(c2);
+		leaves_differ = X509_NAME_cmp(c1_dn, c2_dn) != 0;
+		c1_not_ca = X509_NAME_cmp(c1_dn, ca_dn) != 0;
+		c2_not_ca = X509_NAME_cmp(c2_dn, ca_dn) != 0;
+		c1_issued_by_ca =
+			X509_NAME_cmp(X509_get_issuer_name(c1), ca_dn) == 0;
+		c1_not_self_issued =
+			(X509_get_extension_flags(c1) & EXFLAG_SI) == 0;
+		c2_not_self_issued =
+			(X509_get_extension_flags(c2) & EXFLAG_SI) == 0;
+		/* Disambiguating the DN must not displace the server name. */
+		cn_kept = cert_cn_equals(c1, "dn.example") &&
+			  cert_cn_equals(ca, "dn.example");
+	}
+	X509_free(c2);
+	X509_free(c1);
+	X509_free(ca);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ca_ok);
+	T_EXPECT(leaves_ok);
+	T_EXPECT(read_ok);
+	T_EXPECT(leaves_differ);
+	T_EXPECT(c1_not_ca);
+	T_EXPECT(c2_not_ca);
+	T_EXPECT(c1_issued_by_ca);
+	T_EXPECT(c1_not_self_issued);
+	T_EXPECT(c2_not_self_issued);
+	T_EXPECT(cn_kept);
+}
+
+/* A leaf is not a CA: a chain under it is rejected by every verifier, so
+ * --sign with one must fail locally, before writing anything, rather than
+ * report "ok" and leave the failure to a remote handshake. */
+T_DECLARE_CASE(test_gencerts_non_ca_signer_rejected)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	T_CHECK(gencerts("ca", "ca.example", NULL, "ed25519", 0, NULL));
+	T_CHECK(gencerts("leaf", "leaf.example", "ca", "ed25519", 0, NULL));
+
+	const bool ok =
+		gencerts("a,b", "a.example", "leaf", "ed25519", 0, NULL);
+	const int a_cert = access("a-cert.pem", F_OK);
+	const int a_key = access("a-key.pem", F_OK);
+	const int b_cert = access("b-cert.pem", F_OK);
+	const int b_key = access("b-key.pem", F_OK);
+
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(!ok);
+	T_EXPECT_EQ(a_cert, -1);
+	T_EXPECT_EQ(a_key, -1);
+	T_EXPECT_EQ(b_cert, -1);
+	T_EXPECT_EQ(b_key, -1);
+}
+
+/* A --sign'ed leaf must verify under its CA the way a strict TLS peer checks
+ * it -- X509_V_FLAG_X509_STRICT, for both the server and the client role --
+ * not merely carry a signature X509_verify() accepts. This is the only
+ * end-to-end check of the --sign chain: smoke_test.py uses unsigned
+ * certificates only. */
+T_DECLARE_CASE(test_gencerts_signed_chain_verifies_strict)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok =
+		gencerts("ca", "chain.example", NULL, "ecdsa", 256, NULL) &&
+		gencerts("peer", "chain.example", "ca", "ecdsa", 256, NULL);
+	X509 *const ca = ok ? read_cert_file("ca-cert.pem") : NULL;
+	X509 *const peer = ok ? read_cert_file("peer-cert.pem") : NULL;
+
+	const bool read_ok = ca != NULL && peer != NULL;
+	int server_rc = -1, client_rc = -1;
+	if (read_ok) {
+		server_rc = verify_strict(ca, peer, X509_PURPOSE_SSL_SERVER);
+		client_rc = verify_strict(ca, peer, X509_PURPOSE_SSL_CLIENT);
+	}
+	X509_free(peer);
+	X509_free(ca);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ok);
+	T_EXPECT(read_ok);
+	if (server_rc != X509_V_OK || client_rc != X509_V_OK) {
+		T_LOGF("strict verify: server %d (%s), client %d (%s)",
+		       server_rc, X509_verify_cert_error_string(server_rc),
+		       client_rc, X509_verify_cert_error_string(client_rc));
+	}
+	T_EXPECT_EQ(server_rc, X509_V_OK);
+	T_EXPECT_EQ(client_rc, X509_V_OK);
+}
+
+/* An unsigned certificate is handed to tls.authcerts as its own trust anchor
+ * and to tls.cert as the end-entity certificate, so it must verify against a
+ * store holding only itself under the same strict rules, in both roles. */
+T_DECLARE_CASE(test_gencerts_self_signed_verifies_as_anchor)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok =
+		gencerts("solo", "solo.example", NULL, "ecdsa", 256, NULL);
+	X509 *const solo = ok ? read_cert_file("solo-cert.pem") : NULL;
+
+	const bool read_ok = solo != NULL;
+	bool self_signed = false;
+	int server_rc = -1, client_rc = -1;
+	if (read_ok) {
+		self_signed = (X509_get_extension_flags(solo) & EXFLAG_SS) != 0;
+		server_rc = verify_strict(solo, solo, X509_PURPOSE_SSL_SERVER);
+		client_rc = verify_strict(solo, solo, X509_PURPOSE_SSL_CLIENT);
+	}
+	X509_free(solo);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ok);
+	T_EXPECT(read_ok);
+	T_EXPECT(self_signed);
+	if (server_rc != X509_V_OK || client_rc != X509_V_OK) {
+		T_LOGF("strict verify: server %d (%s), client %d (%s)",
+		       server_rc, X509_verify_cert_error_string(server_rc),
+		       client_rc, X509_verify_cert_error_string(client_rc));
+	}
+	T_EXPECT_EQ(server_rc, X509_V_OK);
+	T_EXPECT_EQ(client_rc, X509_V_OK);
+}
+
+/* The X.509 content of a CA and a --sign'ed leaf, extension by extension with
+ * its criticality: basicConstraints (critical CA:TRUE on the CA, no CA flag on
+ * the leaf), extendedKeyUsage, the key identifiers -- the leaf's AKI keyid
+ * naming the CA's SKI -- and the subjectAltName; v3, and the backdated
+ * ten-year validity window. */
+T_DECLARE_CASE(test_gencerts_ca_and_leaf_extensions)
+{
+	char tmpl[] = "/tmp/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool ok =
+		gencerts("ca", "ext.example", NULL, "ed25519", 0, NULL) &&
+		gencerts("leaf", "ext.example", "ca", "ed25519", 0, NULL);
+	X509 *const ca = ok ? read_cert_file("ca-cert.pem") : NULL;
+	X509 *const leaf = ok ? read_cert_file("leaf-cert.pem") : NULL;
+
+	const bool read_ok = ca != NULL && leaf != NULL;
+	const uint32_t tls_xku = XKU_SSL_SERVER | XKU_SSL_CLIENT;
+	long ca_version = -1, leaf_version = -1;
+	int ca_bc = -2, ca_ku = -2, ca_eku = -2, ca_ski = -2, ca_san = -2;
+	int leaf_eku = -2, leaf_aki = -2, leaf_ski = -2, leaf_san = -2;
+	bool ca_flag = false, leaf_ca_flag = true;
+	bool ca_xku = false, leaf_xku = false;
+	bool aki_names_ca = false;
+	int days = -1, secs = -1;
+	if (read_ok) {
+		ca_version = X509_get_version(ca);
+		leaf_version = X509_get_version(leaf);
+		ca_bc = ext_criticality(ca, NID_basic_constraints);
+		ca_ku = ext_criticality(ca, NID_key_usage);
+		ca_eku = ext_criticality(ca, NID_ext_key_usage);
+		ca_ski = ext_criticality(ca, NID_subject_key_identifier);
+		ca_san = ext_criticality(ca, NID_subject_alt_name);
+		leaf_eku = ext_criticality(leaf, NID_ext_key_usage);
+		leaf_aki = ext_criticality(leaf, NID_authority_key_identifier);
+		leaf_ski = ext_criticality(leaf, NID_subject_key_identifier);
+		leaf_san = ext_criticality(leaf, NID_subject_alt_name);
+		ca_flag = (X509_get_extension_flags(ca) & EXFLAG_CA) != 0;
+		leaf_ca_flag =
+			(X509_get_extension_flags(leaf) & EXFLAG_CA) != 0;
+		ca_xku = (X509_get_extended_key_usage(ca) & tls_xku) == tls_xku;
+		leaf_xku = (X509_get_extended_key_usage(leaf) & tls_xku) ==
+			   tls_xku;
+		const ASN1_OCTET_STRING *const aki =
+			X509_get0_authority_key_id(leaf);
+		const ASN1_OCTET_STRING *const ski =
+			X509_get0_subject_key_id(ca);
+		aki_names_ca = aki != NULL && ski != NULL &&
+			       ASN1_OCTET_STRING_cmp(aki, ski) == 0;
+		if (ASN1_TIME_diff(
+			    &days, &secs, X509_get0_notBefore(leaf),
+			    X509_get0_notAfter(leaf)) != 1) {
+			days = secs = -1;
+		}
+	}
+	X509_free(leaf);
+	X509_free(ca);
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ok);
+	T_EXPECT(read_ok);
+	T_EXPECT_EQ(ca_version, (long)X509_VERSION_3);
+	T_EXPECT_EQ(leaf_version, (long)X509_VERSION_3);
+	/* CA: critical CA:TRUE and keyUsage; the rest non-critical. */
+	T_EXPECT_EQ(ca_bc, 1);
+	T_EXPECT(ca_flag);
+	T_EXPECT_EQ(ca_ku, 1);
+	T_EXPECT_EQ(ca_eku, 0);
+	T_EXPECT(ca_xku);
+	T_EXPECT_EQ(ca_ski, 0);
+	T_EXPECT_EQ(ca_san, 0);
+	/* Leaf: an end entity, identifying its issuer by key. */
+	T_EXPECT(!leaf_ca_flag);
+	T_EXPECT_EQ(leaf_eku, 0);
+	T_EXPECT(leaf_xku);
+	T_EXPECT_EQ(leaf_aki, 0);
+	T_EXPECT(aki_names_ca);
+	T_EXPECT_EQ(leaf_ski, 0);
+	T_EXPECT_EQ(leaf_san, 0);
+	/* notBefore backdated an hour, notAfter 3652 days on; the two are
+	 * stamped from separate clock reads, so allow a second of drift. */
+	T_EXPECT_EQ(days, 3652);
+	T_EXPECT(secs >= 3600 && secs <= 3601);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_ed25519),
 	T_CASE(test_gencerts_ecdsa),
@@ -1087,11 +1607,12 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_skips_all_space_name_token),
 	T_CASE(test_gencerts_empty_name_list_fails),
 	T_CASE(test_gencerts_with_signing_cert),
-	T_CASE(test_gencerts_ecdsa_p224),
+	T_CASE(test_gencerts_ecdsa_p224_rejected),
 	T_CASE(test_gencerts_ecdsa_p384),
 	T_CASE(test_gencerts_ecdsa_p521),
 	T_CASE(test_gencerts_key_write_failure_removes_cert),
 	T_CASE(test_gencerts_sni_too_long_rejected),
+	T_CASE(test_gencerts_sni_san_injection_rejected),
 	T_CASE(test_gencerts_rsa_keysize_too_large_rejected),
 	T_CASE(test_gencerts_rsa_keysize_too_small_rejected),
 	T_CASE(test_gencerts_ecdsa_default_keysize),
@@ -1106,8 +1627,18 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_identity_explicit_list),
 	T_CASE(test_gencerts_identity_percent_encoded),
 	T_CASE(test_gencerts_identity_count_mismatch),
+	T_CASE(test_gencerts_validates_before_generating),
+	T_CASE(test_gencerts_mid_list_failure_logs_removal),
+	T_CASE(test_gencerts_identity_wire_limit),
+	T_CASE(test_gencerts_identity_past_claim_limit_warns),
+	T_CASE(test_gencerts_identity_control_byte_rejected),
 	T_CASE(test_gencerts_ca_key_usage),
 	T_CASE(test_gencerts_serial_is_positive_and_128_bit),
+	T_CASE(test_gencerts_signed_leaves_have_unique_subjects),
+	T_CASE(test_gencerts_non_ca_signer_rejected),
+	T_CASE(test_gencerts_signed_chain_verifies_strict),
+	T_CASE(test_gencerts_self_signed_verifies_as_anchor),
+	T_CASE(test_gencerts_ca_and_leaf_extensions),
 	T_SUITE_END,
 };
 

@@ -80,8 +80,9 @@
 bool csprng_bytes(unsigned char *buf, size_t len);
 
 /**
- * @brief Remove a file, warning rather than failing when it cannot be.
- * Used to discard partially written output.
+ * @brief Remove a file, logging the removal, and warning rather than failing
+ * when it cannot be. Used to discard partially written output and to take
+ * back files a failed call already announced as written.
  */
 void discard_file(const char *path);
 

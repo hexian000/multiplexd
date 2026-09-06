@@ -354,6 +354,139 @@ T_DECLARE_CASE(test_genpsk_write_failure_leaves_no_file)
 	T_EXPECT_EQ(entries, 0);
 }
 
+/* A name failing part-way through the list fails the whole call and takes
+ * back the keys written earlier in it: a stray key would make the corrected
+ * retry fail on O_EXCL. The pre-existing key that caused the failure is not
+ * this call's to remove, so it is left exactly as it was. */
+T_DECLARE_CASE(test_genpsk_mid_list_failure_discards_earlier_keys)
+{
+	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool seed_ok = genpsk("beta");
+	char before[PSK_FILE_LEN * 2];
+	const size_t n_before =
+		read_key_file("beta.psk", before, sizeof(before));
+	const bool ok = genpsk("alpha, beta");
+	const bool left_alpha = access("alpha.psk", F_OK) == 0;
+	char after[PSK_FILE_LEN * 2];
+	const size_t n_after = read_key_file("beta.psk", after, sizeof(after));
+	const int entries = count_entries();
+	/* With the conflict gone, the same list now goes through. */
+	const bool retry_ok = genpsk("alpha, gamma");
+
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(seed_ok);
+	T_EXPECT(!ok);
+	T_EXPECT(!left_alpha);
+	T_EXPECT_EQ(entries, 1);
+	T_EXPECT_EQ(n_before, (size_t)PSK_FILE_LEN);
+	T_EXPECT_EQ(n_after, n_before);
+	T_EXPECT(memcmp(before, after, n_before) == 0);
+	T_EXPECT(retry_ok);
+}
+
+/* Collects the log lines genpsk() emits while registered as slog's sink. */
+struct log_capture {
+	size_t len;
+	bool overflow;
+	char buf[4096];
+};
+
+static void
+log_capture_write(void *ud, const unsigned char *buf, const size_t len)
+{
+	struct log_capture *const restrict cap = ud;
+	/* One byte is reserved for the NUL the string searches need. */
+	if (cap->len + len >= sizeof(cap->buf)) {
+		cap->overflow = true;
+		return;
+	}
+	memcpy(cap->buf + cap->len, buf, len);
+	cap->len += len;
+	cap->buf[cap->len] = '\0';
+}
+
+/* Run genpsk() with its NOTICE-and-above output captured into @p cap. The
+ * suite otherwise runs silent with no sink, which is how it is left. */
+static bool
+genpsk_captured(struct log_capture *restrict cap, const char *restrict names)
+{
+	cap->len = 0;
+	cap->overflow = false;
+	cap->buf[0] = '\0';
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_capture_write, cap);
+	slog_setlevel(LOG_LEVEL_NOTICE);
+	const bool ok = genpsk(names);
+	slog_setlevel(LOG_LEVEL_SILENCE);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+	return ok;
+}
+
+/* A key genpsk_one() announced as written and a later name's failure then took
+ * back must be reported as removed, after the notice that claimed it:
+ * otherwise the log asserts a key file exists that does not. */
+T_DECLARE_CASE(test_genpsk_mid_list_failure_logs_removal)
+{
+	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	const bool seed_ok = genpsk("beta");
+	struct log_capture cap;
+	const bool ok = genpsk_captured(&cap, "alpha, beta");
+	const bool left_alpha = access("alpha.psk", F_OK) == 0;
+
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(seed_ok);
+	T_EXPECT(!ok);
+	T_EXPECT(!cap.overflow);
+	T_EXPECT(!left_alpha);
+	const char *const written = strstr(cap.buf, "write alpha.psk");
+	T_EXPECT(written != NULL);
+	if (written != NULL) {
+		const bool removed =
+			strstr(written, "remove alpha.psk") != NULL;
+		if (!removed) {
+			T_LOGF("rollback not logged: %s", cap.buf);
+		}
+		T_EXPECT(removed);
+	}
+}
+
+/* The other ways a later name can fail -- repeating an earlier name, or a
+ * path too long for the buffer -- likewise leave nothing behind. */
+T_DECLARE_CASE(test_genpsk_failed_list_leaves_no_file)
+{
+	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	enum {
+		PATH_BUF_LEN = 256,
+		TOO_LONG = PATH_BUF_LEN - sizeof(".psk") + 1
+	};
+	char list[sizeof("first,") + TOO_LONG];
+	memcpy(list, "first,", sizeof("first,") - 1);
+	memset(list + sizeof("first,") - 1, 'a', TOO_LONG);
+	list[sizeof(list) - 1] = '\0';
+
+	const bool dup_ok = genpsk("same,same");
+	const int dup_entries = count_entries();
+	const bool long_ok = genpsk(list);
+	const int long_entries = count_entries();
+
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(!dup_ok);
+	T_EXPECT_EQ(dup_entries, 0);
+	T_EXPECT(!long_ok);
+	T_EXPECT_EQ(long_entries, 0);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_genpsk_writes_lowercase_hex_key),
 	T_CASE(test_genpsk_multiple_names_get_distinct_keys),
@@ -363,6 +496,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_genpsk_file_permissions),
 	T_CASE(test_genpsk_path_too_long_rejected),
 	T_CASE(test_genpsk_write_failure_leaves_no_file),
+	T_CASE(test_genpsk_mid_list_failure_discards_earlier_keys),
+	T_CASE(test_genpsk_mid_list_failure_logs_removal),
+	T_CASE(test_genpsk_failed_list_leaves_no_file),
 	T_SUITE_END,
 };
 
