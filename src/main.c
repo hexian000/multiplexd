@@ -60,7 +60,10 @@ static struct {
 	const char *sign;
 	const char *keytype;
 	int keysize;
-#endif
+	/* The first certificate option given (--sni, --identity, --sign,
+	 * --keytype or --keysize); only --gencerts reads them. */
+	const char *gencerts_option;
+#endif /* WITH_OPENSSL */
 	int loglevel;
 	bool daemonize : 1;
 	bool dump_config : 1;
@@ -100,7 +103,7 @@ static void print_usage(const char *argv0)
 		"  --keytype <type>           key type: rsa, ecdsa, or ed25519\n"
 		"                             (default: rsa)\n"
 		"  --keysize <bits>           key size (RSA: 2048-16384, default 4096;\n"
-		"                             ECDSA: 224/256/384/521)\n"
+		"                             ECDSA: 256/384/521)\n"
 		"\n"
 #endif /* WITH_OPENSSL */
 #if WITH_TLS
@@ -155,32 +158,25 @@ static bool parse_uint_arg(const char *arg, uintmax_t max, uintmax_t *out)
  * past its argument; false if argv[*i] is not one of these flags. */
 static bool parse_gencerts_arg(const int argc, char *const *argv, int *i)
 {
-	if (strcmp(argv[*i], "--gencerts") == 0) {
+	const char *const option = argv[*i];
+	if (strcmp(option, "--gencerts") == 0) {
 		OPT_REQUIRE_ARG(argc, argv, *i);
 		args.gencerts = argv[++*i];
 		return true;
 	}
-	if (strcmp(argv[*i], "--sni") == 0) {
+	if (strcmp(option, "--sni") == 0) {
 		OPT_REQUIRE_ARG(argc, argv, *i);
 		args.server_name = argv[++*i];
-		return true;
-	}
-	if (strcmp(argv[*i], "--identity") == 0) {
+	} else if (strcmp(option, "--identity") == 0) {
 		OPT_REQUIRE_ARG(argc, argv, *i);
 		args.identities = argv[++*i];
-		return true;
-	}
-	if (strcmp(argv[*i], "--sign") == 0) {
+	} else if (strcmp(option, "--sign") == 0) {
 		OPT_REQUIRE_ARG(argc, argv, *i);
 		args.sign = argv[++*i];
-		return true;
-	}
-	if (strcmp(argv[*i], "--keytype") == 0) {
+	} else if (strcmp(option, "--keytype") == 0) {
 		OPT_REQUIRE_ARG(argc, argv, *i);
 		args.keytype = argv[++*i];
-		return true;
-	}
-	if (strcmp(argv[*i], "--keysize") == 0) {
+	} else if (strcmp(option, "--keysize") == 0) {
 		OPT_REQUIRE_ARG(argc, argv, *i);
 		uintmax_t val;
 		if (!parse_uint_arg(argv[++*i], (uintmax_t)INT_MAX, &val)) {
@@ -188,11 +184,81 @@ static bool parse_gencerts_arg(const int argc, char *const *argv, int *i)
 			exit(EXIT_FAILURE);
 		}
 		args.keysize = (int)val;
-		return true;
+	} else {
+		return false;
 	}
-	return false;
+	if (args.gencerts_option == NULL) {
+		args.gencerts_option = option;
+	}
+	return true;
 }
 #endif /* WITH_OPENSSL */
+
+#if WITH_TLS
+#if WITH_OPENSSL
+#define ONESHOT_OPTIONS "--genpsk, --gencerts and --dump-config"
+#else
+#define ONESHOT_OPTIONS "--genpsk and --dump-config"
+#endif
+
+/* Each one-shot option runs its action instead of the daemon and exits, and
+ * main() runs only the first of them it checks, so a command line naming two
+ * would silently skip the other yet still exit 0. Without TLS only
+ * --dump-config exists, so no conflict is possible. */
+static bool oneshot_options_conflict(void)
+{
+	int count = 0;
+	if (args.genpsk != NULL) {
+		count++;
+	}
+#if WITH_OPENSSL
+	if (args.gencerts != NULL) {
+		count++;
+	}
+#endif
+	if (args.dump_config) {
+		count++;
+	}
+	return count > 1;
+}
+#endif /* WITH_TLS */
+
+/* The one-shot option given, or NULL for a daemon run. Called only once
+ * oneshot_options_conflict() has ruled out more than one. */
+static const char *oneshot_option(void)
+{
+#if WITH_TLS
+	if (args.genpsk != NULL) {
+		return "--genpsk";
+	}
+#endif
+#if WITH_OPENSSL
+	if (args.gencerts != NULL) {
+		return "--gencerts";
+	}
+#endif
+	if (args.dump_config) {
+		return "--dump-config";
+	}
+	return NULL;
+}
+
+/* The first option given that the one-shot run would never read, or NULL:
+ * each one-shot option returns from main() before --daemonize and --user are
+ * applied, and of them only --dump-config loads the --config file. */
+static const char *oneshot_unread_option(void)
+{
+	if (args.daemonize) {
+		return "--daemonize";
+	}
+	if (args.user_name != NULL) {
+		return "--user";
+	}
+	if (args.conf_path != NULL && !args.dump_config) {
+		return "--config";
+	}
+	return NULL;
+}
 
 static void parse_args(const int argc, char *const *argv)
 {
@@ -258,14 +324,39 @@ static void parse_args(const int argc, char *const *argv)
 		print_usage(argv[0]);
 		exit(EXIT_FAILURE);
 	}
+#if WITH_TLS
+	if (oneshot_options_conflict()) {
+		LOGF("options " ONESHOT_OPTIONS " are mutually exclusive");
+		print_usage(argv[0]);
+		exit(EXIT_FAILURE);
+	}
+#endif /* WITH_TLS */
+	/* Every other misuse is fatal, so an option the run would drop without
+	 * a word must be too: a script that over-specifies a command would
+	 * otherwise learn nothing from a zero exit status. */
+	const char *const oneshot = oneshot_option();
+	const char *const unread =
+		oneshot != NULL ? oneshot_unread_option() : NULL;
+	if (unread != NULL) {
+		LOGF_F("option `%s' cannot be used with `%s'", unread, oneshot);
+		print_usage(argv[0]);
+		exit(EXIT_FAILURE);
+	}
+#if WITH_OPENSSL
+	if (args.gencerts_option != NULL && args.gencerts == NULL) {
+		LOGF_F("option `%s' requires `--gencerts'",
+		       args.gencerts_option);
+		print_usage(argv[0]);
+		exit(EXIT_FAILURE);
+	}
+#endif /* WITH_OPENSSL */
 
 #undef OPT_REQUIRE_ARG
 #undef OPT_ARG_ERROR
 }
 
 /* Release resources after a startup failure and report EXIT_FAILURE. */
-static int
-fail_startup(struct server *restrict server, struct config *restrict conf)
+static int fail_startup(struct server *server, struct config *restrict conf)
 {
 	server_stop(server);
 	server_free(server);

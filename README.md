@@ -193,6 +193,14 @@ multiplexd --genpsk 'hub-east~spoke-1,hub-east~spoke-2'
 An existing file is never overwritten: regenerating a key silently would lock
 out the peer still holding the old one.
 
+`--genpsk`, `--gencerts` and `--dump-config` each run once in place of the
+daemon, so they cannot be combined: giving more than one is an argument error.
+Nor do they take the daemon's options: `-d` and `-u` are an argument error with
+any of them, and `-c` with `--genpsk` or `--gencerts` (only `--dump-config`
+reads a config). Likewise `--sni`, `--identity`, `--sign`, `--keytype` and
+`--keysize` are an argument error without `--gencerts`. `--loglevel` combines
+with anything.
+
 **Always generate keys this way.** The identity label a peer puts on the wire
 is derived from its key, so publishing it hands an attacker an offline oracle:
 against 32 random octets that is meaningless, against a passphrase it is fatal.
