@@ -235,7 +235,7 @@ Because JSON has no comments, multiplexd ignores any key whose name begins with 
 
 Omit the `tls` object on trusted networks if the lower overhead outweighs the loss of protocol confidentiality, integrity, and peer authentication.
 
-**TLS**: `cert`, `key`, and `authcerts` must all be present or all absent. The `@path` prefix loads a PEM file at startup; bare strings are treated as inline PEM. Mutual authentication (mTLS) is always enforced — the system CA store is never consulted.
+**TLS**: `cert`, `key`, and `authcerts` must all be present or all absent. The `@path` prefix loads a PEM file at startup; bare strings are treated as inline PEM. Mutual authentication (mTLS) is always enforced — the system CA store is never consulted. `tls.ciphersuites` restricts the TLS 1.3 suites by IANA name, colon-separated (e.g. `TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256`); those names work with both the OpenSSL and the mbedTLS build, so one config serves either. Any name that is not a TLS 1.3 suite the build supports stops startup rather than being skipped.
 
 **Pre-shared keys**: `tls.psk` replaces certificates entirely — it is mutually
 exclusive with `cert`, `key` and `authcerts`, and a PSK handshake sends no

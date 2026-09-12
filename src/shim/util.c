@@ -3,14 +3,18 @@
 
 /**
  * @file util.c
- * @brief CSPRNG bytes, address-resolution, MIME media-type, and ALPN
- * list-tokenizing helpers.
+ * @brief Project-wide helpers shared across the multiplexd modules.
+ *
+ * CSPRNG bytes, exclusive file creation and discard, address resolution,
+ * socket backpressure classification, MIME media-type validation, identity
+ * escaping, and, with TLS, ALPN list tokenizing and certificate identity
+ * matching. The macros are header-only; see util.h.
  */
 
-#include "shim/util.h"
+#include "util.h"
 
 #if WITH_TLS
-#include "shim/tls.h"
+#include "tls.h"
 
 #include "codec/csv.h"
 #include "net/url.h"
@@ -185,6 +189,24 @@ enum mime_check_result mime_check_media(
 	return MIME_CHECK_OK;
 }
 
+/* Length of the control character at s: 1 for a C0 byte or DEL, 2 for the
+ * UTF-8 encoding of a C1 control (U+0080..U+009F, C2 80..C2 9F), which a UTF-8
+ * terminal acts on as it does ESC-prefixed sequences (U+009B is CSI), and 0
+ * for anything else. */
+static size_t control_len(const char *s)
+{
+	const unsigned char c = (unsigned char)s[0];
+	if (c < 0x20 || c == 0x7f) {
+		return 1;
+	}
+	/* s[1] is readable: s[0] is not the terminator. */
+	const unsigned char next = (unsigned char)s[1];
+	if (c == 0xc2 && next >= 0x80 && next <= 0x9f) {
+		return 2;
+	}
+	return 0;
+}
+
 void escape_identity(
 	char *restrict out, const size_t outsize, const char *restrict in,
 	const enum escape_ctx ctx)
@@ -216,29 +238,36 @@ void escape_identity(
 			}
 			out[o++] = '\\';
 			out[o++] = esc;
-		} else if (c >= 0x20) {
+			continue;
+		}
+		const size_t n = control_len(&in[i]);
+		if (n == 0) {
 			if (o + 1 >= outsize) {
 				break;
 			}
 			out[o++] = (char)c;
 		} else if (ctx == ESCAPE_PLAIN) {
-			/* Any remaining C0 control byte (e.g. ESC) would let a
-			 * crafted identity drive terminal cursor motion; emit an
-			 * inert \xNN escape. */
-			if (o + 4 >= outsize) {
+			/* Any remaining control (e.g. ESC or CSI) would let a
+			 * crafted identity drive terminal cursor motion; emit
+			 * each of its bytes as an inert \xNN escape. */
+			if (o + 4 * n >= outsize) {
 				break;
 			}
-			out[o++] = '\\';
-			out[o++] = 'x';
-			tohexlower(&out[o], c);
-			o += 2;
+			for (size_t k = 0; k < n; k++) {
+				out[o++] = '\\';
+				out[o++] = 'x';
+				tohexlower(&out[o], (unsigned char)in[i + k]);
+				o += 2;
+			}
+			i += n - 1;
 		} else {
-			/* The metric grammar spells no escape for a remaining C0
-			 * byte, so substitute the inert placeholder instead. */
+			/* The metric grammar spells no escape for a remaining
+			 * control, so substitute one inert placeholder for it. */
 			if (o + 1 >= outsize) {
 				break;
 			}
 			out[o++] = IDENTITY_METRIC_PLACEHOLDER;
+			i += n - 1;
 		}
 	}
 	out[o] = '\0';

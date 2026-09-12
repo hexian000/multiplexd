@@ -8,8 +8,8 @@
 
 #if WITH_TLS
 
-#include "shim/tls.h"
-#include "shim/util.h"
+#include "tls.h"
+#include "util.h"
 
 #include "meta/minmax.h"
 #include "utils/debug.h"
@@ -110,6 +110,9 @@ struct tls_conn_impl {
 	SSL *ssl;
 	struct tls_callback cb;
 	bool fd_backed;
+	/* Latched once tls_shutdown has handed our close_notify off: a repeat
+	 * SSL_shutdown() would go on to await the peer's, not re-send ours. */
+	bool close_notify_sent;
 };
 
 static struct tls_conn_impl *tls_conn_raw(struct tls_connection *restrict conn)
@@ -131,12 +134,16 @@ static void tls_fire_send(struct tls_conn_impl *restrict c)
 	}
 }
 
-/* Fire on_recv when more plaintext is available without another read:
+/* Fire on_recv when more plaintext may be available without another read:
  * SSL_has_pending misses BIO-buffered records so also check the read BIO
- * (exists only in memory-transport mode). */
-static void tls_fire_recv(struct tls_conn_impl *restrict c)
+ * (exists only in memory-transport mode).  Both checks also count a trailing
+ * partial record, so a fire can still be answered by WANT_READ.  After an
+ * SSL_read that itself ended in WANT_READ, everything buffered is such a
+ * partial record: AUTO_RETRY keeps SSL_read consuming records until the read
+ * BIO runs dry, so skip the notifier there. */
+static void tls_fire_recv(struct tls_conn_impl *restrict c, const int err)
 {
-	if (c->cb.on_recv == NULL) {
+	if (c->cb.on_recv == NULL || err == SSL_ERROR_WANT_READ) {
 		return;
 	}
 	if (SSL_has_pending(c->ssl) != 0 ||
@@ -437,6 +444,20 @@ tls_verify_cert_strength_cb(int preverify_ok, X509_STORE_CTX *store_ctx)
 		return 0;
 	}
 	return preverify_ok;
+}
+
+/* Verify callback for a PSK client, which has no trust store and accepts no
+ * certificate.  A TLS 1.3 server that selects the offered PSK sends none, so
+ * any certificate reaching this callback means the server ignored the PSK and
+ * fell back to a certificate handshake -- which an on-path attacker holding no
+ * key can complete.  Rejecting it makes the PSK the only way the client can
+ * authenticate the server. */
+static int
+tls_verify_reject_cert_cb(int preverify_ok, X509_STORE_CTX *store_ctx)
+{
+	(void)preverify_ok;
+	X509_STORE_CTX_set_error(store_ctx, X509_V_ERR_CERT_REJECTED);
+	return 0;
 }
 
 static void tls_ctx_tune(
@@ -781,24 +802,83 @@ void tls_secure_erase(void *ptr, size_t len)
 	}
 }
 
-/* Apply an explicit ciphersuites list to the context, if configured. OpenSSL's
- * SSL_CTX_set_ciphersuites("") returns success but leaves the TLS 1.3 suite list
- * empty, yielding a context pinned to TLS 1.3 with zero suites that can never
- * handshake; reject an empty string up front so the misconfiguration fails at
- * startup with a clear message, matching the mbedTLS backend which rejects it at
- * context creation. */
+/* The five TLS 1.3 suites, by IANA id.  SSL_CTX_get_ciphers() also carries the
+ * separate TLS 1.2 list, which pinning min=max=TLS1.3 does not remove, so the
+ * suite is matched by id rather than by position. */
+static bool cipher_is_tls13(const SSL_CIPHER *c)
+{
+	switch (SSL_CIPHER_get_id(c)) {
+	case 0x03001301u: /* TLS_AES_128_GCM_SHA256 */
+	case 0x03001302u: /* TLS_AES_256_GCM_SHA384 */
+	case 0x03001303u: /* TLS_CHACHA20_POLY1305_SHA256 */
+	case 0x03001304u: /* TLS_AES_128_CCM_SHA256 */
+	case 0x03001305u: /* TLS_AES_128_CCM_8_SHA256 */
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* True when the context's active suite list holds the TLS 1.3 suite named by
+ * the @p len bytes at @p name.  A TLS 1.3 suite's OpenSSL name is its IANA
+ * name, the spelling tls.ciphersuites takes. */
+static bool ctx_has_tls13_suite(
+	SSL_CTX *ssl_ctx, const char *restrict name, const size_t len)
+{
+	STACK_OF(SSL_CIPHER) *const sk = SSL_CTX_get_ciphers(ssl_ctx);
+	const int n = sk == NULL ? 0 : sk_SSL_CIPHER_num(sk);
+	for (int i = 0; i < n; i++) {
+		const SSL_CIPHER *const c = sk_SSL_CIPHER_value(sk, i);
+		if (!cipher_is_tls13(c)) {
+			continue;
+		}
+		const char *const cname = SSL_CIPHER_get_name(c);
+		if (strlen(cname) == len && memcmp(cname, name, len) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Apply an explicit ciphersuites list to the context, if configured.
+ *
+ * SSL_CTX_set_ciphersuites() fails only when no name in the list resolves: it
+ * skips an unknown name, admits a TLS 1.2 suite named by its IANA name into
+ * the TLS 1.3 list where the pinned context can never negotiate it, and drops a
+ * suite whose algorithms no provider offers.  An empty string even succeeds and
+ * leaves zero suites.  So each colon-separated name is checked to have landed
+ * in the list as a TLS 1.3 suite, and the first one that did not fails context
+ * creation -- a typo or a foreign spelling fails at startup, as on the mbedTLS
+ * backend, instead of silently narrowing the configured set. */
 static bool
 tls_ctx_apply_ciphersuites(SSL_CTX *ssl_ctx, const char *ciphersuites)
 {
 	if (ciphersuites == NULL) {
 		return true;
 	}
-	if (ciphersuites[0] == '\0') {
-		LOGE("tls.ciphersuites must not be empty");
-		return false;
-	}
 	if (SSL_CTX_set_ciphersuites(ssl_ctx, ciphersuites) != 1) {
 		LOG_SSLERROR(ERROR, "SSL_CTX_set_ciphersuites");
+		return false;
+	}
+	size_t count = 0;
+	for (const char *tok = ciphersuites; *tok != '\0';) {
+		const size_t len = strcspn(tok, ":");
+		if (len > 0) {
+			if (!ctx_has_tls13_suite(ssl_ctx, tok, len)) {
+				LOGE_F("tls.ciphersuites: unknown or unsupported "
+				       "TLS 1.3 ciphersuite '%.*s'",
+				       (int)len, tok);
+				return false;
+			}
+			count++;
+		}
+		tok += len;
+		if (*tok == ':') {
+			tok++;
+		}
+	}
+	if (count == 0) {
+		LOGE("tls.ciphersuites must not be empty");
 		return false;
 	}
 	return true;
@@ -818,7 +898,7 @@ struct psk_conf {
 	void *lookup_ctx;
 	/* Gives back the hold taken on lookup_ctx; NULL when it needs none. */
 	void (*lookup_ctx_release)(void *ctx);
-	/* Suite whose handshake hash the PSK is bound to; see psk_pick_cipher. */
+	/* Suite the PSK session is bound to; see psk_restrict_ciphersuites. */
 	const SSL_CIPHER *cipher;
 };
 
@@ -888,9 +968,11 @@ static struct psk_conf *psk_conf_of(SSL *ssl)
 	return SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), g_psk_ctx_ex_idx);
 }
 
-/* Record which label authenticated this connection, for tls_peer_psk_label().
- * OpenSSL exposes no getter for the negotiated PSK identity, so both callbacks
- * stash it as the handshake selects it. */
+/* Record the label this connection's handshake offered (client) or looked up
+ * (server), for tls_peer_psk_label().  OpenSSL exposes no getter for the
+ * negotiated PSK identity, so both callbacks stash it before the peer has
+ * proved anything; tls_peer_psk_label() only reports it once the handshake has
+ * finished on that PSK. */
 static bool psk_conn_set_label(SSL *ssl, const char *label)
 {
 	if (!psk_ex_idx_ready()) {
@@ -909,70 +991,28 @@ static bool psk_conn_set_label(SSL *ssl, const char *label)
 	return true;
 }
 
-/* The five TLS 1.3 suites, by IANA id.  SSL_CTX_get_ciphers() also carries the
- * separate TLS 1.2 list, which pinning min=max=TLS1.3 does not remove, so the
- * suite is matched by id rather than by position. */
-static bool cipher_is_tls13(const SSL_CIPHER *c)
-{
-	switch (SSL_CIPHER_get_id(c)) {
-	case 0x03001301u: /* TLS_AES_128_GCM_SHA256 */
-	case 0x03001302u: /* TLS_AES_256_GCM_SHA384 */
-	case 0x03001303u: /* TLS_CHACHA20_POLY1305_SHA256 */
-	case 0x03001304u: /* TLS_AES_128_CCM_SHA256 */
-	case 0x03001305u: /* TLS_AES_128_CCM_8_SHA256 */
-		return true;
-	default:
-		return false;
-	}
-}
-
-/* Choose the suite whose handshake hash binds the PSK.
+/* Narrow the TLS 1.3 suite list -- the configured one, or OpenSSL's default
+ * when none is configured -- to its SHA-256 suites, keeping their order, and
+ * return the first of them, the suite the PSK session is bound to.
  *
  * A TLS 1.3 PSK is tied to one hash, so both peers must land on a suite using
- * it or the handshake cannot complete.  With an explicit tls.ciphersuites the
- * first configured suite decides, which keeps the option meaningful; with none
- * configured SHA-256 is chosen rather than OpenSSL's default preference, whose
- * first entry is TLS_AES_256_GCM_SHA384.  The caller then narrows the suite
- * list to that hash, so negotiation cannot pick a mismatching one. */
-static const SSL_CIPHER *
-psk_pick_cipher(SSL_CTX *ssl_ctx, const char *ciphersuites)
+ * it or the handshake cannot complete.  Every external PSK is bound to
+ * SHA-256, whatever the list's order, as on the mbedTLS backend, which
+ * hard-codes that hash: so the two backends always agree.  A suite of another
+ * hash could never be negotiated with the PSK, and a list with no SHA-256
+ * suite at all would build a context whose every handshake fails; that one is
+ * refused here instead. */
+static const SSL_CIPHER *psk_restrict_ciphersuites(SSL_CTX *ssl_ctx)
 {
 	STACK_OF(SSL_CIPHER) *const sk = SSL_CTX_get_ciphers(ssl_ctx);
-	if (sk == NULL) {
-		return NULL;
-	}
-	const int n = sk_SSL_CIPHER_num(sk);
-	const SSL_CIPHER *sha256 = NULL;
-	for (int i = 0; i < n; i++) {
-		const SSL_CIPHER *const c = sk_SSL_CIPHER_value(sk, i);
-		if (!cipher_is_tls13(c)) {
-			continue;
-		}
-		if (ciphersuites != NULL) {
-			return c; /* first configured suite wins */
-		}
-		if (sha256 == NULL &&
-		    SSL_CIPHER_get_handshake_digest(c) == EVP_sha256()) {
-			sha256 = c;
-		}
-	}
-	return sha256;
-}
-
-/* Narrow the TLS 1.3 suite list to those sharing @p cipher's handshake hash,
- * so a PSK bound to that hash can always be used by whatever is negotiated. */
-static bool
-psk_restrict_ciphersuites(SSL_CTX *ssl_ctx, const SSL_CIPHER *restrict cipher)
-{
-	const EVP_MD *const want = SSL_CIPHER_get_handshake_digest(cipher);
-	STACK_OF(SSL_CIPHER) *const sk = SSL_CTX_get_ciphers(ssl_ctx);
+	const SSL_CIPHER *first = NULL;
 	char list[256];
 	size_t w = 0;
 	const int n = sk == NULL ? 0 : sk_SSL_CIPHER_num(sk);
 	for (int i = 0; i < n; i++) {
 		const SSL_CIPHER *const c = sk_SSL_CIPHER_value(sk, i);
 		if (!cipher_is_tls13(c) ||
-		    SSL_CIPHER_get_handshake_digest(c) != want) {
+		    SSL_CIPHER_get_handshake_digest(c) != EVP_sha256()) {
 			continue;
 		}
 		const char *const name = SSL_CIPHER_get_name(c);
@@ -981,19 +1021,23 @@ psk_restrict_ciphersuites(SSL_CTX *ssl_ctx, const SSL_CIPHER *restrict cipher)
 			name);
 		if (len < 0 || (size_t)len >= sizeof(list) - w) {
 			LOGE("tls.psk: ciphersuite list too long");
-			return false;
+			return NULL;
 		}
 		w += (size_t)len;
+		if (first == NULL) {
+			first = c;
+		}
 	}
-	if (w == 0) {
-		LOGE("tls.psk: no TLS 1.3 ciphersuite matches the PSK hash");
-		return false;
+	if (first == NULL) {
+		LOGE("tls.psk: no TLS 1.3 ciphersuite uses SHA-256, the hash "
+		     "every PSK is bound to");
+		return NULL;
 	}
 	if (SSL_CTX_set_ciphersuites(ssl_ctx, list) != 1) {
 		LOG_SSLERROR(ERROR, "SSL_CTX_set_ciphersuites(psk)");
-		return false;
+		return NULL;
 	}
-	return true;
+	return first;
 }
 
 static SSL_SESSION *psk_session_new(
@@ -1041,6 +1085,10 @@ static int psk_find_session_cb(
 	unsigned char key[TLS_PSK_MAX_LEN];
 	size_t key_len = sizeof(key);
 	if (!pc->lookup(pc->lookup_ctx, label, key, &key_len)) {
+		return 1;
+	}
+	if (key_len < TLS_PSK_MIN_LEN || key_len > TLS_PSK_MAX_LEN) {
+		OPENSSL_cleanse(key, sizeof(key));
 		return 1;
 	}
 	SSL_SESSION *const s = psk_session_new(pc->cipher, key, key_len);
@@ -1096,13 +1144,20 @@ static bool tls_ctx_set_psk(
 		LOGE("failed to register PSK ex_data slots");
 		return false;
 	}
-	const SSL_CIPHER *const cipher =
-		psk_pick_cipher(c->ssl_ctx, conf->ciphersuites);
+	const SSL_CIPHER *const cipher = psk_restrict_ciphersuites(c->ssl_ctx);
 	if (cipher == NULL) {
-		LOGE("tls.psk: no usable TLS 1.3 ciphersuite");
 		return false;
 	}
-	if (!psk_restrict_ciphersuites(c->ssl_ctx, cipher)) {
+	/* Pin psk_dhe_ke: SSL_CTX_new() applies the host openssl.cnf system
+	 * defaults, which may allow (or prefer) bare psk_ke and so drop forward
+	 * secrecy. */
+	uint64_t no_dhe_opts = SSL_OP_ALLOW_NO_DHE_KEX;
+#ifdef SSL_OP_PREFER_NO_DHE_KEX
+	no_dhe_opts |= SSL_OP_PREFER_NO_DHE_KEX;
+#endif
+	if ((SSL_CTX_clear_options(c->ssl_ctx, no_dhe_opts) & no_dhe_opts) !=
+	    0) {
+		LOGE("tls.psk: failed to require psk_dhe_ke key exchange");
 		return false;
 	}
 	struct psk_conf *const pc = calloc(1, sizeof(*pc));
@@ -1286,6 +1341,11 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf)
 		 * omitted (see "Deployment Notes" in README.md). */
 		SSL_CTX_set_verify(
 			ssl_ctx, SSL_VERIFY_PEER, tls_verify_cert_strength_cb);
+	} else {
+		/* Offering a PSK does not oblige the server to use it: refuse
+		 * the certificate handshake it can fall back to. */
+		SSL_CTX_set_verify(
+			ssl_ctx, SSL_VERIFY_PEER, tls_verify_reject_cert_cb);
 	}
 
 	if (!tls_ctx_apply_ciphersuites(ssl_ctx, conf->ciphersuites)) {
@@ -1501,7 +1561,7 @@ size_t tls_output(
 	return ret > 0 ? (size_t)ret : 0;
 }
 
-enum tls_error tls_handshake(struct tls_connection *restrict conn)
+enum tls_error tls_handshake(struct tls_connection *conn)
 {
 	ERR_clear_error();
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
@@ -1515,6 +1575,7 @@ enum tls_error tls_handshake(struct tls_connection *restrict conn)
 	 * WANT_READ into a spurious SYSCALL and tear down a healthy connection. */
 	const int err = SSL_get_error(ssl, ret);
 	tls_fire_send(c);
+	tls_fire_recv(c, err);
 	if (ret == 1) {
 		/* Report whether KTLS engaged per direction (both macros expand to
 		 * 0 when the linked OpenSSL lacks KTLS support). */
@@ -1558,6 +1619,7 @@ enum tls_error tls_send(
 	 * reads, which would misreport WANT_READ as SYSCALL. */
 	const int err = SSL_get_error(ssl, ret);
 	tls_fire_send(c);
+	tls_fire_recv(c, err);
 	if (ret > 0) {
 		*len = (size_t)ret;
 		return TLS_ERROR_NONE;
@@ -1585,9 +1647,8 @@ enum tls_error tls_send(
 	return TLS_ERROR_UNKNOWN;
 }
 
-enum tls_error tls_recv(
-	struct tls_connection *restrict conn, void *restrict buf,
-	size_t *restrict len)
+enum tls_error
+tls_recv(struct tls_connection *conn, void *restrict buf, size_t *restrict len)
 {
 	if (*len == 0) {
 		return TLS_ERROR_NONE;
@@ -1605,7 +1666,7 @@ enum tls_error tls_recv(
 	/* A read can drive the handshake and emit records (e.g. the client's
 	 * Finished); surface any staged ciphertext and buffered plaintext. */
 	tls_fire_send(c);
-	tls_fire_recv(c);
+	tls_fire_recv(c, err);
 	if (ret > 0) {
 		*len = (size_t)ret;
 		return TLS_ERROR_NONE;
@@ -1633,10 +1694,13 @@ enum tls_error tls_recv(
 	return TLS_ERROR_UNKNOWN;
 }
 
-enum tls_error tls_shutdown(struct tls_connection *restrict conn)
+enum tls_error tls_shutdown(struct tls_connection *conn)
 {
-	ERR_clear_error();
 	struct tls_conn_impl *const c = tls_conn_raw(conn);
+	if (c->close_notify_sent) {
+		return TLS_ERROR_NONE;
+	}
+	ERR_clear_error();
 	SSL *const ssl = c->ssl;
 
 	const int ret = SSL_shutdown(ssl);
@@ -1649,6 +1713,7 @@ enum tls_error tls_shutdown(struct tls_connection *restrict conn)
 	if (ret >= 0) {
 		/* One-way: our close_notify is flushed (ret==0) or both exchanged
 		 * (ret==1); the caller reads the peer's close_notify via tls_recv. */
+		c->close_notify_sent = true;
 		return TLS_ERROR_NONE;
 	}
 
@@ -1824,11 +1889,16 @@ bool tls_peer_psk_label(
 	    *len < TLS_PSK_LABEL_MAX + 1 || !psk_ex_idx_ready()) {
 		return false;
 	}
-	const char *const label =
-		SSL_get_ex_data(tls_conn_ssl(conn), g_psk_ssl_ex_idx);
+	SSL *const ssl = tls_conn_ssl(conn);
+	/* A certificate handshake is not an error: the caller distinguishes
+	 * the two credential modes by this return.  The label is recorded when
+	 * the PSK is offered or looked up, before the binder is checked, so it
+	 * counts only once the handshake has finished on the PSK. */
+	if (!SSL_is_init_finished(ssl) || SSL_session_reused(ssl) != 1) {
+		return false;
+	}
+	const char *const label = SSL_get_ex_data(ssl, g_psk_ssl_ex_idx);
 	if (label == NULL) {
-		/* Certificate handshake: not an error, the caller distinguishes
-		 * the two credential modes by this return. */
 		return false;
 	}
 	const size_t label_len = strlen(label);

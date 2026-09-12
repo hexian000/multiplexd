@@ -3,15 +3,17 @@
 
 /* util_test.c - black-box tests for util.c's public API: address resolution
  * (resolve_addr, resolve_bindaddr), CSPRNG byte generation (csprng_bytes),
- * MIME media-type validation (mime_check_media), and identity escaping
- * (escape_identity).
+ * MIME media-type validation (mime_check_media), identity escaping
+ * (escape_identity), and the transient-backpressure predicate
+ * (sock_would_block).
  * Dependencies: links the real util.c (+ TLS backend). */
 
-#include "shim/util.h"
+#include "util.h"
 
 #include "os/socket.h"
 #include "utils/testing.h"
 
+#include <errno.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -295,28 +297,56 @@ T_DECLARE_CASE(test_mime_check_media_malformed_tail)
 }
 
 /* Every escape class of the plaintext grammar in one identity: the two
- * verbatim escapes, the shared \n, the two ESCAPE_PLAIN-only escapes, and a
- * remaining C0 byte -- ESC, the one that drives a reader's terminal -- as an
- * inert \xNN. */
+ * verbatim escapes, the shared \n, the two ESCAPE_PLAIN-only escapes, and the
+ * remaining controls that drive a reader's terminal -- ESC, DEL, and the UTF-8
+ * C1 control U+009B (CSI, so "\xc2\x9b" "2J" would clear the screen) -- as
+ * inert \xNN per byte. Non-control UTF-8 (U+00A0, U+00E9) stays verbatim. */
 T_DECLARE_CASE(test_escape_identity_plain_escapes_every_class)
 {
 	char out[IDENTITY_ESCAPED_MAX];
 	escape_identity(
-		out, sizeof(out), "a\"b\nc\\d\te\rf\x1b[", ESCAPE_PLAIN);
-	T_EXPECT_STREQ(out, "a\\\"b\\nc\\\\d\\te\\rf\\x1b[");
+		out, sizeof(out),
+		"a\"b\nc\\d\te\rf\x1b[g\x7fh\xc2\x9b"
+		"2J\xc2\xa0\xc3\xa9",
+		ESCAPE_PLAIN);
+	T_EXPECT_STREQ(
+		out, "a\\\"b\\nc\\\\d\\te\\rf\\x1b[g\\x7fh\\xc2\\x9b"
+		     "2J\xc2\xa0\xc3\xa9");
 }
 
 /* The same identity in the Prometheus grammar, where \\, \" and \n are the
- * only valid label-value escapes: every other C0 byte -- TAB and CR as much as
- * the terminal-driving ESC -- becomes the placeholder, since \t, \r and \xNN
- * alike would make the scrape unparseable and passing the byte through would
- * put it on the operator's terminal. */
-T_DECLARE_CASE(test_escape_identity_metric_substitutes_remaining_c0)
+ * only valid label-value escapes: every other control -- TAB and CR as much as
+ * the terminal-driving ESC, DEL and C1 CSI -- becomes one placeholder, since
+ * \t, \r and \xNN alike would make the scrape unparseable and passing the
+ * character through would put it on the operator's terminal. */
+T_DECLARE_CASE(test_escape_identity_metric_substitutes_remaining_controls)
 {
 	char out[IDENTITY_ESCAPED_MAX];
 	escape_identity(
-		out, sizeof(out), "a\"b\nc\\d\te\rf\x1b[", ESCAPE_METRIC);
-	T_EXPECT_STREQ(out, "a\\\"b\\nc\\\\d?e?f?[");
+		out, sizeof(out),
+		"a\"b\nc\\d\te\rf\x1b[g\x7fh\xc2\x9b"
+		"2J\xc2\xa0\xc3\xa9",
+		ESCAPE_METRIC);
+	T_EXPECT_STREQ(out, "a\\\"b\\nc\\\\d?e?f?[g?h?2J\xc2\xa0\xc3\xa9");
+}
+
+/* The C1 range is exactly C2 80..C2 9F: both ends are controls, the code
+ * points either side (U+007F is DEL, handled on its own; U+00A0 is NBSP) and a
+ * lone C2 -- at the end, or before a byte that is no continuation -- are not
+ * C1, so a C2 byte is passed through unless it leads a C1 control. */
+T_DECLARE_CASE(test_escape_identity_c1_range_boundaries)
+{
+	char out[IDENTITY_ESCAPED_MAX];
+	escape_identity(
+		out, sizeof(out), "\xc2\x80|\xc2\x9f|\xc2\xa0|\xc2",
+		ESCAPE_PLAIN);
+	T_EXPECT_STREQ(out, "\\xc2\\x80|\\xc2\\x9f|\xc2\xa0|\xc2");
+	escape_identity(out, sizeof(out), "\xc2\x7f", ESCAPE_PLAIN);
+	T_EXPECT_STREQ(out, "\xc2\\x7f");
+	escape_identity(
+		out, sizeof(out), "\xc2\x80|\xc2\x9f|\xc2\xa0|\xc2",
+		ESCAPE_METRIC);
+	T_EXPECT_STREQ(out, "?|?|\xc2\xa0|\xc2");
 }
 
 /* Each truncation guard at its exact boundary: the result breaks at a whole
@@ -349,6 +379,18 @@ T_DECLARE_CASE(test_escape_identity_truncates_and_terminates)
 		escape_identity(out, sizeof(out), "a\x1bz", ESCAPE_PLAIN);
 		T_EXPECT_STREQ(out, "a\\x1b");
 	}
+	/* Two-byte C1 control: "a\xc2\x9b" needs 10 bytes with the
+	 * terminator, and is never split between its two \xNN escapes. */
+	{
+		char out[9];
+		escape_identity(out, sizeof(out), "a\xc2\x9bz", ESCAPE_PLAIN);
+		T_EXPECT_STREQ(out, "a");
+	}
+	{
+		char out[10];
+		escape_identity(out, sizeof(out), "a\xc2\x9bz", ESCAPE_PLAIN);
+		T_EXPECT_STREQ(out, "a\\xc2\\x9b");
+	}
 	/* Verbatim byte: one byte with the terminator. */
 	{
 		char out[3];
@@ -376,8 +418,9 @@ T_DECLARE_CASE(test_escape_identity_truncates_and_terminates)
 }
 
 /* IDENTITY_ESCAPED_MAX is sized against the worst case, so a full-length
- * identity of the costliest byte -- a C0 control, 4 output bytes each -- must
- * come back whole rather than truncated. */
+ * identity of the costliest octets -- C0 controls at 4 output bytes each, or
+ * two-byte C1 controls at 8 per pair -- must come back whole rather than
+ * truncated. */
 T_DECLARE_CASE(test_escape_identity_worst_case_fits_escaped_max)
 {
 	/* The longest identity the constant budgets for, derived from it. */
@@ -389,6 +432,31 @@ T_DECLARE_CASE(test_escape_identity_worst_case_fits_escaped_max)
 	char out[IDENTITY_ESCAPED_MAX];
 	escape_identity(out, sizeof(out), in, ESCAPE_PLAIN);
 	T_EXPECT_EQ(strlen(out), (size_t)(4 * IDENTITY_MAX));
+
+	/* C1 pairs fill the identity, bar one C0 byte when it is odd. */
+	for (size_t i = 0; i + 1 < IDENTITY_MAX; i += 2) {
+		in[i] = '\xc2';
+		in[i + 1] = '\x9b';
+	}
+	escape_identity(out, sizeof(out), in, ESCAPE_PLAIN);
+	T_EXPECT_EQ(strlen(out), (size_t)(4 * IDENTITY_MAX));
+}
+
+/* sock_would_block is the single predicate every socket path -- the mux wire
+ * and stream I/O, the API server, and the mbedTLS socket-offload BIO --
+ * consults to tell backpressure worth an EV_WRITE/EV_READ wait from a dead
+ * connection.  A full kernel buffer (ENOBUFS/ENOMEM) is backpressure too; a
+ * reset, a broken pipe or a bad descriptor never is. */
+T_DECLARE_CASE(test_sock_would_block_admits_only_transient_backpressure)
+{
+	T_EXPECT(sock_would_block(EAGAIN));
+	T_EXPECT(sock_would_block(EWOULDBLOCK));
+	T_EXPECT(sock_would_block(ENOBUFS));
+	T_EXPECT(sock_would_block(ENOMEM));
+
+	T_EXPECT(!sock_would_block(ECONNRESET));
+	T_EXPECT(!sock_would_block(EPIPE));
+	T_EXPECT(!sock_would_block(EBADF));
 }
 
 static const struct testing_suite suite[] = {
@@ -413,9 +481,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_mime_check_media_wrong_type),
 	T_CASE(test_mime_check_media_malformed_tail),
 	T_CASE(test_escape_identity_plain_escapes_every_class),
-	T_CASE(test_escape_identity_metric_substitutes_remaining_c0),
+	T_CASE(test_escape_identity_metric_substitutes_remaining_controls),
+	T_CASE(test_escape_identity_c1_range_boundaries),
 	T_CASE(test_escape_identity_truncates_and_terminates),
 	T_CASE(test_escape_identity_worst_case_fits_escaped_max),
+	T_CASE(test_sock_would_block_admits_only_transient_backpressure),
 	T_SUITE_END,
 };
 

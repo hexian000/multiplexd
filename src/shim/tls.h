@@ -43,8 +43,11 @@ struct tls_callback {
 	/* Outbound ciphertext staged, ready to drain with tls_output; memory-backed
 	 * connections only. */
 	void (*on_send)(void *ctx);
-	/* Buffered plaintext is readable by tls_recv without feeding more ciphertext
-	 * (or, fd-backed, without another socket read). */
+	/* Buffered input may yield plaintext to tls_recv without feeding more
+	 * ciphertext (or, fd-backed, without another socket read).  Never missed
+	 * while decrypted plaintext or a whole record is buffered, but it may fire
+	 * for a trailing partial record, which tls_recv answers with WANT_READ: a
+	 * caller draining on this hint stops on WANT_READ, not on the hint alone. */
 	void (*on_recv)(void *ctx);
 };
 
@@ -54,6 +57,16 @@ struct tls_callback {
  * on *length*, not on entropy, and keys must come from a CSPRNG. */
 #define TLS_PSK_MIN_LEN 32u
 #define TLS_PSK_MAX_LEN 64u
+#if WITH_MBEDTLS
+/* mbedTLS rejects keys longer than its compile-time limit in both the
+ * configuration and handshake APIs. Keep the shared contract no wider than
+ * the selected backend, while retaining the 64-octet ceiling elsewhere. */
+#include <mbedtls/ssl.h>
+#if MBEDTLS_PSK_MAX_LEN < TLS_PSK_MAX_LEN
+#undef TLS_PSK_MAX_LEN
+#define TLS_PSK_MAX_LEN MBEDTLS_PSK_MAX_LEN
+#endif
+#endif /* WITH_MBEDTLS */
 /* Derived identity label: 16 octets, lowercase hex, excluding the NUL. */
 #define TLS_PSK_LABEL_MAX 32u
 
@@ -65,7 +78,9 @@ struct tls_callback {
  * but never log it unescaped.
  * @param[out] key Caller-provided buffer of ::TLS_PSK_MAX_LEN octets.  Copied
  * into rather than lent, so no key outlives the call.
- * @param[inout] key_len In: capacity.  Out: octets written.
+ * @param[inout] key_len In: capacity.  Out: octets written, from
+ * ::TLS_PSK_MIN_LEN through ::TLS_PSK_MAX_LEN; any other value rejects the
+ * handshake even when the callback returns true.
  * @return true if the identity is known; false rejects the handshake.
  */
 typedef bool (*tls_psk_lookup_fn)(
@@ -104,7 +119,14 @@ struct tls_config {
 	 * long as one connection still runs handshakes over it. */
 	void (*psk_lookup_ctx_hold)(void *ctx);
 	void (*psk_lookup_ctx_release)(void *ctx);
-	/* Colon-separated TLS 1.3 cipher suites, or NULL for defaults. */
+	/* Colon-separated TLS 1.3 cipher suites, or NULL for defaults.  IANA
+	 * names (TLS_AES_128_GCM_SHA256) work on both backends; mbedTLS also
+	 * takes its own spellings (TLS1-3-AES-128-GCM-SHA256), OpenSSL does not.
+	 * Context creation fails if any name is not a TLS 1.3 suite this build
+	 * supports, or the list names none.  With a PSK the list is narrowed to
+	 * its SHA-256 suites, in their configured order: a TLS 1.3 PSK is always
+	 * bound to SHA-256, on both backends, and context creation fails when the
+	 * list has no SHA-256 suite. */
 	const char *ciphersuites;
 	/* Comma-separated ALPN list; NULL or empty omits the extension. */
 	const char *alpn;
@@ -112,8 +134,9 @@ struct tls_config {
 	const char *sni;
 	/* OpenSSL only: request KTLS offload (kernel frames+encrypts records). */
 	bool kernel_offload : 1;
-	/* mux.readahead > 0: enable the library read-ahead (SSL_CTX_set_read_ahead)
-	 * so one socket read can buffer several records.  OpenSSL only. */
+	/* mux.readahead > 0 under tls.socket_offload: enable the library
+	 * read-ahead (SSL_CTX_set_read_ahead) so one socket read can buffer
+	 * several records.  Fd-backed connections only; OpenSSL only. */
 	bool readahead : 1;
 };
 
@@ -212,6 +235,8 @@ struct tls_context *tls_ctx_server(const struct tls_config *conf);
  * @param[in] conf Parameters; exactly one credential set -- conf->cert with
  * conf->key, verifying the peer against conf->authcerts, or conf->psk.
  * @return The context, or NULL on failure.
+ * @note With conf->psk the server must authenticate with that PSK: a server
+ * that ignores the offer and presents a certificate fails the handshake.
  */
 struct tls_context *tls_ctx_client(const struct tls_config *conf);
 
@@ -304,7 +329,7 @@ size_t tls_output(
  * @return NONE when done; WANT_READ/WANT_WRITE while in progress on that
  * direction; else fatal.
  */
-enum tls_error tls_handshake(struct tls_connection *restrict conn);
+enum tls_error tls_handshake(struct tls_connection *conn);
 
 /**
  * @brief Send plaintext with partial writes.
@@ -325,19 +350,21 @@ enum tls_error tls_send(
  * @param[inout] len In: capacity. Out: bytes read (0 on error).
  * @return A ::tls_error status.
  */
-enum tls_error tls_recv(
-	struct tls_connection *restrict conn, void *restrict buf,
-	size_t *restrict len);
+enum tls_error
+tls_recv(struct tls_connection *conn, void *restrict buf, size_t *restrict len);
 
 /**
  * @brief Send this side's close_notify; one-way, does NOT await the peer's.
  * @param conn Target connection.
  * @return NONE when flushed; WANT_READ/WANT_WRITE to retry on that direction;
  * else fatal.
+ * @note Once a call has returned NONE, every later call returns NONE without
+ * any I/O: the alert is sent exactly once, and a memory-backed caller still
+ * owns draining it with tls_output().
  * @note To observe the peer's close, keep calling tls_recv() until
  * TLS_ERROR_ZERO_RETURN.
  */
-enum tls_error tls_shutdown(struct tls_connection *restrict conn);
+enum tls_error tls_shutdown(struct tls_connection *conn);
 
 /**
  * @brief Free a TLS connection.
@@ -383,13 +410,14 @@ bool tls_peer_cert_uri_sans(
 
 /**
  * @brief The PSK identity label this connection authenticated with.
- * @param conn Target connection, after a successful handshake.
+ * @param conn Target connection.
  * @param[out] buf Receives the NUL-terminated label.
  * @param[inout] len In: capacity, at least ::TLS_PSK_LABEL_MAX + 1.  Out:
  * label length excluding the NUL.
- * @return true when the handshake used a PSK; false for a certificate
+ * @return true when the handshake finished on a PSK; false for a certificate
  * handshake, which is not an error -- the caller distinguishes the two
- * credential modes by this return.
+ * credential modes by this return -- and for a handshake that has not
+ * finished or failed, whatever label it offered or looked up.
  * @note The binder proves the peer holds the key for the label it offered, so
  * a true return is an authenticated statement of which configured peer this
  * is -- unlike a certificate's subjectAltName, nothing further need be

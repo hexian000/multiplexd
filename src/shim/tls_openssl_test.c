@@ -2,20 +2,24 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* tls_openssl_test.c - white-box tests for the OpenSSL backend's
- * certificate-strength floor.  The floor helpers (tls_ec_curve_allowed,
+ * certificate-strength floor, its PSK context setup and its server-side PSK
+ * identity checks.  The floor helpers (tls_ec_curve_allowed,
  * tls_cert_digest_allowed, tls_verify_cert_strength_cb) are static and cannot
- * be reached through the public tls.h API: OpenSSL's own security level refuses
- * to *load* a sub-floor own certificate, so no black-box handshake ever
+ * be reached through the public tls.h API: OpenSSL's own security level
+ * refuses to *load* a sub-floor own certificate, so no black-box handshake ever
  * presents one to the verify callback -- the handshake cases in tls_test.c hit
  * that load refusal on this backend and only exercise the mbedTLS profile
- * floor.  This TU compiles tls_openssl.c directly (its symbols are internal to
- * this file, so it must not link `shim`) to test the floor in isolation against
- * certificates and keys built at runtime. */
+ * floor.  Likewise the public API only ever offers a well-formed derived PSK
+ * label, so no black-box handshake hands psk_find_session_cb a hostile
+ * identity.  This TU compiles tls_openssl.c directly (its symbols are internal
+ * to this file, so it must not link `shim`) to test them in isolation. */
 
 /* WITH_TLS comes from the force-included config.h, as in tls_openssl.c. */
 #if WITH_TLS
 
-/* Compile the backend into this TU to reach its static floor helpers. */
+#include "tls.h"
+
+/* Compile the backend into this TU to reach its static helpers. */
 #include "tls_openssl.c"
 
 #include "utils/slog.h"
@@ -29,8 +33,11 @@
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Generate a key pair; a NULL result is a test-setup failure, not a case
@@ -317,11 +324,142 @@ T_DECLARE_CASE(test_load_cert_without_certificate_logs)
 	T_EXPECT(logged);
 }
 
+static const unsigned char psk_key[TLS_PSK_MIN_LEN] = { 1 };
+
+/* tls_psk_lookup_fn serving psk_key for any identity. */
+static bool psk_lookup_any(
+	void *ctx, const char *identity, unsigned char *key, size_t *key_len)
+{
+	(void)ctx;
+	(void)identity;
+	if (*key_len < sizeof(psk_key)) {
+		return false;
+	}
+	memcpy(key, psk_key, sizeof(psk_key));
+	*key_len = sizeof(psk_key);
+	return true;
+}
+
+/* Install PSK credentials on a fresh context of @p method that the host
+ * openssl.cnf is modelled as having set @p preset on, and return the options
+ * left afterwards.  Aborts the case when the install itself fails. */
+static uint64_t psk_opts_after_setup(
+	const SSL_METHOD *const method, const bool is_server,
+	const uint64_t preset)
+{
+	struct tls_context *const ctx = tls_ctx_new(method);
+	T_CHECK(ctx != NULL);
+	struct tls_ctx_impl *const c = tls_ctx_raw(ctx);
+	(void)SSL_CTX_set_options(c->ssl_ctx, preset);
+	const struct tls_config conf = {
+		.psk_lookup = is_server ? psk_lookup_any : NULL,
+		.psk = is_server ? NULL : psk_key,
+		.psk_len = is_server ? 0 : sizeof(psk_key),
+	};
+	const bool ok = tls_ctx_set_psk(c, &conf, is_server);
+	const uint64_t opts = SSL_CTX_get_options(c->ssl_ctx);
+	tls_ctx_free(ctx);
+	T_CHECK(ok);
+	return opts;
+}
+
+/* A PSK context must negotiate psk_dhe_ke only.  SSL_CTX_new() applies the
+ * host openssl.cnf [system_default] section, where AllowNoDHEKEX (and, from
+ * OpenSSL 3.3, PreferNoDHEKEX) would let two peers settle on bare psk_ke and
+ * lose forward secrecy; the PSK setup must clear both on either role. */
+T_DECLARE_CASE(test_psk_clears_no_dhe_kex)
+{
+	uint64_t no_dhe = SSL_OP_ALLOW_NO_DHE_KEX;
+#ifdef SSL_OP_PREFER_NO_DHE_KEX
+	no_dhe |= SSL_OP_PREFER_NO_DHE_KEX;
+#endif
+	/* Clearing is targeted: an unrelated option set beside it survives. */
+	const uint64_t other = SSL_OP_CIPHER_SERVER_PREFERENCE;
+	const uint64_t srv =
+		psk_opts_after_setup(TLS_server_method(), true, no_dhe | other);
+	const uint64_t cli = psk_opts_after_setup(
+		TLS_client_method(), false, no_dhe | other);
+	T_EXPECT((srv & no_dhe) == 0);
+	T_EXPECT((cli & no_dhe) == 0);
+	T_EXPECT((srv & other) != 0);
+	T_EXPECT((cli & other) != 0);
+}
+
+/* Records what psk_find_session_cb forwarded; always reports "unknown", so
+ * no session is built. */
+struct psk_lookup_spy {
+	int calls;
+	char label[TLS_PSK_LABEL_MAX + 1];
+};
+
+static bool psk_spy_lookup(
+	void *ctx, const char *identity, unsigned char *key, size_t *key_len)
+{
+	struct psk_lookup_spy *const spy = ctx;
+	spy->calls++;
+	(void)snprintf(spy->label, sizeof(spy->label), "%s", identity);
+	memset(key, 0, *key_len);
+	*key_len = 0;
+	return false;
+}
+
+/* Run the server's find-session callback on one offered identity; returns
+ * whether it declined it cleanly (1, no session). */
+static bool psk_find_declines(SSL *ssl, const char *identity, size_t len)
+{
+	SSL_SESSION *sess = NULL;
+	const int ret = psk_find_session_cb(
+		ssl, (const unsigned char *)identity, len, &sess);
+	SSL_SESSION_free(sess);
+	return ret == 1 && sess == NULL;
+}
+
+/* The identity is the attacker's, and arrives with no terminator.  One longer
+ * than any derived label, or one holding a NUL -- which the C-string lookup
+ * would read as a shorter label, possibly another peer's -- is declined before
+ * the lookup runs.  The 32-octet case is the boundary that must still reach the
+ * lookup, intact. */
+T_DECLARE_CASE(test_psk_find_session_cb_rejects_hostile_identity)
+{
+	static const char k_max[] = "0123456789abcdef0123456789abcdef";
+	static const char k_over[] = "0123456789abcdef0123456789abcdef0";
+	static const char k_nul_last[] = "0123456789abcdef0123456789abcde\0";
+	static_assert(sizeof(k_max) - 1 == TLS_PSK_LABEL_MAX, "boundary");
+	struct psk_lookup_spy spy = { 0 };
+	struct tls_context *const ctx = tls_ctx_server(&(struct tls_config){
+		.psk_lookup = psk_spy_lookup, .psk_lookup_ctx = &spy });
+	T_CHECK(ctx != NULL);
+	SSL *const ssl = SSL_new(tls_ctx_raw(ctx)->ssl_ctx);
+	T_CHECK(ssl != NULL);
+
+	const bool nul_mid_declined = psk_find_declines(ssl, "ab\0cd", 5);
+	const bool nul_last_declined =
+		psk_find_declines(ssl, k_nul_last, sizeof(k_nul_last) - 1);
+	const bool over_declined =
+		psk_find_declines(ssl, k_over, sizeof(k_over) - 1);
+	const int hostile_calls = spy.calls;
+	const bool max_declined =
+		psk_find_declines(ssl, k_max, sizeof(k_max) - 1);
+
+	SSL_free(ssl);
+	tls_ctx_free(ctx);
+
+	T_EXPECT(nul_mid_declined);
+	T_EXPECT(nul_last_declined);
+	T_EXPECT(over_declined);
+	T_EXPECT_EQ(hostile_calls, 0);
+	T_EXPECT(max_declined);
+	T_EXPECT_EQ(spy.calls, 1);
+	T_EXPECT_STREQ(spy.label, k_max);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_ec_curve_allowlist),
 	T_CASE(test_cert_digest_floor),
 	T_CASE(test_verify_cert_strength_cb),
 	T_CASE(test_load_cert_without_certificate_logs),
+	T_CASE(test_psk_clears_no_dhe_kex),
+	T_CASE(test_psk_find_session_cb_rejects_hostile_identity),
 	T_SUITE_END,
 };
 

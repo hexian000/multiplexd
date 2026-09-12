@@ -3,8 +3,14 @@
 
 /**
  * @file util.h
- * @brief CSPRNG bytes, address resolution, MIME media-type validation, ALPN
- * list tokenizing, and event/thread assertion macros.
+ * @brief Project-wide helpers shared across the multiplexd modules.
+ *
+ * Event and thread assertion macros (CHECK_REVENTS, THRD_ASSERT), best-effort
+ * socket option logging (LOG_SOCKOPT), CSPRNG bytes, exclusive file creation
+ * and discard, address resolution and its length limits, socket backpressure
+ * classification (sock_would_block), MIME media-type validation, and identity
+ * escaping for text output; with TLS, also ALPN list tokenizing and matching a
+ * claimed identity against the peer certificate's IDENTITY_URI_SCHEME name.
  */
 
 #ifndef SHIM_UTIL_H
@@ -139,27 +145,31 @@ enum mime_check_result
 mime_check_media(char *buf, const char *subtype, const char **version_out);
 
 /* An identity is only NUL-excluded per doc/spec.md 5.2.3.2, so a peer may claim
- * one holding quotes, backslashes, newlines or other control bytes. Escape it
- * before interpolating into text output, or a crafted identity forges log
- * records, corrupts the /metrics exposition, or drives a reader's terminal.
+ * one holding quotes, backslashes, newlines or other control characters -- C0
+ * bytes, DEL, and C1 controls (U+0080..U+009F, UTF-8 C2 80..C2 9F), which a
+ * UTF-8 terminal acts on (U+009B is CSI). Escape it before interpolating into
+ * text output, or a crafted identity forges log records, corrupts the /metrics
+ * exposition, or drives a reader's terminal.
  *
- * Worst case per octet is a plaintext control byte at 4 bytes (\xNN); the
- * metric context never exceeds 2x. */
+ * Worst case per octet is a plaintext control at 4 bytes (\xNN per byte; a
+ * two-byte C1 control takes 8); the metric context never exceeds 2x. */
 enum { IDENTITY_ESCAPED_MAX = 4 * 255 + 1 };
 
-/* Stands in for a C0 byte the metric grammar cannot escape. Printable, so it
+/* Stands in for a control character the metric grammar cannot escape, one
+ * placeholder per character (a two-byte C1 control included). Printable, so it
  * survives interpolation inertly. Lossy by design: identities differing only in
- * which control byte they carry collapse onto one label value. */
+ * which control character they carry collapse onto one label value. */
 #define IDENTITY_METRIC_PLACEHOLDER '?'
 
 /* escape_identity() target grammar. The Prometheus 0.0.4 text format accepts
  * only \\, \" and \n as backslash escapes inside a label value; any other
  * escape (e.g. \t or \r) is an "invalid escape sequence" that makes the whole
- * scrape unparseable. A C0 byte with no valid escape -- TAB and CR as much as
- * ESC -- is therefore substituted with IDENTITY_METRIC_PLACEHOLDER rather than
- * escaped or passed through. Plaintext -- a log record or a status line -- has
- * no such grammar, so it escapes every control byte: TAB and CR as \t and \r,
- * and any other C0 byte (e.g. ESC) as an inert \xNN. */
+ * scrape unparseable. A control character with no valid escape -- TAB and CR
+ * as much as ESC, DEL or a C1 control -- is therefore substituted with
+ * IDENTITY_METRIC_PLACEHOLDER rather than escaped or passed through. Plaintext
+ * -- a log record or a status line -- has no such grammar, so it escapes every
+ * control character: TAB and CR as \t and \r, and any other (e.g. ESC, DEL,
+ * or U+009B CSI) as an inert \xNN per byte. */
 enum escape_ctx { ESCAPE_METRIC, ESCAPE_PLAIN };
 
 /**
