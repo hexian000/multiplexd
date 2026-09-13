@@ -23,6 +23,31 @@
 #include <string.h>
 #include <sys/socket.h>
 
+/* Linux may pass through a pending per-connection network error from accept()
+ * instead of discarding it; per accept(2), treat these like EAGAIN. EHOSTDOWN
+ * and ENONET are not POSIX and not defined on every platform. */
+static bool is_accept_network_error(const int err)
+{
+	switch (err) {
+	case ENETDOWN:
+	case EPROTO:
+	case ENOPROTOOPT:
+	case EHOSTUNREACH:
+	case EOPNOTSUPP:
+	case ENETUNREACH:
+#ifdef EHOSTDOWN
+	case EHOSTDOWN:
+#endif
+#ifdef ENONET
+	case ENONET:
+#endif
+		return true;
+	default:
+		break;
+	}
+	return false;
+}
+
 static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ);
@@ -44,13 +69,7 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 			if (err == EAGAIN || err == EWOULDBLOCK) {
 				break; /* no more pending connections */
 			}
-			/* Linux may pass through a pending per-connection network
-			 * error from accept() instead of discarding it; per
-			 * accept(2), treat these like EAGAIN. */
-			if (err == ENETDOWN || err == EPROTO ||
-			    err == ENOPROTOOPT || err == EHOSTDOWN ||
-			    err == ENONET || err == EHOSTUNREACH ||
-			    err == EOPNOTSUPP || err == ENETUNREACH) {
+			if (is_accept_network_error(err)) {
 				break; /* transient per-connection error */
 			}
 			if (err == ENOBUFS || err == ENOMEM || err == EMFILE ||
@@ -131,14 +150,15 @@ void listener_init(
 	l->num_accepted = num_accepted;
 }
 
-bool listener_start(
-	struct listener *l, struct ev_loop *loop, const struct sockaddr *sa)
+int listener_open(
+	const struct conf_socket_opts *const restrict socket_opts,
+	const struct sockaddr *const restrict sa)
 {
 	const int fd = socket(sa->sa_family, SOCK_STREAM, 0);
 	if (fd < 0) {
 		const int err = errno;
 		LOGE_F("socket: (%d) %s", err, strerror(err));
-		return false;
+		return -1;
 	}
 
 	LOG_SOCKOPT("socket_set_cloexec", socket_set_cloexec(fd));
@@ -146,11 +166,9 @@ bool listener_start(
 		const int err = errno;
 		LOGE_F("socket_set_nonblock: (%d) %s", err, strerror(err));
 		socket_close(fd);
-		return false;
+		return -1;
 	}
 
-	const struct conf_socket_opts *const restrict socket_opts =
-		l->socket_opts;
 	LOG_SOCKOPT(
 		"socket_set_buffer",
 		socket_set_buffer(
@@ -167,14 +185,14 @@ bool listener_start(
 		const int err = errno;
 		LOGE_F("bind: (%d) %s", err, strerror(err));
 		socket_close(fd);
-		return false;
+		return -1;
 	}
 
 	if (listen(fd, socket_opts->backlog) != 0) {
 		const int err = errno;
 		LOGE_F("listen: (%d) %s", err, strerror(err));
 		socket_close(fd);
-		return false;
+		return -1;
 	}
 
 #if WITH_TCP_FASTOPEN
@@ -183,9 +201,35 @@ bool listener_start(
 		socket_set_fastopen(fd, socket_opts->backlog));
 #endif
 
+	return fd;
+}
+
+void listener_start_fd(
+	struct listener *const restrict l, struct ev_loop *const restrict loop,
+	const int fd)
+{
 	ev_io_set(&l->w_accept, fd, EV_READ);
 	ev_io_start(loop, &l->w_accept);
+}
+
+bool listener_start(
+	struct listener *const restrict l, struct ev_loop *const restrict loop,
+	const struct sockaddr *const restrict sa)
+{
+	const int fd = listener_open(l->socket_opts, sa);
+	if (fd < 0) {
+		return false;
+	}
+	listener_start_fd(l, loop, fd);
 	return true;
+}
+
+bool listener_get_addr(
+	const struct listener *const restrict l,
+	union sockaddr_max *const restrict sa)
+{
+	const int fd = l->w_accept.fd;
+	return fd != -1 && socket_get_addr(fd, sa) == 0;
 }
 
 void listener_stop(struct listener *l, struct ev_loop *loop)

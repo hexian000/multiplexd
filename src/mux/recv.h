@@ -22,7 +22,7 @@ struct mux_header;
 
 /* Drain the transport read side: read and dispatch as many complete frames as
  * are available.  Entry point from session.c:socket_cb on EV_READ. */
-void mux_session_on_recv(struct mux_session *restrict ss);
+void mux_session_on_recv(struct mux_session *ss);
 
 /* Dispatch whatever complete frames are already buffered in wire.recvbuf,
  * without reading more from the transport.  Entry point from
@@ -31,12 +31,12 @@ void mux_session_on_recv(struct mux_session *restrict ss);
  * behind tx_pending, and tx_pending has now settled to false without ever
  * writing a byte to the peer (e.g. every queued stream tombstoned during
  * suspension), so no peer ACK is coming to trigger a fresh EV_READ. */
-void mux_session_dispatch_pending(struct mux_session *restrict ss);
+void mux_session_dispatch_pending(struct mux_session *ss);
 
 /* Process an inbound PING: send PONG if rate limit permits.  A PING longer than
  * max_payload cannot be echoed and resets the session (spec §5.3.2). */
 void mux_session_recv_ping(
-	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	struct mux_session *ss, const struct mux_header *restrict hdr,
 	size_t frame_size);
 
 /* Process an inbound PONG: feed timestamp to the BDP estimator. */

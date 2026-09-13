@@ -31,6 +31,7 @@ struct api_ctx;
 struct config;
 struct hashtable;
 struct tls_context;
+struct udp_listener;
 
 /* Single event log entry for the session event ring buffer. */
 struct server_evlog_entry {
@@ -127,7 +128,16 @@ struct server_counters {
 		uint_least64_t traffic_byt_mux_sent;
 		uint_least64_t traffic_byt_push_recv;
 		uint_least64_t traffic_byt_push_sent;
+		uint_least64_t pkt_dgram_sent;
+		uint_least64_t pkt_dgram_recv;
+		uint_least64_t pkt_dgram_dropped;
+		uint_least64_t byt_dgram_sent;
+		uint_least64_t byt_dgram_recv;
 	} closed;
+	/* lossymux datagrams a UDP listener dropped before any tunnel took
+	 * them: no session to route to, truncated, or out of memory.
+	 * Server-thread only, so plain. */
+	uint_least64_t num_dgram_unrouted;
 };
 
 /* Snapshot of server statistics; plain (non-atomic) fields, safe to read
@@ -171,6 +181,15 @@ struct server_stats {
 	uint_least64_t traffic_byt_mux_sent;
 	uint_least64_t traffic_byt_push_recv;
 	uint_least64_t traffic_byt_push_sent;
+	/* lossymux datagram totals over every tunnel, live and closed; dropped
+	 * includes datagrams no tunnel took.  num_flows is the live UDP flow
+	 * gauge. */
+	uint_least64_t pkt_dgram_sent;
+	uint_least64_t pkt_dgram_recv;
+	uint_least64_t pkt_dgram_dropped;
+	uint_least64_t byt_dgram_sent;
+	uint_least64_t byt_dgram_recv;
+	size_t num_flows;
 	/* Monotonic count of establishment-latency observations over every
 	 * tunnel, live and closed.  This is how many samples the percentiles
 	 * below summarize over the process's life, unlike the windowed
@@ -201,6 +220,8 @@ struct server_stats {
 /* Per-identity listener and the pool of mux sessions serving it. */
 struct identity_listener {
 	struct listener listener;
+	/* lossymux UDP socket bound beside listener; NULL when disabled. */
+	struct udp_listener *udp;
 	/* Peer identity expected in hellos — not owned. */
 	const char *peer_identity;
 	/* Active tunnels for this identity; owned, all non-NULL. */
@@ -240,6 +261,8 @@ struct server {
 	struct listener mux_listener;
 	struct listener local_listener;
 	struct listener api_listener;
+	/* lossymux UDP socket bound beside local_listener; NULL when disabled. */
+	struct udp_listener *udp_local;
 	/* Head of the live api_listener connections, an intrusive list owned by
 	 * api_server.c and swept by api_server_stop(). */
 	struct api_ctx *api_conns;
@@ -261,6 +284,13 @@ struct server {
 	size_t num_identity_tunnels;
 	/* monotonically-increasing index */
 	uint_least64_t next_tunnel_index;
+	/* Pointer-keyed set of the tunnels the running force-close sweep
+	 * (server_stop's snapshot, or a discarded identity pool) has not seen
+	 * freed yet; NULL outside a sweep, or when building it ran out of
+	 * memory. server_close_and_fold() deletes each tunnel before freeing
+	 * it, so a sweep entry freed by a reentrant handle_closed is missing
+	 * here -- an O(1) check in place of a walk over every registry. */
+	struct hashtable *sweep_live;
 
 	int_least64_t started;
 
@@ -291,21 +321,28 @@ struct server {
 	 * the wall-clock fallback. */
 	bool check_uses_boottime;
 	/* Set by signal_cb on SIGINT/SIGTERM; makes w_maintenance the force-exit
-	 * deadline and gates the early-exit check in handle_closed. */
+	 * deadline, gates the early-exit check in handle_closed, and makes
+	 * server_apply_config refuse every further reload. Also set by
+	 * server_stop, so nothing re-arms the maintenance tick on a server being
+	 * torn down. */
 	bool shutting_down;
 	/* Cross-thread relay: ev_async + dispatcher for session threads. */
 #if WITH_THREADS
 	ev_async w_async;
-	/* Set on a tunnel thread when a relay task is dropped, since a lost
-	 * CLOSED event can strand an identity slot that only the maintenance
-	 * sweep reclaims.  Carries no data, so relaxed ordering suffices; the
-	 * relay async is what actually wakes the server loop to read it. */
-	atomic_bool sweep_pending;
 	struct dispatcher *disp;
-	/* Shared mutex protecting accepted_tunnels; exclusive on the server thread
-	 * for add/remove, shared on worker threads for lookups. */
+	/* Shared mutex protecting accepted_tunnels and the identities table
+	 * pointer; exclusive on the server thread for an accepted_tunnels
+	 * add/remove or an identities swap on reload, shared on worker threads
+	 * for lookups (resume, peer verification). Session capacity reservation,
+	 * release and limit updates take the exclusive lock on either thread. */
 	smtx_t accepted_mu;
 #endif /* WITH_THREADS */
+
+	/* Session capacity, protected by accepted_mu with threads. Inbound
+	 * transports reserve only when establishing; outbound tunnels reserve
+	 * from creation, and both retain the slot until destruction. */
+	size_t session_slots;
+	size_t session_limit;
 
 	struct server_counters counters;
 
@@ -323,8 +360,9 @@ struct server {
 
 /* Apply a pre-parsed configuration to a running server (hot-reload); takes
  * ownership of @p new_conf. On success it becomes s->conf; on failure it is
- * freed, the server keeps its current config, and this returns false. */
-bool server_apply_config(struct server *restrict s, struct config *new_conf);
+ * freed, the server keeps its current config, and this returns false. Once a
+ * graceful shutdown has begun it always fails. */
+bool server_apply_config(struct server *s, struct config *new_conf);
 
 /* Allocate and initialize a server; @p conf becomes s->conf on success but the
  * caller retains ownership of it. NULL on allocation/setup failure, in which
@@ -334,21 +372,24 @@ bool server_apply_config(struct server *restrict s, struct config *new_conf);
 struct server *server_new(struct ev_loop *loop, struct config *conf);
 
 /* Start listeners, background workers, and outbound sessions; false on failure. */
-bool server_start(struct server *restrict s);
+bool server_start(struct server *s);
 
 /* Stop listeners, drop any connection the management API still holds, and
- * initiate shutdown of active sessions. */
+ * force-close every remaining session synchronously: each tunnel is closed and
+ * freed before this returns, and the tunnel pools are released.  Nothing is
+ * left running; a graceful drain is the SIGINT/SIGTERM handler's job, before
+ * this is called. */
 void server_stop(struct server *s);
 
 /* Free a stopped server and all owned resources; NULL is allowed. Releases the
- * async watcher server_new() armed, so the ev_loop must outlive this call and a
- * server that never had a config applied needs no server_stop() first. Once
- * server_apply_config() has run, tunnels exist and are started even if
- * server_start() never was, and only server_stop() tears them down: freeing
- * without it leaves live tunnel threads posting into a destroyed dispatcher.
- * Does not free s->conf --
- * the caller owns the config (see server_new) and must free it separately, using
- * the current s->conf since a reload may have replaced it. */
+ * async watcher server_new() armed and stops the maintenance timer, so the
+ * ev_loop must outlive this call and a server that never had a config applied
+ * needs no server_stop() first. Once server_apply_config() has run, tunnels
+ * exist and are started even if server_start() never was, and only
+ * server_stop() tears them down: freeing without it leaves live tunnel threads
+ * posting into a destroyed dispatcher. Does not free s->conf -- the caller owns
+ * the config (see server_new) and must free it separately, using the current
+ * s->conf since a reload may have replaced it. */
 void server_free(struct server *s);
 
 /* Allocate a consistent snapshot of all server statistics (caller frees);
@@ -368,8 +409,9 @@ server_stats(const struct server *restrict s, bool want_tunnel_latency);
  * invoked with its identifier: the peer identity for identity listeners, or the
  * configured local listen address for the top-level listener.  Returns the
  * number of offline listeners (0 means healthy); @p cb may be NULL to only
- * count.  On-demand mode (mux.idle_timeout > 0) always reports healthy, since
- * tunnels disconnect when idle by design.  Must run on the server loop; per
+ * count. A listener backed by a configured on-demand dialed tunnel
+ * (mux.idle_timeout > 0) reports healthy while that tunnel is idle; passive
+ * routes still require an established session. Must run on the server loop; per
  * tunnel liveness is read from the relaxed-atomic mirror via tunnel_state(). */
 size_t server_offline_listeners(
 	const struct server *restrict s,

@@ -9,13 +9,13 @@
 #ifndef MUX_SESSION_H
 #define MUX_SESSION_H
 
-#include "mux/estimator.h"
-#include "mux/frame.h"
-#include "mux/handshake.h"
-#include "mux/mux.h"
-#include "mux/sched.h"
-#include "mux/unacked.h"
-#include "mux/wire.h"
+#include "estimator.h"
+#include "frame.h"
+#include "handshake.h"
+#include "mux.h"
+#include "sched.h"
+#include "unacked.h"
+#include "wire.h"
 
 #include "algo/hashtable.h"
 #include "os/socket.h"
@@ -147,6 +147,9 @@ enum session_state {
 struct mux_session {
 	struct ev_loop *loop;
 	struct mux_session_config conf;
+	/* Internal owner admission hook, after resume lookup and before a fresh
+	 * server hello. NULL leaves admission unrestricted. */
+	bool (*admit_session)(void *userdata);
 	/* Frame allocator; set at creation time and never changed. */
 	struct mux_frame_allocator pool;
 	/* Authoritative logical max outbound frame payload, frozen from conf at
@@ -244,6 +247,9 @@ struct mux_session {
 
 	/* Reconnection state: monotonic ns when SESSION_CONNECT entered. */
 	int_least64_t connect_started;
+	/* ev_now() when the established transport was lost; resume_timeout
+	 * counts from here across every failed resume attempt. */
+	ev_tstamp suspended_at;
 };
 
 #define MUX_LOG_F(level, ss, format, ...)                                      \
@@ -256,9 +262,15 @@ struct mux_session {
 	} while (0)
 #define MUX_LOG(level, ss, message) MUX_LOG_F(level, ss, "%s", message)
 
-/* Fire a session event to the owner's callback, if one is registered. */
+/* Fire a session event to the owner's callback, if one is registered.
+ *
+ * The callback may act on the session through a handle it stored earlier
+ * rather than the one it is passed -- a dialed owner redials with
+ * mux_attach_fd() on its own pointer.  So, as for every other session
+ * callback, a function that holds ss across a call that can fire one must not
+ * declare ss restrict. */
 static inline void session_emit(
-	struct mux_session *restrict ss, const enum mux_event event,
+	struct mux_session *ss, const enum mux_event event,
 	const union mux_event_data data)
 {
 	if (ss->callbacks.on_event != NULL) {
@@ -276,6 +288,16 @@ session_closed_data(const struct mux_session *restrict ss, const bool expired)
 		.closed.clean = ss->wire.rx_eof,
 		.closed.expired = expired,
 		.closed.err = ss->wire.err,
+	};
+}
+
+/* Build the CONNECT_FAILED payload: the errno that ended the attempt, which
+ * the owner paces its retries by. */
+static inline union mux_event_data
+session_connect_failed_data(const struct mux_session *restrict ss)
+{
+	return (union mux_event_data){
+		.connect_failed.err = ss->wire.err,
 	};
 }
 
@@ -304,16 +326,25 @@ static inline void session_publish_estimate(struct mux_session *restrict ss)
 	PUB_STORE(ss->_pub_bdp_tx, ss->estimator.tx.bdp);
 }
 
+/* Whether lossymux (spec §5.2.3.3) was negotiated on the current transport:
+ * both our hello and the peer's offered it. */
+static inline bool
+session_dgram_negotiated(const struct mux_session *restrict ss)
+{
+	return ss->handshake.offered_lossymux && ss->handshake.peer_lossymux;
+}
+
 /* True once the graceful-drain cascade has bulk-freed the session's streams.
  * Closing the last active stream of a draining session runs stream_mark_closed
  * -> mux_sched_check_no_active_streams -> mux_session_initiate_shutdown ->
- * mux_sched_free_streams, which frees every struct mux_stream and nulls the
- * scheduler's stream table (the struct mux_session itself survives; the same
- * shutdown also runs mux_wire_discard_buffers, resetting the recvbuf). Within a
- * single synchronous callback that is the only path that frees a stream, so a
- * recv/flush caller that just invoked such a path must re-check this before
- * touching the stream again -- or consuming the recvbuf, which the cascade has
- * reset out from under it. */
+ * mux_sched_free_streams, which frees every struct mux_stream -- or orphans one
+ * the application still holds, which the library no longer drives --
+ * and nulls the scheduler's stream table (the struct mux_session itself
+ * survives; the same shutdown also runs mux_wire_discard_buffers, resetting the
+ * recvbuf). Within a single synchronous callback that is the only path that
+ * frees a stream, so a recv/flush caller that just invoked such a path must
+ * re-check this before touching the stream again -- or consuming the recvbuf,
+ * which the cascade has reset out from under it. */
 static inline bool session_streams_freed(const struct mux_session *restrict ss)
 {
 	return ss->sched.streams == NULL;
@@ -324,7 +355,7 @@ static inline bool session_streams_freed(const struct mux_session *restrict ss)
 void mux_session_update_watcher(struct mux_session *restrict ss);
 
 /* conf.keepalive scaled by a random jitter factor; shared with recv.c so a
- * received PONG can re-arm the keepalive deadline. */
+ * completed PING/PONG exchange can re-arm the keepalive deadline. */
 double mux_keepalive_interval(const struct mux_session *restrict ss);
 
 /* Allocate and initialize a new session; takes ownership of opts->fd. */
@@ -332,7 +363,7 @@ struct mux_session *mux_session_new(
 	struct ev_loop *restrict loop, const struct mux_session_opts *opts);
 
 /* Tear down and free a session; caller must remove it from external lists first. */
-void mux_session_close(struct mux_session *restrict ss);
+void mux_session_close(struct mux_session *ss);
 
 /* Apply a new configuration snapshot; safe to call on a running session. */
 void mux_session_set_config(
@@ -341,21 +372,21 @@ void mux_session_set_config(
 
 /* Begin I/O: accepted -> start handshake; client (fd=-1) -> no-op;
  * call mux_attach_fd() afterward to supply a connected fd. */
-void mux_session_start(struct mux_session *restrict ss);
+void mux_session_start(struct mux_session *ss);
 
 /* Accept a connected fd and transition to SESSION_CONNECT.
  * Valid from SESSION_INIT (initial connect), SESSION_SUSPENDED (resume),
  * or SESSION_CLOSED (reconnect after idle/timeout).  Takes fd ownership. */
-void mux_session_attach_fd(struct mux_session *restrict ss, int fd);
+void mux_session_attach_fd(struct mux_session *ss, int fd);
 
 /* Drop in-flight data, close all streams, and begin the transport close sequence. */
-void mux_session_initiate_shutdown(struct mux_session *restrict ss);
+void mux_session_initiate_shutdown(struct mux_session *ss);
 
 /* Drain: reject new inbound streams and begin graceful shutdown when the last
  * stream closes (or immediately if already idle); cleared by mux_session_attach_fd()
  * on a genuinely fresh (re)connect, but preserved across a resume from
  * SUSPENDED so a transport blip can't silently cancel a pending drain. */
-void mux_session_drain(struct mux_session *restrict ss);
+void mux_session_drain(struct mux_session *ss);
 
 /* Open a new locally-initiated stream; returns NULL when the session rejects it. */
 struct mux_stream *mux_session_open_stream(struct mux_session *restrict ss);
@@ -392,14 +423,18 @@ void mux_session_reset(struct mux_session *ss);
 
 /* Call mux_session_reset then fire MUX_EVENT_CLOSED if the session closed.
  * expired is set when the event is triggered by a resume-timeout. */
-void mux_session_notify_closed(struct mux_session *restrict ss, bool expired);
+void mux_session_notify_closed(struct mux_session *ss, bool expired);
 
-/* Suspend the transport on error, preserving stream and unacked state for resume. */
-void mux_session_suspend(struct mux_session *restrict ss);
+/* Suspend the transport on error, preserving stream and unacked state for
+ * resume.  From ESTABLISHED this emits MUX_EVENT_SUSPENDED and starts the
+ * resume_timeout; a dialed session's failed resume attempt (CONNECT or
+ * HANDSHAKE) returns to SUSPENDED, emits MUX_EVENT_CONNECT_FAILED and waits
+ * only for what remains of that timeout. */
+void mux_session_suspend(struct mux_session *ss);
 
 /* On a transport loss, mux_session_suspend() a resumable session (preserving its
  * streams) or mux_session_reset() it otherwise. */
-void mux_session_suspend_or_reset(struct mux_session *restrict ss);
+void mux_session_suspend_or_reset(struct mux_session *ss);
 
 /* Complete session establishment after a successful hello exchange. */
 void mux_session_handshake_done(struct mux_session *ss);

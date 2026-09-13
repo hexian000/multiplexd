@@ -7,6 +7,7 @@
 #include "conf.h"
 
 #include "mux/mux.h"
+#include "shim/tls.h"
 
 #include "meta/arraysize.h"
 #include "utils/slog.h"
@@ -19,17 +20,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 #include <unistd.h>
 
-/* Write a string to a new temp file; return -1 on failure. */
-static int write_tmpfile(char *restrict tmpl, const char *restrict content)
+/* Write bytes to a new temp file; return -1 on failure. */
+static int write_tmpfile_len(
+	char *restrict tmpl, const char *restrict content, const size_t len)
 {
 	const int fd = mkstemp(tmpl);
 	if (fd < 0) {
 		return -1;
 	}
-	const size_t len = strlen(content);
 	if (write(fd, content, len) != (ssize_t)len) {
 		(void)close(fd);
 		(void)unlink(tmpl);
@@ -37,6 +37,11 @@ static int write_tmpfile(char *restrict tmpl, const char *restrict content)
 	}
 	(void)close(fd);
 	return 0;
+}
+
+static int write_tmpfile(char *restrict tmpl, const char *restrict content)
+{
+	return write_tmpfile_len(tmpl, content, strlen(content));
 }
 
 static bool
@@ -60,7 +65,7 @@ write_conf_file(const struct config *restrict conf, const char *restrict path)
 
 static struct config *parse_tmpconf(const char *restrict content)
 {
-	char tmpl[] = "/tmp/conf_test_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_test_XXXXXX";
 	if (write_tmpfile(tmpl, content) != 0) {
 		return NULL;
 	}
@@ -114,8 +119,118 @@ T_DECLARE_CASE(test_conf_new_default_matches_empty_parse)
 	T_EXPECT_EQ(a->loglevel, b->loglevel);
 	T_EXPECT_EQ(a->mux.mem_pressure_hi, b->mux.mem_pressure_hi);
 	T_EXPECT_EQ(a->mux.mem_pressure_lo, b->mux.mem_pressure_lo);
+	T_EXPECT_EQ(a->mux.lossymux, b->mux.lossymux);
+	T_EXPECT_EQ(a->mux.lossymux_idle_timeout, b->mux.lossymux_idle_timeout);
+	T_EXPECT_EQ(a->mux.lossymux_queue, b->mux.lossymux_queue);
 	conf_free(b);
 	conf_free(a);
+}
+
+/* mux.lossymux defaults to disabled with the schema's idle timeout and queue,
+ * the same values the mux layer's fallback config carries for hand-built
+ * configs. */
+T_DECLARE_CASE(test_conf_lossymux_defaults)
+{
+	struct config *const conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\"}");
+	T_CHECK(conf != NULL);
+	T_EXPECT(!conf->mux.lossymux);
+	T_EXPECT(!conf_get_mux(conf).lossymux);
+	T_EXPECT_EQ(
+		conf->mux.lossymux_idle_timeout,
+		mux_session_config_default.lossymux_idle_timeout);
+	T_EXPECT_EQ(
+		conf->mux.lossymux_queue,
+		mux_session_config_default.lossymux_queue);
+	conf_free(conf);
+}
+
+/* An explicit mux.lossymux is loaded into the session config and survives a
+ * dump/reparse round trip (GET /config, --dump-config). */
+T_DECLARE_CASE(test_conf_lossymux_parse_and_roundtrip)
+{
+	struct config *const orig = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"lossymux\":"
+		"{\"enabled\":true,\"idle_timeout\":5,\"queue\":300}}}");
+	T_CHECK(orig != NULL);
+	T_EXPECT(orig->mux.lossymux);
+	T_EXPECT(conf_get_mux(orig).lossymux);
+	T_EXPECT_EQ(orig->mux.lossymux_idle_timeout, 5);
+	T_EXPECT_EQ(orig->mux.lossymux_queue, 300);
+
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_lossymux_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	(void)close(fd);
+	T_CHECK(write_conf_file(orig, tmpl));
+	struct config *const reparsed = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	T_CHECK(reparsed != NULL);
+	T_EXPECT(reparsed->mux.lossymux);
+	T_EXPECT_EQ(reparsed->mux.lossymux_idle_timeout, 5);
+	T_EXPECT_EQ(reparsed->mux.lossymux_queue, 300);
+
+	conf_free(reparsed);
+	conf_free(orig);
+}
+
+/* The schema bounds reject a zero (or oversized) idle timeout or queue, and
+ * a non-object mux.lossymux. */
+T_DECLARE_CASE(test_conf_lossymux_rejects_out_of_range)
+{
+	static const char *const bad[] = {
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"lossymux\":"
+		"{\"idle_timeout\":0}}}",
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"lossymux\":"
+		"{\"idle_timeout\":86401}}}",
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"lossymux\":"
+		"{\"queue\":0}}}",
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"lossymux\":"
+		"{\"queue\":65536}}}",
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"mux\":{\"lossymux\":true}}",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(bad); i++) {
+		struct config *const conf = parse_tmpconf(bad[i]);
+		T_EXPECT(conf == NULL);
+		conf_free(conf);
+	}
+}
+
+/* conf_parse() must honor len and not rely on a NUL terminator: a PUT /config
+ * body is followed by whatever else sits in the receive buffer. The byte
+ * after the JSON here is trailing garbage the parser would reject if it read
+ * past len. */
+T_DECLARE_CASE(test_conf_parse_honors_len_without_nul)
+{
+	char buf[] = "{\"mux_connect\":\"127.0.0.1:9000\"}X";
+	struct config *const conf = conf_parse(buf, sizeof(buf) - 2);
+	T_CHECK(conf != NULL);
+	T_EXPECT_STREQ(conf->mux_connect, "127.0.0.1:9000");
+	conf_free(conf);
+}
+
+/* Fill buf[0, len) with a valid config padded by trailing whitespace. */
+static void fill_padded_conf(char *restrict buf, const size_t len)
+{
+	static const char json[] = "{\"mux_connect\":\"127.0.0.1:9000\"}";
+	memset(buf, ' ', len);
+	memcpy(buf, json, sizeof(json) - 1);
+}
+
+/* conf_parse() applies CONF_MAXSIZE itself, independently of the file reader:
+ * a valid config padded to exactly CONF_MAXSIZE bytes parses, and the same
+ * config padded one byte further is rejected. */
+T_DECLARE_CASE(test_conf_parse_rejects_oversized_buffer)
+{
+	char *const buf = malloc(CONF_MAXSIZE + 1);
+	T_CHECK(buf != NULL);
+	fill_padded_conf(buf, CONF_MAXSIZE);
+	struct config *const conf = conf_parse(buf, CONF_MAXSIZE);
+	T_EXPECT(conf != NULL);
+	conf_free(conf);
+	fill_padded_conf(buf, CONF_MAXSIZE + 1);
+	T_EXPECT(conf_parse(buf, CONF_MAXSIZE + 1) == NULL);
+	free(buf);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_nonexistent)
@@ -187,7 +302,7 @@ T_DECLARE_CASE(test_conf_dump_roundtrip)
 	orig->mux_connect = strdup("127.0.0.1:7777");
 	T_CHECK(orig->mux_connect != NULL);
 
-	char tmpl[] = "/tmp/conf_dump_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_dump_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -222,7 +337,7 @@ T_DECLARE_CASE(test_conf_parsefile_mux_max_frame_size_roundtrip)
 		(int)(32768 - MUX_FRAME_HEADER_SIZE));
 
 	/* Dump and reparse: the re-added header must reproduce the same payload. */
-	char tmpl[] = "/tmp/conf_maxframe_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_maxframe_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -267,6 +382,40 @@ T_DECLARE_CASE(test_conf_identity_verify_requires_tls)
 	T_EXPECT(conf == NULL);
 }
 
+#if !WITH_TLS
+/* Nothing loads the tls object in this build, so a credential in it would
+ * otherwise start the daemon in cleartext with no diagnostic: each one is a
+ * hard error, while a key that selects no TLS (a tuning knob, an empty psk
+ * object) stays inert exactly as in a credential-less TLS build. */
+T_DECLARE_CASE(test_conf_no_tls_rejects_credentials)
+{
+	static const char *const rejected[] = {
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"cert\":\"@c.pem\",\"key\":\"@k.pem\",\"authcerts\":[\"@a.pem\"]}}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"cert\":\"\"}}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"key\":\"@k.pem\"}}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"authcerts\":[\"@a.pem\"]}}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{\"peer\":\"@p.key\"}}}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":\"@p.key\"}}",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(rejected); i++) {
+		struct config *const conf = parse_tmpconf(rejected[i]);
+		T_EXPECT(conf == NULL);
+		conf_free(conf);
+	}
+
+	static const char *const accepted[] = {
+		"{\"mux_listen\":\"127.0.0.1:9000\"}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"sni\":\"example.com\",\"socket_offload\":true}}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{ }}}",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(accepted); i++) {
+		struct config *const conf = parse_tmpconf(accepted[i]);
+		T_EXPECT(conf != NULL);
+		conf_free(conf);
+	}
+}
+#endif /* !WITH_TLS */
+
 T_DECLARE_CASE(test_conf_loglevel_parsed)
 {
 	struct config *const conf = parse_tmpconf(
@@ -309,7 +458,7 @@ T_DECLARE_CASE(test_conf_parsefile_requires_claim_for_identity_listen)
 /* mux_listen and mux_connect together are legal and both take effect: the
  * daemon accepts inbound sessions and maintains the outbound one.  Asserting
  * mux_connect survives conf_check is the point -- nothing clears it, and
- * server_reload_mux_tunnel dials it regardless of mux_listen. */
+ * server_ensure_mux_tunnel dials it regardless of mux_listen. */
 T_DECLARE_CASE(test_conf_parsefile_accepts_mux_listen_and_mux_connect)
 {
 	struct config *const conf = parse_tmpconf(
@@ -416,7 +565,7 @@ T_DECLARE_CASE(test_conf_dump_identity_listen_multi_peer_roundtrip)
 	T_CHECK(orig != NULL);
 	T_CHECK((int)orig->identity.peers_count == 2);
 
-	char tmpl[] = "/tmp/conf_listen_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_listen_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -499,19 +648,46 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_listen_value)
 	T_EXPECT(conf == NULL);
 }
 
-/* identity.listen keys are peer identity strings capped at 255 octets on the
- * wire; a longer key can never match a connecting peer, so conf_check must
- * reject it (the map keys bypass the schema's generated per-field checks). */
-T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_listen_key)
+/* Build an identity.listen config whose single key is @p key_len octets. */
+T_DECLARE_SUBCASE(
+	identity_listen_key_json, char *restrict json, const size_t json_size,
+	const size_t key_len)
 {
-	char key[257];
-	memset(key, 'k', sizeof(key) - 1);
-	key[sizeof(key) - 1] = '\0';
-	char json[512];
-	(void)snprintf(
-		json, sizeof(json),
+	char key[MUX_MAX_CLAIM_LEN + 2];
+	T_EXPECT(key_len < sizeof(key));
+	memset(key, 'k', key_len);
+	key[key_len] = '\0';
+	const int n = snprintf(
+		json, json_size,
 		"{\"identity\":{\"claim\":\"mynode\",\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"%s\":\"127.0.0.1:9002\"}}}",
 		key);
+	T_EXPECT(n > 0 && (size_t)n < json_size);
+}
+
+/* identity.listen keys are peer identity strings, and no peer claims more than
+ * MUX_MAX_CLAIM_LEN octets; a longer key can never match a connecting peer, so
+ * conf_check must reject it (the map keys bypass the schema's generated
+ * per-field checks).  The boundary value itself must still load. */
+T_DECLARE_CASE(test_conf_parsefile_accepts_max_length_identity_listen_key)
+{
+	char json[512];
+	T_CALL_SUBCASE(
+		identity_listen_key_json, json, sizeof(json),
+		MUX_MAX_CLAIM_LEN);
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_CHECK(conf->identity.peers_count == 1);
+	T_EXPECT_EQ(
+		(int)conf->identity.peers[0].id_len, (int)MUX_MAX_CLAIM_LEN);
+	conf_free(conf);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_listen_key)
+{
+	char json[512];
+	T_CALL_SUBCASE(
+		identity_listen_key_json, json, sizeof(json),
+		MUX_MAX_CLAIM_LEN + 1);
 	struct config *const conf = parse_tmpconf(json);
 	T_EXPECT(conf == NULL);
 }
@@ -601,8 +777,8 @@ T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_non_string_value)
 /* A JSON \u0000 escape is legal and decodes to a literal
  * embedded NUL with a correct .len, but strndup() (used to materialize
  * every config string) stops at the first NUL regardless of .len -- so a
- * claim like "abc\u0000<200 more>" would silently truncate to "abc" after
- * passing the full-length maxLength check, letting the 255-octet wire
+ * claim like "abc\u0000<50 more>" would silently truncate to "abc" after
+ * passing the full-length maxLength check, letting the MUX_MAX_CLAIM_LEN
  * limit validate content that is never what actually gets stored or sent.
  * conf_strndup() must reject this outright instead of truncating. */
 T_DECLARE_CASE(test_conf_parsefile_rejects_embedded_nul_in_identity_claim)
@@ -854,7 +1030,7 @@ T_DECLARE_CASE(test_conf_dump_tls_fields)
 	T_CHECK(orig->tls_cert != NULL);
 	T_CHECK(orig->tls_key != NULL);
 
-	char tmpl[] = "/tmp/conf_tls_dump_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_tls_dump_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -921,8 +1097,8 @@ T_DECLARE_CASE(test_conf_load_tls_kernel_offload_explicit_override)
 T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
 {
 	/* conf_inline_pem must replace @path fields with the file's content. */
-	char cert_tmpl[] = "/tmp/conf_inline_cert_XXXXXX";
-	char key_tmpl[] = "/tmp/conf_inline_key_XXXXXX";
+	char cert_tmpl[] = CONF_TEST_TMPDIR "/conf_inline_cert_XXXXXX";
+	char key_tmpl[] = CONF_TEST_TMPDIR "/conf_inline_key_XXXXXX";
 	T_CHECK(write_tmpfile(cert_tmpl, "CERTCONTENT") == 0);
 	T_CHECK(write_tmpfile(key_tmpl, "KEYCONTENT") == 0);
 
@@ -952,7 +1128,7 @@ T_DECLARE_CASE(test_conf_inline_pem_replaces_at_path)
  * @path replacement tests never touch. */
 T_DECLARE_CASE(test_conf_inline_pem_concatenates_authcerts_bundle)
 {
-	char ca_tmpl[] = "/tmp/conf_inline_ca_XXXXXX";
+	char ca_tmpl[] = CONF_TEST_TMPDIR "/conf_inline_ca_XXXXXX";
 	T_CHECK(write_tmpfile(ca_tmpl, "CA_FROM_FILE") == 0);
 
 	struct config *const conf = conf_new_default();
@@ -981,12 +1157,70 @@ T_DECLARE_CASE(test_conf_inline_pem_concatenates_authcerts_bundle)
 	conf_free(conf);
 }
 
+/* File-backed credentials must obey the same text boundary as decoded JSON
+ * strings. A valid hex prefix must not hide a NUL or the suffix after it. */
+T_DECLARE_CASE(test_conf_inline_pem_rejects_embedded_nuls)
+{
+	static const size_t positions[] = { 64, 0, 128 };
+	static const size_t fields[] = { 3, 0, 1, 2 };
+	for (size_t f = 0; f < ARRAY_SIZE(fields); f++) {
+		const size_t field = fields[f];
+		for (size_t i = 0; i < ARRAY_SIZE(positions); i++) {
+			char content[129];
+			memset(content, 'a', 64);
+			memset(content + 64, 'b', sizeof(content) - 64u);
+			content[positions[i]] = '\0';
+			char tmpl[] = CONF_TEST_TMPDIR "/conf_nul_XXXXXX";
+			T_CHECK(write_tmpfile_len(
+					tmpl, content, sizeof(content)) == 0);
+			char reference[sizeof(tmpl) + 1u];
+			(void)snprintf(
+				reference, sizeof(reference), "@%s", tmpl);
+			struct config *const conf = conf_new_default();
+			T_CHECK(conf != NULL);
+			char **slot;
+			if (field == 0) {
+				slot = &conf->tls_cert;
+			} else if (field == 1) {
+				slot = &conf->tls_key;
+			} else if (field == 2) {
+				conf->tls_authcerts =
+					(char **)calloc(1, sizeof(char *));
+				T_CHECK(conf->tls_authcerts != NULL);
+				conf->tls_authcerts_count = 1;
+				slot = &conf->tls_authcerts[0];
+			} else {
+				conf->tls_psk =
+					calloc(1, sizeof(struct psk_entry));
+				T_CHECK(conf->tls_psk != NULL);
+				conf->tls_psk_count = 1;
+				conf->tls_psk[0].id = strdup("peer");
+				T_CHECK(conf->tls_psk[0].id != NULL);
+				conf->tls_psk[0].id_len = 4;
+				slot = &conf->tls_psk[0].hex;
+			}
+			*slot = strdup(reference);
+			T_CHECK(*slot != NULL);
+			const bool accepted = conf_inline_pem(conf);
+			const bool retained_reference =
+				strcmp(*slot, reference) == 0;
+			conf_free(conf);
+			(void)unlink(tmpl);
+			T_LOGF("credential field %zu, NUL at %zu", field,
+			       positions[i]);
+			T_EXPECT(!accepted);
+			T_EXPECT(retained_reference);
+		}
+	}
+}
+
 T_DECLARE_CASE(test_conf_inline_pem_fails_for_missing_file)
 {
 	/* conf_inline_pem must return false if an @path file does not exist. */
 	struct config *const conf = conf_new_default();
 	T_CHECK(conf != NULL);
-	conf->tls_cert = strdup("@/tmp/conf_inline_nonexistent_XXXXXX.pem");
+	conf->tls_cert = strdup(
+		"@" CONF_TEST_TMPDIR "/conf_inline_nonexistent_XXXXXX.pem");
 	conf->tls_key = strdup("plaintext");
 	T_CHECK(conf->tls_cert != NULL);
 	T_CHECK(conf->tls_key != NULL);
@@ -995,8 +1229,6 @@ T_DECLARE_CASE(test_conf_inline_pem_fails_for_missing_file)
 	conf_free(conf);
 }
 
-/* With TLS credentials present, identity.verify is accepted and survives a
- * dump/parse round-trip, so GET /config and --dump-config report it. */
 /* A 32-octet key as hex; the value itself is irrelevant to parsing. */
 #define PSK_HEX                                                                \
 	"\"0101010101010101010101010101010101010101010101010101010101010101\""
@@ -1038,6 +1270,34 @@ T_DECLARE_CASE(test_conf_psk_rejects_certificate_fields)
 	T_EXPECT(conf == NULL);
 }
 
+/* PSK mode has no certificate for a server name to select, so tls.sni --
+ * whether defaulted by the schema or set explicitly -- resolves to no SNI,
+ * while certificate mode keeps its default. */
+T_DECLARE_CASE(test_conf_psk_omits_sni)
+{
+	struct config *const dflt = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
+		"\"peer\":" PSK_HEX "}}}");
+	T_CHECK(dflt != NULL);
+	T_EXPECT(dflt->tls_sni == NULL);
+	conf_free(dflt);
+
+	struct config *const set = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"tls\":{"
+		"\"sni\":\"host.example\",\"psk\":{\"peer\":" PSK_HEX "}}}");
+	T_CHECK(set != NULL);
+	T_EXPECT(set->tls_sni == NULL);
+	conf_free(set);
+
+	struct config *const cert = parse_tmpconf(
+		"{\"mux_connect\":\"127.0.0.1:9000\",\"tls\":{"
+		"\"cert\":\"c\",\"key\":\"k\",\"authcerts\":[\"a\"]}}");
+	T_CHECK(cert != NULL);
+	T_CHECK(cert->tls_sni != NULL);
+	T_EXPECT_STREQ(cert->tls_sni, "example.com");
+	conf_free(cert);
+}
+
 T_DECLARE_CASE(test_conf_psk_rejects_identity_verify)
 {
 	/* PSK binds identity through the binder, so the certificate-mode
@@ -1057,25 +1317,234 @@ T_DECLARE_CASE(test_conf_psk_rejects_duplicate_identity)
 	T_EXPECT(conf == NULL);
 }
 
+/* Build a tls.psk config with one entry: identity @p id, value @p val (a key
+ * or an "@path" reference). */
+T_DECLARE_SUBCASE(
+	psk_conf_json, char *restrict json, const size_t json_size,
+	const char *restrict id, const char *restrict val)
+{
+	const int n = snprintf(
+		json, json_size,
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
+		"\"%s\":\"%s\"}}}",
+		id, val);
+	T_EXPECT(n > 0 && (size_t)n < json_size);
+}
+
+/* Fill @p hex with @p octets octets of key -- 2 * @p octets copies of the
+ * digit @p c -- NUL-terminated. */
+static void psk_hex_fill(char *restrict hex, const size_t octets, const char c)
+{
+	memset(hex, c, octets * 2u);
+	hex[octets * 2u] = '\0';
+}
+
+/* An inline key is fully visible to conf_parse, so a malformed one must fail
+ * the parse itself -- which is what makes PUT /config answer 400 rather than
+ * accept the body and fail the reload later. */
 T_DECLARE_CASE(test_conf_psk_rejects_bad_key)
 {
-	/* Length and alphabet are checked in conf_inline_pem(), once any
-	 * "@path" is resolved, so drive that rather than conf_check(). */
-	struct config *const shortkey = parse_tmpconf(
-		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
-		"\"peer\":\"0101\"}}}");
-	T_CHECK(shortkey != NULL);
-	T_EXPECT(!conf_inline_pem(shortkey));
-	conf_free(shortkey);
+	char hex[(TLS_PSK_MAX_LEN + 1u) * 2u + 2u];
+	char json[512];
+
+	/* Below TLS_PSK_MIN_LEN. */
+	psk_hex_fill(hex, TLS_PSK_MIN_LEN - 1u, '0');
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
+	T_EXPECT(parse_tmpconf(json) == NULL);
+
+	/* Above TLS_PSK_MAX_LEN. */
+	psk_hex_fill(hex, TLS_PSK_MAX_LEN + 1u, '0');
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
+	T_EXPECT(parse_tmpconf(json) == NULL);
+
+	/* Odd number of hex digits: half an octet. */
+	psk_hex_fill(hex, TLS_PSK_MIN_LEN + 1u, '0');
+	hex[strlen(hex) - 1u] = '\0';
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
+	T_EXPECT(parse_tmpconf(json) == NULL);
 
 	/* Right length, wrong alphabet. */
-	struct config *const nothex = parse_tmpconf(
+	psk_hex_fill(hex, TLS_PSK_MIN_LEN, 'z');
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
+	T_EXPECT(parse_tmpconf(json) == NULL);
+}
+
+/* Both length bounds are inclusive. */
+T_DECLARE_CASE(test_conf_psk_accepts_key_length_bounds)
+{
+	char hex[TLS_PSK_MAX_LEN * 2u + 1u];
+	char json[512];
+	const size_t bounds[] = { TLS_PSK_MIN_LEN, TLS_PSK_MAX_LEN };
+	for (size_t i = 0; i < ARRAY_SIZE(bounds); i++) {
+		psk_hex_fill(hex, bounds[i], '0');
+		T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
+		struct config *const conf = parse_tmpconf(json);
+		T_CHECK(conf != NULL);
+		T_EXPECT_STREQ(conf->tls_psk[0].hex, hex);
+		T_EXPECT(conf_inline_pem(conf));
+		conf_free(conf);
+	}
+}
+
+/* Whitespace around an inline key is trimmed at parse, and every byte the key
+ * vacates by shifting left over the leading whitespace is erased: the
+ * strlen-based credential erase stops at the new terminator, so a key tail
+ * left behind it would outlive the erase. */
+T_DECLARE_CASE(test_conf_psk_trim_erases_vacated_tail)
+{
+	enum { LEAD = 3 };
+	char hex[TLS_PSK_MIN_LEN * 2u + 1u];
+	psk_hex_fill(hex, TLS_PSK_MIN_LEN, 'a');
+	char val[sizeof(hex) + LEAD + 2u];
+	(void)snprintf(val, sizeof(val), "%*s%s\\n", LEAD, "", hex);
+	char json[512];
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", val);
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	/* Resolving references must leave an inline key as parse left it. */
+	T_EXPECT(conf_inline_pem(conf));
+	const char *const got = conf->tls_psk[0].hex;
+	T_EXPECT_STREQ(got, hex);
+	/* The value was stored as a strndup of the JSON string ("   <hex>\n"), so
+	 * its allocation extends LEAD + 1 bytes past the trimmed terminator. */
+	const size_t len = strlen(hex);
+	for (size_t i = len + 1u; i <= len + LEAD + 1u; i++) {
+		T_EXPECT_EQ(got[i], '\0');
+	}
+	conf_free(conf);
+}
+
+/* A key file written by --genpsk ends with a newline; "@path" loads it
+ * verbatim, and conf_inline_pem must trim it before the hex check. */
+T_DECLARE_CASE(test_conf_psk_at_path_trims_trailing_newline)
+{
+	char hex[TLS_PSK_MIN_LEN * 2u + 2u];
+	psk_hex_fill(hex, TLS_PSK_MIN_LEN, 'b');
+	char key_tmpl[] = CONF_TEST_TMPDIR "/conf_psk_key_XXXXXX";
+	char content[sizeof(hex) + 1u];
+	(void)snprintf(content, sizeof(content), "%s\n", hex);
+	T_CHECK(write_tmpfile(key_tmpl, content) == 0);
+	char ref[sizeof(key_tmpl) + 1u];
+	(void)snprintf(ref, sizeof(ref), "@%s", key_tmpl);
+	char json[512];
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", ref);
+
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	/* Still the reference: conf_parse cannot see the key yet. */
+	T_EXPECT_STREQ(conf->tls_psk[0].hex, ref);
+	const bool ok = conf_inline_pem(conf);
+	(void)unlink(key_tmpl);
+	T_EXPECT(ok);
+	T_EXPECT_STREQ(conf->tls_psk[0].hex, hex);
+	conf_free(conf);
+}
+
+/* A malformed key behind "@path" passes conf_parse, which sees only the
+ * reference, and is rejected once conf_inline_pem loads it. */
+T_DECLARE_CASE(test_conf_psk_preserves_uppercase_hex)
+{
+	char hex[TLS_PSK_MIN_LEN * 2u + 1u];
+	psk_hex_fill(hex, TLS_PSK_MIN_LEN, 'A');
+	char json[512];
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
+	struct config *conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	const bool inline_preserved = strcmp(conf->tls_psk[0].hex, hex) == 0;
+	conf_free(conf);
+	T_EXPECT(inline_preserved);
+
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_psk_upper_XXXXXX";
+	T_CHECK(write_tmpfile(tmpl, hex) == 0);
+	char reference[sizeof(tmpl) + 1u];
+	(void)snprintf(reference, sizeof(reference), "@%s", tmpl);
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", reference);
+	conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	const bool accepted = conf_inline_pem(conf);
+	const bool preserved = strcmp(conf->tls_psk[0].hex, hex) == 0;
+	conf_free(conf);
+	(void)unlink(tmpl);
+	T_EXPECT(accepted);
+	T_EXPECT(preserved);
+}
+
+T_DECLARE_CASE(test_conf_psk_at_path_rejects_bad_key)
+{
+	char key_tmpl[] = CONF_TEST_TMPDIR "/conf_psk_key_XXXXXX";
+	T_CHECK(write_tmpfile(key_tmpl, "0101\n") == 0);
+	char ref[sizeof(key_tmpl) + 1u];
+	(void)snprintf(ref, sizeof(ref), "@%s", key_tmpl);
+	char json[512];
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", ref);
+
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	const bool ok = conf_inline_pem(conf);
+	(void)unlink(key_tmpl);
+	T_EXPECT(!ok);
+	conf_free(conf);
+}
+
+/* tls.psk identities are peer identities, bounded like identity.listen keys:
+ * MUX_MAX_CLAIM_LEN octets load, one more is rejected. */
+T_DECLARE_CASE(test_conf_psk_identity_length_bound)
+{
+	char hex[TLS_PSK_MIN_LEN * 2u + 1u];
+	psk_hex_fill(hex, TLS_PSK_MIN_LEN, '0');
+	char id[MUX_MAX_CLAIM_LEN + 2u];
+	char json[512];
+
+	memset(id, 'i', MUX_MAX_CLAIM_LEN);
+	id[MUX_MAX_CLAIM_LEN] = '\0';
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), id, hex);
+	struct config *const conf = parse_tmpconf(json);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->tls_psk[0].id_len, (int)MUX_MAX_CLAIM_LEN);
+	conf_free(conf);
+
+	memset(id, 'i', MUX_MAX_CLAIM_LEN + 1u);
+	id[MUX_MAX_CLAIM_LEN + 1u] = '\0';
+	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), id, hex);
+	T_EXPECT(parse_tmpconf(json) == NULL);
+}
+
+/* tls.psk is a dynamic map walked by hand, like identity.listen, so the walk's
+ * own error paths need their own cases: a non-object, a malformed fragment and
+ * a non-string value are rejected, and a "-" comment key is skipped. */
+T_DECLARE_CASE(test_conf_psk_rejects_non_object)
+{
+	T_EXPECT(
+		parse_tmpconf(
+			"{\"mux_listen\":\"127.0.0.1:9000\","
+			"\"tls\":{\"psk\":\"not-an-object\"}}") == NULL);
+}
+
+T_DECLARE_CASE(test_conf_psk_rejects_malformed_json)
+{
+	T_EXPECT(
+		parse_tmpconf(
+			"{\"mux_listen\":\"127.0.0.1:9000\","
+			"\"tls\":{\"psk\":{\"peer\"}}}") == NULL);
+}
+
+T_DECLARE_CASE(test_conf_psk_rejects_non_string_value)
+{
+	T_EXPECT(
+		parse_tmpconf(
+			"{\"mux_listen\":\"127.0.0.1:9000\","
+			"\"tls\":{\"psk\":{\"peer\":123}}}") == NULL);
+}
+
+T_DECLARE_CASE(test_conf_psk_skips_comment_key)
+{
+	struct config *const conf = parse_tmpconf(
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":{\"psk\":{"
-		"\"peer\":\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
-		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"}}}");
-	T_CHECK(nothex != NULL);
-	T_EXPECT(!conf_inline_pem(nothex));
-	conf_free(nothex);
+		"\"-old\":123,\"peer\":" PSK_HEX "}}}");
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ((int)conf->tls_psk_count, 1);
+	T_EXPECT_STREQ(conf->tls_psk[0].id, "peer");
+	conf_free(conf);
 }
 
 T_DECLARE_CASE(test_conf_psk_dump_roundtrip)
@@ -1085,7 +1554,7 @@ T_DECLARE_CASE(test_conf_psk_dump_roundtrip)
 		"\"peer\":" PSK_HEX "}}}");
 	T_CHECK(orig != NULL);
 
-	char tmpl[] = "/tmp/conf_psk_dump_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_psk_dump_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -1096,11 +1565,14 @@ T_DECLARE_CASE(test_conf_psk_dump_roundtrip)
 	T_CHECK(reparsed != NULL);
 	T_EXPECT_EQ((int)reparsed->tls_psk_count, 1);
 	T_EXPECT_STREQ(reparsed->tls_psk[0].id, "peer");
+	T_EXPECT_STREQ(reparsed->tls_psk[0].hex, orig->tls_psk[0].hex);
 
 	conf_free(reparsed);
 	conf_free(orig);
 }
 
+/* With TLS credentials present, identity.verify is accepted and survives a
+ * dump/parse round-trip, so GET /config and --dump-config report it. */
 T_DECLARE_CASE(test_conf_identity_verify_with_tls_roundtrip)
 {
 	struct config *const orig = parse_tmpconf(
@@ -1110,7 +1582,7 @@ T_DECLARE_CASE(test_conf_identity_verify_with_tls_roundtrip)
 	T_CHECK(orig != NULL);
 	T_EXPECT(orig->identity.verify);
 
-	char tmpl[] = "/tmp/conf_id_verify_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_id_verify_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -1247,26 +1719,58 @@ T_DECLARE_CASE(test_conf_parsefile_max_startups_valid)
 	conf_free(conf);
 }
 
-T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_file)
+/* Truncating this input at the size ceiling leaves valid JSON, so rejecting
+ * it proves the reader's guard rather than the parser's syntax check. */
+static bool write_padded_config(const int fd, const size_t size)
 {
-	/* conf_parsefile must reject files larger than CONF_MAXSIZE bytes. */
-	char tmpl[] = "/tmp/conf_big_XXXXXX";
+	static const char json[] = "{\"mux_connect\":\"127.0.0.1:9000\"}";
+	if (write(fd, json, sizeof(json) - 1u) !=
+	    (ssize_t)(sizeof(json) - 1u)) {
+		return false;
+	}
+	char padding[256];
+	memset(padding, ' ', sizeof(padding));
+	size_t remaining = size - (sizeof(json) - 1u);
+	while (remaining > 0) {
+		const size_t chunk = remaining < sizeof(padding) ?
+					     remaining :
+					     sizeof(padding);
+		const ssize_t n = write(fd, padding, chunk);
+		if (n <= 0) {
+			return false;
+		}
+		remaining -= (size_t)n;
+	}
+	return true;
+}
+
+T_DECLARE_CASE(test_conf_parsefile_accepts_maxsize)
+{
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_limit_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
-	char buf[256];
-	memset(buf, 'x', sizeof(buf));
-	size_t remaining = CONF_MAXSIZE + 1;
-	while (remaining > 0) {
-		const size_t chunk =
-			remaining < sizeof(buf) ? remaining : sizeof(buf);
-		const ssize_t w = write(fd, buf, chunk);
-		T_CHECK(w > 0);
-		remaining -= (size_t)w;
-	}
+	T_CHECK(write_padded_config(fd, CONF_MAXSIZE));
 	(void)close(fd);
 	struct config *const conf = conf_parsefile(tmpl);
 	(void)unlink(tmpl);
-	T_EXPECT(conf == NULL);
+	const bool accepted = conf != NULL;
+	conf_free(conf);
+	T_EXPECT(accepted);
+}
+
+T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_file)
+{
+	/* conf_parsefile must reject files larger than CONF_MAXSIZE bytes. */
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_big_XXXXXX";
+	const int fd = mkstemp(tmpl);
+	T_CHECK(fd >= 0);
+	T_CHECK(write_padded_config(fd, CONF_MAXSIZE + 1u));
+	(void)close(fd);
+	struct config *const conf = conf_parsefile(tmpl);
+	(void)unlink(tmpl);
+	const bool rejected = conf == NULL;
+	conf_free(conf);
+	T_EXPECT(rejected);
 }
 
 T_DECLARE_CASE(test_conf_parsefile_stdin_success)
@@ -1282,9 +1786,11 @@ T_DECLARE_CASE(test_conf_parsefile_stdin_success)
 	T_CHECK(saved_stdin >= 0);
 	T_CHECK(dup2(pipefd[0], STDIN_FILENO) == STDIN_FILENO);
 	(void)close(pipefd[0]);
+	clearerr(stdin);
 	struct config *const conf = conf_parsefile("-");
 	T_CHECK(dup2(saved_stdin, STDIN_FILENO) == STDIN_FILENO);
 	(void)close(saved_stdin);
+	clearerr(stdin);
 	T_CHECK(conf != NULL);
 	T_EXPECT_STREQ(conf->mux_connect, "127.0.0.1:9000");
 	conf_free(conf);
@@ -1293,19 +1799,10 @@ T_DECLARE_CASE(test_conf_parsefile_stdin_success)
 T_DECLARE_CASE(test_conf_parsefile_stdin_rejects_oversized)
 {
 	/* conf_parsefile("-") must reject stdin input larger than CONF_MAXSIZE. */
-	char tmpl[] = "/tmp/conf_big_stdin_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_big_stdin_XXXXXX";
 	const int tmpfd = mkstemp(tmpl);
 	T_CHECK(tmpfd >= 0);
-	char buf[256];
-	memset(buf, 'x', sizeof(buf));
-	size_t remaining = CONF_MAXSIZE + 1;
-	while (remaining > 0) {
-		const size_t chunk =
-			remaining < sizeof(buf) ? remaining : sizeof(buf);
-		const ssize_t w = write(tmpfd, buf, chunk);
-		T_CHECK(w > 0);
-		remaining -= (size_t)w;
-	}
+	T_CHECK(write_padded_config(tmpfd, CONF_MAXSIZE + 1u));
 	(void)close(tmpfd);
 	const int filefd = open(tmpl, O_RDONLY);
 	(void)unlink(tmpl);
@@ -1314,10 +1811,25 @@ T_DECLARE_CASE(test_conf_parsefile_stdin_rejects_oversized)
 	T_CHECK(saved_stdin >= 0);
 	T_CHECK(dup2(filefd, STDIN_FILENO) == STDIN_FILENO);
 	(void)close(filefd);
+	/* Seed an EOF indicator on this fixture itself, independent of which
+	 * other cases ran. Seeking the descriptor does not reset FILE flags. */
+	T_CHECK(lseek(STDIN_FILENO, 0, SEEK_END) == (off_t)(CONF_MAXSIZE + 1));
+	T_CHECK(fgetc(stdin) == EOF);
+	T_CHECK(feof(stdin));
+	T_CHECK(lseek(STDIN_FILENO, 0, SEEK_SET) == 0);
+	T_CHECK(feof(stdin));
+	clearerr(stdin);
+	const bool flags_reset = !feof(stdin) && !ferror(stdin);
 	struct config *const conf = conf_parsefile("-");
+	const off_t consumed = lseek(STDIN_FILENO, 0, SEEK_CUR);
 	T_CHECK(dup2(saved_stdin, STDIN_FILENO) == STDIN_FILENO);
 	(void)close(saved_stdin);
-	T_EXPECT(conf == NULL);
+	clearerr(stdin);
+	const bool rejected = conf == NULL;
+	conf_free(conf);
+	T_EXPECT(flags_reset);
+	T_EXPECT(rejected);
+	T_EXPECT_EQ(consumed, (off_t)(CONF_MAXSIZE + 1));
 }
 
 T_DECLARE_CASE(test_conf_dump_identity_fields)
@@ -1336,7 +1848,7 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 	T_CHECK(orig->identity.mux_connect[0] != NULL);
 	orig->identity.mux_connect_count = 1;
 
-	char tmpl[] = "/tmp/conf_id_dump_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_id_dump_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -1363,7 +1875,7 @@ T_DECLARE_CASE(test_conf_dump_identity_listen_roundtrip)
 	T_CHECK(orig != NULL);
 	T_EXPECT_EQ((int)orig->identity.peers_count, 1);
 
-	char tmpl[] = "/tmp/conf_listen_dump_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_listen_dump_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -1401,7 +1913,7 @@ T_DECLARE_CASE(test_conf_dump_identity_listen_exact_grow_boundary)
 	T_CHECK(orig != NULL);
 	T_EXPECT_EQ((int)orig->identity.peers_count, 1);
 
-	char tmpl[] = "/tmp/conf_listen_boundary_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_listen_boundary_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -1426,7 +1938,7 @@ T_DECLARE_CASE(test_conf_dump_readahead_roundtrip)
 	T_CHECK(orig != NULL);
 	T_EXPECT_EQ(orig->mux.readahead, 65536);
 
-	char tmpl[] = "/tmp/conf_readahead_dump_XXXXXX";
+	char tmpl[] = CONF_TEST_TMPDIR "/conf_readahead_dump_XXXXXX";
 	const int fd = mkstemp(tmpl);
 	T_CHECK(fd >= 0);
 	(void)close(fd);
@@ -1493,6 +2005,9 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_invalid_type)
 static const struct testing_suite suite[] = {
 	T_CASE(test_conf_new_default_fields),
 	T_CASE(test_conf_new_default_matches_empty_parse),
+	T_CASE(test_conf_lossymux_defaults),
+	T_CASE(test_conf_lossymux_parse_and_roundtrip),
+	T_CASE(test_conf_lossymux_rejects_out_of_range),
 	T_CASE(test_conf_parsefile_nonexistent),
 	T_CASE(test_conf_parsefile_invalid_json),
 	T_CASE(test_conf_parsefile_rejects_invalid_utf8),
@@ -1516,6 +2031,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_parsefile_identity_listen_duplicate_key_last_wins),
 	T_CASE(test_conf_parsefile_identity_listen_many_peers),
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_listen_value),
+	T_CASE(test_conf_parsefile_accepts_max_length_identity_listen_key),
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_listen_key),
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_mux_connect),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_non_object),
@@ -1548,14 +2064,26 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_load_tls_kernel_offload_explicit_override),
 	T_CASE(test_conf_inline_pem_replaces_at_path),
 	T_CASE(test_conf_inline_pem_concatenates_authcerts_bundle),
+	T_CASE(test_conf_inline_pem_rejects_embedded_nuls),
 	T_CASE(test_conf_inline_pem_fails_for_missing_file),
 	T_CASE(test_conf_identity_verify_with_tls_roundtrip),
 	T_CASE(test_conf_psk_parsed_in_order),
 	T_CASE(test_conf_psk_empty_identity),
 	T_CASE(test_conf_psk_rejects_certificate_fields),
+	T_CASE(test_conf_psk_omits_sni),
 	T_CASE(test_conf_psk_rejects_identity_verify),
 	T_CASE(test_conf_psk_rejects_duplicate_identity),
 	T_CASE(test_conf_psk_rejects_bad_key),
+	T_CASE(test_conf_psk_accepts_key_length_bounds),
+	T_CASE(test_conf_psk_trim_erases_vacated_tail),
+	T_CASE(test_conf_psk_at_path_trims_trailing_newline),
+	T_CASE(test_conf_psk_preserves_uppercase_hex),
+	T_CASE(test_conf_psk_at_path_rejects_bad_key),
+	T_CASE(test_conf_psk_identity_length_bound),
+	T_CASE(test_conf_psk_rejects_non_object),
+	T_CASE(test_conf_psk_rejects_malformed_json),
+	T_CASE(test_conf_psk_rejects_non_string_value),
+	T_CASE(test_conf_psk_skips_comment_key),
 	T_CASE(test_conf_psk_dump_roundtrip),
 #endif /* WITH_TLS */
 	T_CASE(test_conf_parsefile_ignores_comment_keys),
@@ -1571,11 +2099,17 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_dump_identity_fields),
 	T_CASE(test_conf_identity_verify_defaults_false),
 	T_CASE(test_conf_identity_verify_requires_tls),
+#if !WITH_TLS
+	T_CASE(test_conf_no_tls_rejects_credentials),
+#endif /* !WITH_TLS */
 	T_CASE(test_conf_dump_identity_listen_roundtrip),
 	T_CASE(test_conf_dump_identity_listen_exact_grow_boundary),
+	T_CASE(test_conf_parsefile_accepts_maxsize),
 	T_CASE(test_conf_parsefile_rejects_oversized_file),
 	T_CASE(test_conf_parsefile_stdin_success),
 	T_CASE(test_conf_parsefile_stdin_rejects_oversized),
+	T_CASE(test_conf_parse_honors_len_without_nul),
+	T_CASE(test_conf_parse_rejects_oversized_buffer),
 	T_SUITE_END,
 };
 

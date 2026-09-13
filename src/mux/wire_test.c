@@ -5,16 +5,18 @@
  * staging/coalescing); wire.c #included, real frame.c and TLS backend linked,
  * real socketpairs used; no sibling collaborators mocked. */
 
-#include "mux/wire.h"
+#include "wire.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/session.h"
-#include "mux/wire.c"
+#include "frame.h"
+#include "mux.h"
+#include "session.h"
 #if WITH_TLS
 #include "shim/tls.h"
 #endif
+#include "shim/util.h"
+#include "wire.c"
 
+#include "os/socket.h"
 #include "utils/testing.h"
 
 #include <ev.h>
@@ -72,7 +74,7 @@ make_session(struct frame_pool_ctx *restrict pool_ctx, const int fd)
 #if WITH_TLS
 	/* Match the production default: the TLS library owns the socket fd.
 	 * Memory-transport tests opt out by clearing this. */
-	ss.conf.tls_socket_offload = true;
+	ss.wire.tls_offload = true;
 #endif
 	return ss;
 }
@@ -242,111 +244,6 @@ T_DECLARE_CASE(test_wire_recv_eof_clears_rx_open_and_sets_tx_pending)
 	(void)close(fds[1]);
 }
 
-T_DECLARE_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes)
-{
-	struct frame_pool_ctx pool_ctx = { 0 };
-	struct mux_session ss = make_session(&pool_ctx, -1);
-	struct mux_header hdr = {
-		.version = MUX_PROTOCOL_VERSION,
-		.flags = MUX_FLAG_PUSH,
-		.length = 1,
-		.stream_id = 2,
-		.extra = 0,
-	};
-	unsigned char bytes[2 * MUX_FRAME_HEADER_SIZE + 2] = { 0 };
-
-	mux_write_header(bytes, &hdr);
-	bytes[MUX_FRAME_HEADER_SIZE] = 'A';
-	hdr.stream_id = 4;
-	mux_write_header(bytes + MUX_FRAME_HEADER_SIZE + 1, &hdr);
-	bytes[2 * MUX_FRAME_HEADER_SIZE + 1] = 'B';
-	ss.wire.recvbuf = bytebuf_new(sizeof(bytes));
-	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), bytes, sizeof(bytes));
-	bytebuf_produce(ss.wire.recvbuf, sizeof(bytes));
-
-	bytebuf_consume(ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE + 1);
-	T_EXPECT_EQ(
-		bytebuf_readable(ss.wire.recvbuf),
-		sizeof(bytes) - ((size_t)MUX_FRAME_HEADER_SIZE + 1));
-	T_EXPECT(
-		bytebuf_read_ptr(ss.wire.recvbuf)[MUX_FRAME_HEADER_SIZE] ==
-		'B');
-	bytebuf_free(ss.wire.recvbuf);
-}
-
-T_DECLARE_CASE(test_bytebuf_consume_advances_offset_without_copy)
-{
-	struct frame_pool_ctx pool_ctx = { 0 };
-	struct mux_session ss = make_session(&pool_ctx, -1);
-	unsigned char bytes[2 * MUX_FRAME_HEADER_SIZE] = { 0 };
-
-	ss.wire.recvbuf = bytebuf_new(sizeof(bytes));
-	T_CHECK(ss.wire.recvbuf != NULL);
-	memcpy(bytebuf_write_ptr(ss.wire.recvbuf), bytes, sizeof(bytes));
-	bytebuf_produce(ss.wire.recvbuf, sizeof(bytes));
-
-	bytebuf_consume(ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE);
-	T_EXPECT_EQ(ss.wire.recvbuf->off, (size_t)MUX_FRAME_HEADER_SIZE);
-	T_EXPECT_EQ(
-		bytebuf_readable(ss.wire.recvbuf),
-		sizeof(bytes) - (size_t)MUX_FRAME_HEADER_SIZE);
-	bytebuf_free(ss.wire.recvbuf);
-}
-
-/* mux_bytebuf_shrink reclaims a grown buffer down to the target, compacting the
- * live bytes to the front and preserving them. */
-T_DECLARE_CASE(test_bytebuf_shrink_reclaims_capacity)
-{
-	struct bytebuf *rb = bytebuf_new(4096);
-	T_CHECK(rb != NULL);
-	memset(bytebuf_write_ptr(rb), 'X', 100);
-	bytebuf_produce(rb, 100);
-	bytebuf_consume(rb, 10); /* off=10, len=90: forces compaction */
-	T_EXPECT_EQ(rb->cap, (size_t)4096);
-
-	mux_bytebuf_shrink(&rb, 256);
-
-	T_EXPECT_EQ(rb->cap, (size_t)256);
-	T_EXPECT_EQ(rb->off, (size_t)0);
-	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)90);
-	const unsigned char *const p = bytebuf_read_ptr(rb);
-	bool intact = true;
-	for (size_t i = 0; i < 90; i++) {
-		intact = intact && (p[i] == 'X');
-	}
-	T_EXPECT(intact);
-	bytebuf_free(rb);
-}
-
-/* mux_bytebuf_shrink never drops below the live byte count, even when the target is
- * smaller. */
-T_DECLARE_CASE(test_bytebuf_shrink_keeps_live_bytes)
-{
-	struct bytebuf *rb = bytebuf_new(4096);
-	T_CHECK(rb != NULL);
-	memset(bytebuf_write_ptr(rb), 'Y', 500);
-	bytebuf_produce(rb, 500); /* len=500 > target */
-
-	mux_bytebuf_shrink(&rb, 256);
-
-	T_EXPECT_EQ(rb->cap, (size_t)500);
-	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)500);
-	bytebuf_free(rb);
-}
-
-/* mux_bytebuf_shrink is a no-op when the capacity is already at or below target. */
-T_DECLARE_CASE(test_bytebuf_shrink_noop_when_small)
-{
-	struct bytebuf *rb = bytebuf_new(128);
-	T_CHECK(rb != NULL);
-
-	mux_bytebuf_shrink(&rb, 256);
-
-	T_EXPECT_EQ(rb->cap, (size_t)128);
-	bytebuf_free(rb);
-}
-
 T_DECLARE_CASE(test_wire_discard_buffers_frees_all_pending_frames)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
@@ -417,7 +314,7 @@ T_DECLARE_CASE(test_wire_flush_done_without_memory_transport_tls)
 	T_EXPECT_EQ(mux_wire_flush(&ss), WIRE_FLUSH_DONE);
 
 #if WITH_TLS
-	/* tls_socket_offload defaults true in make_session; a non-NULL tlsconn
+	/* wire.tls_offload defaults true in make_session; a non-NULL tlsconn
 	 * must still resolve to DONE without ever touching wire_cipher_push.
 	 * Use the address of a local as a type-safe non-NULL sentinel; this path
 	 * never dereferences tlsconn. */
@@ -888,9 +785,9 @@ T_DECLARE_CASE(test_wire_tls_buffered_send_recv)
 	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
 	srv_ss.wire.tlsconn = srv_conn;
 	cli_ss.wire.tlsconn = cli_conn;
-	/* Memory transport is selected by disabling socket offload in the mux config. */
-	srv_ss.conf.tls_socket_offload = false;
-	cli_ss.conf.tls_socket_offload = false;
+	/* Memory transport is selected by latching the wire out of socket offload. */
+	srv_ss.wire.tls_offload = false;
+	cli_ss.wire.tls_offload = false;
 
 	/* Drive the handshake and exchange by pumping each side's hello plaintext
 	 * through mux_wire_send (returns 0 bytes until the handshake completes) and
@@ -997,8 +894,8 @@ T_DECLARE_CASE(test_wire_recv_buffered_zero_return_reports_push_failure)
 	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
 	srv_ss.wire.tlsconn = srv_conn;
 	cli_ss.wire.tlsconn = cli_conn;
-	srv_ss.conf.tls_socket_offload = false;
-	cli_ss.conf.tls_socket_offload = false;
+	srv_ss.wire.tls_offload = false;
+	cli_ss.wire.tls_offload = false;
 
 	/* Complete the handshake (mirrors test_wire_tls_buffered_send_recv). */
 	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
@@ -1070,6 +967,484 @@ T_DECLARE_CASE(test_wire_recv_buffered_zero_return_reports_push_failure)
 	T_EXPECT_EQ(rn, (size_t)0);
 }
 
+/* A memory-transport TLS pair over a nonblocking socketpair (fds[0] server,
+ * fds[1] client) with the wire notifiers bound as in production, so the
+ * backend's on_recv drives wire.tls_readable. */
+struct wire_test_tls_pair {
+	struct tls_context *srv_ctx;
+	struct tls_context *cli_ctx;
+	struct frame_pool_ctx pool_ctx;
+	struct mux_session srv;
+	struct mux_session cli;
+	int fds[2];
+};
+
+/* Build the pair in place (the notifiers keep &p->srv / &p->cli) and complete
+ * the handshake with a ping/pong exchange through the wire API.  On failure
+ * the pair is still safe to pass to wire_test_tls_pair_close. */
+static bool wire_test_tls_pair_open(struct wire_test_tls_pair *restrict p)
+{
+	*p = (struct wire_test_tls_pair){ .fds = { -1, -1 } };
+	p->srv_ctx = wire_test_server_ctx();
+	p->cli_ctx = wire_test_client_ctx();
+	if (p->srv_ctx == NULL || p->cli_ctx == NULL ||
+	    socketpair(AF_UNIX, SOCK_STREAM, 0, p->fds) != 0) {
+		return false;
+	}
+	if (fcntl(p->fds[0], F_SETFL, O_NONBLOCK) != 0 ||
+	    fcntl(p->fds[1], F_SETFL, O_NONBLOCK) != 0) {
+		return false;
+	}
+	p->srv = make_session(&p->pool_ctx, p->fds[0]);
+	p->cli = make_session(&p->pool_ctx, p->fds[1]);
+	struct tls_connection *const srv_conn = tls_server(p->srv_ctx, -1);
+	mux_wire_adopt_tlsconn(&p->srv, srv_conn, false);
+	struct tls_connection *const cli_conn = tls_client(p->cli_ctx, -1);
+	mux_wire_adopt_tlsconn(&p->cli, cli_conn, false);
+	if (srv_conn == NULL || cli_conn == NULL) {
+		return false;
+	}
+
+	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
+	unsigned char rx[4096];
+	size_t cli_sent = 0, srv_sent = 0, srv_got = 0, cli_got = 0;
+	for (int i = 0; i < 100 && (srv_got == 0 || cli_got == 0); i++) {
+		size_t n;
+		if (cli_sent == 0) {
+			n = sizeof(cli_msg) - 1;
+			if (!mux_wire_send(&p->cli, cli_msg, &n)) {
+				return false;
+			}
+			cli_sent = n;
+		}
+		if (srv_sent == 0) {
+			n = sizeof(srv_msg) - 1;
+			if (!mux_wire_send(&p->srv, srv_msg, &n)) {
+				return false;
+			}
+			srv_sent = n;
+		}
+		n = sizeof(rx);
+		if (!mux_wire_recv(&p->srv, rx, &n)) {
+			return false;
+		}
+		srv_got += n;
+		n = sizeof(rx);
+		if (!mux_wire_recv(&p->cli, rx, &n)) {
+			return false;
+		}
+		cli_got += n;
+	}
+	p->srv.wire.rx_open = true;
+	p->cli.wire.rx_open = true;
+	return srv_got == sizeof(cli_msg) - 1 && cli_got == sizeof(srv_msg) - 1;
+}
+
+static void wire_test_tls_pair_close(struct wire_test_tls_pair *restrict p)
+{
+	mux_wire_conn_free(&p->srv);
+	mux_wire_conn_free(&p->cli);
+	bytebuf_free(p->srv.wire.rawbuf);
+	bytebuf_free(p->cli.wire.rawbuf);
+	tls_ctx_free(p->srv_ctx);
+	tls_ctx_free(p->cli_ctx);
+	if (p->fds[0] != -1) {
+		(void)close(p->fds[0]);
+	}
+	if (p->fds[1] != -1) {
+		(void)close(p->fds[1]);
+	}
+}
+
+/* Fill buf[0..len) with a position-dependent pattern so a dropped, repeated
+ * or reordered chunk shows up in a memcmp. */
+static void
+wire_test_fill_pattern(unsigned char *restrict buf, const size_t len)
+{
+	for (size_t i = 0; i < len; i++) {
+		buf[i] = (unsigned char)(i * 7u + 1u);
+	}
+}
+
+#define WIRE_TEST_DRAIN_MSG_LEN 4000u
+#define WIRE_TEST_DRAIN_CHUNK 256u
+
+/* Queue one WIRE_TEST_DRAIN_MSG_LEN-byte application record from the client,
+ * close the client's TLS stream (close_notify, then its TCP FIN) so any server
+ * read past that record sees a clean EOF, then read through a
+ * WIRE_TEST_DRAIN_CHUNK-byte buffer until the first plaintext arrives.  The record no longer fits the receive buffer, so the rest of its
+ * plaintext is left decrypted inside the TLS library.  Returns the first
+ * chunk's length (0 on failure). */
+static size_t wire_test_recv_first_chunk(
+	struct wire_test_tls_pair *restrict p, unsigned char *restrict rx)
+{
+	unsigned char msg[WIRE_TEST_DRAIN_MSG_LEN];
+	wire_test_fill_pattern(msg, sizeof(msg));
+	size_t n = sizeof(msg);
+	if (!mux_wire_send(&p->cli, msg, &n) || n != sizeof(msg) ||
+	    mux_wire_flush(&p->cli) != WIRE_FLUSH_DONE ||
+	    mux_wire_shutdown(&p->cli) != WIRE_SHUTDOWN_DONE) {
+		return 0;
+	}
+	for (int i = 0; i < 64; i++) {
+		n = WIRE_TEST_DRAIN_CHUNK;
+		if (!mux_wire_recv(&p->srv, rx, &n) || p->srv.wire.rx_eof) {
+			return 0;
+		}
+		if (n > 0) {
+			return n;
+		}
+	}
+	return 0;
+}
+
+/* Plaintext the library already decrypted is handed out before any new
+ * ciphertext is read: once a record outgrows the receive buffer, the remainder
+ * arrives chunk by chunk with the socket already at EOF, and the EOF is only
+ * reported after the last plaintext byte. */
+T_DECLARE_CASE(test_wire_recv_buffered_drains_plaintext_before_socket)
+{
+	struct wire_test_tls_pair p;
+	const bool opened = wire_test_tls_pair_open(&p);
+	unsigned char rx[WIRE_TEST_DRAIN_MSG_LEN] = { 0 };
+	size_t total = 0;
+	bool pending_after_first = false;
+	bool eof_before_last = false;
+	bool eof_after_last = false;
+	if (opened) {
+		total = wire_test_recv_first_chunk(&p, rx);
+		pending_after_first = mux_wire_has_pending(&p.srv);
+	}
+	for (int i = 0; total > 0 && total < sizeof(rx) && i < 64; i++) {
+		size_t n = WIRE_TEST_DRAIN_CHUNK;
+		if (n > sizeof(rx) - total) {
+			n = sizeof(rx) - total;
+		}
+		if (!mux_wire_recv(&p.srv, rx + total, &n) ||
+		    p.srv.wire.rx_eof) {
+			eof_before_last = p.srv.wire.rx_eof;
+			break;
+		}
+		total += n;
+	}
+	if (total == sizeof(rx)) {
+		unsigned char tail[16];
+		size_t n = sizeof(tail);
+		eof_after_last = mux_wire_recv(&p.srv, tail, &n) && n == 0 &&
+				 p.srv.wire.rx_eof;
+	}
+	unsigned char want[WIRE_TEST_DRAIN_MSG_LEN];
+	wire_test_fill_pattern(want, sizeof(want));
+	const bool payload_ok = memcmp(rx, want, sizeof(want)) == 0;
+
+	wire_test_tls_pair_close(&p);
+	T_CHECK(opened);
+	T_EXPECT(pending_after_first);
+	T_EXPECT(!eof_before_last);
+	T_EXPECT_EQ(total, (size_t)WIRE_TEST_DRAIN_MSG_LEN);
+	T_EXPECT(payload_ok);
+	T_EXPECT(eof_after_last);
+}
+
+/* Read the first chunk of a record that outgrows the receive buffer (see
+ * wire_test_recv_first_chunk), then stage unflushed ciphertext residue on the
+ * server so the drain path's next wire_cipher_push has something to send.
+ * Returns false if the first chunk never arrived or nothing could be staged. */
+static bool wire_test_drain_with_residue(
+	struct wire_test_tls_pair *restrict p, unsigned char *restrict rx)
+{
+	static const size_t residue_len = 16;
+	if (wire_test_recv_first_chunk(p, rx) == 0) {
+		return false;
+	}
+	struct bytebuf *const rb = p->srv.wire.rawbuf;
+	if (rb == NULL || bytebuf_write_space(rb) < residue_len) {
+		return false;
+	}
+	memset(bytebuf_write_ptr(rb), 'x', residue_len);
+	bytebuf_produce(rb, residue_len);
+	return true;
+}
+
+/* The drain path pushes retained ciphertext too: with the socket full it still
+ * delivers the chunk and keeps the write side pending, residue retained. */
+T_DECLARE_CASE(test_wire_recv_buffered_drain_push_blocked_keeps_tx_pending)
+{
+	struct wire_test_tls_pair p;
+	const bool opened = wire_test_tls_pair_open(&p);
+	unsigned char rx[WIRE_TEST_DRAIN_CHUNK];
+	const bool first = opened && wire_test_drain_with_residue(&p, rx);
+	bool socket_full = false;
+	size_t n = 0;
+	bool recv_ok = false;
+	bool tx_pending = false;
+	size_t sent = 0;
+	if (first) {
+		const size_t staged = bytebuf_readable(p.srv.wire.rawbuf);
+		unsigned char junk[4096] = { 0 };
+		for (int i = 0; i < 4096 && !socket_full; i++) {
+			socket_full = send(p.fds[0], junk, sizeof(junk),
+					   MSG_NOSIGNAL) < 0;
+		}
+		p.srv.wire.tx_pending = false;
+		n = sizeof(rx);
+		recv_ok = mux_wire_recv(&p.srv, rx, &n);
+		tx_pending = p.srv.wire.tx_pending;
+		sent = staged - bytebuf_readable(p.srv.wire.rawbuf);
+	}
+
+	wire_test_tls_pair_close(&p);
+	T_CHECK(opened);
+	T_EXPECT(first);
+	T_CHECK(socket_full);
+	T_EXPECT(recv_ok);
+	T_EXPECT_EQ(n, (size_t)WIRE_TEST_DRAIN_CHUNK);
+	T_EXPECT(tx_pending);
+	T_EXPECT_EQ(sent, (size_t)0);
+}
+
+/* A hard send error on the drain path fails the receive, drops the chunk and
+ * closes the read side. */
+T_DECLARE_CASE(test_wire_recv_buffered_drain_push_error_fails)
+{
+	struct wire_test_tls_pair p;
+	const bool opened = wire_test_tls_pair_open(&p);
+	unsigned char rx[WIRE_TEST_DRAIN_CHUNK];
+	const bool first = opened && wire_test_drain_with_residue(&p, rx);
+	bool shut = false;
+	size_t n = 0;
+	bool failed = false;
+	bool rx_closed = false;
+	if (first) {
+		shut = shutdown(p.fds[0], SHUT_WR) == 0;
+		n = sizeof(rx);
+		failed = !mux_wire_recv(&p.srv, rx, &n);
+		rx_closed = !p.srv.wire.rx_open;
+	}
+
+	wire_test_tls_pair_close(&p);
+	T_CHECK(opened);
+	T_EXPECT(first);
+	T_CHECK(shut);
+	T_EXPECT(failed);
+	T_EXPECT(rx_closed);
+	T_EXPECT_EQ(n, (size_t)0);
+}
+
+/* on_recv is only a hint: when the flag is set but the library has no
+ * plaintext buffered, the receive falls through to the socket and returns the
+ * newly arrived record instead of an empty read. */
+T_DECLARE_CASE(test_wire_recv_buffered_stale_readable_reads_socket)
+{
+	struct wire_test_tls_pair p;
+	const bool opened = wire_test_tls_pair_open(&p);
+	unsigned char msg[] = "hello";
+	unsigned char rx[4096] = { 0 };
+	bool sent = false;
+	size_t n = 0;
+	bool recv_ok = false;
+	bool flag_cleared = false;
+	if (opened) {
+		size_t len = sizeof(msg) - 1;
+		sent = mux_wire_send(&p.cli, msg, &len) &&
+		       len == sizeof(msg) - 1;
+		p.srv.wire.tls_readable = true;
+		n = sizeof(rx);
+		recv_ok = mux_wire_recv(&p.srv, rx, &n);
+		flag_cleared = !mux_wire_has_pending(&p.srv);
+	}
+	const bool payload_ok =
+		n == sizeof(msg) - 1 && memcmp(rx, msg, sizeof(msg) - 1) == 0;
+
+	wire_test_tls_pair_close(&p);
+	T_CHECK(opened);
+	T_CHECK(sent);
+	T_EXPECT(recv_ok);
+	T_EXPECT(payload_ok);
+	T_EXPECT(flag_cleared);
+}
+
+/* Receive on @p ss until the transport's read side closes (or @p max_calls
+ * elapse), appending plaintext to out[0..cap).  Returns false as soon as
+ * mux_wire_recv does. */
+static bool wire_test_recv_until_closed(
+	struct mux_session *restrict ss, unsigned char *restrict out,
+	const size_t cap, size_t *restrict got, const int max_calls)
+{
+	*got = 0;
+	for (int i = 0; i < max_calls && ss->wire.rx_open; i++) {
+		struct pollfd pfd = { .fd = ss->w_socket.fd, .events = POLLIN };
+		if (!ss->wire.tls_readable) {
+			(void)poll(&pfd, 1, 20);
+		}
+		size_t rn = cap - *got;
+		if (!mux_wire_recv(ss, out + *got, &rn)) {
+			return false;
+		}
+		*got += rn;
+	}
+	return true;
+}
+
+/* A close_notify push the socket cannot take must be retried by the next
+ * mux_wire_shutdown: the repeat has to flush the retained alert and finish,
+ * not ask the TLS library to shut down again (which awaited the peer's
+ * close_notify on the empty memory read side -- PENDING on EV_READ with our
+ * alert stranded in rawbuf, never sent). */
+T_DECLARE_CASE(test_wire_shutdown_retries_blocked_close_notify)
+{
+	struct wire_test_tls_pair p;
+	const bool opened = wire_test_tls_pair_open(&p);
+	if (!opened) {
+		wire_test_tls_pair_close(&p);
+	}
+	T_CHECK(opened);
+
+	/* Fill the client's send direction with raw bytes the server leaves
+	 * unread, so the alert's push blocks; then take single bytes until
+	 * even those are refused. */
+	unsigned char fill[4096];
+	memset(fill, 'x', sizeof(fill));
+	size_t junk = 0;
+	for (size_t chunk = sizeof(fill); chunk > 0; chunk /= 2) {
+		for (;;) {
+			size_t n = chunk;
+			const int err = socket_send(p.fds[1], fill, &n);
+			if (err != 0) {
+				T_CHECK(sock_would_block(err));
+				break;
+			}
+			junk += n;
+		}
+	}
+	T_CHECK(junk > 0);
+
+	const enum wire_shutdown_state first = mux_wire_shutdown(&p.cli);
+	const int first_want = p.cli.wire.tls_want;
+	const bool alert_retained = p.cli.wire.rawbuf != NULL &&
+				    bytebuf_readable(p.cli.wire.rawbuf) > 0;
+
+	/* The peer reads the filler, which frees the socket for the alert. */
+	size_t drained = 0;
+	while (drained < junk) {
+		size_t n = junk - drained;
+		if (n > sizeof(fill)) {
+			n = sizeof(fill);
+		}
+		if (socket_recv(p.fds[0], fill, &n) != 0 || n == 0) {
+			break;
+		}
+		drained += n;
+	}
+
+	const enum wire_shutdown_state second = mux_wire_shutdown(&p.cli);
+	const int second_want = p.cli.wire.tls_want;
+
+	/* What follows the filler is exactly our close_notify: the server
+	 * sees a clean close, with no plaintext ahead of it. */
+	unsigned char rx[256];
+	size_t got = 0;
+	const bool recv_ok =
+		wire_test_recv_until_closed(&p.srv, rx, sizeof(rx), &got, 50);
+	const bool srv_clean = p.srv.wire.rx_eof;
+
+	wire_test_tls_pair_close(&p);
+	T_EXPECT_EQ(first, WIRE_SHUTDOWN_PENDING);
+	T_EXPECT_EQ(first_want, EV_WRITE);
+	T_EXPECT(alert_retained);
+	T_EXPECT_EQ(drained, junk);
+	T_EXPECT_EQ(second, WIRE_SHUTDOWN_DONE);
+	T_EXPECT_EQ(second_want, 0);
+	T_EXPECT(recv_ok);
+	T_EXPECT_EQ(got, (size_t)0);
+	T_EXPECT(srv_clean);
+}
+
+/* A TCP FIN with no close_notify ahead of it is a truncated TLS stream -- a
+ * transport loss the session may resume from -- so the memory transport must
+ * fail the receive (as the fd-backed library does on its unexpected EOF), not
+ * report the clean close that makes the session tear down for good. */
+T_DECLARE_CASE(test_wire_recv_buffered_bare_fin_is_not_clean)
+{
+	struct wire_test_tls_pair p;
+	const bool opened = wire_test_tls_pair_open(&p);
+	if (!opened) {
+		wire_test_tls_pair_close(&p);
+	}
+	T_CHECK(opened);
+
+	T_CHECK(shutdown(p.fds[1], SHUT_WR) == 0);
+	unsigned char rx[256];
+	size_t got = 0;
+	const bool recv_ok =
+		wire_test_recv_until_closed(&p.srv, rx, sizeof(rx), &got, 50);
+	const bool rx_open = p.srv.wire.rx_open;
+	const bool rx_eof = p.srv.wire.rx_eof;
+
+	wire_test_tls_pair_close(&p);
+	T_EXPECT(!recv_ok);
+	T_EXPECT(!rx_open);
+	T_EXPECT(!rx_eof);
+	T_EXPECT_EQ(got, (size_t)0);
+}
+
+/* A last record, the close_notify and the FIN arriving in one read: the data
+ * is delivered first, then the alert still buffered in the library ends the
+ * stream cleanly -- whether it is decrypted from the drained-records path or
+ * after the FIN is read. */
+T_DECLARE_CASE(test_wire_recv_buffered_close_notify_behind_data)
+{
+	struct wire_test_tls_pair p;
+	const bool opened = wire_test_tls_pair_open(&p);
+	if (!opened) {
+		wire_test_tls_pair_close(&p);
+	}
+	T_CHECK(opened);
+
+	unsigned char msg[] = "bye";
+	size_t n = sizeof(msg) - 1;
+	T_CHECK(mux_wire_send(&p.cli, msg, &n));
+	T_CHECK(n == sizeof(msg) - 1);
+	T_CHECK(mux_wire_shutdown(&p.cli) == WIRE_SHUTDOWN_DONE);
+
+	unsigned char rx[256];
+	size_t got = 0;
+	const bool recv_ok =
+		wire_test_recv_until_closed(&p.srv, rx, sizeof(rx), &got, 50);
+	const bool data_ok =
+		(got == sizeof(msg) - 1 && memcmp(rx, msg, got) == 0);
+	const bool srv_clean = p.srv.wire.rx_eof;
+
+	wire_test_tls_pair_close(&p);
+	T_EXPECT(recv_ok);
+	T_EXPECT(data_ok);
+	T_EXPECT(srv_clean);
+}
+
+/* After our own shutdown, a peer that answers with a bare TCP FIN never
+ * confirmed the close: the memory transport must report it as the fd-backed
+ * library's unexpected EOF does (WIRE_EOF_ERROR), not as WIRE_EOF_CONFIRMED. */
+T_DECLARE_CASE(test_wire_wait_eof_tls_buffered_bare_fin_is_error)
+{
+	struct wire_test_tls_pair p;
+	const bool opened = wire_test_tls_pair_open(&p);
+	if (!opened) {
+		wire_test_tls_pair_close(&p);
+	}
+	T_CHECK(opened);
+
+	T_CHECK(shutdown(p.fds[1], SHUT_WR) == 0);
+	enum wire_eof_result eof = WIRE_EOF_PENDING;
+	for (int i = 0; i < 50 && eof == WIRE_EOF_PENDING; i++) {
+		struct pollfd pfd = { .fd = p.fds[0], .events = POLLIN };
+		(void)poll(&pfd, 1, 20);
+		eof = mux_wire_wait_eof(&p.srv);
+	}
+
+	wire_test_tls_pair_close(&p);
+	T_EXPECT_EQ(eof, WIRE_EOF_ERROR);
+}
+
 /* mux_wire_flush's WIRE_FLUSH_BLOCKED/WIRE_FLUSH_ERROR outcomes
  * (memory-transport TLS only -- socket-offload bypasses wire_cipher_push
  * entirely) had zero direct test references. */
@@ -1095,8 +1470,8 @@ T_DECLARE_CASE(test_wire_flush_blocked_on_partial_socket_write)
 	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
 	srv_ss.wire.tlsconn = srv_conn;
 	cli_ss.wire.tlsconn = cli_conn;
-	srv_ss.conf.tls_socket_offload = false;
-	cli_ss.conf.tls_socket_offload = false;
+	srv_ss.wire.tls_offload = false;
+	cli_ss.wire.tls_offload = false;
 
 	/* Complete the handshake (mirrors test_wire_tls_buffered_send_recv). */
 	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
@@ -1177,8 +1552,8 @@ T_DECLARE_CASE(test_wire_flush_error_on_hard_send_failure)
 	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
 	srv_ss.wire.tlsconn = srv_conn;
 	cli_ss.wire.tlsconn = cli_conn;
-	srv_ss.conf.tls_socket_offload = false;
-	cli_ss.conf.tls_socket_offload = false;
+	srv_ss.wire.tls_offload = false;
+	cli_ss.wire.tls_offload = false;
 
 	/* Complete the handshake (mirrors test_wire_tls_buffered_send_recv). */
 	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
@@ -1268,8 +1643,11 @@ T_DECLARE_CASE(test_wire_adopt_tlsconn_swaps_and_rebinds_notifier)
 	};
 	tls_set_callback(conn_new, &transient_cb);
 
-	mux_wire_adopt_tlsconn(&ss, conn_new);
+	/* ss was latched to socket offload (the make_session default); conn_new is
+	 * memory-backed, so the adopt must take its mode along with it. */
+	mux_wire_adopt_tlsconn(&ss, conn_new, false);
 	const bool swapped = (ss.wire.tlsconn == conn_new);
+	const bool mode_adopted = !ss.wire.tls_offload;
 
 	/* Fire the notifier: a memory-backed client's first handshake stages the
 	 * ClientHello, which the backend reports via on_send. */
@@ -1285,6 +1663,7 @@ T_DECLARE_CASE(test_wire_adopt_tlsconn_swaps_and_rebinds_notifier)
 	tls_ctx_free(srv_ctx);
 	tls_ctx_free(cli_ctx);
 	T_EXPECT(swapped);
+	T_EXPECT(mode_adopted);
 	T_EXPECT(handshake_progressing);
 	T_EXPECT(fired_on_ss);
 	T_EXPECT(not_fired_on_transient);
@@ -1316,8 +1695,8 @@ T_DECLARE_CASE(test_wire_wait_eof_tls_buffered_confirmed)
 	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
 	srv_ss.wire.tlsconn = srv_conn;
 	cli_ss.wire.tlsconn = cli_conn;
-	srv_ss.conf.tls_socket_offload = false;
-	cli_ss.conf.tls_socket_offload = false;
+	srv_ss.wire.tls_offload = false;
+	cli_ss.wire.tls_offload = false;
 
 	/* Complete the handshake (mirrors test_wire_tls_buffered_send_recv). */
 	unsigned char cli_msg[] = "ping", srv_msg[] = "pong";
@@ -1428,6 +1807,119 @@ T_DECLARE_CASE(test_wire_wait_eof_tls_offload_error_on_appdata)
 	(void)close(fds[0]);
 	(void)close(fds[1]);
 	T_EXPECT(is_error);
+}
+
+/* Pump msg each way between two TLS sessions through the wire API until both
+ * copies arrive intact, driving any pending handshake on the way.  Returns
+ * false on a wire error, a corrupted payload, or no delivery in the budget. */
+static bool wire_test_tls_exchange(
+	struct mux_session *restrict cli_ss,
+	struct mux_session *restrict srv_ss, const char *restrict msg)
+{
+	const size_t len = strlen(msg);
+	unsigned char cli_rx[4096], srv_rx[4096];
+	size_t cli_sent = 0, srv_sent = 0, cli_got = 0, srv_got = 0;
+	if (len > sizeof(cli_rx)) {
+		return false;
+	}
+	for (int i = 0; i < 100 && (cli_got < len || srv_got < len); i++) {
+		size_t n = len - cli_sent;
+		if (n > 0 &&
+		    !mux_wire_send(
+			    cli_ss, (const unsigned char *)msg + cli_sent,
+			    &n)) {
+			return false;
+		}
+		cli_sent += n;
+		n = len - srv_sent;
+		if (n > 0 &&
+		    !mux_wire_send(
+			    srv_ss, (const unsigned char *)msg + srv_sent,
+			    &n)) {
+			return false;
+		}
+		srv_sent += n;
+		if (mux_wire_flush(cli_ss) == WIRE_FLUSH_ERROR ||
+		    mux_wire_flush(srv_ss) == WIRE_FLUSH_ERROR) {
+			return false;
+		}
+		n = sizeof(srv_rx) - srv_got;
+		if (!mux_wire_recv(srv_ss, srv_rx + srv_got, &n)) {
+			return false;
+		}
+		srv_got += n;
+		n = sizeof(cli_rx) - cli_got;
+		if (!mux_wire_recv(cli_ss, cli_rx + cli_got, &n)) {
+			return false;
+		}
+		cli_got += n;
+		struct pollfd pfd[2] = {
+			{ .fd = cli_ss->w_socket.fd, .events = POLLIN },
+			{ .fd = srv_ss->w_socket.fd, .events = POLLIN },
+		};
+		(void)poll(pfd, 2, 10);
+	}
+	return cli_got == len && srv_got == len &&
+	       memcmp(cli_rx, msg, len) == 0 && memcmp(srv_rx, msg, len) == 0;
+}
+
+/* A config reload (mux_session_set_config overwriting ss->conf) must not change
+ * the I/O mode of a live TLS connection: the mode describes how the connection
+ * was built.  Builds the client through mux_wire_tls_start and the server as
+ * mux_session_new does (tls_server + the conf-derived latch), exchanges data,
+ * flips conf.tls_socket_offload on both sides as a reload would, then
+ * exchanges again over the same connections. */
+static bool wire_test_tls_mode_survives_reload(const bool offload)
+{
+	struct tls_context *const srv_ctx = wire_test_server_ctx();
+	struct tls_context *const cli_ctx = wire_test_client_ctx();
+	int fds[2] = { -1, -1 };
+	bool ok = srv_ctx != NULL && cli_ctx != NULL &&
+		  socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0 &&
+		  fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0 &&
+		  fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0;
+
+	struct frame_pool_ctx pool_ctx = { 0 };
+	struct mux_session srv_ss = make_session(&pool_ctx, fds[0]);
+	struct mux_session cli_ss = make_session(&pool_ctx, fds[1]);
+	srv_ss.conf.tls_socket_offload = offload;
+	cli_ss.conf.tls_socket_offload = offload;
+	if (ok) {
+		srv_ss.wire.tlsconn =
+			tls_server(srv_ctx, offload ? fds[0] : -1);
+		srv_ss.wire.tls_offload = offload;
+		cli_ss.wire.tlsctx = cli_ctx;
+		ok = srv_ss.wire.tlsconn != NULL &&
+		     mux_wire_tls_start(&cli_ss) &&
+		     wire_test_tls_exchange(&cli_ss, &srv_ss, "before");
+	}
+	if (ok) {
+		srv_ss.conf.tls_socket_offload = !offload;
+		cli_ss.conf.tls_socket_offload = !offload;
+		ok = wire_test_tls_exchange(&cli_ss, &srv_ss, "after reload");
+	}
+
+	mux_wire_conn_free(&srv_ss);
+	mux_wire_conn_free(&cli_ss);
+	bytebuf_free(srv_ss.wire.rawbuf);
+	bytebuf_free(cli_ss.wire.rawbuf);
+	tls_ctx_free(srv_ctx);
+	tls_ctx_free(cli_ctx);
+	if (fds[0] != -1) {
+		(void)close(fds[0]);
+		(void)close(fds[1]);
+	}
+	return ok;
+}
+
+T_DECLARE_CASE(test_wire_tls_memory_mode_survives_reload)
+{
+	T_EXPECT(wire_test_tls_mode_survives_reload(false));
+}
+
+T_DECLARE_CASE(test_wire_tls_offload_mode_survives_reload)
+{
+	T_EXPECT(wire_test_tls_mode_survives_reload(true));
 }
 
 #endif /* WITH_TLS */
@@ -1742,11 +2234,6 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_wire_send_plain_tcp_hard_error_returns_false),
 	T_CASE(test_wire_recv_plain_tcp_reads_payload),
 	T_CASE(test_wire_recv_eof_clears_rx_open_and_sets_tx_pending),
-	T_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes),
-	T_CASE(test_bytebuf_consume_advances_offset_without_copy),
-	T_CASE(test_bytebuf_shrink_reclaims_capacity),
-	T_CASE(test_bytebuf_shrink_keeps_live_bytes),
-	T_CASE(test_bytebuf_shrink_noop_when_small),
 	T_CASE(test_wire_discard_buffers_frees_all_pending_frames),
 	T_CASE(test_wire_has_pending_reflects_build_variant),
 	T_CASE(test_wire_flush_done_without_memory_transport_tls),
@@ -1773,11 +2260,21 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_wire_tls_shutdown_completes),
 	T_CASE(test_wire_tls_buffered_send_recv),
 	T_CASE(test_wire_recv_buffered_zero_return_reports_push_failure),
+	T_CASE(test_wire_recv_buffered_drains_plaintext_before_socket),
+	T_CASE(test_wire_recv_buffered_drain_push_blocked_keeps_tx_pending),
+	T_CASE(test_wire_recv_buffered_drain_push_error_fails),
+	T_CASE(test_wire_recv_buffered_stale_readable_reads_socket),
+	T_CASE(test_wire_shutdown_retries_blocked_close_notify),
+	T_CASE(test_wire_recv_buffered_bare_fin_is_not_clean),
+	T_CASE(test_wire_recv_buffered_close_notify_behind_data),
+	T_CASE(test_wire_wait_eof_tls_buffered_bare_fin_is_error),
 	T_CASE(test_wire_flush_blocked_on_partial_socket_write),
 	T_CASE(test_wire_flush_error_on_hard_send_failure),
 	T_CASE(test_wire_adopt_tlsconn_swaps_and_rebinds_notifier),
 	T_CASE(test_wire_wait_eof_tls_buffered_confirmed),
 	T_CASE(test_wire_wait_eof_tls_offload_error_on_appdata),
+	T_CASE(test_wire_tls_memory_mode_survives_reload),
+	T_CASE(test_wire_tls_offload_mode_survives_reload),
 #endif /* WITH_TLS */
 	T_SUITE_END,
 };

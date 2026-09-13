@@ -42,6 +42,10 @@ if(LIBATOMIC)
     target_link_libraries(mux PUBLIC ${LIBATOMIC})
 endif()
 
+if(NOT BUILD_TESTING)
+    return()
+endif()
+
 function(add_mux_test target_name)
     add_executable(${target_name} ${ARGN})
 

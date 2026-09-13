@@ -9,9 +9,9 @@
 #ifndef MUX_STREAM_H
 #define MUX_STREAM_H
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/stream_io.h"
+#include "frame.h"
+#include "mux.h"
+#include "stream_io.h"
 
 #include <ev.h>
 
@@ -54,17 +54,37 @@ struct mux_stream {
 	/* State flags (shared by both modes) */
 	/* Which scheduling queue this stream belongs to; mutually exclusive. */
 	uint_least8_t sched_queue : 2;
-	/* true = direct I/O mode; false = socket mode */
+	/* true = direct I/O mode; false = socket mode. mux_stream_close() also
+	 * sets it on a stream it closes before the application gave it a mode:
+	 * with no socket to finish the close on, the stream completes as a
+	 * direct stream the application has closed. */
 	bool is_direct : 1;
-	/* Direct mode only: the application has relinquished the stream via
-	 * mux_stream_close() (close(fd) semantics), so it will never call
-	 * mux_stream_recv() again. The library normally defers a direct-mode
-	 * stream's final CLOSED transition to that call -- it must not free a
-	 * stream the application still holds -- but once this is set there is no
-	 * owner left to drive it, so the close paths complete it themselves.
-	 * Distinct from direct.w_io == NULL, which merely means the watcher is
-	 * currently stopped and says nothing about ownership. */
+	/* Direct mode only (which a stream closed before it had a mode joins,
+	 * see is_direct): the application has relinquished the stream --
+	 * mux_stream_close() (close(fd) semantics), the end-of-stream return of
+	 * mux_stream_recv() that closes it, or an on_accept rejection -- so it
+	 * will never touch it again. The library must not free a direct stream
+	 * the application still holds: it defers the final CLOSED transition to
+	 * mux_stream_recv(), and a stream closed under the application (peer RST,
+	 * local abort) stays allocated past its tombstone until this is set.
+	 * Once set there is no owner left to drive the stream, so the close
+	 * paths complete it themselves. Distinct from direct.w_io == NULL, which
+	 * merely means the watcher is currently stopped and says nothing about
+	 * ownership. */
 	bool user_closed : 1;
+	/* Returned by mux_stream_open() and not yet given a mode: the
+	 * application holds the stream until mux_stream_attach_fd() hands it to
+	 * the library, mux_stream_io_start() enters direct mode (whose own hold
+	 * user_closed tracks), or mux_stream_close() gives it up. Until then the
+	 * library must not free it: a close keeps it allocated past its
+	 * tombstone, as for a held direct stream. */
+	bool pending_attach : 1;
+	/* Its session tore the stream table down (graceful shutdown, drain
+	 * completion, reset, or a rejected resume) while the application still
+	 * held it (mux_stream_app_held). The stream is CLOSED and off every
+	 * scheduler queue and the table, linked on sched.orphans instead, until
+	 * mux_stream_close() or mux_close() frees it. */
+	bool orphaned : 1;
 	/* Receive window update pending; a credit-bearing ACK must be sent to the peer. */
 	bool ack_pending : 1;
 	/* true when the local socket has sent EOF (or application called mux_stream_shutdown) */
@@ -90,6 +110,8 @@ struct mux_stream {
 	/* Singly-linked next pointer, shared by the DRR ready queue and the
 	 * low-priority lifecycle queue (mutually exclusive; both strict FIFO). */
 	struct mux_stream *next;
+	/* Coalescing delay list links; an orphaned stream, never on that list,
+	 * reuses them for the session's orphan list. */
 	struct mux_stream *delay_prev;
 	struct mux_stream *delay_next;
 
@@ -167,6 +189,14 @@ static inline bool stream_fin_pending(const struct mux_stream *restrict s)
 		s->state == STREAM_CLOSE_WAIT);
 }
 
+/* True once the application has given the stream a mode: attached a socket
+ * (mux_stream_do_attach_fd) or started direct I/O (mux_stream_do_io_start).
+ * Meaningful only before STREAM_CLOSED, which releases a socket-mode fd. */
+static inline bool stream_has_mode(const struct mux_stream *restrict s)
+{
+	return s->is_direct || s->socket.w_io.fd != -1;
+}
+
 /* True in the states from which the stream may still originate application
  * data: before its SYN has left (INIT), while established, or after the peer's
  * FIN with the local send side still open (CLOSE_WAIT). The single source of
@@ -175,6 +205,16 @@ static inline bool stream_can_send_data(const struct mux_stream *restrict s)
 {
 	return s->state == STREAM_INIT || s->state == STREAM_ESTABLISHED ||
 	       s->state == STREAM_CLOSE_WAIT;
+}
+
+/* True while the application may still originate data on the stream: a state
+ * that can send (stream_can_send_data()) and no local write-EOF yet. After
+ * mux_stream_shutdown() (or a socket-mode local EOF) the data already queued
+ * still drains under stream_can_send_data(), but no new data may join it --
+ * shutdown(fd, SHUT_WR) semantics, independent of whether the FIN has left. */
+static inline bool stream_may_originate(const struct mux_stream *restrict s)
+{
+	return !s->rx_eof && stream_can_send_data(s);
 }
 
 /* True when a direct-mode stream has an EV_READ condition to deliver: buffered
@@ -191,12 +231,13 @@ static inline bool stream_direct_read_ready(const struct mux_stream *restrict s)
 }
 
 /* True when a direct-mode stream can accept an EV_WRITE: it may still originate
- * data and has peer credit to spend. Shared by mux_stream_do_io_start() and
- * mux_stream_io_modify(). */
+ * data and has peer credit to spend. The single gate for every direct-mode
+ * EV_WRITE feed: mux_stream_do_io_start(), mux_stream_io_modify(), and the
+ * credit notifications in stream.c. */
 static inline bool
 stream_direct_write_ready(const struct mux_stream *restrict s)
 {
-	return stream_can_send_data(s) && stream_read_credit_avail(s) > 0;
+	return stream_may_originate(s) && stream_read_credit_avail(s) > 0;
 }
 
 /* Remaining receive space after subtracting credit the peer may still spend. */
@@ -216,6 +257,22 @@ struct mux_stream *mux_stream_new(
 	struct mux_session *restrict ss, uint_fast16_t id, bool active_open);
 
 void mux_stream_free(struct mux_stream *s);
+
+/* True while the application holds a pointer to @p s that the library must
+ * not free under it: a direct stream it has not released with
+ * mux_stream_close(), or an opened stream it has not given a mode yet. */
+static inline bool mux_stream_app_held(const struct mux_stream *restrict s)
+{
+	return s->pending_attach || (s->is_direct && !s->user_closed);
+}
+
+/* Session-level teardown of a stream the application still holds: close it as
+ * a local abort without the per-stream close cascade (discard its buffers, no
+ * RST), mark it orphaned, and feed a direct stream's watcher EV_READ so
+ * mux_stream_recv() reports ECONNRESET. The caller links it on the session's
+ * orphan list; mux_stream_close() or mux_close() frees it, and a later
+ * mux_stream_attach_fd() or mux_stream_io_start() rejects it. */
+void mux_stream_orphan(struct mux_stream *s);
 
 void mux_stream_do_attach_fd(struct mux_stream *s, int fd);
 
@@ -237,10 +294,17 @@ void mux_stream_notify_recv(struct mux_stream *restrict s);
 /* Abort the stream locally and emit one peer-visible RST carrying @p code.
  * May free s when it is the last active stream of a draining session (the
  * shutdown cascade), so callers must re-check before touching it again. */
-void mux_stream_abort(struct mux_stream *restrict s, enum mux_status code);
+void mux_stream_abort(struct mux_stream *s, enum mux_status code);
+
+/* Abort a STREAM_INIT stream whose SYN could not be sent.  No SYN left the
+ * host, so the peer holds no state for the ID and no RST goes on the wire;
+ * locally the open failed and is reported as a reset (a direct watcher gets
+ * EV_READ and mux_stream_recv returns ECONNRESET, an attached socket is closed
+ * abortively) and counted failed.  May free s as mux_stream_abort does. */
+void mux_stream_abort_unopened(struct mux_stream *s);
 
 void mux_stream_recv_copy(
-	struct mux_stream *restrict s, const unsigned char *restrict payload,
+	struct mux_stream *s, const unsigned char *restrict payload,
 	size_t payload_len);
 
 void mux_stream_check_ack(struct mux_stream *restrict s);
@@ -256,6 +320,12 @@ void mux_stream_recv_rst(struct mux_stream *s, uint_fast16_t status);
 /* close(fd) semantics: discard unread data and RST the peer; otherwise
  * immediate teardown (caller responsible for prior RST/FIN actions). */
 void mux_stream_do_close(struct mux_stream *s);
+
+/* The application gives up a CLOSED stream (mux_stream_close() after a peer RST,
+ * local abort, or session teardown): a stream it holds (mux_stream_app_held) is
+ * kept allocated until then, so free it now if orphaned, else hand it to
+ * lifecycle cleanup now, or at tombstone expiry if its tombstone lingers. */
+void mux_stream_do_release(struct mux_stream *s);
 
 /* Half-close the write side, equivalent to shutdown(fd, SHUT_WR).
  * Queues a FIN to the peer once all pending send data has been flushed.

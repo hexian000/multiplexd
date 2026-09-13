@@ -5,10 +5,10 @@
  * Dependencies: frame.c #included (leaf module, no collaborators to mock).
  * Benches (bench section) are opt-in: run with TESTING_BENCH set in the env. */
 
-#include "mux/frame.h"
+#include "frame.h"
 
-#include "mux/frame.c"
-#include "mux/mux.h"
+#include "frame.c"
+#include "mux.h"
 
 #include "meta/arraysize.h"
 #include "utils/testing.h"
@@ -660,6 +660,108 @@ T_DECLARE_CASE(test_bytebuf_reserve_len_plus_need_overflow_rejects)
 	bytebuf_free(rb);
 }
 
+/* Consuming one frame from the front of a receive buffer must leave the next
+ * frame's bytes readable and intact. */
+T_DECLARE_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes)
+{
+	struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_PUSH,
+		.length = 1,
+		.stream_id = 2,
+		.extra = 0,
+	};
+	unsigned char bytes[2 * MUX_FRAME_HEADER_SIZE + 2] = { 0 };
+
+	mux_write_header(bytes, &hdr);
+	bytes[MUX_FRAME_HEADER_SIZE] = 'A';
+	hdr.stream_id = 4;
+	mux_write_header(bytes + MUX_FRAME_HEADER_SIZE + 1, &hdr);
+	bytes[2 * MUX_FRAME_HEADER_SIZE + 1] = 'B';
+	struct bytebuf *rb = bytebuf_new(sizeof(bytes));
+	T_CHECK(rb != NULL);
+	memcpy(bytebuf_write_ptr(rb), bytes, sizeof(bytes));
+	bytebuf_produce(rb, sizeof(bytes));
+
+	bytebuf_consume(rb, MUX_FRAME_HEADER_SIZE + 1);
+	T_EXPECT_EQ(
+		bytebuf_readable(rb),
+		sizeof(bytes) - ((size_t)MUX_FRAME_HEADER_SIZE + 1));
+	T_EXPECT(bytebuf_read_ptr(rb)[MUX_FRAME_HEADER_SIZE] == 'B');
+	bytebuf_free(rb);
+}
+
+/* A partial consume advances the read offset rather than moving bytes. */
+T_DECLARE_CASE(test_bytebuf_consume_advances_offset_without_copy)
+{
+	unsigned char bytes[2 * MUX_FRAME_HEADER_SIZE] = { 0 };
+
+	struct bytebuf *rb = bytebuf_new(sizeof(bytes));
+	T_CHECK(rb != NULL);
+	memcpy(bytebuf_write_ptr(rb), bytes, sizeof(bytes));
+	bytebuf_produce(rb, sizeof(bytes));
+
+	bytebuf_consume(rb, MUX_FRAME_HEADER_SIZE);
+	T_EXPECT_EQ(rb->off, (size_t)MUX_FRAME_HEADER_SIZE);
+	T_EXPECT_EQ(
+		bytebuf_readable(rb),
+		sizeof(bytes) - (size_t)MUX_FRAME_HEADER_SIZE);
+	bytebuf_free(rb);
+}
+
+/* mux_bytebuf_shrink reclaims a grown buffer down to the target, compacting the
+ * live bytes to the front and preserving them. */
+T_DECLARE_CASE(test_bytebuf_shrink_reclaims_capacity)
+{
+	struct bytebuf *rb = bytebuf_new(4096);
+	T_CHECK(rb != NULL);
+	memset(bytebuf_write_ptr(rb), 'X', 100);
+	bytebuf_produce(rb, 100);
+	bytebuf_consume(rb, 10); /* off=10, len=90: forces compaction */
+	T_EXPECT_EQ(rb->cap, (size_t)4096);
+
+	mux_bytebuf_shrink(&rb, 256);
+
+	T_EXPECT_EQ(rb->cap, (size_t)256);
+	T_EXPECT_EQ(rb->off, (size_t)0);
+	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)90);
+	const unsigned char *const p = bytebuf_read_ptr(rb);
+	bool intact = true;
+	for (size_t i = 0; i < 90; i++) {
+		intact = intact && (p[i] == 'X');
+	}
+	T_EXPECT(intact);
+	bytebuf_free(rb);
+}
+
+/* mux_bytebuf_shrink never drops below the live byte count, even when the target is
+ * smaller. */
+T_DECLARE_CASE(test_bytebuf_shrink_keeps_live_bytes)
+{
+	struct bytebuf *rb = bytebuf_new(4096);
+	T_CHECK(rb != NULL);
+	memset(bytebuf_write_ptr(rb), 'Y', 500);
+	bytebuf_produce(rb, 500); /* len=500 > target */
+
+	mux_bytebuf_shrink(&rb, 256);
+
+	T_EXPECT_EQ(rb->cap, (size_t)500);
+	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)500);
+	bytebuf_free(rb);
+}
+
+/* mux_bytebuf_shrink is a no-op when the capacity is already at or below target. */
+T_DECLARE_CASE(test_bytebuf_shrink_noop_when_small)
+{
+	struct bytebuf *rb = bytebuf_new(128);
+	T_CHECK(rb != NULL);
+
+	mux_bytebuf_shrink(&rb, 256);
+
+	T_EXPECT_EQ(rb->cap, (size_t)128);
+	bytebuf_free(rb);
+}
+
 /* bench - per-frame hot-path micro-benchmarks (opt-in: run with TESTING_BENCH set) */
 
 /* Opaque source/sink (volatile) to keep the optimizer from constant-folding the
@@ -770,6 +872,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_bytebuf_reserve_doubling_growth_loop),
 	T_CASE(test_bytebuf_reserve_overflow_clamp_rejects),
 	T_CASE(test_bytebuf_reserve_len_plus_need_overflow_rejects),
+	T_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes),
+	T_CASE(test_bytebuf_consume_advances_offset_without_copy),
+	T_CASE(test_bytebuf_shrink_reclaims_capacity),
+	T_CASE(test_bytebuf_shrink_keeps_live_bytes),
+	T_CASE(test_bytebuf_shrink_noop_when_small),
 	T_CASE(test_mux_status_str_names_known_codes_distinctly),
 	/* Opt-in micro-benchmarks: each runs ~1s, so they are skipped by the
 	 * default (unfiltered) run.  Select with `--bench <ere>` or TESTING_BENCH. */

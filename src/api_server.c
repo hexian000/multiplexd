@@ -13,6 +13,7 @@
 #include "listener.h"
 #include "mux/mux.h"
 #include "server.h"
+#include "shim/tls.h"
 #include "shim/util.h"
 #include "tunnel.h"
 
@@ -26,13 +27,16 @@
 #include "strings/time.h"
 #include "utils/buffer.h"
 #include "utils/ctype_ascii.h"
+#include "utils/debug.h"
 #include "utils/slog.h"
 
 #include <ev.h>
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <locale.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -51,13 +55,6 @@ enum {
 	HTTP_MAX_RESPONSE_HDR = 1024,
 };
 
-enum {
-	/* RFC 9112 2.3: the status for a well-formed request whose HTTP major
-	 * version this server cannot process. contrib's read-only
-	 * http_status_code enum does not define it. */
-	HTTP_VERSION_NOT_SUPPORTED = 505,
-};
-
 #define API_TIMEOUT 30.0
 
 struct api_ctx {
@@ -72,8 +69,10 @@ struct api_ctx {
 	bool hdr_done : 1;
 	bool keepalive : 1;
 	bool content_length_seen : 1;
+	bool host_seen : 1;
 	/* Client sent Expect: 100-continue and the interim response is
-	 * still owed; cleared once it has been written. */
+	 * still owed; cleared once it has been written, or by
+	 * start_response() when a final status answers the request first. */
 	bool expect_continue : 1;
 	/* Sticky OR of connection_has_close() over every Connection header, set
 	 * at parse time.  Replaces a fixed value buffer so neither a token list
@@ -81,6 +80,8 @@ struct api_ctx {
 	 * list-valued Connection header (RFC 7230 3.2.2) can lose the token. */
 	bool close_requested : 1;
 	size_t wpos;
+	/* Bytes already written from the interim 100 Continue response. */
+	size_t continue_pos;
 	/* parsed Content-Length from the request; 0 when absent */
 	size_t content_length;
 	struct {
@@ -124,7 +125,9 @@ static void api_ctx_reset(struct ev_loop *loop, struct api_ctx *restrict ctx)
 	ctx->hdr_done = false;
 	ctx->keepalive = false;
 	ctx->content_length_seen = false;
+	ctx->host_seen = false;
 	ctx->expect_continue = false;
+	ctx->continue_pos = 0;
 	ctx->close_requested = false;
 	ctx->content_length = 0;
 	BUF_RESET(ctx->wbuf);
@@ -167,51 +170,15 @@ static bool parse_bool(const char *s)
 			     strcmp(s, "t") == 0 || strcmp(s, "true") == 0);
 }
 
-/* RFC 7231 section 7.1.1.1 IMF-fixdate, built from a static English name
- * table instead of contrib's http_date(), which formats via strftime's
- * locale-dependent %a/%b -- under init()'s own setlocale(LC_ALL, ""), a
- * non-English LC_TIME breaks the RFC-mandated English day/month names, and
- * an overflowing localized expansion can even make strftime return 0
- * (contrib is read-only, so the fix lives at the call site). Returns the
- * formatted length, or 0 on failure (undersized buf or gmtime_r failure),
- * matching http_date()'s own contract. */
-static size_t http_date_safe(char *restrict buf, const size_t buf_size)
-{
-	static const char *const wday_name[7] = { "Sun", "Mon", "Tue", "Wed",
-						  "Thu", "Fri", "Sat" };
-	static const char *const mon_name[12] = { "Jan", "Feb", "Mar", "Apr",
-						  "May", "Jun", "Jul", "Aug",
-						  "Sep", "Oct", "Nov", "Dec" };
-	const time_t now = time(NULL);
-	struct tm gmt;
-	if (gmtime_r(&now, &gmt) == NULL) {
-		return 0;
-	}
-	const int n = snprintf(
-		buf, buf_size, "%s, %02d %s %d %02d:%02d:%02d GMT",
-		wday_name[gmt.tm_wday % 7], gmt.tm_mday,
-		mon_name[gmt.tm_mon % 12], gmt.tm_year + 1900, gmt.tm_hour,
-		gmt.tm_min, gmt.tm_sec);
-	return (n > 0 && (size_t)n < buf_size) ? (size_t)n : 0;
-}
-
-/* Writes an HTTP response with the given status code and empty body. */
-/* Emit a bodiless response.  @p allow, when non-NULL, is the comma-separated
- * method list for the Allow header RFC 7231 6.5.5 requires on a 405. */
-static void respond_status_allow(
-	struct api_ctx *restrict ctx, const int code,
-	const char *restrict allow)
+/* Reset wbuf and stage the head lines every response shares: the status
+ * line, Date, and Connection.  The caller appends its remaining header
+ * fields and the blank line ending the head. */
+static void respond_prologue(struct api_ctx *restrict ctx, const int code)
 {
 	char date_str[32];
-	const size_t date_len = http_date_safe(date_str, sizeof(date_str));
+	const size_t date_len = http_date(date_str, sizeof(date_str));
 	const char *const status = http_status((uint_fast16_t)code);
 	BUF_RESET(ctx->wbuf);
-	/* Guarantee the documented "empty body" contract even when called
-	 * after a partial cbuf append failed with OOM: send_cb() always
-	 * transmits wbuf then cbuf, so a stale/partial cbuf here would
-	 * otherwise desync the declared Content-Length: 0 from what's
-	 * actually sent. */
-	VBUF_RESET(ctx->cbuf);
 	BUF_APPENDF(
 		ctx->wbuf, "HTTP/1.1 %d %s\r\n", code, status ? status : "");
 	/* RFC 7231 7.1.1.2: a server without a clock capable of a reasonable
@@ -224,6 +191,21 @@ static void respond_status_allow(
 	BUF_APPENDF(
 		ctx->wbuf, "Connection: %s\r\n",
 		ctx->keepalive ? "keep-alive" : "close");
+}
+
+/* Emit a bodiless response.  @p allow, when non-NULL, is the comma-separated
+ * method list for the Allow header RFC 7231 6.5.5 requires on a 405. */
+static void respond_status_allow(
+	struct api_ctx *restrict ctx, const int code,
+	const char *restrict allow)
+{
+	/* Guarantee the documented "empty body" contract even when called
+	 * after a partial cbuf append failed with OOM: send_cb() always
+	 * transmits wbuf then cbuf, so a stale/partial cbuf here would
+	 * otherwise desync the declared Content-Length: 0 from what's
+	 * actually sent. */
+	VBUF_RESET(ctx->cbuf);
+	respond_prologue(ctx, code);
 	if (allow != NULL) {
 		BUF_APPENDF(ctx->wbuf, "Allow: %s\r\n", allow);
 	}
@@ -246,28 +228,15 @@ static void respond_body(
 	struct api_ctx *restrict ctx, const int code, const char *content_type,
 	const size_t body_len)
 {
-	char date_str[32];
-	const size_t date_len = http_date_safe(date_str, sizeof(date_str));
-	const char *const status = http_status((uint_fast16_t)code);
-	BUF_RESET(ctx->wbuf);
-	BUF_APPENDF(
-		ctx->wbuf, "HTTP/1.1 %d %s\r\n", code, status ? status : "");
-	/* RFC 7231 7.1.1.2: omit Date entirely when no valid date is available
-	 * rather than emit a syntactically empty value. */
-	if (date_len > 0) {
-		BUF_APPENDF(
-			ctx->wbuf, "Date: %.*s\r\n", (int)date_len, date_str);
-	}
+	respond_prologue(ctx, code);
 	BUF_APPENDF(
 		ctx->wbuf,
-		"Connection: %s\r\n"
 		"Content-Type: %s\r\n"
 		"X-Content-Type-Options: nosniff\r\n"
 		"Cache-Control: no-store\r\n"
 		"Content-Length: %zu\r\n"
 		"\r\n",
-		ctx->keepalive ? "keep-alive" : "close", content_type,
-		body_len);
+		content_type, body_len);
 }
 
 /* Writes a 200 OK response with headers only; body is expected in cbuf. */
@@ -609,6 +578,17 @@ handle_stats(struct api_ctx *restrict ctx, const bool stateless, char *query)
 			ctx->cbuf, "%-20s: Rx %s, Tx %s\n", "Payload Traffic",
 			rx_push, tx_push);
 	}
+	{
+		FORMAT_BYTES(rx_dgram, stats->byt_dgram_recv);
+		FORMAT_BYTES(tx_dgram, stats->byt_dgram_sent);
+		VBUF_APPENDF(
+			ctx->cbuf,
+			"%-20s: Rx %" PRIuLEAST64 " (%s), Tx %" PRIuLEAST64
+			" (%s), Dropped %" PRIuLEAST64 ", Flows %zu\n",
+			"Datagrams", stats->pkt_dgram_recv, rx_dgram,
+			stats->pkt_dgram_sent, tx_dgram,
+			stats->pkt_dgram_dropped, stats->num_flows);
+	}
 
 	if (!stateless) {
 		append_stateful_stats(ctx, stats, now, s->started);
@@ -793,6 +773,40 @@ static struct vbuffer *append_connection_metrics(
 	return cbuf;
 }
 
+/* Appends the lossymux datagram counters and the live UDP flow gauge. */
+static struct vbuffer *append_dgram_metrics(
+	struct vbuffer *restrict cbuf,
+	const struct server_stats *restrict stats)
+{
+	APPEND_METRIC_HDR(
+		"datagrams_total", "counter",
+		"lossymux datagrams relayed over the mux (spec §5.2.3.3)");
+	APPEND_METRIC_L(
+		"datagrams_total", "direction=\"%s\"", "%" PRIuLEAST64, "rx",
+		stats->pkt_dgram_recv);
+	APPEND_METRIC_L(
+		"datagrams_total", "direction=\"%s\"", "%" PRIuLEAST64, "tx",
+		stats->pkt_dgram_sent);
+	APPEND_METRIC_HDR(
+		"datagram_bytes_total", "counter",
+		"lossymux datagram payload bytes relayed over the mux");
+	APPEND_METRIC_L(
+		"datagram_bytes_total", "direction=\"%s\"", "%" PRIuLEAST64,
+		"rx", stats->byt_dgram_recv);
+	APPEND_METRIC_L(
+		"datagram_bytes_total", "direction=\"%s\"", "%" PRIuLEAST64,
+		"tx", stats->byt_dgram_sent);
+	APPEND_METRIC(
+		"datagrams_dropped_total", "counter",
+		"lossymux datagrams dropped instead of relayed (congestion,"
+		" no session, oversized, or unknown flow)",
+		"%" PRIuLEAST64, stats->pkt_dgram_dropped);
+	APPEND_METRIC(
+		"udp_flows", "gauge", "Live lossymux UDP flows", "%zu",
+		stats->num_flows);
+	return cbuf;
+}
+
 /* offset[] entry for a tunnel with no identity pool: it is anonymous and emits
  * no labeled series at all. */
 #define NO_LABEL SIZE_MAX
@@ -938,6 +952,23 @@ static struct vbuffer *append_session_link_metrics(
 		"PUSH-frame payload bytes on the mux link per identity session",
 		"counter", "%" PRIuLEAST64, true, t->byt_push_recv,
 		t->byt_push_sent);
+	APPEND_TUNNEL_METRIC_RXTX(
+		"session_datagrams_total",
+		"lossymux datagrams relayed per identity session", "counter",
+		"%" PRIuLEAST64, true, t->pkt_dgram_recv, t->pkt_dgram_sent);
+	APPEND_TUNNEL_METRIC_RXTX(
+		"session_datagram_bytes_total",
+		"lossymux datagram payload bytes per identity session",
+		"counter", "%" PRIuLEAST64, true, t->byt_dgram_recv,
+		t->byt_dgram_sent);
+	APPEND_TUNNEL_METRIC(
+		"session_datagrams_dropped_total",
+		"lossymux datagrams dropped per identity session", "counter",
+		"%" PRIuLEAST64, true, t->pkt_dgram_dropped);
+	APPEND_TUNNEL_METRIC(
+		"session_udp_flows",
+		"Live lossymux UDP flows per identity session", "gauge", "%zu",
+		true, t->num_flows);
 	APPEND_TUNNEL_METRIC_RXTX(
 		"session_window_bytes",
 		"Per-stream window size per identity session", "gauge", "%zu",
@@ -1117,6 +1148,7 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 	cbuf = append_gauge_metrics(cbuf, stats, uptime);
 	cbuf = append_stream_metrics(cbuf, stats);
 	cbuf = append_connection_metrics(cbuf, stats);
+	cbuf = append_dgram_metrics(cbuf, stats);
 	cbuf = append_tunnel_metrics(cbuf, stats, &labels);
 	{
 		struct timespec cpu_ts;
@@ -1165,7 +1197,23 @@ static void handle_config_get(struct api_ctx *restrict ctx)
 	respond_ok(ctx, "application/json; charset=utf-8", ctx->cbuf->len);
 }
 
-/* Handles PUT /config — parse the request body as a new config and hot-reload. */
+/* True if @p new_conf moves the API listener away from @p old_conf's: a
+ * different api_listen value, or the field added or removed. */
+static bool api_listen_changed(
+	const struct config *restrict old_conf,
+	const struct config *restrict new_conf)
+{
+	if (old_conf->api_listen == NULL || new_conf->api_listen == NULL) {
+		return old_conf->api_listen != new_conf->api_listen;
+	}
+	return strcmp(old_conf->api_listen, new_conf->api_listen) != 0;
+}
+
+/* Handles PUT /config — parse the request body as a new config and hot-reload.
+ * The API cannot move its own listener: any page that reaches a loopback API
+ * (DNS rebinding makes a hostile page same-origin to it) could otherwise
+ * re-expose it on a public address, so only a file reload may change
+ * api_listen, and a body changing it is refused whole with 403. */
 static void handle_config_put(struct api_ctx *restrict ctx)
 {
 	if (!ctx->content_length_seen) {
@@ -1181,8 +1229,31 @@ static void handle_config_put(struct api_ctx *restrict ctx)
 	}
 	struct config *const restrict new_conf =
 		conf_parse(ctx->next, ctx->content_length);
+#if WITH_TLS
+	/* conf_parse decodes in place, so the body still holds any inline
+	 * tls.key or tls.psk verbatim; struct config erases only its own copies. */
+	tls_secure_erase(ctx->next, ctx->content_length);
+#endif
 	if (new_conf == NULL) {
 		respond_status(ctx, HTTP_BAD_REQUEST);
+		return;
+	}
+	if (api_listen_changed(ctx->s->conf, new_conf)) {
+		conf_free(new_conf);
+		LOGW_F("api [fd:%d]: config reload rejected: "
+		       "api_listen cannot be changed via the API",
+		       ctx->fd);
+		VBUF_RESET(ctx->cbuf);
+		VBUF_APPENDSTR(
+			ctx->cbuf, "api_listen cannot be changed via the API; "
+				   "reload the config file instead\n");
+		if (VBUF_HAS_OOM(ctx->cbuf)) {
+			respond_status(ctx, HTTP_FORBIDDEN);
+			return;
+		}
+		respond_body(
+			ctx, HTTP_FORBIDDEN, "text/plain; charset=utf-8",
+			ctx->cbuf->len);
 		return;
 	}
 	/* new_conf ownership transfers; freed by server_apply_config on failure */
@@ -1302,13 +1373,60 @@ static bool api_should_keepalive(const struct api_ctx *restrict ctx)
 	return !ctx->close_requested;
 }
 
+/* Write the interim 100 Continue. Not routed through the final-response
+ * portion of send_cb(): that response owns wbuf/cbuf and may tear the
+ * connection down after it, while this is interim and reading continues.
+ * Returns 1 when complete, 0 when transient backpressure requires EV_WRITE,
+ * and -1 for a permanent socket error. */
+static int send_continue(struct api_ctx *restrict ctx)
+{
+	static const char msg[] = "HTTP/1.1 100 Continue\r\n\r\n";
+	while (ctx->continue_pos < sizeof(msg) - 1) {
+		size_t n = sizeof(msg) - 1 - ctx->continue_pos;
+		const int err = socket_send(
+			ctx->fd, (const unsigned char *)msg + ctx->continue_pos,
+			&n);
+		if (err != 0) {
+			if (sock_would_block(err)) {
+				return 0;
+			}
+			return -1;
+		}
+		if (n == 0) {
+			return 0;
+		}
+		ctx->continue_pos += n;
+	}
+	return 1;
+}
+
 static void send_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 {
 	CHECK_REVENTS(revents, EV_WRITE);
 	struct api_ctx *const restrict ctx = watcher->data;
 
-	/* Logical send buffer: wbuf (headers) then cbuf (body, /metrics only);
-	 * wpos tracks position across both. */
+	/* An interim response must complete before reading the request body. */
+	if (ctx->expect_continue) {
+		const int result = send_continue(ctx);
+		if (result < 0) {
+			LOGD_F("api [fd:%d]: send 100 Continue failed",
+			       ctx->fd);
+			api_ctx_free(loop, ctx);
+			return;
+		}
+		if (result == 0) {
+			return; /* wait for EV_WRITE */
+		}
+		ctx->expect_continue = false;
+		ctx->continue_pos = 0;
+		ev_timer_again(loop, &ctx->w_timeout);
+		ev_io_stop(loop, &ctx->w_send);
+		ev_io_start(loop, &ctx->w_recv);
+		return;
+	}
+
+	/* Logical send buffer: wbuf (headers) then cbuf (the response body,
+	 * empty for a bodiless response); wpos tracks position across both. */
 	const size_t wlen = ctx->wbuf.len;
 	const size_t clen = ctx->cbuf->len;
 	const size_t total = wlen + clen;
@@ -1345,34 +1463,29 @@ static void send_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	}
 }
 
-/* Write the interim 100 Continue. Not routed through wbuf/send_cb: those own
- * the final response and tear the connection down after it, while this is
- * interim and reading continues. Returns false only when the message was left
- * half-written, which cannot be recovered -- a truncated status line would
- * desync the client's parser; having written nothing is survivable, and just
- * leaves the client to its own expect timeout as before. */
-static bool send_continue(struct api_ctx *restrict ctx)
+/* Switch the connection from reading the request to writing the final
+ * response already built in wbuf/cbuf.  A final status answers a pending
+ * 100-continue expectation by itself (RFC 9110 10.1.1), so the interim is
+ * dropped rather than sent in its place -- otherwise send_cb() would write
+ * the 100, strand the final response, and resume reading past a request that
+ * was already answered or rejected. */
+static void start_response(struct ev_loop *loop, struct api_ctx *restrict ctx)
 {
-	static const char msg[] = "HTTP/1.1 100 Continue\r\n\r\n";
-	size_t off = 0;
-	while (off < sizeof(msg) - 1) {
-		size_t n = sizeof(msg) - 1 - off;
-		const int err = socket_send(
-			ctx->fd, (const unsigned char *)msg + off, &n);
-		if (err != 0 || n == 0) {
-			return off == 0;
-		}
-		off += n;
-	}
-	return true;
+	/* A final response is only ever built from recv_cb(), and reads stay
+	 * stopped while a partially written interim waits for EV_WRITE, so no
+	 * interim can be in flight here. */
+	ASSERT(ctx->continue_pos == 0);
+	ctx->expect_continue = false;
+	ctx->wpos = 0;
+	ev_io_stop(loop, &ctx->w_recv);
+	ev_io_start(loop, &ctx->w_send);
 }
 
 static void
 recv_error(struct ev_loop *loop, struct api_ctx *restrict ctx, const int code)
 {
 	respond_status(ctx, code);
-	ev_io_stop(loop, &ctx->w_recv);
-	ev_io_start(loop, &ctx->w_send);
+	start_response(loop, ctx);
 }
 
 /* Validate the request HTTP-version, which http_parse() copies verbatim
@@ -1395,7 +1508,103 @@ static int check_http_version(const char *restrict version)
 	return 0;
 }
 
-/* Read and parse the request incrementally; dispatch to api_handle() when headers are complete. */
+/* RFC 3986 3.2.2: an unreserved or sub-delims octet, the characters a
+ * reg-name admits besides pct-encoded. */
+static bool is_host_char(const unsigned char c)
+{
+	return isalnum(c) ||
+	       (c != '\0' && strchr("-._~!$&'()*+,;=", c) != NULL);
+}
+
+/* RFC 3986 3.2.2: the text between an IP-literal's brackets,
+ * IPv6address / IPvFuture, where
+ *   IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" ) */
+static bool
+ip_literal_is_valid(const char *restrict s, const char *restrict end)
+{
+	if (s < end && (*s == 'v' || *s == 'V')) {
+		const char *p = s + 1;
+		while (p < end && isxdigit((unsigned char)*p)) {
+			p++;
+		}
+		if (p == s + 1 || p >= end || *p != '.' || p + 1 >= end) {
+			return false;
+		}
+		for (p++; p < end; p++) {
+			if (*p != ':' && !is_host_char((unsigned char)*p)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	char addr[INET6_ADDRSTRLEN];
+	const size_t len = (size_t)(end - s);
+	if (len >= sizeof(addr)) {
+		return false;
+	}
+	memcpy(addr, s, len);
+	addr[len] = '\0';
+	struct in6_addr in6;
+	return inet_pton(AF_INET6, addr, &in6) == 1;
+}
+
+/* Validate a Host field value against RFC 9110 7.2,
+ *   Host = uri-host [ ":" port ]
+ * where uri-host = IP-literal / IPv4address / reg-name (RFC 3986 3.2.2; an
+ * IPv4address also matches reg-name) and port = *DIGIT.  An empty value is
+ * valid: it is what a target URI with an empty authority sends. */
+static bool host_is_valid(const char *restrict s)
+{
+	if (*s == '[') {
+		const char *const end = strchr(s, ']');
+		if (end == NULL || !ip_literal_is_valid(s + 1, end)) {
+			return false;
+		}
+		s = end + 1;
+	} else {
+		while (*s != '\0' && *s != ':') {
+			if (*s == '%') {
+				if (!isxdigit((unsigned char)s[1]) ||
+				    !isxdigit((unsigned char)s[2])) {
+					return false;
+				}
+				s += 3;
+				continue;
+			}
+			if (!is_host_char((unsigned char)*s)) {
+				return false;
+			}
+			s++;
+		}
+	}
+	if (*s == ':') {
+		s++;
+		while (isdigit((unsigned char)*s)) {
+			s++;
+		}
+	}
+	return *s == '\0';
+}
+
+/* The strstr-based parser cannot see past a NUL, so a line holding one is
+ * reported as partial forever and the request would stall until the buffer
+ * fills or the idle timeout fires.  RFC 9110 5.5 requires rejecting a NUL in
+ * a field value, so check the still-unparsed head for one whenever parsing
+ * waits for more data.  Bytes before scan_off were already checked by an
+ * earlier call and need not be rescanned. */
+static bool head_has_nul(const struct api_ctx *restrict ctx, size_t scan_off)
+{
+	const size_t next_off =
+		(size_t)((const unsigned char *)ctx->next - ctx->rbuf.data);
+	if (scan_off < next_off) {
+		scan_off = next_off;
+	}
+	return memchr(ctx->rbuf.data + scan_off, '\0',
+		      ctx->rbuf.len - scan_off) != NULL;
+}
+
+/* Read and parse the request incrementally; dispatch to api_handle() once the
+ * headers and the full Content-Length body have arrived. */
 static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ);
@@ -1426,6 +1635,7 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		api_ctx_free(loop, ctx);
 		return;
 	}
+	const size_t scan_off = ctx->rbuf.len;
 	ctx->rbuf.len += n;
 	/* NUL-terminate so http_parse/http_parsehdr can use strstr; the byte
 	 * reserved above guarantees room. */
@@ -1438,6 +1648,9 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			return;
 		}
 		if (parsed == ctx->next) {
+			if (head_has_nul(ctx, scan_off)) {
+				recv_error(loop, ctx, HTTP_BAD_REQUEST);
+			}
 			return; /* Partial line, wait for more data */
 		}
 		ctx->next = parsed;
@@ -1459,11 +1672,30 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			return;
 		}
 		if (parsed == ctx->next) {
+			if (head_has_nul(ctx, scan_off)) {
+				recv_error(loop, ctx, HTTP_BAD_REQUEST);
+			}
 			return; /* Partial header, wait for more data */
 		}
 		ctx->next = parsed;
 		if (key == NULL) {
 			ctx->hdr_done = true;
+			/* RFC 9112 3.2: an HTTP/1.1 request without Host is a
+			 * 400.  check_http_version() admitted only HTTP/1.x, so
+			 * every version but 1.0 is held to the 1.1 rule. */
+			if (!ctx->host_seen &&
+			    strcmp(ctx->msg.req.version, "HTTP/1.0") != 0) {
+				recv_error(loop, ctx, HTTP_BAD_REQUEST);
+				return;
+			}
+		} else if (strcasecmp(key, "Host") == 0) {
+			/* RFC 9112 3.2: more than one Host field line, or an
+			 * invalid Host value, is a 400 on any version. */
+			if (ctx->host_seen || !host_is_valid(value)) {
+				recv_error(loop, ctx, HTTP_BAD_REQUEST);
+				return;
+			}
+			ctx->host_seen = true;
 		} else if (strcasecmp(key, "Connection") == 0) {
 			/* value points into the NUL-terminated rbuf, so parse it
 			 * now and accumulate: no truncation, and a repeated
@@ -1493,6 +1725,13 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			ctx->content_length = (size_t)cl;
 			ctx->content_length_seen = true;
 		} else if (strcasecmp(key, "Expect") == 0) {
+			/* RFC 9110 10.1.1: an HTTP/1.0 request's expectation
+			 * is ignored, and 15.2 forbids any 1xx to an HTTP/1.0
+			 * client.  Expect is an HTTP/1.1 field, so the whole
+			 * field is ignored there, the 417 below included. */
+			if (strcmp(ctx->msg.req.version, "HTTP/1.0") == 0) {
+				continue;
+			}
 			/* RFC 7231 5.1.1: 100-continue is the only defined
 			 * expectation, and 6.5.14 says an unsupported one gets
 			 * 417 rather than being ignored -- ignoring it leaves a
@@ -1528,11 +1767,19 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 			 * a final status instead, and so a body that already
 			 * arrived with the headers needs no interim at all. */
 			if (ctx->expect_continue) {
-				ctx->expect_continue = false;
-				if (!send_continue(ctx)) {
+				const int result = send_continue(ctx);
+				if (result < 0) {
 					api_ctx_free(loop, ctx);
 					return;
 				}
+				if (result == 0) {
+					ev_io_stop(loop, &ctx->w_recv);
+					ev_io_start(loop, &ctx->w_send);
+					return;
+				}
+				ctx->expect_continue = false;
+				ctx->continue_pos = 0;
+				ev_timer_again(loop, &ctx->w_timeout);
 			}
 			return; /* wait for more body data */
 		}
@@ -1549,8 +1796,7 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	ev_timer_again(loop, &ctx->w_timeout);
 	ev_io_stop(loop, &ctx->w_recv);
 	api_handle(ctx);
-	ctx->wpos = 0;
-	ev_io_start(loop, &ctx->w_send);
+	start_response(loop, ctx);
 }
 
 static void

@@ -8,10 +8,10 @@
  *        (The frame serialization/parsing helpers are static inline in frame.h.)
  */
 
-#include "mux/frame.h"
+#include "frame.h"
 
-#include "mux/mux.h"
-#include "mux/session.h"
+#include "mux.h"
+#include "session.h"
 
 #include "algo/hashtable.h"
 #include "hash/fnv1a.h"
@@ -66,6 +66,8 @@ const char *mux_status_str(const uint_fast16_t status)
 const struct mux_session_config mux_session_config_default = {
 	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 	.readahead = 128 * 1024,
+	.lossymux_idle_timeout = 60,
+	.lossymux_queue = 64,
 };
 
 bool mux_bytebuf_reserve(

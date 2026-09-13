@@ -9,7 +9,7 @@
 #ifndef MUX_FRAME_H
 #define MUX_FRAME_H
 
-#include "mux/mux.h"
+#include "mux.h"
 
 #include "binary/serialize.h"
 #include "utils/debug.h"

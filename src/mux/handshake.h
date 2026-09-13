@@ -13,7 +13,7 @@
  * codec and the protocol negotiation state machine, and calls back into
  * session.c and unacked.c for lifecycle side-effects. */
 
-#include "mux/frame.h"
+#include "frame.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -23,9 +23,10 @@
 struct mux_session;
 
 /* Largest hello the marshaller can produce: a resume hello claiming
- * MUX_MAX_CLAIM_LEN octets of control characters. Pinned against the real
- * marshaller by handshake_test. */
-#define MUX_MAX_HELLO_JSON_SIZE 555u
+ * MUX_MAX_CLAIM_LEN octets of control characters, its boolean extensions all
+ * false (one octet longer than true). Pinned against the real marshaller by
+ * handshake_test. */
+#define MUX_MAX_HELLO_JSON_SIZE 573u
 
 /* proto_hello_build reserves one byte for the marshaller's NUL, so the payload
  * must strictly exceed the JSON. */
@@ -44,10 +45,13 @@ struct handshake_ctx {
 
 	/* Peer capabilities and identity extension */
 	bool peer_rejects_inbound_streams : 1;
+	/* Our last hello offered lossymux (spec §5.2.3.3). */
+	bool offered_lossymux : 1;
+	/* The peer's last hello offered lossymux; the extension is active only
+	 * with offered_lossymux also set. */
+	bool peer_lossymux : 1;
 	/* This node's identity announced in hello. */
 	char *identity;
-	/* Internal peer label for diagnostics; NOT sent in hello. */
-	char *peer_id;
 	/* Identity received from the peer's hello. */
 	char *peer_identity;
 };
@@ -72,6 +76,8 @@ struct proto_hello {
 	bool has_resume_seq : 1;
 	/* extensions.reject_inbound (spec §5.2.3.1); default false */
 	bool reject_inbound : 1;
+	/* extensions.lossymux (spec §5.2.3.3); default false */
+	bool lossymux : 1;
 	/* extensions.identity (spec §5.2.3.2) */
 	bool has_identity : 1;
 };
@@ -83,7 +89,7 @@ bool mux_handshake_enqueue_hello(
 /* Parse and validate an incoming hello frame, advancing the handshake
  * state machine. */
 bool mux_handshake_process_hello(
-	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	struct mux_session *ss, const struct mux_header *restrict hdr,
 	size_t frame_size);
 
 #endif /* MUX_HANDSHAKE_H */

@@ -45,6 +45,11 @@
                     "type": "string",
                     "description": "UTF-8 identity claim; maximum 255 octets, NUL character excluded (spec §5.2.3.2).",
                     "maxLength": 255
+                },
+                "lossymux": {
+                    "type": "boolean",
+                    "description": "When true, the sender offers the bilateral lossymux extension: best-effort UDP datagrams carried in stream-0 frames (spec §5.2.3.3).",
+                    "default": false
                 }
             },
             "additionalProperties": true

@@ -41,8 +41,10 @@ json_lookup_proto_extensions(const char *str, size_t len)
 	switch ((unsigned char)str[0]) {
 	case 'i':
 		return len == 8 && memcmp(str, "identity", 8) == 0 ? 0 : -1;
+	case 'l':
+		return len == 8 && memcmp(str, "lossymux", 8) == 0 ? 1 : -1;
 	case 'r':
-		return len == 14 && memcmp(str, "reject_inbound", 14) == 0 ? 1 : -1;
+		return len == 14 && memcmp(str, "reject_inbound", 14) == 0 ? 2 : -1;
 	default: return -1;
 	}
 }
@@ -62,7 +64,8 @@ enum json_proto_key {
 
 enum json_proto_extensions_key {
 	JSON_PROTO_EXTENSIONS_IDENTITY = 0,
-	JSON_PROTO_EXTENSIONS_REJECT_INBOUND = 1,
+	JSON_PROTO_EXTENSIONS_LOSSYMUX = 1,
+	JSON_PROTO_EXTENSIONS_REJECT_INBOUND = 2,
 };
 
 /** @} */
@@ -89,6 +92,7 @@ static bool json_unmarshal_proto_extensions(
 	struct json_proto_extensions *obj, char *json, size_t length)
 {
 	*obj = (struct json_proto_extensions){
+		.lossymux = false,
 		.reject_inbound = false,
 	};
 	const struct json_val root_ = json_parse(json, &(size_t){ length });
@@ -103,7 +107,11 @@ static bool json_unmarshal_proto_extensions(
 		switch (k_) {
 		case JSON_PROTO_EXTENSIONS_IDENTITY: {
 			if (!json_parse_string(val_, val_len_, &obj->identity.str, &obj->identity.len)) { goto fail_; }
-			if (obj->identity.len > 255u) { goto fail_; }
+			if (obj->identity.len > UINT64_C(255)) { goto fail_; }
+			break;
+		}
+		case JSON_PROTO_EXTENSIONS_LOSSYMUX: {
+			if (!json_parse_bool(val_, val_len_, &obj->lossymux)) { goto fail_; }
 			break;
 		}
 		case JSON_PROTO_EXTENSIONS_REJECT_INBOUND: {
@@ -131,6 +139,7 @@ bool json_unmarshal_proto(
 {
 	*obj = (struct json_proto){
 		.extensions = {
+			.lossymux = false,
 			.reject_inbound = false,
 		},
 	};
@@ -165,8 +174,8 @@ bool json_unmarshal_proto(
 		}
 		case JSON_PROTO_SESSION_ID: {
 			if (!json_parse_string(val_, val_len_, &obj->session_id.str, &obj->session_id.len)) { goto fail_; }
-			if (obj->session_id.len < 24u) { goto fail_; }
-			if (obj->session_id.len > 24u) { goto fail_; }
+			if (obj->session_id.len < UINT64_C(24)) { goto fail_; }
+			if (obj->session_id.len > UINT64_C(24)) { goto fail_; }
 			break;
 		}
 		case JSON_PROTO_TYPE: {
@@ -201,10 +210,15 @@ static int json_checked_int_(size_t n_)
 	if (n_ > (size_t)INT_MAX) { return -1; }
 	return (int)n_;
 }
+static size_t json_add_(size_t n_, size_t add_)
+{
+	if (n_ > (size_t)INT_MAX || add_ > (size_t)INT_MAX - n_) { return SIZE_MAX; }
+	return n_ + add_;
+}
 static size_t json_emit_ch_(char *buf, size_t bufsz, size_t n_, char c)
 {
 	if (buf != NULL && n_ < bufsz) { buf[n_] = c; }
-	return n_ + 1;
+	return json_add_(n_, 1);
 }
 static size_t json_emit_raw_(
 	char *buf, size_t bufsz, size_t n_, const char *s, size_t len)
@@ -213,7 +227,7 @@ static size_t json_emit_raw_(
 		const size_t cap_ = bufsz - n_;
 		memcpy(buf + n_, s, len < cap_ ? len : cap_);
 	}
-	return n_ + len;
+	return json_add_(n_, len);
 }
 static size_t json_emit_str_(
 	char *buf, size_t bufsz, size_t n_, const char *s, size_t len)
@@ -222,7 +236,7 @@ static size_t json_emit_str_(
 	const int r_ =
 		json_marshal_string(dst_, dst_ != NULL ? bufsz - n_ : 0, s, len);
 	if (r_ < 0) { return SIZE_MAX; }
-	return n_ + (size_t)r_;
+	return json_add_(n_, (size_t)r_);
 }
 static size_t json_emit_indent_(
 	char *buf, size_t bufsz, size_t n_, const char *indent,
@@ -241,7 +255,7 @@ static size_t json_emit_indent_(
 	char *dst_ = (buf != NULL && n_ < bufsz) ? buf + n_ : NULL; \
 	r_ = snprintf(dst_, dst_ != NULL ? bufsz - n_ : 0, fmt, __VA_ARGS__); \
 	if (r_ < 0) { return SIZE_MAX; } \
-	n_ += (size_t)r_; \
+	n_ = json_add_(n_, (size_t)r_); \
 } while (0)
 #define EMIT_STR(s, len) do { \
 	n_ = json_emit_str_(buf, bufsz, n_, (s), (len)); \
@@ -251,7 +265,7 @@ static size_t json_emit_indent_(
 	char *dst_ = (buf != NULL && n_ < bufsz) ? buf + n_ : NULL; \
 	const size_t rsub_ = (fn)(dst_, dst_ != NULL ? bufsz - n_ : 0, (arg), indent, (d)); \
 	if (rsub_ == SIZE_MAX) { return SIZE_MAX; } \
-	n_ += rsub_; \
+	n_ = json_add_(n_, rsub_); \
 } while (0)
 #define EMIT_LIT(s) do { \
 	static const char lit_[] = s; \
@@ -291,6 +305,17 @@ static size_t json_marshal_proto_extensions_impl(
 		EMIT_STR(obj->identity.str, obj->identity.len);
 		EMIT(',');
 	}
+	EMIT_INDENT(depth + 1);
+	EMIT('"');
+	EMIT_LIT("lossymux");
+	EMIT('"');
+	EMIT_COLON();
+	if (obj->lossymux) {
+		EMIT_LIT("true");
+	} else {
+		EMIT_LIT("false");
+	}
+	EMIT(',');
 	EMIT_INDENT(depth + 1);
 	EMIT('"');
 	EMIT_LIT("reject_inbound");

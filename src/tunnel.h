@@ -23,6 +23,7 @@
 
 struct sockaddr;
 struct tunnel;
+struct udp_dgram;
 
 /* Server-level counter pointers for the mux session counters block.  Session
  * lifecycle only: every other counter in the block is per-tunnel and the tunnel
@@ -43,7 +44,12 @@ struct tunnel_context {
 	bool (*post_task)(void *user, struct task task);
 	void (*flush_tasks)(void *user);
 #endif
-	bool (*verify_peer)(void *user, const char *peer_id);
+	/* Internal owner capacity hooks, called from either thread. When reserve
+	 * is set, release must be set too; each successful reservation is released
+	 * once at tunnel destruction. NULL leaves capacity unrestricted. */
+	bool (*reserve_session)(void *user);
+	void (*release_session)(void *user);
+	bool (*verify_peer)(void *user, const char *peer_identity);
 	uint_least64_t (*alloc_index)(void *user);
 	void *user;
 #if !WITH_THREADS
@@ -52,9 +58,18 @@ struct tunnel_context {
 };
 
 /* Callbacks invoked on the server loop for session lifecycle events.
- * on_event fires for all mux events except ESTABLISHED and RESUMED (routed to
- * on_established and on_resumed) and STREAM_ESTABLISHED (consumed by the tunnel
- * layer for latency stats and never relayed). */
+ * ESTABLISHED and RESUMED go to on_established and on_resumed; on_event fires
+ * only for LOST and CLOSED.  The tunnel layer consumes every other event.
+ *
+ * CLOSED is relayed only when the tunnel will not reconnect: it has no connect
+ * address (an accepted tunnel), or its reconnect was disabled (tunnel_shutdown,
+ * or a reload that retired it).  A dialed tunnel that will redial, by backoff
+ * or on demand, keeps its CLOSED to itself.  A relayed CLOSED therefore means
+ * the tunnel is finished, and the owner must close it.
+ *
+ * With threads, relayed events are posted to the owner's task ring in order.
+ * An event the full ring refuses is retried, not dropped, until the owner
+ * closes the tunnel. */
 struct tunnel_callbacks {
 	void (*on_event)(
 		void *data, struct tunnel *t, enum mux_event,
@@ -92,7 +107,6 @@ struct tunnel_opts {
 	const char *connect_addr;
 	const char *forward_addr;
 	const char *identity;
-	const char *peer_id;
 	/* Server-level counter pointers; tunnel fills in per-tunnel fields. */
 	const struct tunnel_session_counters *cnt;
 	/* identity.verify: reject a peer whose claimed identity is not named by
@@ -124,7 +138,10 @@ struct tunnel_opts {
  * success and failure; the caller must not close fd or free conn itself,
  * before or after the call.  opts->tlsctx is adopted on success only, and
  * freed by tunnel_close(); see struct tunnel_opts.  Returns NULL on allocation
- * failure, leaving opts->tlsctx with the caller. */
+ * failure or capacity exhaustion, leaving opts->tlsctx with the caller.
+ * Outbound creation reserves through parent before session creation; capacity
+ * exhaustion sets errno to ENOSPC. Accepted transports reserve only after a
+ * fresh hello, while resumption uses the existing tunnel's reservation. */
 struct tunnel *tunnel_new(
 	const struct tunnel_context *parent,
 	const struct tunnel_opts *restrict opts);
@@ -155,6 +172,11 @@ struct tunnel_final_counters {
 	uint_least64_t byt_mux_sent;
 	uint_least64_t byt_push_recv;
 	uint_least64_t byt_push_sent;
+	uint_least64_t pkt_dgram_sent;
+	uint_least64_t pkt_dgram_recv;
+	uint_least64_t pkt_dgram_dropped;
+	uint_least64_t byt_dgram_sent;
+	uint_least64_t byt_dgram_recv;
 };
 
 /* Force-close: disconnect relay callbacks, suppress mux callbacks, close
@@ -164,18 +186,20 @@ struct tunnel_final_counters {
  * When out is non-NULL it receives the tunnel's counters sampled after the
  * thread is joined and the session closed, so the increments teardown itself
  * makes are included -- mux_close() fails every stream still open, which a
- * tunnel_stats() taken before the call would miss entirely.  The one exception
- * is the OOM path where the thread cannot be told to stop and is abandoned
- * rather than joined: there *out is sampled before detaching and whatever the
- * abandoned thread counts afterwards is lost. */
+ * tunnel_stats() taken before the call would miss entirely.  A full task ring
+ * delays the teardown but never skips it: the call waits for the tunnel thread
+ * to free a slot, so it always returns with the thread joined. */
 void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out);
 
 /* tunnel_close_final() discarding the counters. */
 void tunnel_close(struct tunnel *t);
 
-/* Dispatch a graceful shutdown request to the session's tunnel loop.
- * The session performs a close handshake; MUX_EVENT_CLOSED is emitted
- * through on_event when done. */
+/* Dispatch a graceful shutdown request to the session's tunnel loop and stop
+ * any reconnect.  A handshaking or established session performs a close
+ * handshake; one still connecting, or suspended, closes at once.  Either way
+ * MUX_EVENT_CLOSED is relayed through on_event when done -- also for a session
+ * that was already closed (a dialed tunnel in reconnect backoff, or an idle
+ * on-demand one), which has no transition of its own left to report. */
 void tunnel_shutdown(struct tunnel *t);
 
 /* Drop the underlying transport without closing the mux session: dispatched to
@@ -193,7 +217,6 @@ void tunnel_drop_transport(struct tunnel *t);
 int tunnel_fd(const struct tunnel *t);
 enum mux_state tunnel_state(const struct tunnel *t);
 struct mux_session *tunnel_session(const struct tunnel *t);
-const char *tunnel_peer_id(const struct tunnel *t);
 /* Copy the peer identity (from the session thread's published snapshot) into buf;
  * returns whether a peer identity is present.  Safe to call from the server
  * thread while the tunnel's session thread runs. */
@@ -209,14 +232,9 @@ const unsigned char *tunnel_session_id(const struct tunnel *t);
 /* Server-wide monotonic index, never reused; a stable per-tunnel handle. */
 uint_least64_t tunnel_index(const struct tunnel *t);
 
-/* Fixed capacity of a tunnel's diagnostic-tag buffer, shared by struct tunnel
- * (its private working tag and its published snapshot) and by struct
- * tunnel_stats below, so the cross-struct tag copies in tunnel_stats() are
- * provably in bounds. Shrinking one alone would otherwise risk an OOB access. */
-enum { TUNNEL_TAG_SIZE = 256 };
-
 /* Fixed capacity of the SYN->SYN|ACK latency ring, shared by struct tunnel and
- * struct tunnel_stats below for the same reason. */
+ * struct tunnel_stats below, so the cross-struct ring copy in tunnel_stats() is
+ * provably in bounds. Shrinking one alone would otherwise risk an OOB access. */
 enum { TUNNEL_ESTABLISH_RING_SIZE = 256 };
 
 /* Snapshot of per-tunnel statistics. */
@@ -226,9 +244,6 @@ struct tunnel_stats {
 	const char *peer_identity;
 	/* Server-wide monotonic index, never reused. */
 	uint_least64_t tunnel_index;
-	/* the tunnel's diagnostic tag ("my <= peer"), copied from the session
-	 * thread's published snapshot */
-	char tag[TUNNEL_TAG_SIZE];
 	/* total tunnels in this identity's pool (1 for mux_tunnel) */
 	size_t num_tunnels;
 	/* true for a passively-accepted (server-role) session.  Such a session
@@ -271,6 +286,13 @@ struct tunnel_stats {
 	/* PUSH-frame payload bytes only (no frame headers, no non-PUSH frames) */
 	uint_least64_t byt_push_recv;
 	uint_least64_t byt_push_sent;
+	/* lossymux datagram counters (payload bytes only), and live UDP flows. */
+	uint_least64_t pkt_dgram_sent;
+	uint_least64_t pkt_dgram_recv;
+	uint_least64_t pkt_dgram_dropped;
+	uint_least64_t byt_dgram_sent;
+	uint_least64_t byt_dgram_recv;
+	size_t num_flows;
 	/* SYN->SYN|ACK latency ring (ns); stream_establish_count is the monotonic
 	 * write index.  Fed by every active open, on accepted tunnels too. */
 	size_t stream_establish_count;
@@ -295,6 +317,12 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out);
  * silently. */
 void tunnel_open_stream(struct tunnel *t, int fd);
 
+/* Relay a datagram a local UDP client sent (lossymux) over this tunnel's
+ * session; always consumes d.  With threads it is queued for the tunnel
+ * thread, and dropped (counted) when @p queue_limit datagrams already wait. */
+void tunnel_send_dgram(
+	struct tunnel *t, struct udp_dgram *d, size_t queue_limit);
+
 /* Options for a single-pass reload dispatch, applied atomically in the tunnel
  * thread: address updates precede the drain config. */
 struct tunnel_reload_opts {
@@ -315,7 +343,12 @@ struct tunnel_reload_opts {
 	bool update_connect_addr;
 	const char *connect_addr;
 	/* When true, stop the reconnect timer and set shutting_down.
-	 * Mutually exclusive with update_connect_addr. */
+	 * Mutually exclusive with update_connect_addr.  Either way of disabling
+	 * reconnect ends a session left idle between attempts (already closed,
+	 * suspended, or never started) and relays its MUX_EVENT_CLOSED, as
+	 * tunnel_shutdown() does.  A session with a transport attached then
+	 * -- live, or a resume attempt in flight -- is ended the same way if
+	 * it suspends later, since it will never dial again. */
 	bool disable_reconnect;
 	/* When true, update the stream forwarding address to forward_addr
 	 * (NULL clears the target). */

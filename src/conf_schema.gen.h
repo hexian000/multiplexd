@@ -55,7 +55,15 @@ struct json_conf_mux_mem_pressure {
 	uintmax_t lo;
 };
 
+struct json_conf_mux_lossymux {
+	unsigned idle_timeout;
+	unsigned queue;
+
+	bool enabled;
+};
+
 struct json_conf_mux {
+	struct json_conf_mux_lossymux lossymux;
 	struct json_conf_mux_mem_pressure mem_pressure;
 	struct json_conf_mux_tcp tcp;
 

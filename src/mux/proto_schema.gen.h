@@ -15,6 +15,7 @@
 struct json_proto_extensions {
 	struct json_string identity;
 
+	bool lossymux;
 	bool reject_inbound;
 };
 

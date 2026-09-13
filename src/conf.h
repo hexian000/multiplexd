@@ -31,12 +31,14 @@ struct conf_socket_opts {
 };
 
 /* One tls.psk entry: a peer identity and the key shared with it.  Kept
- * hex-encoded so server_cleanse_tls_config()'s strlen-based erase stays valid
+ * hex-encoded so conf_erase_credentials()'s strlen-based erase stays valid
  * -- a decoded key can contain NULs and would be under-erased. */
 struct psk_entry {
 	char *id;
 	size_t id_len;
-	/* Lowercase hex, or "@path" until conf_inline_pem() resolves it. */
+	/* Hex in either case, or "@path" until conf_inline_pem() resolves it.
+	 * conf_parse() validates an inline key and conf_inline_pem() a loaded
+	 * one, each trimmed of surrounding whitespace first. */
 	char *hex;
 };
 
@@ -141,12 +143,21 @@ char *conf_dump(
 	const char *restrict indent);
 
 #if WITH_TLS
-/* Replace "@path" PEM references with in-memory PEM strings, in place.
- * false on allocation or file-loading failure. */
+/* Replace "@path" PEM references with in-memory PEM strings, in place, and
+ * build tls_authcerts_bundle.  A tls.psk key loaded from a file is trimmed and
+ * validated here, since conf_parse() could only see the reference.  false on
+ * allocation or file-loading failure, or on a malformed loaded key. */
 bool conf_inline_pem(struct config *conf);
-#endif
 
-/* Free a configuration; NULL is allowed. */
+/* Zero every plaintext TLS credential conf holds, in place: the certificate,
+ * private key, each trust anchor and their bundle, and each tls.psk key, which
+ * are left as empty strings.  conf_free() calls it, so a config is never
+ * released with its keys intact; call it directly to erase the credentials of
+ * a config that stays alive once the TLS contexts hold their own copies. */
+void conf_erase_credentials(const struct config *conf);
+#endif /* WITH_TLS */
+
+/* Free a configuration, erasing its TLS credentials first; NULL is allowed. */
 void conf_free(struct config *restrict conf);
 
 /* Build a struct mux_session_config from the config: copies conf->mux, sets

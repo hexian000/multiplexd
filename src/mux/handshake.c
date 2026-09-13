@@ -6,16 +6,16 @@
  * @brief Internal mux hello and resume handshake implementation.
  */
 
-#include "mux/handshake.h"
+#include "handshake.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/proto_schema.gen.h"
-#include "mux/sched.h"
-#include "mux/session.h"
-#include "mux/unacked.h"
-#include "mux/wire.h"
+#include "frame.h"
+#include "mux.h"
+#include "proto_schema.gen.h"
+#include "sched.h"
+#include "session.h"
 #include "shim/util.h"
+#include "unacked.h"
+#include "wire.h"
 
 #include "algo/hashtable.h"
 #include "binary/serialize.h"
@@ -69,6 +69,7 @@ static bool proto_hello_build(
 		.resume_seq = msg->has_resume_seq ? (unsigned)msg->resume_seq : 0,
 		.extensions = {
 			.reject_inbound = msg->reject_inbound,
+			.lossymux = msg->lossymux,
 			.identity = {
 				.str = msg->has_identity
 					? (char *)msg->identity
@@ -229,6 +230,7 @@ static bool proto_hello_parse(
 	}
 	out->msgid = (int)obj.msgid;
 	out->reject_inbound = obj.extensions.reject_inbound;
+	out->lossymux = obj.extensions.lossymux;
 
 	if (obj.session_id.str != NULL &&
 	    !proto_parse_session_id(
@@ -288,13 +290,21 @@ bool mux_handshake_enqueue_hello(
 	struct proto_hello hello_msg = {
 		.msgid = msgid,
 		.reject_inbound = ss->conf.reject_inbound,
+		.lossymux = ss->conf.lossymux,
 		.has_session_id = ss->handshake.has_session_id,
 		.has_resume_seq = include_resume_seq,
 		.resume_seq = include_resume_seq ? ss->unacked.recv_seq : 0,
 	};
 	if (ss->handshake.identity != NULL) {
+		/* MUX_MAX_CLAIM_LEN, not the wire field's 255: only a claim within
+		 * it is guaranteed to marshal into the smallest frame (see
+		 * MUX_MAX_HELLO_JSON_SIZE), and a hello that cannot be built
+		 * resets the session on every attempt. */
+		static_assert(
+			MUX_MAX_CLAIM_LEN < sizeof(hello_msg.identity),
+			"a bounded claim must fit the hello identity field");
 		const size_t id_len = strlen(ss->handshake.identity);
-		if (id_len < sizeof(hello_msg.identity)) {
+		if (id_len <= MUX_MAX_CLAIM_LEN) {
 			hello_msg.has_identity = true;
 			memcpy(hello_msg.identity, ss->handshake.identity,
 			       id_len + 1);
@@ -302,9 +312,9 @@ bool mux_handshake_enqueue_hello(
 			MUX_LOG_F(
 				WARNING, ss,
 				"identity.claim is %zu octets, exceeds the"
-				" %zu-octet hello limit; omitting identity"
+				" %u-octet claim limit; omitting identity"
 				" extension",
-				id_len, sizeof(hello_msg.identity) - 1);
+				id_len, (unsigned)MUX_MAX_CLAIM_LEN);
 		}
 	}
 	if (ss->handshake.has_session_id) {
@@ -312,8 +322,9 @@ bool mux_handshake_enqueue_hello(
 		       MUX_SESSION_ID_LEN);
 	}
 	MUX_LOG_F(
-		VERBOSE, ss, "enqueue_hello: msgid=%d reject_inbound=%d",
-		hello_msg.msgid, hello_msg.reject_inbound);
+		VERBOSE, ss,
+		"enqueue_hello: msgid=%d reject_inbound=%d lossymux=%d",
+		hello_msg.msgid, hello_msg.reject_inbound, hello_msg.lossymux);
 	if (hello_msg.has_session_id) {
 		MUX_LOG_F(
 			VERBOSE, ss,
@@ -339,6 +350,7 @@ bool mux_handshake_enqueue_hello(
 	ASSERT(ss->wire.sendbuf.head == NULL);
 	mux_frame_list_push(&ss->wire.sendbuf, frame);
 	ss->wire.tx_pending = true;
+	ss->handshake.offered_lossymux = hello_msg.lossymux;
 	if (include_resume_seq) {
 		/* resume_seq conveys the full processed count, so nothing is
 		 * left to report in a session ACK. */
@@ -350,8 +362,7 @@ bool mux_handshake_enqueue_hello(
 /* Server side: received ClientHello.  Returns true to continue to
  * mux_session_handshake_done; false if the session was handed off or errored. */
 static bool process_hello_server(
-	struct mux_session *restrict ss,
-	const struct proto_hello *restrict peer_hello)
+	struct mux_session *ss, const struct proto_hello *restrict peer_hello)
 {
 	/* A ClientHello carrying a session_id is a resume attempt (presence is
 	 * the discriminant, not has_resume_seq, since resume_seq=0 is valid). */
@@ -369,16 +380,32 @@ static bool process_hello_server(
 			"resume requested but no matching session found;"
 			" treating as fresh");
 	}
+	if (ss->admit_session != NULL && !ss->admit_session(ss->userdata)) {
+		MUX_LOG(WARNING, ss, "session capacity exhausted");
+		mux_session_reset(ss);
+		return false;
+	}
 	/* Fresh session: reply with our session_id. */
 	return mux_handshake_enqueue_hello(ss, PROTO_MSG_SERVER_HELLO, false);
+}
+
+/* Client side: whether the ServerHello echoes the session_id this session
+ * offered, confirming the resume (spec §5.8.3); anything else starts a fresh
+ * logical session. */
+static bool hello_confirms_resume(
+	const struct mux_session *restrict ss,
+	const struct proto_hello *restrict peer_hello)
+{
+	return peer_hello->has_session_id && ss->handshake.has_session_id &&
+	       memcmp(peer_hello->session_id, ss->handshake.session_id,
+		      MUX_SESSION_ID_LEN) == 0;
 }
 
 /* Client fresh-session path (spec §5.8.3 step 4): discard preserved streams and
  * unacked frames, reset counters, adopt the server's session_id, and clear
  * peer_addr so mux_session_handshake_done fires ESTABLISHED, not RESUMED. */
 static bool handshake_client_fresh(
-	struct mux_session *restrict ss,
-	const struct proto_hello *restrict peer_hello)
+	struct mux_session *ss, const struct proto_hello *restrict peer_hello)
 {
 	if (ss->handshake.has_session_id) {
 		MUX_LOG_F(
@@ -403,14 +430,6 @@ static bool handshake_client_fresh(
 	ss->unacked.last_ack_recv = 0;
 	ss->unacked.ack_ticks = 0;
 	memset(&ss->peer_addr, 0, sizeof(ss->peer_addr));
-	if (!peer_hello->has_identity) {
-		/* The caller already applied a fresh peer_identity above when
-		 * has_identity is true; otherwise don't let the previous
-		 * (now-defunct) session's identity carry over into what's now
-		 * a new logical session. */
-		free(ss->handshake.peer_identity);
-		ss->handshake.peer_identity = NULL;
-	}
 	/* Adopt the server-assigned session id; the sole caller has already
 	 * rejected a ServerHello that carries none. Asserted rather than
 	 * re-checked: a second caller that skipped that rejection would silently
@@ -427,8 +446,7 @@ static bool handshake_client_fresh(
  * the server echoes the same session_id; resume_seq=0 is valid and may not be
  * transmitted.  Returns true to continue, false on error. */
 static bool process_hello_client(
-	struct mux_session *restrict ss,
-	const struct proto_hello *restrict peer_hello)
+	struct mux_session *ss, const struct proto_hello *restrict peer_hello)
 {
 	/* Spec §5.2.2: the server always includes session_id in its ServerHello.
 	 * Without one there is nothing to adopt, and continuing would leave this
@@ -442,11 +460,7 @@ static bool process_hello_client(
 		mux_session_reset(ss);
 		return false;
 	}
-	const bool is_confirmed_resume =
-		ss->handshake.has_session_id &&
-		memcmp(peer_hello->session_id, ss->handshake.session_id,
-		       MUX_SESSION_ID_LEN) == 0;
-	if (is_confirmed_resume) {
+	if (hello_confirms_resume(ss, peer_hello)) {
 		/* Trim our unacked list by the server's resume_seq. */
 		if (!mux_unacked_resume_ack_recv(ss, peer_hello->resume_seq)) {
 			mux_session_reset(ss);
@@ -466,7 +480,7 @@ static bool process_hello_client(
 }
 
 bool mux_handshake_process_hello(
-	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	struct mux_session *ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
 	/* Both guaranteed by the sole call site (dispatch_frame in recv.c):
@@ -518,10 +532,10 @@ bool mux_handshake_process_hello(
 	}
 	MUX_LOG_F(
 		VERBOSE, ss,
-		"hello recv: version=%d msgid=%d reject_inbound=%d"
+		"hello recv: version=%d msgid=%d reject_inbound=%d lossymux=%d"
 		" resume_seq=%" PRIuLEAST32,
 		peer_hello.version, peer_hello.msgid, peer_hello.reject_inbound,
-		peer_hello.resume_seq);
+		peer_hello.lossymux, peer_hello.resume_seq);
 	if (peer_hello.has_session_id) {
 		MUX_LOG_F(
 			VERBOSE, ss,
@@ -531,6 +545,7 @@ bool mux_handshake_process_hello(
 			read_uint64(peer_hello.session_id + sizeof(uint64_t)));
 	}
 	ss->handshake.peer_rejects_inbound_streams = peer_hello.reject_inbound;
+	ss->handshake.peer_lossymux = peer_hello.lossymux;
 	if (peer_hello.has_identity) {
 		char *const dup = strdup(peer_hello.identity);
 		if (dup == NULL) {
@@ -540,6 +555,14 @@ bool mux_handshake_process_hello(
 		}
 		free(ss->handshake.peer_identity);
 		ss->handshake.peer_identity = dup;
+	} else if (!ss->accepted && !hello_confirms_resume(ss, &peer_hello)) {
+		/* A dialed session is reused across reconnects, so it still holds
+		 * the identity an earlier server claimed.  Only a confirmed resume
+		 * continues that logical session; a fresh one whose server claims
+		 * nothing is unidentified, and must be verified as such rather
+		 * than against a claim this server never made. */
+		free(ss->handshake.peer_identity);
+		ss->handshake.peer_identity = NULL;
 	}
 	/* Verify before anything else acts on this hello.  Running here puts the
 	 * check ahead of the resume handoff in process_hello_server() -- so the
@@ -549,8 +572,9 @@ bool mux_handshake_process_hello(
 	 * server sees a ClientHello here, the client a ServerHello.
 	 *
 	 * The effective identity is passed, not merely a claim carried by this
-	 * hello, so an identity inherited from an earlier transport is re-proved
-	 * against the certificate presented on this one. */
+	 * hello, so an identity a confirmed resume inherits from an earlier
+	 * transport is re-proved against the credentials presented on this
+	 * one. */
 	if (ss->callbacks.on_verify_identity != NULL &&
 	    !ss->callbacks.on_verify_identity(
 		    ss->userdata, ss, ss->handshake.peer_identity)) {
@@ -566,6 +590,9 @@ bool mux_handshake_process_hello(
 		return false;
 	}
 	mux_session_handshake_done(ss);
+	if (ss->state != SESSION_ESTABLISHED) {
+		return false;
+	}
 	/* If resuming, start retransmitting from the head after handshake. */
 	if (ss->unacked.ring != NULL && ss->unacked.ring->count > 0) {
 		unacked_set_replay_off(&ss->unacked, 0);

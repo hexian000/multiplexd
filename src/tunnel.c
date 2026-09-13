@@ -13,10 +13,12 @@
 
 #include "conf.h"
 #include "mux/mux.h"
+#include "mux/session.h"
 #if WITH_TLS
 #include "shim/tls.h"
 #endif
 #include "shim/util.h"
+#include "udp.h"
 
 #include "math/rand.h"
 #include "meta/arraysize.h"
@@ -45,6 +47,11 @@
 #include <string.h>
 #include <sys/socket.h>
 
+/* Fixed capacity of a tunnel's diagnostic-tag buffer, shared by its private
+ * working tag, its published snapshot and TUNNEL_LOG_PUB_F's local copy, so the
+ * whole-buffer copies between them are provably in bounds. */
+enum { TUNNEL_TAG_SIZE = 256 };
+
 #define TUNNEL_LOG_F(level, t, format, ...)                                    \
 	do {                                                                   \
 		if (!LOGLEVEL(level)) {                                        \
@@ -59,7 +66,7 @@
  * private working buffer, rewritten in place by tunnel_set_tag on every
  * establish, so reading it from the server thread is a data race; go through
  * the pub.mu-guarded snapshot the design already provides for cross-thread
- * reads, as tunnel_stats/tunnel_fd do. Defined here beside its sibling; every
+ * reads, as tunnel_fd does. Defined here beside its sibling; every
  * use is below tunnel_pub_lock's definition. */
 #define TUNNEL_LOG_PUB_F(level, t, format, ...)                                \
 	do {                                                                   \
@@ -82,15 +89,16 @@
 /* Interval between frame_cache trims, in seconds. */
 #define TUNNEL_MAINTENANCE_INTERVAL 10.0
 
-#if WITH_THREADS
-/* Intrusive FIFO node for a local connection accepted on the parent loop and
- * awaiting a stream open on the owning tunnel's thread; see
- * struct tunnel::open_head. */
+/* Interval between re-posts of a refused relay backlog, in seconds. */
+#define TUNNEL_RELAY_RETRY_INTERVAL 0.01
+
+/* Intrusive FIFO node for a local connection awaiting a stream open: queued
+ * from the parent loop for the owning tunnel's thread (struct tunnel::open_head),
+ * or parked there behind an on-demand redial (struct tunnel::park_head). */
 struct pending_open {
 	int fd;
 	struct pending_open *next;
 };
-#endif
 
 struct tunnel {
 #if WITH_THREADS
@@ -104,16 +112,25 @@ struct tunnel {
 	 * queued here instead of posted onto it and drained by tunnel_async_cb --
 	 * decoupling the number of simultaneous opens from the ring size so no
 	 * accepted connection is dropped.  open_mu guards the list between the
-	 * parent thread (producer) and this tunnel's thread (consumer). */
+	 * parent thread (producer) and this tunnel's thread (consumer), and the
+	 * datagram queue below the same way. */
 	mtx_t open_mu;
 	struct pending_open *open_head;
 	struct pending_open *open_tail;
+	/* lossymux datagrams read on the parent loop and awaiting relay on this
+	 * tunnel's thread; bounded by tunnel_send_dgram's queue_limit, beyond
+	 * which datagrams are dropped rather than queued. */
+	struct udp_dgram *dgram_head;
+	struct udp_dgram *dgram_tail;
+	size_t dgram_count;
 #endif /* WITH_THREADS */
 	struct ev_loop *loop;
 	/* Wrapped callbacks registered with the mux session. */
 	struct mux_callbacks cb;
 	/* Back-pointer to the mux session running on this tunnel's loop. */
 	struct mux_session *ss;
+	/* lossymux UDP flows relayed over ss; owned, on this tunnel's loop. */
+	struct udp_flows *flows;
 	/* Per-tunnel frame cache. */
 	struct mcache *frame_cache;
 	ev_timer w_maintenance;
@@ -132,6 +149,12 @@ struct tunnel {
 	 * lifetime fence is thrd_join(). */
 #if WITH_THREADS
 	atomic_bool relay_disconnected;
+	/* Relay backlog: events the relay loop's ring refused, oldest first,
+	 * re-posted by w_relay_retry.  Only this tunnel's thread touches them
+	 * until tunnel_close_final() has joined it. */
+	struct relayed_event *relay_head;
+	struct relayed_event *relay_tail;
+	ev_timer w_relay_retry;
 #endif
 
 	/* Callback data passed to wrapped callbacks. */
@@ -145,10 +168,23 @@ struct tunnel {
 	ev_timer w_reconnect;
 	/* Backoff state: incremented per retry; reset on CONNECTED or RESUMED. */
 	int reconnect_count;
+	/* Local connections waiting for an on-demand redial in flight: opened
+	 * as streams once the session is up, closed if the attempt ends any other
+	 * way.  Touched only on this tunnel's loop, so unlocked. */
+	struct pending_open *park_head;
+	struct pending_open *park_tail;
+	/* Settles the parked connections one loop iteration after a session
+	 * lifecycle event, outside the session's own event callback. */
+	ev_timer w_park;
 	/* Set when tunnel_shutdown is called; suppresses reconnect on CLOSED. */
 	bool shutting_down;
+	/* On-demand tunnel: a connection arrived while the session was still
+	 * closing, so handle_closed() redials once the close completes. */
+	bool redial_on_closed;
 	/* true for passively-accepted (server-role) sessions; set at creation. */
 	bool accepted;
+	/* Owned until destruction, including suspension and reconnects. */
+	bool session_reserved;
 	/* identity.verify: a claimed peer identity must be named by the
 	 * certificate presented on this transport.  Set at creation, refreshed by
 	 * reload_task, and read on this tunnel's thread at each hello. */
@@ -169,7 +205,6 @@ struct tunnel {
 	uint_least64_t tunnel_index;
 	/* Owned copies of session metadata strings. */
 	char *identity;
-	char *peer_id;
 	char *peer_identity;
 	/* Session log tag: "my <= peer" or "my => peer". */
 	char tag[TUNNEL_TAG_SIZE];
@@ -255,6 +290,20 @@ struct tunnel {
 			mux_gauge send_buffered_frames;
 			mux_gauge unacked_frames;
 		} buf_gauge;
+		/* Per-tunnel lossymux counters; updated on the session thread by
+		 * the mux_session_counters pointer-block and by the flow table.
+		 * pkt_dgram_dropped has a second writer: tunnel_send_dgram() bumps
+		 * it on the parent thread when the datagram FIFO is full, so every
+		 * update must go through TPUB_ADD / COUNTER_ADD, never a plain
+		 * read-modify-write. */
+		struct {
+			mux_counter pkt_dgram_sent;
+			mux_counter pkt_dgram_recv;
+			mux_counter pkt_dgram_dropped;
+			mux_counter byt_dgram_sent;
+			mux_counter byt_dgram_recv;
+			mux_gauge num_flows;
+		} dgram_cnt;
 		/* SYN->SYN|ACK latency ring; written per stream-established on the
 		 * session thread (handle_stream_established), read on the server
 		 * thread (tunnel_stats).  High-frequency, so relaxed-atomic. */
@@ -289,8 +338,9 @@ struct tunnel {
 
 /* TPUB_STORE/TPUB_LOAD/TPUB_ADD: relaxed-atomic access to a scalar tunnel field
  * owned by one thread (last_changed, stream_establish ring/count, the counters
- * this tunnel bumps itself) and read by the server thread.  Operate on the field
- * lvalue. */
+ * this tunnel bumps itself) and read by the server thread.  With threads
+ * TPUB_ADD is an atomic add, so it also serves a counter with more than one
+ * writer (dgram_cnt.pkt_dgram_dropped).  Operate on the field lvalue. */
 #if WITH_THREADS
 #define TPUB_STORE(field, v)                                                   \
 	atomic_store_explicit(&(field), (v), memory_order_relaxed)
@@ -317,9 +367,9 @@ struct tunnel {
 #define TPSK_LOAD(field) (field)
 #endif /* WITH_THREADS */
 
-/* Lock/unlock the per-tunnel stats-snapshot mutex.  Takes const because the
- * snapshot read path holds a const tunnel; the mutex is not part of the object's
- * const-observable state (the build uses no -Wcast-qual). */
+/* Lock/unlock the per-tunnel diagnostic-snapshot mutex.  Takes const because
+ * the snapshot read path holds a const tunnel; the mutex is not part of the
+ * object's const-observable state (the build uses no -Wcast-qual). */
 static void tunnel_pub_lock(const struct tunnel *restrict t)
 {
 #if WITH_THREADS
@@ -402,6 +452,14 @@ static bool stream_connect(
 		"socket_set_buffer", socket_set_buffer(
 					     fd, t->local_socket.tcp_sndbuf,
 					     t->local_socket.tcp_rcvbuf));
+#if WITH_TCP_NOTSENT_LOWAT
+	if (t->local_socket.tcp_notsent_lowat > 0) {
+		LOG_SOCKOPT(
+			"socket_notsent_lowat",
+			socket_notsent_lowat(
+				fd, t->local_socket.tcp_notsent_lowat));
+	}
+#endif
 	LOG_SOCKOPT(
 		"socket_set_tcp", socket_set_tcp(
 					  fd, t->local_socket.tcp_nodelay,
@@ -444,84 +502,163 @@ static bool tunnel_on_accept(
 	return stream_connect(t, stream, t->forward_addr);
 }
 
+/* Whether the owner registered a callback for this relayed event. */
+static bool
+relay_wanted(const struct tunnel *restrict t, const enum mux_event event)
+{
+	switch (event) {
+	case MUX_EVENT_ESTABLISHED:
+		return t->relay.cb.on_established != NULL;
+	case MUX_EVENT_RESUMED:
+		return t->relay.cb.on_resumed != NULL;
+	default:
+		return t->relay.cb.on_event != NULL;
+	}
+}
+
+/* Hand one relayed event to the owner's callback for it; relay_wanted() has
+ * already confirmed that callback exists. */
+static void relay_invoke(
+	struct tunnel *restrict t, const enum mux_event event,
+	const union mux_event_data data)
+{
+	switch (event) {
+	case MUX_EVENT_ESTABLISHED:
+		t->relay.cb.on_established(
+			t->callback_data, t, data.connected.ns);
+		break;
+	case MUX_EVENT_RESUMED:
+		t->relay.cb.on_resumed(t->callback_data, t, data.connected.ns);
+		break;
+	default:
+		t->relay.cb.on_event(t->callback_data, t, event, data);
+		break;
+	}
+}
+
+static void tunnel_on_dgram(
+	void *data, struct mux_session *ss, const uint_least16_t flow,
+	const unsigned char *payload, const size_t len)
+{
+	(void)ss;
+	struct tunnel *const restrict t = data;
+	udp_flows_recv(t->flows, flow, payload, len, t->forward_addr);
+}
+
+static void tunnel_on_dgram_close(
+	void *data, struct mux_session *ss, const uint_least16_t flow)
+{
+	(void)ss;
+	struct tunnel *const restrict t = data;
+	udp_flows_recv_close(t->flows, flow);
+}
+
 #if WITH_THREADS
-/* Task argument for an on_event relay dispatched to the relay loop. */
-struct relay_event_arg {
+/* One event on its way to the relay loop.  While the relay loop's bounded ring
+ * refuses it, it waits on this tunnel's relay backlog, linked by next. */
+struct relayed_event {
+	struct relayed_event *next;
 	struct tunnel *t;
 	enum mux_event event;
 	union mux_event_data data;
 };
 
-static void relay_dispatch_on_event(void *p)
+static void relay_dispatch(void *p)
 {
-	struct relay_event_arg *const restrict arg = p;
-	struct tunnel *const restrict t = arg->t;
-	const enum mux_event event = arg->event;
-	const union mux_event_data data = arg->data;
-	free(arg);
+	struct relayed_event *const restrict ev = p;
+	struct tunnel *const restrict t = ev->t;
+	const enum mux_event event = ev->event;
+	const union mux_event_data data = ev->data;
+	free(ev);
 	if (!atomic_load_explicit(
-		    &t->relay_disconnected, memory_order_relaxed) &&
-	    t->relay.cb.on_event != NULL) {
-		t->relay.cb.on_event(t->callback_data, t, event, data);
+		    &t->relay_disconnected, memory_order_relaxed)) {
+		relay_invoke(t, event, data);
 	}
 }
 
-/* Task argument for on_established / on_resumed relays. */
-struct relay_connected_arg {
-	struct tunnel *t;
-	int_fast64_t lat_ns;
-	void (*cb)(void *, struct tunnel *, int_fast64_t);
-};
-
-static void relay_dispatch_connected(void *p)
+/* Once this returns true the relay loop owns ev and may already have freed it. */
+static bool relay_try_post(struct tunnel *restrict t, struct relayed_event *ev)
 {
-	struct relay_connected_arg *const restrict arg = p;
-	struct tunnel *const restrict t = arg->t;
-	const int_fast64_t lat_ns = arg->lat_ns;
-	void (*const cb)(void *, struct tunnel *, int_fast64_t) = arg->cb;
-	free(arg);
-	if (cb != NULL &&
-	    !atomic_load_explicit(
-		    &t->relay_disconnected, memory_order_relaxed)) {
-		cb(t->callback_data, t, lat_ns);
+	return t->relay.parent.post_task(
+		t->relay.parent.user,
+		(struct task){ .func = relay_dispatch, .data = ev });
+}
+
+static void relay_backlog_free(struct tunnel *restrict t)
+{
+	struct relayed_event *ev = t->relay_head;
+	t->relay_head = t->relay_tail = NULL;
+	while (ev != NULL) {
+		struct relayed_event *const next = ev->next;
+		free(ev);
+		ev = next;
 	}
+}
+
+/* Re-post the backlog, oldest first, until the ring refuses one again or the
+ * backlog is empty. */
+static void relay_retry_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct tunnel *const restrict t = w->data;
+	if (atomic_load_explicit(&t->relay_disconnected, memory_order_relaxed)) {
+		relay_backlog_free(t);
+		ev_timer_stop(loop, w);
+		return;
+	}
+	while (t->relay_head != NULL) {
+		struct relayed_event *const ev = t->relay_head;
+		struct relayed_event *const next = ev->next;
+		if (!relay_try_post(t, ev)) {
+			return;
+		}
+		t->relay_head = next;
+	}
+	t->relay_tail = NULL;
+	ev_timer_stop(loop, w);
 }
 #endif /* WITH_THREADS */
 
-static void relay_connected(
-	struct tunnel *restrict t,
-	void (*cb)(void *, struct tunnel *, int_fast64_t),
-	const int_fast64_t lat_ns)
+/* Deliver an event to the owner on its own loop.  With threads that is a post
+ * onto the owner's shared, bounded task ring; an event the ring refuses joins
+ * the relay backlog and is retried from this tunnel's loop, so a full ring
+ * loses no event and the owner still sees them in order. */
+static void relay_event(
+	struct tunnel *restrict t, const enum mux_event event,
+	const union mux_event_data data)
 {
-	if (cb == NULL) {
+	if (!relay_wanted(t, event)) {
 		return;
 	}
 #if WITH_THREADS
 	if (atomic_load_explicit(&t->relay_disconnected, memory_order_relaxed)) {
 		return;
 	}
-	struct relay_connected_arg *const restrict arg = malloc(sizeof(*arg));
-	if (arg == NULL) {
+	struct relayed_event *const restrict ev = malloc(sizeof(*ev));
+	if (ev == NULL) {
 		LOGOOM();
 		return;
 	}
-	*arg = (struct relay_connected_arg){
+	*ev = (struct relayed_event){
 		.t = t,
-		.lat_ns = lat_ns,
-		.cb = cb,
+		.event = event,
+		.data = data,
 	};
-	const bool posted = t->relay.parent.post_task(
-		t->relay.parent.user,
-		(struct task){ .func = relay_dispatch_connected, .data = arg });
-	if (!posted) {
-		TUNNEL_LOG(
-			ERROR, t,
-			"failed to dispatch relay connected event (queue full)");
-		free(arg);
-		return;
+	if (t->relay_head == NULL) {
+		if (relay_try_post(t, ev)) {
+			return;
+		}
+		t->relay_head = ev;
+		TUNNEL_LOG(DEBUG, t, "relay queue full, retrying relay events");
+	} else {
+		t->relay_tail->next = ev;
+	}
+	t->relay_tail = ev;
+	if (!ev_is_active(&t->w_relay_retry)) {
+		ev_timer_again(t->loop, &t->w_relay_retry);
 	}
 #else /* WITH_THREADS */
-	cb(t->callback_data, t, lat_ns);
+	relay_invoke(t, event, data);
 #endif /* WITH_THREADS */
 }
 
@@ -548,11 +685,19 @@ static bool path_unreachable(const int err)
 	}
 }
 
+/* True when the tunnel will never dial again: it has no address (an accepted
+ * tunnel, or one a reload cleared), or its reconnect was disabled
+ * (tunnel_shutdown, or a reload that retired it). */
+static bool tunnel_reconnect_off(const struct tunnel *restrict t)
+{
+	return t->connect_addr == NULL || t->shutting_down;
+}
+
 /* err is the connect(2) errno the failed attempt reported, or 0 where the
  * caller has none (a close, or a failure before the connect). */
 static void tunnel_schedule_reconnect(struct tunnel *restrict t, const int err)
 {
-	if (t->connect_addr == NULL || t->shutting_down) {
+	if (tunnel_reconnect_off(t)) {
 		return;
 	}
 	if (path_unreachable(err) &&
@@ -565,7 +710,6 @@ static void tunnel_schedule_reconnect(struct tunnel *restrict t, const int err)
 	const double delay =
 		tunnel_reconnect_delays[idx] * (0.8 + frand() * 0.4);
 	t->reconnect_count++;
-	TPUB_ADD(t->error_cnt.num_reconnects, 1);
 	TUNNEL_LOG_F(
 		INFO, t, "reconnect scheduled in %.1fs (attempt %d)", delay,
 		t->reconnect_count);
@@ -648,22 +792,44 @@ static bool tunnel_do_connect(struct tunnel *restrict t, int *restrict err_out)
 	return true;
 }
 
+/* Every dial after the initial one: the backoff timer firing, the immediate
+ * attempt on transport loss, and the on-demand dial of an idle_timeout tunnel.
+ * num_reconnects counts here, where the attempt is actually made, so a backoff
+ * that is scheduled and then cancelled leaves it untouched. */
+static bool tunnel_redial(struct tunnel *restrict t, int *restrict err_out)
+{
+	TPUB_ADD(t->error_cnt.num_reconnects, 1);
+	return tunnel_do_connect(t, err_out);
+}
+
+/* Demand-triggered redial of an on-demand tunnel; a dial that fails at once
+ * falls back to the backoff timer. */
+static void tunnel_redial_on_demand(struct tunnel *t)
+{
+	int err;
+	if (!tunnel_redial(t, &err)) {
+		tunnel_schedule_reconnect(t, err);
+	}
+}
+
 static void
 tunnel_reconnect_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct tunnel *const restrict t = w->data;
+	struct tunnel *const t = w->data;
 	ASSERT(loop == t->loop);
 	(void)loop;
 	ev_timer_stop(loop, &t->w_reconnect);
-	if (t->connect_addr == NULL) {
-		/* Nothing to dial: an accepted tunnel, or one whose address a
-		 * reload cleared. Matches the guard every other reconnect entry
-		 * point already has. */
+	if (tunnel_reconnect_off(t)) {
+		/* Armed by tunnel_end_retired_later() for a retired dialed
+		 * tunnel's suspended session: nothing will dial it again, so
+		 * it can never resume.  Its CLOSED is relayed now.  Last:
+		 * without threads the owner may close t inside. */
+		mux_shutdown(t->ss);
 		return;
 	}
 	int err;
-	if (tunnel_do_connect(t, &err)) {
+	if (tunnel_redial(t, &err)) {
 		return;
 	}
 	TUNNEL_LOG(WARNING, t, "connect failed, scheduling retry");
@@ -675,23 +841,62 @@ static const struct mux_session_config *tunnel_conf(const struct tunnel *t)
 	return mux_conf(t->ss);
 }
 
-/* Dirty disconnect on a dialed tunnel: reconnect immediately (attempt 0)
- * before backoff, unless the tunnel is shutting down (a reload drained its
- * removed slot) or demand-triggered reconnect is in use. */
-static void handle_transport_lost(struct tunnel *restrict t)
+/* A dialed tunnel whose reconnect is off has just seen its session suspend:
+ * nothing will dial it again, so it can never resume.  End it from the loop
+ * rather than inside the session's own transition (tunnel_reconnect_cb). */
+static void tunnel_end_retired_later(struct tunnel *restrict t)
 {
-	if (t->connect_addr == NULL || t->shutting_down ||
-	    tunnel_conf(t)->idle_timeout != 0) {
+	ev_timer_stop(t->loop, &t->w_reconnect);
+	ev_timer_set(&t->w_reconnect, 0.0, 0.0);
+	ev_timer_start(t->loop, &t->w_reconnect);
+}
+
+/* Dirty disconnect: an accepted tunnel waits for the peer to resume.  A dialed
+ * one reconnects immediately (attempt 0) before backoff, unless
+ * demand-triggered reconnect is in use, or its reconnect is off (a reload
+ * retired it while live, or tunnel_shutdown) and it is ended instead. */
+static void handle_transport_lost(struct tunnel *t)
+{
+	if (t->accepted) {
+		return;
+	}
+	if (tunnel_reconnect_off(t)) {
+		tunnel_end_retired_later(t);
+		return;
+	}
+	if (tunnel_conf(t)->idle_timeout != 0) {
 		return;
 	}
 	TUNNEL_LOG(INFO, t, "transport lost, reconnecting");
 	ev_timer_stop(t->loop, &t->w_reconnect);
-	TPUB_ADD(t->error_cnt.num_reconnects, 1);
 	int err;
-	if (!tunnel_do_connect(t, &err)) {
+	if (!tunnel_redial(t, &err)) {
 		TUNNEL_LOG(WARNING, t, "connect failed, scheduling retry");
 		tunnel_schedule_reconnect(t, err);
 	}
+}
+
+/* A failed resume attempt leaves the session suspended with no CLOSED to
+ * follow, so this is where its retry is paced.  An attempt that closed the
+ * session is paced by handle_closed, and an on-demand tunnel is redialed by
+ * tunnel_open_fd() on the next inbound connection.  A tunnel a reload retired
+ * while the attempt was in flight gets no retry: its session is ended instead
+ * (tunnel_end_retired_later). */
+static void handle_connect_failed(
+	struct tunnel *restrict t, const struct mux_session *restrict ss,
+	const int err)
+{
+	if (mux_state(ss) != MUX_STATE_SUSPENDED) {
+		return;
+	}
+	if (tunnel_reconnect_off(t)) {
+		tunnel_end_retired_later(t);
+		return;
+	}
+	if (tunnel_conf(t)->idle_timeout != 0) {
+		return;
+	}
+	tunnel_schedule_reconnect(t, err);
 }
 
 static void tunnel_set_tag_part(
@@ -729,72 +934,75 @@ static void handle_connected(
 	t->reconnect_count = 0;
 
 	free(t->peer_identity);
-	/* The peer's claimed identity (from its hello), distinct from t->peer_id
-	 * (the immutable local label set at tunnel creation). */
+	/* The peer's claimed identity, from its hello. */
 	const char *const peer_identity = edata.connected.peer_identity;
 	t->peer_identity = peer_identity != NULL ? strdup(peer_identity) : NULL;
 	if (peer_identity != NULL && t->peer_identity == NULL) {
 		LOGOOM();
 	}
 
-	/* Rebuild the diagnostic tag once the peer identity is known; skipped when
-	 * the peer sent no identity (the connect-time "=> ?" tag is retained). */
-	if (peer_identity != NULL) {
-		if (t->accepted) {
-			/* Update tag for accepted identity sessions; runs on the
-			 * session thread.  The parent's verify_peer callback
-			 * provides thread-safe identity table lookup. */
-			const bool matched = t->relay.parent.verify_peer(
-				t->relay.parent.user, peer_identity);
-			/* t->identity is conf->identity.claim frozen at creation
-			 * and may be NULL (accepted before any identity was
-			 * configured, then a reload added one); guard it like the
-			 * dialed branch does -- passing NULL to "%s" is UB. */
-			const char *const my =
-				(matched && t->identity != NULL) ? t->identity :
-								   "?";
-			tunnel_set_tag(
-				t->tag, sizeof(t->tag), my,
-				" <= ", peer_identity);
+	/* Rebuild the diagnostic tag for the transport just established.  A dialed
+	 * tunnel is reused across reconnects, so its tag is rebuilt every time:
+	 * naming this peer's claim, or the address it was dialed at when the peer
+	 * claimed none -- never a claim an earlier session's peer made.  An
+	 * accepted tunnel is never redialed; without a claim it keeps the peer
+	 * address tunnel_new tagged it with. */
+	if (!t->accepted) {
+		/* server.c server_on_established wires identities[].tunnels[];
+		 * here we just update the tag. */
+		char my[64];
+		if (t->identity != NULL) {
+			tunnel_set_tag_part(my, sizeof(my), t->identity);
 		} else {
-			/* server.c server_on_established wires
-			 * identities[].tunnels[]; here we just update the tag. */
-			char my[64];
-			if (t->identity != NULL) {
-				tunnel_set_tag_part(
-					my, sizeof(my), t->identity);
+			union sockaddr_max addr;
+			if (socket_get_addr(mux_fd(ss), &addr) == 0) {
+				(void)sa_format(my, sizeof(my), &addr.sa);
 			} else {
-				union sockaddr_max addr;
-				if (socket_get_addr(mux_fd(ss), &addr) == 0) {
-					(void)sa_format(
-						my, sizeof(my), &addr.sa);
-				} else {
-					tunnel_set_tag_part(
-						my, sizeof(my), "?");
-				}
+				tunnel_set_tag_part(my, sizeof(my), "?");
 			}
-			tunnel_set_tag(
-				t->tag, sizeof(t->tag), my, " => ",
-				peer_identity);
 		}
+		const char *peer = peer_identity;
+		if (peer == NULL) {
+			peer = t->connect_addr != NULL ? t->connect_addr : "?";
+		}
+		tunnel_set_tag(t->tag, sizeof(t->tag), my, " => ", peer);
+	} else if (peer_identity != NULL) {
+		/* Runs on the session thread.  The parent's verify_peer callback
+		 * provides thread-safe identity table lookup. */
+		const bool matched = t->relay.parent.verify_peer(
+			t->relay.parent.user, peer_identity);
+		/* t->identity is conf->identity.claim frozen at creation and may
+		 * be NULL (accepted before any identity was configured, then a
+		 * reload added one); guard it like the dialed branch does --
+		 * passing NULL to "%s" is UB. */
+		const char *const my =
+			(matched && t->identity != NULL) ? t->identity : "?";
+		tunnel_set_tag(
+			t->tag, sizeof(t->tag), my, " <= ", peer_identity);
 	}
-	/* Publish tag + peer_identity for the server thread's stats path. */
+	/* Publish tag + peer_identity for server-thread diagnostic readers. */
 	tunnel_publish_pub(t);
 }
 
 /* Returns false when the event should not be relayed to the server: the
  * tunnel persists locally and reconnects later instead of being torn down,
  * either via the backoff timer or, for idle_timeout tunnels, on demand. */
-static bool handle_closed(struct tunnel *restrict t, const int err)
+static bool handle_closed(struct tunnel *t, const int err)
 {
-	if (t->connect_addr == NULL || t->shutting_down) {
+	const bool demanded = t->redial_on_closed;
+	t->redial_on_closed = false;
+	if (tunnel_reconnect_off(t)) {
 		ev_timer_stop(t->loop, &t->w_reconnect);
 		return true;
 	}
 	if (tunnel_conf(t)->idle_timeout != 0) {
 		/* On-demand tunnel: no backoff timer; tunnel_open_fd()
-		 * redials on the next inbound connection. */
+		 * redials on the next inbound connection, or now for one it
+		 * had to refuse while the session was closing. */
 		ev_timer_stop(t->loop, &t->w_reconnect);
+		if (demanded) {
+			tunnel_redial_on_demand(t);
+		}
 		return false;
 	}
 	/* Both clean and dirty closes schedule a backoff reconnect; no
@@ -813,21 +1021,131 @@ static void handle_stream_established(struct tunnel *t, int_fast64_t lat_ns)
 	TPUB_STORE(t->stream_establish_count, count + 1);
 }
 
+/* Open one local connection as a new stream.  Returns false, leaving fd with
+ * the caller, when the session cannot open a stream right now. */
+static bool tunnel_attach_stream(struct tunnel *restrict t, const int fd)
+{
+	struct mux_stream *const stream = mux_stream_open(t->ss);
+	if (stream == NULL) {
+		return false;
+	}
+	/* Start reading from local socket immediately.  One frame may be read
+	 * before the SYN is sent and piggybacked as SYN|PUSH (fast open). */
+	mux_stream_attach_fd(stream, fd);
+	TUNNEL_LOG_F(
+		DEBUG, t, "[fd:%d] new stream %" PRIuLEAST16, fd,
+		mux_stream_id(stream));
+	return true;
+}
+
+/* Queue fd behind the redial in flight.  Returns false on OOM (logged), leaving
+ * fd with the caller. */
+static bool tunnel_park(struct tunnel *restrict t, const int fd)
+{
+	struct pending_open *const restrict node = malloc(sizeof(*node));
+	if (node == NULL) {
+		LOGOOM();
+		return false;
+	}
+	node->fd = fd;
+	node->next = NULL;
+	if (t->park_tail != NULL) {
+		t->park_tail->next = node;
+	} else {
+		t->park_head = node;
+	}
+	t->park_tail = node;
+	return true;
+}
+
+/* Close every parked connection and free its node: the redial they waited on
+ * failed, or the tunnel is going away. */
+static void tunnel_flush_parked(struct tunnel *restrict t)
+{
+	struct pending_open *node = t->park_head;
+	t->park_head = t->park_tail = NULL;
+	while (node != NULL) {
+		struct pending_open *const restrict next = node->next;
+		TUNNEL_LOG_F(
+			DEBUG, t, "[fd:%d] redial did not establish, closing",
+			node->fd);
+		socket_close(node->fd);
+		free(node);
+		node = next;
+	}
+}
+
+/* Serve the parked connections once the redial they wait on has finished: open
+ * each as a stream if the session came up, close them all if the attempt ended
+ * any other way.  While it is still connecting, or still closing ahead of a
+ * redial handle_closed() owes, they keep waiting. */
+static void tunnel_settle_parked(struct tunnel *t)
+{
+	const enum mux_state state = mux_state(t->ss);
+	if (state == MUX_STATE_CONNECT || t->redial_on_closed) {
+		return;
+	}
+	if (state != MUX_STATE_ESTABLISHED) {
+		tunnel_flush_parked(t);
+		return;
+	}
+	struct pending_open *node = t->park_head;
+	t->park_head = t->park_tail = NULL;
+	while (node != NULL) {
+		struct pending_open *const restrict next = node->next;
+		if (!tunnel_attach_stream(t, node->fd)) {
+			TUNNEL_LOG_F(
+				DEBUG, t, "[fd:%d] session not ready, closing",
+				node->fd);
+			socket_close(node->fd);
+		}
+		free(node);
+		node = next;
+	}
+}
+
+static void tunnel_park_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct tunnel *const t = w->data;
+	ASSERT(loop == t->loop);
+	(void)loop;
+	tunnel_settle_parked(t);
+}
+
 static void tunnel_on_event(
 	void *data, struct mux_session *ss, enum mux_event event,
 	union mux_event_data edata)
 {
-	struct tunnel *restrict t = data;
+	struct tunnel *t = data;
 
-	/* Update reconnect state before relaying to the server loop. */
+	/* Any lifecycle event may end the redial the parked connections wait on.
+	 * Settle them from the loop rather than here: this callback runs inside
+	 * the session's own state transition. */
+	if (t->park_head != NULL && event != MUX_EVENT_STREAM_ESTABLISHED &&
+	    !ev_is_active(&t->w_park)) {
+		ev_timer_set(&t->w_park, 0.0, 0.0);
+		ev_timer_start(t->loop, &t->w_park);
+	}
+
+	/* Update the tunnel's own state first, then relay only the events the
+	 * owner acts on (see struct tunnel_callbacks). */
 	switch (event) {
+	case MUX_EVENT_CONNECT:
+		return;
 	case MUX_EVENT_LOST:
 		TPUB_STORE(t->last_changed, clock_monotonic_ns());
 		break;
 	case MUX_EVENT_SUSPENDED:
 		handle_transport_lost(t);
-		break;
+		return;
+	case MUX_EVENT_CONNECT_FAILED:
+		handle_connect_failed(t, ss, edata.connect_failed.err);
+		return;
 	case MUX_EVENT_ESTABLISHED:
+		/* A fresh session: the peer holds none of the old flows. */
+		udp_flows_reset(t->flows);
+		/* falls through */
 	case MUX_EVENT_RESUMED:
 		/* Both bring the transport up: stamp last_changed and run the
 		 * connected handler. (RESUMED previously skipped the stamp,
@@ -839,105 +1157,100 @@ static void tunnel_on_event(
 		handle_stream_established(t, edata.stream_established.ns);
 		return;
 	case MUX_EVENT_CLOSED:
+		udp_flows_reset(t->flows);
 		if (!handle_closed(t, edata.closed.err)) {
 			return;
 		}
 		break;
-	default:
-		break;
 	}
+	relay_event(t, event, edata);
+}
 
-	if (event == MUX_EVENT_ESTABLISHED) {
-		relay_connected(
-			t, t->relay.cb.on_established, edata.connected.ns);
+/* Demand-triggered reconnect for local traffic the session could not take:
+ * when idle-closed/suspended with idle_timeout set, reconnect so the next
+ * attempt succeeds.  A session still closing (an idle close waits for the
+ * peer's close) cannot take new traffic yet, so the redial is deferred to its
+ * CLOSED event.  Suppressed once shutting_down: a reload that removed this
+ * slot must not redial the now-stale connect_addr. */
+static void tunnel_demand_redial(struct tunnel *t)
+{
+	if (tunnel_reconnect_off(t) || tunnel_conf(t)->idle_timeout <= 0 ||
+	    ev_is_active(&t->w_reconnect)) {
 		return;
 	}
-	if (event == MUX_EVENT_RESUMED) {
-		relay_connected(t, t->relay.cb.on_resumed, edata.connected.ns);
-		return;
+	const enum mux_state state = mux_state(t->ss);
+	if (state == MUX_STATE_SUSPENDED || state == MUX_STATE_CLOSED) {
+		tunnel_redial_on_demand(t);
+	} else if (state == MUX_STATE_CLOSING) {
+		t->redial_on_closed = true;
 	}
-
-#if WITH_THREADS
-	if (t->relay.cb.on_event != NULL &&
-	    !atomic_load_explicit(
-		    &t->relay_disconnected, memory_order_relaxed)) {
-		struct relay_event_arg *restrict arg = malloc(sizeof(*arg));
-		if (arg == NULL) {
-			LOGOOM();
-			return;
-		}
-		*arg = (struct relay_event_arg){
-			.t = t,
-			.event = event,
-			.data = edata,
-		};
-		const bool posted = t->relay.parent.post_task(
-			t->relay.parent.user,
-			(struct task){
-				.func = relay_dispatch_on_event,
-				.data = arg,
-			});
-		if (!posted) {
-			/* Unrecoverable for MUX_EVENT_CLOSED: the tunnel thread
-			 * exits right after, so nothing re-posts it and the
-			 * server never runs handle_closed for this tunnel --
-			 * an accepted tunnel stays in accepted_tunnels and a
-			 * dialed identity tunnel wedges its staging slot until
-			 * the next peers-changed reload. Log loudly; the
-			 * sibling tunnel_post sites all do. */
-			TUNNEL_LOG_F(
-				ERROR, t,
-				"failed to dispatch relay event %d (queue full)",
-				(int)event);
-			free(arg);
-			return;
-		}
-	}
-#else /* WITH_THREADS */
-	if (t->relay.cb.on_event != NULL) {
-		t->relay.cb.on_event(t->callback_data, t, event, edata);
-	}
-#endif /* WITH_THREADS */
 }
 
 /* Open one accepted local connection as a new stream.  Runs on this tunnel's
  * own thread (or inline without threads); the caller guarantees t->ss is live. */
-static void tunnel_open_fd(struct tunnel *restrict t, const int fd)
+static void tunnel_open_fd(struct tunnel *t, const int fd)
 {
-	struct mux_stream *const stream = mux_stream_open(t->ss);
-	if (stream == NULL) {
-		/* Demand-triggered reconnect: when idle-closed/suspended with
-		 * idle_timeout set, reconnect so the next open_stream succeeds.
-		 * Suppressed once shutting_down: a reload that removed this slot
-		 * must not redial the now-stale connect_addr. */
-		if (!t->shutting_down && t->connect_addr != NULL &&
-		    tunnel_conf(t)->idle_timeout > 0 &&
-		    !ev_is_active(&t->w_reconnect) &&
-		    (mux_state(t->ss) == MUX_STATE_SUSPENDED ||
-		     mux_state(t->ss) == MUX_STATE_CLOSED)) {
-			int err;
-			if (!tunnel_do_connect(t, &err)) {
-				tunnel_schedule_reconnect(t, err);
-			}
-		}
-		TUNNEL_LOG_F(
-			DEBUG, t, "[fd:%d] session not ready, closing", fd);
-		socket_close(fd);
+	if (tunnel_attach_stream(t, fd)) {
 		return;
 	}
-	/* Start reading from local socket immediately.  One frame may be read
-	 * before the SYN is sent and piggybacked as SYN|PUSH (fast open). */
-	mux_stream_attach_fd(stream, fd);
-	TUNNEL_LOG_F(
-		DEBUG, t, "[fd:%d] new stream %" PRIuLEAST16, fd,
-		mux_stream_id(stream));
+	/* Demand-triggered reconnect (tunnel_demand_redial), then hold fd until
+	 * the redial ends -- the connection that triggers it is the first one it
+	 * serves.  An open that finds a dial already in flight waits on it the
+	 * same way. */
+	tunnel_demand_redial(t);
+	if (!tunnel_reconnect_off(t) && tunnel_conf(t)->idle_timeout > 0) {
+		/* A dial is in flight only while a transport is attached: INIT
+		 * also reads as MUX_STATE_CONNECT, with none.  A close that ends
+		 * in a redial is waited on the same way. */
+		if (((mux_state(t->ss) == MUX_STATE_CONNECT &&
+		      mux_fd(t->ss) >= 0) ||
+		     t->redial_on_closed) &&
+		    tunnel_park(t, fd)) {
+			TUNNEL_LOG_F(
+				DEBUG, t, "[fd:%d] waiting for redial", fd);
+			return;
+		}
+	}
+	TUNNEL_LOG_F(DEBUG, t, "[fd:%d] session not ready, closing", fd);
+	socket_close(fd);
+}
+
+/* Relay one local UDP datagram over the session.  Runs on this tunnel's own
+ * thread (or inline without threads); consumes d. */
+static void tunnel_dgram_input(struct tunnel *t, struct udp_dgram *d)
+{
+	if (t->ss == NULL) {
+		TPUB_ADD(t->dgram_cnt.pkt_dgram_dropped, 1);
+		udp_dgram_free(d);
+		return;
+	}
+	if (!mux_dgram_ready(t->ss)) {
+		tunnel_demand_redial(t);
+	}
+	udp_flows_input(t->flows, d);
 }
 
 #if WITH_THREADS
+/* Detach the queued datagrams and relay each (dropping them when the session
+ * is already torn down).  Runs on the tunnel thread. */
+static void tunnel_drain_pending_dgrams(struct tunnel *t)
+{
+	THRD_ASSERT(mtx_lock(&t->open_mu));
+	struct udp_dgram *d = t->dgram_head;
+	t->dgram_head = t->dgram_tail = NULL;
+	t->dgram_count = 0;
+	THRD_ASSERT(mtx_unlock(&t->open_mu));
+	while (d != NULL) {
+		struct udp_dgram *const next = d->next;
+		tunnel_dgram_input(t, d);
+		d = next;
+	}
+}
+
 /* Detach the queued opens and either open each (session live) or close it
  * (session already torn down earlier in this async tick).  Runs on the tunnel
  * thread. */
-static void tunnel_drain_pending_opens(struct tunnel *restrict t)
+static void tunnel_drain_pending_opens(struct tunnel *t)
 {
 	THRD_ASSERT(mtx_lock(&t->open_mu));
 	struct pending_open *node = t->open_head;
@@ -959,11 +1272,12 @@ static void tunnel_async_cb(struct ev_loop *loop, ev_async *w, int revents)
 {
 	(void)loop;
 	(void)revents;
-	struct tunnel *const restrict t = w->data;
+	struct tunnel *const t = w->data;
 	dispatcher_tick(t->disp);
 	/* After the ring: a queued task may have been task_tunnel_teardown, which
-	 * clears t->ss, so the drain must tolerate a torn-down session. */
+	 * clears t->ss, so the drains must tolerate a torn-down session. */
 	tunnel_drain_pending_opens(t);
+	tunnel_drain_pending_dgrams(t);
 }
 
 static int tunnel_thread(void *arg)
@@ -1030,42 +1344,55 @@ static void tunnel_resume_attach_task(void *p)
 }
 #endif /* WITH_THREADS */
 
-/* Move a detached transport onto the suspended tunnel old_t and resume it.
- * The attach must run on old_t's own loop, so post it there.  Always consumes
- * @p transport. */
-static void tunnel_handoff_resume(
-	struct tunnel *restrict old_t, struct mux_transport *restrict transport,
+/* Move new_ss's transport onto the suspended tunnel old_t and resume it.  The
+ * attach must run on old_t's own loop, so post it there.  Returns whether the
+ * transport was handed off; on failure new_ss keeps it, so the caller can
+ * report the resume unhandled and let the mux layer serve new_ss fresh. */
+static bool tunnel_handoff_resume(
+	struct tunnel *restrict old_t, struct mux_session *restrict new_ss,
 	const uint_least32_t resume_seq)
 {
 #if WITH_THREADS
+	/* Allocate before detaching: a transport taken off new_ss and then not
+	 * handed off would leave the session with nothing to be served fresh on. */
 	struct resume_attach_arg *restrict arg = malloc(sizeof(*arg));
-	if (arg != NULL) {
-		*arg = (struct resume_attach_arg){
-			.old_t = old_t,
-			.transport = *transport,
-			.resume_seq = resume_seq,
-		};
-		if (tunnel_post(
-			    old_t,
-			    (struct task){ tunnel_resume_attach_task, arg })) {
-			return;
-		}
-		free(arg);
-	} else {
+	if (arg == NULL) {
 		LOGOOM();
+		return false;
 	}
-	/* Hand-off failed: drop the transport.  old_t stays suspended and recovers
-	 * on its own resume timeout. */
-	mux_transport_discard(transport);
+	arg->old_t = old_t;
+	arg->resume_seq = resume_seq;
+	mux_transport_detach(new_ss, &arg->transport);
+	if (tunnel_post(
+		    old_t, (struct task){ tunnel_resume_attach_task, arg })) {
+		return true;
+	}
+	/* old_t's queue is full: put the transport back so new_ss can carry a
+	 * fresh session.  old_t stays suspended and recovers on its own resume
+	 * timeout. */
+	TUNNEL_LOG_PUB(
+		ERROR, old_t,
+		"failed to dispatch resume attach (queue full);"
+		" serving the peer as a fresh session");
+	mux_transport_reattach(new_ss, &arg->transport);
+	free(arg);
+	return false;
 #else /* WITH_THREADS */
-	mux_resume_attach(old_t->ss, transport, resume_seq);
+	struct mux_transport transport;
+	mux_transport_detach(new_ss, &transport);
+	mux_resume_attach(old_t->ss, &transport, resume_seq);
+	return true;
 #endif /* WITH_THREADS */
 }
 
 /* mux on_verify_identity: enforce identity.verify.  A peer that claims an
  * identity must present a certificate naming it (spec Section 10.1); a peer
  * claiming none is left unidentified, which is the behavior without this
- * option, and reaches only the root forwarding target. */
+ * option, and reaches only the root forwarding target.
+ *
+ * Runs on the session thread, and on a dialed tunnel also before establishment
+ * (the client checks the ServerHello), when the published fd is still -1 or
+ * names the previous transport; the records log ss's live transport fd. */
 static bool tunnel_on_verify_identity(
 	void *data, struct mux_session *ss, const char *identity)
 {
@@ -1087,9 +1414,11 @@ static bool tunnel_on_verify_identity(
 			char esc[IDENTITY_ESCAPED_MAX];
 			escape_identity(
 				esc, sizeof(esc), identity, ESCAPE_PLAIN);
-			LOGE_F("[fd:%d] identity \"%s\" cannot be verified:"
-			       " session did not authenticate with a PSK",
-			       tunnel_fd(t), esc);
+			TUNNEL_LOG_F(
+				ERROR, t,
+				"[fd:%d] identity \"%s\" cannot be verified:"
+				" session did not authenticate with a PSK",
+				mux_fd(ss), esc);
 			return false;
 		}
 		const char *const owner =
@@ -1098,10 +1427,12 @@ static bool tunnel_on_verify_identity(
 			char esc[IDENTITY_ESCAPED_MAX];
 			escape_identity(
 				esc, sizeof(esc), identity, ESCAPE_PLAIN);
-			LOGE_F("[fd:%d] peer claims identity \"%s\" but"
-			       " authenticated with the key of \"%s\"",
-			       tunnel_fd(t), esc,
-			       owner != NULL ? owner : "(unknown)");
+			TUNNEL_LOG_F(
+				ERROR, t,
+				"[fd:%d] peer claims identity \"%s\" but"
+				" authenticated with the key of \"%s\"",
+				mux_fd(ss), esc,
+				owner != NULL ? owner : "(unknown)");
 			return false;
 		}
 		return true;
@@ -1118,26 +1449,31 @@ static bool tunnel_on_verify_identity(
 		 * silently doing nothing.  Fail closed instead. */
 		char esc[IDENTITY_ESCAPED_MAX];
 		escape_identity(esc, sizeof(esc), identity, ESCAPE_PLAIN);
-		LOGE_F("[fd:%d] identity \"%s\" cannot be verified: session is"
-		       " not using TLS",
-		       tunnel_fd(t), esc);
+		TUNNEL_LOG_F(
+			ERROR, t,
+			"[fd:%d] identity \"%s\" cannot be verified:"
+			" session is not using TLS",
+			mux_fd(ss), esc);
 		return false;
 	}
 	if (!identity_matches_cert(conn, identity)) {
 		char esc[IDENTITY_ESCAPED_MAX];
 		escape_identity(esc, sizeof(esc), identity, ESCAPE_PLAIN);
-		LOGE_F("[fd:%d] peer claims identity \"%s\" but its certificate"
-		       " does not name it",
-		       tunnel_fd(t), esc);
+		TUNNEL_LOG_F(
+			ERROR, t,
+			"[fd:%d] peer claims identity \"%s\" but its"
+			" certificate does not name it",
+			mux_fd(ss), esc);
 		return false;
 	}
 	return true;
 #else /* WITH_TLS */
-	(void)ss;
 	char esc[IDENTITY_ESCAPED_MAX];
 	escape_identity(esc, sizeof(esc), identity, ESCAPE_PLAIN);
-	LOGE_F("[fd:%d] identity \"%s\" cannot be verified: built without TLS",
-	       tunnel_fd(t), esc);
+	TUNNEL_LOG_F(
+		ERROR, t,
+		"[fd:%d] identity \"%s\" cannot be verified: built without TLS",
+		mux_fd(ss), esc);
 	return false;
 #endif /* WITH_TLS */
 }
@@ -1157,9 +1493,9 @@ static bool tunnel_on_verify_identity(
  * session with neither has no identity to keep continuous.
  *
  * The claim is read from the session rather than old_t's published snapshot:
- * that snapshot is only refreshed on MUX_EVENT_CONNECTED, which has not fired
- * for new_ss yet.  old_t's snapshot is pinned by the caller's lookup and is
- * pub-locked, so reading it from this thread is safe.
+ * that snapshot is only refreshed on MUX_EVENT_ESTABLISHED/MUX_EVENT_RESUMED,
+ * neither of which has fired for new_ss yet.  old_t's snapshot is pinned by the
+ * caller's lookup and is pub-locked, so reading it from this thread is safe.
  *
  * Must run before mux_transport_detach(), which moves new_ss's identity onto
  * the transport and leaves NULL behind; afterwards this would compare against
@@ -1181,16 +1517,20 @@ static bool tunnel_resume_identity_ok(
 	const bool ok = has_resumed == (claimed != NULL) &&
 			(claimed == NULL || strcmp(claimed, resumed) == 0);
 	if (!ok) {
-		LOGW_F("[fd:%d] resume rejected: claimed identity does not match"
-		       " the session being resumed",
-		       tunnel_fd(t));
+		TUNNEL_LOG_F(
+			WARNING, t,
+			"[fd:%d] resume rejected: claimed identity does not"
+			" match the session being resumed",
+			mux_fd(new_ss));
 	}
 	return ok;
 }
 
 /* mux on_resume: a resume hello arrived on the transient session new_ss.  Find
- * the suspended tunnel, detach new_ss's transport and hand it off, returning
- * true so the mux layer tears new_ss down. */
+ * the suspended tunnel and hand new_ss's transport off to it, returning true so
+ * the mux layer tears new_ss down.  With no match, or when the hand-off cannot
+ * be dispatched, new_ss keeps its transport and false makes the mux layer serve
+ * it as a fresh session. */
 static bool tunnel_on_resume(
 	void *data, struct mux_session *new_ss, const unsigned char *session_id,
 	const uint_least32_t resume_seq)
@@ -1211,13 +1551,10 @@ static bool tunnel_on_resume(
 	}
 	bool handled = false;
 	if (old_t != NULL) {
-		struct mux_transport transport;
-		mux_transport_detach(new_ss, &transport);
-		tunnel_handoff_resume(old_t, &transport, resume_seq);
+		handled = tunnel_handoff_resume(old_t, new_ss, resume_seq);
 		if (t->relay.cb.on_resume_unpin != NULL) {
 			t->relay.cb.on_resume_unpin(t->callback_data, t);
 		}
-		handled = true;
 	}
 	return handled;
 }
@@ -1232,7 +1569,12 @@ static struct mux_frame *tunnel_frame_alloc(void *data, const size_t size)
 
 /* Refilling the cache is the only thing that gives the trim timer work, so it
  * is also what arms it: teardown therefore stops the timer only after the last
- * mux_close, or a released frame would revive it. */
+ * mux_close, or a released frame would revive it.
+ *
+ * This hook, like the session callbacks, reaches t through the pointer the
+ * session was given, not through its caller's: a function that holds t across
+ * a mux call that can fire them, and touches what they change, must not
+ * declare t restrict. */
 static void tunnel_frame_free(void *data, struct mux_frame *frame)
 {
 	struct tunnel *const restrict t = data;
@@ -1256,11 +1598,32 @@ tunnel_maintenance_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	}
 }
 
+static bool tunnel_admit_session(void *data)
+{
+	struct tunnel *const t = data;
+	if (t->session_reserved || t->relay.parent.reserve_session == NULL) {
+		return true;
+	}
+	if (!t->relay.parent.reserve_session(t->relay.parent.user)) {
+		return false;
+	}
+	t->session_reserved = true;
+	return true;
+}
+
+static void tunnel_release_session(struct tunnel *t)
+{
+	if (t->session_reserved) {
+		t->relay.parent.release_session(t->relay.parent.user);
+		t->session_reserved = false;
+	}
+}
+
 /* Tear down a partially-initialized tunnel on any tunnel_new failure exit
  * after `t` was allocated; safe at any point since t is calloc-zeroed.
  * owns_fd_conn is false once mux_new has taken fd/conn ownership (mux.h). */
 static void tunnel_new_cleanup(
-	struct tunnel *restrict t, struct mux_session *restrict ss,
+	struct tunnel *t, struct mux_session *restrict ss,
 	const bool owns_fd_conn, const struct tunnel_opts *restrict opts)
 {
 	if (ss != NULL) {
@@ -1286,7 +1649,7 @@ static void tunnel_new_cleanup(
 	free(t->forward_addr);
 	free(t->connect_addr);
 	free(t->identity);
-	free(t->peer_id);
+	tunnel_release_session(t);
 	free(t);
 	if (owns_fd_conn) {
 		if (opts->fd >= 0) {
@@ -1310,7 +1673,6 @@ struct tunnel *tunnel_new(
 	const char *const connect_addr = opts->connect_addr;
 	const char *const forward_addr = opts->forward_addr;
 	const char *const identity = opts->identity;
-	const char *const peer_id = opts->peer_id;
 	const struct tunnel_session_counters *const cnt = opts->cnt;
 #if WITH_TLS
 	struct tls_context *const tlsctx = opts->tlsctx;
@@ -1330,19 +1692,22 @@ struct tunnel *tunnel_new(
 	t->relay.parent = *parent;
 	t->relay.cb = *cb;
 	t->callback_data = data;
+	t->accepted = (fd >= 0);
+	if (!t->accepted && !tunnel_admit_session(t)) {
+		tunnel_new_cleanup(t, NULL, true, opts);
+		errno = ENOSPC;
+		return NULL;
+	}
 	t->forward_addr = forward_addr != NULL ? strdup(forward_addr) : NULL;
 	t->connect_addr = connect_addr != NULL ? strdup(connect_addr) : NULL;
 	TPUB_STORE(t->last_changed, clock_monotonic_ns());
 	t->reconnect_count = 0;
 	t->shutting_down = false;
-	t->accepted = (fd >= 0);
 	t->identity = identity != NULL ? strdup(identity) : NULL;
-	t->peer_id = peer_id != NULL ? strdup(peer_id) : NULL;
 	t->peer_identity = NULL;
 	if ((forward_addr != NULL && t->forward_addr == NULL) ||
 	    (connect_addr != NULL && t->connect_addr == NULL) ||
-	    (identity != NULL && t->identity == NULL) ||
-	    (peer_id != NULL && t->peer_id == NULL)) {
+	    (identity != NULL && t->identity == NULL)) {
 		LOGOOM();
 		tunnel_new_cleanup(t, NULL, true, opts);
 		return NULL;
@@ -1367,6 +1732,8 @@ struct tunnel *tunnel_new(
 		.on_verify_identity = tunnel_on_verify_identity,
 		.on_resume =
 			cb->on_resume_lookup != NULL ? tunnel_on_resume : NULL,
+		.on_dgram = tunnel_on_dgram,
+		.on_dgram_close = tunnel_on_dgram_close,
 	};
 #if WITH_THREADS
 	t->started = false;
@@ -1383,6 +1750,10 @@ struct tunnel *tunnel_new(
 	ev_async_init(&t->w_async, tunnel_async_cb);
 	t->w_async.data = t;
 	ev_async_start(t->loop, &t->w_async);
+	ev_timer_init(
+		&t->w_relay_retry, relay_retry_cb, TUNNEL_RELAY_RETRY_INTERVAL,
+		TUNNEL_RELAY_RETRY_INTERVAL);
+	t->w_relay_retry.data = t;
 #else /* WITH_THREADS */
 	t->loop = parent->loop;
 #endif /* WITH_THREADS */
@@ -1390,6 +1761,8 @@ struct tunnel *tunnel_new(
 		&t->w_reconnect, tunnel_reconnect_cb, 0.0,
 		tunnel_reconnect_delays[0]);
 	t->w_reconnect.data = t;
+	ev_timer_init(&t->w_park, tunnel_park_cb, 0.0, 0.0);
+	t->w_park.data = t;
 	/* Per-tunnel L1 allocator: a fixed-size frame cache (mcache) over malloc,
 	 * each object sized to the session's frame payload. conf_load_mux()
 	 * always clamps this to at least MUX_MIN_FRAME_PAYLOAD, so no fallback
@@ -1442,7 +1815,7 @@ struct tunnel *tunnel_new(
 			}
 		} else {
 			/* Dialed session: my from identity; peer from
-			 * connect_addr (always prefer over peer_id). */
+			 * connect_addr. */
 			tunnel_set_tag_part(
 				my, sizeof(my),
 				identity != NULL ? identity : "?");
@@ -1462,7 +1835,6 @@ struct tunnel *tunnel_new(
 		.fd = fd,
 		.id = id,
 		.identity = identity,
-		.peer_id = peer_id,
 		.cnt = {
 			.session = {
 				.num_session_created =
@@ -1516,6 +1888,14 @@ struct tunnel *tunnel_new(
 				.byt_push_recv = &t->traffic_cnt.byt_push_recv,
 				.byt_push_sent = &t->traffic_cnt.byt_push_sent,
 			},
+			.dgram = {
+				.pkt_dgram_sent = &t->dgram_cnt.pkt_dgram_sent,
+				.pkt_dgram_recv = &t->dgram_cnt.pkt_dgram_recv,
+				.pkt_dgram_dropped =
+					&t->dgram_cnt.pkt_dgram_dropped,
+				.byt_dgram_sent = &t->dgram_cnt.byt_dgram_sent,
+				.byt_dgram_recv = &t->dgram_cnt.byt_dgram_recv,
+			},
 		},
 #if WITH_TLS
 		.tlsctx = tlsctx,
@@ -1529,21 +1909,32 @@ struct tunnel *tunnel_new(
 		tunnel_new_cleanup(t, NULL, false, opts);
 		return NULL;
 	}
+	t->flows = udp_flows_new(
+		t->loop, ss, t->accepted, &t->dgram_cnt.pkt_dgram_dropped,
+		&t->dgram_cnt.num_flows);
+	if (t->flows == NULL) {
+		tunnel_new_cleanup(t, ss, false, opts);
+		return NULL;
+	}
 #if WITH_THREADS
 	/* Init the mutexes last so the failure paths above need no mtx_destroy;
 	 * only tunnel_close pairs with these. */
 	if (mtx_init(&t->pub.mu, mtx_plain) != thrd_success) {
+		udp_flows_free(t->flows);
 		tunnel_new_cleanup(t, ss, false, opts);
 		return NULL;
 	}
 	if (mtx_init(&t->open_mu, mtx_plain) != thrd_success) {
 		mtx_destroy(&t->pub.mu);
+		udp_flows_free(t->flows);
 		tunnel_new_cleanup(t, ss, false, opts);
 		return NULL;
 	}
 #endif /* WITH_THREADS */
 	t->ss = ss;
-	/* Publish the creation-time tag for the stats path before the thread runs. */
+	ss->admit_session = tunnel_admit_session;
+	/* Publish the creation-time snapshot for the server thread's diagnostic
+	 * readers (its log records' tag and fd) before the thread runs. */
 	tunnel_publish_pub(t);
 	return t;
 }
@@ -1555,7 +1946,7 @@ static void task_mux_start(void *p)
 
 static void tunnel_initial_connect_task(void *p)
 {
-	struct tunnel *const restrict t = p;
+	struct tunnel *const t = p;
 	int err;
 	if (!tunnel_do_connect(t, &err)) {
 		tunnel_schedule_reconnect(t, err);
@@ -1608,19 +1999,38 @@ bool tunnel_start(struct tunnel *t)
 	return true;
 }
 
-#if WITH_THREADS
-/* Final dispatched task on the tunnel thread: suppress callbacks, close
- * session, stop event loop.  Clears t->ss so tunnel_close knows it ran. */
-static void task_tunnel_teardown(void *p)
+/* Suppress the mux callbacks, then close the session and stop the timers that
+ * serve it.  Runs on the loop that owns t->ss.  Without the suppression,
+ * mux_close() would still emit LOST or CONNECT_FAILED from a live session
+ * through tunnel_on_event() into an owner that has already let go of t. */
+static void tunnel_close_session(struct tunnel *t)
 {
-	struct tunnel *const restrict t = p;
 	ev_timer_stop(t->loop, &t->w_reconnect);
+	/* Its callback reads t->ss, which is cleared below.  Only a lifecycle
+	 * event arms it, and the suppression below silences those. */
+	ev_timer_stop(t->loop, &t->w_park);
 	mux_set_callbacks(t->ss, &(struct mux_callbacks){ 0 });
+	/* Its watchers run on this loop, so free it on this thread. */
+	udp_flows_free(t->flows);
+	t->flows = NULL;
 	mux_close(t->ss);
 	t->ss = NULL;
-	/* After mux_close, so a frame released during teardown cannot re-arm it
-	 * and leave this loop with a watcher that never lets ev_run return. */
+	/* After mux_close, so a frame released during teardown cannot re-arm it:
+	 * an armed timer would keep the tunnel thread's ev_run from returning, or
+	 * without threads fire from the shared parent loop on a freed t. */
 	ev_timer_stop(t->loop, &t->w_maintenance);
+}
+
+#if WITH_THREADS
+/* Final dispatched task on the tunnel thread: close the session and stop the
+ * last watcher, so ev_run returns and the thread exits. */
+static void task_tunnel_teardown(void *p)
+{
+	struct tunnel *const t = p;
+	/* relay_disconnected is already set, so the backlog is moot; it is freed
+	 * after the join. */
+	ev_timer_stop(t->loop, &t->w_relay_retry);
+	tunnel_close_session(t);
 	ev_async_stop(t->loop, &t->w_async);
 }
 #endif /* WITH_THREADS */
@@ -1666,6 +2076,11 @@ static void tunnel_load_counters(
 	out->byt_push_recv = t->traffic_cnt.byt_push_recv;
 	out->byt_push_sent = t->traffic_cnt.byt_push_sent;
 #endif /* WITH_THREADS */
+	out->pkt_dgram_sent = TPUB_LOAD(t->dgram_cnt.pkt_dgram_sent);
+	out->pkt_dgram_recv = TPUB_LOAD(t->dgram_cnt.pkt_dgram_recv);
+	out->pkt_dgram_dropped = TPUB_LOAD(t->dgram_cnt.pkt_dgram_dropped);
+	out->byt_dgram_sent = TPUB_LOAD(t->dgram_cnt.byt_dgram_sent);
+	out->byt_dgram_recv = TPUB_LOAD(t->dgram_cnt.byt_dgram_recv);
 	out->num_reconnects = TPUB_LOAD(t->error_cnt.num_reconnects);
 	out->num_rst_sent = TPUB_LOAD(t->error_cnt.num_rst_sent);
 	out->num_rst_recv = TPUB_LOAD(t->error_cnt.num_rst_recv);
@@ -1687,6 +2102,14 @@ static void tunnel_flush_pending_opens(struct tunnel *restrict t)
 		free(node);
 		node = next;
 	}
+	struct udp_dgram *d = t->dgram_head;
+	t->dgram_head = t->dgram_tail = NULL;
+	t->dgram_count = 0;
+	while (d != NULL) {
+		struct udp_dgram *const next = d->next;
+		udp_dgram_free(d);
+		d = next;
+	}
 }
 #endif /* WITH_THREADS */
 
@@ -1699,37 +2122,24 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 		&t->relay_disconnected, true, memory_order_relaxed);
 
 	if (t->started) {
-		/* Suppress mux callbacks, close session, stop event loop. Retry
-		 * once: a concurrent free on another thread may let it succeed. */
-		bool teardown_posted = tunnel_post(
-			t, (struct task){ task_tunnel_teardown, t });
-		if (!teardown_posted) {
-			teardown_posted = tunnel_post(
-				t, (struct task){ task_tunnel_teardown, t });
-		}
-		if (!teardown_posted) {
-			/* thrd_join() below would hang the caller forever, since
-			 * the worker loop has no other way to learn it should
-			 * stop; detach and leave it running instead. */
+		/* The ring is full only while the tunnel thread is behind on
+		 * draining it, and that thread keeps draining until this very
+		 * task stops its loop -- the progress thrd_join() below relies
+		 * on anyway -- so wait for a slot rather than give up on it. */
+		const struct task teardown = { task_tunnel_teardown, t };
+		if (!tunnel_post(t, teardown)) {
 			TUNNEL_LOG_PUB(
-				ERROR, t,
-				"failed to dispatch teardown after retry"
-				" (queue full), abandoning tunnel thread");
-			/* Sample before detaching: the abandoned thread keeps
-			 * counting, and t is never freed, so this is the last
-			 * point the caller can account for any of it. */
-			if (out != NULL) {
-				tunnel_load_counters(t, out);
-			}
-			THRD_ASSERT(thrd_detach(t->thread));
-			return;
+				WARNING, t,
+				"teardown queue full, waiting for the tunnel"
+				" thread to drain it");
+			do {
+				(void)thrd_yield();
+			} while (!tunnel_post(t, teardown));
 		}
 		THRD_ASSERT(thrd_join(t->thread, NULL));
-		/* If task_tunnel_teardown never ran (tunnel self-closed first),
-		 * t->ss is still alive; free it here, safe after thrd_join. */
-		if (t->ss != NULL) {
-			mux_close(t->ss);
-		}
+		/* The loop only returns once task_tunnel_teardown has stopped
+		 * w_async, and the thread drains its ring once more on exit. */
+		ASSERT(t->ss == NULL);
 		/* Flush the server dispatcher so this tunnel's already-queued relay
 		 * tasks run now (freeing their arg allocations against a
 		 * disconnected relay) before t is freed below -- otherwise they
@@ -1745,27 +2155,24 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 		 * filtering dispatcher variant (contrib/csnippets, read-only). */
 		t->relay.parent.flush_tasks(t->relay.parent.user);
 	} else {
-		/* Thread never started; just release mux session resources. */
-		ev_timer_stop(t->loop, &t->w_reconnect);
-		mux_close(t->ss);
+		/* Thread never started; release the session here. */
+		tunnel_close_session(t);
+		ev_async_stop(t->loop, &t->w_async);
 	}
-	/* After every mux_close above -- including the post-join one -- so a frame
-	 * released during teardown cannot re-arm it past ev_loop_destroy below. */
-	ev_timer_stop(t->loop, &t->w_maintenance);
-	ev_async_stop(t->loop, &t->w_async);
 	/* The tunnel thread is stopped (joined) or never ran, so no drain can race
-	 * this: close any opens still queued -- they can no longer be served. */
+	 * this: close any opens (and drop any datagrams) still queued -- they
+	 * can no longer be served -- and drop the relay events still waiting for
+	 * the relay loop. */
+	ev_timer_stop(t->loop, &t->w_relay_retry);
 	tunnel_flush_pending_opens(t);
+	relay_backlog_free(t);
 	dispatcher_destroy(t->disp);
 	ev_loop_destroy(t->loop);
 #else /* WITH_THREADS */
-	ev_timer_stop(t->loop, &t->w_reconnect);
-	mux_close(t->ss);
-	/* After mux_close: the loop here is the shared parent loop, which outlives
-	 * t, so a frame released during teardown must not leave a timer armed on
-	 * a tunnel that is about to be freed. */
-	ev_timer_stop(t->loop, &t->w_maintenance);
+	tunnel_close_session(t);
 #endif /* WITH_THREADS */
+	/* The session is gone, so nothing will settle the parked connections. */
+	tunnel_flush_parked(t);
 	/* After the join and every mux_close() path above, so the counters
 	 * teardown bumped -- one num_stream_failed per stream still open -- are
 	 * part of the sample.  The counters live in t, not in the session, so
@@ -1776,7 +2183,6 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 	free(t->forward_addr);
 	free(t->connect_addr);
 	free(t->identity);
-	free(t->peer_id);
 	free(t->peer_identity);
 #if WITH_TLS
 	/* Safe after mux_close above: the session no longer borrows it. */
@@ -1789,6 +2195,7 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 	/* After mux_close: any frames released during teardown are now back in
 	 * the cache, so it is safe to drop. */
 	mcache_free(t->frame_cache);
+	tunnel_release_session(t);
 	free(t);
 }
 
@@ -1797,28 +2204,70 @@ void tunnel_close(struct tunnel *t)
 	tunnel_close_final(t, NULL);
 }
 
-static void task_mux_shutdown(void *p)
+/* Report the CLOSED of a session that already reached it, once reconnect has
+ * been turned off: a dialed tunnel waiting out its reconnect backoff, or an
+ * idle on-demand one.  handle_closed() kept that CLOSED local, and the session
+ * has no transition left to emit another, so the owner would otherwise never
+ * learn of it.  A CLOSED the owner has not yet processed makes this a
+ * duplicate, which is harmless: without threads the relay is synchronous, so a
+ * tunnel the owner still holds has reported none; with threads the owner
+ * closes the tunnel on the first, and tunnel_close_final() disconnects the
+ * relay first, so the second is dropped.  Without threads the owner may close
+ * t before this returns, so the caller must not touch t afterwards. */
+static void tunnel_report_closed(struct tunnel *restrict t)
 {
-	mux_shutdown(p);
+	tunnel_on_event(
+		t, t->ss, MUX_EVENT_CLOSED,
+		(union mux_event_data){ .closed = { .err = 0 } });
 }
 
-static void task_set_shutting_down(void *p)
+/* End the session of a dialed tunnel whose reconnect was just turned off, when
+ * it is idle and so has no transition of its own left: report the CLOSED it
+ * already reached, and close one that is suspended or never started -- nothing
+ * will dial it again, and only the dialing side resumes a session.  A session
+ * with a transport attached, live or mid-attempt, is left to run: it either
+ * closes by itself, or suspends once that transport fails and is ended then
+ * (handle_transport_lost(), handle_connect_failed()); handle_closed() relays
+ * its CLOSED now.  Without threads the owner may close t inside, so the caller
+ * must not touch t afterwards. */
+static void tunnel_end_idle(struct tunnel *restrict t)
 {
-	struct tunnel *restrict t = p;
+	switch (mux_state(t->ss)) {
+	case MUX_STATE_CLOSED:
+		tunnel_report_closed(t);
+		return;
+	case MUX_STATE_SUSPENDED:
+		break;
+	case MUX_STATE_CONNECT:
+		/* Never started (a failed resolve) reads as CONNECT too, but
+		 * with no transport attached. */
+		if (mux_fd(t->ss) >= 0) {
+			return;
+		}
+		break;
+	default:
+		return;
+	}
+	mux_shutdown(t->ss);
+}
+
+static void task_shutdown(void *p)
+{
+	struct tunnel *t = p;
 	t->shutting_down = true;
 	ev_timer_stop(t->loop, &t->w_reconnect);
+	if (mux_state(t->ss) != MUX_STATE_CLOSED) {
+		/* Every other state ends in a CLOSED transition, which
+		 * handle_closed() relays once shutting_down is set. */
+		mux_shutdown(t->ss);
+		return;
+	}
+	tunnel_report_closed(t);
 }
 
 void tunnel_shutdown(struct tunnel *t)
 {
-	/* Both tasks carry no separate heap payload; attempt both regardless
-	 * of the first outcome (matching a plain no-throw dispatch) and report
-	 * each failure instead of leaking silently. */
-	if (!tunnel_post(t, (struct task){ task_set_shutting_down, t })) {
-		TUNNEL_LOG_PUB(
-			ERROR, t, "failed to dispatch shutdown (queue full)");
-	}
-	if (!tunnel_post(t, (struct task){ task_mux_shutdown, t->ss })) {
+	if (!tunnel_post(t, (struct task){ task_shutdown, t })) {
 		TUNNEL_LOG_PUB(
 			ERROR, t, "failed to dispatch shutdown (queue full)");
 	}
@@ -1867,11 +2316,6 @@ enum mux_state tunnel_state(const struct tunnel *t)
 struct mux_session *tunnel_session(const struct tunnel *t)
 {
 	return t->ss;
-}
-
-const char *tunnel_peer_id(const struct tunnel *t)
-{
-	return t->peer_id;
 }
 
 bool tunnel_peer_identity_copy(
@@ -1923,10 +2367,6 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	/* fixed at creation and never rewritten, so plain. */
 	out->accepted = t->accepted;
 	out->tunnel_index = t->tunnel_index;
-	/* tag is a string, so copy it from the published snapshot under the lock. */
-	tunnel_pub_lock(t);
-	(void)memcpy(out->tag, t->pub.tag, sizeof(out->tag));
-	tunnel_pub_unlock(t);
 	struct mux_session_stats snap;
 	mux_session_stats(t->ss, &snap);
 	out->rx_window = snap.rx_window;
@@ -1961,6 +2401,12 @@ void tunnel_stats(const struct tunnel *t, struct tunnel_stats *restrict out)
 	out->byt_mux_sent = cnt.byt_mux_sent;
 	out->byt_push_recv = cnt.byt_push_recv;
 	out->byt_push_sent = cnt.byt_push_sent;
+	out->pkt_dgram_sent = cnt.pkt_dgram_sent;
+	out->pkt_dgram_recv = cnt.pkt_dgram_recv;
+	out->pkt_dgram_dropped = cnt.pkt_dgram_dropped;
+	out->byt_dgram_sent = cnt.byt_dgram_sent;
+	out->byt_dgram_recv = cnt.byt_dgram_recv;
+	out->num_flows = TPUB_LOAD(t->dgram_cnt.num_flows);
 	out->recv_buffered_bytes = TPUB_LOAD(t->buf_gauge.recv_buffered_bytes);
 	out->send_buffered_frames =
 		TPUB_LOAD(t->buf_gauge.send_buffered_frames);
@@ -1997,6 +2443,36 @@ void tunnel_open_stream(struct tunnel *t, const int fd)
 	ev_async_send(t->loop, &t->w_async);
 #else /* WITH_THREADS */
 	tunnel_open_fd(t, fd);
+#endif /* WITH_THREADS */
+}
+
+void tunnel_send_dgram(
+	struct tunnel *t, struct udp_dgram *d, const size_t queue_limit)
+{
+#if WITH_THREADS
+	d->next = NULL;
+	THRD_ASSERT(mtx_lock(&t->open_mu));
+	const bool full = t->dgram_count >= queue_limit;
+	if (!full) {
+		if (t->dgram_tail != NULL) {
+			t->dgram_tail->next = d;
+		} else {
+			t->dgram_head = d;
+		}
+		t->dgram_tail = d;
+		t->dgram_count++;
+	}
+	THRD_ASSERT(mtx_unlock(&t->open_mu));
+	if (full) {
+		/* The tunnel thread cannot keep up: shed the datagram. */
+		TPUB_ADD(t->dgram_cnt.pkt_dgram_dropped, 1);
+		udp_dgram_free(d);
+		return;
+	}
+	ev_async_send(t->loop, &t->w_async);
+#else /* WITH_THREADS */
+	(void)queue_limit;
+	tunnel_dgram_input(t, d);
 #endif /* WITH_THREADS */
 }
 
@@ -2038,15 +2514,16 @@ static void release_psk_ctx(void *restrict ctx, void (*release)(void *ctx))
 static void reload_task(void *p)
 {
 	struct reload_arg *const restrict arg = p;
-	struct tunnel *const restrict t = arg->t;
+	struct tunnel *const t = arg->t;
 	if (arg->update_connect_addr) {
 		free(t->connect_addr);
 		t->connect_addr = arg->connect_addr;
 		if (t->connect_addr == NULL) {
 			/* tunnel.h documents a NULL address as also disabling
-			 * reconnect. Stop the backoff timer here or a pending
-			 * tick would reach tunnel_do_connect with no address --
-			 * it has no NULL guard, unlike every other caller. */
+			 * reconnect, so no backoff may stay armed.  A tick left
+			 * pending would not dial: with reconnect off,
+			 * tunnel_reconnect_cb() reads any tick as
+			 * tunnel_end_retired_later()'s and ends the session. */
 			ev_timer_stop(t->loop, &t->w_reconnect);
 		}
 	}
@@ -2054,6 +2531,9 @@ static void reload_task(void *p)
 		t->shutting_down = true;
 		ev_timer_stop(t->loop, &t->w_reconnect);
 	}
+	const bool retired =
+		arg->disable_reconnect ||
+		(arg->update_connect_addr && t->connect_addr == NULL);
 	if (arg->update_forward_addr) {
 		free(t->forward_addr);
 		t->forward_addr = arg->forward_addr;
@@ -2091,6 +2571,11 @@ static void reload_task(void *p)
 	t->mux_socket = arg->mux_socket;
 	t->local_socket = arg->local_socket;
 	free(arg);
+	if (!retired) {
+		return;
+	}
+	/* Last: without threads the owner may close t inside. */
+	tunnel_end_idle(t);
 }
 
 void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)

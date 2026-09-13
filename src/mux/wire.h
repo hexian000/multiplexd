@@ -9,7 +9,7 @@
 #ifndef MUX_WIRE_H
 #define MUX_WIRE_H
 
-#include "mux/frame.h"
+#include "frame.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -27,8 +27,9 @@ struct wire_ctx {
 	bool tx_pending : 1;
 	/* true when the last flush left unsent residue (congested). */
 	bool send_blocked : 1;
-	/* true when the peer closed the transport cleanly (TCP FIN or TLS
-	 * close_notify); false on connection errors or timeouts. */
+	/* true when the peer closed the transport cleanly (TLS close_notify, or
+	 * TCP FIN on a plaintext transport); false on connection errors, a TCP FIN
+	 * that truncates a TLS stream, or timeouts. */
 	bool rx_eof : 1;
 #if WITH_TLS
 	/* true when the TLS library holds buffered plaintext readable without
@@ -38,6 +39,9 @@ struct wire_ctx {
 	/* true when sendbuf.tail is the open entry (pos == 0) that can still
 	 * absorb packed small frames on its tail; false when frozen or empty. */
 	bool sendbuf_staging : 1;
+	/* true when dgrambuf has the next turn over scheduled stream data; set
+	 * after each data frame so datagrams and data alternate. */
+	bool dgram_turn : 1;
 	/* true when the kernel's TCP_USER_TIMEOUT is installed on the socket, so
 	 * it -- not w_send_timeout -- covers "peer stopped acking". Persistent per
 	 * connection; distinguishes "kernel handles the watchdog" from the timer's
@@ -55,10 +59,19 @@ struct wire_ctx {
 	/* Out-of-band control queue (PROBE/PING/PONG), drained ahead of any
 	 * non-retransmit regular frame; bypasses the send-stall gate (spec §6.2). */
 	struct mux_frame_list oobbuf;
+	/* lossymux DATAGRAM/FLOW-CLOSE queue (spec §5.2.3.3), bounded by
+	 * conf.lossymux_queue.  Never retained or replayed: dropped on suspend. */
+	struct mux_frame_list dgrambuf;
 	/* Receive byte ring for parsing inbound frames. */
 	struct bytebuf *recvbuf;
 #if WITH_TLS
 	struct tls_connection *tlsconn;
+	/* true when tlsconn owns the socket fd (socket offload); false when it is
+	 * a memory transport whose ciphertext wire.c shuttles.  Latched when the
+	 * connection is installed, since it describes how that connection was
+	 * built: a later mux_set_config must not re-interpret a live connection.
+	 * Meaningful only while tlsconn is non-NULL. */
+	bool tls_offload : 1;
 	/* Pending I/O direction required by the TLS layer (0, EV_READ, or
 	 * EV_WRITE).  Overrides normal watcher event selection when TLS needs
 	 * a cross-direction I/O (e.g. tls_send returns WANT_READ). */
@@ -91,7 +104,7 @@ bool mux_wire_send(
 /* Read up to *len bytes from the transport into buf.  On return *len is the
  * number of bytes actually received.  Returns false on unrecoverable error. */
 bool mux_wire_recv(
-	struct mux_session *restrict ss, unsigned char *restrict buf,
+	struct mux_session *ss, unsigned char *restrict buf,
 	size_t *restrict len);
 
 /* Return true when the TLS layer has data buffered that can be read by
@@ -143,9 +156,11 @@ void mux_wire_tls_log_status(struct mux_session *restrict ss);
 
 /* Install a TLS connection onto ss during session resume and rebind its I/O
  * notifier to ss (the connection was created for the transient session that
- * carried the resume hello).  Frees any existing TLS connection on ss first. */
+ * carried the resume hello).  offload is the mode conn was built with (see
+ * wire_ctx.tls_offload).  Frees any existing TLS connection on ss first. */
 void mux_wire_adopt_tlsconn(
-	struct mux_session *restrict ss, struct tls_connection *restrict conn);
+	struct mux_session *restrict ss, struct tls_connection *restrict conn,
+	bool offload);
 
 /* Free a detached TLS connection not owned by any session. */
 void mux_wire_tlsconn_free(struct tls_connection *restrict conn);
@@ -162,17 +177,19 @@ enum wire_shutdown_state mux_wire_shutdown(struct mux_session *restrict ss);
 
 /* Result of mux_wire_wait_eof. */
 enum wire_eof_result {
-	/* Peer's TCP FIN or TLS close_notify observed: the close is confirmed. */
+	/* Peer's TLS close_notify (or, plaintext, TCP FIN) observed: the close is
+	 * confirmed. */
 	WIRE_EOF_CONFIRMED,
 	/* Nothing to report yet (EAGAIN, or a TLS layer still mid-shutdown);
 	 * not a confirmed close.  Retry on the next wakeup. */
 	WIRE_EOF_PENDING,
-	/* Unexpected application data after shutdown, or a hard I/O error. */
+	/* Unexpected application data after shutdown, a TCP FIN with no TLS
+	 * close_notify ahead of it, or a hard I/O error. */
 	WIRE_EOF_ERROR,
 };
 
-/* Drain the read side waiting for peer's TCP FIN or TLS close_notify.
- * Does not modify wire.rx_open or wire.tls_want. */
+/* Drain the read side waiting for the peer's TLS close_notify (or, plaintext,
+ * TCP FIN).  Does not modify wire.rx_open or wire.tls_want. */
 enum wire_eof_result mux_wire_wait_eof(struct mux_session *restrict ss);
 
 #endif /* MUX_WIRE_H */

@@ -6,11 +6,11 @@
  * @brief Internal mux transport I/O implementation.
  */
 
-#include "mux/wire.h"
+#include "wire.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/session.h"
+#include "frame.h"
+#include "mux.h"
+#include "session.h"
 #if WITH_TLS
 #include "shim/tls.h"
 #endif
@@ -122,11 +122,26 @@ static bool wire_send_buffered(
 	return perr == 0 || perr == EAGAIN;
 }
 
+/* The peer's close_notify arrived: a clean, terminal close.  Flushes any final
+ * ciphertext (e.g. our own close_notify); a fatal push error still fails the
+ * connection like every other wire_cipher_push call site. */
+static bool
+wire_recv_close_notify(struct mux_session *restrict ss, size_t *restrict len)
+{
+	LOGV_F("[fd:%d] TLS connection closed by peer", ss->w_socket.fd);
+	ss->wire.rx_open = false;
+	ss->wire.tx_pending = true;
+	ss->wire.rx_eof = true;
+	*len = 0;
+	const int perr = wire_cipher_push(ss);
+	return perr == 0 || perr == EAGAIN;
+}
+
 /* Buffered transport receive: read ciphertext from the socket into @p buf, feed
  * it to the TLS library, and decrypt in place back into @p buf.  Also pushes any
  * ciphertext the library produced (e.g. handshake records). */
 static bool wire_recv_buffered(
-	struct mux_session *restrict ss, unsigned char *restrict buf,
+	struct mux_session *ss, unsigned char *restrict buf,
 	size_t *restrict len)
 {
 	ss->wire.tls_want = 0;
@@ -134,6 +149,9 @@ static bool wire_recv_buffered(
 		ss->wire.tls_readable = false;
 		size_t n = *len;
 		const enum tls_error err = tls_recv(ss->wire.tlsconn, buf, &n);
+		if (err == TLS_ERROR_ZERO_RETURN) {
+			return wire_recv_close_notify(ss, len);
+		}
 		if (err == TLS_ERROR_NONE && n > 0) {
 			*len = n;
 			LOGV_F("[fd:%d] tls_recv(drained): %zu bytes",
@@ -150,6 +168,7 @@ static bool wire_recv_buffered(
 		}
 	}
 	size_t clen = *len;
+	bool fin = false;
 	const int serr = socket_recv(ss->w_socket.fd, buf, &clen);
 	if (serr != 0) {
 		if (!sock_would_block(serr)) {
@@ -161,13 +180,9 @@ static bool wire_recv_buffered(
 		}
 		clen = 0; /* no new ciphertext; still drain decrypted data below */
 	} else if (clen == 0) {
-		/* TCP FIN before close_notify: treat as a graceful close. */
-		LOGV_F("[fd:%d] connection closed by peer", ss->w_socket.fd);
-		ss->wire.rx_open = false;
-		ss->wire.tx_pending = true;
-		ss->wire.rx_eof = true;
-		*len = 0;
-		return true;
+		/* TCP FIN: still decrypt what the library holds, since only a
+		 * close_notify ahead of the FIN makes this a clean close. */
+		fin = true;
 	}
 	if (clen > 0 && !tls_input(ss->wire.tlsconn, buf, clen)) {
 		LOGOOM();
@@ -187,24 +202,17 @@ static bool wire_recv_buffered(
 		ss->wire.tls_want = EV_WRITE; /* cross-direction (handshake) */
 		break;
 	case TLS_ERROR_ZERO_RETURN:
-		LOGV_F("[fd:%d] TLS connection closed by peer",
-		       ss->w_socket.fd);
-		ss->wire.rx_open = false;
-		ss->wire.tx_pending = true;
-		ss->wire.rx_eof = true;
-		*len = 0;
-		/* Flush any final ciphertext (e.g. our own close_notify)
-		 * before treating this as a clean close; a fatal push error
-		 * still fails the connection like the other wire_cipher_push
-		 * call sites above and below. */
-		{
-			const int perr = wire_cipher_push(ss);
-			if (perr != 0 && perr != EAGAIN) {
-				return false;
-			}
-		}
-		return true;
+		return wire_recv_close_notify(ss, len);
 	default:
+		ss->wire.rx_open = false;
+		*len = 0;
+		return false;
+	}
+	if (fin && n == 0) {
+		/* A truncated TLS stream: a transport loss, not a clean close,
+		 * exactly as the fd-backed library reports an unexpected EOF. */
+		LOGD_F("[fd:%d] connection closed without TLS close_notify",
+		       ss->w_socket.fd);
 		ss->wire.rx_open = false;
 		*len = 0;
 		return false;
@@ -230,7 +238,7 @@ bool mux_wire_send(
 {
 #if WITH_TLS
 	if (ss->wire.tlsconn != NULL) {
-		if (!ss->conf.tls_socket_offload) {
+		if (!ss->wire.tls_offload) {
 			return wire_send_buffered(ss, buf, len);
 		}
 		ss->wire.tls_want = 0;
@@ -286,12 +294,12 @@ bool mux_wire_send(
 }
 
 bool mux_wire_recv(
-	struct mux_session *restrict ss, unsigned char *restrict buf,
+	struct mux_session *ss, unsigned char *restrict buf,
 	size_t *restrict len)
 {
 #if WITH_TLS
 	if (ss->wire.tlsconn != NULL) {
-		if (!ss->conf.tls_socket_offload) {
+		if (!ss->wire.tls_offload) {
 			return wire_recv_buffered(ss, buf, len);
 		}
 		ss->wire.tls_want = 0;
@@ -353,7 +361,7 @@ bool mux_wire_recv(
 bool mux_wire_has_pending(const struct mux_session *restrict ss)
 {
 #if WITH_TLS
-	/* Set by the on_recv notifier during the last tls_recv. */
+	/* TLS progress may leave input buffered without further socket I/O. */
 	return ss->wire.tls_readable;
 #else
 	(void)ss;
@@ -365,6 +373,7 @@ void mux_wire_discard_buffers(struct mux_session *restrict ss)
 {
 	mux_frame_list_clear(&ss->wire.sendbuf, &ss->pool);
 	mux_frame_list_clear(&ss->wire.oobbuf, &ss->pool);
+	mux_frame_list_clear(&ss->wire.dgrambuf, &ss->pool);
 	ss->wire.sendbuf_staging = false;
 	bytebuf_reset(ss->wire.recvbuf);
 #if WITH_TLS
@@ -406,7 +415,7 @@ void mux_wire_sendbuf_push(
 enum wire_flush_result mux_wire_flush(struct mux_session *restrict ss)
 {
 #if WITH_TLS
-	if (ss->wire.tlsconn != NULL && !ss->conf.tls_socket_offload) {
+	if (ss->wire.tlsconn != NULL && !ss->wire.tls_offload) {
 		switch (wire_cipher_push(ss)) {
 		case 0:
 			return WIRE_FLUSH_DONE;
@@ -431,15 +440,22 @@ void mux_wire_set_tlsctx(
 
 /* on_send notifier: the library staged outbound ciphertext.  Mark the
  * transport write side pending so the session schedules a flush; the
- * cleared-each-pass tx_pending makes an over-eager set self-correcting. */
+ * cleared-each-pass tx_pending makes an over-eager set self-correcting.
+ *
+ * This one runs inside tls_handshake/tls_send/tls_recv/tls_shutdown, and
+ * on_recv inside tls_handshake/tls_send/tls_recv; both write ss->wire's
+ * flag bits through the ctx pointer registered with the connection, not
+ * through the caller's. A function that holds ss across such a call and
+ * touches those bits must not declare ss restrict, or the compiler may keep
+ * the flag byte in a register across the call and write the stale copy back. */
 static void wire_on_tls_send(void *ctx)
 {
 	struct mux_session *const restrict ss = ctx;
 	ss->wire.tx_pending = true;
 }
 
-/* on_recv notifier: the library holds buffered plaintext readable without
- * further I/O. */
+/* on_recv notifier: the library may hold buffered plaintext readable without
+ * further I/O; a spurious hint costs one tls_recv answered by WANT_READ. */
 static void wire_on_tls_recv(void *ctx)
 {
 	struct mux_session *const restrict ss = ctx;
@@ -451,20 +467,23 @@ bool mux_wire_tls_start(struct mux_session *restrict ss)
 	if (ss->wire.tlsctx == NULL && ss->wire.tlsconn == NULL) {
 		return true;
 	}
-	/* With socket offload the library drives the socket directly; without it
-	 * the connection is memory-transport, so pass fd=-1. */
-	const int tlsfd = ss->conf.tls_socket_offload ? ss->w_socket.fd : -1;
 	const struct tls_callback cb = {
 		.ctx = ss,
 		.on_send = wire_on_tls_send,
 		.on_recv = wire_on_tls_recv,
 	};
 	if (ss->wire.tlsconn == NULL) {
-		/* Outbound: create the client connection now, then bind the notifier. */
-		ss->wire.tlsconn = tls_client(ss->wire.tlsctx, tlsfd);
+		/* Outbound: create the client connection now, then bind the notifier.
+		 * With socket offload the library drives the socket directly; without
+		 * it the connection is memory-transport, so pass fd=-1.  Each dial
+		 * takes the mode from the current config and latches it. */
+		const bool offload = ss->conf.tls_socket_offload;
+		ss->wire.tlsconn = tls_client(
+			ss->wire.tlsctx, offload ? ss->w_socket.fd : -1);
 		if (ss->wire.tlsconn == NULL) {
 			return false;
 		}
+		ss->wire.tls_offload = offload;
 	}
 	/* Inbound: the accepted connection was created before this session
 	 * existed (the notifier ctx).  Either way, bind the notifier now. */
@@ -491,12 +510,14 @@ void mux_wire_tls_log_status(struct mux_session *restrict ss)
 #endif /* NDEBUG */
 
 void mux_wire_adopt_tlsconn(
-	struct mux_session *restrict ss, struct tls_connection *restrict conn)
+	struct mux_session *restrict ss, struct tls_connection *restrict conn,
+	const bool offload)
 {
 	if (ss->wire.tlsconn != NULL) {
 		tls_conn_free(ss->wire.tlsconn);
 	}
 	ss->wire.tlsconn = conn;
+	ss->wire.tls_offload = offload;
 	if (conn != NULL) {
 		/* The connection was created for the transient session that carried
 		 * the resume hello; rebind the I/O notifier to ss so it never fires
@@ -541,8 +562,10 @@ enum wire_shutdown_state mux_wire_shutdown(struct mux_session *restrict ss)
 		case TLS_ERROR_NONE:
 			/* Our close_notify is flushed (one-way); fall through to TCP
 			 * half-close; peer's close_notify is read later via
-			 * mux_wire_wait_eof; memory-transport: push alert first. */
-			if (!ss->conf.tls_socket_offload) {
+			 * mux_wire_wait_eof; memory-transport: push alert first.  A
+			 * retry after a blocked push lands here again, since a
+			 * repeat tls_shutdown only reports the alert already sent. */
+			if (!ss->wire.tls_offload) {
 				switch (mux_wire_flush(ss)) {
 				case WIRE_FLUSH_DONE:
 					break;
@@ -609,7 +632,7 @@ enum wire_eof_result mux_wire_wait_eof(struct mux_session *restrict ss)
 {
 	unsigned char buf[256];
 #if WITH_TLS
-	if (ss->wire.tlsconn != NULL && !ss->conf.tls_socket_offload) {
+	if (ss->wire.tlsconn != NULL && !ss->wire.tls_offload) {
 		/* Memory transport: drain the socket ourselves and feed the library
 		 * before checking for the peer's close_notify or stray data. */
 		size_t clen = sizeof(buf);
@@ -621,7 +644,16 @@ enum wire_eof_result mux_wire_wait_eof(struct mux_session *restrict ss)
 			return WIRE_EOF_ERROR;
 		}
 		if (clen == 0) {
-			return WIRE_EOF_CONFIRMED; /* peer closed (TCP FIN) */
+			/* TCP FIN: a confirmed close only behind the peer's
+			 * close_notify, which the library may still hold. */
+			size_t nread = sizeof(buf);
+			if (tls_recv(ss->wire.tlsconn, buf, &nread) ==
+			    TLS_ERROR_ZERO_RETURN) {
+				return WIRE_EOF_CONFIRMED;
+			}
+			LOGD_F("[fd:%d] connection closed without TLS close_notify",
+			       ss->w_socket.fd);
+			return WIRE_EOF_ERROR;
 		}
 		if (!tls_input(ss->wire.tlsconn, buf, clen)) {
 			LOGOOM();

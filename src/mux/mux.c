@@ -6,15 +6,16 @@
  * @brief Public mux API wrappers over the internal session machinery.
  */
 
-#include "mux/mux.h"
+#include "mux.h"
 
-#include "mux/estimator.h"
-#include "mux/frame.h"
-#include "mux/sched.h"
-#include "mux/session.h"
-#include "mux/stream.h"
-#include "mux/stream_io.h"
-#include "mux/wire.h"
+#include "estimator.h"
+#include "frame.h"
+#include "sched.h"
+#include "send.h"
+#include "session.h"
+#include "stream.h"
+#include "stream_io.h"
+#include "wire.h"
 
 #include "meta/minmax.h"
 #include "utils/debug.h"
@@ -134,6 +135,25 @@ void mux_session_stats(
 	out->bdp_tx = PUB_LOAD(ss->_pub_bdp_tx);
 }
 
+/* --- Datagram operations --- */
+
+bool mux_dgram_ready(const struct mux_session *ss)
+{
+	return ss->state == SESSION_ESTABLISHED && session_dgram_negotiated(ss);
+}
+
+bool mux_dgram_send(
+	struct mux_session *ss, const uint_least16_t flow, const void *buf,
+	const size_t len)
+{
+	return mux_session_send_dgram(ss, MUX_FLAG_PUSH, flow, buf, len);
+}
+
+void mux_dgram_close(struct mux_session *ss, const uint_least16_t flow)
+{
+	(void)mux_session_send_dgram(ss, MUX_FLAG_FIN, flow, NULL, 0);
+}
+
 /* --- Session mutators --- */
 
 void mux_set_config(
@@ -216,7 +236,12 @@ void mux_stream_io_stop(struct ev_loop *loop, mux_stream_io *restrict w)
 
 struct mux_stream *mux_stream_open(struct mux_session *ss)
 {
-	return mux_session_open_stream(ss);
+	struct mux_stream *const s = mux_session_open_stream(ss);
+	if (s != NULL) {
+		/* The application holds it until it gives it a mode or closes it. */
+		s->pending_attach = true;
+	}
+	return s;
 }
 
 void mux_stream_attach_fd(struct mux_stream *s, const int fd)
@@ -233,7 +258,7 @@ int mux_stream_send(
 	struct mux_stream *restrict s, const void *restrict buf,
 	size_t *restrict len)
 {
-	if (!stream_can_send_data(s)) {
+	if (!stream_may_originate(s)) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -281,7 +306,7 @@ int mux_stream_send(
 }
 
 int mux_stream_recv(
-	struct mux_stream *restrict s, void *restrict buf, size_t *restrict len)
+	struct mux_stream *s, void *restrict buf, size_t *restrict len)
 {
 	if (s->rst_received || s->aborted) {
 		errno = ECONNRESET;
@@ -295,8 +320,11 @@ int mux_stream_recv(
 			return -1;
 		}
 		/* CLOSE_WAIT (peer FIN) or CLOSING (both FINs): return EOF below.
-		 * On CLOSING the recv buffer is drained, so close now (idempotent). */
+		 * On CLOSING the recv buffer is drained, so close now (idempotent);
+		 * the caller must not use s after this return, so it is released
+		 * as if mux_stream_close() had been called. */
 		if (s->state == STREAM_CLOSING) {
+			s->user_closed = true;
 			mux_stream_do_close(s);
 		}
 		*len = 0;
@@ -332,7 +360,23 @@ void mux_stream_shutdown(struct mux_stream *s)
 void mux_stream_close(struct mux_stream *s)
 {
 	if (s->state == STREAM_CLOSED) {
+		mux_stream_do_release(s);
 		return;
+	}
+	/* Closed before it was given a mode: the library completes it. */
+	s->pending_attach = false;
+	if (!stream_has_mode(s)) {
+		if (s->state == STREAM_SYN_RECEIVED) {
+			/* Accepted but never answered: no SYN|ACK has left, so
+			 * there is nothing to close gracefully. Refuse it. */
+			mux_stream_abort(s, MUX_STATUS_REFUSED_STREAM);
+			return;
+		}
+		/* Opened but never given a mode: no socket will ever finish the
+		 * close, so complete it as a direct stream with no watcher, which
+		 * the close paths finish on their own once it is closed. */
+		s->is_direct = true;
+		s->direct.w_io = NULL;
 	}
 	/* Detach the user watcher first so the mux_stream_do_shutdown()/mux_stream_do_close()
 	 * below cannot feed it a re-entrant EV_READ/EV_WRITE callback while the

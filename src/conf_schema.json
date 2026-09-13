@@ -81,11 +81,11 @@
                     "type": "string"
                 },
                 "ciphersuites": {
-                    "description": "Colon-separated list of TLS 1.3 ciphersuites to allow.",
+                    "description": "Colon-separated list of TLS 1.3 ciphersuites to allow, by IANA name: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_AES_128_CCM_SHA256, TLS_AES_128_CCM_8_SHA256. These names work with both the OpenSSL and the mbedTLS build; an mbedTLS build also accepts mbedTLS's own spellings (e.g. TLS1-3-AES-128-GCM-SHA256), which OpenSSL does not recognize. With tls.psk only the SHA-256 suites of the list are used, in their listed order: a PSK is always bound to SHA-256 on both builds, and a list with no SHA-256 suite is refused.",
                     "type": "string"
                 },
                 "sni": {
-                    "description": "Server Name Indication sent in the client TLS handshake. Set to an empty string to omit the SNI extension entirely.",
+                    "description": "Server Name Indication sent in the client TLS handshake. Set to an empty string to omit the SNI extension entirely. Not sent with tls.psk, which has no certificate for the name to select.",
                     "type": "string",
                     "default": "example.com"
                 },
@@ -97,7 +97,7 @@
                     "description": "External pre-shared keys, keyed by peer identity. Values are lowercase hex (at least 32 octets) or '@path' to a file holding the same. Mutually exclusive with cert/key/authcerts: a PSK handshake sends no certificate in either direction. Generate with --genpsk; a hand-written key is unsafe, because the identity label published on the wire is derived from it. When dialing, the first entry is the one offered.",
                     "type": "object",
                     "additionalProperties": {
-                        "description": "Lowercase hex key, or '@path'. A map value, so it bypasses generated per-field checks; length and format are enforced by conf_check in conf.c instead.",
+                        "description": "Lowercase hex key, or '@path'. A map value, so it bypasses generated per-field checks; conf.c enforces length and format instead, on an inline key when the config is parsed and on an '@path' key once the file is loaded.",
                         "type": "string"
                     }
                 },
@@ -189,49 +189,49 @@
                     "minimum": 0
                 },
                 "connect_timeout": {
-                    "description": "Time limit in seconds for each TCP connect and handshake attempt. 0 = disabled (wait indefinitely).",
+                    "description": "Time limit in seconds for each TCP connect and handshake attempt. Positive values below 10 are raised to 10. 0 = disabled (wait indefinitely).",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 86400,
                     "default": 15
                 },
                 "keepalive": {
-                    "description": "Interval in seconds between one-way keepalive PROBE frames (encrypted TCP-keepalive over the tunnel). The session is declared dead after roughly 1.1x this with no inbound traffic. 0 = disabled.",
+                    "description": "Interval in seconds between keepalive PING frames, each answered by the peer (encrypted TCP-keepalive over the tunnel). The session is declared dead after keepalive + max(keepalive / 10, 90) seconds with no inbound traffic: 1.1x only from 900 up, e.g. 390 at 300, 7920 at the default 7200, and 100 at the floor of 10. Positive values below 10 are raised to 10. 0 = disabled.",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 86400,
                     "default": 7200
                 },
                 "send_timeout": {
-                    "description": "Seconds without send progress before the session is suspended and reconnected, enabling faster detection of stalled connections. 0 = disabled.",
+                    "description": "Seconds without send progress before the session is suspended and reconnected, enabling faster detection of stalled connections. Positive values below 10 are raised to 10. 0 = disabled.",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 86400,
                     "default": 15
                 },
                 "idle_timeout": {
-                    "description": "Seconds of inactivity with no open streams before a session is closed. 0 = disabled.",
+                    "description": "Seconds of inactivity with no open streams before a session is closed. Positive values below 10 are raised to 10. 0 = disabled.",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 86400,
                     "default": 0
                 },
                 "resume_timeout": {
-                    "description": "Seconds a suspended session is held on the server waiting for the client to reconnect. 0 = disabled (held indefinitely).",
+                    "description": "Seconds a suspended session is held on the server waiting for the client to reconnect. Positive values below 10 are raised to 10. 0 = disabled (held indefinitely).",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 86400,
                     "default": 600
                 },
                 "session_window": {
-                    "description": "Session-level send concurrency cap in bytes. 0 = automatic.",
+                    "description": "Session-level send concurrency cap in bytes. Rounded down to a multiple of 16384 (16 KiB), with a floor of 65536: any smaller nonzero value becomes 65536. 0 = automatic.",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 1073725440,
                     "default": 0
                 },
                 "stream_window": {
-                    "description": "Per-stream receive buffer size in bytes advertised to the peer. 0 = automatic.",
+                    "description": "Per-stream receive buffer size in bytes advertised to the peer. Rounded down to a multiple of 16384 (16 KiB), with a floor of 65536: any smaller nonzero value becomes 65536. 0 = automatic.",
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 1073725440,
@@ -252,20 +252,46 @@
                     "default": 16384
                 },
                 "mem_pressure": {
-                    "description": "Receive-buffer memory back-pressure thresholds. hi = 0 disables.",
+                    "description": "Per-session receive-buffer pressure thresholds for scaling new window grants. These thresholds do not cap receive-buffer memory. hi = 0 disables.",
                     "type": "object",
                     "properties": {
                         "hi": {
-                            "description": "Hard cap in bytes; receive windows are fully restricted at this level. 0 = disabled.",
+                            "description": "High watermark in buffered receive bytes; new window grants scale down linearly toward 1/8 between lo and hi and stay at that minimum above hi. At least one window unit is granted whenever that much credit is grantable. 0 = disabled.",
                             "type": "integer",
                             "minimum": 0,
                             "default": 0
                         },
                         "lo": {
-                            "description": "Soft cap in bytes; receive windows begin shrinking here. 0 = hi / 2.",
+                            "description": "Low watermark in buffered receive bytes; new window grants remain unscaled at or below this threshold. 0 = hi / 2.",
                             "type": "integer",
                             "minimum": 0,
                             "default": 0
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "lossymux": {
+                    "description": "Best-effort UDP relay over the mux session (the bilateral 'lossymux' hello extension). Active on a session only when both peers enable it.",
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "description": "Advertise the lossymux extension and bind a UDP socket on every 'listen' and 'identity.listen' address; inbound flows are relayed to the 'connect' target over UDP.",
+                            "type": "boolean",
+                            "default": false
+                        },
+                        "idle_timeout": {
+                            "description": "Seconds without a datagram in either direction before a UDP flow is dropped.",
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 86400,
+                            "default": 60
+                        },
+                        "queue": {
+                            "description": "Maximum datagrams queued per session awaiting transmission; a datagram arriving while the queue is full is dropped.",
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 65535,
+                            "default": 64
                         }
                     },
                     "additionalProperties": false

@@ -14,18 +14,18 @@
  * waiting for the next EV_WRITE.
  */
 
-#include "mux/recv.h"
+#include "recv.h"
 
-#include "mux/estimator.h"
-#include "mux/frame.h"
-#include "mux/handshake.h"
-#include "mux/mux.h"
-#include "mux/sched.h"
-#include "mux/send.h"
-#include "mux/session.h"
-#include "mux/stream.h"
-#include "mux/unacked.h"
-#include "mux/wire.h"
+#include "estimator.h"
+#include "frame.h"
+#include "handshake.h"
+#include "mux.h"
+#include "sched.h"
+#include "send.h"
+#include "session.h"
+#include "stream.h"
+#include "unacked.h"
+#include "wire.h"
 
 #include "algo/hashtable.h"
 #include "binary/serial.h"
@@ -80,8 +80,8 @@ validate_flags_by_stream(const struct mux_stream *s, const uint_fast8_t flags)
 		if (non_rst_flags == 0) {
 			return false;
 		}
-		/* Resume replay may duplicate a prior SYN|ACK; SYN becomes idempotent
-		 * once ACK is present and the frame can fall through normally. */
+		/* Resume replay may duplicate a prior SYN|ACK; accept any SYN that
+		 * carries ACK so dispatch_by_stream() can drop it idempotently. */
 		if ((non_rst_flags & MUX_FLAG_SYN) != 0) {
 			return (non_rst_flags & MUX_FLAG_ACK) != 0;
 		}
@@ -126,8 +126,36 @@ is_ignorable_unknown_terminal_frame(const struct mux_header *restrict hdr)
 	return (flags & (uint_fast8_t) ~(MUX_FLAG_ACK | MUX_FLAG_FIN)) == 0;
 }
 
+/* Deliver a PUSH frame's payload to s: count it into byt_push_recv, copy it
+ * into the stream, consume the frame, and feed the estimator.  Returns false
+ * when the copy freed the streams, and s with them: mux_stream_recv_copy() may
+ * mux_stream_abort on a recv-window overflow or bytebuf OOM, and on the last
+ * active stream of a draining session that cascades into
+ * mux_session_initiate_shutdown() -> mux_sched_free_streams() (frees s) +
+ * mux_wire_discard_buffers() (resets this recvbuf).  The frame is then left
+ * unconsumed, since the ring it sat in is already reset, and the caller must
+ * not touch s again. */
+static bool deliver_push_payload(
+	struct mux_session *ss, struct mux_stream *s,
+	const struct mux_header *restrict hdr, const size_t frame_size)
+{
+	COUNTER_ADD(ss->cnt.traffic.byt_push_recv, (uint_least64_t)hdr->length);
+	mux_stream_recv_copy(
+		s, bytebuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE,
+		hdr->length);
+	if (session_streams_freed(ss)) {
+		return false;
+	}
+	bytebuf_consume(ss->wire.recvbuf, frame_size);
+	if (ss->auto_stream_window || ss->auto_session_window) {
+		mux_estimator_add(ss, hdr->length);
+		mux_session_flush_oob(ss);
+	}
+	return true;
+}
+
 static void process_syn_payload(
-	struct mux_session *ss, struct mux_stream *restrict s,
+	struct mux_session *ss, struct mux_stream *s,
 	const struct mux_header *restrict hdr, const size_t frame_size)
 {
 	/* mux_stream_start() has already collapsed SYN_SENT before SYN|PUSH reaches here. */
@@ -158,47 +186,26 @@ static void process_syn_payload(
 				" length=%" PRIuLEAST16 " grant=%" PRIuLEAST32,
 				s->id, hdr->length, s->grant_sent);
 			mux_stream_abort(s, MUX_STATUS_FLOW_CONTROL_ERROR);
-			/* Same drain-cascade hazard as below: mux_stream_abort can free the
-			 * last active stream of a draining session, whose shutdown
-			 * resets this recvbuf -- do not consume a ring it already
-			 * reset. */
+			/* mux_stream_abort can free the last active stream of a
+			 * draining session, whose shutdown resets this recvbuf -- do
+			 * not consume a ring it already reset. */
 			if (session_streams_freed(ss)) {
 				return;
 			}
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
-		/* A fast-open payload is PUSH-frame payload like any other; count
-		 * it into byt_push_recv, matching the ordinary PUSH path in
-		 * dispatch_by_stream (mux.h documents no SYN exclusion). */
-		COUNTER_ADD(
-			ss->cnt.traffic.byt_push_recv,
-			(uint_least64_t)hdr->length);
-		mux_stream_recv_copy(
-			s,
-			bytebuf_read_ptr(ss->wire.recvbuf) +
-				MUX_FRAME_HEADER_SIZE,
-			hdr->length);
-		/* Same drain-cascade hazard as dispatch_by_stream()'s PUSH branch:
-		 * a fast-open payload can mux_stream_abort the last active stream of a
-		 * draining session, whose shutdown frees the streams and resets this
-		 * recvbuf -- do not consume a ring the cascade already reset. */
-		if (session_streams_freed(ss)) {
-			return;
-		}
-		bytebuf_consume(ss->wire.recvbuf, frame_size);
-		if (ss->auto_stream_window || ss->auto_session_window) {
-			mux_estimator_add(ss, hdr->length);
-			mux_session_flush_oob(ss);
-		}
+		/* A fast-open payload is PUSH-frame payload like any other (mux.h
+		 * documents no SYN exclusion from byt_push_recv). */
+		(void)deliver_push_payload(ss, s, hdr, frame_size);
 		return;
 	}
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 }
 
 /* Report stream establishment latency once, on the first SYN|ACK. */
-static void stream_report_established(
-	struct mux_session *restrict ss, struct mux_stream *restrict s)
+static void
+stream_report_established(struct mux_session *ss, struct mux_stream *s)
 {
 	if (s->syn_sent_ns <= 0) {
 		return;
@@ -222,7 +229,7 @@ static void stream_report_established(
 }
 
 static void dispatch_by_stream(
-	struct mux_session *ss, struct mux_stream *restrict s,
+	struct mux_session *ss, struct mux_stream *s,
 	const struct mux_header *restrict hdr)
 {
 	const uint_fast16_t stream_id = hdr->stream_id;
@@ -331,10 +338,13 @@ static void dispatch_by_stream(
 	}
 
 	/* SYN|ACK completes establishment.  A retransmit on resume may arrive
-	 * when already ESTABLISHED/FIN_WAIT; consume idempotently. */
+	 * in any state validate_flags_by_stream() lets a SYN|ACK through past
+	 * SYN_SENT; consume idempotently. */
 	if (flags & MUX_FLAG_SYN) {
 		if (s->state != STREAM_SYN_SENT) {
-			/* Idempotent retransmit: SYN|ACK already processed. */
+			/* Idempotent retransmit: the original SYN|ACK already granted
+			 * its credit and delivered its payload, so drop the frame
+			 * whole rather than double-count either. */
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
 			return;
 		}
@@ -379,27 +389,9 @@ static void dispatch_by_stream(
 	 * the "peer ACK restored send credit" DEBUG log on the same condition. */
 
 	if (LIKELY((flags & MUX_FLAG_PUSH) && hdr->length > 0)) {
-		COUNTER_ADD(
-			ss->cnt.traffic.byt_push_recv,
-			(uint_least64_t)hdr->length);
-		mux_stream_recv_copy(
-			s,
-			bytebuf_read_ptr(ss->wire.recvbuf) +
-				MUX_FRAME_HEADER_SIZE,
-			hdr->length);
-		/* mux_stream_recv_copy() may mux_stream_abort on a recv-window/flow-control
-		 * overflow or bytebuf OOM; on the last active stream of a draining
-		 * session that cascades into mux_session_initiate_shutdown() ->
-		 * mux_sched_free_streams() (frees s) + mux_wire_discard_buffers() (resets
-		 * this recvbuf). The consume below would then run on a reset ring and
-		 * mux_stream_recv_fin(s) on freed memory, so stop once the free shows. */
-		if (session_streams_freed(ss)) {
+		/* s is freed once delivery reports false: no mux_stream_recv_fin. */
+		if (!deliver_push_payload(ss, s, hdr, frame_size)) {
 			return;
-		}
-		bytebuf_consume(ss->wire.recvbuf, frame_size);
-		if (ss->auto_stream_window || ss->auto_session_window) {
-			mux_estimator_add(ss, hdr->length);
-			mux_session_flush_oob(ss);
 		}
 		if (flags & MUX_FLAG_FIN) {
 			mux_stream_recv_fin(s);
@@ -425,6 +417,16 @@ static void dispatch_no_stream(
 	 * session before dispatch reaches here, so no reserved bit can be set at
 	 * this point -- the branches below need only consider MUX_FLAG_MASK bits. */
 	ASSERT((flags & (uint_fast8_t)(~MUX_FLAG_MASK)) == 0);
+	if (stream_id != STREAMID_CTRL &&
+	    !is_valid_peer_stream_id(ss, stream_id)) {
+		MUX_LOG_F(
+			DEBUG, ss,
+			"invalid peer stream id parity: stream=%" PRIuFAST16
+			", closing connection",
+			stream_id);
+		mux_session_reset(ss);
+		return;
+	}
 
 	if (flags & MUX_FLAG_RST) {
 		MUX_LOG_F(
@@ -444,16 +446,6 @@ static void dispatch_no_stream(
 				", closing connection",
 				(uint_least8_t)(flags & MUX_FLAG_MASK),
 				stream_id);
-			mux_session_reset(ss);
-			return;
-		}
-
-		if (!is_valid_peer_stream_id(ss, hdr->stream_id)) {
-			MUX_LOG_F(
-				DEBUG, ss,
-				"invalid peer stream id parity: stream=%" PRIuLEAST16
-				", closing connection",
-				hdr->stream_id);
 			mux_session_reset(ss);
 			return;
 		}
@@ -492,7 +484,7 @@ static void dispatch_no_stream(
 		}
 
 		if (ss->conf.max_streams > 0 &&
-		    table_size(ss->sched.streams) - ss->sched.num_tombstones >=
+		    table_size(ss->sched.streams) - ss->sched.num_closed >=
 			    (size_t)ss->conf.max_streams) {
 			MUX_LOG_F(
 				VERBOSE, ss,
@@ -590,6 +582,11 @@ static void dispatch_no_stream(
 				ss, stream_id, MUX_FLAG_RST,
 				MUX_STATUS_REFUSED_STREAM);
 			s->aborted = true;
+			/* Rejecting relinquishes the stream even when the callback
+			 * started direct I/O on it first. */
+			if (s->is_direct) {
+				s->user_closed = true;
+			}
 			mux_stream_do_close(s);
 			bytebuf_consume(ss->wire.recvbuf, frame_size);
 			return;
@@ -620,13 +617,57 @@ static void dispatch_no_stream(
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 }
 
-/* Handle a control-stream frame.  Returns false if the session was reset and
- * frame dispatch should stop. */
+/* Deliver a lossymux stream-0 frame (spec §5.2.3.3) to the owner: a DATAGRAM
+ * (flags PUSH) or a FLOW-CLOSE (flags FIN, no payload).  Any other shape, flow
+ * id 0, or a session that did not negotiate the extension is a reserved frame
+ * and ignored.  The caller consumes the frame afterwards: the callback borrows
+ * the payload in place. */
+static void dispatch_dgram_frame(
+	struct mux_session *ss, const struct mux_header *restrict hdr)
+{
+	if (!session_dgram_negotiated(ss) || hdr->extra == 0) {
+		return;
+	}
+	if (hdr->flags == MUX_FLAG_PUSH) {
+		COUNTER_ADD(ss->cnt.dgram.pkt_dgram_recv, 1);
+		COUNTER_ADD(ss->cnt.dgram.byt_dgram_recv, hdr->length);
+		if (ev_is_active(&ss->w_idle_timeout)) {
+			ev_timer_again(ss->loop, &ss->w_idle_timeout);
+		}
+		if (ss->callbacks.on_dgram != NULL) {
+			const unsigned char *const payload =
+				bytebuf_read_ptr(ss->wire.recvbuf) +
+				MUX_FRAME_HEADER_SIZE;
+			ss->callbacks.on_dgram(
+				ss->userdata, ss, hdr->extra, payload,
+				hdr->length);
+		}
+	} else if (hdr->flags == MUX_FLAG_FIN && hdr->length == 0) {
+		if (ss->callbacks.on_dgram_close != NULL) {
+			ss->callbacks.on_dgram_close(
+				ss->userdata, ss, hdr->extra);
+		}
+	}
+}
+
+/* Handle a control-stream frame.  Returns false once the session has left
+ * SESSION_ESTABLISHED -- reset here or by a handler it calls (e.g.
+ * mux_session_recv_ping on an oversized PING) -- and frame dispatch must
+ * stop. */
 static bool dispatch_ctrl_frame(
-	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	struct mux_session *ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
 	if (hdr->flags & MUX_FLAG_ACK) {
+		if (hdr->flags != MUX_FLAG_ACK || hdr->length != 0) {
+			MUX_LOG_F(
+				DEBUG, ss,
+				"invalid session ACK shape: flags=0x%02" PRIxLEAST8
+				" length=%" PRIuLEAST16 ", closing connection",
+				(uint_least8_t)hdr->flags, hdr->length);
+			mux_session_reset(ss);
+			return false;
+		}
 		MUX_LOG_F(
 			DEBUG, ss,
 			"session ACK received: acked=%" PRIuLEAST16
@@ -663,9 +704,12 @@ static bool dispatch_ctrl_frame(
 			break;
 		}
 	} else {
+		/* A lossymux frame, or else a reserved one to discard (spec
+		 * §4.1); consumed either way once its callback returns. */
+		dispatch_dgram_frame(ss, hdr);
 		bytebuf_consume(ss->wire.recvbuf, frame_size);
 	}
-	return true;
+	return ss->state == SESSION_ESTABLISHED;
 }
 
 static void dispatch_frame(struct mux_session *ss)
@@ -741,13 +785,6 @@ static void dispatch_frame(struct mux_session *ss)
 			if (!dispatch_ctrl_frame(ss, &hdr, frame_size)) {
 				return;
 			}
-			/* dispatch_ctrl_frame can reset the session and still return
-			 * true (e.g. mux_session_recv_ping's oversized-PING path), so apply
-			 * the same post-dispatch state check the stream path below does
-			 * rather than continuing to dispatch on a CLOSED session. */
-			if (ss->state != SESSION_ESTABLISHED) {
-				return;
-			}
 			continue;
 		}
 
@@ -796,7 +833,7 @@ static size_t recv_window(const struct mux_session *restrict ss)
 {
 	const size_t frame = (size_t)MUX_FRAME_HEADER_SIZE + ss->max_payload;
 #if WITH_TLS
-	if (ss->conf.tls_socket_offload) {
+	if (ss->wire.tlsconn != NULL && ss->wire.tls_offload) {
 		return frame;
 	}
 #endif
@@ -809,7 +846,7 @@ static size_t recv_window(const struct mux_session *restrict ss)
 /* Read and dispatch one TLS record.  Returns true when a record was
  * successfully received and dispatched; returns false when no data is
  * available (EAGAIN) or on error. */
-static bool recv_one(struct mux_session *restrict ss)
+static bool recv_one(struct mux_session *ss)
 {
 	/* Offer the read-ahead window so one plaintext recv() can drain several
 	 * buffered frames per syscall.  The ring still grows on demand for a larger
@@ -858,7 +895,7 @@ static bool recv_one(struct mux_session *restrict ss)
 	return true;
 }
 
-void mux_session_on_recv(struct mux_session *restrict ss)
+void mux_session_on_recv(struct mux_session *ss)
 {
 	if (recv_one(ss)) {
 		while (ss->state == SESSION_ESTABLISHED &&
@@ -879,16 +916,30 @@ void mux_session_on_recv(struct mux_session *restrict ss)
 	mux_session_flush_resp(ss);
 }
 
-void mux_session_dispatch_pending(struct mux_session *restrict ss)
+void mux_session_dispatch_pending(struct mux_session *ss)
 {
 	dispatch_frame(ss);
+}
+
+/* A completed keepalive exchange -- a PONG received, or a PING answered -- has
+ * carried a frame each way, so restart the keepalive interval from it.  Other
+ * traffic does not defer the next PING: an inbound frame nobody answers (a
+ * PROBE) leaves the NAT binding unrefreshed, and an outbound one nobody answers
+ * (a credit grant) leaves w_timeout unfed. */
+static void session_defer_keepalive(struct mux_session *restrict ss)
+{
+	const double keepalive = mux_keepalive_interval(ss);
+	ev_timer_set(&ss->w_keepalive, 0.0, keepalive);
+	if (ev_is_active(&ss->w_keepalive)) {
+		ev_timer_again(ss->loop, &ss->w_keepalive);
+	}
 }
 
 /* Handle an inbound PING (spec §5.3.2): queue a PONG echoing the payload
  * byte-for-byte.  Silently discards the PING when rate-limited; closes the
  * connection on an oversized PING, which cannot be echoed. */
 void mux_session_recv_ping(
-	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
+	struct mux_session *ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
 	/* A PONG must echo the PING payload byte-for-byte into one of our frames,
@@ -918,13 +969,16 @@ void mux_session_recv_ping(
 		ss, MUX_CTRL_PONG, ping_payload, hdr->length);
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 	if (!queued) {
-		/* OOM: PONG dropped.  OOB is never retransmitted, so the peer's
-		 * in-flight BDP probe stalls until the transport is re-established
-		 * (suspend clears OOB state); liveness is unaffected (no PONG dep). */
+		/* OOM: PONG dropped, and OOB is never retransmitted.  The peer
+		 * abandons an unanswered BDP probe after MUX_PING_PROBE_TIMEOUT_NS;
+		 * an unanswered keepalive PING leaves the peer's inactivity
+		 * deadline fed only by other traffic until its next PING.  Nothing
+		 * went out, so our own keepalive interval is not restarted. */
 		return;
 	}
 
 	ss->ping_recv_last_ns = now;
+	session_defer_keepalive(ss);
 	mux_session_flush_oob(ss);
 }
 
@@ -978,13 +1032,15 @@ static void session_update_stream_window(
 		window_bytes, (size_t)ss->stream_window * MUX_WINDOW_UNIT);
 }
 
-/* Handle an inbound PONG (spec §5.3.3): feed the echoed timestamp into the
- * estimator, apply its BDP to the live window floors, and reset the keepalive
- * timer so a successful PONG always defers the next probe. */
+/* Handle an inbound PONG (spec §5.3.3): reset the keepalive timer so any PONG
+ * defers the next keepalive PING, then feed an estimator-sized echoed timestamp
+ * into the estimator and apply its BDP to the live window floors.  A shorter
+ * payload answers a keepalive PING and carries no RTT sample. */
 void mux_session_recv_pong(
 	struct mux_session *restrict ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
+	session_defer_keepalive(ss);
 	if (hdr->length < MUX_PING_PAYLOAD_SIZE) {
 		bytebuf_consume(ss->wire.recvbuf, frame_size);
 		return;
@@ -1002,14 +1058,6 @@ void mux_session_recv_pong(
 	if (ss->auto_session_window) {
 		mux_session_update_session_window(
 			ss, mux_estimator_tx_window_size(&ss->estimator));
-	}
-
-	/* Any PONG confirms the link is alive: reset the keepalive deadline
-	 * regardless of which path sent the PING. */
-	const double keepalive = mux_keepalive_interval(ss);
-	ev_timer_set(&ss->w_keepalive, 0.0, keepalive);
-	if (ev_is_active(&ss->w_keepalive)) {
-		ev_timer_again(ss->loop, &ss->w_keepalive);
 	}
 }
 

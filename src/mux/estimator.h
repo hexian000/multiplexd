@@ -9,7 +9,7 @@
 #ifndef MUX_ESTIMATOR_H
 #define MUX_ESTIMATOR_H
 
-#include "mux/mux.h"
+#include "mux.h"
 
 #include "algo/wndfilter.h"
 

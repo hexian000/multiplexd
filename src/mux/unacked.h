@@ -63,8 +63,16 @@ struct unacked_ctx {
 	 * original is validly peeked; consumed by mux_unacked_track_sent's retire
 	 * branch to advance retransmitted_frames without re-peeking the ring (which
 	 * would reopen the #47 use-after-free). Valid only while retransmit_copy is
-	 * non-NULL. */
+	 * non-NULL. Decremented alongside retransmit_copy_sent when a peer ACK
+	 * trims into that entry mid-flight, so the retire branch still adds the
+	 * entry's current unacked_count. */
 	size_t retransmit_copy_count;
+	/* Sub-frames of the in-flight replay copy already fully written (a
+	 * partial write can complete a coalesced copy's leading sub-frames) and
+	 * not yet trimmed by a peer ACK; the peer may acknowledge them before the
+	 * copy retires, so mux_unacked_ack_recv's replay bound admits them. Valid
+	 * only while retransmit_copy is non-NULL. */
+	size_t retransmit_copy_sent;
 };
 
 /* Position the resume-replay cursor at a boundary (0 to arm replay from the
@@ -92,7 +100,16 @@ struct unacked_ack_result {
  * and hello frames, retire retransmit copies (advancing the replay cursor), and
  * push the rest for possible resume replay.  Takes ownership of frame. */
 void mux_unacked_track_sent(
-	struct mux_session *restrict ss, struct mux_frame *restrict frame);
+	struct mux_session *ss, struct mux_frame *restrict frame);
+
+/* Account @p frame's fully written non-stream-0 sub-frames after a partial
+ * write, because the peer may ACK them before the remainder is flushed.
+ * @p frame is the sendbuf head. A replay copy advances retransmit_copy_sent;
+ * other entries copy the completed prefix into the ring. Cut an accounted
+ * prefix from @p frame so pos/len cover only the untracked remainder.
+ * Completed stream-0 controls alone need no allocation. May reset the
+ * session, freeing @p frame, if committed frames cannot be recorded. */
+void mux_unacked_track_partial(struct mux_session *ss, struct mux_frame *frame);
 
 /* Trim count logical frames from the unacked ring; see struct
  * unacked_ack_result.  Internal primitive shared by mux_unacked_ack_recv and
@@ -103,7 +120,8 @@ mux_unacked_ack_trim(struct mux_session *restrict ss, uint_fast32_t count);
 
 /* Handle a session-level ACK from a peer frame received during normal
  * operation (dispatch_ctrl_frame's MUX_FLAG_ACK path). Bounds count by what
- * has actually been retransmitted so far when mid-replay, then trims via
+ * has actually been retransmitted so far when mid-replay (including the
+ * in-flight copy's fully written sub-frames), then trims via
  * mux_unacked_ack_trim; see struct unacked_ack_result. */
 struct unacked_ack_result
 mux_unacked_ack_recv(struct mux_session *restrict ss, uint_fast32_t count);

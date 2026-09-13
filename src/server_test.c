@@ -19,6 +19,7 @@
 
 #include "algo/hashtable.h"
 #include "os/socket.h"
+#include "sync/shared_mutex.h"
 #include "sync/task.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
@@ -27,8 +28,10 @@
 
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <signal.h>
-#if WITH_THREADS
+#if WITH_THREADS || defined(SERVER_TEST_WRAP_REALLOC)
 #include <stdatomic.h>
 #endif
 #include <stdbool.h>
@@ -37,9 +40,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/types.h>
+#if WITH_THREADS
+#include <threads.h>
+#endif
 #include <time.h>
 #include <unistd.h>
+
+#ifdef SERVER_TEST_WRAP_REALLOC
+/* Fail only growth of the armed array, once. Tunnel-thread allocations cannot
+ * consume this injection, and the cleanup prevents it reaching a later case. */
+static atomic_uintptr_t fail_realloc_ptr;
+void *__real_realloc(void *ptr, size_t size);
+void *__wrap_realloc(void *ptr, size_t size);
+
+void *__wrap_realloc(void *ptr, size_t size)
+{
+	uintptr_t expected = (uintptr_t)ptr;
+	if (expected != 0 &&
+	    atomic_compare_exchange_strong_explicit(
+		    &fail_realloc_ptr, &expected, 0, memory_order_relaxed,
+		    memory_order_relaxed)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return __real_realloc(ptr, size);
+}
+
+static void clear_realloc_failure(void *data)
+{
+	(void)data;
+	atomic_store_explicit(&fail_realloc_ptr, 0, memory_order_relaxed);
+}
+#endif /* SERVER_TEST_WRAP_REALLOC */
 
 /* I/O wait timeouts, generous on purpose: the bound only bites on genuine
  * failure, with headroom for host clock anomalies (e.g. CLOCK_MONOTONIC stalls
@@ -104,6 +136,10 @@ struct test_fixture {
 
 	struct mock_server backend_a;
 	struct mock_server backend_b;
+	/* lossymux: UDP echo backends on each TCP backend's port (the connect
+	 * address serves both protocols); fd -1 when not set up. */
+	ev_io udp_echo_a;
+	ev_io udp_echo_b;
 };
 
 static const char *g_setup_stage = "init";
@@ -727,6 +763,12 @@ static struct config *make_config(
 				.stream_window = 2,
 				.session_window = 256,
 				.max_frame_payload = mux_session_config_default.max_frame_payload,
+				.lossymux_idle_timeout =
+					mux_session_config_default
+						.lossymux_idle_timeout,
+				.lossymux_queue =
+					mux_session_config_default
+						.lossymux_queue,
 			},
 		.mux_tcp =
 			{
@@ -785,34 +827,17 @@ struct wait_stats {
 static struct wait_stats wait_stats_snapshot(const struct server *restrict s)
 {
 	struct wait_stats st = { 0 };
-#if WITH_THREADS
-	const uint_least64_t session_connect = atomic_load_explicit(
-		&s->counters.num_session_connect, memory_order_relaxed);
-	const uint_least64_t session_connected = atomic_load_explicit(
-		&s->counters.num_session_connected, memory_order_relaxed);
-	const uint_least64_t session_disconnected = atomic_load_explicit(
-		&s->counters.num_session_disconnected, memory_order_relaxed);
-#else /* WITH_THREADS */
-	const uint_least64_t session_connect = s->counters.num_session_connect;
-	const uint_least64_t session_connected =
-		s->counters.num_session_connected;
-	const uint_least64_t session_disconnected =
-		s->counters.num_session_disconnected;
-#endif /* WITH_THREADS */
-	st.num_established_sessions =
-		(size_t)(session_connected - session_disconnected);
-	st.num_halfopen_sessions =
-		(size_t)(session_connect - session_connected);
-	struct server_stats *const restrict snap = server_stats(s, true);
+	struct server_stats *const restrict snap = server_stats(s, false);
 	if (snap != NULL) {
+		st.num_established_sessions = snap->num_sessions;
+		st.num_halfopen_sessions = snap->num_session_halfopen;
+		/* Logical completion precedes tombstone reclamation; this wait
+		 * counts unfinished streams, not still-allocated stream objects. */
 		st.num_streams = (size_t)((snap->num_stream_opened +
 					   snap->num_stream_accepted) -
 					  (snap->num_stream_succeeded +
 					   snap->num_stream_failed));
-		st.num_halfopen_streams =
-			(size_t)((snap->num_stream_opened +
-				  snap->num_stream_accepted) -
-				 snap->num_stream_established);
+		st.num_halfopen_streams = snap->num_stream_halfopen;
 		free(snap);
 	}
 	return st;
@@ -971,8 +996,59 @@ wait_for_streams_exact(struct test_fixture *restrict fx, const size_t expected)
 	return ret;
 }
 
-static int
-fixture_setup(struct test_fixture *restrict fx, const enum mock_mode mode)
+/* Echo every datagram back to its sender. */
+static void udp_echo_cb(struct ev_loop *loop, ev_io *w, const int revents)
+{
+	(void)loop;
+	(void)revents;
+	for (;;) {
+		unsigned char buf[2048];
+		union sockaddr_max from;
+		socklen_t from_len = sizeof(from);
+		const ssize_t n = recvfrom(
+			w->fd, buf, sizeof(buf), MSG_DONTWAIT, &from.sa,
+			&from_len);
+		if (n < 0) {
+			return;
+		}
+		(void)sendto(w->fd, buf, (size_t)n, 0, &from.sa, from_len);
+	}
+}
+
+/* Bind a UDP echo on 127.0.0.1:port, watched by w on loop. */
+static int udp_echo_start(ev_io *w, struct ev_loop *loop, const int port)
+{
+	const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (fd < 0) {
+		return -1;
+	}
+	struct sockaddr_in sa = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+		.sin_port = htons((uint16_t)port),
+	};
+	if (bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		(void)close(fd);
+		return -1;
+	}
+	ev_io_init(w, udp_echo_cb, fd, EV_READ);
+	ev_io_start(loop, w);
+	return 0;
+}
+
+static void udp_echo_stop(ev_io *w, struct ev_loop *loop)
+{
+	if (w->fd < 0) {
+		return;
+	}
+	ev_io_stop(loop, w);
+	(void)close(w->fd);
+	ev_io_set(w, -1, EV_READ);
+}
+
+static int fixture_setup_ex(
+	struct test_fixture *restrict fx, const enum mock_mode mode,
+	const bool lossymux)
 {
 	g_setup_stage = "fixture_init";
 	*fx = (struct test_fixture){
@@ -987,6 +1063,8 @@ fixture_setup(struct test_fixture *restrict fx, const enum mock_mode mode)
 		.backend_a = { .listen_fd = -1, .port = -1 },
 		.backend_b = { .listen_fd = -1, .port = -1 },
 	};
+	ev_io_init(&fx->udp_echo_a, udp_echo_cb, -1, EV_READ);
+	ev_io_init(&fx->udp_echo_b, udp_echo_cb, -1, EV_READ);
 	g_setup_stage = "ev_loop_new";
 	fx->loop = ev_loop_new(EVFLAG_AUTO);
 	if (fx->loop == NULL) {
@@ -1001,6 +1079,17 @@ fixture_setup(struct test_fixture *restrict fx, const enum mock_mode mode)
 	if (mock_server_start(&fx->backend_b, fx->loop, mode) != 0) {
 		return -1;
 	}
+	if (lossymux) {
+		g_setup_stage = "udp_echo_start";
+		if (udp_echo_start(
+			    &fx->udp_echo_a, fx->loop, fx->backend_a.port) !=
+			    0 ||
+		    udp_echo_start(
+			    &fx->udp_echo_b, fx->loop, fx->backend_b.port) !=
+			    0) {
+			return -1;
+		}
+	}
 
 	char connect_a[64];
 	(void)snprintf(
@@ -1011,6 +1100,7 @@ fixture_setup(struct test_fixture *restrict fx, const enum mock_mode mode)
 	if (fx->conf_a == NULL) {
 		return -1;
 	}
+	fx->conf_a->mux.lossymux = lossymux;
 	g_setup_stage = "server_a_create";
 	fx->srv_a = server_new(fx->loop, fx->conf_a);
 	if (fx->srv_a == NULL) {
@@ -1040,6 +1130,7 @@ fixture_setup(struct test_fixture *restrict fx, const enum mock_mode mode)
 	if (fx->conf_b == NULL) {
 		return -1;
 	}
+	fx->conf_b->mux.lossymux = lossymux;
 	g_setup_stage = "server_b_create";
 	fx->srv_b = server_new(fx->loop, fx->conf_b);
 	if (fx->srv_b == NULL) {
@@ -1068,6 +1159,12 @@ fixture_setup(struct test_fixture *restrict fx, const enum mock_mode mode)
 	}
 	g_setup_stage = "ok";
 	return 0;
+}
+
+static int
+fixture_setup(struct test_fixture *restrict fx, const enum mock_mode mode)
+{
+	return fixture_setup_ex(fx, mode, false);
 }
 
 static int connect_and_wait_echo(
@@ -1141,6 +1238,10 @@ static void fixture_teardown(struct test_fixture *restrict fx)
 
 	mock_server_stop(&fx->backend_b);
 	mock_server_stop(&fx->backend_a);
+	if (fx->loop != NULL) {
+		udp_echo_stop(&fx->udp_echo_b, fx->loop);
+		udp_echo_stop(&fx->udp_echo_a, fx->loop);
+	}
 
 	if (fx->loop != NULL) {
 		ev_loop_destroy(fx->loop);
@@ -1159,10 +1260,10 @@ static void fixture_teardown(struct test_fixture *restrict fx)
 /* Minimal established-tunnel builder for the identity-listener offline check
  * below (server_offline_listeners reads only tunnel_state via
  * listener_has_live_tunnel). Mirrors api_server_test's helper. */
-static bool ol_verify_peer(void *user, const char *peer_id)
+static bool ol_verify_peer(void *user, const char *peer_identity)
 {
 	(void)user;
-	(void)peer_id;
+	(void)peer_identity;
 	return false;
 }
 static uint_least64_t ol_alloc_index(void *user)
@@ -1182,8 +1283,9 @@ static void ol_flush_tasks(void *user)
 }
 #endif /* WITH_THREADS */
 
-static struct tunnel *
-ol_make_established_tunnel(struct server *restrict srv, const char *peer_id)
+/* A dialed tunnel that is never started: its session stays in INIT, which
+ * reads as MUX_STATE_CONNECT -- a pool member that cannot carry a stream. */
+static struct tunnel *ol_make_tunnel(struct server *restrict srv)
 {
 	static const struct tunnel_callbacks cb = { 0 };
 	static const unsigned char session_id[MUX_SESSION_ID_LEN] = { 0 };
@@ -1219,10 +1321,14 @@ ol_make_established_tunnel(struct server *restrict srv, const char *peer_id)
 		.connect_addr = "127.0.0.1:1",
 		.forward_addr = NULL,
 		.identity = "self",
-		.peer_id = peer_id,
 		.cnt = &cnts,
 	};
-	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	return tunnel_new(&ctx, &opts);
+}
+
+static struct tunnel *ol_make_established_tunnel(struct server *restrict srv)
+{
+	struct tunnel *const t = ol_make_tunnel(srv);
 	if (t == NULL) {
 		return NULL;
 	}
@@ -1269,6 +1375,12 @@ T_DECLARE_CASE(test_server_offline_listeners_identity_branch)
 			.nodelay = true,
 		},
 	};
+	struct identity_peer peers[] = {
+		{ .id = "peer-live", .listen = "127.0.0.1:1" },
+		{ .id = "peer-off", .listen = "127.0.0.1:2" },
+	};
+	conf.identity.peers = peers;
+	conf.identity.peers_count = 2;
 	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
 	struct server srv = { .conf = &conf, .loop = loop };
@@ -1279,8 +1391,7 @@ T_DECLARE_CASE(test_server_offline_listeners_identity_branch)
 	});
 	T_CHECK(srv.identities != NULL);
 
-	struct tunnel *const live =
-		ol_make_established_tunnel(&srv, "peer-live");
+	struct tunnel *const live = ol_make_established_tunnel(&srv);
 	T_CHECK(live != NULL);
 	struct tunnel *live_arr[1] = { live };
 	struct identity_listener sl_live = {
@@ -1358,6 +1469,120 @@ T_DECLARE_CASE(test_server_offline_listeners_idle_timeout_scoped_to_mux_connect)
 	T_EXPECT_EQ(server_offline_listeners(&srv, NULL, NULL), (size_t)1);
 }
 
+/* Historical failed negotiations and streams must not look half-open once
+ * their gauges return to zero. Both readiness predicates consume this view. */
+T_DECLARE_CASE(test_server_wait_stats_ignores_historical_failures)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	fx.srv_a->counters.num_session_connect++;
+	fx.srv_b->counters.num_session_connect++;
+	fx.srv_a->counters.closed.num_stream_opened++;
+	fx.srv_a->counters.closed.num_stream_failed++;
+	fx.srv_b->counters.closed.num_stream_opened++;
+	fx.srv_b->counters.closed.num_stream_failed++;
+	const struct wait_stats st = wait_stats_snapshot(fx.srv_a);
+	const int sessions_ready = sessions_ready_wait_predicate(&fx);
+	struct streams_wait_ctx ctx = { .fx = &fx, .expected = 0 };
+	const int streams_ready = streams_exact_wait_predicate(&ctx);
+	fixture_teardown(&fx);
+	T_EXPECT_EQ(st.num_halfopen_sessions, (size_t)0);
+	T_EXPECT_EQ(st.num_halfopen_streams, (size_t)0);
+	T_EXPECT_EQ(sessions_ready, 1);
+	T_EXPECT_EQ(streams_ready, 1);
+}
+
+/* A global idle timeout does not make passive identity routes dialable.
+ * The exemption follows a configured dial-out in that exact pool. */
+T_DECLARE_CASE(test_server_offline_ignores_routing_only_peer)
+{
+	struct config *const conf =
+		make_config("127.0.0.1:0", NULL, NULL, NULL);
+	T_CHECK(conf != NULL);
+	conf->identity.peers = calloc(1, sizeof(conf->identity.peers[0]));
+	T_CHECK(conf->identity.peers != NULL);
+	conf->identity.peers_count = 1;
+	conf->identity.peers[0].id = strdup("routing-only");
+	T_CHECK(conf->identity.peers[0].id != NULL);
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	struct server *const srv = server_new(loop, conf);
+	T_CHECK(srv != NULL);
+	const bool started = server_start(srv);
+	const size_t offline = server_offline_listeners(srv, NULL, NULL);
+	server_stop(srv);
+	server_free(srv);
+	conf_free(conf);
+	ev_loop_destroy(loop);
+	T_EXPECT(started);
+	T_EXPECT_EQ(offline, (size_t)0);
+}
+
+T_DECLARE_CASE(test_server_offline_passive_identity_with_idle_timeout)
+{
+	struct config *const conf = make_config(NULL, NULL, NULL, NULL);
+	T_CHECK(conf != NULL);
+	conf->mux.idle_timeout = 60;
+	struct identity_peer peers[] = {
+		{ .id = "passive", .listen = "127.0.0.1:1" },
+		{ .id = "outbound", .listen = "127.0.0.1:2" },
+	};
+	conf->identity.peers = peers;
+	conf->identity.peers_count = 2;
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	struct server srv = { .conf = conf, .loop = loop };
+	srv.identities = table_new(&TABLE_OPTS_STR);
+	T_CHECK(srv.identities != NULL);
+	struct tunnel *const dialed = ol_make_tunnel(&srv);
+	T_CHECK(dialed != NULL);
+	struct tunnel *members[] = { dialed };
+	struct identity_listener passive = { .peer_identity = "passive" };
+	struct identity_listener outbound = {
+		.peer_identity = "outbound",
+		.tunnels = members,
+		.num_tunnels = 1,
+	};
+	void *slot = &passive;
+	srv.identities =
+		table_set(srv.identities, passive.peer_identity, &slot);
+	T_CHECK(slot == NULL);
+	slot = &outbound;
+	srv.identities =
+		table_set(srv.identities, outbound.peer_identity, &slot);
+	T_CHECK(slot == NULL);
+	const size_t passive_only = server_offline_listeners(&srv, NULL, NULL);
+	char *destinations[] = { "127.0.0.1:1" };
+	conf->identity.mux_connect = destinations;
+	conf->identity.mux_connect_count = 1;
+	srv.identity_tunnels = members;
+	srv.num_identity_tunnels = 1;
+	struct offline_capture cap = { 0 };
+	const size_t mixed =
+		server_offline_listeners(&srv, offline_capture_cb, &cap);
+	/* Removing the destination also removes the idle exemption. */
+	conf->identity.mux_connect_count = 0;
+	const size_t removed = server_offline_listeners(&srv, NULL, NULL);
+	peers[0].listen = NULL;
+	peers[1].listen = NULL;
+	const size_t routing_only = server_offline_listeners(&srv, NULL, NULL);
+	conf->identity.mux_connect = NULL;
+	conf->identity.peers = NULL;
+	conf->identity.peers_count = 0;
+	tunnel_close(dialed);
+	table_free(srv.identities);
+	ev_loop_destroy(loop);
+	conf_free(conf);
+	T_EXPECT_EQ(passive_only, (size_t)2);
+	T_EXPECT_EQ(mixed, (size_t)1);
+	T_EXPECT_EQ(cap.count, (size_t)1);
+	T_EXPECT_STREQ(cap.names[0], "passive");
+	T_EXPECT_EQ(removed, (size_t)2);
+	T_EXPECT_EQ(routing_only, (size_t)0);
+}
+
 T_DECLARE_CASE(test_bidirectional_stream_and_forward)
 {
 	struct test_fixture fx;
@@ -1410,6 +1635,158 @@ cleanup:
 	T_LOG("forward: teardown begin");
 	fixture_teardown(&fx);
 	T_LOG("forward: teardown done");
+}
+
+/* A UDP client of one server's listen address and the reply it waits for.
+ * The datagram is re-sent every few polls: best effort, it is dropped while
+ * lossymux is not yet ready on the session carrying it. */
+struct udp_echo_wait {
+	int fd;
+	struct sockaddr_in to;
+	const char *msg;
+	int polls;
+	ssize_t received_len;
+	char got[64];
+};
+
+static int udp_echo_wait_predicate(void *ptr)
+{
+	struct udp_echo_wait *const restrict w = ptr;
+	struct pollfd pfd = { .fd = w->fd, .events = POLLIN };
+	if (poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLIN)) {
+		const ssize_t n =
+			recv(w->fd, w->got, sizeof(w->got) - 1, MSG_DONTWAIT);
+		if (n >= 0) {
+			w->received_len = n;
+			w->got[n] = '\0';
+			return 1;
+		}
+	}
+	if (w->polls++ % 20 == 0) {
+		(void)sendto(
+			w->fd, w->msg, strlen(w->msg), 0,
+			(const struct sockaddr *)&w->to, sizeof(w->to));
+	}
+	return 0;
+}
+
+/* Send msg to 127.0.0.1:port over UDP and wait for its echo. */
+static bool
+udp_roundtrip(struct test_fixture *restrict fx, const int port, const char *msg)
+{
+	struct udp_echo_wait w = {
+		.fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP),
+		.to = {
+			.sin_family = AF_INET,
+			.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+			.sin_port = htons((uint16_t)port),
+		},
+		.msg = msg,
+		.received_len = -1,
+	};
+	if (w.fd < 0) {
+		return false;
+	}
+	const int ret = wait_until(
+		fx, (double)ECHO_WAIT_TIMEOUT_MS / 1000.0,
+		udp_echo_wait_predicate, &w);
+	(void)close(w.fd);
+	return ret == 0 && w.received_len == (ssize_t)strlen(msg) &&
+	       strcmp(w.got, msg) == 0;
+}
+
+/* lossymux end to end, both directions over one session: a datagram to the
+ * dialing server's listen address is relayed to the accepting server's
+ * connect target and the echo comes back to the client (forward), and the
+ * same from the accepting side (reverse).  Each side's datagram counters
+ * account for it. */
+T_DECLARE_CASE(test_server_lossymux_udp_roundtrip)
+{
+	struct test_fixture fx;
+	if (fixture_setup_ex(&fx, MOCK_ECHO, true) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	/* The UDP sockets share their TCP listeners' (port-0) ports. */
+	const bool forward = udp_roundtrip(&fx, fx.tcp_port_b, "forward");
+	const bool reverse = udp_roundtrip(&fx, fx.tcp_port_a, "reverse");
+
+	struct server_stats *const sa = server_stats(fx.srv_a, false);
+	struct server_stats *const sb = server_stats(fx.srv_b, false);
+	T_CHECK(sa != NULL && sb != NULL);
+	const uint_least64_t a_sent = sa->pkt_dgram_sent;
+	const uint_least64_t a_recv = sa->pkt_dgram_recv;
+	const uint_least64_t b_sent = sb->pkt_dgram_sent;
+	const uint_least64_t b_recv = sb->pkt_dgram_recv;
+	const size_t a_flows = sa->num_flows;
+	const size_t b_flows = sb->num_flows;
+	free(sa);
+	free(sb);
+	fixture_teardown(&fx);
+
+	T_EXPECT(forward);
+	T_EXPECT(reverse);
+	/* One flow each way per side: an active one and a passive one. */
+	T_EXPECT_EQ(a_flows, (size_t)2);
+	T_EXPECT_EQ(b_flows, (size_t)2);
+	T_EXPECT(a_sent >= 2 && a_recv >= 2);
+	T_EXPECT(b_sent >= 2 && b_recv >= 2);
+}
+
+/* Empty datagrams traverse the socket/mux/socket relay in each direction.
+ * Packet counters advance while payload-byte counters remain zero. */
+T_DECLARE_CASE(test_server_lossymux_udp_empty_roundtrip)
+{
+	struct test_fixture fx;
+	if (fixture_setup_ex(&fx, MOCK_ECHO, true) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	const bool forward = udp_roundtrip(&fx, fx.tcp_port_b, "");
+	const bool reverse = udp_roundtrip(&fx, fx.tcp_port_a, "");
+	struct server_stats *const sa = server_stats(fx.srv_a, false);
+	struct server_stats *const sb = server_stats(fx.srv_b, false);
+	T_CHECK(sa != NULL && sb != NULL);
+	const uint_least64_t a_sent = sa->pkt_dgram_sent;
+	const uint_least64_t a_recv = sa->pkt_dgram_recv;
+	const uint_least64_t b_sent = sb->pkt_dgram_sent;
+	const uint_least64_t b_recv = sb->pkt_dgram_recv;
+	const uint_least64_t a_bytes_sent = sa->byt_dgram_sent;
+	const uint_least64_t a_bytes_recv = sa->byt_dgram_recv;
+	const uint_least64_t b_bytes_sent = sb->byt_dgram_sent;
+	const uint_least64_t b_bytes_recv = sb->byt_dgram_recv;
+	const size_t a_flows = sa->num_flows;
+	const size_t b_flows = sb->num_flows;
+	free(sa);
+	free(sb);
+	fixture_teardown(&fx);
+
+	T_EXPECT(forward);
+	T_EXPECT(reverse);
+	T_EXPECT_EQ(a_flows, (size_t)2);
+	T_EXPECT_EQ(b_flows, (size_t)2);
+	T_EXPECT(a_sent >= 2 && a_recv >= 2);
+	T_EXPECT(b_sent >= 2 && b_recv >= 2);
+	T_EXPECT_EQ(a_bytes_sent, (uint_least64_t)0);
+	T_EXPECT_EQ(a_bytes_recv, (uint_least64_t)0);
+	T_EXPECT_EQ(b_bytes_sent, (uint_least64_t)0);
+	T_EXPECT_EQ(b_bytes_recv, (uint_least64_t)0);
+}
+
+/* Without lossymux no UDP socket is bound beside the listen address. */
+T_DECLARE_CASE(test_server_lossymux_disabled_binds_no_udp)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	const bool none_a = fx.srv_a->udp_local == NULL;
+	const bool none_b = fx.srv_b->udp_local == NULL;
+	fixture_teardown(&fx);
+
+	T_EXPECT(none_a);
+	T_EXPECT(none_b);
 }
 
 /* Regression: server_stop()'s force-close sweep must fold a still-open tunnel's
@@ -2170,13 +2547,16 @@ T_DECLARE_CASE(test_on_demand_tunnel_reconnects_after_idle_close)
 		goto cleanup;
 	}
 
-	/* The actual regression check: a new local connection after the
-	 * idle-close must still be forwarded, via a demand-triggered
-	 * reconnect. Before the fix this always timed out. */
-	if (connect_and_wait_echo(&fx, fx.tcp_port_b, "after-idle", &cl2) !=
-	    0) {
-		T_LOG("echo after idle-close failed"
-		      " -- tunnel did not reconnect on demand");
+	/* The actual regression check: the first local connection after the
+	 * idle-close must itself be forwarded -- it triggers the demand
+	 * reconnect and waits for it, rather than being closed while the
+	 * session comes back up. One attempt only: a retry would hide exactly
+	 * that dropped first connection. */
+	cl2 = connect_local(&fx, fx.tcp_port_b);
+	if (cl2 < 0 || send_and_expect_echo(
+			       &fx, cl2, "after-idle", strlen("after-idle"),
+			       (double)ECHO_WAIT_TIMEOUT_MS / 1000.0) != 0) {
+		T_LOG("first connection after idle-close was not forwarded");
 		T_FAIL();
 		goto cleanup;
 	}
@@ -2308,6 +2688,552 @@ T_DECLARE_CASE(test_server_config_reload)
 	fixture_teardown(&fx);
 }
 
+/* A listener bind failure during reload must be reported before the active
+ * configuration is replaced, leaving the previous listener serving traffic. */
+T_DECLARE_CASE(test_server_reload_rejects_listener_bind_failure)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+
+	char occupied[64];
+	(void)snprintf(
+		occupied, sizeof(occupied), "127.0.0.1:%d", fx.tcp_port_b);
+	struct config *const new_conf = make_config(
+		fx.conf_a->mux_listen, fx.conf_a->mux_connect, occupied,
+		fx.conf_a->connect);
+	if (new_conf == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	struct config *const old_conf = fx.srv_a->conf;
+	const int old_port = fx.tcp_port_a;
+	const bool applied = server_apply_config(fx.srv_a, new_conf);
+
+	fx.conf_a = fx.srv_a->conf;
+	const bool kept_conf = fx.srv_a->conf == old_conf;
+	const int port_after = get_listener_port(&fx.srv_a->local_listener);
+	const int fd = connect_local(&fx, old_port);
+	if (fd >= 0) {
+		(void)close(fd);
+	}
+
+	fixture_teardown(&fx);
+
+	T_EXPECT(!applied);
+	T_EXPECT(kept_conf);
+	T_EXPECT_EQ(port_after, old_port);
+	T_EXPECT(fd >= 0);
+}
+
+/* The API control socket carries a dedicated profile, not the application's
+ * tcp{} tuning: server_new() binds api_listener with a fixed socket_opts that
+ * server_apply_config never repoints (unlike the local and mux listeners), so a
+ * reload that moves api_listen must bind the replacement with those same
+ * options.  Preparing it from new_conf->tcp instead leaks the user's buffer
+ * hints, keepalive, reuseport and fastopen settings onto the control socket and
+ * leaves api_listener.socket_opts describing a socket that does not exist. */
+T_DECLARE_CASE(test_server_reload_api_listener_keeps_dedicated_socket_opts)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+
+	struct config *const new_conf = make_config(
+		fx.conf_a->mux_listen, fx.conf_a->mux_connect,
+		fx.conf_a->listen, fx.conf_a->connect);
+	if (new_conf == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	/* Only api_listen changes, so the reload rebinds that listener alone. */
+	new_conf->api_listen = strdup("127.0.0.1:0");
+	if (new_conf->api_listen == NULL) {
+		conf_free(new_conf);
+		FIXTURE_FATAL(&fx, "strdup failed");
+	}
+	/* Each option the API profile pins, requested the other way round here, so
+	 * a socket bound from tcp{} is distinguishable from one bound from the
+	 * profile. */
+	new_conf->tcp.tcp_nodelay = false;
+	new_conf->tcp.tcp_keepalive = true;
+	new_conf->tcp.tcp_reuseport = true;
+
+	const bool applied = server_apply_config(fx.srv_a, new_conf);
+	if (applied) {
+		/* Track the new config so teardown frees it, not the freed old one. */
+		fx.conf_a = fx.srv_a->conf;
+	}
+
+	const int api_fd = fx.srv_a->api_listener.w_accept.fd;
+	int nodelay = -1;
+	int keepalive = -1;
+	int reuseport = 0;
+	if (api_fd >= 0) {
+		socklen_t len = sizeof(nodelay);
+		(void)getsockopt(
+			api_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, &len);
+		len = sizeof(keepalive);
+		(void)getsockopt(
+			api_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, &len);
+#ifdef SO_REUSEPORT
+		len = sizeof(reuseport);
+		(void)getsockopt(
+			api_fd, SOL_SOCKET, SO_REUSEPORT, &reuseport, &len);
+#endif
+	}
+
+	fixture_teardown(&fx);
+
+	T_EXPECT(applied);
+	T_EXPECT(api_fd >= 0);
+	/* api_socket_opts: nodelay on, keepalive off, reuseport off. */
+	T_EXPECT(nodelay != 0);
+	T_EXPECT_EQ(keepalive, 0);
+	T_EXPECT_EQ(reuseport, 0);
+}
+
+/* Reload fx->srv_a with fx->conf_a's addresses except listen, which becomes
+ * @p listen, and track the config srv_a runs afterwards. On success the old
+ * config was freed by server_apply_config; on failure it is still in force. */
+static bool reload_local_listen(
+	struct test_fixture *restrict fx, const char *restrict listen)
+{
+	struct config *const new_conf = make_config(
+		fx->conf_a->mux_listen, fx->conf_a->mux_connect, listen,
+		fx->conf_a->connect);
+	if (new_conf == NULL) {
+		return false;
+	}
+	const bool applied = server_apply_config(fx->srv_a, new_conf);
+	fx->conf_a = fx->srv_a->conf;
+	return applied;
+}
+
+/* True if @p l is bound to the IPv4 address @p ip (host byte order) on
+ * @p port. */
+static bool listener_bound_to(
+	const struct listener *restrict l, const uint32_t ip, const int port)
+{
+	union sockaddr_max sa;
+	return listener_get_addr(l, &sa) && sa.sa.sa_family == AF_INET &&
+	       sa.in.sin_addr.s_addr == htonl(ip) &&
+	       (int)ntohs(sa.in.sin_port) == port;
+}
+
+/* True if connecting to 127.0.0.1:@p port succeeds. */
+static bool can_connect_local(struct test_fixture *restrict fx, const int port)
+{
+	const int fd = connect_local(fx, port);
+	if (fd < 0) {
+		return false;
+	}
+	(void)close(fd);
+	return true;
+}
+
+/* Regression: a reload that moves a listener to another address on the port
+ * it already holds must succeed. Linux refuses to bind an address:port that
+ * overlaps a listening socket even with SO_REUSEADDR, so binding the
+ * replacement beside the live socket failed every such reload: a respelling
+ * of the bound address, widening to the wildcard, and narrowing back. */
+T_DECLARE_CASE(test_server_reload_moves_listener_within_port)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	const int port = fx.tcp_port_a;
+	char addr[64];
+
+	/* "127.0.0.1:0" respelled as the address it is bound to: the live
+	 * socket is kept, not rebound. */
+	const int old_fd = fx.srv_a->local_listener.w_accept.fd;
+	(void)snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
+	const bool respelled = reload_local_listen(&fx, addr);
+	const int respelled_fd = fx.srv_a->local_listener.w_accept.fd;
+
+	(void)snprintf(addr, sizeof(addr), "0.0.0.0:%d", port);
+	const bool widened = reload_local_listen(&fx, addr);
+	const bool widened_bound =
+		listener_bound_to(&fx.srv_a->local_listener, INADDR_ANY, port);
+	const bool widened_serves = can_connect_local(&fx, port);
+
+	(void)snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
+	const bool narrowed = reload_local_listen(&fx, addr);
+	const bool narrowed_bound = listener_bound_to(
+		&fx.srv_a->local_listener, INADDR_LOOPBACK, port);
+	const bool narrowed_serves = can_connect_local(&fx, port);
+
+	/* Asserted only after teardown: a failing assertion longjmps out of the
+	 * case, which would leak the fixture's loop and servers. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(respelled);
+	T_EXPECT_EQ(respelled_fd, old_fd);
+	T_EXPECT(widened);
+	T_EXPECT(widened_bound);
+	T_EXPECT(widened_serves);
+	T_EXPECT(narrowed);
+	T_EXPECT(narrowed_bound);
+	T_EXPECT(narrowed_serves);
+}
+
+/* True if this host refuses to bind @p ip (host byte order), e.g. because it
+ * is not one of its addresses and non-local binds are off. */
+static bool host_refuses_bind(const uint32_t ip)
+{
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		return false;
+	}
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(ip);
+	const bool refused =
+		bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0;
+	(void)close(fd);
+	return refused;
+}
+
+/* Build fx->conf_a with listen replaced by @p listen and one identity peer
+ * listening on 127.0.0.1:@p occupied_port. Returns NULL on allocation failure,
+ * having freed whatever it built. */
+static struct config *make_listen_with_occupied_peer(
+	const struct test_fixture *restrict fx, const char *restrict listen,
+	const int occupied_port)
+{
+	struct config *const conf = make_config(
+		fx->conf_a->mux_listen, fx->conf_a->mux_connect, listen,
+		fx->conf_a->connect);
+	if (conf == NULL) {
+		return NULL;
+	}
+	char occupied[64];
+	(void)snprintf(
+		occupied, sizeof(occupied), "127.0.0.1:%d", occupied_port);
+	conf->identity.peers = malloc(sizeof(*conf->identity.peers));
+	if (conf->identity.peers == NULL) {
+		conf_free(conf);
+		return NULL;
+	}
+	conf->identity.peers[0] = (struct identity_peer){
+		.id = strdup("peer1"),
+		.listen = strdup(occupied),
+	};
+	conf->identity.peers_count = 1;
+	if (conf->identity.peers[0].id == NULL ||
+	    conf->identity.peers[0].listen == NULL) {
+		conf_free(conf);
+		return NULL;
+	}
+	return conf;
+}
+
+/* A reload that released the live listener to move it within its port, and
+ * then cannot bind the new address, must bind the listener back on its old
+ * address before reporting the failure. */
+T_DECLARE_CASE(test_server_reload_restores_listener_after_failed_bind)
+{
+	/* 192.0.2.1 is TEST-NET-1: unbindable unless non-local binds are on. */
+	if (!host_refuses_bind(UINT32_C(0xC0000201))) {
+		T_LOG("host binds 192.0.2.1; nothing to fail the reload with");
+		return;
+	}
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	const int port = fx.tcp_port_a;
+	struct config *const old_conf = fx.srv_a->conf;
+
+	char addr[64];
+	(void)snprintf(addr, sizeof(addr), "192.0.2.1:%d", port);
+	const bool applied = reload_local_listen(&fx, addr);
+	const bool kept_conf = fx.srv_a->conf == old_conf;
+	const bool bound = listener_bound_to(
+		&fx.srv_a->local_listener, INADDR_LOOPBACK, port);
+	const bool serves = can_connect_local(&fx, port);
+
+	/* Asserted only after teardown, as above. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(!applied);
+	T_EXPECT(kept_conf);
+	T_EXPECT(bound);
+	T_EXPECT(serves);
+}
+
+/* Likewise when the new address binds but a later step of the reload fails:
+ * here the identity listener, whose address is srv_b's live TCP listener. */
+T_DECLARE_CASE(test_server_reload_restores_listener_after_later_failure)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	const int port = fx.tcp_port_a;
+	struct config *const old_conf = fx.srv_a->conf;
+
+	char addr[64];
+	(void)snprintf(addr, sizeof(addr), "0.0.0.0:%d", port);
+	struct config *const new_conf =
+		make_listen_with_occupied_peer(&fx, addr, fx.tcp_port_b);
+	if (new_conf == NULL) {
+		FIXTURE_FATAL(&fx, "make_listen_with_occupied_peer failed");
+	}
+	const bool applied = server_apply_config(fx.srv_a, new_conf);
+	const bool kept_conf = fx.srv_a->conf == old_conf;
+	const bool bound = listener_bound_to(
+		&fx.srv_a->local_listener, INADDR_LOOPBACK, port);
+	const bool serves = can_connect_local(&fx, port);
+
+	/* Asserted only after teardown, as above. */
+	fixture_teardown(&fx);
+
+	T_EXPECT(!applied);
+	T_EXPECT(kept_conf);
+	T_EXPECT(bound);
+	T_EXPECT(serves);
+}
+
+/* Every listening role can inherit a port the previous role relinquishes. */
+T_DECLARE_CASE(test_server_reload_transfers_listener_between_roles)
+{
+	struct test_fixture fx = {
+		.loop = ev_loop_new(EVFLAG_AUTO),
+		.backend_a = { .listen_fd = -1 },
+		.backend_b = { .listen_fd = -1 },
+		.udp_echo_a = { .fd = -1 },
+		.udp_echo_b = { .fd = -1 },
+	};
+	if (fx.loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	fx.conf_a = make_config(NULL, NULL, "127.0.0.1:0", NULL);
+	if (fx.conf_a == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		FIXTURE_FATAL(&fx, "server_start failed");
+	}
+	const int port = get_listener_port(&fx.srv_a->local_listener);
+	char addr[64];
+	(void)snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
+	bool applied[4] = { false };
+	int ports[4] = { -1, -1, -1, -1 };
+	for (size_t role = 0; role < 4; role++) {
+		struct config *const nc = make_config(
+			role == 0 ? addr : NULL, NULL, role == 3 ? addr : NULL,
+			NULL);
+		if (nc == NULL) {
+			FIXTURE_FATAL(&fx, "make_config failed");
+		}
+		if (role == 1) {
+			nc->api_listen = strdup(addr);
+			if (nc->api_listen == NULL) {
+				conf_free(nc);
+				FIXTURE_FATAL(&fx, "strdup failed");
+			}
+		}
+		if (role == 2) {
+			nc->identity.peers =
+				calloc(1, sizeof(nc->identity.peers[0]));
+			if (nc->identity.peers == NULL) {
+				conf_free(nc);
+				FIXTURE_FATAL(&fx, "calloc failed");
+			}
+			nc->identity.peers_count = 1;
+			nc->identity.peers[0].id = strdup("peer");
+			nc->identity.peers[0].listen = strdup(addr);
+			if (nc->identity.peers[0].id == NULL ||
+			    nc->identity.peers[0].listen == NULL) {
+				conf_free(nc);
+				FIXTURE_FATAL(&fx, "strdup failed");
+			}
+		}
+		applied[role] = server_apply_config(fx.srv_a, nc);
+		fx.conf_a = fx.srv_a->conf;
+		struct listener *l = role == 0 ? &fx.srv_a->mux_listener :
+				     role == 1 ? &fx.srv_a->api_listener :
+						 &fx.srv_a->local_listener;
+		void *elem;
+		if (role == 2 &&
+		    table_find(fx.srv_a->identities, "peer", &elem)) {
+			l = &((struct identity_listener *)elem)->listener;
+		}
+		ports[role] = get_listener_port(l);
+	}
+	fixture_teardown(&fx);
+	for (size_t i = 0; i < 4; i++) {
+		T_EXPECT(applied[i]);
+		T_EXPECT_EQ(ports[i], port);
+	}
+}
+
+/* Two roles can swap ports; a later identity-bind failure must restore both. */
+T_DECLARE_CASE(test_server_reload_swaps_roles_and_rolls_back)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	char local[64];
+	char mux[64];
+	(void)snprintf(local, sizeof(local), "127.0.0.1:%d", fx.mux_port_a);
+	(void)snprintf(mux, sizeof(mux), "127.0.0.1:%d", fx.tcp_port_a);
+	struct config *const nc =
+		make_config(mux, NULL, local, fx.conf_a->connect);
+	if (nc == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	const bool applied = server_apply_config(fx.srv_a, nc);
+	fx.conf_a = fx.srv_a->conf;
+	const bool swapped =
+		get_listener_port(&fx.srv_a->local_listener) == fx.mux_port_a &&
+		get_listener_port(&fx.srv_a->mux_listener) == fx.tcp_port_a;
+	struct config *const rejected =
+		make_listen_with_occupied_peer(&fx, mux, fx.tcp_port_b);
+	if (rejected == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	free(rejected->mux_listen);
+	rejected->mux_listen = strdup(local);
+	if (rejected->mux_listen == NULL) {
+		conf_free(rejected);
+		FIXTURE_FATAL(&fx, "strdup failed");
+	}
+	const bool rejected_applied = server_apply_config(fx.srv_a, rejected);
+	fx.conf_a = fx.srv_a->conf;
+	const bool restored =
+		get_listener_port(&fx.srv_a->local_listener) == fx.mux_port_a &&
+		get_listener_port(&fx.srv_a->mux_listener) == fx.tcp_port_a;
+	fixture_teardown(&fx);
+	T_EXPECT(applied);
+	T_EXPECT(swapped);
+	T_EXPECT(!rejected_applied);
+	T_EXPECT(restored);
+}
+
+/* A routing-only retained peer can acquire a listener before a later bind
+ * fails. Rollback must stop that new socket and restore its old option owner. */
+T_DECLARE_CASE(test_server_reload_rolls_back_new_listener_on_retained_peer)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	struct config *const route = make_config(
+		fx.conf_a->mux_listen, NULL, fx.conf_a->listen,
+		fx.conf_a->connect);
+	if (route == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	route->identity.peers = calloc(1, sizeof(route->identity.peers[0]));
+	if (route->identity.peers == NULL) {
+		conf_free(route);
+		FIXTURE_FATAL(&fx, "calloc failed");
+	}
+	route->identity.peers_count = 1;
+	route->identity.peers[0].id = strdup("retained");
+	if (route->identity.peers[0].id == NULL) {
+		conf_free(route);
+		FIXTURE_FATAL(&fx, "strdup failed");
+	}
+	const bool prepared = server_apply_config(fx.srv_a, route);
+	fx.conf_a = fx.srv_a->conf;
+	if (!prepared) {
+		FIXTURE_FATAL(&fx, "routing-only reload failed");
+	}
+	struct config *const nc =
+		make_listen_with_occupied_peer(&fx, NULL, fx.tcp_port_b);
+	if (nc == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	struct identity_peer *const peers = (struct identity_peer *)realloc(
+		(void *)nc->identity.peers, 2 * sizeof(peers[0]));
+	if (peers == NULL) {
+		conf_free(nc);
+		FIXTURE_FATAL(&fx, "realloc failed");
+	}
+	nc->identity.peers = peers;
+	peers[1] = peers[0];
+	char addr[64];
+	(void)snprintf(addr, sizeof(addr), "127.0.0.1:%d", fx.tcp_port_a);
+	peers[0] = (struct identity_peer){ .id = strdup("retained"),
+					   .listen = strdup(addr) };
+	nc->identity.peers_count = 2;
+	if (peers[0].id == NULL || peers[0].listen == NULL) {
+		conf_free(nc);
+		FIXTURE_FATAL(&fx, "strdup failed");
+	}
+	const bool applied = server_apply_config(fx.srv_a, nc);
+	fx.conf_a = fx.srv_a->conf;
+	void *elem;
+	const bool found = table_find(fx.srv_a->identities, "retained", &elem);
+	const bool peer_stopped =
+		found &&
+		((struct identity_listener *)elem)->listener.w_accept.fd == -1;
+	const bool owner_restored =
+		found &&
+		((struct identity_listener *)elem)->listener.socket_opts ==
+			&fx.conf_a->tcp;
+	const bool local_restored =
+		get_listener_port(&fx.srv_a->local_listener) == fx.tcp_port_a;
+	fixture_teardown(&fx);
+	T_EXPECT(!applied);
+	T_EXPECT(peer_stopped);
+	T_EXPECT(owner_restored);
+	T_EXPECT(local_restored);
+}
+
+/* Count the live tunnels s currently pools under the peer identity id, or
+ * SIZE_MAX if the stats snapshot could not be taken. */
+static size_t
+count_pooled_tunnels(const struct server *restrict s, const char *restrict id)
+{
+	struct server_stats *const stats = server_stats(s, true);
+	if (stats == NULL) {
+		return SIZE_MAX;
+	}
+	size_t count = 0;
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		if (stats->tunnels[i].peer_identity != NULL &&
+		    strcmp(stats->tunnels[i].peer_identity, id) == 0) {
+			count++;
+		}
+	}
+	free(stats);
+	return count;
+}
+
+struct identity_pool_wait_ctx {
+	const struct server *srv_a;
+	const char *peer_identity;
+	size_t expected;
+};
+
+/* Polls server_stats() for the condition under test (>= expected tunnels
+ * pooled under peer_identity) instead of the session counters: a session is
+ * counted established on its tunnel's thread before the server loop pools the
+ * tunnel, and two concurrent connects bump independent relaxed atomics, so a
+ * counter-based wait can pass while server_stats()'s own tunnels[] walk -- the
+ * thing these tests assert on -- does not match it yet. */
+static int identity_pool_wait_predicate(void *ptr)
+{
+	const struct identity_pool_wait_ctx *const restrict ctx = ptr;
+	const size_t count =
+		count_pooled_tunnels(ctx->srv_a, ctx->peer_identity);
+	return count != SIZE_MAX && count >= ctx->expected ? 1 : 0;
+}
+
 /* Regression for "server_reload_identities_changed leaks tunnels for a peer
  * removed entirely from config": an identity.peers entry dropped by a reload
  * (not merely changed) must have its pooled tunnel actually closed, not just
@@ -2380,26 +3306,23 @@ T_DECLARE_CASE(test_server_reload_removes_identity_peer_closes_tunnel)
 	if (wait_for_sessions_ready(&fx) != 0) {
 		FIXTURE_FATAL(&fx, "sessions not ready");
 	}
-
-	/* Defer assertions until after teardown; failing early would leak the
-	 * loop's signal watchers and corrupt later tests in this process. */
-	struct server_stats *const before = server_stats(fx.srv_a, true);
-	bool found_before = false;
-	if (before != NULL) {
-		for (size_t i = 0; i < before->num_tunnels; i++) {
-			if (before->tunnels[i].peer_identity != NULL &&
-			    strcmp(before->tunnels[i].peer_identity, "peer1") ==
-				    0) {
-				found_before = true;
-				break;
-			}
-		}
-		free(before);
+	/* The session counts as established before srv_a pools its tunnel. */
+	struct identity_pool_wait_ctx pool_ctx = {
+		.srv_a = fx.srv_a,
+		.peer_identity = "peer1",
+		.expected = 1,
+	};
+	if (wait_until(
+		    &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		    identity_pool_wait_predicate, &pool_ctx) != 0) {
+		FIXTURE_FATAL(&fx, "peer1 tunnel not pooled");
 	}
 
 	/* Reload srv_a with an otherwise-identical config that drops "peer1"
 	 * entirely (not just changes it) -- server_apply_config takes ownership
-	 * of new_conf, including on failure. */
+	 * of new_conf, including on failure. Assertions are deferred until after
+	 * teardown; failing early would leak the loop's signal watchers and
+	 * corrupt later tests in this process. */
 	struct config *const new_conf =
 		make_config("127.0.0.1:0", NULL, NULL, NULL);
 	if (new_conf == NULL) {
@@ -2423,41 +3346,626 @@ T_DECLARE_CASE(test_server_reload_removes_identity_peer_closes_tunnel)
 
 	fixture_teardown(&fx);
 
-	T_EXPECT(found_before);
 	T_EXPECT(applied);
 	T_EXPECT_EQ(num_tunnels_after, (size_t)0);
 }
 
-struct identity_pool_wait_ctx {
-	const struct server *srv_a;
-	const char *peer_identity;
-	size_t expected;
-};
-
-/* Polls server_stats() directly for the condition under test (>= expected
- * tunnels sharing peer_identity) instead of srv_a's aggregate session
- * counters: those are independent relaxed atomics racing two concurrent
- * connect attempts, so a snapshot can transiently read a count that does not
- * yet match server_stats()'s own tunnels[] walk -- the actual thing this test
- * asserts on -- causing a flaky "expect 2, got 1" observed empirically when
- * this originally polled wait_stats_snapshot() instead. */
-static int identity_pool_wait_predicate(void *ptr)
+/* Build the config this case reloads: mux_listen on an ephemeral port, an
+ * identity claim of "server-a", and num_peers peers named peer1..peerN, each
+ * listening on an ephemeral port. Returns NULL on allocation failure, having
+ * freed whatever it built. */
+static struct config *make_identity_peers_config(const size_t num_peers)
 {
-	struct identity_pool_wait_ctx *const restrict ctx = ptr;
-	struct server_stats *const stats = server_stats(ctx->srv_a, true);
-	if (stats == NULL) {
-		return 0;
+	struct config *const conf =
+		make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf == NULL) {
+		return NULL;
 	}
-	size_t count = 0;
-	for (size_t i = 0; i < stats->num_tunnels; i++) {
-		if (stats->tunnels[i].peer_identity != NULL &&
-		    strcmp(stats->tunnels[i].peer_identity,
-			   ctx->peer_identity) == 0) {
-			count++;
+	conf->identity.claim = strdup("server-a");
+	conf->identity.peers = calloc(num_peers, sizeof(*conf->identity.peers));
+	if (conf->identity.claim == NULL || conf->identity.peers == NULL) {
+		conf_free(conf);
+		return NULL;
+	}
+	conf->identity.peers_count = num_peers;
+	for (size_t i = 0; i < num_peers; i++) {
+		char id[32];
+		(void)snprintf(id, sizeof(id), "peer%zu", i + 1);
+		conf->identity.peers[i] = (struct identity_peer){
+			.id = strdup(id),
+			.listen = strdup("127.0.0.1:0"),
+		};
+		if (conf->identity.peers[i].id == NULL ||
+		    conf->identity.peers[i].listen == NULL) {
+			conf_free(conf);
+			return NULL;
 		}
 	}
-	free(stats);
-	return count >= ctx->expected ? 1 : 0;
+	return conf;
+}
+
+/* Regression: a reload that keeps an identity peer must keep that peer's
+ * listener and its pooled tunnels reachable. The rebuild locates the retained
+ * peer with a table lookup that cannot miss, and once made that lookup the
+ * operand of ASSERT() -- which expands to `((void)(0))` under NDEBUG, so in a
+ * release build the call never runs, the out-param stays NULL, and the very
+ * next store dereferences it. Reloads twice: first with an unchanged peer
+ * table, then with a peer added, which must still carry the retained peer's
+ * live pool over. Both crashed a release build before that fix; a debug build
+ * never did, because ASSERT() is live there. */
+T_DECLARE_CASE(test_server_reload_retains_identity_peer)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct test_fixture fx = {
+		.loop = loop,
+		.mux_port_a = -1,
+		.tcp_port_a = -1,
+		.tcp_port_b = -1,
+		.backend_a = { .listen_fd = -1, .port = -1 },
+		.backend_b = { .listen_fd = -1, .port = -1 },
+	};
+
+	fx.conf_a = make_identity_peers_config(1);
+	if (fx.conf_a == NULL) {
+		FIXTURE_FATAL(&fx, "make_identity_peers_config(conf_a) failed");
+	}
+
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		FIXTURE_FATAL(&fx, "srv_a start failed");
+	}
+	if (wait_for_listener_port(
+		    &fx, &fx.srv_a->mux_listener, &fx.mux_port_a,
+		    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) != 0) {
+		FIXTURE_FATAL(&fx, "srv_a mux port wait failed");
+	}
+
+	char mux_connect_b[64];
+	(void)snprintf(
+		mux_connect_b, sizeof(mux_connect_b), "127.0.0.1:%d",
+		fx.mux_port_a);
+	fx.conf_b = make_config(NULL, mux_connect_b, NULL, NULL);
+	if (fx.conf_b == NULL) {
+		FIXTURE_FATAL(&fx, "make_config(conf_b) failed");
+	}
+	fx.conf_b->identity.claim = strdup("peer1");
+	if (fx.conf_b->identity.claim == NULL) {
+		FIXTURE_FATAL(&fx, "OOM building conf_b identity fields");
+	}
+
+	fx.srv_b = server_new(fx.loop, fx.conf_b);
+	if (fx.srv_b == NULL || !server_start(fx.srv_b)) {
+		FIXTURE_FATAL(&fx, "srv_b start failed");
+	}
+	if (wait_for_sessions_ready(&fx) != 0) {
+		FIXTURE_FATAL(&fx, "sessions not ready");
+	}
+	/* The session counts as established before srv_a pools its tunnel. */
+	struct identity_pool_wait_ctx pool_ctx = {
+		.srv_a = fx.srv_a,
+		.peer_identity = "peer1",
+		.expected = 1,
+	};
+	if (wait_until(
+		    &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		    identity_pool_wait_predicate, &pool_ctx) != 0) {
+		FIXTURE_FATAL(&fx, "peer1 tunnel not pooled");
+	}
+
+	/* Defer assertions until after teardown; failing early would leak the
+	 * loop's signal watchers and corrupt later tests in this process. */
+	const size_t pooled_before = count_pooled_tunnels(fx.srv_a, "peer1");
+
+	/* Reload with an identical peer table: the rebuild only repoints each
+	 * retained listener at the new config. */
+	struct config *const new_conf = make_identity_peers_config(1);
+	if (new_conf == NULL) {
+		FIXTURE_FATAL(
+			&fx, "make_identity_peers_config(new_conf) failed");
+	}
+	const bool applied_unchanged = server_apply_config(fx.srv_a, new_conf);
+	fx.conf_a =
+		fx.srv_a->conf; /* old conf_a was freed by server_apply_config */
+	const size_t pooled_unchanged = count_pooled_tunnels(fx.srv_a, "peer1");
+	/* The retained listener must now name the peer through the new config's
+	 * own string: the old one is freed the moment this reload returns. */
+	void *elem = NULL;
+	const bool repointed =
+		table_find(fx.srv_a->identities, "peer1", &elem) &&
+		((const struct identity_listener *)elem)->peer_identity ==
+			fx.conf_a->identity.peers[0].id;
+
+	/* Reload with a peer added: peer1's listener, pool included, has to
+	 * carry over into the rebuilt table. */
+	struct config *const new_conf2 = make_identity_peers_config(2);
+	if (new_conf2 == NULL) {
+		FIXTURE_FATAL(
+			&fx, "make_identity_peers_config(new_conf2) failed");
+	}
+	const bool applied_changed = server_apply_config(fx.srv_a, new_conf2);
+	fx.conf_a = fx.srv_a->conf;
+	const size_t pooled_changed = count_pooled_tunnels(fx.srv_a, "peer1");
+
+	fixture_teardown(&fx);
+
+	T_EXPECT_EQ(pooled_before, (size_t)1);
+	/* Unchanged peer table: reload applies and the pooled tunnel stays. */
+	T_EXPECT(applied_unchanged);
+	T_EXPECT_EQ(pooled_unchanged, (size_t)1);
+	/* The retained listener adopted the new config's own id pointer. */
+	T_EXPECT(repointed);
+	/* Changed peer table: the retained peer keeps its pool. */
+	T_EXPECT(applied_changed);
+	T_EXPECT_EQ(pooled_changed, (size_t)1);
+}
+
+/* The listener s serves peer id through, or NULL when s has no such peer. */
+static const struct identity_listener *
+find_identity_listener(const struct server *restrict s, const char *restrict id)
+{
+	void *elem = NULL;
+	if (!table_find(s->identities, id, &elem)) {
+		return NULL;
+	}
+	return elem;
+}
+
+/* The fd and the port of the socket s listens on for peer id; -1 each when s
+ * has no such peer or the peer has no socket. */
+static int identity_listener_fd(const struct server *restrict s, const char *id)
+{
+	const struct identity_listener *const sl =
+		find_identity_listener(s, id);
+	return sl != NULL ? sl->listener.w_accept.fd : -1;
+}
+
+static int
+identity_listener_port(const struct server *restrict s, const char *id)
+{
+	const struct identity_listener *const sl =
+		find_identity_listener(s, id);
+	return sl != NULL ? get_listener_port(&sl->listener) : -1;
+}
+
+/* Replace peer i's listen address in conf with 127.0.0.1:port (port 0 picks an
+ * ephemeral one). False on OOM. The cases below only ever name a port srv_a
+ * already listens on: one picked free and released up front could be taken by
+ * any ephemeral bind, the server's own included, before srv_a binds it. */
+static bool set_identity_peer_port(
+	struct config *restrict conf, const size_t i, const int port)
+{
+	char addr[64];
+	(void)snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
+	char *const listen = strdup(addr);
+	if (listen == NULL) {
+		return false;
+	}
+	free(conf->identity.peers[i].listen);
+	conf->identity.peers[i].listen = listen;
+	return true;
+}
+
+/* A blocking connect to 127.0.0.1:port that never runs the event loop, so the
+ * connection completes into the listener's accept queue and stays there
+ * unaccepted. -1 on failure. */
+static int connect_unaccepted(const int port)
+{
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		return -1;
+	}
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	sa.sin_port = htons((unsigned)port & 0xFFFFu);
+	if (connect(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		(void)close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* True while fd's connection is open with nothing to read: neither reset nor
+ * closed by the other end. */
+static bool connection_still_open(const int fd)
+{
+	char byte;
+	const ssize_t n = recv(fd, &byte, 1, MSG_DONTWAIT);
+	return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+}
+
+/* Regression: a reload that changes the identity peer set must leave the
+ * listening socket of every peer whose listen address is unchanged alone. It
+ * once stopped and rebound every identity listener, so an unchanged peer on an
+ * ephemeral port moved to another port, and a connection waiting in its accept
+ * queue was reset. The same reload also moves two peers onto each other's
+ * port and adds a peer, which the rebound listeners must still accommodate. */
+T_DECLARE_CASE(test_server_reload_keeps_unchanged_identity_listener)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct test_fixture fx = {
+		.loop = loop,
+		.mux_port_a = -1,
+		.tcp_port_a = -1,
+		.tcp_port_b = -1,
+		.backend_a = { .listen_fd = -1, .port = -1 },
+		.backend_b = { .listen_fd = -1, .port = -1 },
+	};
+
+	fx.conf_a = make_identity_peers_config(3);
+	if (fx.conf_a == NULL) {
+		FIXTURE_FATAL(&fx, "building conf_a failed");
+	}
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		FIXTURE_FATAL(&fx, "srv_a start failed");
+	}
+
+	const int fd1_before = identity_listener_fd(fx.srv_a, "peer1");
+	const int port1_before = identity_listener_port(fx.srv_a, "peer1");
+	const int port2 = identity_listener_port(fx.srv_a, "peer2");
+	const int port3 = identity_listener_port(fx.srv_a, "peer3");
+	if (port2 <= 0 || port3 <= 0) {
+		FIXTURE_FATAL(&fx, "reading peer ports failed");
+	}
+	/* Waits in peer1's accept queue across the reload. */
+	const int pending =
+		port1_before > 0 ? connect_unaccepted(port1_before) : -1;
+
+	/* peer1 unchanged, peer2 and peer3 trade ports on fixed addresses, peer4
+	 * is new. */
+	struct config *const new_conf = make_identity_peers_config(4);
+	if (new_conf == NULL || !set_identity_peer_port(new_conf, 1, port3) ||
+	    !set_identity_peer_port(new_conf, 2, port2)) {
+		if (new_conf != NULL) {
+			conf_free(new_conf);
+		}
+		if (pending >= 0) {
+			(void)close(pending);
+		}
+		FIXTURE_FATAL(&fx, "building new_conf failed");
+	}
+	const bool applied = server_apply_config(fx.srv_a, new_conf);
+	fx.conf_a = fx.srv_a->conf;
+
+	const int fd1_after = identity_listener_fd(fx.srv_a, "peer1");
+	const int port1_after = identity_listener_port(fx.srv_a, "peer1");
+	const int port2_after = identity_listener_port(fx.srv_a, "peer2");
+	const int port3_after = identity_listener_port(fx.srv_a, "peer3");
+	const int port4_after = identity_listener_port(fx.srv_a, "peer4");
+	const bool pending_open =
+		pending >= 0 && connection_still_open(pending);
+	/* Every listener names its peer through the new config's own string. */
+	bool repointed = applied;
+	for (size_t i = 0; applied && i < fx.conf_a->identity.peers_count;
+	     i++) {
+		const struct identity_peer *const p =
+			&fx.conf_a->identity.peers[i];
+		const struct identity_listener *const sl =
+			find_identity_listener(fx.srv_a, p->id);
+		if (sl == NULL || sl->peer_identity != p->id ||
+		    sl->listener.socket_opts != &fx.conf_a->tcp) {
+			repointed = false;
+		}
+	}
+	if (pending >= 0) {
+		(void)close(pending);
+	}
+
+	fixture_teardown(&fx);
+
+	T_EXPECT(fd1_before >= 0);
+	T_EXPECT(port1_before > 0);
+	T_EXPECT(pending >= 0);
+	T_EXPECT(applied);
+	/* peer1 keeps its very socket, and with it the queued connection. */
+	T_EXPECT_EQ(fd1_after, fd1_before);
+	T_EXPECT_EQ(port1_after, port1_before);
+	T_EXPECT(pending_open);
+	T_EXPECT_EQ(port2_after, port3);
+	T_EXPECT_EQ(port3_after, port2);
+	T_EXPECT(port4_after > 0);
+	T_EXPECT(repointed);
+}
+
+/* A reload whose new identity listener cannot be bound is rejected with the
+ * running identity table intact: the unchanged peer's socket untouched, the
+ * changed and the removed peer's listeners bound back on their old ports, and
+ * the new peer's listener gone. */
+T_DECLARE_CASE(test_server_reload_restores_identity_listeners_on_bind_failure)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct test_fixture fx = {
+		.loop = loop,
+		.mux_port_a = -1,
+		.tcp_port_a = -1,
+		.tcp_port_b = -1,
+		.backend_a = { .listen_fd = -1, .port = -1 },
+		.backend_b = { .listen_fd = -1, .port = -1 },
+	};
+
+	const int occupied_fd = bind_listen_localhost();
+	const int occupied_port =
+		occupied_fd >= 0 ? listener_fd_port(occupied_fd) : -1;
+	if (occupied_port <= 0) {
+		if (occupied_fd >= 0) {
+			socket_close(occupied_fd);
+		}
+		FIXTURE_FATAL(&fx, "occupying a port failed");
+	}
+	fx.conf_a = make_identity_peers_config(3);
+	if (fx.conf_a == NULL) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "building conf_a failed");
+	}
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "srv_a start failed");
+	}
+	struct config *const old_conf = fx.srv_a->conf;
+	const struct hashtable *const old_tbl = fx.srv_a->identities;
+	const struct identity_listener *const sl1 =
+		find_identity_listener(fx.srv_a, "peer1");
+	const int fd1_before = identity_listener_fd(fx.srv_a, "peer1");
+	const int port1_before = identity_listener_port(fx.srv_a, "peer1");
+	const int port2 = identity_listener_port(fx.srv_a, "peer2");
+	const int port3 = identity_listener_port(fx.srv_a, "peer3");
+	if (port2 <= 0 || port3 <= 0) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "reading peer ports failed");
+	}
+
+	/* peer1 unchanged, peer2 moved to the port of peer3, which is removed,
+	 * and peer4 new on the occupied port -- the bind that fails. */
+	struct config *const new_conf = make_identity_peers_config(3);
+	char *const peer4 = strdup("peer4");
+	if (new_conf == NULL || peer4 == NULL ||
+	    !set_identity_peer_port(new_conf, 1, port3) ||
+	    !set_identity_peer_port(new_conf, 2, occupied_port)) {
+		free(peer4);
+		if (new_conf != NULL) {
+			conf_free(new_conf);
+		}
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "building new_conf failed");
+	}
+	free(new_conf->identity.peers[2].id);
+	new_conf->identity.peers[2].id = peer4;
+	new_conf->identity.peers[2].id_len = strlen(peer4);
+
+	const bool applied = server_apply_config(fx.srv_a, new_conf);
+	const bool conf_kept = fx.srv_a->conf == old_conf;
+	const bool table_kept = fx.srv_a->identities == old_tbl;
+
+	const struct identity_listener *const sl1_after =
+		find_identity_listener(fx.srv_a, "peer1");
+	const struct identity_listener *const sl2_after =
+		find_identity_listener(fx.srv_a, "peer2");
+	const struct identity_listener *const sl3_after =
+		find_identity_listener(fx.srv_a, "peer3");
+	const int fd1_after = identity_listener_fd(fx.srv_a, "peer1");
+	const int port1_after = identity_listener_port(fx.srv_a, "peer1");
+	const int port2_after = identity_listener_port(fx.srv_a, "peer2");
+	const int port3_after = identity_listener_port(fx.srv_a, "peer3");
+	const bool peer4_absent =
+		find_identity_listener(fx.srv_a, "peer4") == NULL;
+	const size_t num_peers = table_size(fx.srv_a->identities);
+	/* The restored listeners still take the running config's options. */
+	const bool opts_kept =
+		sl2_after != NULL &&
+		sl2_after->listener.socket_opts == &old_conf->tcp &&
+		sl3_after != NULL &&
+		sl3_after->listener.socket_opts == &old_conf->tcp;
+	/* Each old port accepts again. */
+	int accepted = 0;
+	const int ports[] = { port1_before, port2, port3 };
+	for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
+		const int fd = connect_unaccepted(ports[i]);
+		if (fd >= 0) {
+			accepted++;
+			(void)close(fd);
+		}
+	}
+	socket_close(occupied_fd);
+
+	fixture_teardown(&fx);
+
+	T_EXPECT(fd1_before >= 0);
+	T_EXPECT(!applied);
+	T_EXPECT(conf_kept);
+	T_EXPECT(table_kept);
+	T_EXPECT(sl1_after == sl1);
+	T_EXPECT_EQ(fd1_after, fd1_before);
+	T_EXPECT_EQ(port1_after, port1_before);
+	T_EXPECT_EQ(port2_after, port2);
+	T_EXPECT_EQ(port3_after, port3);
+	T_EXPECT(peer4_absent);
+	T_EXPECT_EQ(num_peers, (size_t)3);
+	T_EXPECT(opts_kept);
+	T_EXPECT_EQ(accepted, 3);
+}
+
+/* Regression: a rejected reload restores peers that traded addresses. peer1
+ * and peer2 swap ports and are both rebound before peer3's bind fails. The
+ * restore once stopped and rebound one peer at a time, so peer1 went back to
+ * its old port while peer2 still held it and was left with no listener. */
+T_DECLARE_CASE(test_server_reload_restores_traded_identity_listeners)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct test_fixture fx = {
+		.loop = loop,
+		.mux_port_a = -1,
+		.tcp_port_a = -1,
+		.tcp_port_b = -1,
+		.backend_a = { .listen_fd = -1, .port = -1 },
+		.backend_b = { .listen_fd = -1, .port = -1 },
+	};
+
+	const int occupied_fd = bind_listen_localhost();
+	const int occupied_port =
+		occupied_fd >= 0 ? listener_fd_port(occupied_fd) : -1;
+	if (occupied_port <= 0) {
+		if (occupied_fd >= 0) {
+			socket_close(occupied_fd);
+		}
+		FIXTURE_FATAL(&fx, "occupying a port failed");
+	}
+	fx.conf_a = make_identity_peers_config(3);
+	if (fx.conf_a == NULL) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "building conf_a failed");
+	}
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "srv_a start failed");
+	}
+	struct config *const old_conf = fx.srv_a->conf;
+	const int port1 = identity_listener_port(fx.srv_a, "peer1");
+	const int port2 = identity_listener_port(fx.srv_a, "peer2");
+	const int port3 = identity_listener_port(fx.srv_a, "peer3");
+	if (port1 <= 0 || port2 <= 0 || port3 <= 0) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "reading peer ports failed");
+	}
+
+	/* peer1 and peer2 trade ports; peer3 moves to the occupied port. */
+	struct config *const new_conf = make_identity_peers_config(3);
+	if (new_conf == NULL || !set_identity_peer_port(new_conf, 0, port2) ||
+	    !set_identity_peer_port(new_conf, 1, port1) ||
+	    !set_identity_peer_port(new_conf, 2, occupied_port)) {
+		if (new_conf != NULL) {
+			conf_free(new_conf);
+		}
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "building new_conf failed");
+	}
+
+	const bool applied = server_apply_config(fx.srv_a, new_conf);
+	const bool conf_kept = fx.srv_a->conf == old_conf;
+	const int port1_after = identity_listener_port(fx.srv_a, "peer1");
+	const int port2_after = identity_listener_port(fx.srv_a, "peer2");
+	const int port3_after = identity_listener_port(fx.srv_a, "peer3");
+	int accepted = 0;
+	const int ports[] = { port1, port2, port3 };
+	for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
+		const int fd = connect_unaccepted(ports[i]);
+		if (fd >= 0) {
+			accepted++;
+			(void)close(fd);
+		}
+	}
+	socket_close(occupied_fd);
+
+	fixture_teardown(&fx);
+
+	T_EXPECT(!applied);
+	T_EXPECT(conf_kept);
+	T_EXPECT_EQ(port1_after, port1);
+	T_EXPECT_EQ(port2_after, port2);
+	T_EXPECT_EQ(port3_after, port3);
+	T_EXPECT_EQ(accepted, 3);
+}
+
+/* Regression: a rejected reload binds each released identity listener back on
+ * the address its socket held, not on its old listen string resolved anew.
+ * peer1 and peer2 listen on ephemeral ports; the reload moves peer1 to peer2's
+ * port as a fixed one, drops peer2, and fails on new peer3's occupied port. The
+ * restore once resolved "127.0.0.1:0" again, so both came back on fresh
+ * ephemeral ports. */
+T_DECLARE_CASE(test_server_reload_restores_identity_listener_bound_port)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct test_fixture fx = {
+		.loop = loop,
+		.mux_port_a = -1,
+		.tcp_port_a = -1,
+		.tcp_port_b = -1,
+		.backend_a = { .listen_fd = -1, .port = -1 },
+		.backend_b = { .listen_fd = -1, .port = -1 },
+	};
+
+	const int occupied_fd = bind_listen_localhost();
+	const int occupied_port =
+		occupied_fd >= 0 ? listener_fd_port(occupied_fd) : -1;
+	if (occupied_port <= 0) {
+		if (occupied_fd >= 0) {
+			socket_close(occupied_fd);
+		}
+		FIXTURE_FATAL(&fx, "occupying a port failed");
+	}
+	fx.conf_a = make_identity_peers_config(2);
+	if (fx.conf_a == NULL) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "building conf_a failed");
+	}
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "srv_a start failed");
+	}
+	const int port1_before = identity_listener_port(fx.srv_a, "peer1");
+	const int port2_before = identity_listener_port(fx.srv_a, "peer2");
+	if (port1_before <= 0 || port2_before <= 0) {
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "reading peer ports failed");
+	}
+
+	/* peer1 moved to the fixed port of peer2, which is removed, and peer3 new
+	 * on the occupied port -- the bind that fails. */
+	struct config *const new_conf = make_identity_peers_config(2);
+	char *const peer3 = strdup("peer3");
+	if (new_conf == NULL || peer3 == NULL ||
+	    !set_identity_peer_port(new_conf, 0, port2_before) ||
+	    !set_identity_peer_port(new_conf, 1, occupied_port)) {
+		free(peer3);
+		if (new_conf != NULL) {
+			conf_free(new_conf);
+		}
+		socket_close(occupied_fd);
+		FIXTURE_FATAL(&fx, "building new_conf failed");
+	}
+	free(new_conf->identity.peers[1].id);
+	new_conf->identity.peers[1].id = peer3;
+	new_conf->identity.peers[1].id_len = strlen(peer3);
+
+	const bool applied = server_apply_config(fx.srv_a, new_conf);
+	const int port1_after = identity_listener_port(fx.srv_a, "peer1");
+	const int port2_after = identity_listener_port(fx.srv_a, "peer2");
+	int accepted = 0;
+	const int ports[] = { port1_before, port2_before };
+	for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
+		const int fd = connect_unaccepted(ports[i]);
+		if (fd >= 0) {
+			accepted++;
+			(void)close(fd);
+		}
+	}
+	socket_close(occupied_fd);
+
+	fixture_teardown(&fx);
+
+	T_EXPECT(!applied);
+	T_EXPECT_EQ(port1_after, port1_before);
+	T_EXPECT_EQ(port2_after, port2_before);
+	T_EXPECT_EQ(accepted, 2);
 }
 
 /* Covers one identity_listener holding multiple live tunnels for the same
@@ -3451,6 +4959,207 @@ cleanup:
 	}
 }
 
+static struct mux_frame *resume_peer_alloc(void *data, size_t size)
+{
+	(void)data;
+	return malloc(size);
+}
+
+static void resume_peer_free(void *data, struct mux_frame *frame)
+{
+	(void)data;
+	free(frame);
+}
+
+static size_t server_capacity_used(struct server *srv)
+{
+#if WITH_THREADS
+	T_CHECK(smtx_sharedlock(&srv->accepted_mu) == thrd_success);
+#endif
+	const size_t used = srv->session_slots;
+#if WITH_THREADS
+	T_CHECK(smtx_sharedunlock(&srv->accepted_mu) == thrd_success);
+#endif
+	return used;
+}
+
+struct resume_peer_wait_ctx {
+	struct mux_session *peer;
+	struct tunnel *accepted;
+	const struct server *server;
+};
+
+static int resume_peer_suspended_predicate(void *data)
+{
+	const struct resume_peer_wait_ctx *const ctx = data;
+	return mux_state(ctx->peer) == MUX_STATE_SUSPENDED &&
+			       tunnel_state(ctx->accepted) ==
+				       MUX_STATE_SUSPENDED ?
+		       1 :
+		       0;
+}
+
+static int resume_peer_completed_predicate(void *data)
+{
+	const struct resume_peer_wait_ctx *const ctx = data;
+	return mux_state(ctx->peer) == MUX_STATE_ESTABLISHED &&
+			       table_size(ctx->server->accepted_tunnels) == 1 ?
+		       1 :
+		       0;
+}
+
+/* The unbound peer may change its non-NULL hello claim on successful resume.
+ * Drive a real resume, then check both routing pools and unique stats entries. */
+T_DECLARE_CASE(test_server_resume_reconciles_changed_identity)
+{
+	struct test_fixture fx = {
+		.loop = ev_loop_new(EVFLAG_AUTO),
+		.backend_a = { .listen_fd = -1 },
+		.backend_b = { .listen_fd = -1 },
+		.udp_echo_a = { .fd = -1 },
+		.udp_echo_b = { .fd = -1 },
+	};
+	struct mux_session *peer = NULL;
+	bool resumed = false;
+	size_t suspended_usage = SIZE_MAX;
+	size_t resumed_usage = SIZE_MAX;
+	size_t alice_count = SIZE_MAX;
+	size_t bob_count = SIZE_MAX;
+	size_t stats_count = SIZE_MAX;
+	uint_least64_t initial_index = 0;
+	uint_least64_t resumed_index = 0;
+	if (fx.loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	fx.conf_a = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (fx.conf_a == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.conf_a->max_sessions = 1;
+	fx.conf_a->identity.peers =
+		calloc(2, sizeof(fx.conf_a->identity.peers[0]));
+	if (fx.conf_a->identity.peers == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.conf_a->identity.peers_count = 2;
+	fx.conf_a->identity.peers[0].id = strdup("alice");
+	fx.conf_a->identity.peers[1].id = strdup("bob");
+	if (fx.conf_a->identity.peers[0].id == NULL ||
+	    fx.conf_a->identity.peers[1].id == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	const int port = get_listener_port(&fx.srv_a->mux_listener);
+	static const struct mux_callbacks callbacks = { 0 };
+	static const unsigned char id[MUX_SESSION_ID_LEN] = { 1 };
+	const struct mux_session_config conf = conf_get_mux(fx.conf_a);
+	const struct mux_session_opts opts = {
+		.callbacks = &callbacks,
+		.conf = &conf,
+		.fd = -1,
+		.id = id,
+		.identity = "alice",
+		.pool = { resume_peer_alloc, resume_peer_free, NULL },
+	};
+	peer = mux_new(fx.loop, &opts);
+	if (peer == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	int fd = connect_local(&fx, port);
+	if (fd < 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	mux_attach_fd(peer, fd);
+	struct pool_size_wait_ctx wait = {
+		.srv = fx.srv_a,
+		.peer_identity = "alice",
+		.expected = 1,
+	};
+	if (wait_until(
+		    &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		    pool_size_wait_predicate, &wait) != 0) {
+		T_LOG("initial alice handshake failed");
+		T_FAIL();
+		goto cleanup;
+	}
+	void *elem;
+	(void)table_find(fx.srv_a->identities, "alice", &elem);
+	struct tunnel *const accepted =
+		((struct identity_listener *)elem)->tunnels[0];
+	initial_index = tunnel_index(accepted);
+	struct resume_peer_wait_ctx suspended = { .peer = peer,
+						  .accepted = accepted,
+						  .server = fx.srv_a };
+	if (wait_until(
+		    &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		    resume_peer_completed_predicate, &suspended) != 0) {
+		T_LOG("initial client handshake failed");
+		T_FAIL();
+		goto cleanup;
+	}
+	(void)shutdown(mux_fd(peer), SHUT_RDWR);
+	if (wait_until(
+		    &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		    resume_peer_suspended_predicate, &suspended) != 0) {
+		T_LOG("transport did not suspend");
+		T_FAIL();
+		goto cleanup;
+	}
+	suspended_usage = server_capacity_used(fx.srv_a);
+	/* This client session runs on the test loop, so its hello claim can be
+	 * changed without racing a tunnel worker. Its session ID is preserved. */
+	char *const claim = strdup("bob");
+	if (claim == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	free(peer->handshake.identity);
+	peer->handshake.identity = claim;
+	fd = connect_local(&fx, port);
+	if (fd < 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	mux_attach_fd(peer, fd);
+	suspended.server = fx.srv_a;
+	resumed = wait_until(
+			  &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+			  resume_peer_completed_predicate, &suspended) == 0;
+	alice_count = identity_pool_size(fx.srv_a, "alice");
+	bob_count = identity_pool_size(fx.srv_a, "bob");
+	struct server_stats *const stats = server_stats(fx.srv_a, false);
+	if (stats != NULL) {
+		stats_count = stats->num_tunnels;
+		if (stats_count > 0) {
+			resumed_index = stats->tunnels[0].tunnel_index;
+		}
+		free(stats);
+	}
+	resumed_usage = server_capacity_used(fx.srv_a);
+cleanup:
+	if (peer != NULL) {
+		mux_close(peer);
+	}
+	fixture_teardown(&fx);
+	T_EXPECT_EQ(suspended_usage, (size_t)1);
+	T_EXPECT_EQ(resumed_usage, (size_t)1);
+	T_EXPECT(resumed);
+	T_EXPECT_EQ(alice_count, (size_t)0);
+	T_EXPECT_EQ(bob_count, (size_t)1);
+	T_EXPECT_EQ(stats_count, (size_t)1);
+	T_EXPECT(initial_index != 0);
+	T_EXPECT_EQ(resumed_index, initial_index);
+}
+
 /* Regression: once an identity.mux_connect slot is freed -- e.g. a draining
  * orphan that had shadowed a reconfigured target finally closes -- maintenance_cb
  * must re-dial the slot from the current config instead of leaving it empty until
@@ -3543,6 +5252,157 @@ T_DECLARE_CASE(test_server_maintenance_redials_emptied_identity_slot)
 	T_EXPECT(orphan != NULL);
 	T_EXPECT(redialed != NULL);
 	T_EXPECT(redialed != orphan);
+}
+
+#ifdef SERVER_TEST_WRAP_REALLOC
+T_DECLARE_CASE(test_server_maintenance_retries_identity_array_growth)
+{
+	struct test_fixture fx = {
+		.loop = ev_loop_new(EVFLAG_AUTO),
+		.backend_a = { .listen_fd = -1 },
+		.backend_b = { .listen_fd = -1 },
+		.udp_echo_a = { .fd = -1 },
+		.udp_echo_b = { .fd = -1 },
+	};
+	if (fx.loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	fx.conf_a = make_config(NULL, NULL, NULL, NULL);
+	if (fx.conf_a == NULL ||
+	    !build_identity_dialer_conf(fx.conf_a, "127.0.0.1:1")) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		FIXTURE_FATAL(&fx, "server_start failed");
+	}
+	struct config *const nc = make_config(NULL, NULL, NULL, NULL);
+	if (nc == NULL || !build_identity_dialer_conf(nc, "127.0.0.1:1")) {
+		conf_free(nc);
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	char **const addresses = (char **)realloc(
+		(void *)nc->identity.mux_connect, 2 * sizeof(*addresses));
+	if (addresses == NULL) {
+		conf_free(nc);
+		FIXTURE_FATAL(&fx, "realloc failed");
+	}
+	nc->identity.mux_connect = addresses;
+	addresses[1] = strdup("127.0.0.1:2");
+	if (addresses[1] == NULL) {
+		conf_free(nc);
+		FIXTURE_FATAL(&fx, "strdup failed");
+	}
+	nc->identity.mux_connect_count = 2;
+	atomic_store_explicit(
+		&fail_realloc_ptr, (uintptr_t)fx.srv_a->identity_tunnels,
+		memory_order_relaxed);
+	T_CLEANUP(clear_realloc_failure, NULL);
+	const bool applied = server_apply_config(fx.srv_a, nc);
+	fx.conf_a = fx.srv_a->conf;
+	const bool failed_growth =
+		atomic_load_explicit(&fail_realloc_ptr, memory_order_relaxed) ==
+			0 &&
+		fx.srv_a->num_identity_tunnels == 1;
+	const bool retry_armed = ev_is_active(&fx.srv_a->w_maintenance);
+	clear_realloc_failure(NULL);
+	ev_invoke(fx.loop, &fx.srv_a->w_maintenance, EV_TIMER);
+	const bool grew = fx.srv_a->num_identity_tunnels == 2 &&
+			  fx.srv_a->identity_tunnels[1] != NULL;
+	fixture_teardown(&fx);
+	T_EXPECT(applied);
+	T_EXPECT(failed_growth);
+	T_EXPECT(retry_armed);
+	T_EXPECT(grew);
+}
+#endif /* SERVER_TEST_WRAP_REALLOC */
+
+struct slot_closed_wait_ctx {
+	const struct server *srv;
+};
+
+static int slot_closed_predicate(void *ptr)
+{
+	const struct slot_closed_wait_ctx *const restrict ctx = ptr;
+	const struct tunnel *const t = ctx->srv->identity_tunnels[0];
+	return t != NULL && tunnel_state(t) == MUX_STATE_CLOSED ? 1 : 0;
+}
+
+/* An on-demand identity tunnel (mux.idle_timeout > 0) whose dial failed is
+ * CLOSED, and it waits in its slot for the local connection that redials it:
+ * the tunnel keeps that CLOSED to itself.  A maintenance pass must leave it
+ * there.  It must not take the CLOSED state for a lost close notification,
+ * tear the tunnel down and dial a replacement nobody asked for. */
+T_DECLARE_CASE(test_server_maintenance_keeps_idle_on_demand_identity_tunnel)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	struct test_fixture fx = {
+		.loop = loop,
+		.mux_port_a = -1,
+		.tcp_port_a = -1,
+		.tcp_port_b = -1,
+		.backend_a = { .listen_fd = -1, .port = -1 },
+		.backend_b = { .listen_fd = -1, .port = -1 },
+	};
+
+	/* A bound socket that never listens: every dial to it is refused. */
+	const int refuse_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (refuse_fd < 0) {
+		FIXTURE_FATAL(&fx, "socket failed");
+	}
+	struct sockaddr_in refuse_sa = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	socklen_t refuse_len = sizeof(refuse_sa);
+	if (bind(refuse_fd, (struct sockaddr *)&refuse_sa, sizeof(refuse_sa)) !=
+		    0 ||
+	    getsockname(refuse_fd, (struct sockaddr *)&refuse_sa, &refuse_len) !=
+		    0) {
+		(void)close(refuse_fd);
+		FIXTURE_FATAL(&fx, "bind failed");
+	}
+	char mux_connect[64];
+	(void)snprintf(
+		mux_connect, sizeof(mux_connect), "127.0.0.1:%d",
+		(int)ntohs(refuse_sa.sin_port));
+
+	fx.conf_b = make_config(NULL, NULL, NULL, NULL);
+	if (fx.conf_b == NULL ||
+	    !build_identity_dialer_conf(fx.conf_b, mux_connect)) {
+		(void)close(refuse_fd);
+		FIXTURE_FATAL(&fx, "building conf_b failed");
+	}
+	fx.conf_b->mux.idle_timeout = 60;
+	fx.srv_b = server_new(fx.loop, fx.conf_b);
+	if (fx.srv_b == NULL || !server_start(fx.srv_b)) {
+		(void)close(refuse_fd);
+		FIXTURE_FATAL(&fx, "srv_b start failed");
+	}
+
+	struct slot_closed_wait_ctx wait_ctx = { .srv = fx.srv_b };
+	const bool closed =
+		wait_until(
+			&fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+			slot_closed_predicate, &wait_ctx) == 0;
+	const struct tunnel *const before = fx.srv_b->identity_tunnels[0];
+	const uint_least64_t index_before = fx.srv_b->next_tunnel_index;
+	ev_invoke(fx.loop, &fx.srv_b->w_maintenance, EV_TIMER);
+	const struct tunnel *const after = fx.srv_b->identity_tunnels[0];
+	/* A replacement tunnel takes a fresh index even if the allocator hands
+	 * it the old tunnel's address. */
+	const uint_least64_t index_after = fx.srv_b->next_tunnel_index;
+
+	fixture_teardown(&fx);
+	(void)close(refuse_fd);
+
+	T_EXPECT(closed);
+	T_EXPECT(before != NULL);
+	T_EXPECT(after == before);
+	T_EXPECT_EQ(index_after, index_before);
 }
 
 /* The maintenance tick is deferred work, not a heartbeat: it must be disarmed
@@ -3638,116 +5498,283 @@ T_DECLARE_CASE(test_server_start_identity_peer_with_null_listen)
 	T_EXPECT(started);
 }
 
-/* test_server_max_sessions_rejects: exercises max_sessions via
- * is_startup_limited(). Lowers limit and fakes num_sessions; the next
- * inbound connection must be closed immediately. */
-T_DECLARE_CASE(test_server_max_sessions_rejects)
+struct capacity_peer_wait {
+	struct mux_session **peers;
+	size_t count;
+};
+
+static int capacity_peers_settled(void *data)
 {
-	struct test_fixture fx;
-	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
-		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
-		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	const struct capacity_peer_wait *const wait = data;
+	for (size_t i = 0; i < wait->count; i++) {
+		const enum mux_state state = mux_state(wait->peers[i]);
+		if (state != MUX_STATE_ESTABLISHED &&
+		    state != MUX_STATE_CLOSED && state != MUX_STATE_SUSPENDED) {
+			return 0;
+		}
 	}
-
-	/* Clamp the limit below the faked session count. */
-	fx.srv_a->conf->max_sessions = 1;
-
-	/* Fake num_sessions == 2 so the check (2 > 1) fires. */
-#if WITH_THREADS
-	atomic_store_explicit(
-		&fx.srv_a->counters.num_sessions, 2, memory_order_relaxed);
-#else
-	fx.srv_a->counters.num_sessions = 2;
-#endif
-
-	/* Open a raw TCP connection to the mux listener; expect immediate
-	 * close (server rejects it via is_startup_limited). */
-	const int raw = connect_local(&fx, fx.mux_port_a);
-	if (raw < 0) {
-		FIXTURE_FATAL(&fx, "connect_local to mux port failed");
-	}
-
-	/* Drive until the connection is rejected and closed; server closes
-	 * the fd synchronously in mux_serve, so one event-loop iteration
-	 * is sufficient. */
-	const int revents = wait_fd_events(
-		&fx, raw, EV_READ, (double)CONNECT_WAIT_TIMEOUT_MS / 1000.0);
-	T_CHECK((revents & EV_READ) != 0);
-
-	char buf[1];
-	const ssize_t n = read(raw, buf, sizeof(buf));
-	(void)close(raw);
-
-	/* Defer assertions until after teardown; failing early would leak the
-	 * loop's signal watchers and corrupt later tests in this process. */
-	const bool rejected = fx.srv_a->counters.num_rejected > 0;
-
-	/* Restore the faked counter so the fixture tears down cleanly. */
-#if WITH_THREADS
-	atomic_store_explicit(
-		&fx.srv_a->counters.num_sessions, 1, memory_order_relaxed);
-#else
-	fx.srv_a->counters.num_sessions = 1;
-#endif
-	fx.srv_a->conf->max_sessions = 0;
-
-	fixture_teardown(&fx);
-
-	T_EXPECT_EQ(n, (ssize_t)0); /* peer closed the connection */
-	T_EXPECT(rejected);
+	return 1;
 }
 
-/* is_startup_limited() must reject once the existing count already equals
- * the configured limit, not only once it exceeds it -- the check runs
- * before this connection is counted, so count == limit already means
- * admitting this one would make limit + 1. Distinguishes >= from the
- * pre-fix strict >, which test_server_max_sessions_rejects above (count one
- * past the limit) cannot: that case rejects under either operator. */
-T_DECLARE_CASE(test_server_max_sessions_rejects_at_exact_limit)
+static struct mux_session *capacity_peer_new(struct test_fixture *fx)
+{
+	static const struct mux_callbacks callbacks = { 0 };
+	static const unsigned char id[MUX_SESSION_ID_LEN] = { 42 };
+	const struct mux_session_config conf = conf_get_mux(fx->srv_a->conf);
+	const struct mux_session_opts opts = {
+		.callbacks = &callbacks,
+		.conf = &conf,
+		.fd = -1,
+		.id = id,
+		.pool = { resume_peer_alloc, resume_peer_free, NULL },
+	};
+	return mux_new(fx->loop, &opts);
+}
+
+struct capacity_accept_wait {
+	struct server *srv;
+	size_t count;
+};
+
+static int capacity_accepted(void *data)
+{
+	const struct capacity_accept_wait *const wait = data;
+	return table_size(wait->srv->accepted_tunnels) == wait->count;
+}
+
+/* Queue every TCP transport before any hello, then drive all client hellos
+ * together. The tunnel workers compete for one shared capacity reservation. */
+T_DECLARE_CASE(test_server_capacity_simultaneous_inbound)
+{
+	struct test_fixture fx = {
+		.loop = ev_loop_new(EVFLAG_AUTO),
+		.backend_a = { .listen_fd = -1 },
+		.backend_b = { .listen_fd = -1 },
+		.udp_echo_a = { .fd = -1 },
+		.udp_echo_b = { .fd = -1 },
+	};
+	enum { N = 4 };
+	struct mux_session *peers[N] = { 0 };
+	int fds[N] = { -1, -1, -1, -1 };
+	size_t established = 0;
+	bool settled = false;
+	size_t halfopen_used = SIZE_MAX;
+	size_t established_used = SIZE_MAX;
+	size_t stopped_used = SIZE_MAX;
+	if (fx.loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	fx.conf_a = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (fx.conf_a == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.conf_a->max_sessions = 1;
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL || !server_start(fx.srv_a)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.mux_port_a = get_listener_port(&fx.srv_a->mux_listener);
+	for (size_t i = 0; i < N; i++) {
+		fds[i] = connect_local(&fx, fx.mux_port_a);
+		peers[i] = capacity_peer_new(&fx);
+		if (fds[i] < 0 || peers[i] == NULL) {
+			T_FAIL();
+			goto cleanup;
+		}
+	}
+	struct capacity_accept_wait admitted = { fx.srv_a, N };
+	if (wait_until(&fx, 2.0, capacity_accepted, &admitted) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	halfopen_used = server_capacity_used(fx.srv_a);
+	for (size_t i = 0; i < N; i++) {
+		mux_attach_fd(peers[i], fds[i]);
+		fds[i] = -1;
+	}
+	struct capacity_peer_wait wait = { peers, N };
+	settled = wait_until(&fx, 2.0, capacity_peers_settled, &wait) == 0;
+	for (size_t i = 0; i < N; i++) {
+		established += mux_state(peers[i]) == MUX_STATE_ESTABLISHED;
+	}
+	established_used = server_capacity_used(fx.srv_a);
+cleanup:
+	for (size_t i = 0; i < N; i++) {
+		if (peers[i] != NULL) {
+			mux_close(peers[i]);
+		}
+		if (fds[i] >= 0) {
+			socket_close(fds[i]);
+		}
+	}
+	if (fx.srv_a != NULL) {
+		server_stop(fx.srv_a);
+		stopped_used = server_capacity_used(fx.srv_a);
+	}
+	fixture_teardown(&fx);
+	T_EXPECT_EQ(halfopen_used, (size_t)0);
+	T_EXPECT(settled);
+	T_EXPECT_EQ(established, (size_t)1);
+	T_EXPECT_EQ(established_used, (size_t)1);
+	T_EXPECT_EQ(stopped_used, (size_t)0);
+}
+
+/* Lowering the budget preserves both the established tunnel and its slot.
+ * Temporary transports remain admitted, but neither fresh nor unmatched resume
+ * hellos can establish. Removing the cap admits fresh sessions again. */
+T_DECLARE_CASE(test_server_capacity_reload_and_unmatched_resume)
 {
 	struct test_fixture fx;
 	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
-		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
 		FIXTURE_FATAL(&fx, "fixture_setup failed");
 	}
-
-	fx.srv_a->conf->max_sessions = 2;
-#if WITH_THREADS
-	atomic_store_explicit(
-		&fx.srv_a->counters.num_sessions, 2, memory_order_relaxed);
-#else
-	fx.srv_a->counters.num_sessions = 2;
-#endif
-
-	const int raw = connect_local(&fx, fx.mux_port_a);
-	if (raw < 0) {
-		FIXTURE_FATAL(&fx, "connect_local to mux port failed");
+	struct mux_session *existing = capacity_peer_new(&fx);
+	const int existing_fd = connect_local(&fx, fx.mux_port_a);
+	if (existing == NULL || existing_fd < 0) {
+		if (existing != NULL) {
+			mux_close(existing);
+		}
+		if (existing_fd >= 0) {
+			socket_close(existing_fd);
+		}
+		FIXTURE_FATAL(&fx, "second established peer setup failed");
 	}
+	mux_attach_fd(existing, existing_fd);
+	struct capacity_peer_wait initial = { &existing, 1 };
+	if (wait_until(&fx, 2.0, capacity_peers_settled, &initial) != 0 ||
+	    mux_state(existing) != MUX_STATE_ESTABLISHED) {
+		mux_close(existing);
+		FIXTURE_FATAL(&fx, "second peer handshake failed");
+	}
+	struct config *conf = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	conf->max_sessions = 1;
+	if (!server_apply_config(fx.srv_a, conf)) {
+		FIXTURE_FATAL(&fx, "capacity reload failed");
+	}
+	fx.conf_a = conf;
+	fx.mux_port_a = get_listener_port(&fx.srv_a->mux_listener);
+	const size_t lowered_usage = server_capacity_used(fx.srv_a);
+	bool rejects[2] = { false, false };
+	size_t retained[2] = { SIZE_MAX, SIZE_MAX };
+	for (size_t attempt = 0; attempt < 2; attempt++) {
+		struct mux_session *peer = capacity_peer_new(&fx);
+		if (peer == NULL) {
+			FIXTURE_FATAL(&fx, "mux_new failed");
+		}
+		if (attempt != 0) {
+			peer->handshake.has_session_id = true;
+			memset(peer->handshake.session_id, 77,
+			       MUX_SESSION_ID_LEN);
+		}
+		const int fd = connect_local(&fx, fx.mux_port_a);
+		if (fd < 0) {
+			mux_close(peer);
+			FIXTURE_FATAL(&fx, "connect_local failed");
+		}
+		mux_attach_fd(peer, fd);
+		struct capacity_peer_wait wait = { &peer, 1 };
+		const bool settled =
+			wait_until(&fx, 2.0, capacity_peers_settled, &wait) ==
+			0;
+		const bool rejected = mux_state(peer) == MUX_STATE_CLOSED ||
+				      mux_state(peer) == MUX_STATE_SUSPENDED;
+		mux_close(peer);
+		rejects[attempt] = settled && rejected;
+		retained[attempt] = server_capacity_used(fx.srv_a);
+	}
+	conf = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	if (!server_apply_config(fx.srv_a, conf)) {
+		FIXTURE_FATAL(&fx, "unlimited reload failed");
+	}
+	fx.conf_a = conf;
+	fx.mux_port_a = get_listener_port(&fx.srv_a->mux_listener);
+	struct mux_session *peer = capacity_peer_new(&fx);
+	const int fd = connect_local(&fx, fx.mux_port_a);
+	if (peer == NULL || fd < 0) {
+		if (peer != NULL) {
+			mux_close(peer);
+		}
+		if (fd >= 0) {
+			socket_close(fd);
+		}
+		FIXTURE_FATAL(&fx, "unlimited peer setup failed");
+	}
+	mux_attach_fd(peer, fd);
+	struct capacity_peer_wait wait = { &peer, 1 };
+	const bool settled =
+		wait_until(&fx, 2.0, capacity_peers_settled, &wait) == 0;
+	const bool established = mux_state(peer) == MUX_STATE_ESTABLISHED;
 
-	const int revents = wait_fd_events(
-		&fx, raw, EV_READ, (double)CONNECT_WAIT_TIMEOUT_MS / 1000.0);
-	T_CHECK((revents & EV_READ) != 0);
-
-	char buf[1];
-	const ssize_t n = read(raw, buf, sizeof(buf));
-	(void)close(raw);
-
-	/* Defer assertions until after teardown; failing early would leak the
-	 * loop's signal watchers and corrupt later tests in this process. */
-	const bool rejected = fx.srv_a->counters.num_rejected > 0;
-
-#if WITH_THREADS
-	atomic_store_explicit(
-		&fx.srv_a->counters.num_sessions, 1, memory_order_relaxed);
-#else
-	fx.srv_a->counters.num_sessions = 1;
-#endif
-	fx.srv_a->conf->max_sessions = 0;
-
+	mux_close(existing);
+	mux_close(peer);
 	fixture_teardown(&fx);
+	T_EXPECT_EQ(lowered_usage, (size_t)2);
+	T_EXPECT(rejects[0]);
+	T_EXPECT(rejects[1]);
+	T_EXPECT_EQ(retained[0], (size_t)2);
+	T_EXPECT_EQ(retained[1], (size_t)2);
+	T_EXPECT(settled);
+	T_EXPECT(established);
+}
 
-	T_EXPECT_EQ(n, (ssize_t)0);
-	T_EXPECT(rejected);
+static int capacity_removed_outbound_closed(void *data)
+{
+	const struct server *const srv = data;
+	return srv->mux_tunnel == NULL;
+}
+
+/* Capacity reduction preserves retained sessions, but removing a configured
+ * outbound tunnel in the same reload must still drain and release its slot. */
+T_DECLARE_CASE(test_server_capacity_reduction_drains_removed_outbound)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+	const int fd = connect_local(&fx, fx.tcp_port_b);
+	if (fd < 0) {
+		FIXTURE_FATAL(&fx, "connect_local failed");
+	}
+	if (wait_for_streams_ready(&fx, 1) != 0 ||
+	    send_and_expect_echo(&fx, fd, "before", 6, 2.0) != 0) {
+		(void)close(fd);
+		FIXTURE_FATAL(&fx, "stream setup failed");
+	}
+	const size_t before = server_capacity_used(fx.srv_b);
+	struct config *const conf =
+		make_config(NULL, NULL, "127.0.0.1:0", fx.conf_b->connect);
+	if (conf == NULL) {
+		(void)close(fd);
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	conf->max_sessions = 1;
+	if (!server_apply_config(fx.srv_b, conf)) {
+		(void)close(fd);
+		FIXTURE_FATAL(&fx, "capacity reload failed");
+	}
+	fx.conf_b = conf;
+	/* The active stream keeps the retired tunnel alive until its own close. */
+	const bool echoed = send_and_expect_echo(&fx, fd, "after", 5, 2.0) == 0;
+	const size_t draining = server_capacity_used(fx.srv_b);
+	(void)close(fd);
+	const bool closed = wait_until(
+				    &fx, 2.0, capacity_removed_outbound_closed,
+				    fx.srv_b) == 0;
+	const size_t after = server_capacity_used(fx.srv_b);
+	fixture_teardown(&fx);
+	T_EXPECT(echoed);
+	T_EXPECT(closed);
+	T_EXPECT_EQ(before, (size_t)1);
+	T_EXPECT_EQ(draining, (size_t)1);
+	T_EXPECT_EQ(after, (size_t)0);
 }
 
 /* startup_limit_start == 0 is a valid, explicit "throttle from the first
@@ -3791,6 +5818,100 @@ T_DECLARE_CASE(test_server_startup_limit_zero_start_throttles_first_connection)
 
 	T_EXPECT_EQ(n, (ssize_t)0);
 	T_EXPECT(rejected);
+}
+
+struct admission_wait_ctx {
+	const struct server *srv;
+	uint_least64_t served0;
+	uint_least64_t rejected0;
+};
+
+/* Predicate: srv has either admitted or rejected one more mux connection. */
+static int admission_decided_predicate(void *ptr)
+{
+	const struct admission_wait_ctx *const restrict ctx = ptr;
+	return ctx->srv->counters.num_served != ctx->served0 ||
+	       ctx->srv->counters.num_rejected != ctx->rejected0;
+}
+
+static void fake_halfopen_add(struct server *restrict srv, const size_t n)
+{
+#if WITH_THREADS
+	(void)atomic_fetch_add_explicit(
+		&srv->counters.num_session_halfopen, n, memory_order_relaxed);
+#else
+	srv->counters.num_session_halfopen += n;
+#endif
+}
+
+static void fake_halfopen_sub(struct server *restrict srv, const size_t n)
+{
+#if WITH_THREADS
+	(void)atomic_fetch_sub_explicit(
+		&srv->counters.num_session_halfopen, n, memory_order_relaxed);
+#else
+	srv->counters.num_session_halfopen -= n;
+#endif
+}
+
+/* Connects to srv_a's mux port and drives the loop until the listener has
+ * admitted or rejected it; returns whether it was rejected, or -1 when no
+ * decision was observed. */
+static int probe_admission(struct test_fixture *restrict fx)
+{
+	struct admission_wait_ctx ctx = {
+		.srv = fx->srv_a,
+		.served0 = fx->srv_a->counters.num_served,
+		.rejected0 = fx->srv_a->counters.num_rejected,
+	};
+	const int raw = connect_local(fx, fx->mux_port_a);
+	if (raw < 0) {
+		return -1;
+	}
+	const int rc = wait_until(
+		fx, (double)CONNECT_WAIT_TIMEOUT_MS / 1000.0,
+		admission_decided_predicate, &ctx);
+	(void)close(raw);
+	if (rc != 0) {
+		return -1;
+	}
+	return fx->srv_a->counters.num_rejected != ctx.rejected0;
+}
+
+/* The startup_limit_full hard cap rejects once the half-open count already
+ * equals it -- the check runs before this connection is
+ * counted -- and admits one below it. rate=0 disables the probabilistic
+ * branch, so the cap is the only thing that can reject here. */
+T_DECLARE_CASE(test_server_startup_limit_full_rejects_at_exact_limit)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+
+	const int full = 3;
+	fx.srv_a->conf->max_sessions = 0;
+	fx.srv_a->conf->startup_limit_start = 0;
+	fx.srv_a->conf->startup_limit_rate = 0;
+	fx.srv_a->conf->startup_limit_full = full;
+
+	/* Rejected connections never touch the half-open count, so the fake
+	 * offset stays exact across the first probe. */
+	fake_halfopen_add(fx.srv_a, (size_t)full);
+	const int at_limit = probe_admission(&fx);
+	fake_halfopen_sub(fx.srv_a, 1);
+	const int below_limit = probe_admission(&fx);
+	fake_halfopen_sub(fx.srv_a, (size_t)full - 1);
+
+	/* Defer assertions until after teardown; failing early would leak the
+	 * loop's signal watchers and corrupt later tests in this process. */
+	fx.srv_a->conf->startup_limit_full = 0;
+
+	fixture_teardown(&fx);
+
+	T_EXPECT_EQ(at_limit, 1);
+	T_EXPECT_EQ(below_limit, 0);
 }
 
 struct establish_count_ctx {
@@ -4026,9 +6147,27 @@ static int srv_a_sessions_drained_predicate(void *ptr)
 	return drained ? 1 : 0;
 }
 
-/* test_server_graceful_shutdown_via_signal: fires srv_a's SIGTERM watcher
- * directly (bypassing srv_b), drives the loop until listeners stop, and
- * verifies teardown stays clean. */
+/* Records, through w->data, that the timer fired, and breaks the loop: the
+ * shutdown tests' safety net, and a stand-in for the force-exit deadline that
+ * makes reaching it observable. */
+static void
+shutdown_safety_break_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	(void)revents;
+	*(bool *)w->data = true;
+	ev_break(loop, EVBREAK_ALL);
+}
+
+/* Bound on a shutdown test's ev_run, well past signal_cb's 2 s force-exit
+ * deadline so that the deadline, not this, ends a shutdown that fails to
+ * drain. */
+static const double SHUTDOWN_SAFETY_S = 10.0;
+
+/* test_server_graceful_shutdown_via_signal: delivers SIGTERM to srv_a (the
+ * accepting side) and runs the loop until something breaks it.  The graceful
+ * drain must be what ends it -- handle_closed() stops the force-exit deadline
+ * and breaks the loop the moment the last session closes -- so the deadline
+ * is swapped for a marker that would record it being reached instead. */
 T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
 {
 	struct test_fixture fx;
@@ -4037,29 +6176,102 @@ T_DECLARE_CASE(test_server_graceful_shutdown_via_signal)
 		FIXTURE_FATAL(&fx, "fixture_setup failed");
 	}
 
-	/* Invoke srv_a's SIGTERM watcher directly; using ev_feed_signal_event
-	 * would also fire srv_b's watcher and complicate teardown ordering. */
+	/* Precondition: there is a session to drain, or the case is vacuous. */
+	const bool had_session = srv_a_sessions_drained_predicate(&fx) == 0;
+
+	/* Invoke srv_a's SIGTERM watcher directly; ev_feed_signal_event would
+	 * also fire srv_b's watcher and complicate teardown ordering. */
 	ev_invoke(fx.loop, &fx.srv_a->w_sigterm, EV_SIGNAL);
+	const bool listeners_stopped =
+		fx.srv_a->mux_listener.w_accept.fd == -1 &&
+		fx.srv_a->local_listener.w_accept.fd == -1;
+	/* With a session left to drain, signal_cb armed the deadline. */
+	const bool shutting_down = fx.srv_a->shutting_down;
+	const bool deadline_armed = ev_is_active(&fx.srv_a->w_maintenance);
 
-	/* Drive until signal_cb has stopped the mux listener (synchronous
-	 * side-effect of the signal handler). */
-	const ev_tstamp deadline =
-		mono_now() + (double)SETUP_WAIT_TIMEOUT_MS / 1000.0;
-	while (fx.srv_a->mux_listener.w_accept.fd != -1 &&
-	       mono_now() < deadline) {
-		drive_loop_once(&fx);
-	}
-	T_CHECK(fx.srv_a->mux_listener.w_accept.fd == -1);
-	T_CHECK(fx.srv_a->local_listener.w_accept.fd == -1);
-
-	/* Drive the graceful shutdown until it has actually drained srv_a's
-	 * sessions, rather than a fixed settle count; bounded, and teardown
-	 * force-closes anything still lingering if the drain does not complete. */
-	(void)wait_until(
-		&fx, (double)SETUP_WAIT_TIMEOUT_MS / 1000.0,
-		srv_a_sessions_drained_predicate, &fx);
+	bool deadline_reached = false;
+	ev_timer *const w_deadline = &fx.srv_a->w_maintenance;
+	void (*const saved_cb)(struct ev_loop *, ev_timer *, int) =
+		ev_cb(w_deadline);
+	void *const saved_data = w_deadline->data;
+	ev_set_cb(w_deadline, shutdown_safety_break_cb);
+	w_deadline->data = &deadline_reached;
+	/* Bounds a drain that ends neither way, e.g. with the deadline
+	 * stopped but the loop never broken. */
+	bool safety_fired = false;
+	ev_timer w_safety;
+	ev_timer_init(
+		&w_safety, shutdown_safety_break_cb, SHUTDOWN_SAFETY_S, 0.0);
+	w_safety.data = &safety_fired;
+	ev_timer_start(fx.loop, &w_safety);
+	ev_run(fx.loop, 0);
+	ev_timer_stop(fx.loop, &w_safety);
+	const bool drained = srv_a_sessions_drained_predicate(&fx) == 1;
+	ev_timer_stop(fx.loop, w_deadline);
+	ev_set_cb(w_deadline, saved_cb);
+	w_deadline->data = saved_data;
 
 	fixture_teardown(&fx);
+
+	T_EXPECT(had_session);
+	T_EXPECT(shutting_down);
+	T_EXPECT(deadline_armed);
+	T_EXPECT(listeners_stopped);
+	T_EXPECT(!deadline_reached);
+	T_EXPECT(!safety_fired);
+	T_EXPECT(drained);
+}
+
+/* A graceful shutdown leaves the API connections open, so a PUT /config can
+ * still reach server_apply_config() after SIGTERM.  It must be refused: a
+ * reload would rebind the listeners signal_cb just stopped and dial tunnels
+ * that were never told to shut down, so shutdown could only end at the
+ * force-exit deadline. */
+T_DECLARE_CASE(test_server_apply_config_rejected_while_shutting_down)
+{
+	struct test_fixture fx;
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup failed");
+	}
+
+	ev_invoke(fx.loop, &fx.srv_a->w_sigterm, EV_SIGNAL);
+	const bool initially_stopped =
+		fx.srv_a->local_listener.w_accept.fd == -1 &&
+		fx.srv_a->mux_listener.w_accept.fd == -1;
+	struct tunnel *const old_mux_tunnel = fx.srv_a->mux_tunnel;
+
+	/* Name the ports signal_cb just released explicitly: the strings differ
+	 * from the configured "127.0.0.1:0", so an applied reload would rebind
+	 * both listeners. */
+	char mux_listen[64];
+	char listen[64];
+	(void)snprintf(
+		mux_listen, sizeof(mux_listen), "127.0.0.1:%d", fx.mux_port_a);
+	(void)snprintf(listen, sizeof(listen), "127.0.0.1:%d", fx.tcp_port_a);
+	struct config *const new_conf = make_config(
+		mux_listen, fx.conf_a->mux_connect, listen, fx.conf_a->connect);
+	if (new_conf == NULL) {
+		FIXTURE_FATAL(&fx, "make_config failed");
+	}
+	struct config *const old_conf = fx.srv_a->conf;
+	const bool applied = server_apply_config(fx.srv_a, new_conf);
+	if (applied) {
+		/* Track the new config so teardown frees it, not the freed old one. */
+		fx.conf_a = fx.srv_a->conf;
+	}
+
+	const bool kept_conf = fx.srv_a->conf == old_conf;
+	const bool still_stopped = fx.srv_a->local_listener.w_accept.fd == -1 &&
+				   fx.srv_a->mux_listener.w_accept.fd == -1;
+	const bool kept_tunnel = fx.srv_a->mux_tunnel == old_mux_tunnel;
+	fixture_teardown(&fx);
+
+	T_EXPECT(initially_stopped);
+	T_EXPECT(!applied);
+	T_EXPECT(kept_conf);
+	T_EXPECT(still_stopped);
+	T_EXPECT(kept_tunnel);
 }
 
 /* server_apply_config()'s SIGHUP reload path must honor an explicit --loglevel
@@ -4149,6 +6361,26 @@ T_DECLARE_CASE(test_server_maintenance_suspend_drops_transports_and_reconnects)
 		FIXTURE_FATAL(&fx, "fixture_setup failed");
 	}
 
+	/* Both peers are already using their single slot. A real outbound
+	 * reconnect must reuse it, and the inbound resume must use its old slot. */
+	struct server *const servers[] = { fx.srv_a, fx.srv_b };
+	for (size_t i = 0; i < 2; i++) {
+		struct server *const srv = servers[i];
+		struct config *const conf = make_config(
+			srv->conf->mux_listen, srv->conf->mux_connect,
+			srv->conf->listen, srv->conf->connect);
+		if (conf == NULL) {
+			FIXTURE_FATAL(&fx, "capacity config failed");
+		}
+		conf->max_sessions = 1;
+		const bool applied = server_apply_config(srv, conf);
+		fx.conf_a = fx.srv_a->conf;
+		fx.conf_b = fx.srv_b->conf;
+		if (!applied) {
+			FIXTURE_FATAL(&fx, "capacity reload failed");
+		}
+	}
+	const uint_least64_t dialed_index = tunnel_index(fx.srv_b->mux_tunnel);
 	/* srv_b is the dialer; its mux_tunnel holds a client transport that the
 	 * suspend handler must drop and reconnect. */
 	const uint_least64_t before = server_num_reconnects(fx.srv_b);
@@ -4169,86 +6401,415 @@ T_DECLARE_CASE(test_server_maintenance_suspend_drops_transports_and_reconnects)
 		reconnect_moved_predicate, &ctx);
 	const uint_least64_t after = server_num_reconnects(fx.srv_b);
 
+	const int established = wait_for_sessions_ready(&fx);
+	const size_t inbound_usage = server_capacity_used(fx.srv_a);
+	const size_t outbound_usage = server_capacity_used(fx.srv_b);
+	const uint_least64_t reconnected_index =
+		tunnel_index(fx.srv_b->mux_tunnel);
 	fixture_teardown(&fx);
 
 	T_EXPECT_EQ(waited, 0);
 	T_EXPECT(after > before);
+	T_EXPECT_EQ(established, 0);
+	T_EXPECT_EQ(inbound_usage, (size_t)1);
+	T_EXPECT_EQ(outbound_usage, (size_t)1);
+	T_EXPECT_EQ(reconnected_index, dialed_index);
 }
 
-/* Safety net for the shutdown-deadline test: records that it fired and breaks
- * the loop, so a maintenance_cb that fails to force the exit cannot hang. */
-static void maintenance_safety_break_cb(
-	struct ev_loop *loop, ev_timer *w, const int revents)
+/* Start a server whose only session is a mux_connect dial-out to
+ * 127.0.0.1:@p port; NULL on failure.  Release it with dialer_server_free(). */
+static struct server *dialer_server_start(
+	struct ev_loop *loop, const int port, const int idle_timeout)
 {
-	(void)revents;
-	*(bool *)w->data = true;
-	ev_break(loop, EVBREAK_ALL);
+	char mux_connect[64];
+	(void)snprintf(mux_connect, sizeof(mux_connect), "127.0.0.1:%d", port);
+	struct config *const conf = make_config(NULL, mux_connect, NULL, NULL);
+	if (conf == NULL) {
+		return NULL;
+	}
+	conf->mux.idle_timeout = idle_timeout;
+	/* No handshake or close timeout: a session stalled on a silent peer
+	 * stays stalled, rather than closing on its own mid-test. */
+	conf->mux.connect_timeout = 0;
+	struct server *const srv = server_new(loop, conf);
+	if (srv == NULL) {
+		conf_free(conf);
+		return NULL;
+	}
+	if (!server_start(srv)) {
+		server_stop(srv);
+		server_free(srv);
+		conf_free(conf);
+		return NULL;
+	}
+	return srv;
 }
 
-/* maintenance_cb()'s highest-priority task: while shutting_down, once the
- * force-exit deadline (2s past shutdown_start_ns) has elapsed it must break the
- * event loop. Enter shutdown with an already-expired deadline, drive the
- * maintenance timer promptly, and assert the loop broke via maintenance_cb --
- * not via the safety net that bounds the run. */
+static void dialer_server_free(struct server *restrict srv)
+{
+	if (srv == NULL) {
+		return;
+	}
+	server_stop(srv);
+	struct config *const conf = srv->conf;
+	server_free(srv);
+	conf_free(conf);
+}
+
+/* A loopback port that refuses connections: bound, then released again. */
+static int refused_port(void)
+{
+	const int fd = bind_listen_localhost();
+	if (fd < 0) {
+		return -1;
+	}
+	const int port = listener_fd_port(fd);
+	socket_close(fd);
+	return port;
+}
+
+/* Predicate: srv's dial-out is resting in CLOSED after a failed redial.  The
+ * counter moves where a redial is made, so a nonzero count with the session
+ * CLOSED means that redial has failed too, putting the next attempt on the
+ * 2 s backoff rung: long enough for a shutdown to find the session there. */
+static int dialer_in_backoff_predicate(void *ptr)
+{
+	const struct server *const restrict srv = ptr;
+	if (server_num_reconnects(srv) == 0 || srv->mux_tunnel == NULL) {
+		return 0;
+	}
+	return tunnel_state(srv->mux_tunnel) == MUX_STATE_CLOSED ? 1 : 0;
+}
+
+/* Predicate: srv's dial-out has closed and is kept for an on-demand redial. */
+static int dialer_closed_predicate(void *ptr)
+{
+	const struct server *const restrict srv = ptr;
+	return srv->mux_tunnel != NULL && tunnel_state(srv->mux_tunnel) ==
+						  MUX_STATE_CLOSED ?
+		       1 :
+		       0;
+}
+
+/* SIGTERM a server whose dial-out session is already CLOSED -- between
+ * reconnect attempts, or resting as an on-demand tunnel -- and run its loop
+ * until something breaks it.  Shutting such a session down is no transition,
+ * so the tunnel has to report the close itself; handle_closed() then drops the
+ * tunnel and ends the loop.  Returns NULL if that happened, else what went
+ * wrong: had the loop run out to the force-exit deadline instead, the tunnel
+ * would still be there. */
+static const char *dialer_shutdown_failure(
+	const int idle_timeout, wait_predicate_fn closed_predicate)
+{
+	struct test_fixture fx = { .loop = ev_loop_new(EVFLAG_AUTO) };
+	if (fx.loop == NULL) {
+		return "ev_loop_new failed";
+	}
+	const char *failure = NULL;
+	const int port = refused_port();
+	struct server *const srv =
+		port < 0 ? NULL :
+			   dialer_server_start(fx.loop, port, idle_timeout);
+	if (srv == NULL) {
+		failure = "dialer start failed";
+		goto cleanup;
+	}
+	if (wait_until(
+		    &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		    closed_predicate, srv) != 0) {
+		failure = "dial-out never came to rest in CLOSED";
+		goto cleanup;
+	}
+
+	bool safety_fired = false;
+	ev_timer w_safety;
+	ev_timer_init(
+		&w_safety, shutdown_safety_break_cb, SHUTDOWN_SAFETY_S, 0.0);
+	w_safety.data = &safety_fired;
+	ev_timer_start(fx.loop, &w_safety);
+	/* Run signal_cb inside ev_run, as a real signal does. */
+	ev_feed_event(fx.loop, &srv->w_sigterm, EV_SIGNAL);
+	ev_run(fx.loop, 0);
+	ev_timer_stop(fx.loop, &w_safety);
+
+	if (safety_fired) {
+		failure = "shutdown never ended";
+	} else if (srv->mux_tunnel != NULL) {
+		failure = "loop ended at the force-exit deadline, tunnel live";
+	}
+
+cleanup:
+	dialer_server_free(srv);
+	ev_loop_destroy(fx.loop);
+	return failure;
+}
+
+T_DECLARE_CASE(test_server_graceful_shutdown_dialer_in_reconnect_backoff)
+{
+	const char *const failure =
+		dialer_shutdown_failure(0, dialer_in_backoff_predicate);
+	if (failure != NULL) {
+		T_LOG(failure);
+	}
+	T_EXPECT(failure == NULL);
+}
+
+T_DECLARE_CASE(test_server_graceful_shutdown_idle_on_demand_dialer)
+{
+	const char *const failure =
+		dialer_shutdown_failure(1, dialer_closed_predicate);
+	if (failure != NULL) {
+		T_LOG(failure);
+	}
+	T_EXPECT(failure == NULL);
+}
+
+/* signal_cb()'s force-exit deadline: with a session that cannot finish its
+ * close -- a dial-out stalled in the handshake against a peer that accepts but
+ * never answers, with no connect_timeout to end it -- SIGTERM must arm
+ * w_maintenance as a one-shot at the deadline, and reaching it must break the
+ * loop through maintenance_cb.  The arming is checked as signal_cb left it,
+ * then the deadline is pulled in to fire at once rather than after 2 s. */
 T_DECLARE_CASE(test_server_maintenance_shutdown_deadline_breaks_loop)
+{
+	struct test_fixture fx = { .loop = ev_loop_new(EVFLAG_AUTO) };
+	if (fx.loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	int conn_fd = -1;
+	struct server *srv = NULL;
+	bool armed_one_shot = false;
+	bool armed_at_deadline = false;
+	bool safety_fired = false;
+	bool still_closing = false;
+
+	const int peer_fd = bind_listen_localhost();
+	const int port = peer_fd < 0 ? -1 : listener_fd_port(peer_fd);
+	srv = port < 0 ? NULL : dialer_server_start(fx.loop, port, 0);
+	if (srv == NULL) {
+		T_LOG("dialer start failed");
+		T_FAIL();
+		goto cleanup;
+	}
+	/* The hello's arrival means the dialer is in the handshake, where a
+	 * shutdown starts a close exchange this peer never finishes. */
+	if ((wait_fd_events(
+		     &fx, peer_fd, EV_READ,
+		     (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) &
+	     EV_READ) == 0) {
+		T_LOG("dialer never connected");
+		T_FAIL();
+		goto cleanup;
+	}
+	conn_fd = accept(peer_fd, NULL, NULL);
+	if (conn_fd < 0 || (wait_fd_events(
+				    &fx, conn_fd, EV_READ,
+				    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) &
+			    EV_READ) == 0) {
+		T_LOG("dialer never sent its hello");
+		T_FAIL();
+		goto cleanup;
+	}
+
+	ev_invoke(fx.loop, &srv->w_sigterm, EV_SIGNAL);
+	T_CHECK(srv->shutting_down);
+	T_CHECK(ev_is_active(&srv->w_maintenance));
+	armed_one_shot = srv->w_maintenance.repeat == 0.0;
+	/* The 2 s deadline, not the 1 s maintenance period. */
+	const ev_tstamp remaining =
+		ev_timer_remaining(fx.loop, &srv->w_maintenance);
+	armed_at_deadline = remaining > 1.5 && remaining <= 2.0;
+
+	ev_timer_stop(fx.loop, &srv->w_maintenance);
+	ev_timer_set(&srv->w_maintenance, 0.01, 0.0);
+	ev_timer_start(fx.loop, &srv->w_maintenance);
+
+	ev_timer w_safety;
+	ev_timer_init(
+		&w_safety, shutdown_safety_break_cb, SHUTDOWN_SAFETY_S, 0.0);
+	w_safety.data = &safety_fired;
+	ev_timer_start(fx.loop, &w_safety);
+	ev_run(fx.loop, 0);
+	ev_timer_stop(fx.loop, &w_safety);
+	/* Still mid-close: the deadline, not a drain, ended the loop. */
+	still_closing = srv->mux_tunnel != NULL &&
+			tunnel_state(srv->mux_tunnel) == MUX_STATE_CLOSING;
+
+cleanup:
+	dialer_server_free(srv);
+	if (conn_fd >= 0) {
+		socket_close(conn_fd);
+	}
+	if (peer_fd >= 0) {
+		socket_close(peer_fd);
+	}
+	ev_loop_destroy(fx.loop);
+
+	T_EXPECT(armed_one_shot);
+	T_EXPECT(armed_at_deadline);
+	T_EXPECT(!safety_fired);
+	T_EXPECT(still_closing);
+}
+
+/* A config for dialer_server_start()'s server, with mux_connect to
+ * 127.0.0.1:@p port, or none when @p port is negative; NULL on OOM. */
+static struct config *dialer_reload_config(const int port)
+{
+	char mux_connect[64];
+	(void)snprintf(mux_connect, sizeof(mux_connect), "127.0.0.1:%d", port);
+	struct config *const conf =
+		make_config(NULL, port < 0 ? NULL : mux_connect, NULL, NULL);
+	if (conf == NULL) {
+		return NULL;
+	}
+	conf->mux.connect_timeout = 0;
+	return conf;
+}
+
+struct mux_tunnel_changed_ctx {
+	const struct server *srv;
+	const struct tunnel *old;
+};
+
+/* Predicate: srv's mux_connect slot no longer holds the given tunnel. */
+static int mux_tunnel_changed_predicate(void *ptr)
+{
+	const struct mux_tunnel_changed_ctx *const restrict ctx = ptr;
+	return ctx->srv->mux_tunnel != ctx->old ? 1 : 0;
+}
+
+/* A reload that removes mux_connect retires the dial-out, which keeps its slot
+ * while its session winds down -- here a dial stalled against a peer that
+ * never answers.  A reload that re-adds mux_connect meanwhile finds the slot
+ * held and dials nothing, and must not hand the address back to the retired
+ * tunnel either: it stays retired.  So once it closes and frees the slot,
+ * maintenance must dial a fresh tunnel for the re-added mux_connect, as it
+ * does for an emptied identity slot.  Pre-fix nothing did, and the configured
+ * mux_connect stayed down until yet another reload changed it. */
+T_DECLARE_CASE(test_server_maintenance_redials_mux_connect_readded_while_retired)
+{
+	struct test_fixture fx = { .loop = ev_loop_new(EVFLAG_AUTO) };
+	if (fx.loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	int conn_fd = -1;
+	struct server *srv = NULL;
+	bool setup_ok = false;
+	bool removed_kept = false;
+	bool readded_kept = false;
+	bool freed = false;
+	bool fresh = false;
+	bool redialed = false;
+
+	const int peer_fd = bind_listen_localhost();
+	const int port = peer_fd < 0 ? -1 : listener_fd_port(peer_fd);
+	srv = port < 0 ? NULL : dialer_server_start(fx.loop, port, 0);
+	if (srv == NULL) {
+		T_LOG("dialer start failed");
+		goto cleanup;
+	}
+	if ((wait_fd_events(
+		     &fx, peer_fd, EV_READ,
+		     (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) &
+	     EV_READ) == 0) {
+		T_LOG("dialer never connected");
+		goto cleanup;
+	}
+	conn_fd = accept(peer_fd, NULL, NULL);
+	if (conn_fd < 0) {
+		T_LOG("accept failed");
+		goto cleanup;
+	}
+	const struct tunnel *const old = srv->mux_tunnel;
+
+	/* Its dial is still live, so the retired tunnel keeps the slot. */
+	struct config *conf = dialer_reload_config(-1);
+	if (conf == NULL || !server_apply_config(srv, conf)) {
+		T_LOG("reload removing mux_connect failed");
+		goto cleanup;
+	}
+	removed_kept = srv->mux_tunnel == old;
+	conf = dialer_reload_config(port);
+	if (conf == NULL || !server_apply_config(srv, conf)) {
+		T_LOG("reload re-adding mux_connect failed");
+		goto cleanup;
+	}
+	readded_kept = srv->mux_tunnel == old;
+
+	/* The peer drops the stalled dial, and the retired tunnel closes. */
+	socket_close(conn_fd);
+	conn_fd = -1;
+	struct mux_tunnel_changed_ctx wait_ctx = { .srv = srv, .old = old };
+	freed = wait_until(
+			&fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+			mux_tunnel_changed_predicate, &wait_ctx) == 0;
+	ev_invoke(fx.loop, &srv->w_maintenance, EV_TIMER);
+	fresh = srv->mux_tunnel != NULL;
+	/* And the fresh tunnel dials the re-added address. */
+	redialed = fresh && (wait_fd_events(
+				     &fx, peer_fd, EV_READ,
+				     (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) &
+			     EV_READ) != 0;
+	setup_ok = true;
+
+cleanup:
+	dialer_server_free(srv);
+	if (conn_fd >= 0) {
+		socket_close(conn_fd);
+	}
+	if (peer_fd >= 0) {
+		socket_close(peer_fd);
+	}
+	ev_loop_destroy(fx.loop);
+
+	T_EXPECT(setup_ok);
+	T_EXPECT(removed_kept);
+	T_EXPECT(readded_kept);
+	T_EXPECT(freed);
+	T_EXPECT(fresh);
+	T_EXPECT(redialed);
+}
+
+/* Invoke-pending hook that runs nothing: it only records, in the loop's
+ * userdata, how many watchers came due. */
+static void count_pending_cb(struct ev_loop *loop)
+{
+	*(unsigned int *)ev_userdata(loop) = ev_pending_count(loop);
+}
+
+/* server_free() must stop the maintenance tick whatever armed it: the timer
+ * lives in the server, so leaving it in the loop hands the loop freed memory.
+ * Arm it as a maintenance kick would (due in 10 ms rather than a full period),
+ * free the server, and run one loop iteration that counts what comes due
+ * without invoking it -- a stale timer would call maintenance_cb on the freed
+ * server.  With nothing left active the iteration returns at once. */
+T_DECLARE_CASE(test_server_free_stops_maintenance_timer)
 {
 	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	if (loop == NULL) {
 		T_FATAL("ev_loop_new failed");
 	}
-	struct config *conf = NULL;
-	struct server *srv = NULL;
-	ev_timer w_safety;
-	bool have_safety = false;
-	bool safety_fired = false;
-	bool started = false;
-
-	conf = make_config("127.0.0.1:0", NULL, NULL, NULL);
-	if (conf == NULL) {
+	struct config *const conf =
+		make_config("127.0.0.1:0", NULL, NULL, NULL);
+	struct server *const srv = conf == NULL ? NULL : server_new(loop, conf);
+	if (srv == NULL) {
 		T_FAIL();
-		goto cleanup;
+		conf_free(conf);
+		ev_loop_destroy(loop);
+		return;
 	}
-	srv = server_new(loop, conf);
-	if (srv == NULL || !server_start(srv)) {
-		T_FAIL();
-		goto cleanup;
-	}
-	started = true;
-
-	/* Bound the run: if maintenance_cb fails to break, the safety timer breaks
-	 * it after a fixed delay and records that it had to. */
-	ev_timer_init(&w_safety, maintenance_safety_break_cb, 2.0, 0.0);
-	w_safety.data = &safety_fired;
-	ev_timer_start(loop, &w_safety);
-	have_safety = true;
-
-	/* Enter shutdown: from here the watcher IS the force-exit deadline, so
-	 * reaching it must break the loop. */
-	srv->shutting_down = true;
-
-	/* Re-arm the deadline to fire almost immediately rather than after its
-	 * full 2s period, then let the loop run it. */
 	srv->w_maintenance.repeat = 0.01;
 	ev_timer_again(loop, &srv->w_maintenance);
-	ev_run(loop, 0);
+	T_EXPECT(ev_is_active(&srv->w_maintenance));
+	server_free(srv);
+	conf_free(conf);
 
-cleanup:
-	if (have_safety) {
-		ev_timer_stop(loop, &w_safety);
-	}
-	if (srv != NULL) {
-		server_stop(srv);
-		struct config *const final_conf = srv->conf;
-		server_free(srv);
-		conf_free(final_conf);
-	} else if (conf != NULL) {
-		conf_free(conf);
-	}
+	unsigned int came_due = 0;
+	ev_set_userdata(loop, &came_due);
+	ev_set_invoke_pending_cb(loop, count_pending_cb);
+	ev_run(loop, EVRUN_ONCE);
 	ev_loop_destroy(loop);
-
-	T_EXPECT(started);
-	/* The loop broke on maintenance_cb's deadline, before the safety net. */
-	T_EXPECT(!safety_fired);
+	T_EXPECT_EQ(came_due, 0u);
 }
 
 #if WITH_THREADS
@@ -4295,6 +6856,61 @@ T_DECLARE_CASE(test_server_new_arms_async_before_start)
 	server_free(srv);
 	conf_free(final_conf);
 	ev_loop_destroy(loop);
+}
+
+/* A CLOSED event still queued when server_stop() runs is handled there, by its
+ * dispatcher flush -- and must not re-arm the maintenance tick on the server
+ * being torn down.  Queue one deterministically: shut down a dial-out resting
+ * in reconnect backoff, whose tunnel then relays its CLOSED, and wait for the
+ * relay's wakeup without running the loop. */
+T_DECLARE_CASE(test_server_stop_leaves_maintenance_disarmed)
+{
+	struct test_fixture fx = { .loop = ev_loop_new(EVFLAG_AUTO) };
+	if (fx.loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	bool queued = false;
+	bool armed_after_stop = true;
+	const int port = refused_port();
+	struct server *srv =
+		port < 0 ? NULL : dialer_server_start(fx.loop, port, 0);
+	if (srv == NULL) {
+		T_LOG("dialer start failed");
+		T_FAIL();
+		goto cleanup;
+	}
+	if (wait_until(
+		    &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		    dialer_in_backoff_predicate, srv) != 0) {
+		T_LOG("dial-out never came to rest in CLOSED");
+		T_FAIL();
+		goto cleanup;
+	}
+	/* Consume any wakeup already pending, so the next one is the CLOSED. */
+	ev_run(fx.loop, EVRUN_NOWAIT);
+
+	tunnel_shutdown(srv->mux_tunnel);
+	const ev_tstamp deadline =
+		mono_now() + (double)SETUP_WAIT_TIMEOUT_MS / 1000.0;
+	while (!(queued = ev_async_pending(&srv->w_async)) &&
+	       mono_now() < deadline) {
+		const struct timespec ts = { .tv_nsec = 1000000 };
+		(void)nanosleep(&ts, NULL);
+	}
+
+	server_stop(srv);
+	armed_after_stop = ev_is_active(&srv->w_maintenance);
+	struct config *const conf = srv->conf;
+	server_free(srv);
+	conf_free(conf);
+	srv = NULL;
+
+cleanup:
+	dialer_server_free(srv);
+	ev_loop_destroy(fx.loop);
+
+	T_EXPECT(queued);
+	T_EXPECT(!armed_after_stop);
 }
 
 /* w_async stays armed for the object's whole lifetime, so the destructor -- not
@@ -4655,6 +7271,247 @@ cleanup:
 	}
 }
 
+/* Drive n fresh connections to port, one at a time; each must echo on its own
+ * first attempt. Returns 0 when all did. */
+static int
+echo_each_connection(struct test_fixture *restrict fx, const int port, int n)
+{
+	for (; n > 0; n--) {
+		const int cl = connect_local(fx, port);
+		if (cl < 0) {
+			return -1;
+		}
+		const int rc = send_and_expect_echo(
+			fx, cl, "rr-echo", strlen("rr-echo"),
+			(double)ECHO_WAIT_TIMEOUT_MS / 1000.0);
+		(void)close(cl);
+		if (rc != 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Regression: identity_listener_pick() must skip a pooled tunnel that is not
+ * established. srv_a's "peer-x" pool holds one real dialed-in tunnel plus a
+ * never-started one (its session stuck short of ESTABLISHED, as a pooled
+ * tunnel is through reconnect backoff or suspension). Plain round-robin handed
+ * every other connection to the dead member, which closed it; every connection
+ * must now be forwarded over the live one. */
+T_DECLARE_CASE(test_server_identity_listener_skips_non_established_tunnel)
+{
+	struct ev_loop *loop = NULL;
+	struct config *conf_a = NULL;
+	struct server *srv_a = NULL;
+	struct config *conf_c = NULL;
+	struct server *srv_c = NULL;
+	struct tunnel *dead = NULL;
+	struct identity_listener *sl = NULL;
+	struct mock_server backend = { .listen_fd = -1, .port = -1 };
+	struct test_fixture fx = { 0 };
+	int mux_port_a = -1;
+	int id_port = -1;
+	char mux_connect_a[64];
+	char connect_backend[64];
+	int echo_rc = -1;
+	bool setup_ok = false;
+
+	loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.loop = loop;
+
+	if (mock_server_start(&backend, loop, MOCK_ECHO) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	(void)snprintf(
+		connect_backend, sizeof(connect_backend), "127.0.0.1:%d",
+		backend.port);
+
+	conf_a = make_config("127.0.0.1:0", NULL, NULL, NULL);
+	if (conf_a == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	conf_a->identity.claim = strdup("server-a");
+	conf_a->identity.peers = malloc(sizeof(*conf_a->identity.peers));
+	if (conf_a->identity.claim == NULL || conf_a->identity.peers == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	conf_a->identity.peers[0] = (struct identity_peer){
+		.id = strdup("peer-x"),
+		.listen = strdup("127.0.0.1:0"),
+	};
+	conf_a->identity.peers_count = 1;
+	if (conf_a->identity.peers[0].id == NULL ||
+	    conf_a->identity.peers[0].listen == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	srv_a = server_new(loop, conf_a);
+	if (srv_a == NULL || !server_start(srv_a)) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fx.srv_a = srv_a;
+	if (wait_for_listener_port(
+		    &fx, &srv_a->mux_listener, &mux_port_a,
+		    (double)SETUP_WAIT_TIMEOUT_MS / 1000.0) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	(void)snprintf(
+		mux_connect_a, sizeof(mux_connect_a), "127.0.0.1:%d",
+		mux_port_a);
+
+	conf_c = make_config(NULL, mux_connect_a, NULL, connect_backend);
+	if (conf_c == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	conf_c->identity.claim = strdup("peer-x");
+	if (conf_c->identity.claim == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	srv_c = server_new(loop, conf_c);
+	if (srv_c == NULL || !server_start(srv_c)) {
+		T_FAIL();
+		goto cleanup;
+	}
+
+	struct identity_pool_wait_ctx pool_ctx = {
+		.srv_a = srv_a,
+		.peer_identity = "peer-x",
+		.expected = 1,
+	};
+	if (wait_until(
+		    &fx, (double)SESSION_WAIT_TIMEOUT_MS / 1000.0,
+		    identity_pool_wait_predicate, &pool_ctx) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	{
+		size_t cursor = 0;
+		void *elem = NULL;
+		if (table_next(srv_a->identities, &cursor, NULL, &elem)) {
+			sl = elem;
+			id_port = get_listener_port(&sl->listener);
+		}
+	}
+	/* Append the dead member in place: the pool's first growth leaves room
+	 * for four, so no reallocation is needed. */
+	if (sl == NULL || id_port <= 0 || sl->num_tunnels != 1 ||
+	    sl->cap_tunnels < 2) {
+		T_FAIL();
+		goto cleanup;
+	}
+	dead = ol_make_tunnel(srv_a);
+	if (dead == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	sl->tunnels[sl->num_tunnels++] = dead;
+	setup_ok = true;
+
+	/* Four picks walk the two-member pool twice over. */
+	echo_rc = echo_each_connection(&fx, id_port, 4);
+
+cleanup:
+	if (dead != NULL) {
+		for (size_t i = 0; sl != NULL && i < sl->num_tunnels; i++) {
+			if (sl->tunnels[i] == dead) {
+				sl->tunnels[i] = sl->tunnels[--sl->num_tunnels];
+				sl->rr_next = 0;
+				break;
+			}
+		}
+		tunnel_close(dead);
+	}
+	if (srv_c != NULL) {
+		server_stop(srv_c);
+		server_free(srv_c);
+	}
+	if (srv_a != NULL) {
+		server_stop(srv_a);
+		server_free(srv_a);
+	}
+	if (conf_c != NULL) {
+		conf_free(conf_c);
+	}
+	if (conf_a != NULL) {
+		conf_free(conf_a);
+	}
+	mock_server_stop(&backend);
+	if (loop != NULL) {
+		ev_loop_destroy(loop);
+	}
+
+	if (setup_ok) {
+		T_EXPECT_EQ(echo_rc, 0);
+	}
+}
+
+/* Regression: tcp_serve()'s accepted-tunnel fallback (no mux_connect) must skip
+ * an accepted tunnel that is not established -- every accepted connection is
+ * registered before its handshake, so a peer holding half-open connections
+ * used to take a share of the local connections, each closed. A never-started
+ * tunnel stands in for such a half-open entry beside srv_b's real one. */
+T_DECLARE_CASE(test_server_accepted_fallback_skips_non_established_tunnel)
+{
+	struct test_fixture fx;
+	struct tunnel *dead = NULL;
+	bool registered = false;
+	int echo_rc = -1;
+
+	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
+		T_LOGF("fixture setup failed at %s", g_setup_stage);
+		FIXTURE_FATAL(&fx, "fixture_setup");
+	}
+	struct server *const srv = fx.srv_a;
+	dead = ol_make_tunnel(srv);
+	if (dead == NULL) {
+		FIXTURE_FATAL(&fx, "ol_make_tunnel");
+	}
+	{
+		void *elem = dead;
+#if WITH_THREADS
+		THRD_ASSERT(smtx_lock(&srv->accepted_mu));
+#endif
+		srv->accepted_tunnels = table_set(
+			srv->accepted_tunnels, tunnel_session_id(dead), &elem);
+#if WITH_THREADS
+		THRD_ASSERT(smtx_unlock(&srv->accepted_mu));
+#endif
+		registered = (elem == NULL);
+	}
+	if (registered && table_size(srv->accepted_tunnels) == 2) {
+		/* Four picks walk the two-entry table twice over. */
+		echo_rc = echo_each_connection(&fx, fx.tcp_port_a, 4);
+	}
+
+	if (registered) {
+#if WITH_THREADS
+		THRD_ASSERT(smtx_lock(&srv->accepted_mu));
+#endif
+		srv->accepted_tunnels = table_del(
+			srv->accepted_tunnels, tunnel_session_id(dead), NULL);
+		srv->accepted_rr_cursor = 0;
+#if WITH_THREADS
+		THRD_ASSERT(smtx_unlock(&srv->accepted_mu));
+#endif
+	}
+	tunnel_close(dead);
+	fixture_teardown(&fx);
+
+	T_EXPECT(registered);
+	T_EXPECT_EQ(echo_rc, 0);
+}
+
 /* Regression: an API connection still mid-request when the server stops must be
  * reclaimed by server_stop(), not left behind with its context and open fd. The
  * client sends a request whose body it withholds under Expect: 100-continue; the
@@ -4665,6 +7522,7 @@ cleanup:
 T_DECLARE_CASE(test_server_stop_frees_inflight_api_connection)
 {
 	static const char req[] = "POST /config HTTP/1.1\r\n"
+				  "Host: test\r\n"
 				  "Content-Length: 4\r\n"
 				  "Expect: 100-continue\r\n"
 				  "\r\n";
@@ -4774,6 +7632,107 @@ log_capture_write(void *ud, const unsigned char *buf, const size_t len)
 	memcpy(cap->buf + cap->len, buf, len);
 	cap->len += len;
 	cap->buf[cap->len] = '\0';
+}
+
+static int capacity_outbound_retried(void *data)
+{
+	const struct server *const srv = data;
+	return srv->mux_tunnel == NULL && srv->num_identity_tunnels == 1 &&
+	       srv->identity_tunnels[0] != NULL;
+}
+
+T_DECLARE_CASE(test_server_capacity_defers_outbound_and_retries)
+{
+	struct test_fixture fx = {
+		.loop = ev_loop_new(EVFLAG_AUTO),
+		.backend_a = { .listen_fd = -1 },
+		.backend_b = { .listen_fd = -1 },
+		.udp_echo_a = { .fd = -1 },
+		.udp_echo_b = { .fd = -1 },
+	};
+	if (fx.loop == NULL) {
+		T_FATAL("ev_loop_new failed");
+	}
+	const int listener = bind_listen_localhost();
+	if (listener < 0) {
+		fixture_teardown(&fx);
+		T_FATAL("bind_listen_localhost failed");
+	}
+	char address[64];
+	(void)snprintf(
+		address, sizeof(address), "127.0.0.1:%d",
+		listener_fd_port(listener));
+	fx.conf_a = make_config(NULL, address, NULL, NULL);
+	if (fx.conf_a == NULL ||
+	    !build_identity_dialer_conf(fx.conf_a, address)) {
+		socket_close(listener);
+		FIXTURE_FATAL(&fx, "dialer config failed");
+	}
+	fx.conf_a->max_sessions = 1;
+	fx.conf_a->mux.connect_timeout = 0;
+	fx.srv_a = server_new(fx.loop, fx.conf_a);
+	if (fx.srv_a == NULL) {
+		socket_close(listener);
+		FIXTURE_FATAL(&fx, "server_new failed");
+	}
+	struct log_capture cap = { 0 };
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_capture_write, &cap);
+	slog_setlevel(LOG_LEVEL_WARNING);
+	const bool started = server_start(fx.srv_a);
+	slog_setlevel(LOG_LEVEL_SILENCE);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+	const bool deferred = started && fx.srv_a->mux_tunnel != NULL &&
+			      fx.srv_a->num_identity_tunnels == 1 &&
+			      fx.srv_a->identity_tunnels[0] == NULL;
+	const size_t initial_usage = server_capacity_used(fx.srv_a);
+	const bool warning =
+		strstr(cap.buf, "session capacity exhausted;") != NULL;
+	bool retried = false;
+	if (deferred) {
+		/* Retire the half-open mux session; its destruction frees capacity.
+		 * The still configured identity tunnel is then created by maintenance. */
+		struct config *const conf = make_config(NULL, NULL, NULL, NULL);
+		if (conf != NULL && build_identity_dialer_conf(conf, address)) {
+			conf->max_sessions = 1;
+			conf->mux.connect_timeout = 0;
+			if (server_apply_config(fx.srv_a, conf)) {
+				fx.conf_a = conf;
+				if ((wait_fd_events(
+					     &fx, listener, EV_READ, 2.0) &
+				     EV_READ) != 0) {
+					const int fd =
+						accept(listener, NULL, NULL);
+					if (fd >= 0) {
+						socket_close(fd);
+					}
+				}
+				ev_invoke(
+					fx.loop, &fx.srv_a->w_maintenance,
+					EV_TIMER);
+				retried = wait_until(
+						  &fx, 2.0,
+						  capacity_outbound_retried,
+						  fx.srv_a) == 0;
+			} else {
+				T_FAIL();
+			}
+		} else {
+			conf_free(conf);
+			T_FAIL();
+		}
+	}
+	const size_t retry_usage = server_capacity_used(fx.srv_a);
+	socket_close(listener);
+	server_stop(fx.srv_a);
+	const size_t stopped_usage = server_capacity_used(fx.srv_a);
+	fixture_teardown(&fx);
+	T_EXPECT_EQ(initial_usage, (size_t)1);
+	T_EXPECT_EQ(retry_usage, (size_t)1);
+	T_EXPECT_EQ(stopped_usage, (size_t)0);
+	T_EXPECT(started);
+	T_EXPECT(deferred);
+	T_EXPECT(warning);
+	T_EXPECT(retried);
 }
 
 static int evlog_nonempty_predicate(void *ctx)
@@ -4890,11 +7849,80 @@ T_DECLARE_CASE(test_server_escapes_peer_identity_in_output)
 	T_EXPECT(strchr(evmsg, '\x1b') == NULL);
 }
 
+#if WITH_TLS
+/* Builds a PSK server's TLS context from a config carrying mux.readahead's
+ * schema default and returns what slog emitted at WARNING while doing so. */
+static bool build_tls_ctx_capture_log(
+	const bool socket_offload, struct log_capture *restrict cap)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	if (loop == NULL) {
+		return false;
+	}
+	struct config *const conf =
+		make_psk_config("127.0.0.1:0", NULL, RELOAD_PSK_HEX_A);
+	if (conf == NULL) {
+		ev_loop_destroy(loop);
+		return false;
+	}
+	conf->mux.readahead = 131072;
+	conf->tls_socket_offload = socket_offload;
+
+	/* The suite runs at LOG_LEVEL_SILENCE with no sink; both are put back
+	 * that way before returning. */
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_capture_write, cap);
+	slog_setlevel(LOG_LEVEL_WARNING);
+	struct server *const srv = server_new(loop, conf);
+	slog_setlevel(LOG_LEVEL_SILENCE);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+
+	const bool ok = srv != NULL && srv->server_tlsctx != NULL;
+	server_free(srv);
+	conf_free(conf);
+	ev_loop_destroy(loop);
+	return ok;
+}
+
+/* Regression: mux.readahead reached the TLS context as a request for library
+ * read-ahead even in memory-BIO mode, where it only sizes the session receive
+ * ring.  Its schema default is non-zero, so the mbedTLS backend, which has no
+ * read-ahead to enable, warned "mux.readahead ... ignored" on every context
+ * built from an untouched config.  The request belongs to socket offload
+ * alone, as tls.kernel_offload's does. */
+T_DECLARE_CASE(test_server_tls_readahead_only_under_socket_offload)
+{
+	struct log_capture mem_cap = { 0 };
+	T_CHECK(build_tls_ctx_capture_log(false, &mem_cap));
+	T_EXPECT(!mem_cap.overflow);
+	T_EXPECT(strstr(mem_cap.buf, "mux.readahead") == NULL);
+
+	/* Under socket offload the request is real: the mbedTLS backend still
+	 * says it cannot honor it, and OpenSSL enables it silently. */
+	struct log_capture fd_cap = { 0 };
+	T_CHECK(build_tls_ctx_capture_log(true, &fd_cap));
+	T_EXPECT(!fd_cap.overflow);
+#if WITH_MBEDTLS
+	T_EXPECT(strstr(fd_cap.buf, "mux.readahead") != NULL);
+#else
+	T_EXPECT(strstr(fd_cap.buf, "mux.readahead") == NULL);
+#endif
+}
+#endif /* WITH_TLS */
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_server_apply_config_honors_cli_loglevel_override),
 	T_CASE(test_server_offline_listeners_idle_timeout_scoped_to_mux_connect),
 	T_CASE(test_server_offline_listeners_identity_branch),
+	T_CASE(test_server_offline_passive_identity_with_idle_timeout),
+	T_CASE(test_server_offline_ignores_routing_only_peer),
+	T_CASE(test_server_wait_stats_ignores_historical_failures),
+	T_CASE(test_server_reload_transfers_listener_between_roles),
+	T_CASE(test_server_reload_swaps_roles_and_rolls_back),
+	T_CASE(test_server_reload_rolls_back_new_listener_on_retained_peer),
 	T_CASE(test_bidirectional_stream_and_forward),
+	T_CASE(test_server_lossymux_udp_roundtrip),
+	T_CASE(test_server_lossymux_udp_empty_roundtrip),
+	T_CASE(test_server_lossymux_disabled_binds_no_udp),
 	T_CASE(test_server_force_close_folds_tunnel_counters),
 	T_CASE(test_server_snapshot_cap_allows_many_tunnels),
 	T_CASE(test_half_close_b_to_a),
@@ -4907,7 +7935,18 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_large_payload_then_half_close),
 	T_CASE(test_on_demand_tunnel_reconnects_after_idle_close),
 	T_CASE(test_server_config_reload),
+	T_CASE(test_server_reload_rejects_listener_bind_failure),
+	T_CASE(test_server_reload_moves_listener_within_port),
+	T_CASE(test_server_reload_restores_listener_after_failed_bind),
+	T_CASE(test_server_reload_restores_listener_after_later_failure),
+	T_CASE(test_server_apply_config_rejected_while_shutting_down),
+	T_CASE(test_server_reload_api_listener_keeps_dedicated_socket_opts),
 	T_CASE(test_server_reload_removes_identity_peer_closes_tunnel),
+	T_CASE(test_server_reload_retains_identity_peer),
+	T_CASE(test_server_reload_keeps_unchanged_identity_listener),
+	T_CASE(test_server_reload_restores_identity_listeners_on_bind_failure),
+	T_CASE(test_server_reload_restores_traded_identity_listeners),
+	T_CASE(test_server_reload_restores_identity_listener_bound_port),
 	T_CASE(test_server_identity_pool_holds_concurrent_tunnels_same_peer),
 	T_CASE(test_server_reload_drops_two_identity_peers_no_uaf),
 	T_CASE(test_server_reload_keeps_established_identity_mux_connect_tunnel),
@@ -4916,26 +7955,44 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_server_psk_retirement_waits_for_live_tls_context),
 #endif
 	T_CASE(test_server_maintenance_redials_emptied_identity_slot),
+#ifdef SERVER_TEST_WRAP_REALLOC
+	T_CASE(test_server_maintenance_retries_identity_array_growth),
+#endif
+	T_CASE(test_server_maintenance_keeps_idle_on_demand_identity_tunnel),
 	T_CASE(test_server_maintenance_timer_stops_when_idle),
 	T_CASE(test_server_start_identity_peer_with_null_listen),
-	T_CASE(test_server_max_sessions_rejects),
-	T_CASE(test_server_max_sessions_rejects_at_exact_limit),
+	T_CASE(test_server_capacity_simultaneous_inbound),
+	T_CASE(test_server_capacity_defers_outbound_and_retries),
+	T_CASE(test_server_capacity_reload_and_unmatched_resume),
+	T_CASE(test_server_capacity_reduction_drains_removed_outbound),
 	T_CASE(test_server_startup_limit_zero_start_throttles_first_connection),
+	T_CASE(test_server_startup_limit_full_rejects_at_exact_limit),
 	T_CASE(test_server_stream_establish_percentiles),
 	T_CASE(test_server_stream_establish_percentiles_accepted_side),
 	T_CASE(test_server_evlog_dedups_consecutive_reload_events),
 	T_CASE(test_server_graceful_shutdown_via_signal),
 	T_CASE(test_server_maintenance_suspend_drops_transports_and_reconnects),
+	T_CASE(test_server_graceful_shutdown_dialer_in_reconnect_backoff),
+	T_CASE(test_server_graceful_shutdown_idle_on_demand_dialer),
 	T_CASE(test_server_maintenance_shutdown_deadline_breaks_loop),
+	T_CASE(test_server_maintenance_redials_mux_connect_readded_while_retired),
+	T_CASE(test_server_free_stops_maintenance_timer),
 #if WITH_THREADS
+	T_CASE(test_server_stop_leaves_maintenance_disarmed),
 	T_CASE(test_server_new_arms_async_before_start),
 	T_CASE(test_server_free_releases_async_without_stop),
 #endif
 	T_CASE(test_server_identity_pool_single_membership_across_reclaim),
+	T_CASE(test_server_resume_reconciles_changed_identity),
 	T_CASE(test_server_identity_listener_forwards_over_pool),
 	T_CASE(test_server_identity_listener_empty_pool_closes_conn),
+	T_CASE(test_server_identity_listener_skips_non_established_tunnel),
+	T_CASE(test_server_accepted_fallback_skips_non_established_tunnel),
 	T_CASE(test_server_stop_frees_inflight_api_connection),
 	T_CASE(test_server_escapes_peer_identity_in_output),
+#if WITH_TLS
+	T_CASE(test_server_tls_readahead_only_under_socket_offload),
+#endif
 	T_SUITE_END,
 };
 

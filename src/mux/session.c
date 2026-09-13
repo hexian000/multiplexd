@@ -6,19 +6,19 @@
  * @brief Internal mux session state machine implementation.
  */
 
-#include "mux/session.h"
+#include "session.h"
 
-#include "mux/estimator.h"
-#include "mux/frame.h"
-#include "mux/handshake.h"
-#include "mux/mux.h"
-#include "mux/recv.h"
-#include "mux/sched.h"
-#include "mux/send.h"
-#include "mux/stream.h"
-#include "mux/unacked.h"
-#include "mux/wire.h"
+#include "estimator.h"
+#include "frame.h"
+#include "handshake.h"
+#include "mux.h"
+#include "recv.h"
+#include "sched.h"
+#include "send.h"
 #include "shim/util.h"
+#include "stream.h"
+#include "unacked.h"
+#include "wire.h"
 
 #include "algo/hashtable.h"
 #include "io/io.h"
@@ -82,7 +82,8 @@ void mux_session_update_watcher(struct mux_session *restrict ss)
 		       ss->unacked.stalled || (events & EV_WRITE) ||
 		       (ss->sched.sched_head == NULL &&
 			ss->wire.sendbuf.head == NULL &&
-			ss->wire.oobbuf.head == NULL));
+			ss->wire.oobbuf.head == NULL &&
+			ss->wire.dgrambuf.head == NULL));
 		break;
 	case SESSION_CLOSE_WAIT:
 		/* Wait for peer to close; if receive is closed, drive teardown via write. */
@@ -173,7 +174,7 @@ static void connect_cb(struct mux_session *ss)
 		/* The owner paces its retries by this; a connect that never
 		 * completes reports it nowhere else. */
 		ss->wire.err = err;
-		mux_session_reset(ss);
+		mux_session_suspend_or_reset(ss);
 		return;
 	}
 
@@ -182,7 +183,7 @@ static void connect_cb(struct mux_session *ss)
 #if WITH_TLS
 	if (!mux_wire_tls_start(ss)) {
 		MUX_LOG(ERROR, ss, "TLS connect failed");
-		mux_session_reset(ss);
+		mux_session_suspend_or_reset(ss);
 		return;
 	}
 #endif /* WITH_TLS */
@@ -195,7 +196,7 @@ static void connect_cb(struct mux_session *ss)
 static void socket_cb(struct ev_loop *loop, ev_io *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_READ | EV_WRITE);
-	struct mux_session *const restrict ss = w->data;
+	struct mux_session *const ss = w->data;
 	ASSERT(loop == ss->loop);
 	(void)loop;
 	MUX_LOG_F(
@@ -256,18 +257,19 @@ static void socket_cb(struct ev_loop *loop, ev_io *w, const int revents)
  * this does not suppress the emit for an already-CLOSED session -- the exact
  * nested-self-close case (a ring-push OOM inside mux_session_suspend/capture) where
  * nothing else has told the owner. */
-static void session_emit_closed(struct mux_session *restrict ss)
+static void session_emit_closed(struct mux_session *ss)
 {
 	session_emit(ss, MUX_EVENT_CLOSED, (union mux_event_data){ 0 });
 }
 
 /* Tear down a session on a fatal liveness condition: suspend for resume when a
  * session id was negotiated, else close (@p reason is logged).  This is the
- * sole dead-link detector (reached via send_timeout/w_timeout below);
- * run_probe_cycle() (estimator.c) deliberately has no probe timeout of its
- * own and defers to this instead, even while traffic is flowing. */
-static void session_on_dead_link(
-	struct mux_session *restrict ss, const char *restrict reason)
+ * sole dead-link detector (reached via send_timeout/w_timeout below), even
+ * while traffic is flowing.  The BDP estimator's MUX_PING_PROBE_TIMEOUT_NS in
+ * run_probe_cycle() (estimator.c) only abandons an unanswered probe and
+ * restarts its cycle; it never declares the link dead. */
+static void
+session_on_dead_link(struct mux_session *ss, const char *restrict reason)
 {
 	if (ss->handshake.has_session_id) {
 		MUX_LOG_F(WARNING, ss, "%s; suspending for resume", reason);
@@ -293,31 +295,26 @@ static void
 connect_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *const restrict ss = w->data;
+	struct mux_session *const ss = w->data;
 	ASSERT(loop == ss->loop);
 	(void)loop;
 	const bool was_suspended = (ss->state == SESSION_SUSPENDED);
 	switch (ss->state) {
 	case SESSION_CONNECT:
-		MUX_LOG(WARNING, ss, "connect timeout");
-		break;
 	case SESSION_HANDSHAKE:
 		MUX_LOG(WARNING, ss, "connect timeout");
-		/* A resume attempt that is merely slow, not dead, must not
-		 * destroy streams/unacked data -- mirrors session_on_dead_link()
-		 * and the send.c I/O-error paths for this same state.
-		 * mux_session_suspend()'s own precondition excludes SESSION_CONNECT
-		 * (transport not up yet), so this can't also cover that case. */
+		/* A resume attempt that is merely slow, or whose SYN was
+		 * blackholed, must not destroy streams/unacked data -- mirrors
+		 * session_on_dead_link() and the send.c I/O-error paths. */
 		if (!ss->accepted && ss->handshake.has_session_id) {
 			mux_session_suspend(ss);
 			if (ss->state == SESSION_CLOSED) {
 				/* mux_session_suspend() can itself close ss on a
 				 * nested ring-push OOM (unacked_push); tell the
 				 * owner since nothing else did. Checking ==
-				 * CLOSED, not != SUSPENDED: the reentrant
-				 * reconnect this same function's own dialed
-				 * path can trigger (via MUX_EVENT_SUSPENDED)
-				 * may legitimately land on SESSION_CONNECT. */
+				 * CLOSED, not != SUSPENDED: an owner that
+				 * redials from MUX_EVENT_CONNECT_FAILED may
+				 * legitimately land on SESSION_CONNECT. */
 				session_emit_closed(ss);
 			}
 			return;
@@ -340,7 +337,7 @@ static void
 send_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *const restrict ss = w->data;
+	struct mux_session *const ss = w->data;
 	ASSERT(loop == ss->loop);
 	(void)loop;
 	CHECKMSGF(
@@ -352,7 +349,7 @@ send_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *const restrict ss = w->data;
+	struct mux_session *const ss = w->data;
 	ASSERT(loop == ss->loop);
 	(void)loop;
 	CHECKMSGF(
@@ -373,15 +370,18 @@ static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
 		ss->state);
 
-	/* Encrypted TCP-keepalive: a one-way PROBE the peer discards, but whose
-	 * arrival resets its w_timeout.  No reply is expected; death detection is
-	 * w_timeout (inbound) plus send_timeout (outbound), not this path. */
-	if (!mux_session_send_oob(ss, MUX_CTRL_PROBE, NULL, 0)) {
+	/* Encrypted TCP-keepalive: an empty PING, which the peer must answer with
+	 * a PONG (spec §5.3.2) whatever its own keepalive setting.  A one-way
+	 * PROBE would leave our w_timeout fed only by the peer's independently
+	 * configured probe interval.  The empty payload keeps the PONG out of the
+	 * estimator's RTT cycle.  Death detection remains w_timeout (inbound)
+	 * plus send_timeout (outbound), not this path. */
+	if (!mux_session_send_oob(ss, MUX_CTRL_PING, NULL, 0)) {
 		/* OOM: skip this cycle; the timer re-arms below regardless. */
 		MUX_LOG(DEBUG, ss,
-			"keepalive PROBE skipped: frame pool exhausted");
+			"keepalive PING skipped: frame pool exhausted");
 	} else {
-		MUX_LOG(VERBOSE, ss, "keepalive PROBE sent");
+		MUX_LOG(VERBOSE, ss, "keepalive PING sent");
 	}
 	const double keepalive = mux_keepalive_interval(ss);
 	ev_timer_set(&ss->w_keepalive, 0.0, keepalive);
@@ -392,14 +392,20 @@ static void keepalive_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void idle_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
 	CHECK_REVENTS(revents, EV_TIMER);
-	struct mux_session *const restrict ss = w->data;
+	struct mux_session *const ss = w->data;
 	ASSERT(loop == ss->loop);
 	(void)loop;
 	CHECKMSGF(
 		ss->state == SESSION_ESTABLISHED, "unexpected session state %d",
 		ss->state);
 	MUX_LOG(INFO, ss, "idle timeout, closing session");
-	mux_session_notify_closed(ss, false);
+	/* Close gracefully (spec 5.6), never by reset: the peer reads an abortive
+	 * close as a transport loss and keeps its side suspended for resume_timeout,
+	 * although the close here discards the session_id that could resume it.  No
+	 * stream is aborted -- the timer only runs while none is active.  Over
+	 * plaintext the peer still cannot tell this FIN from a dirty one and
+	 * suspends regardless; only a TLS close_notify marks the close final. */
+	mux_session_initiate_shutdown(ss);
 }
 
 /* Tear down a partially-initialized session on any mux_session_new failure
@@ -408,7 +414,6 @@ static void idle_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 static void session_new_cleanup(
 	struct mux_session *restrict ss, const struct mux_session_opts *opts)
 {
-	free(ss->handshake.peer_id);
 	free(ss->handshake.identity);
 	bytebuf_free(ss->wire.recvbuf);
 	table_free(ss->sched.streams);
@@ -458,6 +463,8 @@ struct mux_session *mux_session_new(
 #if WITH_TLS
 		.wire.tlsctx = opts->tlsctx,
 		.wire.tlsconn = opts->conn,
+		/* The caller built an accepted conn from this same config. */
+		.wire.tls_offload = conf->tls_socket_offload,
 #endif
 		.state = SESSION_INIT,
 		.last_modified = (int_least64_t)clock_monotonic_ns(),
@@ -488,14 +495,6 @@ struct mux_session *mux_session_new(
 	if (opts->identity != NULL) {
 		ss->handshake.identity = strdup(opts->identity);
 		if (ss->handshake.identity == NULL) {
-			LOGOOM();
-			session_new_cleanup(ss, opts);
-			return NULL;
-		}
-	}
-	if (opts->peer_id != NULL) {
-		ss->handshake.peer_id = strdup(opts->peer_id);
-		if (ss->handshake.peer_id == NULL) {
 			LOGOOM();
 			session_new_cleanup(ss, opts);
 			return NULL;
@@ -568,8 +567,8 @@ static void session_reset_stream_window_floor(struct mux_session *restrict ss)
  * calls mux_unacked_track_sent, whose OOM path reaches mux_wire_discard_buffers(ss) and
  * touches ss->wire.sendbuf/oobbuf through an ss-based lvalue -- a restrict list
  * would make that formal UB (C11 6.7.3.8). */
-static void session_capture_frame_list(
-	struct mux_session *restrict ss, struct mux_frame_list *list)
+static void
+session_capture_frame_list(struct mux_session *ss, struct mux_frame_list *list)
 {
 	if (list->head == NULL) {
 		return;
@@ -587,7 +586,7 @@ static void session_capture_frame_list(
 	}
 }
 
-static void session_capture_sendbuf(struct mux_session *restrict ss)
+static void session_capture_sendbuf(struct mux_session *ss)
 {
 	session_capture_frame_list(ss, &ss->wire.sendbuf);
 }
@@ -600,7 +599,7 @@ static void session_capture_sendbuf(struct mux_session *restrict ss)
  * capture can itself self-close ss on a nested ring-push OOM (unacked_push);
  * returns false when it did, so the caller can discard its not-yet-installed fd
  * and notify the owner rather than revive a closed session. */
-static bool session_capture_and_discard(struct mux_session *restrict ss)
+static bool session_capture_and_discard(struct mux_session *ss)
 {
 	session_capture_sendbuf(ss);
 	session_capture_frame_list(ss, &ss->wire.oobbuf);
@@ -648,11 +647,10 @@ static void session_cleanup(struct mux_session *restrict ss)
 static void handshake_cleanup(struct mux_session *restrict ss)
 {
 	free(ss->handshake.identity);
-	free(ss->handshake.peer_id);
 	free(ss->handshake.peer_identity);
 }
 
-void mux_session_close(struct mux_session *restrict ss)
+void mux_session_close(struct mux_session *ss)
 {
 	MUX_LOG(VERBOSE, ss, "finalizing");
 	/* Route a still-live session (e.g. force-closed during shutdown before it
@@ -664,6 +662,9 @@ void mux_session_close(struct mux_session *restrict ss)
 	mux_session_reset(ss);
 	session_stop(ss);
 	session_cleanup(ss);
+	/* The session goes with them: free the streams the application still
+	 * held through a teardown, invalidating its pointers. */
+	mux_sched_free_orphans(ss);
 	bytebuf_free(ss->wire.recvbuf);
 #if WITH_TLS
 	bytebuf_free(ss->wire.rawbuf);
@@ -685,6 +686,23 @@ session_apply_kernel_send_timeout(struct mux_session *restrict ss, const int fd)
 	if (ss->wire.kernel_send_timeout) {
 		ss->w_send_timeout.repeat = 0.0;
 	}
+}
+
+/* Reset the per-transport deadlines for a transport about to be installed on
+ * fd.  w_connect_timeout doubles as the one-shot resume and graceful-close
+ * deadlines (mux_session_suspend, mux_session_initiate_shutdown), both of
+ * which leave repeat at 0.0, and ev_timer_again arms nothing for an inactive
+ * timer with repeat 0.0 -- so stop it and restore the connect deadline for the
+ * caller's ev_timer_again.  w_send_timeout.repeat may likewise hold a previous
+ * transport's 0.0, and whether TCP_USER_TIMEOUT covers the watchdog is a
+ * property of fd, so restore the userspace default before re-deriving it. */
+static void
+session_install_timers(struct mux_session *restrict ss, const int fd)
+{
+	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
+	ss->w_connect_timeout.repeat = (double)ss->conf.connect_timeout;
+	ss->w_send_timeout.repeat = (double)ss->conf.send_timeout;
+	session_apply_kernel_send_timeout(ss, fd);
 }
 
 void mux_session_set_config(
@@ -773,15 +791,15 @@ void mux_session_set_config(
 		}
 	}
 
+	/* A reload can enable idle closing on a session whose timer was never
+	 * armed. Derive eligibility from the live state, excluding CLOSED entries. */
 	const double idle_timeout = (double)conf->idle_timeout;
-	if (idle_timeout > 0.0) {
-		ev_timer_set(&ss->w_idle_timeout, 0.0, idle_timeout);
-		if (ev_is_active(&ss->w_idle_timeout)) {
-			ev_timer_again(ss->loop, &ss->w_idle_timeout);
-		}
-	} else {
-		ev_timer_stop(ss->loop, &ss->w_idle_timeout);
-		ev_timer_set(&ss->w_idle_timeout, 0.0, 0.0);
+	ev_timer_stop(ss->loop, &ss->w_idle_timeout);
+	ev_timer_set(&ss->w_idle_timeout, 0.0, idle_timeout);
+	if (idle_timeout > 0.0 && !ss->accepted &&
+	    ss->state == SESSION_ESTABLISHED &&
+	    table_size(ss->sched.streams) == ss->sched.num_closed) {
+		ev_timer_again(ss->loop, &ss->w_idle_timeout);
 	}
 
 	/* Seed the estimator only when first entering auto mode; re-seeding an
@@ -792,7 +810,7 @@ void mux_session_set_config(
 	}
 }
 
-void mux_session_start(struct mux_session *restrict ss)
+void mux_session_start(struct mux_session *ss)
 {
 	if (ss->w_socket.fd == -1) {
 		/* Client session without transport; caller must supply a
@@ -809,7 +827,7 @@ void mux_session_start(struct mux_session *restrict ss)
 	}
 #endif
 
-	session_apply_kernel_send_timeout(ss, ss->w_socket.fd);
+	session_install_timers(ss, ss->w_socket.fd);
 	if (!handshake_start(ss)) {
 		/* ClientHello enqueue failed; session is already CLOSED. Do not
 		 * re-arm the connect deadline or notify on a dead session. */
@@ -822,19 +840,14 @@ void mux_session_start(struct mux_session *restrict ss)
 	ev_timer_again(ss->loop, &ss->w_connect_timeout);
 }
 
-void mux_session_attach_fd(struct mux_session *restrict ss, const int fd)
+void mux_session_attach_fd(struct mux_session *ss, const int fd)
 {
 	CHECKMSGF(
 		ss->state == SESSION_INIT || ss->state == SESSION_SUSPENDED ||
 			ss->state == SESSION_CLOSED,
 		"mux_session_attach_fd: unexpected state %d", ss->state);
 
-	/* Transitioning out of SUSPENDED: stop the resume timeout and
-	 * restore repeat clobbered by mux_session_suspend's one-shot reuse. */
 	if (ss->state == SESSION_SUSPENDED) {
-		ev_timer_stop(ss->loop, &ss->w_connect_timeout);
-		ss->w_connect_timeout.repeat = (double)ss->conf.connect_timeout;
-
 		if (!session_capture_and_discard(ss)) {
 			/* A capture reset ss on a ring-push OOM; discard the
 			 * not-yet-attached fd and tell the owner instead of
@@ -881,13 +894,10 @@ void mux_session_attach_fd(struct mux_session *restrict ss, const int fd)
 	 * backend. */
 	ev_io_stop(ss->loop, &ss->w_socket);
 	ev_io_set(&ss->w_socket, fd, EV_WRITE);
-	/* A resume that installs TCP_USER_TIMEOUT must set the flag so
-	 * update_send_timeout still arms the userspace fallback for an OOM-stalled
-	 * retransmit, and one that fails to install it must restore repeat from a
-	 * prior connection's 0.0 so egress stays watched: reset repeat before
-	 * session_apply_kernel_send_timeout re-derives the flag. */
-	ss->w_send_timeout.repeat = (double)ss->conf.send_timeout;
-	session_apply_kernel_send_timeout(ss, fd);
+	/* Every source state needs this: from SUSPENDED and from a CLOSED reached
+	 * by a graceful close or an expired resume deadline, w_connect_timeout
+	 * still carries its one-shot repeat of 0.0. */
+	session_install_timers(ss, fd);
 	/* Time from attach so setup spans socket creation to ESTABLISHED. */
 	ss->connect_started = clock_monotonic_ns();
 	mux_session_set_state(ss, SESSION_CONNECT);
@@ -903,16 +913,15 @@ void mux_session_attach_fd(struct mux_session *restrict ss, const int fd)
 /* Initiate an immediate graceful shutdown: abandon transfers, close streams,
  * discard buffered data, then enter SESSION_CLOSING for the transport close
  * handshake (TLS close_notify then TCP FIN). */
-void mux_session_initiate_shutdown(struct mux_session *restrict ss)
+void mux_session_initiate_shutdown(struct mux_session *ss)
 {
 	if (ss->state != SESSION_ESTABLISHED &&
 	    ss->state != SESSION_HANDSHAKE) {
 		/* Not transferring: force-close without any protocol exchange.
 		 * Route through mux_session_notify_closed so CLOSED is emitted only on
-		 * a real transition -- the session can already be CLOSED here (the
-		 * shutdown loop dispatches task_mux_shutdown asynchronously and the
-		 * session may reach CLOSED between snapshot and task), and an
-		 * unguarded re-emit would spuriously repeat MUX_EVENT_CLOSED. */
+		 * a real transition -- the session can already be CLOSED here
+		 * (mux_shutdown() may be called on a session that has closed), and
+		 * an unguarded re-emit would spuriously repeat MUX_EVENT_CLOSED. */
 		mux_session_notify_closed(ss, false);
 		return;
 	}
@@ -926,7 +935,8 @@ void mux_session_initiate_shutdown(struct mux_session *restrict ss)
 	session_reset_stream_window_floor(ss);
 
 	/* Free all streams: closes local fds, drains queues; no protocol
-	 * frames are sent (per spec §5.6: streams are implicitly aborted). */
+	 * frames are sent (per spec §5.6: streams are implicitly aborted). A
+	 * stream the application still holds is orphaned instead. */
 	mux_sched_free_streams(ss);
 
 	/* Discard all pending session-level data. */
@@ -950,11 +960,11 @@ void mux_session_initiate_shutdown(struct mux_session *restrict ss)
 	mux_session_update_watcher(ss);
 }
 
-void mux_session_drain(struct mux_session *restrict ss)
+void mux_session_drain(struct mux_session *ss)
 {
 	ss->draining = true;
-	/* If already idle (established, no active streams after subtracting
-	 * tombstones), shut down now via the one canonical helper. */
+	/* If already idle (established, no non-CLOSED streams), shut down now
+	 * via the one canonical helper. */
 	mux_sched_check_no_active_streams(ss);
 }
 
@@ -987,7 +997,7 @@ struct mux_stream *mux_session_open_stream(struct mux_session *restrict ss)
 		return NULL;
 	}
 	if (ss->conf.max_streams > 0 &&
-	    table_size(ss->sched.streams) - ss->sched.num_tombstones >=
+	    table_size(ss->sched.streams) - ss->sched.num_closed >=
 		    (size_t)ss->conf.max_streams) {
 		MUX_LOG_F(
 			VERBOSE, ss, "open_stream: max_streams (%d) reached",
@@ -996,8 +1006,8 @@ struct mux_stream *mux_session_open_stream(struct mux_session *restrict ss)
 	}
 	const uint_fast16_t id = mux_sched_alloc_stream_id(ss);
 	if (id == STREAMID_CTRL) {
-		/* All stream IDs in this parity class are active (spec §4.1);
-		 * reject the request and wait for existing streams to close. */
+		/* Every ID in this parity class is occupied (spec §4.1), including
+		 * retained CLOSED entries; wait for a table entry to be removed. */
 		MUX_LOG(VERBOSE, ss, "open_stream: stream IDs exhausted");
 		return NULL;
 	}
@@ -1107,6 +1117,12 @@ void mux_session_set_state(struct mux_session *ss, enum session_state newstate)
 		DEBUG, ss, "state: %s -> %s", session_state_str[ss->state],
 		session_state_str[newstate]);
 	const enum session_state oldstate = ss->state;
+	/* Publish before lifecycle callbacks: they run synchronously and may
+	 * re-enter the session (including a reset/close).  A re-entry must see the
+	 * transition already applied, and this function must not touch ss after a
+	 * callback that may have released it. */
+	ss->state = newstate;
+	PUB_STORE(ss->_pub_state, newstate);
 
 	if (oldstate == SESSION_ESTABLISHED) {
 		session_stop_timers(ss);
@@ -1115,20 +1131,23 @@ void mux_session_set_state(struct mux_session *ss, enum session_state newstate)
 		COUNTER_ADD(ss->cnt.session.num_session_disconnected, 1);
 		COUNTER_SUB(ss->cnt.session.num_sessions, 1);
 		session_emit(ss, MUX_EVENT_LOST, (union mux_event_data){ 0 });
-	} else if (
-		(oldstate == SESSION_CONNECT ||
-		 oldstate == SESSION_HANDSHAKE) &&
-		newstate != SESSION_CONNECT && newstate != SESSION_HANDSHAKE &&
-		newstate != SESSION_ESTABLISHED &&
-		newstate != SESSION_SUSPENDED) {
-		COUNTER_SUB(ss->cnt.session.num_session_halfopen, 1);
-		session_emit(
-			ss, MUX_EVENT_CONNECT_FAILED,
-			(union mux_event_data){ 0 });
+		return;
 	}
-
-	ss->state = newstate;
-	PUB_STORE(ss->_pub_state, newstate);
+	if ((oldstate == SESSION_CONNECT || oldstate == SESSION_HANDSHAKE) &&
+	    newstate != SESSION_CONNECT && newstate != SESSION_HANDSHAKE &&
+	    newstate != SESSION_ESTABLISHED) {
+		COUNTER_SUB(ss->cnt.session.num_session_halfopen, 1);
+		/* A failed resume attempt re-suspends: mux_session_suspend()
+		 * emits its CONNECT_FAILED once the old transport is torn down,
+		 * so an owner that redials from the event attaches to a
+		 * quiescent session. */
+		if (newstate != SESSION_SUSPENDED) {
+			session_emit(
+				ss, MUX_EVENT_CONNECT_FAILED,
+				session_connect_failed_data(ss));
+		}
+		return;
+	}
 
 	if ((newstate == SESSION_CONNECT || newstate == SESSION_HANDSHAKE) &&
 	    oldstate != SESSION_CONNECT && oldstate != SESSION_HANDSHAKE) {
@@ -1160,7 +1179,6 @@ void mux_session_set_state(struct mux_session *ss, enum session_state newstate)
 					  MUX_EVENT_RESUMED,
 			(union mux_event_data){
 				.connected.ns = ss->last_connect_latency_ns,
-				.connected.peer_id = ss->handshake.peer_id,
 				.connected.peer_identity =
 					ss->handshake.peer_identity,
 			});
@@ -1191,8 +1209,7 @@ void mux_session_reset(struct mux_session *ss)
 	ss->handshake.has_session_id = false;
 }
 
-void mux_session_notify_closed(
-	struct mux_session *restrict ss, const bool expired)
+void mux_session_notify_closed(struct mux_session *ss, const bool expired)
 {
 	/* Emit only on a real transition: mux_session_reset() is a no-op when
 	 * already CLOSED (e.g. an OOM retrying mux_session_attach_fd's reconnect
@@ -1206,27 +1223,21 @@ void mux_session_notify_closed(
 	}
 }
 
-void mux_session_suspend(struct mux_session *restrict ss)
+void mux_session_suspend(struct mux_session *ss)
 {
+	/* A dialed session's resume attempt: it was already suspended, and
+	 * the attempt failed before reaching ESTABLISHED. */
+	const bool attempt =
+		(ss->state == SESSION_CONNECT ||
+		 ss->state == SESSION_HANDSHAKE);
 	ASSERT(ss->state == SESSION_ESTABLISHED ||
-	       (ss->state == SESSION_HANDSHAKE && !ss->accepted &&
-		ss->handshake.has_session_id));
-	if (ss->state == SESSION_HANDSHAKE) {
-		MUX_LOG(WARNING, ss,
-			"transport lost during resume handshake; re-suspending");
-		/* mux_session_set_state()'s halfopen accounting only pays back the
-		 * CONNECT/HANDSHAKE-entry increment on a transition directly
-		 * out of {CONNECT,HANDSHAKE}; SUSPENDED is deliberately excluded
-		 * there (a suspended resume attempt is still "pending"). But if
-		 * this session is later torn down straight from SUSPENDED
-		 * (e.g. connect_timeout_cb's resume-timeout arm), oldstate is
-		 * SUSPENDED at that point too, so the debt is never paid and
-		 * num_session_halfopen leaks by one, permanently. Settle it
-		 * here instead, at the one moment oldstate is still HANDSHAKE. */
-		COUNTER_SUB(ss->cnt.session.num_session_halfopen, 1);
+	       (attempt && !ss->accepted && ss->handshake.has_session_id));
+	if (attempt) {
+		MUX_LOG(WARNING, ss, "resume attempt failed; re-suspending");
 	} else {
 		MUX_LOG(WARNING, ss,
 			"transport lost; session suspended awaiting resume");
+		ss->suspended_at = ev_now(ss->loop);
 	}
 	mux_session_set_state(ss, SESSION_SUSPENDED);
 
@@ -1243,6 +1254,8 @@ void mux_session_suspend(struct mux_session *restrict ss)
 	 * second suspend, so migrate the list the same way wire.sendbuf is
 	 * captured above instead of unconditionally clearing it. */
 	session_capture_frame_list(ss, &ss->wire.oobbuf);
+	/* Datagrams are best effort (spec §5.2.3.3): they never replay. */
+	mux_session_drop_dgrams(ss);
 
 	if (ss->state == SESSION_CLOSED) {
 		/* A capture above reset ss on a ring-push OOM (unacked_push);
@@ -1278,33 +1291,47 @@ void mux_session_suspend(struct mux_session *restrict ss)
 	ss->wire.tls_want = 0;
 #endif
 
-	/* Reuse w_connect_timeout as a one-shot resume deadline.  send_timeout
-	 * is not used in SESSION_SUSPENDED; it gates live sends only.
-	 * resume_timeout == 0 means disabled (held suspended indefinitely;
-	 * schema-legal, conf_check() no longer clamps it up). This is a
-	 * one-shot at-delay arm, not ev_timer_again, so an unconditional arm
-	 * with at=0 would fire immediately instead of never -- skip arming
-	 * entirely instead. */
+	/* Reuse w_connect_timeout as a one-shot resume deadline, counted from
+	 * the transport loss so failed resume attempts do not extend it.
+	 * send_timeout is not used in SESSION_SUSPENDED; it gates live sends
+	 * only. resume_timeout == 0 means disabled (held suspended
+	 * indefinitely; schema-legal, conf_check() no longer clamps it up).
+	 * This is a one-shot at-delay arm, not ev_timer_again, so an
+	 * unconditional arm with at=0 would fire immediately instead of never
+	 * -- skip arming entirely instead. A deadline already past arms at 0
+	 * and expires on the next loop iteration. */
 	if (ss->conf.resume_timeout > 0) {
-		const double wait = (double)ss->conf.resume_timeout;
-		ev_timer_set(&ss->w_connect_timeout, wait, 0.0);
+		const double deadline =
+			ss->suspended_at + (double)ss->conf.resume_timeout;
+		const double wait = deadline - ev_now(ss->loop);
+		ev_timer_set(&ss->w_connect_timeout, MAX(wait, 0.0), 0.0);
 		ev_timer_start(ss->loop, &ss->w_connect_timeout);
 	}
 
 	/* Notify after entering SUSPENDED: dialed sessions may reconnect now,
-	 * accepted sessions wait for the peer to resume. */
-	session_emit(ss, MUX_EVENT_SUSPENDED, (union mux_event_data){ 0 });
+	 * accepted sessions wait for the peer to resume. A failed attempt
+	 * reports CONNECT_FAILED instead, so the owner paces the next one. */
+	if (attempt) {
+		session_emit(
+			ss, MUX_EVENT_CONNECT_FAILED,
+			session_connect_failed_data(ss));
+	} else {
+		session_emit(
+			ss, MUX_EVENT_SUSPENDED, (union mux_event_data){ 0 });
+	}
 }
 
-void mux_session_suspend_or_reset(struct mux_session *restrict ss)
+void mux_session_suspend_or_reset(struct mux_session *ss)
 {
 	/* A transport loss on a resumable session (has a negotiated session id
 	 * and is either established or a client resume attempt still in
-	 * handshake) suspends to preserve its streams; otherwise reset. This
-	 * is the suspend precondition mux_session_suspend() asserts above. */
+	 * connect or handshake) suspends to preserve its streams; otherwise
+	 * reset. This is the suspend precondition mux_session_suspend()
+	 * asserts above. */
 	if (ss->handshake.has_session_id &&
 	    (ss->state == SESSION_ESTABLISHED ||
-	     (ss->state == SESSION_HANDSHAKE && !ss->accepted))) {
+	     (!ss->accepted && (ss->state == SESSION_CONNECT ||
+				ss->state == SESSION_HANDSHAKE)))) {
 		mux_session_suspend(ss);
 	} else {
 		mux_session_reset(ss);
@@ -1319,6 +1346,11 @@ void mux_session_handshake_done(struct mux_session *ss)
 	 * clears connect_started and updates peer_addr. */
 	const bool is_resume = (ss->peer_addr.sa.sa_family != AF_UNSPEC);
 	mux_session_set_state(ss, SESSION_ESTABLISHED);
+	/* The establishment event can synchronously shut down or reset the
+	 * session, stopping its timers and releasing its transport/streams. */
+	if (ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
 	ev_timer_again(ss->loop, &ss->w_timeout);
 	if (LOGLEVEL(NOTICE)) {
 		char str[32];
@@ -1375,6 +1407,7 @@ void mux_transport_detach(
 	out->peer_identity = new_ss->handshake.peer_identity;
 	new_ss->handshake.peer_identity = NULL;
 	out->reject_inbound = new_ss->handshake.peer_rejects_inbound_streams;
+	out->lossymux = new_ss->handshake.peer_lossymux;
 	/* Stop the transient's watcher before stealing its fd, else
 	 * mux_session_reset(new_ss) -> ev_io_stop fires on fd=-1 (libev assertion). */
 	ev_io_stop(new_ss->loop, &new_ss->w_socket);
@@ -1389,16 +1422,45 @@ void mux_transport_detach(
 	ASSERT(new_ss->wire.rawbuf == NULL ||
 	       bytebuf_readable(new_ss->wire.rawbuf) == 0);
 	out->tlsconn = new_ss->wire.tlsconn;
+	out->tls_offload = new_ss->wire.tls_offload;
 	new_ss->wire.tlsconn = NULL;
-	new_ss->wire.tlsctx = NULL;
+	/* wire.tlsctx is left alone: it is the borrowed context this session would
+	 * dial *out* with, not part of the transport, and clearing it would make
+	 * the detach irreversible for mux_transport_reattach below. */
 #endif /* WITH_TLS */
+}
+
+void mux_transport_reattach(
+	struct mux_session *restrict new_ss,
+	struct mux_transport *restrict transport)
+{
+	/* Only what the detach moved out is put back: connect_started,
+	 * reject_inbound and lossymux were copied, and the session still holds them. */
+	ASSERT(new_ss->w_socket.fd == -1);
+	ASSERT(new_ss->handshake.peer_identity == NULL);
+	new_ss->handshake.peer_identity = transport->peer_identity;
+	transport->peer_identity = NULL;
+#if WITH_TLS
+	ASSERT(new_ss->wire.tlsconn == NULL);
+	new_ss->wire.tlsconn = transport->tlsconn;
+	new_ss->wire.tls_offload = transport->tls_offload;
+	transport->tlsconn = NULL;
+#endif /* WITH_TLS */
+	/* The watcher was stopped by the detach and is left stopped: the caller is
+	 * inside the hello exchange, whose mux_session_update_watcher re-arms it
+	 * with the events the continued handshake needs. */
+	ASSERT(!ev_is_active(&new_ss->w_socket));
+	ev_io_set(
+		&new_ss->w_socket, transport->fd,
+		new_ss->w_socket.events & (EV_READ | EV_WRITE));
+	transport->fd = -1;
 }
 
 /* Install a detached transport on a suspended session; sends ServerHello
  * and replays unacked frames.  Consumes @p t on success; leaves it
  * untouched on failure for the caller to discard. */
 static void session_resume_attach(
-	struct mux_session *restrict ss, struct mux_transport *restrict t,
+	struct mux_session *ss, struct mux_transport *restrict t,
 	const uint_least32_t client_resume_seq)
 {
 	/* The suspended session may have been torn down (resume timeout or
@@ -1448,13 +1510,14 @@ static void session_resume_attach(
 	 * claim across a reconnect would be silently ignored. An absent identity
 	 * leaves the current one, matching the client side. */
 	ss->handshake.peer_rejects_inbound_streams = t->reject_inbound;
+	ss->handshake.peer_lossymux = t->lossymux;
 	if (t->peer_identity != NULL) {
 		free(ss->handshake.peer_identity);
 		ss->handshake.peer_identity = t->peer_identity;
 		t->peer_identity = NULL;
 	}
 #if WITH_TLS
-	mux_wire_adopt_tlsconn(ss, t->tlsconn);
+	mux_wire_adopt_tlsconn(ss, t->tlsconn, t->tls_offload);
 	t->tlsconn = NULL;
 #endif
 	/* ss is SUSPENDED here (checked/forced above), and mux_session_suspend -- the
@@ -1484,10 +1547,9 @@ static void session_resume_attach(
 	ev_io_set(&ss->w_socket, new_fd, EV_READ | EV_WRITE);
 
 	ev_timer_stop(ss->loop, &ss->w_send_timeout);
-	/* Stop the one-shot resume deadline that mux_session_suspend started.
-	 * Restore repeat so the subsequent ev_timer_again arms correctly. */
-	ev_timer_stop(ss->loop, &ss->w_connect_timeout);
-	ss->w_connect_timeout.repeat = (double)ss->conf.connect_timeout;
+	/* A reload while SUSPENDED re-derived kernel_send_timeout for no fd at
+	 * all, so derive it again for the adopted one. */
+	session_install_timers(ss, new_fd);
 
 	/* Transfer the attach timestamp so setup time covers from mux_session_new()
 	 * to SESSION_ESTABLISHED on the resumed session too. */
@@ -1514,6 +1576,9 @@ static void session_resume_attach(
 		return;
 	}
 	mux_session_handshake_done(ss);
+	if (ss->state != SESSION_ESTABLISHED) {
+		return;
+	}
 
 	/* Start retransmit replay and I/O. */
 	if (ss->unacked.ring != NULL && ss->unacked.ring->count > 0) {
@@ -1527,8 +1592,7 @@ static void session_resume_attach(
 }
 
 void mux_resume_attach(
-	struct mux_session *restrict ss,
-	struct mux_transport *restrict transport,
+	struct mux_session *ss, struct mux_transport *restrict transport,
 	const uint_least32_t resume_seq)
 {
 	session_resume_attach(ss, transport, resume_seq);

@@ -4,6 +4,7 @@ add_executable(multiplexd
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
+    udp.c udp.h
     api_server.c api_server.h
     main.c
 )
@@ -13,6 +14,11 @@ target_link_libraries(multiplexd PRIVATE csnippets)
 
 if(FORCE_POSIX)
     target_compile_definitions(multiplexd PRIVATE _POSIX_C_SOURCE=200809L)
+    # for realpath(): glibc declares it only at the XSI level, which a bare
+    # _POSIX_C_SOURCE=200809L does not select; main_test.c compiles main.c in
+    set_source_files_properties(main.c main_test.c
+        PROPERTIES COMPILE_DEFINITIONS _XOPEN_SOURCE=700
+    )
 else()
     target_compile_definitions(multiplexd PRIVATE _GNU_SOURCE)
 endif()
@@ -203,6 +209,10 @@ target_link_libraries(multiplexd PRIVATE mux)
 # Tests
 # =============================================================================
 
+if(NOT BUILD_TESTING)
+    return()
+endif()
+
 function(add_src_test target_name)
     add_executable(${target_name} ${ARGN})
 
@@ -249,10 +259,31 @@ add_src_test(conf_test
     mux/frame.c mux/frame.h
     conf_test.c
 )
+# Keep configuration and credential fixtures in this build's scratch area.
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/tmp")
+target_compile_definitions(conf_test PRIVATE
+    CONF_TEST_TMPDIR="${CMAKE_BINARY_DIR}/tmp")
+
+# --run takes a POSIX ERE: the anchors must keep the first name from also
+# selecting its *_listen sibling, and the alternation must select both names.
+add_test(NAME conf_test_run_filter_ere
+    COMMAND conf_test --run
+        "^test_conf_parsefile_requires_claim_for_identity$|^test_conf_dump_roundtrip$"
+)
+set_tests_properties(conf_test_run_filter_ere PROPERTIES
+    PASS_REGULAR_EXPRESSION "=== DONE  2 passed, 0 failed, 0 skipped"
+)
 
 add_src_test(listener_test
     listener.c listener.h
     listener_test.c
+)
+
+# White-box: compiles udp.c into the TU against a recording fake of the four
+# mux calls it makes, so no mux session is linked.
+add_src_test(udp_test
+    udp.h
+    udp_test.c
 )
 
 # Always registered; no-op when TLS disabled.
@@ -267,13 +298,15 @@ add_src_test(genpsk_test
     genpsk_test.c
 )
 
-# White-box: compiles tunnel.c into the TU to reach the static reconnect
-# backoff ladder; every collaborator is linked real.
+# White-box: compiles tunnel.c into the TU so cases can call its static
+# functions and reach tunnel/session internals; every collaborator is linked
+# real.
 add_src_test(tunnel_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
+    udp.c udp.h
     api_server.c api_server.h
     tunnel_test.c
 )
@@ -285,10 +318,15 @@ add_src_test(server_test
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
+    udp.c udp.h
     api_server.c api_server.h
     server_test.c
 )
 target_link_libraries(server_test PRIVATE mux)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(server_test PRIVATE "-Wl,--wrap=realloc")
+    target_compile_definitions(server_test PRIVATE SERVER_TEST_WRAP_REALLOC=1)
+endif()
 
 add_src_test(api_server_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
@@ -296,6 +334,7 @@ add_src_test(api_server_test
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
+    udp.c udp.h
     api_server.c api_server.h
     api_server_test.c
 )
@@ -311,6 +350,7 @@ add_src_test(main_test
     listener.c listener.h
     server.c server.h
     tunnel.c tunnel.h
+    udp.c udp.h
     api_server.c api_server.h
     main_test.c
 )

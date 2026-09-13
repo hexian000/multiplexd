@@ -141,7 +141,9 @@ values:
 
 For frames with neither SYN, ACK, nor RST set, receivers MUST ignore Extra,
 except for stream-0 frames with Flags = 0x00, whose Extra field is interpreted
-as a keepalive subtype per Section 2.4.4.
+as a keepalive subtype per Section 2.4.4, and, while the `lossymux` extension
+is active, the stream-0 DATAGRAM and FLOW-CLOSE frames, whose Extra field
+carries a flow identifier (Section 5.2.3.3).
 
 #### 2.4.3.  Session Acknowledgement Encoding (Stream 0 + ACK)
 
@@ -187,7 +189,9 @@ FIN indicates that the sender will not transmit further data on this stream.
 FIN MAY be combined with other non-RST flags where the stream state permits
 (for example, PUSH|FIN to deliver a final payload together with the
 end-of-stream signal).  When ACK is also set, Extra carries a credit grant per
-Section 2.4.1; otherwise, senders MUST set Extra to zero.
+Section 2.4.1; otherwise, senders MUST set Extra to zero, except on the
+stream-0 `lossymux` FLOW-CLOSE frame, whose Extra carries a flow identifier
+(Section 5.2.3.3).
 
 #### 3.2.2.  SYN (0x02)
 
@@ -205,8 +209,10 @@ and any payload in the frame.  Extra MAY carry a stream status code
 #### 3.2.4.  PUSH (0x08)
 
 When PUSH is set, the receiver MUST copy exactly Length octets from the frame
-payload into the stream receive buffer.  When PUSH is clear, the receiver MAY
-discard any payload octets present in the frame.
+payload into the stream receive buffer.  The stream-0 `lossymux` DATAGRAM frame
+is the exception: its payload is one datagram for the flow named in Extra
+(Section 5.2.3.3).  When PUSH is clear, the receiver MAY discard any payload
+octets present in the frame.
 
 #### 3.2.5.  ACK (0x10)
 
@@ -247,7 +253,9 @@ Stream IDs are 16-bit unsigned integers subject to the following rules:
 -  Stream 0 is reserved for session-level control.  Frames addressed to stream 0
    with the ACK flag set carry session acknowledgements (Section 5.7).
    Stream-0 frames with Flags = 0x00 serve as keepalive probes or RTT probes
-   (Section 5.3).  All other stream-0 frame types are reserved for future use.
+   (Section 5.3).  While the `lossymux` extension is active, stream-0 frames
+   with Flags = PUSH or Flags = FIN carry datagrams (Section 5.2.3.3).  All
+   other stream-0 frame types are reserved for future use.
    Absent a negotiated extension or protocol version that defines such a frame,
    a receiver MUST silently discard any stream-0 frame whose Flags field is
    neither 0x00 nor has the ACK bit set, without closing the connection.
@@ -498,7 +506,7 @@ following field values, followed immediately by a UTF-8-encoded JSON body:
 | msgid      | integer | Yes         | 0 = ClientHello; 1 = ServerHello                                                                             |
 | session_id | string  | Conditional | 24-character Base64-encoded string (RFC 4648) encoding the server-assigned 16-byte shared session identity   |
 | resume_seq | integer | No          | Number of the peer's non-stream-0 frames processed by this endpoint; see Section 5.7                         |
-| extensions | object  | No          | Extension negotiation; values are extension-specific objects; absent means {}                                |
+| extensions | object  | No          | Extensions advertised by the sender; each value's JSON type is extension-specific; absent means {}           |
 
 Additional hello object members are extension points.  Receivers MUST ignore
 unknown members and MUST NOT fail the handshake solely because such members are
@@ -555,9 +563,10 @@ The `type` field is a MIME media type string.  Receivers MUST parse it per
 Failure of either condition MUST cause the receiver to close the connection.
 
 The `extensions` field is an object whose keys are extension names and whose
-values are extension-specific objects.  Receivers MUST ignore any extension
-entry they do not recognize and MUST NOT fail the handshake solely because this
-field is present.
+values are JSON values of the type each extension's definition specifies (for
+example, a boolean or a string; Section 5.2.3).  Receivers MUST ignore any
+extension entry they do not recognize and MUST NOT fail the handshake solely
+because this field is present.
 
 -  Extension keys defined in this specification are listed without a namespace
    prefix (Section 5.2.3).
@@ -566,11 +575,20 @@ field is present.
    `x-` (analogous to the `x-` convention in MIME type naming [RFC2045]).
    Receivers MUST silently ignore unknown `x-`-prefixed extension entries.
 
-After the handshake completes, the set of active extensions is the intersection
-of the extensions advertised by both peers: an extension is considered active
-only if both endpoints include its key in their respective `extensions` objects
-with compatible parameters.  Extensions absent from either hello MUST be treated
-as inactive for the session.
+Each extension's definition states which of two kinds it is:
+
+-  A unilateral extension is a declaration about the sender alone.  It takes
+   effect when the peer receives it, whether or not the receiver's own hello
+   carries the same key; the sender's hello alone determines its value for the
+   session.
+
+-  A bilateral extension is negotiated.  It is active only if both endpoints
+   include its key in their respective `extensions` objects with compatible
+   parameters; a bilateral extension absent from either hello MUST be treated
+   as inactive for the session.
+
+The `reject_inbound` and `identity` extensions (Sections 5.2.3.1 and 5.2.3.2)
+are unilateral; `lossymux` (Section 5.2.3.3) is bilateral.
 
 #### 5.2.3.  Defined Extensions
 
@@ -594,6 +612,10 @@ that advertised `reject_inbound: true`.
 The default (absent or false) indicates the endpoint MAY accept new inbound
 streams.
 
+`reject_inbound` is a unilateral extension (Section 5.2.2): it describes only
+the sender, and the receiver honors it whether or not its own hello carries
+the key.
+
 ##### 5.2.3.2.  identity
 
 ```json
@@ -607,10 +629,81 @@ streams.
 | identity | string | UTF-8 identity claim; maximum 255 octets, NUL-excluded |
 
 Either or both endpoints MAY include the `identity` extension; the value
-advertises the sender's identity to the peer.  An endpoint that has an identity
-configured SHOULD echo this extension in its own hello.  How a receiver uses a
-claimed identity — for routing, access control (Section 10.1), logging, or not
-at all — is local policy outside the scope of this protocol.
+advertises the sender's identity to the peer.  `identity` is a unilateral
+extension (Section 5.2.2): a receiver may act on the peer's claim whether or
+not its own hello carries one.  An endpoint that has an identity configured
+SHOULD include this extension in its own hello.  How a receiver uses a claimed
+identity — for routing, access control (Section 10.1), logging, or not at all —
+is local policy outside the scope of this protocol.
+
+##### 5.2.3.3.  lossymux
+
+```json
+"extensions": { "lossymux": true }
+```
+
+| Field    | Type    | Default | Description                                       |
+| -------- | ------- | ------- | ------------------------------------------------- |
+| lossymux | boolean | false   | Sender offers best-effort datagrams over stream 0 |
+
+`lossymux` is a bilateral extension (Section 5.2.2): it is active for the
+session only when both hellos carry it with the value true.  An absent key or
+the value false means not offered.  Because a resume repeats the hello exchange
+(Section 5.8), the extension is renegotiated on every transport.
+
+While active, the extension defines two stream-0 frame types.  Both carry a
+16-bit flow identifier in Extra:
+
+| Frame      | Flags       | Length  | Meaning                                            |
+| ---------- | ----------- | ------- | -------------------------------------------------- |
+| DATAGRAM   | PUSH (0x08) | 0-65535 | One datagram for the flow; the payload is its body |
+| FLOW-CLOSE | FIN (0x01)  | 0       | The sender has dropped the flow                    |
+
+A flow is a bidirectional association between one datagram source on one
+endpoint and that endpoint's peer.  Flow identifiers follow the stream-ID
+parity rule of Section 4.1: the client allocates odd identifiers and the server
+even ones, and 0 is never a flow identifier.  They form a namespace separate
+from stream IDs.  A flow is opened implicitly by its first DATAGRAM; there is
+no handshake.  How an endpoint maps a flow to local datagram sources and
+destinations is a local matter.
+
+Datagrams are best effort:
+
+-  DATAGRAM and FLOW-CLOSE are stream-0 frames.  They are not counted in the
+   frame process count (Section 5.7.1) and are not retained in the unacked
+   list.  They are not retransmitted on resume, are not subject to per-stream
+   credit (Section 6), and MUST NOT be gated by the send-stall gate
+   (Section 6.2).
+
+-  A sender MAY drop any DATAGRAM or FLOW-CLOSE instead of transmitting it,
+   for example when its transmit queue is congested or its transport is
+   suspended.  A receiver MUST NOT treat a missing, duplicated or reordered
+   datagram as a protocol error.  The underlying transport delivers each frame
+   it does carry in order.
+
+-  A receiver MUST accept a DATAGRAM of any length from 0 to 65535 octets, even
+   one larger than its own outbound frame size (Section 2.3).  A receiver MAY
+   drop any DATAGRAM it cannot relay.
+
+-  A DATAGRAM whose flow identifier is 0 MUST be silently discarded.
+
+-  On a DATAGRAM for an unknown flow of the peer's parity, the receiver opens
+   the flow.  If it cannot, it drops the datagram and SHOULD send FLOW-CLOSE for
+   that flow.  A DATAGRAM for an unknown flow of the receiver's own parity
+   belongs to a flow the receiver has already dropped: the receiver discards it
+   and SHOULD answer with FLOW-CLOSE.
+
+-  On FLOW-CLOSE, the receiver SHOULD drop the flow.  A FLOW-CLOSE for an
+   unknown flow MUST be silently discarded.  No response is sent.
+
+-  An endpoint MAY drop a flow at any time, for example after an
+   implementation-defined idle period, and SHOULD then send FLOW-CLOSE.  All
+   flows end with the session.  When a resume falls back to a fresh session
+   (Section 5.8.3, step 4), both endpoints start with no flows.
+
+While the extension is inactive, DATAGRAM and FLOW-CLOSE are reserved stream-0
+frame types and MUST be silently discarded (Section 4.1).  The same applies to
+every other stream-0 flag combination whether or not the extension is active.
 
 #### 5.2.4.  Handshake Flow
 
@@ -1012,7 +1105,8 @@ the session: whatever backpressure an implementation applies, the following
 frames MUST NOT be stalled, regardless of the state of the gate:
 
 -  All stream-0 frames: keepalive probes (PROBE), RTT probes (PING and PONG),
-   and session ACKs.
+   session ACKs, and the `lossymux` DATAGRAM and FLOW-CLOSE frames
+   (Section 5.2.3.3), which are never retained for resumption.
 -  RST frames for any stream.
 -  ACK frames (credit grants) and FIN frames (stream half-close) for any
    non-stream-0 stream.
@@ -1199,6 +1293,10 @@ coalescing is implemented:
 | Send timeout (when send_timeout is configured)                                                         | Close connection                  |
 | Session resumption timeout expired in SESSION_SUSPENDED                                                | Close connection; abort streams   |
 | Session ACK `extra` exceeds unacked list length                                                        | Close connection                  |
+| `lossymux` DATAGRAM with flow identifier 0, or FLOW-CLOSE for an unknown flow (Section 5.2.3.3)        | Ignore                            |
+| `lossymux` DATAGRAM for an unknown flow the receiver cannot open (Section 5.2.3.3)                     | Drop; SHOULD send FLOW-CLOSE      |
+| `lossymux` DATAGRAM for an unknown flow of the receiver's parity (Section 5.2.3.3)                     | Drop; SHOULD send FLOW-CLOSE      |
+| `lossymux` DATAGRAM for a known flow that cannot be relayed (Section 5.2.3.3)                          | MAY drop                          |
 
 ## 9.  Protocol Versioning
 
@@ -1295,22 +1393,26 @@ Regardless of transport, implementations MUST enforce:
 The following interoperability tests are REQUIRED for conformant
 implementations:
 
-| ID   | Scenario                               | Test Vector                                                                           | Expected Result                                                                                                      |
-| ---- | -------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| I-1  | Ignorable ACK on unknown stream        | First frame for unknown non-zero stream uses zero-length ACK without SYN              | Receiver MUST ignore the frame for stream-state purposes and keep the session open; it MAY still emit a session ACK  |
-| I-2  | Illegal state-dependent data after FIN | Stream in STREAM_CLOSE_WAIT receives PUSH                                             | Receiver treats the data as undefined for state and MAY send RST                                                     |
-| I-3  | ACK\|FIN Extra field interpretation    | Frame with ACK\|FIN and non-zero Extra                                                | Extra is interpreted as a credit grant per Section 2.4.1 (RST is clear, ACK is set)                                  |
-| I-4  | Stream ID parity violation             | Client sends a frame with an even Stream ID                                           | Receiver MUST close the connection and MUST NOT resume the session                                                   |
-| I-5  | Duplicate SYN for existing stream      | SYN received for an already-existing stream ID                                        | Receiver sends RST                                                                                                   |
-| I-6  | Fast-open credit boundary              | SYN\|PUSH frame with payload length exactly 16384 octets                              | Receiver accepts the frame and completes stream establishment; no RST sent                                           |
-| I-7  | Out-of-order FIN then data             | Peer sends FIN, then sends PUSH on the same stream                                    | Receiver treats post-FIN data as undefined and MAY send RST                                                          |
-| I-8  | Out-of-order RST handling              | Peer sends RST followed by additional valid non-RST frames on the same stream         | Receiver MUST keep the session open; it MAY send one RST for the now-unknown stream and MAY ignore later late frames |
-| I-9  | Reserved flag bit set                  | Frame sets any reserved bit (0x20, 0x40, or 0x80)                                     | Receiver MUST close the connection                                                                                   |
-| I-10 | Hello version parameter mismatch       | ClientHello `type` field carries `version=2`                                          | Server MUST close the connection                                                                                     |
-| I-11 | PING/PONG echo                         | Send PING (stream_id=0, flags=0x00, extra=0x0001) with a small payload (an RTT token) | Receiver MUST reply with PONG (extra=0x0002) carrying the identical payload                                          |
-| I-12 | Unknown keepalive subtype              | stream_id=0, flags=0x00, extra=0x0003                                                 | Receiver MUST silently discard the frame; connection MUST remain open                                                |
-| I-13 | Invalid opening SYN flags              | First frame for unknown non-zero stream uses SYN\|ACK                                 | Receiver MUST close the connection and MUST NOT resume the session                                                   |
-| I-14 | Reserved stream-0 frame type           | stream_id=0 with a non-zero, non-ACK flag combination (e.g., PUSH)                    | Receiver MUST silently discard the frame; connection MUST remain open                                                |
+| ID   | Scenario                                 | Test Vector                                                                             | Expected Result                                                                                                      |
+| ---- | ---------------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| I-1  | Ignorable ACK on unknown stream          | First frame for unknown non-zero stream uses zero-length ACK without SYN                | Receiver MUST ignore the frame for stream-state purposes and keep the session open; it MAY still emit a session ACK  |
+| I-2  | Illegal state-dependent data after FIN   | Stream in STREAM_CLOSE_WAIT receives PUSH                                               | Receiver treats the data as undefined for state and MAY send RST                                                     |
+| I-3  | ACK\|FIN Extra field interpretation      | Frame with ACK\|FIN and non-zero Extra                                                  | Extra is interpreted as a credit grant per Section 2.4.1 (RST is clear, ACK is set)                                  |
+| I-4  | Stream ID parity violation               | Client sends a frame with an even Stream ID                                             | Receiver MUST close the connection and MUST NOT resume the session                                                   |
+| I-5  | Duplicate SYN for existing stream        | SYN received for an already-existing stream ID                                          | Receiver sends RST                                                                                                   |
+| I-6  | Fast-open credit boundary                | SYN\|PUSH frame with payload length exactly 16384 octets                                | Receiver accepts the frame and completes stream establishment; no RST sent                                           |
+| I-7  | Out-of-order FIN then data               | Peer sends FIN, then sends PUSH on the same stream                                      | Receiver treats post-FIN data as undefined and MAY send RST                                                          |
+| I-8  | Out-of-order RST handling                | Peer sends RST followed by additional valid non-RST frames on the same stream           | Receiver MUST keep the session open; it MAY send one RST for the now-unknown stream and MAY ignore later late frames |
+| I-9  | Reserved flag bit set                    | Frame sets any reserved bit (0x20, 0x40, or 0x80)                                       | Receiver MUST close the connection                                                                                   |
+| I-10 | Hello version parameter mismatch         | ClientHello `type` field carries `version=2`                                            | Server MUST close the connection                                                                                     |
+| I-11 | PING/PONG echo                           | Send PING (stream_id=0, flags=0x00, extra=0x0001) with a small payload (an RTT token)   | Receiver MUST reply with PONG (extra=0x0002) carrying the identical payload                                          |
+| I-12 | Unknown keepalive subtype                | stream_id=0, flags=0x00, extra=0x0003                                                   | Receiver MUST silently discard the frame; connection MUST remain open                                                |
+| I-13 | Invalid opening SYN flags                | First frame for unknown non-zero stream uses SYN\|ACK                                   | Receiver MUST close the connection and MUST NOT resume the session                                                   |
+| I-14 | Reserved stream-0 frame type             | stream_id=0 with a non-zero, non-ACK flag combination (e.g., PUSH), `lossymux` inactive | Receiver MUST silently discard the frame; connection MUST remain open                                                |
+| I-15 | DATAGRAM without `lossymux`              | Only one hello offers `lossymux`; peer sends stream_id=0, flags=PUSH, extra=1           | Extension inactive: receiver MUST silently discard the frame; connection MUST remain open                            |
+| I-16 | DATAGRAM with flow identifier 0          | `lossymux` active; stream_id=0, flags=PUSH, extra=0                                     | Receiver MUST silently discard the frame; connection MUST remain open                                                |
+| I-17 | DATAGRAM above the receiver's frame size | `lossymux` active; DATAGRAM longer than the receiver's outbound frame payload           | Receiver MUST accept the frame; connection MUST remain open                                                          |
+| I-18 | FLOW-CLOSE for an unknown flow           | `lossymux` active; stream_id=0, flags=FIN, length=0, extra=an unused flow identifier    | Receiver MUST silently discard the frame; no response; connection MUST remain open                                   |
 
 For each test, endpoints MUST record wire-level evidence (sent and received
 frames, flags, stream IDs, and Extra values) sufficient to diagnose behavioral

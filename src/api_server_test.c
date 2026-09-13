@@ -36,25 +36,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
-/* Test seam for the clock-failure path of the Date header.  api_server.c's
- * http_date_safe() calls time() then gmtime_r(), and gmtime_r() cannot be
- * driven to fail from the black-box API surface while the wall clock is real.
+/* Test seam for the Date header's failure paths.  api_server.c formats the
+ * header with contrib's http_date(), which calls time() then gmtime_r(), and
+ * neither an unrepresentable clock nor a year outside IMF-fixdate's 4DIGIT
+ * can be reached from the black-box API surface while the wall clock is real.
  * Defining time() here resolves ahead of libc's for every reference in this
  * test executable (ordinary static-link symbol resolution), so a case can set
- * the flag to force a value large enough that gmtime_r() overflows struct tm's
- * tm_year and returns NULL.  With the flag clear it returns the real wall clock
- * via clock_gettime(), so every other test's Date header is unaffected. */
-static bool g_force_clock_failure = false;
+ * g_force_time to make it return g_forced_time instead.  With the flag clear
+ * it returns the real wall clock via clock_gettime(), so every other test's
+ * Date header is unaffected. */
+static bool g_force_time = false;
+static time_t g_forced_time = 0;
 
 time_t time(time_t *tloc)
 {
 	time_t now;
-	if (g_force_clock_failure) {
-		now = (time_t)INT64_MAX;
+	if (g_force_time) {
+		now = g_forced_time;
 	} else {
 		struct timespec ts = { 0, 0 };
 		(void)clock_gettime(CLOCK_REALTIME, &ts);
@@ -82,10 +83,10 @@ enum {
 
 /* ── tunnel_context helpers for the test fixture ─────────────────────── */
 
-static bool test_verify_peer(void *user, const char *peer_id)
+static bool test_verify_peer(void *user, const char *peer_identity)
 {
 	(void)user;
-	(void)peer_id;
+	(void)peer_identity;
 	return false;
 }
 
@@ -151,13 +152,14 @@ struct apifx {
 	struct server srv;
 	struct listener api_listener;
 	int cli_fd;
+	/* Borrowed from api_serve, only inspected while the API context lives. */
+	int srv_fd;
 };
 
 /* fd < 0 fabricates a dialed (client-role) tunnel; a non-negative fd is adopted
  * by tunnel_new and makes the tunnel accepted (server-role). */
-static struct tunnel *make_tunnel(
-	struct apifx *restrict fx, const char *restrict peer_id,
-	const size_t num_streams, const int fd)
+static struct tunnel *
+make_tunnel(struct apifx *restrict fx, const size_t num_streams, const int fd)
 {
 	static const struct tunnel_callbacks cb = { 0 };
 	static const unsigned char session_id[MUX_SESSION_ID_LEN] = { 0 };
@@ -184,7 +186,6 @@ static struct tunnel *make_tunnel(
 		.connect_addr = "127.0.0.1:1",
 		.forward_addr = NULL,
 		.identity = "self",
-		.peer_id = peer_id,
 		.cnt = &cnts,
 	};
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
@@ -214,18 +215,16 @@ static struct tunnel *make_tunnel(
 	return t;
 }
 
-static struct tunnel *make_established_tunnel(
-	struct apifx *restrict fx, const char *restrict peer_id,
-	const size_t num_streams)
+static struct tunnel *
+make_established_tunnel(struct apifx *restrict fx, const size_t num_streams)
 {
-	return make_tunnel(fx, peer_id, num_streams, -1);
+	return make_tunnel(fx, num_streams, -1);
 }
 
 /* Fabricate a server-role tunnel.  tunnel_new only derives the tag from the fd
  * here (the tunnel's own loop never runs), so a socketpair end is enough to
  * make it accepted; tunnel_close() owns and closes it. */
-static struct tunnel *
-make_accepted_tunnel(struct apifx *restrict fx, const char *restrict peer_id)
+static struct tunnel *make_accepted_tunnel(struct apifx *restrict fx)
 {
 	int fds[2];
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
@@ -233,7 +232,7 @@ make_accepted_tunnel(struct apifx *restrict fx, const char *restrict peer_id)
 	}
 	(void)close(fds[1]);
 	/* tunnel_new fully owns fds[0] from here, including on failure. */
-	return make_tunnel(fx, peer_id, 0, fds[0]);
+	return make_tunnel(fx, 0, fds[0]);
 }
 
 /* Register t in an identity pool keyed by peer_identity, creating the identities
@@ -293,6 +292,7 @@ static int apifx_setup(struct apifx *restrict fx)
 {
 	*fx = (struct apifx){
 		.cli_fd = -1,
+		.srv_fd = -1,
 	};
 
 	fx->loop = ev_loop_new(EVFLAG_AUTO);
@@ -320,7 +320,8 @@ static int apifx_setup(struct apifx *restrict fx)
 		return -1;
 	}
 	/* fds[0] = server side (transferred to api_serve), fds[1] = client side */
-	if (socket_set_nonblock(fds[0]) != 0 || socket_set_nonblock(fds[1]) != 0) {
+	if (socket_set_nonblock(fds[0]) != 0 ||
+	    socket_set_nonblock(fds[1]) != 0) {
 		(void)close(fds[0]);
 		(void)close(fds[1]);
 		ev_loop_destroy(fx->loop);
@@ -329,6 +330,7 @@ static int apifx_setup(struct apifx *restrict fx)
 	}
 
 	fx->cli_fd = fds[1];
+	fx->srv_fd = fds[0];
 	fx->api_listener.srv = &fx->srv;
 	api_serve(&fx->api_listener, fx->loop, fds[0], NULL);
 	return 0;
@@ -611,6 +613,7 @@ struct resp_wait_ctx {
 static int resp_wait_predicate(void *ptr)
 {
 	struct resp_wait_ctx *const restrict ctx = ptr;
+	bool eof = false;
 
 	if (ctx->nread < sizeof(ctx->buf) - 1u) {
 		const ssize_t n =
@@ -625,10 +628,7 @@ static int resp_wait_predicate(void *ptr)
 			}
 			return -1;
 		}
-		if (n == 0) {
-			/* EOF: treat as complete if we already have headers */
-			return ctx->nread > 0 ? 1 : -1;
-		}
+		eof = n == 0;
 		ctx->nread += (size_t)n;
 		ctx->buf[ctx->nread] = '\0';
 	}
@@ -636,22 +636,33 @@ static int resp_wait_predicate(void *ptr)
 	/* Check that the header section has arrived */
 	const char *const restrict hend = strstr(ctx->buf, "\r\n\r\n");
 	if (hend == NULL) {
-		return 0;
+		return eof || ctx->nread == sizeof(ctx->buf) - 1u ? -1 : 0;
 	}
 
 	/* Determine body length from Content-Length header */
 	const char *const restrict cl =
 		strstr(ctx->buf, "\r\nContent-Length: ");
 	size_t content_length = 0;
-	if (cl != NULL) {
-		content_length = (size_t)strtoul(cl + 18, NULL, 10);
+	if (cl != NULL && cl < hend) {
+		char *end;
+		errno = 0;
+		const unsigned long parsed = strtoul(cl + 18, &end, 10);
+		if (errno != 0 || end == cl + 18 || end > hend ||
+		    strncmp(end, "\r\n", 2) != 0 ||
+		    parsed > sizeof(ctx->buf) - 1u) {
+			return -1;
+		}
+		content_length = (size_t)parsed;
 	}
 
 	const size_t body_offset = (size_t)(hend - ctx->buf) + 4u;
-	if (ctx->nread >= body_offset + content_length) {
+	if (content_length > sizeof(ctx->buf) - 1u - body_offset) {
+		return -1;
+	}
+	if (ctx->nread - body_offset >= content_length) {
 		return 1;
 	}
-	return 0;
+	return eof ? -1 : 0;
 }
 
 /* EOF predicate — used by test_connection_close */
@@ -712,40 +723,121 @@ static bool resp_contains(const char *restrict buf, const char *restrict needle)
 /* The Date header's day/month names must always be the RFC
  * 7231-mandated English abbreviations, regardless of the process locale
  * set by init()'s own setlocale(LC_ALL, ""). Parses the full IMF-fixdate
- * structure (not just the two name fields) so a malformed date -- e.g.
- * strftime returning 0 under an overflowing localized expansion,
- * producing an empty Date header -- fails this check too, not just a
- * wrong-language one. */
+ * structure (not just the two name fields) so a malformed or empty Date
+ * header fails this check too, not just a wrong-language one. */
 static bool resp_date_is_english_imf_fixdate(const char *restrict buf)
 {
-	const char *const p = strstr(buf, "\r\nDate: ");
-	if (p == NULL) {
+	const char *const header = strstr(buf, "\r\nDate: ");
+	if (header == NULL) {
 		return false;
 	}
-	char wday[8] = { 0 };
-	char mon[8] = { 0 };
-	/* %*d suppresses assignment for the numeric fields: their values
-	 * aren't needed, only that they are present and well-formed, and
-	 * %d's own error reporting is otherwise unchecked (cert-err34-c). */
-	if (sscanf(p,
-		   "\r\nDate: %7[A-Za-z], %*d %7[A-Za-z] %*d %*d:%*d:%*d GMT",
-		   wday, mon) != 2) {
+	const char *const date = header + 8;
+	const char *const end = strstr(date, "\r\n");
+	if (end == NULL || end - date != 29 ||
+	    strncmp(date + 3, ", ", 2) != 0 || date[7] != ' ' ||
+	    date[11] != ' ' || date[16] != ' ' || date[19] != ':' ||
+	    date[22] != ':' || strncmp(date + 25, " GMT", 4) != 0) {
 		return false;
 	}
-	static const char *const wday_name[7] = { "Sun", "Mon", "Tue", "Wed",
-						  "Thu", "Fri", "Sat" };
-	static const char *const mon_name[12] = { "Jan", "Feb", "Mar", "Apr",
-						  "May", "Jun", "Jul", "Aug",
-						  "Sep", "Oct", "Nov", "Dec" };
+	static const size_t digits[] = {
+		5, 6, 12, 13, 14, 15, 17, 18, 20, 21, 23, 24,
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(digits); i++) {
+		if (date[digits[i]] < '0' || date[digits[i]] > '9') {
+			return false;
+		}
+	}
+	static const char *const wdays[] = {
+		"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+	};
+	static const char *const months[] = {
+		"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+		"Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+	};
 	bool wday_ok = false;
-	for (size_t i = 0; i < 7; i++) {
-		wday_ok = wday_ok || strcmp(wday, wday_name[i]) == 0;
+	for (size_t i = 0; i < ARRAY_SIZE(wdays); i++) {
+		wday_ok = wday_ok || strncmp(date, wdays[i], 3) == 0;
 	}
-	bool mon_ok = false;
-	for (size_t i = 0; i < 12; i++) {
-		mon_ok = mon_ok || strcmp(mon, mon_name[i]) == 0;
+	bool month_ok = false;
+	for (size_t i = 0; i < ARRAY_SIZE(months); i++) {
+		month_ok = month_ok || strncmp(date + 8, months[i], 3) == 0;
 	}
-	return wday_ok && mon_ok;
+	const int day = (date[5] - '0') * 10 + date[6] - '0';
+	const int hour = (date[17] - '0') * 10 + date[18] - '0';
+	const int minute = (date[20] - '0') * 10 + date[21] - '0';
+	const int second = (date[23] - '0') * 10 + date[24] - '0';
+	/* RFC 9110 permits 60 for a leap second. */
+	return wday_ok && month_ok && day >= 1 && day <= 31 && hour <= 23 &&
+	       minute <= 59 && second <= 60;
+}
+
+T_DECLARE_CASE(test_response_reader_requires_complete_framing)
+{
+	static const struct {
+		const char *response;
+		int first, eof;
+	} cases[] = {
+		{ "", 0, -1 },
+		{ "HTTP/1.1 200 OK\r\nContent-Len", 0, -1 },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", 0, -1 },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", 1, 1 },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 1, 1 },
+		{ "HTTP/1.1 204 No Content\r\n\r\n", 1, 1 },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999\r\n\r\n",
+		  -1, -1 },
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		int fds[2];
+		T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+		T_CHECK(socket_set_nonblock(fds[0]) == 0);
+		const size_t len = strlen(cases[i].response);
+		T_CHECK(write(fds[1], cases[i].response, len) == (ssize_t)len);
+		struct resp_wait_ctx ctx = { .fd = fds[0] };
+		const int first = resp_wait_predicate(&ctx);
+		T_CHECK(shutdown(fds[1], SHUT_WR) == 0);
+		const int eof = resp_wait_predicate(&ctx);
+		(void)close(fds[0]);
+		(void)close(fds[1]);
+		T_LOGF("framing control %zu", i);
+		T_EXPECT_EQ(first, cases[i].first);
+		T_EXPECT_EQ(eof, cases[i].eof);
+	}
+}
+
+T_DECLARE_CASE(test_date_validator_rejects_malformed_fields)
+{
+	static const char *const invalid[] = {
+		"Sun, 06 Nov nonsense",
+		"Sun, 06 Nov 1994 08:49:37",
+		"Sun, 6 Nov 1994 08:49:37 GMT",
+		"Sun, 06 Nov 994 08:49:37 GMT",
+		"Sun, 06 Nov 1994 8:49:37 GMT",
+		"Sun, 06 Nov 1994 08:9:37 GMT",
+		"Sun, 06 Nov 1994 08:49:7 GMT",
+		"Sun, 06 Nov 1994 08:49:37 UTC",
+		"Sun, 06 Nov 1994 08:49:37 GMT junk",
+		"sun, 06 Nov 1994 08:49:37 GMT",
+		"Sun, 06 Xxx 1994 08:49:37 GMT",
+		"Sun, 00 Nov 1994 08:49:37 GMT",
+		"Sun, 32 Nov 1994 08:49:37 GMT",
+		"Sun, 06 Nov 1994 24:49:37 GMT",
+		"Sun, 06 Nov 1994 08:60:37 GMT",
+		"Sun, 06 Nov 1994 08:49:61 GMT",
+		"Sun, 06 Nov 1994 08:49:37 GMT\n",
+	};
+	T_EXPECT(resp_date_is_english_imf_fixdate(
+		"HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n"));
+	T_EXPECT(resp_date_is_english_imf_fixdate(
+		"HTTP/1.1 200 OK\r\nDate: Sat, 31 Dec 2016 23:59:60 GMT\r\n\r\n"));
+	T_EXPECT(!resp_date_is_english_imf_fixdate("HTTP/1.1 200 OK\r\n\r\n"));
+	for (size_t i = 0; i < ARRAY_SIZE(invalid); i++) {
+		char response[128];
+		(void)snprintf(
+			response, sizeof(response),
+			"HTTP/1.1 200 OK\r\nDate: %s\r\n\r\n", invalid[i]);
+		T_LOGF("malformed Date: %s", invalid[i]);
+		T_EXPECT(!resp_date_is_english_imf_fixdate(response));
+	}
 }
 
 /* Individual test fixtures — small inline request strings */
@@ -918,6 +1010,64 @@ static bool resp_date_is_english_imf_fixdate(const char *restrict buf)
 	"Expect: something-else\r\n"                                           \
 	"\r\n"
 
+/* A pending 100-continue expectation must never displace a final response
+ * queued before the interim was owed (RFC 9110 10.1.1: a final status answers
+ * the expectation by itself). */
+#define REQ_EXPECT_NO_BODY                                                     \
+	"GET /healthy HTTP/1.1\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Connection: close\r\n"                                                \
+	"Expect: 100-continue\r\n"                                             \
+	"\r\n"
+
+#define REQ_EXPECT_CONFIG_EMPTY_BODY                                           \
+	"PUT /config HTTP/1.1\r\n"                                             \
+	"Host: test\r\n"                                                       \
+	"Connection: close\r\n"                                                \
+	"Expect: 100-continue\r\n"                                             \
+	"Content-Length: 0\r\n"                                                \
+	"\r\n"
+
+#define REQ_EXPECT_OVERSIZED_BODY                                              \
+	"PUT /config HTTP/1.1\r\n"                                             \
+	"Host: test\r\n"                                                       \
+	"Expect: 100-continue\r\n"                                             \
+	"Content-Length: 99999999\r\n"                                         \
+	"\r\n"
+
+#define REQ_EXPECT_TRANSFER_ENCODING                                           \
+	"PUT /config HTTP/1.1\r\n"                                             \
+	"Host: test\r\n"                                                       \
+	"Expect: 100-continue\r\n"                                             \
+	"Transfer-Encoding: chunked\r\n"                                       \
+	"\r\n"
+
+/* The rejected framing must not be parsed past: the trailing bytes would
+ * otherwise satisfy the first Content-Length and dispatch the handler. */
+#define REQ_EXPECT_DUPLICATE_CONTENT_LENGTH                                    \
+	"GET /healthy HTTP/1.1\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Expect: 100-continue\r\n"                                             \
+	"Content-Length: 1\r\n"                                                \
+	"Content-Length: 2\r\n"                                                \
+	"\r\n"                                                                 \
+	"ab"
+
+/* RFC 9110 10.1.1 / 15.2: an HTTP/1.0 request's expectation is ignored and
+ * no 1xx is ever sent to an HTTP/1.0 client. */
+#define REQ_EXPECT_HTTP10_HEADERS                                              \
+	"GET /healthy HTTP/1.0\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Expect: 100-continue\r\n"                                             \
+	"Content-Length: 2\r\n"                                                \
+	"\r\n"
+
+#define REQ_EXPECT_UNKNOWN_HTTP10                                              \
+	"GET /healthy HTTP/1.0\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Expect: something-else\r\n"                                           \
+	"\r\n"
+
 /* http_parse() copies the request-line version verbatim without interpreting
  * it; recv_cb() must reject a token that is not a supported HTTP/1.x version
  * rather than dispatch it as a normal request. */
@@ -942,20 +1092,50 @@ static bool resp_date_is_english_imf_fixdate(const char *restrict buf)
 	"Host: test\r\n"                                                       \
 	"\r\n"
 
-/* Helper — perform a single HTTP exchange on fx and fill rctx.
- * Returns 0 on success, -1 on timeout or error. */
+/* A NUL octet anywhere in the request head is a field value (or request
+ * line) that RFC 9110 5.5 requires rejecting; the fixtures below carry it
+ * embedded, so they are sent by explicit length rather than strlen(). */
+#define REQ_NUL_IN_HEADER_VALUE                                                \
+	"GET /healthy HTTP/1.1\r\n"                                            \
+	"Host: x\0y\r\n"                                                       \
+	"\r\n"
 
-static int do_exchange(
+#define REQ_NUL_IN_REQUEST_LINE                                                \
+	"GET /heal\0thy HTTP/1.1\r\n"                                          \
+	"Host: test\r\n"                                                       \
+	"\r\n"
+
+/* The body is length-delimited, so a NUL there is legal payload and must not
+ * be mistaken for one in the head when both arrive in one read. */
+#define REQ_NUL_IN_BODY                                                        \
+	"GET /healthy HTTP/1.1\r\n"                                            \
+	"Host: test\r\n"                                                       \
+	"Content-Length: 3\r\n"                                                \
+	"\r\n"                                                                 \
+	"a\0b"
+
+/* Helper — perform a single HTTP exchange of len request bytes on fx and fill
+ * rctx.  Returns 0 on success, -1 on timeout or error. */
+static int do_exchange_len(
 	struct apifx *restrict fx, struct resp_wait_ctx *restrict rctx,
-	const char *restrict request)
+	const char *restrict request, const size_t len)
 {
 	*rctx = (struct resp_wait_ctx){ .fd = fx->cli_fd, .nread = 0 };
-	if (do_send(fx, fx->cli_fd, request, strlen(request)) != 0) {
+	if (do_send(fx, fx->cli_fd, request, len) != 0) {
 		return -1;
 	}
 	return wait_until(
 		fx, (double)API_RESP_TIMEOUT_MS / 1000.0, resp_wait_predicate,
 		rctx);
+}
+
+/* Helper — perform a single HTTP exchange on fx and fill rctx.
+ * Returns 0 on success, -1 on timeout or error. */
+static int do_exchange(
+	struct apifx *restrict fx, struct resp_wait_ctx *restrict rctx,
+	const char *restrict request)
+{
+	return do_exchange_len(fx, rctx, request, strlen(request));
 }
 
 /* Single HTTP exchange; T_FAILNOW on error. rctx->buf valid on return. */
@@ -964,6 +1144,19 @@ T_DECLARE_SUBCASE(
 	struct resp_wait_ctx *restrict rctx, const char *restrict request)
 {
 	if (do_exchange(fx, rctx, request) != 0) {
+		T_LOG("response timeout or send error");
+		T_FAILNOW();
+	}
+}
+
+/* Single HTTP exchange of a request that may embed NUL octets; T_FAILNOW on
+ * error.  rctx->buf valid on return. */
+T_DECLARE_SUBCASE(
+	assert_exchange_len, struct apifx *restrict fx,
+	struct resp_wait_ctx *restrict rctx, const char *restrict request,
+	const size_t len)
+{
+	if (do_exchange_len(fx, rctx, request, len) != 0) {
 		T_LOG("response timeout or send error");
 		T_FAILNOW();
 	}
@@ -982,10 +1175,9 @@ T_DECLARE_CASE(test_healthy_get)
 	 * -- switch to a genuinely non-English locale (best effort; a no-op
 	 * if unavailable, matching how init()'s own setlocale(LC_ALL, "")
 	 * silently keeps "C" when the environment's requested locale isn't
-	 * installed) so the Date header's day/month names are checked
-	 * against an LC_TIME that would actually produce different output
-	 * through strftime, not one indistinguishable from "C" on a minimal
-	 * system. */
+	 * installed) so the Date header's day/month names are checked under
+	 * an LC_TIME whose %a/%b would differ from the RFC's English names,
+	 * guarding against any locale-dependent formatting of the header. */
 	const char *const prev_locale = setlocale(LC_TIME, NULL);
 	char saved_locale[64] = { 0 };
 	if (prev_locale != NULL) {
@@ -1044,7 +1236,7 @@ T_DECLARE_CASE(test_stats_buffered_data_uses_configured_frame_size)
 	 * Poking through the session's own counter block exercises the production
 	 * write path and so also proves tunnel_new() wired the block per-tunnel.
 	 * The tunnel carries no streams, so nothing decrements the gauge again. */
-	struct tunnel *const t = make_established_tunnel(&fx, "peer-buf", 0);
+	struct tunnel *const t = make_established_tunnel(&fx, 0);
 	T_CHECK(t != NULL);
 	fx.srv.mux_tunnel = t;
 	struct mux_session *const ss = tunnel_session(t);
@@ -1372,11 +1564,11 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	struct identity_listener *const sl0 = calloc(1, sizeof(*sl0));
 	T_CHECK(sl0 != NULL);
 	sl0->peer_identity = "peer-offline";
-	struct tunnel *const t0 =
-		make_established_tunnel(&fx, "peer-offline", 0);
+	struct tunnel *const t0 = make_established_tunnel(&fx, 0);
 	T_CHECK(t0 != NULL);
 	/* Reset to non-established so tunnel_stats() reports !established. */
 	tunnel_session(t0)->state = SESSION_CONNECT;
+	PUB_STORE(tunnel_session(t0)->_pub_state, SESSION_CONNECT);
 	sl0->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl0->tunnels != NULL);
 	sl0->tunnels[0] = t0;
@@ -1390,8 +1582,7 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	struct identity_listener *const sl1 = calloc(1, sizeof(*sl1));
 	T_CHECK(sl1 != NULL);
 	sl1->peer_identity = "peer-online";
-	struct tunnel *const restrict t1 =
-		make_established_tunnel(&fx, "peer-online", 3);
+	struct tunnel *const restrict t1 = make_established_tunnel(&fx, 3);
 	T_CHECK(t1 != NULL);
 	sl1->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl1->tunnels != NULL);
@@ -1413,10 +1604,10 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(rctx.buf, "> Sessions"));
-	T_EXPECT(resp_contains(rctx.buf, "peer-offline"));
-	T_EXPECT(resp_contains(rctx.buf, "offline"));
-	T_EXPECT(resp_contains(rctx.buf, "peer-online"));
-	T_EXPECT(resp_contains(rctx.buf, "W=Rx"));
+	T_EXPECT(resp_contains(rctx.buf, "\npeer-offline        : offline\n"));
+	T_EXPECT(!resp_contains(rctx.buf, "peer-offline        : W=Rx"));
+	T_EXPECT(resp_contains(rctx.buf, "\npeer-online         : W=Rx "));
+	T_EXPECT(!resp_contains(rctx.buf, "peer-online         : offline"));
 }
 
 T_DECLARE_CASE(test_healthy_offline)
@@ -1439,8 +1630,7 @@ T_DECLARE_CASE(test_healthy_offline)
 	struct identity_listener *const sl_down = calloc(1, sizeof(*sl_down));
 	T_CHECK(sl_down != NULL);
 	sl_down->peer_identity = "peer-down";
-	struct tunnel *const t_down =
-		make_established_tunnel(&fx, "peer-down", 0);
+	struct tunnel *const t_down = make_established_tunnel(&fx, 0);
 	T_CHECK(t_down != NULL);
 	struct mux_session *const ss_down = tunnel_session(t_down);
 	ss_down->state = SESSION_CONNECT;
@@ -1461,7 +1651,7 @@ T_DECLARE_CASE(test_healthy_offline)
 	struct identity_listener *const sl_up = calloc(1, sizeof(*sl_up));
 	T_CHECK(sl_up != NULL);
 	sl_up->peer_identity = "peer-up";
-	struct tunnel *const t_up = make_established_tunnel(&fx, "peer-up", 1);
+	struct tunnel *const t_up = make_established_tunnel(&fx, 1);
 	T_CHECK(t_up != NULL);
 	sl_up->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_up->tunnels != NULL);
@@ -1474,10 +1664,19 @@ T_DECLARE_CASE(test_healthy_offline)
 		T_CHECK(slot == NULL);
 	}
 
+	struct identity_peer peers[] = {
+		{ .id = "peer-down", .listen = "127.0.0.1:1" },
+		{ .id = "peer-up", .listen = "127.0.0.1:2" },
+	};
+	fx.conf.identity.peers = peers;
+	fx.conf.identity.peers_count = 2;
+
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_GET);
 	/* Teardown before asserting so a failing T_EXPECT can't skip it (rctx.buf
 	 * is a stack buffer, safe to read afterward). */
+	fx.conf.identity.peers = NULL;
+	fx.conf.identity.peers_count = 0;
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 503);
 	T_EXPECT(resp_contains(rctx.buf, "offline: peer-down"));
@@ -1508,7 +1707,7 @@ T_DECLARE_CASE(test_healthy_escapes_control_chars_in_identity)
 	struct identity_listener *const sl = calloc(1, sizeof(*sl));
 	T_CHECK(sl != NULL);
 	sl->peer_identity = evil_id;
-	struct tunnel *const t = make_established_tunnel(&fx, evil_id, 0);
+	struct tunnel *const t = make_established_tunnel(&fx, 0);
 	T_CHECK(t != NULL);
 	struct mux_session *const ss = tunnel_session(t);
 	ss->state = SESSION_CONNECT;
@@ -1524,9 +1723,17 @@ T_DECLARE_CASE(test_healthy_escapes_control_chars_in_identity)
 		T_CHECK(slot == NULL);
 	}
 
+	struct identity_peer peers[] = {
+		{ .id = "a\tb\033c\rd", .listen = "127.0.0.1:1" },
+	};
+	fx.conf.identity.peers = peers;
+	fx.conf.identity.peers_count = 1;
+
 	struct resp_wait_ctx rctx;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_GET);
 	/* Teardown before asserting so a failing T_EXPECT can't skip it. */
+	fx.conf.identity.peers = NULL;
+	fx.conf.identity.peers_count = 0;
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 503);
 	/* TAB/CR keep their C-style escapes; ESC becomes an inert \x1b. */
@@ -1551,7 +1758,7 @@ T_DECLARE_CASE(test_healthy_all_online)
 	struct identity_listener *const sl = calloc(1, sizeof(*sl));
 	T_CHECK(sl != NULL);
 	sl->peer_identity = "peer-up";
-	struct tunnel *const t = make_established_tunnel(&fx, "peer-up", 1);
+	struct tunnel *const t = make_established_tunnel(&fx, 1);
 	T_CHECK(t != NULL);
 	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
@@ -1588,8 +1795,7 @@ T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 	struct identity_listener *const sl_rtt = calloc(1, sizeof(*sl_rtt));
 	T_CHECK(sl_rtt != NULL);
 	sl_rtt->peer_identity = "peer-rtt";
-	struct tunnel *const restrict t1 =
-		make_established_tunnel(&fx, "peer-rtt", 1);
+	struct tunnel *const restrict t1 = make_established_tunnel(&fx, 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
 	/* 20 ms RTT */
@@ -1634,7 +1840,7 @@ T_DECLARE_CASE(test_server_stats_dedups_mux_tunnel_in_identity_pool)
 		.flags = TABLE_FAST,
 	});
 	T_CHECK(fx.srv.identities != NULL);
-	struct tunnel *const t = make_established_tunnel(&fx, "peer-dup", 3);
+	struct tunnel *const t = make_established_tunnel(&fx, 3);
 	T_CHECK(t != NULL);
 	/* Same tunnel is both the top-level mux_tunnel and an identity-pool
 	 * member (teardown frees it once, via the pool). */
@@ -1683,8 +1889,7 @@ T_DECLARE_CASE(test_metrics_floats_use_c_numeric_locale)
 	struct identity_listener *const sl_rtt = calloc(1, sizeof(*sl_rtt));
 	T_CHECK(sl_rtt != NULL);
 	sl_rtt->peer_identity = "peer-loc";
-	struct tunnel *const restrict t1 =
-		make_established_tunnel(&fx, "peer-loc", 1);
+	struct tunnel *const restrict t1 = make_established_tunnel(&fx, 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
 	ss->estimator.rtt = INT64_C(20000000); /* 20 ms */
@@ -1744,8 +1949,7 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	struct identity_listener *const sl_win = calloc(1, sizeof(*sl_win));
 	T_CHECK(sl_win != NULL);
 	sl_win->peer_identity = "peer-win";
-	struct tunnel *const restrict t1 =
-		make_established_tunnel(&fx, "peer-win", 1);
+	struct tunnel *const restrict t1 = make_established_tunnel(&fx, 1);
 	T_CHECK(t1 != NULL);
 	struct mux_session *const ss = tunnel_session(t1);
 	session_set_stream_window(ss, 2);
@@ -1801,8 +2005,7 @@ T_DECLARE_CASE(test_metrics_session_counter_type_matches_samples)
 	struct identity_listener *const sl = calloc(1, sizeof(*sl));
 	T_CHECK(sl != NULL);
 	sl->peer_identity = "peer-cnt";
-	struct tunnel *const restrict t1 =
-		make_established_tunnel(&fx, "peer-cnt", 1);
+	struct tunnel *const restrict t1 = make_established_tunnel(&fx, 1);
 	T_CHECK(t1 != NULL);
 	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
@@ -1839,6 +2042,29 @@ T_DECLARE_CASE(test_metrics_session_counter_type_matches_samples)
 	T_EXPECT(resp_contains(
 		rctx.buf,
 		"multiplexd_session_payload_bytes_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} "));
+	/* lossymux datagram series, per tunnel and process-wide. */
+	T_EXPECT(resp_contains(
+		rctx.buf, "# TYPE multiplexd_session_datagrams_total counter"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_datagrams_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"rx\"} 0"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_datagram_bytes_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} 0"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_datagrams_dropped_total{identity=\"peer-cnt\",tunnel=\"1\"} 0"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_session_udp_flows{identity=\"peer-cnt\",tunnel=\"1\"} 0"));
+	T_EXPECT(resp_contains(
+		rctx.buf, "multiplexd_datagrams_total{direction=\"rx\"} 0"));
+	T_EXPECT(resp_contains(
+		rctx.buf,
+		"multiplexd_datagram_bytes_total{direction=\"tx\"} 0"));
+	T_EXPECT(resp_contains(
+		rctx.buf, "multiplexd_datagrams_dropped_total 0"));
+	T_EXPECT(resp_contains(rctx.buf, "multiplexd_udp_flows 0"));
 }
 
 /* A peer identity containing structural characters must be escaped in the
@@ -1868,7 +2094,7 @@ T_DECLARE_CASE(test_metrics_escapes_special_chars_in_identity)
 	struct identity_listener *const sl = calloc(1, sizeof(*sl));
 	T_CHECK(sl != NULL);
 	sl->peer_identity = evil_id;
-	struct tunnel *const t = make_established_tunnel(&fx, evil_id, 1);
+	struct tunnel *const t = make_established_tunnel(&fx, 1);
 	T_CHECK(t != NULL);
 	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
@@ -1901,6 +2127,32 @@ T_DECLARE_CASE(test_metrics_escapes_special_chars_in_identity)
 	T_EXPECT(!resp_contains(rctx.buf, "\\x"));
 }
 
+/* Start of the line following *line, or NULL at the end of the buffer. */
+static const char *next_line(const char *restrict line)
+{
+	const char *const eol = strchr(line, '\n');
+	return eol != NULL ? eol + 1 : NULL;
+}
+
+/* Match a complete sample key at the start of a newline-terminated line,
+ * independent of its value, so duplicate samples with different values count. */
+static size_t
+metric_sample_count(const char *restrict buf, const char *restrict key)
+{
+	const size_t len = strlen(key);
+	size_t count = 0;
+	for (const char *line = buf; line != NULL; line = next_line(line)) {
+		if (strncmp(line, key, len) == 0 && line[len] == ' ') {
+			const char *const end = strchr(line + len + 1u, '\n');
+			if (end == NULL || end == line + len + 1u) {
+				continue;
+			}
+			count++;
+		}
+	}
+	return count;
+}
+
 T_DECLARE_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity)
 {
 	struct apifx fx;
@@ -1919,9 +2171,9 @@ T_DECLARE_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity)
 	struct identity_listener *const sl = calloc(1, sizeof(*sl));
 	T_CHECK(sl != NULL);
 	sl->peer_identity = "peer-dup";
-	struct tunnel *const t1 = make_established_tunnel(&fx, "peer-dup", 0);
+	struct tunnel *const t1 = make_established_tunnel(&fx, 0);
 	T_CHECK(t1 != NULL);
-	struct tunnel *const t2 = make_established_tunnel(&fx, "peer-dup", 0);
+	struct tunnel *const t2 = make_established_tunnel(&fx, 0);
 	T_CHECK(t2 != NULL);
 	sl->tunnels = (struct tunnel **)malloc(2 * sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
@@ -1940,20 +2192,31 @@ T_DECLARE_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity)
 	/* Teardown before asserting so a failing T_EXPECT can't skip it. */
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
-	/* The two tunnel_indexes are 1 and 2 (first two tunnels in a fresh
-	 * fixture).  Each label set must appear exactly once. */
-	T_EXPECT(resp_contains(
-		rctx.buf,
-		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"1\",direction=\"rx\"}"));
-	T_EXPECT(resp_contains(
-		rctx.buf,
-		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"2\",direction=\"rx\"}"));
-	T_EXPECT(resp_contains(
-		rctx.buf,
-		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"1\",direction=\"tx\"}"));
-	T_EXPECT(resp_contains(
-		rctx.buf,
-		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"2\",direction=\"tx\"}"));
+	/* Every identity/tunnel/direction sample must occur exactly once. */
+	static const char *const keys[] = {
+		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"1\",direction=\"rx\"}",
+		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"2\",direction=\"rx\"}",
+		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"1\",direction=\"tx\"}",
+		"multiplexd_session_bytes_total{identity=\"peer-dup\",tunnel=\"2\",direction=\"tx\"}",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(keys); i++) {
+		T_EXPECT_EQ(metric_sample_count(rctx.buf, keys[i]), (size_t)1);
+	}
+}
+
+/* The fixture injects tracker timestamps without sleeping. The timestamp
+ * recorded by the scrape supplies its exact elapsed interval; known byte
+ * deltas stay in the B unit, whose displayed precision is one byte. */
+T_DECLARE_SUBCASE(
+	assert_throughput, const char *response, const char *label,
+	const double recv_bytes, const double sent_bytes, const double elapsed)
+{
+	T_CHECK(elapsed > 0.0);
+	char expected[128];
+	(void)snprintf(
+		expected, sizeof(expected), "\n%-20s: Rx %.0fB/s, Tx %.0fB/s\n",
+		label, recv_bytes / elapsed, sent_bytes / elapsed);
+	T_EXPECT(resp_contains(response, expected));
 }
 
 T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
@@ -1966,6 +2229,8 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	fx.srv.started = clock_monotonic_ns() - 5LL * 1000 * 1000 * 1000;
 	fx.srv.counters.closed.traffic_byt_mux_recv = 2048;
 	fx.srv.counters.closed.traffic_byt_mux_sent = 4096;
+	fx.srv.counters.closed.traffic_byt_push_recv = 1000;
+	fx.srv.counters.closed.traffic_byt_push_sent = 2000;
 
 	struct resp_wait_ctx rctx1;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx1, REQ_STATS_POST);
@@ -1975,32 +2240,61 @@ T_DECLARE_CASE(test_stats_post_tracks_rate_deltas)
 	const bool rt1_is_set = fx.srv.rate_tracker.is_set;
 	const uint_least64_t rt1_recv = fx.srv.rate_tracker.byt_mux_recv;
 	const uint_least64_t rt1_sent = fx.srv.rate_tracker.byt_mux_sent;
+	const double dt1 =
+		(double)(fx.srv.rate_tracker.timestamp - fx.srv.started) / 1e9;
 
 	fx.srv.counters.closed.traffic_byt_mux_recv = 3072;
 	fx.srv.counters.closed.traffic_byt_mux_sent = 6144;
+	fx.srv.counters.closed.traffic_byt_push_recv = 1200;
+	fx.srv.counters.closed.traffic_byt_push_sent = 2600;
 	fx.srv.rate_tracker.timestamp =
 		clock_monotonic_ns() - 2LL * 1000 * 1000 * 1000;
 
+	const int_least64_t start2 = fx.srv.rate_tracker.timestamp;
 	struct resp_wait_ctx rctx2;
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx2, REQ_STATS_POST);
 	/* Capture the post-second-POST rate-tracker state before teardown. */
 	const uint_least64_t rt2_recv = fx.srv.rate_tracker.byt_mux_recv;
 	const uint_least64_t rt2_sent = fx.srv.rate_tracker.byt_mux_sent;
+	const double dt2 =
+		(double)(fx.srv.rate_tracker.timestamp - start2) / 1e9;
+
+	/* No new traffic: a third interval must display zero rates rather than
+	 * the cumulative totals left by the first two scrapes. */
+	fx.srv.rate_tracker.timestamp =
+		clock_monotonic_ns() - 3LL * 1000 * 1000 * 1000;
+	struct resp_wait_ctx rctx3;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx3, REQ_STATS_POST);
 
 	/* Teardown before asserting so a failing T_EXPECT can't skip it; the rctx
 	 * buffers are stack buffers and every fx field read is captured above. */
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx1.buf), 200);
-	T_EXPECT(resp_contains(rctx1.buf, "Mux Throughput"));
+	T_CALL_SUBCASE(
+		assert_throughput, rctx1.buf, "Mux Throughput", 2048.0, 4096.0,
+		dt1);
+	T_CALL_SUBCASE(
+		assert_throughput, rctx1.buf, "Payload Throughput", 1000.0,
+		2000.0, dt1);
 	T_EXPECT(resp_contains(rctx1.buf, "Server Load"));
 	T_EXPECT(rt1_is_set);
 	T_EXPECT_EQ(rt1_recv, (uint_least64_t)2048);
 	T_EXPECT_EQ(rt1_sent, (uint_least64_t)4096);
 	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
-	T_EXPECT(resp_contains(rctx2.buf, "Mux Throughput"));
+	T_CALL_SUBCASE(
+		assert_throughput, rctx2.buf, "Mux Throughput", 1024.0, 2048.0,
+		dt2);
+	T_CALL_SUBCASE(
+		assert_throughput, rctx2.buf, "Payload Throughput", 200.0,
+		600.0, dt2);
 	T_EXPECT(resp_contains(rctx2.buf, "Server Load"));
 	T_EXPECT_EQ(rt2_recv, (uint_least64_t)3072);
 	T_EXPECT_EQ(rt2_sent, (uint_least64_t)6144);
+	T_EXPECT_EQ(parse_status(rctx3.buf), 200);
+	T_EXPECT(resp_contains(
+		rctx3.buf, "\nMux Throughput      : Rx 0/s, Tx 0/s\n"));
+	T_EXPECT(resp_contains(
+		rctx3.buf, "\nPayload Throughput  : Rx 0/s, Tx 0/s\n"));
 }
 
 /* The buffer gauges are per-tunnel state, so every sample must name the tunnel
@@ -2012,7 +2306,7 @@ T_DECLARE_CASE(test_metrics_buffer_gauges_are_labeled)
 		T_FATAL("apifx_setup failed");
 	}
 
-	struct tunnel *const t = make_established_tunnel(&fx, "peer-buf", 0);
+	struct tunnel *const t = make_established_tunnel(&fx, 0);
 	T_CHECK(t != NULL);
 	T_CHECK(pool_tunnel(&fx, t, "peer-buf"));
 	struct mux_session *const ss = tunnel_session(t);
@@ -2050,7 +2344,7 @@ T_DECLARE_CASE(test_metrics_stream_lifecycle_counters_are_labeled)
 		T_FATAL("apifx_setup failed");
 	}
 
-	struct tunnel *const t = make_established_tunnel(&fx, "peer-life", 0);
+	struct tunnel *const t = make_established_tunnel(&fx, 0);
 	T_CHECK(t != NULL);
 	T_CHECK(pool_tunnel(&fx, t, "peer-life"));
 	struct mux_session *const ss = tunnel_session(t);
@@ -2118,11 +2412,10 @@ T_DECLARE_CASE(test_metrics_reconnects_series_skips_accepted_tunnel)
 		T_FATAL("apifx_setup failed");
 	}
 
-	struct tunnel *const acc = make_accepted_tunnel(&fx, "peer-acc");
+	struct tunnel *const acc = make_accepted_tunnel(&fx);
 	T_CHECK(acc != NULL);
 	T_CHECK(pool_tunnel(&fx, acc, "peer-acc"));
-	struct tunnel *const dial =
-		make_established_tunnel(&fx, "peer-dial", 0);
+	struct tunnel *const dial = make_established_tunnel(&fx, 0);
 	T_CHECK(dial != NULL);
 	T_CHECK(pool_tunnel(&fx, dial, "peer-dial"));
 
@@ -2153,14 +2446,12 @@ T_DECLARE_CASE(test_metrics_anonymous_tunnel_counted_in_totals_only)
 
 	/* mux_tunnel is never in an identity pool, so tunnel_stats leaves its
 	 * peer_identity NULL -- exactly the plain client-mode shape. */
-	struct tunnel *const anon =
-		make_established_tunnel(&fx, "peer-anon", 0);
+	struct tunnel *const anon = make_established_tunnel(&fx, 0);
 	T_CHECK(anon != NULL);
 	fx.srv.mux_tunnel = anon;
 	COUNTER_ADD(tunnel_session(anon)->cnt.stream.num_stream_opened, 6);
 
-	struct tunnel *const named =
-		make_established_tunnel(&fx, "peer-named", 0);
+	struct tunnel *const named = make_established_tunnel(&fx, 0);
 	T_CHECK(named != NULL);
 	T_CHECK(pool_tunnel(&fx, named, "peer-named"));
 	COUNTER_ADD(tunnel_session(named)->cnt.stream.num_stream_opened, 4);
@@ -2196,8 +2487,7 @@ T_DECLARE_CASE(test_metrics_staged_identity_tunnel_counted_in_totals)
 		T_FATAL("apifx_setup failed");
 	}
 
-	struct tunnel *const staged =
-		make_established_tunnel(&fx, "peer-staged", 0);
+	struct tunnel *const staged = make_established_tunnel(&fx, 0);
 	T_CHECK(staged != NULL);
 	fx.srv.identity_tunnels =
 		(struct tunnel **)calloc(1, sizeof(struct tunnel *));
@@ -2251,19 +2541,106 @@ static void strip_sample_suffix(char *restrict name)
 	}
 }
 
-/* Start of the line following *line, or NULL at the end of the buffer. */
-static const char *next_line(const char *restrict line)
+static size_t metric_metadata_count(
+	const char *restrict body, const char *restrict prefix,
+	const char *restrict name)
 {
-	const char *const eol = strchr(line, '\n');
-	return eol != NULL ? eol + 1 : NULL;
+	const size_t len = strlen(prefix);
+	size_t count = 0;
+	for (const char *line = body; line != NULL; line = next_line(line)) {
+		char found[96];
+		if (strncmp(line, prefix, len) == 0 &&
+		    parse_metric_name(found, sizeof(found), line + len) &&
+		    strcmp(found, name) == 0) {
+			count++;
+		}
+	}
+	return count;
 }
 
-/* Prometheus requires one TYPE line per metric name and a declared type for
- * every sample.  The per-tunnel macros derive the header and the sample lines
- * from a single spelling of the name, but a mis-parameterized invocation would
- * still compile -- leaving a TYPE naming a series with no samples, or samples
- * carrying an undeclared name.  Scan the whole exposition rather than trusting
- * any single metric. */
+/* The API emits both HELP and TYPE for every family. Their name sets must
+ * match exactly once, every sample needs that metadata, and every declared
+ * family must have a sample. */
+static bool metrics_metadata_valid(const char *restrict body)
+{
+	bool has_sample = false;
+	for (const char *line = body; line != NULL; line = next_line(line)) {
+		const bool metadata = strncmp(line, "# TYPE ", 7) == 0 ||
+				      strncmp(line, "# HELP ", 7) == 0;
+		if ((!metadata && line[0] == '#') || line[0] == '\n' ||
+		    line[0] == '\0') {
+			continue;
+		}
+		char name[96];
+		if (!parse_metric_name(
+			    name, sizeof(name), line + (metadata ? 7 : 0))) {
+			return false;
+		}
+		if (!metadata) {
+			strip_sample_suffix(name);
+			has_sample = true;
+		}
+		if (metric_metadata_count(body, "# TYPE ", name) != 1 ||
+		    metric_metadata_count(body, "# HELP ", name) != 1) {
+			return false;
+		}
+		if (metadata) {
+			bool found = false;
+			for (const char *sample = body;
+			     sample != NULL && !found;
+			     sample = next_line(sample)) {
+				char family[96];
+				if (sample[0] == '#' ||
+				    !parse_metric_name(
+					    family, sizeof(family), sample)) {
+					continue;
+				}
+				strip_sample_suffix(family);
+				found = strcmp(name, family) == 0;
+			}
+			if (!found) {
+				return false;
+			}
+		}
+	}
+	return has_sample;
+}
+
+T_DECLARE_CASE(test_metrics_validation_rejects_duplicates_and_missing_metadata)
+{
+	static const char valid[] =
+		"# HELP sample A sample.\n# TYPE sample gauge\nsample{peer=\"a\"} 1\n";
+	static const char *const invalid[] = {
+		"# TYPE sample gauge\nsample 1\n",
+		"# HELP sample A sample.\nsample 1\n",
+		"# HELP sample A sample.\n# HELP sample Again.\n# TYPE sample gauge\nsample 1\n",
+		"# HELP sample A sample.\n# TYPE sample gauge\n# TYPE sample gauge\nsample 1\n",
+		"# HELP wrong A sample.\n# TYPE sample gauge\nsample 1\n",
+		"# HELP sample A sample.\n# TYPE sample gauge\nother 1\n",
+		"# HELP sample A sample.\n# TYPE sample gauge\n",
+	};
+	T_EXPECT(metrics_metadata_valid(valid));
+	for (size_t i = 0; i < ARRAY_SIZE(invalid); i++) {
+		T_EXPECT(!metrics_metadata_valid(invalid[i]));
+	}
+	T_EXPECT_EQ(
+		metric_sample_count(valid, "sample{peer=\"a\"}"), (size_t)1);
+	T_EXPECT_EQ(
+		metric_sample_count(
+			"sample{peer=\"a\"} 1\nsample{peer=\"a\"} 2\n",
+			"sample{peer=\"a\"}"),
+		(size_t)2);
+	T_EXPECT_EQ(
+		metric_sample_count(
+			"prefix_sample{peer=\"a\"} 1\nsample{peer=\"ab\"} 1\n",
+			"sample{peer=\"a\"}"),
+		(size_t)0);
+	T_EXPECT_EQ(
+		metric_sample_count(
+			"sample{peer=\"a\"} 1", "sample{peer=\"a\"}"),
+		(size_t)0);
+}
+
 T_DECLARE_CASE(test_metrics_help_type_emitted_once_per_name)
 {
 	struct apifx fx;
@@ -2273,13 +2650,13 @@ T_DECLARE_CASE(test_metrics_help_type_emitted_once_per_name)
 
 	/* Two pooled tunnels plus an anonymous one, so every family that can be
 	 * emitted is emitted, with more than one sample per name. */
-	struct tunnel *const t1 = make_established_tunnel(&fx, "peer-a", 1);
+	struct tunnel *const t1 = make_established_tunnel(&fx, 1);
 	T_CHECK(t1 != NULL);
 	T_CHECK(pool_tunnel(&fx, t1, "peer-a"));
-	struct tunnel *const t2 = make_established_tunnel(&fx, "peer-b", 1);
+	struct tunnel *const t2 = make_established_tunnel(&fx, 1);
 	T_CHECK(t2 != NULL);
 	T_CHECK(pool_tunnel(&fx, t2, "peer-b"));
-	struct tunnel *const anon = make_established_tunnel(&fx, "peer-c", 1);
+	struct tunnel *const anon = make_established_tunnel(&fx, 1);
 	T_CHECK(anon != NULL);
 	fx.srv.mux_tunnel = anon;
 
@@ -2288,55 +2665,9 @@ T_DECLARE_CASE(test_metrics_help_type_emitted_once_per_name)
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 
-	/* Collected TYPE names; sized well above the emitted family count so a
-	 * newly added metric trips the T_CHECK below rather than silently
-	 * truncating the set this test validates against. */
-	char declared[64][96];
-	size_t num_declared = 0;
-	bool dup_type = false;
-	for (const char *line = rctx.buf; line != NULL;
-	     line = next_line(line)) {
-		static const char pfx[] = "# TYPE ";
-		if (strncmp(line, pfx, sizeof(pfx) - 1u) != 0) {
-			continue;
-		}
-		T_CHECK(num_declared < ARRAY_SIZE(declared));
-		char *const name = declared[num_declared];
-		T_CHECK(parse_metric_name(
-			name, sizeof(declared[0]), line + sizeof(pfx) - 1u));
-		for (size_t i = 0; i < num_declared; i++) {
-			if (strcmp(declared[i], name) == 0) {
-				T_LOGF("duplicate # TYPE for %s", name);
-				dup_type = true;
-			}
-		}
-		num_declared++;
-	}
-	T_EXPECT(!dup_type);
-	T_EXPECT(num_declared > 0);
-
-	bool undeclared_sample = false;
-	for (const char *line = strstr(rctx.buf, "\r\n\r\n"); line != NULL;
-	     line = next_line(line)) {
-		if (line[0] == '#' || line[0] == '\r' || line[0] == '\n' ||
-		    line[0] == '\0') {
-			continue;
-		}
-		char name[96];
-		if (!parse_metric_name(name, sizeof(name), line)) {
-			continue;
-		}
-		strip_sample_suffix(name);
-		bool found = false;
-		for (size_t i = 0; i < num_declared && !found; i++) {
-			found = strcmp(declared[i], name) == 0;
-		}
-		if (!found) {
-			T_LOGF("sample %s has no # TYPE line", name);
-			undeclared_sample = true;
-		}
-	}
-	T_EXPECT(!undeclared_sample);
+	const char *const body = strstr(rctx.buf, "\r\n\r\n");
+	T_CHECK(body != NULL);
+	T_EXPECT(metrics_metadata_valid(body + 4));
 }
 
 T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
@@ -2353,7 +2684,7 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 
 	/* The rest come from a live tunnel, poked through the session's own counter
 	 * block so the production write path is what feeds the totals. */
-	struct tunnel *const t = make_established_tunnel(&fx, "peer-cnt", 0);
+	struct tunnel *const t = make_established_tunnel(&fx, 0);
 	T_CHECK(t != NULL);
 	T_CHECK(pool_tunnel(&fx, t, "peer-cnt"));
 	struct mux_session *const ss = tunnel_session(t);
@@ -2430,6 +2761,82 @@ T_DECLARE_CASE(test_connection_close_on_non_keepalive_request)
 		T_LOG("expected EOF after HTTP/1.0 request not received");
 		T_FAIL();
 	}
+}
+
+/* Send request, which carries bytes past its own end, in a single write.
+ * Pipelining is unsupported and the reset between keep-alive requests
+ * discards buffered bytes, so the server must answer the first request with
+ * Connection: close and then close rather than keep the connection alive and
+ * silently drop what followed. */
+T_DECLARE_SUBCASE(
+	assert_trailing_bytes_close, const char *restrict request,
+	const int status)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, request);
+
+	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
+
+	/* Teardown after the last fx use (the EOF wait) but before asserting so a
+	 * failing T_EXPECT can't skip it; rctx.buf is a stack buffer and the EOF
+	 * result is captured above, both safe to read afterward. */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), status);
+	T_EXPECT(resp_contains(rctx.buf, "Connection: close"));
+	if (!got_eof) {
+		T_LOG("expected EOF after a request followed by trailing bytes");
+		T_FAIL();
+	}
+}
+
+/* Two requests in one write: only the first is answered. */
+T_DECLARE_CASE(test_pipelined_requests_close_connection)
+{
+	T_CALL_SUBCASE(
+		assert_trailing_bytes_close, REQ_HEALTHY_GET REQ_HEALTHY_GET,
+		200);
+}
+
+/* Bytes past a Content-Length-delimited body are trailing too: the body
+ * itself must not be mistaken for the start of the next request, and what
+ * follows it must be. */
+T_DECLARE_CASE(test_body_followed_by_request_closes_connection)
+{
+	T_CALL_SUBCASE(
+		assert_trailing_bytes_close,
+		REQ_CONFIG_PUT_MALFORMED REQ_HEALTHY_GET, 400);
+}
+
+/* The converse of the case above: a body that ends exactly at the received
+ * data leaves nothing trailing, so the connection stays alive and serves the
+ * next request. */
+T_DECLARE_CASE(test_body_without_trailing_bytes_keeps_alive)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	struct resp_wait_ctx rctx1;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx1, REQ_CONFIG_PUT_MALFORMED);
+
+	struct resp_wait_ctx rctx2;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx2, REQ_HEALTHY_GET);
+	/* Teardown after the last exchange but before asserting so a failing
+	 * T_EXPECT can't skip it (both rctx buffers are stack buffers, safe to
+	 * read afterward). */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx1.buf), 400);
+	T_EXPECT(resp_contains(rctx1.buf, "Connection: keep-alive"));
+	T_EXPECT_EQ(parse_status(rctx2.buf), 200);
 }
 
 /* A Transfer-Encoding this server cannot decode must be rejected (501) and
@@ -2738,6 +3145,165 @@ T_DECLARE_CASE(test_config_put_success)
 	ev_loop_destroy(loop);
 }
 
+/* PUT /config @p body (which sets mux_connect) to a server whose running
+ * api_listen is @p running (NULL for none) and expect @p expected: 403 must
+ * leave the running config whole, api_listen and mux_connect alike; 204 must
+ * apply the body's mux_connect.  The server is never started, so the running
+ * api_listen is not bound and no fixed port is taken. */
+T_DECLARE_SUBCASE(
+	assert_config_put_api_listen, const char *restrict running,
+	const char *restrict body, const int expected)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+
+	struct config *const conf = conf_new_default();
+	T_CHECK(conf != NULL);
+	if (running != NULL) {
+		conf->api_listen = strdup(running);
+		T_CHECK(conf->api_listen != NULL);
+	}
+
+	struct server *const srv = server_new(loop, conf);
+	T_CHECK(srv != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(socket_set_nonblock(fds[0]) == 0);
+	T_CHECK(socket_set_nonblock(fds[1]) == 0);
+	api_serve(&srv->api_listener, loop, fds[0], NULL);
+
+	struct apifx fx = { .loop = loop, .cli_fd = fds[1] };
+
+	char req[512];
+	const int req_len = snprintf(
+		req, sizeof(req),
+		"PUT /config HTTP/1.1\r\n"
+		"Host: test\r\n"
+		"Connection: close\r\n"
+		"Content-Length: %zu\r\n"
+		"\r\n"
+		"%s",
+		strlen(body), body);
+	T_CHECK(req_len > 0 && (size_t)req_len < sizeof(req));
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, req);
+
+	(void)close(fds[1]);
+	server_stop(srv);
+	/* Read the outcome off whichever config is current before freeing it:
+	 * a 204 swapped srv->conf and freed the original. */
+	struct config *const final_conf = srv->conf;
+	const bool api_listen_kept =
+		(final_conf->api_listen == NULL) ?
+			running == NULL :
+			running != NULL &&
+				strcmp(final_conf->api_listen, running) == 0;
+	const bool mux_connect_applied = final_conf->mux_connect != NULL;
+	server_free(srv);
+	conf_free(final_conf);
+	ev_loop_destroy(loop);
+
+	const int status = parse_status(rctx.buf);
+	if (status != expected) {
+		T_LOGF("running api_listen %s, body %s: status %d, expected %d",
+		       running != NULL ? running : "(none)", body, status,
+		       expected);
+		T_FAIL();
+	}
+	T_EXPECT(api_listen_kept);
+	T_EXPECT_EQ(mux_connect_applied, expected == 204);
+	if (expected == 403) {
+		T_EXPECT(resp_contains(rctx.buf, "text/plain"));
+		T_EXPECT(resp_contains(
+			rctx.buf, "api_listen cannot be changed via the API"));
+	}
+}
+
+/* PUT /config cannot move the API listener: a page reaching a loopback API
+ * could otherwise re-expose it on a public address.  Any change to
+ * api_listen -- a new value, even one naming the same address differently, or
+ * the field added or removed -- is refused whole with 403, while a body that
+ * keeps api_listen as it is still reloads. */
+T_DECLARE_CASE(test_config_put_cannot_change_api_listen)
+{
+	T_CALL_SUBCASE(
+		assert_config_put_api_listen, "127.0.0.1:9090",
+		"{\"api_listen\":\"127.0.0.1:0\","
+		"\"mux_connect\":\"127.0.0.1:1\"}",
+		403);
+	T_CALL_SUBCASE(
+		assert_config_put_api_listen, "127.0.0.1:9090",
+		"{\"api_listen\":\"localhost:9090\","
+		"\"mux_connect\":\"127.0.0.1:1\"}",
+		403);
+	T_CALL_SUBCASE(
+		assert_config_put_api_listen, "127.0.0.1:9090",
+		"{\"mux_connect\":\"127.0.0.1:1\"}", 403);
+	T_CALL_SUBCASE(
+		assert_config_put_api_listen, NULL,
+		"{\"api_listen\":\"127.0.0.1:0\","
+		"\"mux_connect\":\"127.0.0.1:1\"}",
+		403);
+	T_CALL_SUBCASE(
+		assert_config_put_api_listen, "127.0.0.1:9090",
+		"{\"api_listen\":\"127.0.0.1:9090\","
+		"\"mux_connect\":\"127.0.0.1:1\"}",
+		204);
+}
+
+#if WITH_TLS
+/* A malformed inline tls.psk key is a body that fails to parse, so PUT /config
+ * must answer 400 -- not accept it and then fail the reload with a 500. */
+T_DECLARE_CASE(test_config_put_bad_inline_psk_rejected)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+
+	struct config *const conf = conf_new_default();
+	T_CHECK(conf != NULL);
+
+	struct server *const srv = server_new(loop, conf);
+	T_CHECK(srv != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(socket_set_nonblock(fds[0]) == 0);
+	T_CHECK(socket_set_nonblock(fds[1]) == 0);
+	api_serve(&srv->api_listener, loop, fds[0], NULL);
+
+	struct apifx fx = { .loop = loop, .cli_fd = fds[1] };
+
+	static const char body[] = "{\"mux_listen\":\"127.0.0.1:0\","
+				   "\"tls\":{\"psk\":{\"peer\":\"0101\"}}}";
+	char req[256];
+	const int req_len = snprintf(
+		req, sizeof(req),
+		"PUT /config HTTP/1.1\r\n"
+		"Host: test\r\n"
+		"Connection: close\r\n"
+		"Content-Length: %zu\r\n"
+		"\r\n"
+		"%s",
+		sizeof(body) - 1, body);
+	T_CHECK(req_len > 0 && (size_t)req_len < sizeof(req));
+
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, req);
+
+	(void)close(fds[1]);
+	server_stop(srv);
+	/* A rejected body leaves srv->conf as it was; free whichever is current
+	 * all the same, as test_config_put_success does. */
+	struct config *const final_conf = srv->conf;
+	server_free(srv);
+	conf_free(final_conf);
+	ev_loop_destroy(loop);
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
+}
+#endif /* WITH_TLS */
+
 /* RFC 7231 6.5.5: a 405 MUST carry Allow listing the resource's supported
  * methods. respond_status emitted only Date/Connection/Content-Length, so no
  * 405 told the client what it could have used. */
@@ -2878,6 +3444,115 @@ T_DECLARE_CASE(test_expect_100_continue_gets_interim_response)
 	T_EXPECT_EQ(final, 204);
 }
 
+/* A full peer receive queue must not lose an interim response.  Before the
+ * retry path existed, send_continue() treated the initial EAGAIN as success,
+ * cleared the expectation, and never armed EV_WRITE, so draining the queue
+ * left a client waiting forever. */
+T_DECLARE_CASE(test_expect_100_continue_retries_after_would_block)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	struct config *const conf = conf_new_default();
+	T_CHECK(conf != NULL);
+	struct server *const srv = server_new(loop, conf);
+	T_CHECK(srv != NULL);
+
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(socket_set_nonblock(fds[0]) == 0);
+	T_CHECK(socket_set_nonblock(fds[1]) == 0);
+	int rcvbuf = 1024;
+	T_CHECK(setsockopt(
+			fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf,
+			sizeof(rcvbuf)) == 0);
+
+	/* Fill the server-to-client queue before handing the server fd to the API
+	 * watcher.  The client end remains unread, so the first interim write must
+	 * hit EAGAIN. */
+	unsigned char filler[4096];
+	memset(filler, 'x', sizeof(filler));
+	size_t filled = 0;
+	for (;;) {
+		const ssize_t n =
+			send(fds[0], filler, sizeof(filler), MSG_NOSIGNAL);
+		if (n > 0) {
+			filled += (size_t)n;
+			continue;
+		}
+		if (n < 0 && errno == EINTR) {
+			continue;
+		}
+		T_CHECK(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+		break;
+	}
+	T_CHECK(filled > sizeof(filler));
+
+	api_serve(&srv->api_listener, loop, fds[0], NULL);
+	struct apifx fx = { .loop = loop, .cli_fd = fds[1] };
+	static const char body[] = "{\"mux_connect\":\"127.0.0.1:1\"}";
+	char headers[256];
+	const int hdr_len = snprintf(
+		headers, sizeof(headers),
+		"PUT /config HTTP/1.1\r\n"
+		"Host: test\r\n"
+		"Connection: close\r\n"
+		"Expect: 100-continue\r\n"
+		"Content-Length: %zu\r\n"
+		"\r\n",
+		sizeof(body) - 1);
+	T_CHECK(hdr_len > 0 && (size_t)hdr_len < sizeof(headers));
+	T_CHECK(do_send(&fx, fds[1], headers, (size_t)hdr_len) == 0);
+
+	/* Process the request once: this is where the server observes EAGAIN and
+	 * transfers ownership of the retry to EV_WRITE. */
+	ev_run(loop, EVRUN_ONCE);
+
+	/* Free the queue space without running the loop.  The write watcher then
+	 * gets its first chance during wait_until(). */
+	unsigned char drained_buf[4096];
+	size_t drained = 0;
+	for (;;) {
+		const ssize_t n =
+			read(fds[1], drained_buf, sizeof(drained_buf));
+		if (n > 0) {
+			drained += (size_t)n;
+			continue;
+		}
+		if (n < 0 && errno == EINTR) {
+			continue;
+		}
+		T_CHECK(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+		break;
+	}
+
+	struct resp_wait_ctx rctx = { .fd = fds[1] };
+	const int interim_rc = wait_until(
+		&fx, (double)API_RESP_TIMEOUT_MS / 1000.0, resp_wait_predicate,
+		&rctx);
+	const int interim = interim_rc == 0 ? parse_status(rctx.buf) : -1;
+
+	const int body_rc = do_send(&fx, fds[1], body, sizeof(body) - 1);
+	rctx = (struct resp_wait_ctx){ .fd = fds[1] };
+	const int final_rc =
+		body_rc == 0 ?
+			wait_until(
+				&fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				resp_wait_predicate, &rctx) :
+			-1;
+	const int final = final_rc == 0 ? parse_status(rctx.buf) : -1;
+
+	(void)close(fds[1]);
+	server_stop(srv);
+	struct config *const final_conf = srv->conf;
+	server_free(srv);
+	conf_free(final_conf);
+	ev_loop_destroy(loop);
+
+	T_EXPECT_EQ(drained, filled);
+	T_EXPECT_EQ(interim, 100);
+	T_EXPECT_EQ(final, 204);
+}
+
 /* RFC 7231 6.5.14: an expectation the server cannot meet is refused with 417,
  * not ignored -- ignoring leaves a client waiting for an interim response that
  * will never come. */
@@ -2892,6 +3567,100 @@ T_DECLARE_CASE(test_unknown_expectation_rejected)
 	T_EXPECT_EQ(parse_status(rctx.buf), 417);
 
 	apifx_teardown(&fx);
+}
+
+/* Send @p request in one piece and expect exactly one final response with
+ * status @p want, followed by the server closing the connection.  An interim
+ * 100 displacing the final response reads as status 100, and without the
+ * close the connection was left waiting for more of a rejected request. */
+T_DECLARE_SUBCASE(
+	assert_final_then_close, const char *restrict request, const int want)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	const int rc = do_exchange(&fx, &rctx, request);
+	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
+	const bool got_eof =
+		rc == 0 && wait_until(
+				   &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				   eof_wait_predicate, &ectx) == 0;
+	/* Teardown before asserting so a failing T_EXPECT can't skip it;
+	 * rctx.buf is a stack buffer, safe to read afterward. */
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(rc, 0);
+	T_EXPECT_EQ(parse_status(rctx.buf), want);
+	if (!got_eof) {
+		T_LOG("expected EOF after the final response");
+		T_FAIL();
+	}
+}
+
+/* No body is owed, so the handler's final response answers the expectation;
+ * it used to be replaced by a lone 100 and the connection left hanging. */
+T_DECLARE_CASE(test_expect_without_body_gets_final_response)
+{
+	T_CALL_SUBCASE(assert_final_then_close, REQ_EXPECT_NO_BODY, 200);
+}
+
+T_DECLARE_CASE(test_expect_with_empty_body_keeps_handler_rejection)
+{
+	T_CALL_SUBCASE(
+		assert_final_then_close, REQ_EXPECT_CONFIG_EMPTY_BODY, 400);
+}
+
+T_DECLARE_CASE(test_expect_with_oversized_body_gets_413)
+{
+	T_CALL_SUBCASE(assert_final_then_close, REQ_EXPECT_OVERSIZED_BODY, 413);
+}
+
+T_DECLARE_CASE(test_expect_with_transfer_encoding_gets_501)
+{
+	T_CALL_SUBCASE(
+		assert_final_then_close, REQ_EXPECT_TRANSFER_ENCODING, 501);
+}
+
+T_DECLARE_CASE(test_expect_with_duplicate_content_length_not_dispatched)
+{
+	T_CALL_SUBCASE(
+		assert_final_then_close, REQ_EXPECT_DUPLICATE_CONTENT_LENGTH,
+		400);
+}
+
+/* The headers are processed on their own, with the body withheld, which is
+ * exactly when an HTTP/1.1 client is owed the interim; an HTTP/1.0 one must
+ * get only the final response once the body arrives. */
+T_DECLARE_CASE(test_expect_ignored_for_http10)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	static const char headers[] = REQ_EXPECT_HTTP10_HEADERS;
+	struct resp_wait_ctx rctx = { .fd = fx.cli_fd, .nread = 0 };
+	int status = -1;
+	if (do_send(&fx, fx.cli_fd, headers, sizeof(headers) - 1) == 0) {
+		/* The headers are already readable, so this runs recv_cb()
+		 * on them alone. */
+		ev_run(fx.loop, EVRUN_ONCE);
+		if (do_send(&fx, fx.cli_fd, "ab", 2) == 0 &&
+		    wait_until(
+			    &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+			    resp_wait_predicate, &rctx) == 0) {
+			status = parse_status(rctx.buf);
+		}
+	}
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(status, 200);
+}
+
+/* Expect is ignored altogether for HTTP/1.0, so an unknown expectation is not
+ * refused with 417 either. */
+T_DECLARE_CASE(test_unknown_expectation_ignored_for_http10)
+{
+	T_CALL_SUBCASE(assert_final_then_close, REQ_EXPECT_UNKNOWN_HTTP10, 200);
 }
 
 /* Trailing garbage after HTTP/1.1 is not the HTTP-version grammar; recv_cb()
@@ -2939,7 +3708,276 @@ T_DECLARE_CASE(test_http_version_unsupported_major_rejected)
 	T_EXPECT_EQ(parse_status(rctx.buf), 505);
 }
 
-/* When http_date_safe() cannot produce a valid IMF-fixdate, both response
+/* A NUL before a head line's CRLF hides that CRLF from the strstr-based
+ * parser; it must be rejected with 400 and the connection closed at once,
+ * not left waiting for a CRLF it can never see until the buffer fills or the
+ * idle timeout fires. */
+T_DECLARE_SUBCASE(
+	assert_nul_in_head_rejected, const char *restrict request,
+	const size_t len)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	const bool got_resp = do_exchange_len(&fx, &rctx, request, len) == 0;
+	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
+	const bool got_eof =
+		got_resp && wait_until(
+				    &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				    eof_wait_predicate, &ectx) == 0;
+	/* Teardown before asserting so a failing T_EXPECT can't skip it
+	 * (rctx.buf is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
+	if (!got_resp) {
+		T_LOG("no response to a request head carrying NUL");
+		T_FAILNOW();
+	}
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
+	if (!got_eof) {
+		T_LOG("expected EOF after rejecting a head carrying NUL");
+		T_FAIL();
+	}
+}
+
+T_DECLARE_CASE(test_nul_in_header_value_rejected)
+{
+	T_CALL_SUBCASE(
+		assert_nul_in_head_rejected, REQ_NUL_IN_HEADER_VALUE,
+		sizeof(REQ_NUL_IN_HEADER_VALUE) - 1u);
+}
+
+T_DECLARE_CASE(test_nul_in_request_line_rejected)
+{
+	T_CALL_SUBCASE(
+		assert_nul_in_head_rejected, REQ_NUL_IN_REQUEST_LINE,
+		sizeof(REQ_NUL_IN_REQUEST_LINE) - 1u);
+}
+
+struct request_consumed_ctx {
+	const struct server *srv;
+	int fd;
+};
+
+static int request_consumed_predicate(void *ptr)
+{
+	const struct request_consumed_ctx *const ctx = ptr;
+	if (ctx->srv->api_conns == NULL) {
+		return -1;
+	}
+	char byte;
+	const ssize_t n = recv(ctx->fd, &byte, 1, MSG_PEEK);
+	if (n < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return 1;
+		}
+		return errno == EINTR ? 0 : -1;
+	}
+	return n == 0 ? -1 : 0;
+}
+
+/* The NUL arrives in a later read than the partial line it belongs to, so
+ * the check must cover newly received bytes, not only the first read. */
+T_DECLARE_CASE(test_nul_in_header_value_split_across_reads_rejected)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	static const char head[] = "GET /healthy HTTP/1.1\r\nHost: x";
+	static const char tail[] = "\0y\r\n\r\n";
+	if (do_send(&fx, fx.cli_fd, head, sizeof(head) - 1u) != 0) {
+		apifx_teardown(&fx);
+		T_FATAL("do_send failed");
+	}
+	/* Observe queued data first, then wait for its consumption.  Only the
+	 * server reads this socket, so an empty receive queue proves the first
+	 * recv_cb completed before the tail can be supplied. */
+	char queued;
+	const ssize_t npeek = recv(fx.srv_fd, &queued, 1, MSG_PEEK);
+	struct request_consumed_ctx consumed = { .srv = &fx.srv,
+						 .fd = fx.srv_fd };
+	if (npeek != 1 || wait_until(
+				  &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				  request_consumed_predicate, &consumed) != 0) {
+		apifx_teardown(&fx);
+		T_FATAL("initial partial header was not consumed");
+	}
+	struct resp_wait_ctx rctx;
+	const bool got_resp =
+		do_exchange_len(&fx, &rctx, tail, sizeof(tail) - 1u) == 0;
+	apifx_teardown(&fx);
+	if (!got_resp) {
+		T_LOG("no response to a head whose NUL arrived in a later read");
+		T_FAILNOW();
+	}
+	T_EXPECT_EQ(parse_status(rctx.buf), 400);
+}
+
+T_DECLARE_CASE(test_nul_in_body_accepted)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(
+		assert_exchange_len, &fx, &rctx, REQ_NUL_IN_BODY,
+		sizeof(REQ_NUL_IN_BODY) - 1u);
+	apifx_teardown(&fx);
+	T_EXPECT_EQ(parse_status(rctx.buf), 200);
+}
+
+/* Send a request whose headers carry Expect: 100-continue but draw a
+ * rejection, and expect that final status -- not an interim 100 Continue --
+ * followed by the connection closing. */
+T_DECLARE_SUBCASE(
+	assert_rejected_under_expect, const char *restrict request,
+	const int expected)
+{
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, request);
+	struct eof_wait_ctx ectx = { .fd = fx.cli_fd };
+	const bool got_eof = wait_until(
+				     &fx, (double)API_RESP_TIMEOUT_MS / 1000.0,
+				     eof_wait_predicate, &ectx) == 0;
+	/* Teardown after the last fx use but before asserting so a failing
+	 * check can't skip it (rctx.buf is a stack buffer, safe to read
+	 * afterward). */
+	apifx_teardown(&fx);
+	const int status = parse_status(rctx.buf);
+	if (status != expected) {
+		T_LOGF("status %d, expected %d for:\n%s", status, expected,
+		       request);
+		T_FAIL();
+	}
+	if (!got_eof) {
+		T_LOGF("expected EOF after the %d rejection", expected);
+		T_FAIL();
+	}
+}
+
+/* A request rejected while its 100 Continue is still owed gets the final
+ * status in place of the interim one.  Sending the interim response instead
+ * resumed reading, and the rejected request was dispatched once its body
+ * arrived. */
+T_DECLARE_CASE(test_rejection_under_expect_is_final)
+{
+	T_CALL_SUBCASE(
+		assert_rejected_under_expect,
+		"PUT /config HTTP/1.1\r\n"
+		"Content-Length: 2\r\n"
+		"Expect: 100-continue\r\n"
+		"\r\n",
+		400);
+	T_CALL_SUBCASE(
+		assert_rejected_under_expect,
+		"PUT /config HTTP/1.1\r\n"
+		"Host: test\r\n"
+		"Expect: 100-continue\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"\r\n",
+		501);
+	T_CALL_SUBCASE(
+		assert_rejected_under_expect,
+		"PUT /config HTTP/1.1\r\n"
+		"Host: test\r\n"
+		"Expect: 100-continue\r\n"
+		"Content-Length: 99999999\r\n"
+		"\r\n",
+		413);
+}
+
+/* Send a GET /healthy request with the given HTTP-version and raw Host field
+ * lines (each "Host: ...\r\n", or "" for none) on a fresh fixture, and
+ * expect the given status. */
+T_DECLARE_SUBCASE(
+	assert_host_status, const char *restrict version,
+	const char *restrict host_lines, const int expected)
+{
+	char req[256];
+	const int n = snprintf(
+		req, sizeof(req), "GET /healthy %s\r\n%s\r\n", version,
+		host_lines);
+	T_CHECK(n > 0 && (size_t)n < sizeof(req));
+
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	struct resp_wait_ctx rctx;
+	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, req);
+	/* Teardown before asserting so a failing check can't skip it (rctx.buf
+	 * is a stack buffer, safe to read afterward). */
+	apifx_teardown(&fx);
+	const int status = parse_status(rctx.buf);
+	if (status != expected) {
+		T_LOGF("%s with Host lines \"%s\": status %d, expected %d",
+		       version, host_lines, status, expected);
+		T_FAIL();
+	}
+}
+
+/* RFC 9112 3.2: an HTTP/1.1 request lacking Host, or any request with more
+ * than one Host field line, must get a 400 rather than be served. */
+T_DECLARE_CASE(test_host_missing_or_duplicate_rejected)
+{
+	T_CALL_SUBCASE(assert_host_status, "HTTP/1.1", "", 400);
+	T_CALL_SUBCASE(
+		assert_host_status, "HTTP/1.1", "Host: a\r\nHost: b\r\n", 400);
+	T_CALL_SUBCASE(
+		assert_host_status, "HTTP/1.1", "Host: a\r\nhost: a\r\n", 400);
+	T_CALL_SUBCASE(
+		assert_host_status, "HTTP/1.0", "Host: a\r\nHost: b\r\n", 400);
+	/* HTTP/1.0 predates Host, so its absence there is not an error. */
+	T_CALL_SUBCASE(assert_host_status, "HTTP/1.0", "", 200);
+	T_CALL_SUBCASE(assert_host_status, "HTTP/1.0", "Host: a\r\n", 200);
+}
+
+/* RFC 9112 3.2: a Host value that is not uri-host [ ":" port ] (RFC 9110
+ * 7.2) must get a 400; every well-formed form, including an empty value,
+ * must still be served. */
+T_DECLARE_CASE(test_host_value_validated)
+{
+	static const char *const invalid[] = {
+		"a b",	     "a/b",   "a@b",	"a:b:c", "a:8x",
+		"%zz",	     "a%4",   "[::1",	"[zz]",	 "[::1]x",
+		"[::1]:8x",  "[v.x]", "[vx.x]", "[v1.]", "[v1.x/]",
+		"[1.2.3.4]", "::1",   "a\"b",	"a[b]",	 "[]",
+	};
+	static const char *const valid[] = {
+		"",
+		"localhost",
+		"localhost:9090",
+		"127.0.0.1",
+		"127.0.0.1:9090",
+		"127.0.0.1:",
+		"[::1]",
+		"[::1]:9090",
+		"[::ffff:127.0.0.1]:80",
+		"[v1.fe80::a+b]",
+		"xn--bcher-kva.example",
+		"a%41b",
+		"a_b~c!$&'()*+,;=",
+	};
+	char lines[128];
+	for (size_t i = 0; i < ARRAY_SIZE(invalid); i++) {
+		(void)snprintf(
+			lines, sizeof(lines), "Host: %s\r\n", invalid[i]);
+		T_CALL_SUBCASE(assert_host_status, "HTTP/1.1", lines, 400);
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(valid); i++) {
+		(void)snprintf(lines, sizeof(lines), "Host: %s\r\n", valid[i]);
+		T_CALL_SUBCASE(assert_host_status, "HTTP/1.1", lines, 200);
+	}
+}
+
+/* When http_date() cannot produce a valid IMF-fixdate, both response
  * builders must omit the Date header entirely (RFC 7231 7.1.1.2) rather than
  * emit a syntactically empty "Date: \r\n".  /healthy exercises
  * respond_status_allow(); /metrics exercises respond_body(). */
@@ -2961,12 +3999,13 @@ T_DECLARE_CASE(test_date_header_omitted_when_clock_unavailable)
 		T_FATAL("apifx_setup failed");
 	}
 
-	g_force_clock_failure = true;
+	g_forced_time = (time_t)INT64_MAX;
+	g_force_time = true;
 	struct resp_wait_ctx rctx_status;
 	const int rc_status = do_exchange(&fx, &rctx_status, REQ_HEALTHY_GET);
 	struct resp_wait_ctx rctx_body;
 	const int rc_body = do_exchange(&fx, &rctx_body, REQ_METRICS_GET);
-	g_force_clock_failure = false;
+	g_force_time = false;
 
 	/* Teardown before asserting so a failing T_EXPECT can't skip it (both
 	 * rctx buffers and the return codes are captured above). */
@@ -2978,6 +4017,51 @@ T_DECLARE_CASE(test_date_header_omitted_when_clock_unavailable)
 	T_EXPECT(!resp_contains(rctx_status.buf, "\r\nDate:"));
 
 	/* respond_body(): same contract. */
+	T_EXPECT_EQ(rc_body, 0);
+	T_EXPECT_EQ(parse_status(rctx_body.buf), 200);
+	T_EXPECT(!resp_contains(rctx_body.buf, "\r\nDate:"));
+}
+
+/* A clock gmtime_r() can still break down, but whose year falls outside
+ * IMF-fixdate's 4DIGIT (RFC 9110 5.6.7), has no valid HTTP-date rendering:
+ * the Date header must be omitted rather than carry a five-digit year. */
+T_DECLARE_CASE(test_date_header_omitted_beyond_4digit_year)
+{
+	/* 10000-01-01T00:00:00Z, the first second past year 9999; only
+	 * reachable where time_t and struct tm can represent it. */
+	const int64_t first_second_of_10000 = INT64_C(253402300800);
+	if ((int64_t)(time_t)first_second_of_10000 != first_second_of_10000) {
+		T_SKIPNOW();
+	}
+	{
+		const time_t probe_time = (time_t)first_second_of_10000;
+		struct tm probe;
+		if (gmtime_r(&probe_time, &probe) == NULL ||
+		    probe.tm_year + 1900 != 10000) {
+			T_SKIPNOW();
+		}
+	}
+
+	struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+
+	g_forced_time = (time_t)first_second_of_10000;
+	g_force_time = true;
+	struct resp_wait_ctx rctx_status;
+	const int rc_status = do_exchange(&fx, &rctx_status, REQ_HEALTHY_GET);
+	struct resp_wait_ctx rctx_body;
+	const int rc_body = do_exchange(&fx, &rctx_body, REQ_METRICS_GET);
+	g_force_time = false;
+
+	/* Teardown before asserting so a failing T_EXPECT can't skip it. */
+	apifx_teardown(&fx);
+
+	T_EXPECT_EQ(rc_status, 0);
+	T_EXPECT_EQ(parse_status(rctx_status.buf), 200);
+	T_EXPECT(!resp_contains(rctx_status.buf, "\r\nDate:"));
+
 	T_EXPECT_EQ(rc_body, 0);
 	T_EXPECT_EQ(parse_status(rctx_body.buf), 200);
 	T_EXPECT(!resp_contains(rctx_body.buf, "\r\nDate:"));
@@ -3000,6 +4084,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_connection_close_multi_token),
 	T_CASE(test_connection_close_long_token_list),
 	T_CASE(test_connection_close_repeated_header),
+	T_CASE(test_response_reader_requires_complete_framing),
+	T_CASE(test_date_validator_rejects_malformed_fields),
 	T_CASE(test_stats_get_includes_identity_rows),
 	T_CASE(test_healthy_offline),
 	T_CASE(test_healthy_escapes_control_chars_in_identity),
@@ -3017,10 +4103,14 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_metrics_reconnects_series_skips_accepted_tunnel),
 	T_CASE(test_metrics_anonymous_tunnel_counted_in_totals_only),
 	T_CASE(test_metrics_staged_identity_tunnel_counted_in_totals),
+	T_CASE(test_metrics_validation_rejects_duplicates_and_missing_metadata),
 	T_CASE(test_metrics_help_type_emitted_once_per_name),
 	T_CASE(test_metrics_reports_non_zero_mux_counters),
 	T_CASE(test_not_found_keepalive_followed_by_success),
 	T_CASE(test_connection_close_on_non_keepalive_request),
+	T_CASE(test_pipelined_requests_close_connection),
+	T_CASE(test_body_followed_by_request_closes_connection),
+	T_CASE(test_body_without_trailing_bytes_keeps_alive),
 	T_CASE(test_transfer_encoding_rejected),
 	T_CASE(test_duplicate_content_length_rejected),
 	T_CASE(test_content_length_plus_sign_rejected),
@@ -3032,16 +4122,36 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_config_put_empty_body_rejected),
 	T_CASE(test_config_put_large_body_not_rejected_for_size),
 	T_CASE(test_config_put_success),
+	T_CASE(test_config_put_cannot_change_api_listen),
+#if WITH_TLS
+	T_CASE(test_config_put_bad_inline_psk_rejected),
+#endif
 	T_CASE(test_method_not_allowed_carries_allow),
 	T_CASE(test_method_not_allowed_allow_is_per_resource),
 	T_CASE(test_healthy_rejects_non_get),
 	T_CASE(test_healthy_rejects_put),
 	T_CASE(test_expect_100_continue_gets_interim_response),
+	T_CASE(test_expect_100_continue_retries_after_would_block),
 	T_CASE(test_unknown_expectation_rejected),
+	T_CASE(test_expect_without_body_gets_final_response),
+	T_CASE(test_expect_with_empty_body_keeps_handler_rejection),
+	T_CASE(test_expect_with_oversized_body_gets_413),
+	T_CASE(test_expect_with_transfer_encoding_gets_501),
+	T_CASE(test_expect_with_duplicate_content_length_not_dispatched),
+	T_CASE(test_expect_ignored_for_http10),
+	T_CASE(test_unknown_expectation_ignored_for_http10),
 	T_CASE(test_http_version_junk_suffix_rejected),
 	T_CASE(test_http_version_empty_rejected),
 	T_CASE(test_http_version_unsupported_major_rejected),
+	T_CASE(test_nul_in_header_value_rejected),
+	T_CASE(test_nul_in_request_line_rejected),
+	T_CASE(test_nul_in_header_value_split_across_reads_rejected),
+	T_CASE(test_nul_in_body_accepted),
+	T_CASE(test_host_missing_or_duplicate_rejected),
+	T_CASE(test_host_value_validated),
+	T_CASE(test_rejection_under_expect_is_final),
 	T_CASE(test_date_header_omitted_when_clock_unavailable),
+	T_CASE(test_date_header_omitted_beyond_4digit_year),
 	T_SUITE_END,
 };
 

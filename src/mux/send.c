@@ -14,16 +14,16 @@
  * mux_session_flush_resp).
  */
 
-#include "mux/send.h"
+#include "send.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/recv.h"
-#include "mux/sched.h"
-#include "mux/session.h"
-#include "mux/stream.h"
-#include "mux/unacked.h"
-#include "mux/wire.h"
+#include "frame.h"
+#include "mux.h"
+#include "recv.h"
+#include "sched.h"
+#include "session.h"
+#include "stream.h"
+#include "unacked.h"
+#include "wire.h"
 
 #include "meta/minmax.h"
 #include "os/clock.h"
@@ -41,8 +41,8 @@
 /* Flush one send attempt for the sendbuf head.  Returns true when the caller
  * must stop pumping (transport blocked or session torn down), false when the
  * head was fully sent and popped. */
-static bool flush_sendbuf_head(
-	struct mux_session *restrict ss, bool *restrict made_progress)
+static bool
+flush_sendbuf_head(struct mux_session *ss, bool *restrict made_progress)
 {
 	struct mux_frame *const frame = ss->wire.sendbuf.head;
 	if (frame == NULL) {
@@ -68,9 +68,6 @@ static bool flush_sendbuf_head(
 	}
 	*made_progress = true;
 
-	if (ev_is_active(&ss->w_keepalive)) {
-		ev_timer_again(ss->loop, &ss->w_keepalive);
-	}
 	COUNTER_ADD(ss->cnt.traffic.byt_mux_sent, (uint_least64_t)nsend);
 	frame->pos += nsend;
 	MUX_LOG_F(
@@ -85,6 +82,9 @@ static bool flush_sendbuf_head(
 		    frame == ss->wire.sendbuf.tail) {
 			ss->wire.sendbuf_staging = false;
 		}
+		/* The sub-frames completed so far can be acknowledged by the
+		 * peer before this entry finishes; account them now. */
+		mux_unacked_track_partial(ss, frame);
 		return true; /* partial write */
 	}
 
@@ -152,6 +152,7 @@ static bool send_queue_retransmit(
 	 * that may have been freed underneath it (the #47 use-after-free). */
 	ss->unacked.retransmit_copy = copy;
 	ss->unacked.retransmit_copy_count = orig->unacked_count;
+	ss->unacked.retransmit_copy_sent = 0;
 	mux_frame_list_push_front(&ss->wire.sendbuf, copy);
 	return true;
 }
@@ -163,11 +164,45 @@ enum send_stage {
 	SEND_STAGE_BLOCKED, /* transport blocked or torn down mid-stage; abort */
 };
 
+/* Whether a dgrambuf frame is a DATAGRAM rather than a FLOW-CLOSE. */
+static bool dgram_frame_is_push(const struct mux_frame *restrict frame)
+{
+	struct mux_header hdr;
+	mux_read_header(frame->data, &hdr);
+	return hdr.flags == MUX_FLAG_PUSH;
+}
+
+/* Stage the head of dgrambuf and hand the next turn back to stream data. */
+static void send_stage_dgram(struct mux_session *restrict ss)
+{
+	struct mux_frame *const frame = mux_frame_list_pop(&ss->wire.dgrambuf);
+	/* A FLOW-CLOSE counts as no datagram. */
+	if (dgram_frame_is_push(frame)) {
+		COUNTER_ADD(ss->cnt.dgram.pkt_dgram_sent, 1);
+		COUNTER_ADD(
+			ss->cnt.dgram.byt_dgram_sent,
+			frame->len - MUX_FRAME_HEADER_SIZE);
+	}
+	ss->wire.dgram_turn = false;
+	mux_wire_sendbuf_push(ss, frame);
+}
+
+/* Nothing else to stage this round: send a queued datagram if there is one. */
+static enum send_stage send_stage_idle_dgram(struct mux_session *restrict ss)
+{
+	if (ss->wire.dgrambuf.head == NULL) {
+		return SEND_STAGE_DONE; /* nothing left to produce */
+	}
+	send_stage_dgram(ss);
+	return SEND_STAGE_PRODUCED;
+}
+
 /* Stage the next frame in descending priority: retransmit replay, OOB
- * control, then DRR data/control via the schedule layer.  Does not
+ * control, then datagrams alternating with DRR data/control via the schedule
+ * layer.  Does not
  * transmit — that is the surrounding send_pump's job. */
 static enum send_stage send_stage_next(
-	struct mux_session *restrict ss, bool *restrict made_progress,
+	struct mux_session *ss, bool *restrict made_progress,
 	bool *restrict retransmitting)
 {
 	/* 1. Resume replay takes precedence over new traffic. */
@@ -202,8 +237,16 @@ static enum send_stage send_stage_next(
 		return SEND_STAGE_PRODUCED;
 	}
 
-	/* 3. send_stalled blocks new payload only; per-stream ACK/FIN must still
-	 * flow so the peer can drain its window. */
+	/* 3. Datagrams alternate with stream data frame by frame, so neither
+	 * class starves the other; dgrambuf's bound is what sheds excess. */
+	if (ss->wire.dgram_turn && ss->wire.dgrambuf.head != NULL) {
+		send_stage_dgram(ss);
+		return SEND_STAGE_PRODUCED;
+	}
+
+	/* 4. send_stalled blocks new payload only; per-stream ACK/FIN must still
+	 * flow so the peer can drain its window.  Datagrams are never retained,
+	 * so the gate does not hold them either. */
 	if (ss->unacked.stalled) {
 		MUX_LOG_F(
 			DEBUG, ss,
@@ -212,22 +255,23 @@ static enum send_stage send_stage_next(
 			ss->unacked.frames, ss->session_window,
 			ss->sched.sched_head != NULL);
 		mux_sched_flush_ctrl(ss);
-		return SEND_STAGE_DONE;
+		return send_stage_idle_dgram(ss);
 	}
 
-	/* 4. Produce one data frame, else drain pending control frames. */
+	/* 5. Produce one data frame, else drain pending control frames and give
+	 * the idle turn to a datagram. */
 	if (!mux_sched_next_data(ss)) {
 		mux_sched_flush_ctrl(ss);
-		return SEND_STAGE_DONE; /* nothing left to produce */
+		return send_stage_idle_dgram(ss);
 	}
+	ss->wire.dgram_turn = true;
 	return SEND_STAGE_PRODUCED;
 }
 
 /* Pump until transport blocks, session tears down, or nothing is left;
  * each turn transmits buffered bytes then stages the next frame via
  * send_stage_next. */
-static void
-send_pump(struct mux_session *restrict ss, bool *restrict made_progress)
+static void send_pump(struct mux_session *ss, bool *restrict made_progress)
 {
 	bool retransmitting = false;
 	for (;;) {
@@ -268,7 +312,7 @@ send_pump(struct mux_session *restrict ss, bool *restrict made_progress)
 static bool send_has_pending_work(const struct mux_session *restrict ss)
 {
 	return ss->wire.sendbuf.head != NULL || ss->wire.oobbuf.head != NULL ||
-	       ss->sched.sched_head != NULL ||
+	       ss->wire.dgrambuf.head != NULL || ss->sched.sched_head != NULL ||
 	       ss->unacked.retransmit_off != SIZE_MAX;
 }
 
@@ -316,7 +360,7 @@ update_send_timeout(struct mux_session *restrict ss, const bool progress)
 
 /* Handle a transport whose read side closed while ESTABLISHED.  Returns true
  * when mux_session_on_send must stop: suspended (resumable TCP FIN) or CLOSING (close_notify). */
-static bool send_handle_rx_closed(struct mux_session *restrict ss)
+static bool send_handle_rx_closed(struct mux_session *ss)
 {
 	if (ss->wire.rx_open || ss->state != SESSION_ESTABLISHED) {
 		return false;
@@ -347,7 +391,7 @@ static bool send_handle_rx_closed(struct mux_session *restrict ss)
 	return true;
 }
 
-void mux_session_on_send(struct mux_session *restrict ss)
+void mux_session_on_send(struct mux_session *ss)
 {
 	ss->wire.tx_pending = false;
 	if (send_handle_rx_closed(ss)) {
@@ -425,10 +469,10 @@ void mux_notify_write(struct mux_session *restrict ss)
 	if (!ss->wire.tx_pending) {
 		MUX_LOG_F(
 			DEBUG, ss,
-			"wake write path: sendbuf=%d oobbuf=%d"
+			"wake write path: sendbuf=%d oobbuf=%d dgrambuf=%zu"
 			" ready=%d stalled=%d",
 			ss->wire.sendbuf.head != NULL,
-			ss->wire.oobbuf.head != NULL,
+			ss->wire.oobbuf.head != NULL, ss->wire.dgrambuf.count,
 			ss->sched.sched_head != NULL, ss->unacked.stalled);
 	}
 	ss->wire.tx_pending = true;
@@ -439,9 +483,11 @@ void mux_notify_write(struct mux_session *restrict ss)
  * and the block reaches the session through both (mux_stream_grant_inc(s) ->
  * session_pressure_scale(s->session) on every call, and mux_stream_mark_fin_sent(s)
  * on the FIN path) while also modifying it through ss -- same reason
- * process_syn_payload leaves it unqualified. */
+ * process_syn_payload leaves it unqualified. s is not restrict either: on the
+ * FIN path mux_stream_mark_fin_sent(s) can reach mux_sched_free_streams, which
+ * writes s through the stream table. */
 void mux_session_send_push(
-	struct mux_session *ss, struct mux_stream *restrict s,
+	struct mux_session *ss, struct mux_stream *s,
 	struct mux_frame *restrict frame)
 {
 	ASSERT(frame->len > MUX_FRAME_HEADER_SIZE);
@@ -609,6 +655,65 @@ bool mux_session_send_oob(
 	return true;
 }
 
+bool mux_session_send_dgram(
+	struct mux_session *restrict ss, const uint_fast8_t flags,
+	const uint_fast16_t flow, const void *restrict payload,
+	const size_t payload_len)
+{
+	ASSERT(flags == MUX_FLAG_PUSH ||
+	       (flags == MUX_FLAG_FIN && payload_len == 0));
+	ASSERT(flow != 0);
+	const bool is_dgram = (flags == MUX_FLAG_PUSH);
+	struct mux_frame *frame = NULL;
+	if (ss->state == SESSION_ESTABLISHED && session_dgram_negotiated(ss) &&
+	    payload_len <= ss->max_payload &&
+	    ss->wire.dgrambuf.count < (size_t)ss->conf.lossymux_queue) {
+		frame = mux_frame_get(&ss->pool, ss->max_payload);
+	}
+	if (frame == NULL) {
+		if (is_dgram) {
+			COUNTER_ADD(ss->cnt.dgram.pkt_dgram_dropped, 1);
+		}
+		return false;
+	}
+	frame->len = MUX_FRAME_HEADER_SIZE + payload_len;
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = flags,
+		.length = (uint_least16_t)payload_len,
+		.stream_id = STREAMID_CTRL,
+		.extra = (uint_least16_t)flow,
+	};
+	mux_write_header(frame->data, &hdr);
+	if (payload_len > 0) {
+		memcpy(frame->data + MUX_FRAME_HEADER_SIZE, payload,
+		       payload_len);
+	}
+	if (LOGLEVEL(VERYVERBOSE)) {
+		mux_session_log_frame_header(
+			ss, "frame out", frame->data, &hdr);
+	}
+	mux_frame_list_push(&ss->wire.dgrambuf, frame);
+	/* A datagram is session activity: an idle session carrying only UDP
+	 * must not be closed under it. */
+	if (ev_is_active(&ss->w_idle_timeout)) {
+		ev_timer_again(ss->loop, &ss->w_idle_timeout);
+	}
+	mux_notify_write(ss);
+	return true;
+}
+
+void mux_session_drop_dgrams(struct mux_session *restrict ss)
+{
+	struct mux_frame *frame;
+	while ((frame = mux_frame_list_pop(&ss->wire.dgrambuf)) != NULL) {
+		if (dgram_frame_is_push(frame)) {
+			COUNTER_ADD(ss->cnt.dgram.pkt_dgram_dropped, 1);
+		}
+		mux_frame_put(&ss->pool, frame);
+	}
+}
+
 void mux_session_emit_ack(struct mux_session *restrict ss)
 {
 	const uint_least32_t emit =
@@ -759,7 +864,7 @@ void mux_session_discard_stream_frames(
 /* Run the send pump inline and settle the aftermath: emit CLOSED on teardown,
  * else recompute the watcher.  Low-load fast path; the caller guarantees
  * ESTABLISHED with a clear pipe (sendbuf empty, no TLS poll pending). */
-static void session_flush_inline(struct mux_session *restrict ss)
+static void session_flush_inline(struct mux_session *ss)
 {
 	mux_session_on_send(ss);
 	if (ss->state == SESSION_CLOSED) {
@@ -786,7 +891,7 @@ static inline bool session_pipe_clear(const struct mux_session *restrict ss)
 		;
 }
 
-void mux_session_flush(struct mux_session *restrict ss)
+void mux_session_flush(struct mux_session *ss)
 {
 	if (ss->state != SESSION_ESTABLISHED) {
 		mux_session_notify(ss);
@@ -811,7 +916,7 @@ void mux_session_flush_oob(struct mux_session *restrict ss)
 	mux_session_notify(ss);
 }
 
-void mux_session_flush_resp(struct mux_session *restrict ss)
+void mux_session_flush_resp(struct mux_session *ss)
 {
 	if (ss->state != SESSION_ESTABLISHED || !ss->wire.tx_pending) {
 		return;

@@ -24,7 +24,7 @@ struct mux_frame;
 
 /* Drain the send pipeline once: retransmit replay, OOB controls, then scheduled
  * data, flushing to the transport.  Entry point from session.c:socket_cb. */
-void mux_session_on_send(struct mux_session *restrict ss);
+void mux_session_on_send(struct mux_session *ss);
 
 /* Wake the write path (arm EV_WRITE) when there is egress to flush; no-op
  * unless SESSION_ESTABLISHED. */
@@ -32,9 +32,10 @@ void mux_notify_write(struct mux_session *restrict ss);
 
 /* Enqueue a PUSH data frame for stream s into the send buffer; takes ownership
  * of frame, which must not be touched afterwards. Cannot fail. ss is not
- * restrict: s->session aliases it (see the definition). */
+ * restrict: s->session aliases it; nor is s, which a piggybacked FIN can tear
+ * down (see the definition). */
 void mux_session_send_push(
-	struct mux_session *ss, struct mux_stream *restrict s,
+	struct mux_session *ss, struct mux_stream *s,
 	struct mux_frame *restrict frame);
 
 /* Enqueue a packed control frame for stream_id with the given flags and extra. */
@@ -48,6 +49,19 @@ bool mux_session_send_oob(
 	struct mux_session *restrict ss, uint_fast8_t extra,
 	const unsigned char *restrict payload, size_t payload_len);
 
+/* Queue one lossymux stream-0 frame (spec §5.2.3.3): a DATAGRAM (flags PUSH)
+ * or a FLOW-CLOSE (flags FIN, payload_len 0) for flow.  Best effort: returns
+ * false, counting a DATAGRAM as dropped, when the extension is not negotiated,
+ * the session is not established, payload_len exceeds max_payload, dgrambuf is
+ * full, or allocation fails. */
+bool mux_session_send_dgram(
+	struct mux_session *restrict ss, uint_fast8_t flags, uint_fast16_t flow,
+	const void *restrict payload, size_t payload_len);
+
+/* Free every queued lossymux frame, counting each DATAGRAM as dropped; for a
+ * transport that is going away, since datagrams never replay. */
+void mux_session_drop_dgrams(struct mux_session *restrict ss);
+
 /* Emit a session-level ACK for all unacknowledged non-stream-0 frames.
  * Caller must ensure unreported != 0. */
 void mux_session_emit_ack(struct mux_session *restrict ss);
@@ -60,7 +74,7 @@ void mux_session_discard_stream_frames(
 
 /* Flush the send buffer once; call after enqueuing control frames outside the
  * I/O callback. */
-void mux_session_flush(struct mux_session *restrict ss);
+void mux_session_flush(struct mux_session *ss);
 
 /* Wake the write path so a queued OOB control frame (PING/PONG/PROBE) drains on
  * the next EV_WRITE (coalesced with any pending data). Arms the watcher
@@ -70,7 +84,7 @@ void mux_session_flush_oob(struct mux_session *restrict ss);
 /* Immediate response to a receive batch: drain ready egress without waiting a
  * libev iteration.  Inline only when the transport pipe is clear, else leave it
  * for the armed EV_WRITE drain. */
-void mux_session_flush_resp(struct mux_session *restrict ss);
+void mux_session_flush_resp(struct mux_session *ss);
 
 /* Wake the scheduler for stream s and arm the write path (EV_WRITE) so the
  * produced frames drain on the next iteration -- despite the name it arms rather

@@ -116,6 +116,19 @@ struct mux_traffic_counters {
 	mux_counter *byt_push_sent;
 };
 
+/* lossymux datagram counters (spec §5.2.3.3); embedded in
+ * mux_session_counters.  Sent/received count DATAGRAM frames handed to or taken
+ * from the transport; dropped counts datagrams the session discarded instead
+ * of sending (queue full, oversized, extension inactive, or lost to a suspend). */
+struct mux_dgram_counters {
+	mux_counter *pkt_dgram_sent;
+	mux_counter *pkt_dgram_recv;
+	mux_counter *pkt_dgram_dropped;
+	/* Datagram payload bytes only (no frame headers). */
+	mux_counter *byt_dgram_sent;
+	mux_counter *byt_dgram_recv;
+};
+
 /* Pointer-block into server_stats for direct session-thread updates.
  * Pointer fields point to atomic or plain counters by build mode.
  * NULL pointers are silently skipped by COUNTER_*.  Grouped by subject so the
@@ -158,6 +171,8 @@ struct mux_session_counters {
 	} buffers;
 	/* Traffic byte counters. */
 	struct mux_traffic_counters traffic;
+	/* lossymux datagram counters. */
+	struct mux_dgram_counters dgram;
 };
 
 /* --- Mux configuration subset --- */
@@ -174,8 +189,9 @@ struct mux_session_config {
 	/* Inactivity deadline in seconds: the session is dead when no frame arrives
 	 * for this long.  0 (with keepalive) disables it. */
 	int timeout;
-	/* Interval in seconds between one-way keepalive PROBE frames.  0 disables
-	 * keepalive (and timeout). */
+	/* Interval in seconds between keepalive PINGs, each answered by the
+	 * peer's PONG; a completed PING/PONG exchange in either direction restarts
+	 * it.  0 disables keepalive (and timeout). */
 	int keepalive;
 	/* Timeout in seconds for a blocked send before the session is reset;
 	 * this is what detects an outbound black-hole during active transfer. */
@@ -203,20 +219,39 @@ struct mux_session_config {
 	 * frame size is unchanged. */
 	int readahead;
 
-	/* Receive-buffer level in bytes at which window grants are fully suppressed; 0 disables pressure scaling. */
+	/* Session receive-buffer high watermark in bytes for window-grant scaling.
+	 * Above the low watermark, grants scale down to a 1/8 floor; if at least
+	 * one MUX_WINDOW_UNIT is grantable, at least one unit is retained.
+	 * This is not a receive-memory cap. <=0 disables pressure scaling. */
 	int mem_pressure_hi;
-	/* Receive-buffer level in bytes at which window-grant scaling begins (default: hi/2). */
+	/* Session receive-buffer low watermark in bytes: no scaling at or below
+	 * this level, then linear decay to the high watermark. Equal watermarks
+	 * give a step to the 1/8 floor above them. 0 defaults to hi/2. */
 	int mem_pressure_lo;
+
+	/* mux.lossymux.idle_timeout: seconds without a datagram in either
+	 * direction before a UDP flow is dropped.  Read by the flow owner, not by
+	 * the session. */
+	int lossymux_idle_timeout;
+	/* mux.lossymux.queue: datagrams queued awaiting transmission before a new
+	 * one is dropped. */
+	int lossymux_queue;
 
 	/* Send frames immediately without coalescing. */
 	bool nodelay : 1;
 	/* Advertise the reject_inbound HELLO extension (spec §5.2.3.1) so the peer
 	 * opens no inbound streams.  Read at handshake time only. */
 	bool reject_inbound : 1;
+	/* Offer the bilateral lossymux HELLO extension (spec §5.2.3.3); datagrams
+	 * flow only when the peer offers it too.  Read at handshake time only. */
+	bool lossymux : 1;
 
 #if WITH_TLS
 	/* Let the TLS library own the socket fd. When false, wire.c drives the
-	 * socket and shuttles ciphertext through the library (memory transport). */
+	 * socket and shuttles ciphertext through the library (memory transport).
+	 * Read when a TLS connection is created; a live connection keeps the mode
+	 * it was built with, so a mux_set_config change takes effect only on the
+	 * next connection. */
 	bool tls_socket_offload : 1;
 #endif
 };
@@ -237,10 +272,9 @@ struct mux_session_opts {
 	int fd;
 	/* Session ID of MUX_SESSION_ID_LEN octets; required, never NULL. */
 	const unsigned char *id;
-	/* Identity claimed in hello; copied if non-NULL. */
+	/* Identity claimed in hello; copied if non-NULL. A claim longer than
+	 * MUX_MAX_CLAIM_LEN octets is omitted from the hello with a warning. */
 	const char *identity;
-	/* Internal peer label for diagnostics; NOT transmitted; copied if non-NULL. */
-	const char *peer_id;
 	/* Pointer-block into server_stats; all NULL pointers are silently skipped. */
 	struct mux_session_counters cnt;
 	/* Frame allocator; data field is set by the caller per-session.  The
@@ -271,6 +305,10 @@ mux_new(struct ev_loop *restrict loop, const struct mux_session_opts *opts);
  * @brief Tear down and free a session.
  * @param ss Session to free.
  * @note The caller must remove it from any external lists first.
+ * @note Frees every stream of @p ss, including one the application still
+ * holds -- a direct-mode stream it has not yet released with
+ * mux_stream_close(), or an opened one it has not attached: no stream of the
+ * session may be used afterwards.
  */
 void mux_close(struct mux_session *ss);
 
@@ -289,7 +327,15 @@ void mux_set_callbacks(struct mux_session *ss, const struct mux_callbacks *cb);
  * and begin the transport close handshake (TLS close_notify then TCP
  * half-close).
  * @param ss Target session.
- * @note ::MUX_EVENT_CLOSED is emitted asynchronously when done.
+ * @note Only a session in HANDSHAKE or ESTABLISHED closes asynchronously: this
+ * call emits ::MUX_EVENT_CONNECT_FAILED or ::MUX_EVENT_LOST as it leaves that
+ * state, and ::MUX_EVENT_CLOSED follows from the session loop once the
+ * transport close handshake ends. From any other state (INIT, CONNECT,
+ * SUSPENDED, CLOSING or CLOSE_WAIT) the session is force-closed with no
+ * protocol exchange, and ::MUX_EVENT_CLOSED is emitted re-entrantly before this
+ * call returns; an already CLOSED session emits nothing. So after this returns
+ * the caller must not touch anything its CLOSED handler may have released --
+ * ss itself included, when that handler calls mux_close().
  */
 void mux_shutdown(struct mux_session *ss);
 
@@ -354,10 +400,12 @@ const unsigned char *mux_session_id(const struct mux_session *ss);
 
 /**
  * @brief The identity claimed by the peer in its hello.
+ * @param ss Target session.
  * @return The identity, or NULL when the peer claimed none. Owned by the
  * session; valid until the next hello is processed.
  * @note Available as soon as the hello is parsed, which is earlier than the
- * ::MUX_EVENT_CONNECTED that publishes it elsewhere.
+ * ::MUX_EVENT_ESTABLISHED or ::MUX_EVENT_RESUMED that publishes it as
+ * .connected.peer_identity.
  */
 const char *mux_peer_identity(const struct mux_session *ss);
 
@@ -403,7 +451,7 @@ enum mux_state {
  */
 enum mux_state mux_state(const struct mux_session *ss);
 
-/* Snapshot of per-session estimator state.  Filled by mux_session_stats(). */
+/* Approximate per-session estimator diagnostics, filled by mux_session_stats(). */
 struct mux_session_stats {
 	/* Per-stream receive window advertised to the peer, in bytes. */
 	size_t rx_window;
@@ -420,9 +468,11 @@ struct mux_session_stats {
 };
 
 /**
- * @brief Snapshot the session's estimator state.
+ * @brief Sample the session's estimator diagnostics.
  * @param ss Target session.
- * @param[out] out Receives a consistent snapshot.
+ * @param[out] out Receives individually sampled fields. Concurrent updates
+ * may leave fields from different updates; no coherent cross-field snapshot
+ * is guaranteed.
  */
 void mux_session_stats(
 	const struct mux_session *ss, struct mux_session_stats *restrict out);
@@ -467,16 +517,20 @@ void mux_drain(struct mux_session *ss);
 enum mux_event {
 	/* Connect or handshake attempt started; fires per attempt. */
 	MUX_EVENT_CONNECT,
-	/* Connect or handshake attempt ended before ESTABLISHED. */
+	/* Connect or handshake attempt ended before ESTABLISHED.  A failed
+	 * resume attempt leaves the session SESSION_SUSPENDED, still resumable
+	 * by mux_attach_fd() until resume_timeout, counted from the transport
+	 * loss, expires; no SUSPENDED or CLOSED follows it.  Any other failed
+	 * attempt is followed by CLOSED. */
 	MUX_EVENT_CONNECT_FAILED,
 	/* Initial handshake completed on this session object. */
 	MUX_EVENT_ESTABLISHED,
 	/* Established transport went away; emitted whenever the session
 	 * leaves ESTABLISHED. */
 	MUX_EVENT_LOST,
-	/* Transport was lost and the session is now SESSION_SUSPENDED.
-	 * Resume-capable callers may wait for a peer reconnect or attach a new
-	 * connected fd with mux_attach_fd(). */
+	/* An established transport was lost and the session is now
+	 * SESSION_SUSPENDED.  Resume-capable callers may wait for a peer
+	 * reconnect or attach a new connected fd with mux_attach_fd(). */
 	MUX_EVENT_SUSPENDED,
 	/* Suspended session finished the resume handshake. */
 	MUX_EVENT_RESUMED,
@@ -489,15 +543,14 @@ enum mux_event {
 /**
  * @brief Payload for on_event(), tagged by the ::mux_event.
  * @note ESTABLISHED/RESUMED use .connected; STREAM_ESTABLISHED uses
- * .stream_established; CLOSED uses .closed; other events are zero-initialized.
+ * .stream_established; CONNECT_FAILED uses .connect_failed; CLOSED uses
+ * .closed; other events are zero-initialized.
  */
 union mux_event_data {
 	/* ESTABLISHED, RESUMED */
 	struct {
 		/* session setup latency, ns */
 		int_least64_t ns;
-		/* peer's internal label */
-		const char *peer_id;
 		/* identity claimed in the peer's hello */
 		const char *peer_identity;
 	} connected;
@@ -506,6 +559,11 @@ union mux_event_data {
 		/* SYN-to-SYN|ACK latency, ns */
 		int_least64_t ns;
 	} stream_established;
+	/* CONNECT_FAILED */
+	struct {
+		/* errno that ended the attempt, or 0 when none was observed */
+		int err;
+	} connect_failed;
 	/* CLOSED */
 	struct {
 		/* peer FIN or TLS close_notify (vs. error/reset) */
@@ -533,7 +591,8 @@ struct mux_callbacks {
 	/**
 	 * @brief Called on session lifecycle changes.
 	 * @note Typical resume sequence: CONNECT → ESTABLISHED, LOST → SUSPENDED,
-	 * CONNECT → RESUMED. ::MUX_EVENT_CLOSED fires before mux_close().
+	 * CONNECT → RESUMED; each failed resume attempt in between reports
+	 * CONNECT → CONNECT_FAILED. ::MUX_EVENT_CLOSED fires before mux_close().
 	 */
 	void (*on_event)(
 		void *data, struct mux_session *, enum mux_event,
@@ -560,10 +619,32 @@ struct mux_callbacks {
 	 * treat new_ss as a fresh session.
 	 * @note On true the mux layer tears new_ss down. The mux layer is
 	 * loop-agnostic: any cross-loop handoff is the owner's responsibility.
+	 * @note false requires new_ss to still own its transport: the handshake
+	 * continues on it. An owner whose handoff fails after
+	 * mux_transport_detach() must restore it with mux_transport_reattach()
+	 * before returning false.
 	 */
 	bool (*on_resume)(
 		void *data, struct mux_session *new_ss,
 		const unsigned char *session_id, uint_least32_t resume_seq);
+	/**
+	 * @brief Called for each DATAGRAM frame received while lossymux is
+	 * active (spec §5.2.3.3).
+	 * @param flow Flow id, never 0.
+	 * @param payload Borrowed; valid only for the duration of the call.
+	 * @note May send datagrams; must not close or shut down the session.
+	 * A NULL callback discards the datagram.
+	 */
+	void (*on_dgram)(
+		void *data, struct mux_session *ss, uint_least16_t flow,
+		const unsigned char *payload, size_t len);
+	/**
+	 * @brief Called for each FLOW-CLOSE frame received while lossymux is
+	 * active: the peer has dropped @p flow (never 0).
+	 * @note Same restrictions as on_dgram.
+	 */
+	void (*on_dgram_close)(
+		void *data, struct mux_session *ss, uint_least16_t flow);
 };
 
 /* Transport (socket fd + TLS connection) detached from a transient session for
@@ -583,8 +664,14 @@ struct mux_transport {
 	 * which case the resumed session keeps its current identity. */
 	char *peer_identity;
 	bool reject_inbound;
+	/* The resume hello offered lossymux (spec §5.2.3.3). */
+	bool lossymux;
 #if WITH_TLS
 	struct tls_connection *tlsconn;
+	/* The mode tlsconn was built with: true when it owns fd (socket offload),
+	 * false for a memory transport.  Travels with the connection because the
+	 * resumed session may have been created under a different config. */
+	bool tls_offload;
 #endif
 };
 
@@ -595,10 +682,28 @@ struct mux_transport {
  * transport, so tearing it down neither closes the fd nor frees the TLS
  * connection.
  * @param[out] out Receives the detached transport.
+ * @note Reversible: an owner that cannot complete the handoff restores
+ * @p new_ss with mux_transport_reattach() instead of discarding the transport.
  */
 void mux_transport_detach(
 	struct mux_session *restrict new_ss,
 	struct mux_transport *restrict out);
+
+/**
+ * @brief Put a detached transport back on the transient session it came from,
+ * undoing mux_transport_detach().
+ * @param new_ss The session the transport was detached from; must still own no
+ * transport and run on its loop.
+ * @param[in] transport Detached transport; always consumed.
+ * @note For an owner that detached before discovering it cannot hand the
+ * transport off. The session is left exactly as mux_transport_detach() found
+ * it, with the socket watcher stopped -- the handshake path that called
+ * ::mux_callbacks::on_resume re-arms it -- so declining the resume afterwards
+ * serves @p new_ss as a fresh session on its own transport.
+ */
+void mux_transport_reattach(
+	struct mux_session *restrict new_ss,
+	struct mux_transport *restrict transport);
 
 /**
  * @brief Install a detached transport on a resumed session and complete the
@@ -609,8 +714,8 @@ void mux_transport_detach(
  * @param resume_seq Peer's resume sequence number.
  */
 void mux_resume_attach(
-	struct mux_session *restrict ss,
-	struct mux_transport *restrict transport, uint_least32_t resume_seq);
+	struct mux_session *ss, struct mux_transport *restrict transport,
+	uint_least32_t resume_seq);
 
 /**
  * @brief Discard a detached transport that will not be installed.
@@ -618,6 +723,40 @@ void mux_resume_attach(
  * connection.
  */
 void mux_transport_discard(struct mux_transport *restrict transport);
+
+/* --- Datagram operations (lossymux, spec §5.2.3.3) --- */
+
+/**
+ * @brief Whether datagrams can be sent now: the session is established and
+ * both hellos offered lossymux.
+ * @param ss Target session; call on its loop.
+ */
+bool mux_dgram_ready(const struct mux_session *ss);
+
+/**
+ * @brief Queue one datagram for @p flow; best effort.
+ * @param ss Target session.
+ * @param flow Non-zero flow id; a locally opened flow uses the local stream-id
+ * parity (odd on the dialing side, even on the accepting side).
+ * @param buf Datagram payload; copied.
+ * @param len Payload length.
+ * @return true when queued; false when dropped (counted as such): lossymux is
+ * not ready, @p len exceeds the session's frame payload, the send queue holds
+ * mux_session_config::lossymux_queue datagrams already, or allocation failed.
+ * @note A queued datagram may still be dropped if the transport is lost
+ * before it is written.
+ */
+bool mux_dgram_send(
+	struct mux_session *ss, uint_least16_t flow, const void *buf,
+	size_t len);
+
+/**
+ * @brief Tell the peer, best effort, that @p flow is gone (FLOW-CLOSE).
+ * @param ss Target session.
+ * @param flow Non-zero flow id.
+ * @note Silently does nothing when lossymux is not ready or the queue is full.
+ */
+void mux_dgram_close(struct mux_session *ss, uint_least16_t flow);
 
 /* --- Stream operations --- */
 
@@ -628,6 +767,12 @@ void mux_transport_discard(struct mux_transport *restrict transport);
  * session is not established or is draining, the peer rejects inbound streams,
  * the halfopen backlog or the stream cap is full, stream IDs are exhausted, or
  * allocation failed.
+ * @note The library does not free the stream before the application gives
+ * it a mode with mux_stream_attach_fd() or mux_stream_io_start(), or gives it
+ * up with mux_stream_close(). A reset, or its session tearing its streams down
+ * -- mux_shutdown(), the end of a mux_drain(), a session reset, or a resume
+ * the peer rejects -- closes it in the meantime, and the deferred call then
+ * rejects it. mux_close() frees it regardless.
  */
 struct mux_stream *mux_stream_open(struct mux_session *ss);
 
@@ -636,6 +781,11 @@ struct mux_stream *mux_stream_open(struct mux_session *ss);
  * @param s Target stream.
  * @param fd Local socket; data transfer is blocked until the peer replies
  * SYN|ACK.
+ * @note A stream from mux_stream_open() may be attached at any time until it
+ * closes, before or after the peer's SYN|ACK; what the peer sent meanwhile is
+ * delivered to @p fd. A stream that has already closed -- reset, or torn down
+ * with its session, before this call -- is rejected: @p fd is closed. Either
+ * way the library owns @p s from here.
  * @note This is socket mode. It is mutually exclusive with direct mode, whose
  * watcher and data-transfer API (mux_stream_io_start() etc.) live in the
  * companion header mux/stream_io.h.

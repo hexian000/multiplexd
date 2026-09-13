@@ -136,6 +136,20 @@ case "$1" in
     cmake --build . -j"$(nproc)"
     ctest -j"$(nproc)"
     ;;
+"san")
+    # rebuild with clang & sanitizers
+    rm -rf build && mkdir -p build && cd build
+    cmake \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -DCMAKE_BUILD_TYPE="Debug" \
+        -DCMAKE_C_COMPILER="clang" \
+        -DENABLE_SANITIZERS=ON \
+        -DENABLE_THREADS=ON \
+        ..
+    cp compile_commands.json ../
+    cmake --build . -j"$(nproc)"
+    ctest -j"$(nproc)"
+    ;;
 "")
     # incremental build
     mkdir -p build && cd build
@@ -144,5 +158,6 @@ case "$1" in
     ;;
 *)
     echo "Unknown option: $1"
+    exit 1
     ;;
 esac

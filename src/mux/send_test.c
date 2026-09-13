@@ -5,12 +5,12 @@
  * Dependencies: send.c #included; all collaborators (sched/stream/wire/
  * estimator/unacked/dispatch) mocked below; no sibling TUs linked. */
 
-#include "mux/estimator.h"
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/session.h"
-#include "mux/stream.h"
-#include "mux/wire.h"
+#include "estimator.h"
+#include "frame.h"
+#include "mux.h"
+#include "session.h"
+#include "stream.h"
+#include "wire.h"
 
 #include "algo/hashtable.h"
 #include "utils/slog.h"
@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -51,6 +52,7 @@ static bool g_wire_send_ret;
 static size_t g_wire_send_nsend; /* bytes accepted; SIZE_MAX = all requested */
 static int g_wire_send_calls;
 static int g_track_sent_calls;
+static int g_track_partial_calls;
 static int g_suspend_calls;
 static int g_reset_calls;
 static int g_dispatch_pending_calls;
@@ -87,6 +89,7 @@ static void spies_reset(void)
 	g_wire_send_nsend = SIZE_MAX;
 	g_wire_send_calls = 0;
 	g_track_sent_calls = 0;
+	g_track_partial_calls = 0;
 	g_suspend_calls = 0;
 	g_reset_calls = 0;
 	g_dispatch_pending_calls = 0;
@@ -98,19 +101,19 @@ void mux_sched_schedule(struct mux_session *restrict ss)
 	g_sched_schedule_calls++;
 }
 
-void mux_sched_drain_lp(struct mux_session *restrict ss)
+void mux_sched_drain_lp(struct mux_session *ss)
 {
 	(void)ss;
 	g_sched_drain_lp_calls++;
 }
 
-void mux_sched_flush_ctrl(struct mux_session *restrict ss)
+void mux_sched_flush_ctrl(struct mux_session *ss)
 {
 	(void)ss;
 	g_sched_flush_ctrl_calls++;
 }
 
-bool mux_sched_next_data(struct mux_session *restrict ss)
+bool mux_sched_next_data(struct mux_session *ss)
 {
 	g_sched_next_data_calls++;
 	if (g_sched_next_data_frames <= 0) {
@@ -145,7 +148,7 @@ bool mux_sched_next_data(struct mux_session *restrict ss)
 
 /* Benign no-op stubs for the remaining session.c collaborators */
 
-void mux_session_dispatch_pending(struct mux_session *restrict ss)
+void mux_session_dispatch_pending(struct mux_session *ss)
 {
 	(void)ss;
 	g_dispatch_pending_calls++;
@@ -284,7 +287,7 @@ bool mux_wire_has_pending(const struct mux_session *restrict ss)
 }
 
 bool mux_wire_recv(
-	struct mux_session *restrict ss, unsigned char *restrict buf,
+	struct mux_session *ss, unsigned char *restrict buf,
 	size_t *restrict len)
 {
 	(void)ss;
@@ -352,10 +355,12 @@ bool mux_wire_tls_start(struct mux_session *restrict ss)
 }
 
 void mux_wire_adopt_tlsconn(
-	struct mux_session *restrict ss, struct tls_connection *restrict conn)
+	struct mux_session *restrict ss, struct tls_connection *restrict conn,
+	const bool offload)
 {
 	(void)ss;
 	(void)conn;
+	(void)offload;
 }
 
 void mux_wire_tls_log_status(struct mux_session *restrict ss)
@@ -407,7 +412,7 @@ void mux_session_set_state(struct mux_session *ss, enum session_state newstate)
 	ss->state = newstate;
 }
 
-void mux_session_suspend(struct mux_session *restrict ss)
+void mux_session_suspend(struct mux_session *ss)
 {
 	g_suspend_calls++;
 	ss->state = SESSION_SUSPENDED;
@@ -421,7 +426,7 @@ void mux_session_reset(struct mux_session *ss)
 
 /* Mirrors production mux_session_suspend_or_reset so these white-box tests still
  * observe the suspend-vs-reset decision via the stubs above. */
-void mux_session_suspend_or_reset(struct mux_session *restrict ss)
+void mux_session_suspend_or_reset(struct mux_session *ss)
 {
 	if (ss->handshake.has_session_id &&
 	    (ss->state == SESSION_ESTABLISHED ||
@@ -457,12 +462,22 @@ void mux_session_log_frame_header(
 /* unacked collaborators referenced by the send pipeline (never reached in these
  * cases: no frame is produced, so the retransmit/track paths stay idle). */
 void mux_unacked_track_sent(
-	struct mux_session *restrict ss, struct mux_frame *restrict frame)
+	struct mux_session *ss, struct mux_frame *restrict frame)
 {
 	/* The real implementation takes ownership; mirror that so the flush
 	 * tests, which fully send a frame, do not leak it. */
 	g_track_sent_calls++;
 	mux_frame_put(&ss->pool, frame);
+}
+
+/* Leaves the frame untouched: the prefix accounting itself is unacked.c's,
+ * covered by unacked_test and mux_test. */
+void mux_unacked_track_partial(
+	struct mux_session *ss, struct mux_frame *restrict frame)
+{
+	(void)ss;
+	(void)frame;
+	g_track_partial_calls++;
 }
 
 void mux_unacked_ack_emitted(struct mux_session *restrict ss, uint_fast32_t emit)
@@ -487,7 +502,7 @@ void mux_unacked_free_all(struct mux_session *restrict ss)
 /* Pull in the unit under test after the collaborator definitions so its
  * external references bind to the spies above.  mux_session_on_send / mux_session_flush /
  * session_flush_inline now live in send.c. */
-#include "mux/send.c"
+#include "send.c"
 
 /* Fixture: a minimal session with a real loop and the mux socket watcher.
  * modify_io_events asserts a valid fd, so w_socket is bound to a live pipe end
@@ -582,6 +597,7 @@ static void si_teardown(struct si_fixture *restrict fx)
 	/* Free any frames the producer tests left queued. */
 	mux_frame_list_clear(&fx->ss.wire.sendbuf, &fx->ss.pool);
 	mux_frame_list_clear(&fx->ss.wire.oobbuf, &fx->ss.pool);
+	mux_frame_list_clear(&fx->ss.wire.dgrambuf, &fx->ss.pool);
 	if (ev_is_active(&fx->ss.w_socket)) {
 		ev_io_stop(fx->loop, &fx->ss.w_socket);
 	}
@@ -858,29 +874,26 @@ T_DECLARE_CASE(test_send_pump_coalesces_staged_frames_into_one_record)
  * mux_session_discard_stream_frames; mux_wire_sendbuf_push spy captures produced
  * frames so the encoded header and session accounting can be asserted. */
 
-static struct mux_frame *
-si_alloc_frame(struct si_fixture *restrict fx, const size_t payload_len)
+static struct mux_frame *si_alloc_frame(
+	struct testing_ctx *_t_, struct si_fixture *restrict fx,
+	const size_t payload_len)
 {
 	struct mux_frame *const f =
 		mux_frame_get(&fx->ss.pool, fx->ss.max_payload);
-	if (f != NULL) {
-		f->pos = 0;
-		f->len = MUX_FRAME_HEADER_SIZE + payload_len;
+	if (f == NULL) {
+		si_teardown(fx);
+		T_FATAL("setup frame allocation failed");
 	}
+	f->pos = 0;
+	f->len = MUX_FRAME_HEADER_SIZE + payload_len;
 	return f;
 }
 
 static void si_queue_ctrl(
-	struct si_fixture *restrict fx, const uint_least16_t stream_id,
-	const uint_least8_t flags)
+	struct testing_ctx *_t_, struct si_fixture *restrict fx,
+	const uint_least16_t stream_id, const uint_least8_t flags)
 {
-	struct mux_frame *const f = si_alloc_frame(fx, 0);
-	if (f == NULL) {
-		/* No case currently forces pool_ctx.fail, so this never fires;
-		 * guard the deref so a future OOM-path case queues nothing (its
-		 * own assertions then fail) rather than dereferencing NULL. */
-		return;
-	}
+	struct mux_frame *const f = si_alloc_frame(_t_, fx, 0);
 	const struct mux_header h = {
 		.version = MUX_PROTOCOL_VERSION,
 		.flags = flags,
@@ -896,13 +909,11 @@ static void si_queue_ctrl(
  * packing of multiple logical frames (possibly from different streams) into a
  * single node -- append it, and return it. */
 static struct mux_frame *si_queue_coalesced(
-	struct si_fixture *restrict fx, const uint_least16_t *restrict ids,
-	const uint_least8_t *restrict flags, const size_t n)
+	struct testing_ctx *_t_, struct si_fixture *restrict fx,
+	const uint_least16_t *restrict ids, const uint_least8_t *restrict flags,
+	const size_t n)
 {
-	struct mux_frame *const f = si_alloc_frame(fx, 0);
-	if (f == NULL) {
-		return NULL;
-	}
+	struct mux_frame *const f = si_alloc_frame(_t_, fx, 0);
 	for (size_t i = 0; i < n; i++) {
 		const struct mux_header h = {
 			.version = MUX_PROTOCOL_VERSION,
@@ -915,6 +926,78 @@ static struct mux_frame *si_queue_coalesced(
 	f->len = n * MUX_FRAME_HEADER_SIZE;
 	mux_frame_list_push(&fx->ss.wire.sendbuf, f);
 	return f;
+}
+
+/* The nested runner owns the failure jump; the outer case keeps the fixture
+ * alive so it can inspect cleanup after the expected failure. */
+static struct si_fixture *g_setup_failure_fx;
+
+T_DECLARE_CASE(probe_setup_frame_failure)
+{
+	si_queue_ctrl(_t_, g_setup_failure_fx, 5, MUX_FLAG_PUSH);
+}
+
+T_DECLARE_CASE(test_setup_frame_allocation_failure_reports_and_cleans_up)
+{
+	for (int queued = 0; queued < 2; queued++) {
+		struct si_fixture fx;
+		if (si_setup(&fx) != 0) {
+			T_FATAL("si_setup failed");
+			return;
+		}
+		if (queued != 0) {
+			si_queue_ctrl(_t_, &fx, 7, MUX_FLAG_PUSH);
+		}
+		int capture[2];
+		if (pipe(capture) != 0) {
+			si_teardown(&fx);
+			T_FATAL("capture pipe failed");
+			return;
+		}
+		FILE *const out = fdopen(capture[1], "w");
+		if (out == NULL) {
+			(void)close(capture[0]);
+			(void)close(capture[1]);
+			si_teardown(&fx);
+			T_FATAL("capture stream failed");
+			return;
+		}
+		FILE *const in = fdopen(capture[0], "r");
+		if (in == NULL) {
+			(void)fclose(out);
+			(void)close(capture[0]);
+			si_teardown(&fx);
+			T_FATAL("capture input stream failed");
+			return;
+		}
+		T_DECLARE_CTX(probe);
+		probe.out = out;
+		fx.pool_ctx.fail = true;
+		g_setup_failure_fx = &fx;
+		T_RUN_CASE(probe, probe_setup_frame_failure);
+		g_setup_failure_fx = NULL;
+		const int close_ret = fclose(out);
+		char diagnostic[1024] = { 0 };
+		/* The writer is closed: consume the bounded report through EOF. */
+		const size_t n =
+			fread(diagnostic, 1, sizeof(diagnostic) - 1, in);
+		const int input_close_ret = fclose(in);
+		const bool cleaned =
+			fx.loop == NULL && fx.pipefd[0] == -1 &&
+			fx.pipefd[1] == -1 && fx.ss.wire.sendbuf.head == NULL &&
+			fx.pool_ctx.alloc_calls == fx.pool_ctx.free_calls;
+		si_teardown(&fx);
+
+		T_EXPECT_EQ(probe.failed, 1);
+		T_EXPECT_EQ(probe.passed, 0);
+		T_EXPECT_EQ(close_ret, 0);
+		T_EXPECT_EQ(input_close_ret, 0);
+		T_EXPECT(n > 0);
+		T_EXPECT(
+			strstr(diagnostic, "setup frame allocation failed") !=
+			NULL);
+		T_EXPECT(cleaned);
+	}
 }
 
 /* mux_session_send_ctrl encodes the header, clamps Extra to 16 bits, queues the
@@ -1060,7 +1143,9 @@ T_DECLARE_CASE(test_send_oob_oom)
 	T_EXPECT(oob_empty);
 }
 
-/* A first PUSH on an INIT stream carries SYN and accounts the payload bytes. */
+/* A first PUSH on an INIT stream is a fast-open SYN: it carries the initial
+ * credit grant in Extra with ACK clear (spec §4.3.1 step 3, §2.4.1), advances
+ * grant_sent by that grant, and accounts the payload bytes. */
 T_DECLARE_CASE(test_send_push_syn_on_init)
 {
 	struct si_fixture fx;
@@ -1069,8 +1154,9 @@ T_DECLARE_CASE(test_send_push_syn_on_init)
 		return;
 	}
 	spies_reset();
+	g_grant_inc = 3;
 	struct mux_stream s = { .id = 4, .state = STREAM_INIT };
-	struct mux_frame *const frame = si_alloc_frame(&fx, 100);
+	struct mux_frame *const frame = si_alloc_frame(_t_, &fx, 100);
 
 	mux_session_send_push(&fx.ss, &s, frame);
 
@@ -1083,10 +1169,83 @@ T_DECLARE_CASE(test_send_push_syn_on_init)
 
 	T_EXPECT(has_head);
 	T_EXPECT_EQ((int)h.flags, MUX_FLAG_PUSH | MUX_FLAG_SYN);
+	T_EXPECT_EQ((int)h.extra, 3);
 	T_EXPECT_EQ((int)h.length, 100);
 	T_EXPECT_EQ((int)h.stream_id, 4);
+	T_EXPECT_EQ(s.grant_sent, (uint_least32_t)(3u * MUX_WINDOW_UNIT));
 	T_EXPECT_EQ(s.bytes_sent, (uint_least32_t)100);
 	T_EXPECT_EQ(s.unacked_bytes, (uint_least32_t)100);
+}
+
+/* A PUSH on a CLOSE_WAIT stream (peer half-closed, local send side open) with
+ * credit to grant piggybacks ACK carrying that grant, clears ack_pending, and
+ * sends no FIN while the local side has not reached EOF. */
+T_DECLARE_CASE(test_send_push_ack_close_wait)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	g_grant_inc = 1;
+	struct mux_stream s = {
+		.id = 10,
+		.state = STREAM_CLOSE_WAIT,
+		.ack_pending = true,
+	};
+	struct mux_frame *const frame = si_alloc_frame(_t_, &fx, 32);
+
+	mux_session_send_push(&fx.ss, &s, frame);
+
+	const bool has_head = fx.ss.wire.sendbuf.head != NULL;
+	const int mark_fin = g_mark_fin_sent_calls;
+	struct mux_header h = { 0 };
+	if (has_head) {
+		mux_read_header(fx.ss.wire.sendbuf.head->data, &h);
+	}
+	si_teardown(&fx);
+
+	T_EXPECT(has_head);
+	T_EXPECT_EQ((int)h.flags, MUX_FLAG_PUSH | MUX_FLAG_ACK);
+	T_EXPECT_EQ((int)h.extra, 1);
+	T_EXPECT_EQ(mark_fin, 0);
+	T_EXPECT(!s.ack_pending);
+	T_EXPECT_EQ(s.grant_sent, (uint_least32_t)MUX_WINDOW_UNIT);
+}
+
+/* A PUSH on an established stream with no credit to grant carries no ACK
+ * (Extra 0 would be useless), advances no grant, and leaves ack_pending for a
+ * standalone ACK to settle. */
+T_DECLARE_CASE(test_send_push_no_ack_without_grant)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	struct mux_stream s = {
+		.id = 12,
+		.state = STREAM_ESTABLISHED,
+		.ack_pending = true,
+	};
+	struct mux_frame *const frame = si_alloc_frame(_t_, &fx, 16);
+
+	mux_session_send_push(&fx.ss, &s, frame);
+
+	const bool has_head = fx.ss.wire.sendbuf.head != NULL;
+	struct mux_header h = { 0 };
+	if (has_head) {
+		mux_read_header(fx.ss.wire.sendbuf.head->data, &h);
+	}
+	si_teardown(&fx);
+
+	T_EXPECT(has_head);
+	T_EXPECT_EQ((int)h.flags, MUX_FLAG_PUSH);
+	T_EXPECT_EQ((int)h.extra, 0);
+	T_EXPECT(s.ack_pending);
+	T_EXPECT_EQ(s.grant_sent, (uint_least32_t)0);
 }
 
 /* A final PUSH on an established stream with EOF reached and credit to grant
@@ -1106,7 +1265,7 @@ T_DECLARE_CASE(test_send_push_ack_fin)
 		.rx_eof = true,
 		.delay_pending = true,
 	};
-	struct mux_frame *const frame = si_alloc_frame(&fx, 50);
+	struct mux_frame *const frame = si_alloc_frame(_t_, &fx, 50);
 
 	mux_session_send_push(&fx.ss, &s, frame);
 
@@ -1146,7 +1305,7 @@ T_DECLARE_CASE(test_send_push_does_not_read_frame_after_push)
 	spies_reset();
 	g_push_frees_frame = true;
 	struct mux_stream s = { .id = 8, .state = STREAM_ESTABLISHED };
-	struct mux_frame *const frame = si_alloc_frame(&fx, 64);
+	struct mux_frame *const frame = si_alloc_frame(_t_, &fx, 64);
 
 	mux_session_send_push(&fx.ss, &s, frame);
 
@@ -1235,9 +1394,9 @@ T_DECLARE_CASE(test_discard_stream_frames_selective)
 		return;
 	}
 	spies_reset();
-	si_queue_ctrl(&fx, 5, MUX_FLAG_PUSH); /* discarded */
-	si_queue_ctrl(&fx, 5, MUX_FLAG_RST); /* kept (never drop a RST) */
-	si_queue_ctrl(&fx, 7, MUX_FLAG_PUSH); /* kept (other stream) */
+	si_queue_ctrl(_t_, &fx, 5, MUX_FLAG_PUSH); /* discarded */
+	si_queue_ctrl(_t_, &fx, 5, MUX_FLAG_RST); /* kept (never drop a RST) */
+	si_queue_ctrl(_t_, &fx, 7, MUX_FLAG_PUSH); /* kept (other stream) */
 
 	mux_session_discard_stream_frames(&fx.ss, 5);
 
@@ -1273,7 +1432,8 @@ T_DECLARE_CASE(test_discard_stream_frames_compacts_coalesced_entry)
 	const uint_least16_t ids[4] = { 5, 7, 5, 5 };
 	const uint_least8_t flags[4] = { MUX_FLAG_PUSH, MUX_FLAG_PUSH,
 					 MUX_FLAG_RST, MUX_FLAG_PUSH };
-	struct mux_frame *const node = si_queue_coalesced(&fx, ids, flags, 4);
+	struct mux_frame *const node =
+		si_queue_coalesced(_t_, &fx, ids, flags, 4);
 	T_CHECK(node != NULL);
 
 	mux_session_discard_stream_frames(&fx.ss, 5);
@@ -1311,7 +1471,8 @@ T_DECLARE_CASE(test_discard_stream_frames_keeps_all_belong_retransmit_copy)
 	spies_reset();
 	const uint_least16_t ids[2] = { 5, 5 };
 	const uint_least8_t flags[2] = { MUX_FLAG_PUSH, MUX_FLAG_PUSH };
-	struct mux_frame *const copy = si_queue_coalesced(&fx, ids, flags, 2);
+	struct mux_frame *const copy =
+		si_queue_coalesced(_t_, &fx, ids, flags, 2);
 	T_CHECK(copy != NULL);
 	fx.ss.unacked.retransmit_copy = copy;
 
@@ -1336,7 +1497,7 @@ T_DECLARE_CASE(test_discard_stream_frames_walks_oobbuf)
 		return;
 	}
 	spies_reset();
-	struct mux_frame *const f = si_alloc_frame(&fx, 0);
+	struct mux_frame *const f = si_alloc_frame(_t_, &fx, 0);
 	T_CHECK(f != NULL);
 	const struct mux_header h = {
 		.version = MUX_PROTOCOL_VERSION,
@@ -1395,7 +1556,8 @@ T_DECLARE_CASE(test_discard_stream_frames_keeps_retransmit_copy_verbatim)
 	const uint_least16_t ids[4] = { 5, 7, 5, 5 };
 	const uint_least8_t flags[4] = { MUX_FLAG_PUSH, MUX_FLAG_PUSH,
 					 MUX_FLAG_RST, MUX_FLAG_PUSH };
-	struct mux_frame *const copy = si_queue_coalesced(&fx, ids, flags, 4);
+	struct mux_frame *const copy =
+		si_queue_coalesced(_t_, &fx, ids, flags, 4);
 	T_CHECK(copy != NULL);
 	fx.ss.unacked.retransmit_copy = copy;
 
@@ -1475,16 +1637,11 @@ T_DECLARE_CASE(test_session_flush_defers_before_established)
 /* flush_sendbuf_head: the per-entry transport write state machine. */
 
 /* Queue one already-encoded frame at the sendbuf head for the flush tests. */
-static struct mux_frame *
-si_queue_sendbuf(struct si_fixture *restrict fx, const size_t len)
+static struct mux_frame *si_queue_sendbuf(
+	struct testing_ctx *_t_, struct si_fixture *restrict fx,
+	const size_t len)
 {
-	struct mux_frame *const f =
-		mux_frame_get(&fx->ss.pool, fx->ss.max_payload);
-	if (f == NULL) {
-		/* No case currently forces pool_ctx.fail; return NULL cleanly so a
-		 * future OOM-path case can T_CHECK it instead of dereferencing NULL. */
-		return NULL;
-	}
+	struct mux_frame *const f = si_alloc_frame(_t_, fx, 0);
 	f->pos = 0;
 	f->len = len;
 	mux_frame_list_push(&fx->ss.wire.sendbuf, f);
@@ -1500,7 +1657,7 @@ T_DECLARE_CASE(test_flush_head_sends_fully)
 		return;
 	}
 	spies_reset();
-	(void)si_queue_sendbuf(&fx, 100);
+	(void)si_queue_sendbuf(_t_, &fx, 100);
 
 	bool made_progress = false;
 	const bool stop = flush_sendbuf_head(&fx.ss, &made_progress);
@@ -1517,6 +1674,35 @@ T_DECLARE_CASE(test_flush_head_sends_fully)
 	T_EXPECT(sendbuf_empty);
 }
 
+/* An outbound write alone does not restart the keepalive interval: a frame the
+ * peer never answers (a credit grant) would otherwise postpone the keepalive
+ * PING past the inbound deadline on an otherwise silent session. */
+T_DECLARE_CASE(test_flush_head_leaves_keepalive_alone)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	ev_timer_init(&fx.ss.w_keepalive, si_noop_timer_cb, 1.0, 100.0);
+	ev_timer_start(fx.ss.loop, &fx.ss.w_keepalive);
+	(void)si_queue_sendbuf(_t_, &fx, 100);
+
+	bool made_progress = false;
+	const bool stop = flush_sendbuf_head(&fx.ss, &made_progress);
+
+	const double remaining =
+		ev_timer_remaining(fx.ss.loop, &fx.ss.w_keepalive);
+	ev_timer_stop(fx.ss.loop, &fx.ss.w_keepalive);
+	si_teardown(&fx);
+
+	T_EXPECT(!stop);
+	T_EXPECT(made_progress);
+	/* Still due at the original 1 s, not pushed out to the 100 s repeat. */
+	T_EXPECT(remaining <= 1.0);
+}
+
 /* A short write advances pos and asks the caller to stop (re-present on retry). */
 T_DECLARE_CASE(test_flush_head_partial_write)
 {
@@ -1527,19 +1713,24 @@ T_DECLARE_CASE(test_flush_head_partial_write)
 	}
 	spies_reset();
 	g_wire_send_nsend = 40;
-	struct mux_frame *const f = si_queue_sendbuf(&fx, 100);
+	struct mux_frame *const f = si_queue_sendbuf(_t_, &fx, 100);
 
 	bool made_progress = false;
 	const bool stop = flush_sendbuf_head(&fx.ss, &made_progress);
 
 	const size_t f_pos = f->pos;
 	const bool head_is_f = fx.ss.wire.sendbuf.head == f;
+	const int partial = g_track_partial_calls;
+	const int tracked = g_track_sent_calls;
 	si_teardown(&fx);
 
 	T_EXPECT(stop);
 	T_EXPECT(made_progress);
 	T_EXPECT_EQ(f_pos, (size_t)40);
 	T_EXPECT(head_is_f); /* still head */
+	/* The completed prefix is offered to the ring now, the entry is not. */
+	T_EXPECT_EQ(partial, 1);
+	T_EXPECT_EQ(tracked, 0);
 }
 
 /* A zero-byte (EAGAIN) write keeps the frame in flight and closes the staging
@@ -1553,7 +1744,7 @@ T_DECLARE_CASE(test_flush_head_blocked_closes_staging)
 	}
 	spies_reset();
 	g_wire_send_nsend = 0;
-	struct mux_frame *const f = si_queue_sendbuf(&fx, 100);
+	struct mux_frame *const f = si_queue_sendbuf(_t_, &fx, 100);
 	fx.ss.wire.sendbuf_staging = true; /* f is the staging tail */
 
 	bool made_progress = false;
@@ -1580,7 +1771,7 @@ T_DECLARE_CASE(test_flush_head_error_suspends)
 	spies_reset();
 	g_wire_send_ret = false;
 	fx.ss.handshake.has_session_id = true;
-	(void)si_queue_sendbuf(&fx, 100);
+	(void)si_queue_sendbuf(_t_, &fx, 100);
 
 	bool made_progress = false;
 	const bool stop = flush_sendbuf_head(&fx.ss, &made_progress);
@@ -1603,7 +1794,7 @@ T_DECLARE_CASE(test_flush_head_error_resets)
 	spies_reset();
 	g_wire_send_ret = false;
 	fx.ss.handshake.has_session_id = false;
-	(void)si_queue_sendbuf(&fx, 100);
+	(void)si_queue_sendbuf(_t_, &fx, 100);
 
 	bool made_progress = false;
 	const bool stop = flush_sendbuf_head(&fx.ss, &made_progress);
@@ -1626,7 +1817,7 @@ T_DECLARE_CASE(test_update_send_timeout_rearms_while_pending)
 	spies_reset();
 	ev_timer_init(&fx.ss.w_send_timeout, si_noop_timer_cb, 0.0, 5.0);
 	fx.ss.w_send_timeout.data = &fx.ss;
-	(void)si_queue_sendbuf(&fx, 100); /* keeps egress non-empty */
+	(void)si_queue_sendbuf(_t_, &fx, 100); /* keeps egress non-empty */
 
 	update_send_timeout(&fx.ss, true); /* progress=true forces the re-arm */
 
@@ -1693,7 +1884,7 @@ T_DECLARE_CASE(test_update_send_timeout_trusts_kernel_once_sendbuf_queued)
 	fx.ss.conf.send_timeout = 5;
 	fx.ss.wire.kernel_send_timeout = true; /* TCP_USER_TIMEOUT installed */
 	fx.ss.unacked.retransmit_off = 0;
-	(void)si_queue_sendbuf(&fx, 16); /* replay copy already staged */
+	(void)si_queue_sendbuf(_t_, &fx, 16); /* replay copy already staged */
 
 	update_send_timeout(&fx.ss, false);
 
@@ -1731,7 +1922,7 @@ T_DECLARE_CASE(test_update_send_timeout_restores_kernel_after_oom_stall_clears)
 	 * work -- exactly when the raised repeat must be handed back to the
 	 * kernel. */
 	fx.ss.unacked.retransmit_off = 0;
-	(void)si_queue_sendbuf(&fx, 16);
+	(void)si_queue_sendbuf(_t_, &fx, 16);
 
 	update_send_timeout(&fx.ss, false);
 
@@ -1765,7 +1956,7 @@ T_DECLARE_CASE(test_session_on_send_sets_tx_pending_for_oom_stalled_retransmit)
 	/* A real unacked ring with one entry so replay is genuinely pending; the
 	 * retransmit *copy* then OOMs (pool_ctx.fail), stalling the replay with
 	 * retransmit_off still armed and sendbuf empty. */
-	struct mux_frame *const entry = si_alloc_frame(&fx, 0);
+	struct mux_frame *const entry = si_alloc_frame(_t_, &fx, 0);
 	T_CHECK(entry != NULL);
 	entry->unacked_count = 1;
 	struct mux_frame_ring *const ring =
@@ -1843,7 +2034,7 @@ T_DECLARE_CASE(test_send_cb_no_redispatch_while_tx_pending_true)
 	fx.ss.unacked.retransmit_off = SIZE_MAX;
 	fx.ss.wire.tx_pending = true;
 	g_wire_send_nsend = 0; /* EAGAIN: leaves the staged frame as residue */
-	struct mux_frame *const f = si_queue_sendbuf(&fx, 16);
+	struct mux_frame *const f = si_queue_sendbuf(_t_, &fx, 16);
 	T_CHECK(f != NULL);
 
 	mux_session_on_send(&fx.ss);
@@ -1908,7 +2099,7 @@ T_DECLARE_CASE(test_flush_head_error_suspends_in_handshake)
 	fx.ss.state = SESSION_HANDSHAKE;
 	fx.ss.accepted = false;
 	fx.ss.handshake.has_session_id = true;
-	(void)si_queue_sendbuf(&fx, 100);
+	(void)si_queue_sendbuf(_t_, &fx, 100);
 
 	bool made_progress = false;
 	const bool stop = flush_sendbuf_head(&fx.ss, &made_progress);
@@ -1928,7 +2119,7 @@ T_DECLARE_CASE(test_send_head_must_flush_partial_head)
 		return;
 	}
 	spies_reset();
-	struct mux_frame *const f = si_queue_sendbuf(&fx, 100);
+	struct mux_frame *const f = si_queue_sendbuf(_t_, &fx, 100);
 	f->pos = 10; /* partially written */
 	const bool must_flush = send_head_must_flush(&fx.ss);
 	si_teardown(&fx);
@@ -1957,7 +2148,8 @@ T_DECLARE_CASE(test_send_handle_rx_closed_terminal)
 	/* Arm a replay copy on the sendbuf (freed by mux_wire_discard_buffers). */
 	const uint_least16_t ids[1] = { 7 };
 	const uint_least8_t flags[1] = { MUX_FLAG_PUSH };
-	struct mux_frame *const copy = si_queue_coalesced(&fx, ids, flags, 1);
+	struct mux_frame *const copy =
+		si_queue_coalesced(_t_, &fx, ids, flags, 1);
 	T_CHECK(copy != NULL);
 	fx.ss.unacked.retransmit_copy = copy;
 	fx.ss.unacked.retransmit_off = 0;
@@ -2209,6 +2401,235 @@ T_DECLARE_CASE(test_send_stage_next_oob_drains_before_data_despite_stall)
 	T_EXPECT(oob_drained); /* OOB popped from oobbuf and sent */
 }
 
+/* si_setup plus a negotiated lossymux extension (spec §5.2.3.3) with a
+ * datagram queue of queue_len frames. */
+static int si_setup_dgram(struct si_fixture *restrict fx, const int queue_len)
+{
+	if (si_setup(fx) != 0) {
+		return -1;
+	}
+	fx->ss.handshake.offered_lossymux = true;
+	fx->ss.handshake.peer_lossymux = true;
+	fx->ss.conf.lossymux_queue = queue_len;
+	return 0;
+}
+
+/* A DATAGRAM is queued on dgrambuf as a stream-0 PUSH frame whose Extra is the
+ * flow id, its payload copied, and the write path woken. */
+T_DECLARE_CASE(test_send_dgram_queues_frame)
+{
+	struct si_fixture fx;
+	if (si_setup_dgram(&fx, 4) != 0) {
+		T_FATAL("si_setup_dgram failed");
+		return;
+	}
+	spies_reset();
+	static const unsigned char payload[] = { 0x10, 0x20, 0x30 };
+	const bool queued = mux_session_send_dgram(
+		&fx.ss, MUX_FLAG_PUSH, 0x4321, payload, sizeof(payload));
+	const size_t count = fx.ss.wire.dgrambuf.count;
+	struct mux_header hdr = { 0 };
+	bool payload_ok = false;
+	if (fx.ss.wire.dgrambuf.head != NULL) {
+		const struct mux_frame *const f = fx.ss.wire.dgrambuf.head;
+		mux_read_header(f->data, &hdr);
+		payload_ok =
+			f->len == MUX_FRAME_HEADER_SIZE + sizeof(payload) &&
+			memcmp(f->data + MUX_FRAME_HEADER_SIZE, payload,
+			       sizeof(payload)) == 0;
+	}
+	const bool tx_pending = fx.ss.wire.tx_pending;
+	const int notify = g_notify_calls;
+	si_teardown(&fx);
+
+	T_EXPECT(queued);
+	T_EXPECT_EQ(count, (size_t)1);
+	T_EXPECT_EQ(hdr.version, (uint_least8_t)MUX_PROTOCOL_VERSION);
+	T_EXPECT_EQ(hdr.flags, (uint_least8_t)MUX_FLAG_PUSH);
+	T_EXPECT_EQ(hdr.stream_id, (uint_least16_t)STREAMID_CTRL);
+	T_EXPECT_EQ(hdr.extra, (uint_least16_t)0x4321);
+	T_EXPECT_EQ(hdr.length, (uint_least16_t)sizeof(payload));
+	T_EXPECT(payload_ok);
+	T_EXPECT(tx_pending);
+	T_EXPECT_EQ(notify, 1);
+}
+
+/* The drop points (spec §5.2.3.3 lets a sender drop any datagram): extension
+ * not negotiated, session not established, payload over the frame limit, queue
+ * full, or allocation failure.  Each returns false and counts one drop; a
+ * dropped FLOW-CLOSE counts none. */
+T_DECLARE_CASE(test_send_dgram_drops)
+{
+	enum drop_case {
+		DROP_NOT_OFFERED,
+		DROP_PEER_NOT_OFFERED,
+		DROP_NOT_ESTABLISHED,
+		DROP_OVERSIZED,
+		DROP_QUEUE_FULL,
+		DROP_OOM,
+		DROP_CASES,
+	};
+	for (int c = 0; c < DROP_CASES; c++) {
+		struct si_fixture fx;
+		if (si_setup_dgram(&fx, 1) != 0) {
+			T_FATAL("si_setup_dgram failed");
+			return;
+		}
+		spies_reset();
+		mux_counter dropped = 0;
+		fx.ss.cnt.dgram.pkt_dgram_dropped = &dropped;
+		size_t len = 8;
+		switch ((enum drop_case)c) {
+		case DROP_NOT_OFFERED:
+			fx.ss.handshake.offered_lossymux = false;
+			break;
+		case DROP_PEER_NOT_OFFERED:
+			fx.ss.handshake.peer_lossymux = false;
+			break;
+		case DROP_NOT_ESTABLISHED:
+			fx.ss.state = SESSION_SUSPENDED;
+			break;
+		case DROP_OVERSIZED:
+			fx.ss.max_payload = MUX_MIN_FRAME_PAYLOAD;
+			len = MUX_MIN_FRAME_PAYLOAD + 1;
+			break;
+		case DROP_QUEUE_FULL:
+			T_CHECK(mux_session_send_dgram(
+				&fx.ss, MUX_FLAG_PUSH, 1, NULL, 0));
+			break;
+		case DROP_OOM:
+			fx.pool_ctx.fail = true;
+			break;
+		case DROP_CASES:
+			break;
+		}
+		unsigned char payload[MUX_MIN_FRAME_PAYLOAD + 1] = { 0 };
+		const size_t before = fx.ss.wire.dgrambuf.count;
+		const bool queued = mux_session_send_dgram(
+			&fx.ss, MUX_FLAG_PUSH, 3, payload, len);
+		const size_t after = fx.ss.wire.dgrambuf.count;
+		const bool close_queued = mux_session_send_dgram(
+			&fx.ss, MUX_FLAG_FIN, 3, NULL, 0);
+		si_teardown(&fx);
+
+		T_EXPECT(!queued);
+		/* Only the size bound spares a payload-less FLOW-CLOSE. */
+		T_EXPECT_EQ(close_queued, c == DROP_OVERSIZED);
+		T_EXPECT_EQ(after, before);
+		T_EXPECT_EQ((uint_least64_t)dropped, (uint_least64_t)1);
+	}
+}
+
+/* Datagrams and stream data alternate frame by frame, so neither class starves
+ * the other; once data runs out, the idle turn goes to a datagram. */
+T_DECLARE_CASE(test_send_stage_next_alternates_dgram_and_data)
+{
+	struct si_fixture fx;
+	if (si_setup_dgram(&fx, 8) != 0) {
+		T_FATAL("si_setup_dgram failed");
+		return;
+	}
+	spies_reset();
+	mux_counter sent = 0;
+	mux_counter sent_bytes = 0;
+	fx.ss.cnt.dgram.pkt_dgram_sent = &sent;
+	fx.ss.cnt.dgram.byt_dgram_sent = &sent_bytes;
+	for (int i = 0; i < 3; i++) {
+		T_CHECK(mux_session_send_dgram(
+			&fx.ss, MUX_FLAG_PUSH, 1, "abcd", 4));
+	}
+	T_CHECK(mux_session_send_dgram(&fx.ss, MUX_FLAG_FIN, 1, NULL, 0));
+	g_sched_next_data_frames = 2;
+
+	/* Expected staging order: data, dgram, data, dgram, then (data
+	 * exhausted) dgram, FLOW-CLOSE, done. */
+	static const char k_expect[] = "DGDGGG";
+	char order[sizeof(k_expect) + 1] = { 0 };
+	size_t n = 0;
+	for (;;) {
+		bool progress = false;
+		bool retransmitting = false;
+		const int data_before = g_sched_next_data_frames;
+		const int push_before = g_sendbuf_push_calls;
+		const enum send_stage r =
+			send_stage_next(&fx.ss, &progress, &retransmitting);
+		if (r != SEND_STAGE_PRODUCED || n >= sizeof(order) - 1) {
+			break;
+		}
+		if (g_sched_next_data_frames != data_before) {
+			order[n++] = 'D';
+		} else if (g_sendbuf_push_calls != push_before) {
+			order[n++] = 'G';
+		}
+	}
+	const bool drained = fx.ss.wire.dgrambuf.head == NULL;
+	si_teardown(&fx);
+
+	T_EXPECT_STREQ(order, k_expect);
+	T_EXPECT(drained);
+	/* The FLOW-CLOSE is no datagram. */
+	T_EXPECT_EQ((uint_least64_t)sent, (uint_least64_t)3);
+	T_EXPECT_EQ((uint_least64_t)sent_bytes, (uint_least64_t)12);
+}
+
+/* Datagrams are never retained for resume, so the send-stall gate that holds
+ * new stream payload does not hold them. */
+T_DECLARE_CASE(test_send_stage_next_dgram_bypasses_stall)
+{
+	struct si_fixture fx;
+	if (si_setup_dgram(&fx, 8) != 0) {
+		T_FATAL("si_setup_dgram failed");
+		return;
+	}
+	spies_reset();
+	fx.ss.unacked.stalled = true;
+	g_sched_next_data_frames = 2;
+	T_CHECK(mux_session_send_dgram(&fx.ss, MUX_FLAG_PUSH, 5, "x", 1));
+
+	bool progress = false;
+	bool retransmitting = false;
+	const enum send_stage r =
+		send_stage_next(&fx.ss, &progress, &retransmitting);
+	const int pushed = g_sendbuf_push_calls;
+	const int next_data = g_sched_next_data_calls;
+	const int flush_ctrl = g_sched_flush_ctrl_calls;
+	const bool drained = fx.ss.wire.dgrambuf.head == NULL;
+	si_teardown(&fx);
+
+	T_EXPECT_EQ(r, SEND_STAGE_PRODUCED);
+	T_EXPECT_EQ(pushed, 1);
+	T_EXPECT_EQ(next_data, 0);
+	T_EXPECT_EQ(flush_ctrl, 1);
+	T_EXPECT(drained);
+}
+
+/* mux_session_drop_dgrams frees the whole queue, counting each DATAGRAM (not
+ * the FLOW-CLOSE) as dropped. */
+T_DECLARE_CASE(test_drop_dgrams_counts_datagrams)
+{
+	struct si_fixture fx;
+	if (si_setup_dgram(&fx, 8) != 0) {
+		T_FATAL("si_setup_dgram failed");
+		return;
+	}
+	spies_reset();
+	mux_counter dropped = 0;
+	fx.ss.cnt.dgram.pkt_dgram_dropped = &dropped;
+	T_CHECK(mux_session_send_dgram(&fx.ss, MUX_FLAG_PUSH, 1, "a", 1));
+	T_CHECK(mux_session_send_dgram(&fx.ss, MUX_FLAG_FIN, 1, NULL, 0));
+	T_CHECK(mux_session_send_dgram(&fx.ss, MUX_FLAG_PUSH, 3, "b", 1));
+
+	mux_session_drop_dgrams(&fx.ss);
+	const bool empty = fx.ss.wire.dgrambuf.head == NULL &&
+			   fx.ss.wire.dgrambuf.count == 0;
+	const uint_least32_t frees = fx.pool_ctx.free_calls;
+	si_teardown(&fx);
+
+	T_EXPECT(empty);
+	T_EXPECT_EQ(frees, (uint_least32_t)3);
+	T_EXPECT_EQ((uint_least64_t)dropped, (uint_least64_t)2);
+}
+
 /* mux_session_flush_resp: outside SESSION_ESTABLISHED it is a no-op -- neither the
  * scheduler nor the inline pump runs (the recv->send response seam only fires
  * once the session is up). */
@@ -2292,7 +2713,7 @@ T_DECLARE_CASE(test_session_flush_resp_defers_when_pipe_occupied)
 	spies_reset();
 	fx.ss.state = SESSION_ESTABLISHED;
 	fx.ss.wire.tx_pending = true;
-	(void)si_queue_sendbuf(&fx, 100); /* pipe occupied */
+	(void)si_queue_sendbuf(_t_, &fx, 100); /* pipe occupied */
 
 	mux_session_flush_resp(&fx.ss);
 
@@ -2383,11 +2804,12 @@ T_DECLARE_CASE(test_discard_stream_frames_keeps_partially_sent)
 		return;
 	}
 	spies_reset();
-	si_queue_ctrl(&fx, 5, MUX_FLAG_PUSH); /* partially sent: kept */
+	si_queue_ctrl(_t_, &fx, 5, MUX_FLAG_PUSH); /* partially sent: kept */
 	struct mux_frame *const partial = fx.ss.wire.sendbuf.tail;
 	partial->pos = MUX_FRAME_HEADER_SIZE; /* bytes already on the wire */
 	si_queue_ctrl(
-		&fx, 5, MUX_FLAG_PUSH); /* fresh stream-5 data: discarded */
+		_t_, &fx, 5,
+		MUX_FLAG_PUSH); /* fresh stream-5 data: discarded */
 
 	mux_session_discard_stream_frames(&fx.ss, 5);
 
@@ -2415,9 +2837,10 @@ T_DECLARE_CASE(test_discard_stream_frames_keeps_blocked_tls_head)
 		return;
 	}
 	spies_reset();
-	si_queue_ctrl(&fx, 5, MUX_FLAG_PUSH); /* in-flight TLS head: kept */
+	si_queue_ctrl(
+		_t_, &fx, 5, MUX_FLAG_PUSH); /* in-flight TLS head: kept */
 	struct mux_frame *const head = fx.ss.wire.sendbuf.head;
-	si_queue_ctrl(&fx, 5, MUX_FLAG_PUSH); /* not the head: discarded */
+	si_queue_ctrl(_t_, &fx, 5, MUX_FLAG_PUSH); /* not the head: discarded */
 	fx.ss.wire.send_blocked = true;
 	fx.ss.wire.tlsconn = (struct tls_connection *)&fx;
 
@@ -2434,6 +2857,7 @@ T_DECLARE_CASE(test_discard_stream_frames_keeps_blocked_tls_head)
 #endif /* WITH_TLS */
 
 static const struct testing_suite suite[] = {
+	T_CASE(test_setup_frame_allocation_failure_reports_and_cleans_up),
 	T_CASE(test_send_cb_defers_lp_drain_before_established),
 	T_CASE(test_send_cb_drains_lp_when_established),
 	T_CASE(test_session_flush_inline_when_pipe_clear),
@@ -2450,6 +2874,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_send_oob_oom),
 	T_CASE(test_send_push_syn_on_init),
 	T_CASE(test_send_push_ack_fin),
+	T_CASE(test_send_push_ack_close_wait),
+	T_CASE(test_send_push_no_ack_without_grant),
 	T_CASE(test_emit_ack_sends_unreported),
 	T_CASE(test_emit_ack_clamps_unreported),
 	T_CASE(test_discard_stream_frames_selective),
@@ -2461,6 +2887,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_notify_write_noop_before_established),
 	T_CASE(test_session_flush_defers_before_established),
 	T_CASE(test_flush_head_sends_fully),
+	T_CASE(test_flush_head_leaves_keepalive_alone),
 	T_CASE(test_flush_head_partial_write),
 	T_CASE(test_flush_head_blocked_closes_staging),
 	T_CASE(test_flush_head_error_suspends),
@@ -2483,6 +2910,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_send_push_does_not_read_frame_after_push),
 	T_CASE(test_send_stage_next_stalled_flushes_ctrl_not_data),
 	T_CASE(test_send_stage_next_oob_drains_before_data_despite_stall),
+	T_CASE(test_send_dgram_queues_frame),
+	T_CASE(test_send_dgram_drops),
+	T_CASE(test_send_stage_next_alternates_dgram_and_data),
+	T_CASE(test_send_stage_next_dgram_bypasses_stall),
+	T_CASE(test_drop_dgrams_counts_datagrams),
 	T_CASE(test_session_flush_resp_noop_before_established),
 	T_CASE(test_session_flush_resp_noop_without_tx_pending),
 	T_CASE(test_session_flush_resp_pumps_inline_when_pipe_clear),

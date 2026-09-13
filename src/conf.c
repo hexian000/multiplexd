@@ -102,6 +102,32 @@ conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
 	return true;
 }
 
+/* Grow a config array geometrically (4, then doubling) so appending n entries
+ * costs O(log n) reallocations.  Returns the reallocated array and updates
+ * *cap, or NULL -- logged, with the original array still valid and *cap
+ * unchanged -- when *cap is already at the addressable maximum or realloc
+ * fails. */
+static void *
+conf_grow_array(void *arr, size_t *restrict cap, const size_t elem_size)
+{
+	const size_t max_cap = SIZE_MAX / elem_size;
+	if (*cap >= max_cap) {
+		LOGOOM();
+		return NULL;
+	}
+	size_t new_cap = *cap == 0 ? 4 : *cap * 2;
+	if (new_cap > max_cap || new_cap < *cap) {
+		new_cap = max_cap;
+	}
+	void *const grown = realloc(arr, new_cap * elem_size);
+	if (grown == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	*cap = new_cap;
+	return grown;
+}
+
 static struct identity_peer *identity_listen_add(
 	struct config *restrict conf, const char *restrict id, size_t id_len)
 {
@@ -118,29 +144,14 @@ static struct identity_peer *identity_listen_add(
 	}
 
 	const size_t n = conf->identity.peers_count;
-	/* Grow geometrically so parsing n peers costs O(log n) reallocations
-	 * rather than one per entry. */
 	if (n == conf->identity.peers_cap) {
-		const size_t max_cap = SIZE_MAX / sizeof(*conf->identity.peers);
-		if (n >= max_cap) {
-			LOGOOM();
-			return NULL;
-		}
-		size_t new_cap = conf->identity.peers_cap == 0 ?
-					 4 :
-					 conf->identity.peers_cap * 2;
-		if (new_cap > max_cap || new_cap < conf->identity.peers_cap) {
-			new_cap = max_cap;
-		}
-		struct identity_peer *const restrict entries =
-			realloc(conf->identity.peers,
-				new_cap * sizeof(*conf->identity.peers));
+		struct identity_peer *const entries = conf_grow_array(
+			conf->identity.peers, &conf->identity.peers_cap,
+			sizeof(*conf->identity.peers));
 		if (entries == NULL) {
-			LOGOOM();
 			return NULL;
 		}
 		conf->identity.peers = entries;
-		conf->identity.peers_cap = new_cap;
 	}
 	struct identity_peer *const restrict entry = &conf->identity.peers[n];
 	*entry = (struct identity_peer){
@@ -156,24 +167,14 @@ static struct identity_peer *identity_listen_add(
 }
 
 #if WITH_TLS
-/* Append one tls.psk entry, preserving document order so the first entry is
- * well-defined as the key a dialing node offers.  Unlike identity.listen this
- * does not dedup: a repeated identity is a configuration error the caller
- * reports, not a last-value-wins field. */
+/* conf_map_fn for tls.psk: append one entry, preserving document order so the
+ * first entry is well-defined as the key a dialing node offers.  Unlike
+ * identity.listen this does not dedup: a repeated identity is a configuration
+ * error the caller reports, not a last-value-wins field. */
 static bool psk_map_cb(
 	struct config *restrict conf, const char *restrict key,
-	const size_t key_len, char *restrict val, const size_t val_len)
+	const size_t key_len, const char *restrict val, const size_t val_len)
 {
-	if (key_len > 0 && key[0] == '-') {
-		/* Comment-only key, as in identity.listen. */
-		return true;
-	}
-	char *s;
-	size_t slen;
-	if (!json_parse_string(val, val_len, &s, &slen)) {
-		LOGE_F("tls.psk.%s: must be a string", key);
-		return false;
-	}
 	for (size_t i = 0; i < conf->tls_psk_count; i++) {
 		const struct psk_entry *const restrict e = &conf->tls_psk[i];
 		if (e->id_len == key_len && memcmp(e->id, key, key_len) == 0) {
@@ -183,24 +184,13 @@ static bool psk_map_cb(
 		}
 	}
 	if (conf->tls_psk_count == conf->tls_psk_cap) {
-		const size_t max_cap = SIZE_MAX / sizeof(*conf->tls_psk);
-		size_t new_cap =
-			conf->tls_psk_cap == 0 ? 4 : conf->tls_psk_cap * 2;
-		if (conf->tls_psk_cap >= max_cap) {
-			LOGOOM();
-			return false;
-		}
-		if (new_cap > max_cap || new_cap < conf->tls_psk_cap) {
-			new_cap = max_cap;
-		}
-		struct psk_entry *const entries = realloc(
-			conf->tls_psk, new_cap * sizeof(*conf->tls_psk));
+		struct psk_entry *const entries = conf_grow_array(
+			conf->tls_psk, &conf->tls_psk_cap,
+			sizeof(*conf->tls_psk));
 		if (entries == NULL) {
-			LOGOOM();
 			return false;
 		}
 		conf->tls_psk = entries;
-		conf->tls_psk_cap = new_cap;
 	}
 	struct psk_entry *const restrict e =
 		&conf->tls_psk[conf->tls_psk_count];
@@ -212,7 +202,7 @@ static bool psk_map_cb(
 	if (e->id == NULL) {
 		return false;
 	}
-	e->hex = conf_strndup("tls.psk value", s, slen);
+	e->hex = conf_strndup("tls.psk value", val, val_len);
 	if (e->hex == NULL) {
 		free(e->id);
 		e->id = NULL;
@@ -224,25 +214,35 @@ static bool psk_map_cb(
 #endif /* WITH_TLS */
 
 #if WITH_TLS
-/* Strip surrounding whitespace from a loaded key in place.  A key file written
- * by --genpsk (or any editor) ends with a newline, and "@path" loads the file
- * verbatim, so the trailing byte would otherwise fail the hex check. */
-static void psk_trim(char *restrict s)
+static bool psk_is_space(const char c)
 {
-	char *p = s;
-	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
-		p++;
-	}
-	size_t len = strlen(p);
-	while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' ||
-			   p[len - 1] == '\r' || p[len - 1] == '\n')) {
-		len--;
-	}
-	memmove(s, p, len);
-	s[len] = '\0';
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-/* Validate one resolved key: well-formed hex of a usable length.
+/* Strip surrounding whitespace from a key in place.  A key file written by
+ * --genpsk (or any editor) ends with a newline, and "@path" loads the file
+ * verbatim, so the trailing byte would otherwise fail the hex check.  Every
+ * byte the key vacates is erased: shifting it left over leading whitespace
+ * would otherwise leave its last characters behind the new terminator, where
+ * conf_erase_credentials()'s strlen-based erase never reaches. */
+static void psk_trim(char *restrict s)
+{
+	const size_t n = strlen(s);
+	size_t start = 0;
+	while (start < n && psk_is_space(s[start])) {
+		start++;
+	}
+	size_t end = n;
+	while (end > start && psk_is_space(s[end - 1])) {
+		end--;
+	}
+	const size_t len = end - start;
+	memmove(s, s + start, len);
+	s[len] = '\0';
+	tls_secure_erase(s + len + 1, n - len);
+}
+
+/* Validate one key: well-formed hex of a usable length.
  *
  * The length floor is on *length, not entropy*: the identity label published
  * in the ClientHello is a one-way function of the key, which hands an attacker
@@ -270,26 +270,26 @@ static bool conf_check_psk_key(const struct psk_entry *restrict e)
 }
 
 /* Validate every tls.psk entry: identities within the same bound as
- * identity.listen keys, and keys that are well-formed hex of a usable length.
- *
- * The length floor is on *length, not entropy*: the identity label published
- * in the ClientHello is a one-way function of the key, which hands an attacker
- * an offline oracle, so a passphrase-derived key of the right length is still
- * unsafe. sha256("hunter2") in hex passes this check and is worth about 20
- * bits. Keys must come from --genpsk. */
-static bool conf_check_psk(const struct config *restrict conf)
+ * identity.listen keys, and each inline key trimmed and checked by
+ * conf_check_psk_key().  An "@path" value is still the file reference here, so
+ * its key is trimmed and checked by conf_inline_pem() once it is loaded. */
+static bool conf_check_psk(struct config *restrict conf)
 {
 	for (size_t i = 0; i < conf->tls_psk_count; i++) {
-		const struct psk_entry *const restrict e = &conf->tls_psk[i];
+		struct psk_entry *const restrict e = &conf->tls_psk[i];
 		if (e->id_len > MUX_MAX_CLAIM_LEN) {
 			LOGE_F("tls.psk key \"%.64s\" (%zu octets) exceeds the"
 			       " %u-octet peer identity limit",
 			       e->id, e->id_len, (unsigned)MUX_MAX_CLAIM_LEN);
 			return false;
 		}
-		/* The key itself is checked by conf_check_psk_key(), after
-		 * conf_inline_pem() has resolved any "@path": at this point the
-		 * value may still be the file reference rather than the key. */
+		if (e->hex[0] == '@') {
+			continue;
+		}
+		psk_trim(e->hex);
+		if (!conf_check_psk_key(e)) {
+			return false;
+		}
 	}
 	/* Both TLS backends accept only one client-side PSK, so a dialing node
 	 * offers the first entry. Say which, rather than let a multi-key node
@@ -304,34 +304,77 @@ static bool conf_check_psk(const struct config *restrict conf)
 }
 #endif /* WITH_TLS */
 
+/* conf_map_fn for identity.listen: record the listen address for one peer. */
 static bool identity_listen_cb(
-	struct config *restrict conf, const char *restrict key, size_t key_len,
-	char *restrict val, size_t val_len)
+	struct config *restrict conf, const char *restrict key,
+	const size_t key_len, const char *restrict val, const size_t val_len)
 {
-	if (key_len > 0 && key[0] == '-') {
-		/* Comment-only key: json_unmarshal already ignores any
-		 * unrecognized key generically (schema is non-strict), so
-		 * this "-" prefix is purely a human authoring convention for
-		 * marking a deliberately-disabled entry, not a rule the
-		 * dispatcher itself enforces -- but identity.listen has no
-		 * fixed key set for the generic dispatcher to apply that
-		 * tolerance to, so this map has to skip it explicitly. */
-		return true;
-	}
-	char *s;
-	size_t slen;
-	if (!json_parse_string(val, val_len, &s, &slen)) {
-		LOGE_F("identity.listen.%s: must be a string", key);
-		return false;
-	}
 	struct identity_peer *const restrict p =
 		identity_listen_add(conf, key, key_len);
 	if (p == NULL) {
 		return false;
 	}
 	free(p->listen);
-	p->listen = conf_strndup("identity.listen value", s, slen);
+	p->listen = conf_strndup("identity.listen value", val, val_len);
 	if (p->listen == NULL) {
+		return false;
+	}
+	return true;
+}
+
+/* Receives one string-valued pair of a dynamic config map: the decoded key and
+ * value, each NUL-terminated inside the JSON buffer.  False fails the load. */
+typedef bool (*conf_map_fn)(
+	struct config *restrict conf, const char *restrict key, size_t key_len,
+	const char *restrict val, size_t val_len);
+
+/* Walk a dynamic config map -- a JSON object with no fixed key set, which the
+ * schema keeps as a raw fragment pointing into the JSON buffer -- calling @p cb
+ * on each pair in document order, so the copies it makes outlive
+ * json_free_conf.  An absent fragment is an empty map.  Every value must be a
+ * string, except under a "-"-prefixed comment key: json_unmarshal already
+ * ignores any unrecognized key generically (schema is non-strict), so that
+ * prefix is purely a human authoring convention for marking a
+ * deliberately-disabled entry, not a rule the dispatcher itself enforces -- but
+ * a map has no fixed key set for the generic dispatcher to apply that tolerance
+ * to, so the walk has to skip it explicitly. */
+static bool conf_walk_map(
+	struct config *restrict conf, const char *restrict field,
+	const struct json_string *restrict frag, const conf_map_fn cb)
+{
+	if (frag->str == NULL) {
+		return true;
+	}
+	size_t frag_len = frag->len;
+	const struct json_val parsed = json_parse(frag->str, &frag_len);
+	if (parsed.type != JSON_OBJECT) {
+		LOGE_F("%s: must be an object", field);
+		return false;
+	}
+	json_iter it = parsed.iter;
+	char *key;
+	size_t key_len;
+	char *val;
+	size_t val_len;
+	int r;
+	while ((r = json_obj_next(
+			frag->str, &frag->len, &it, &key, &key_len, &val,
+			&val_len)) == JSON_NEXT_ITEM) {
+		if (key_len > 0 && key[0] == '-') {
+			continue;
+		}
+		char *s;
+		size_t slen;
+		if (!json_parse_string(val, val_len, &s, &slen)) {
+			LOGE_F("%s.%s: must be a string", field, key);
+			return false;
+		}
+		if (!cb(conf, key, key_len, s, slen)) {
+			return false;
+		}
+	}
+	if (r != JSON_NEXT_END) {
+		LOGE_F("%s: malformed object", field);
 		return false;
 	}
 	return true;
@@ -401,35 +444,55 @@ conf_load_tls(struct config *restrict cfg, const struct json_conf *restrict obj)
 	/* KTLS requires the library to own the socket fd. */
 	cfg->tls_kernel_offload =
 		cfg->tls_socket_offload && obj->tls.kernel_offload;
-	/* tls.psk: raw JSON fragment pointing into the json buffer, walked here
-	 * so the entries outlive json_free_conf.  json_obj_next preserves
-	 * document order, which is what makes "the first entry" well-defined. */
-	if (obj->tls.psk_json.str != NULL) {
-		size_t frag_len = obj->tls.psk_json.len;
-		struct json_val parsed =
-			json_parse(obj->tls.psk_json.str, &frag_len);
-		if (parsed.type != JSON_OBJECT) {
-			LOGE("tls.psk: must be an object");
-			return false;
-		}
-		json_iter it = parsed.iter;
-		char *key;
-		size_t key_len;
-		char *val;
-		size_t val_len;
-		int r;
-		while ((r = json_obj_next(
-				obj->tls.psk_json.str, &obj->tls.psk_json.len,
-				&it, &key, &key_len, &val, &val_len)) ==
-		       JSON_NEXT_ITEM) {
-			if (!psk_map_cb(cfg, key, key_len, val, val_len)) {
-				return false;
-			}
-		}
-		if (r != JSON_NEXT_END) {
-			LOGE("tls.psk: malformed object");
-			return false;
-		}
+	/* json_obj_next preserves document order, which is what makes "the
+	 * first entry" well-defined. */
+	return conf_walk_map(cfg, "tls.psk", &obj->tls.psk_json, psk_map_cb);
+}
+#else /* WITH_TLS */
+/* Whether a tls.psk fragment carries at least one entry.  An empty object is
+ * no key at all -- a TLS build runs it in plaintext mode -- while anything
+ * else, a malformed value included, asks for a PSK handshake. */
+static bool conf_psk_nonempty(const struct json_string *restrict psk)
+{
+	if (psk->str == NULL) {
+		return false;
+	}
+	size_t frag_len = psk->len;
+	const struct json_val parsed = json_parse(psk->str, &frag_len);
+	if (parsed.type != JSON_OBJECT) {
+		return true;
+	}
+	json_iter it = parsed.iter;
+	char *key;
+	size_t key_len;
+	char *val;
+	size_t val_len;
+	return json_obj_next(
+		       psk->str, &psk->len, &it, &key, &key_len, &val,
+		       &val_len) != JSON_NEXT_END;
+}
+
+/* Reject a TLS credential in a build that cannot use it.  The whole tls object
+ * is still parsed, but nothing loads it, so a configuration that asks for an
+ * encrypted transport would otherwise start in cleartext without a word --
+ * the same "asks for a security control, silently does not get it" case
+ * conf_check refuses for identity.verify.  Only the credentials select TLS;
+ * the tuning keys beside them are inert without one in either build. */
+static bool conf_check_no_tls(const struct json_conf *restrict obj)
+{
+	const char *field = NULL;
+	if (obj->tls.cert.str != NULL) {
+		field = "tls.cert";
+	} else if (obj->tls.key.str != NULL) {
+		field = "tls.key";
+	} else if (obj->tls.authcerts_count > 0) {
+		field = "tls.authcerts";
+	} else if (conf_psk_nonempty(&obj->tls.psk_json)) {
+		field = "tls.psk";
+	}
+	if (field != NULL) {
+		LOGE_F("%s requires a TLS-enabled build", field);
+		return false;
 	}
 	return true;
 }
@@ -517,6 +580,10 @@ conf_load_mux(struct config *restrict cfg, const struct json_conf *restrict obj)
 		(int)MIN(obj->mux.mem_pressure.hi, (uintmax_t)INT_MAX);
 	cfg->mux.mem_pressure_lo =
 		(int)MIN(obj->mux.mem_pressure.lo, (uintmax_t)INT_MAX);
+	cfg->mux.lossymux = obj->mux.lossymux.enabled;
+	/* Schema-validated to [1, 86400] and [1, 65535], both fit int. */
+	cfg->mux.lossymux_idle_timeout = (int)obj->mux.lossymux.idle_timeout;
+	cfg->mux.lossymux_queue = (int)obj->mux.lossymux.queue;
 }
 
 static void
@@ -540,37 +607,9 @@ static bool conf_load_identity(
 		    &cfg->identity.mux_connect_count)) {
 		return false;
 	}
-	/* identity.listen: raw JSON fragment pointing into the json buffer.
-	 * Walk it now and strdup each peer address before json_free_conf. */
-	if (obj->identity.listen_json.str != NULL) {
-		size_t frag_len = obj->identity.listen_json.len;
-		struct json_val parsed =
-			json_parse(obj->identity.listen_json.str, &frag_len);
-		if (parsed.type != JSON_OBJECT) {
-			LOGE("identity.listen: must be an object");
-			return false;
-		}
-		json_iter it = parsed.iter;
-		char *key;
-		size_t key_len;
-		char *val;
-		size_t val_len;
-		int r;
-		while ((r = json_obj_next(
-				obj->identity.listen_json.str,
-				&obj->identity.listen_json.len, &it, &key,
-				&key_len, &val, &val_len)) == JSON_NEXT_ITEM) {
-			if (!identity_listen_cb(
-				    cfg, key, key_len, val, val_len)) {
-				return false;
-			}
-		}
-		if (r != JSON_NEXT_END) {
-			LOGE("identity.listen: malformed object");
-			return false;
-		}
-	}
-	return true;
+	return conf_walk_map(
+		cfg, "identity.listen", &obj->identity.listen_json,
+		identity_listen_cb);
 }
 
 /* Load schema struct into config struct (strings strdup'd).  False on error. */
@@ -600,6 +639,10 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 
 #if WITH_TLS
 	if (!conf_load_tls(cfg, obj)) {
+		return false;
+	}
+#else /* WITH_TLS */
+	if (!conf_check_no_tls(obj)) {
 		return false;
 	}
 #endif /* WITH_TLS */
@@ -744,9 +787,14 @@ static bool conf_check(struct config *restrict conf)
 		LOGE("incomplete TLS configuration");
 		return false;
 	}
-	if (has_psk && conf->tls_sni != NULL) {
-		/* No certificate to select, so the name has nothing to act on. */
-		LOGW("ignoring tls.sni: not used with tls.psk");
+	if (has_psk) {
+		/* No certificate to select, so the name has nothing to act on;
+		 * leave it out of the ClientHello rather than send a hostname
+		 * PSK mode never uses.  The schema's default fills tls.sni in
+		 * whether or not the config set it, so there is no telling an
+		 * explicit value apart to warn about. */
+		free(conf->tls_sni);
+		conf->tls_sni = NULL;
 	}
 	if (has_psk && conf->identity.verify) {
 		/* PSK binds identity intrinsically: the binder proves the peer
@@ -775,10 +823,9 @@ static bool conf_check(struct config *restrict conf)
 		LOGE("identity.verify requires a TLS-enabled build");
 		return false;
 	}
-	/* No tls.psk check here: conf_load_tls() is not compiled in, so the whole
-	 * tls object is inert in this build -- tls.cert included -- and singling
-	 * out one key would be the surprising behavior.  identity.verify differs
-	 * because it lives outside tls and is parsed either way. */
+	/* conf_load already refused any TLS credential, so this build always
+	 * runs the plaintext mode a credential-less TLS build warns about. */
+	LOGW("running in plaintext mode: connection is NOT encrypted");
 #endif /* WITH_TLS */
 	conf_normalize(conf);
 	/* Validate max_startups throttle parameters. */
@@ -858,6 +905,20 @@ static bool conf_check(struct config *restrict conf)
 	return true;
 }
 
+/* Free a buffer that may hold key material -- a config with an inline
+ * credential, or a loaded credential file -- erasing its first @p len bytes
+ * first. */
+static void conf_free_sensitive(char *restrict buf, const size_t len)
+{
+#if WITH_TLS
+	tls_secure_erase(buf, len);
+#else
+	/* No TLS library to erase with, and no credential is ever loaded. */
+	(void)len;
+#endif
+	free(buf);
+}
+
 /* Read an already-open stream (the caller retains ownership of @p fp) into a
  * heap buffer.  The +1 allocation serves double duty: oversize detection and
  * NUL termination. */
@@ -881,7 +942,7 @@ static char *read_stream(
 				const int err = errno;
 				LOGE_F("failed to read %s: %s: (%d) %s", desc,
 				       path, err, strerror(err));
-				free(buf);
+				conf_free_sensitive(buf, n);
 				return NULL;
 			}
 			break;
@@ -891,7 +952,7 @@ static char *read_stream(
 	if (n > CONF_MAXSIZE) {
 		LOGE_F("%s exceeds maximum size of %d bytes: %s", desc,
 		       CONF_MAXSIZE, path);
-		free(buf);
+		conf_free_sensitive(buf, n);
 		return NULL;
 	}
 	buf[n] = '\0';
@@ -995,13 +1056,12 @@ struct config *conf_parsefile(const char *path)
 		return NULL;
 	}
 	struct config *const conf = conf_parse(buf, len);
-	free(buf);
+	/* The JSON is decoded in place, so an inline tls.key or tls.psk sits in
+	 * buf verbatim, apart from the copies struct config erases. */
+	conf_free_sensitive(buf, len);
 	return conf;
 }
 
-/* Build a vbuffer containing the JSON object for the identity.listen map
- * into *out (left NULL if no peer has a listen address). Returns false
- * only on an allocation/encoding failure. */
 /* Append one "key":"value" pair to a JSON object body under construction,
  * inserting the separating comma when *first is false.  Shared by the
  * identity.listen and tls.psk builders, whose only difference is which pairs
@@ -1070,6 +1130,9 @@ static bool json_map_finish(
 	return true;
 }
 
+/* Build a vbuffer containing the JSON object for the identity.listen map
+ * into *out (left NULL if no peer has a listen address). Returns false
+ * only on an allocation/encoding failure. */
 static bool build_listen_json(
 	const struct config *restrict conf, struct vbuffer **restrict out)
 {
@@ -1287,6 +1350,12 @@ char *conf_dump(
 				.hi = (uintmax_t)conf->mux.mem_pressure_hi,
 				.lo = (uintmax_t)conf->mux.mem_pressure_lo,
 			},
+			.lossymux = {
+				.enabled = conf->mux.lossymux,
+				.idle_timeout =
+					(unsigned)conf->mux.lossymux_idle_timeout,
+				.queue = (unsigned)conf->mux.lossymux_queue,
+			},
 		},
 		.tcp = {
 			.reuseport = conf->tcp.tcp_reuseport,
@@ -1350,9 +1419,17 @@ static bool inline_field(char **restrict sp, const char *restrict name)
 	if (*sp == NULL || **sp != '@') {
 		return true;
 	}
-	char *const content = read_file(name, *sp + 1, NULL);
+	size_t len;
+	char *const content = read_file(name, *sp + 1, &len);
 	if (content == NULL) {
 		LOGE_F("failed to inline PEM field: %s", name);
+		return false;
+	}
+	if (memchr(content, '\0', len) != NULL) {
+		LOGE_F("%s: contains an embedded NUL character", name);
+		/* read_stream allocates a fixed-size buffer. Erase it all, so
+		 * bytes after the invalid NUL cannot survive rejection. */
+		conf_free_sensitive(content, CONF_MAXSIZE + 1);
 		return false;
 	}
 	free(*sp);
@@ -1387,10 +1464,14 @@ bool conf_inline_pem(struct config *conf)
 	}
 
 	/* Same for each PSK: the file holds the hex key, not PEM, but the
-	 * "@path" convention and the loader are identical.  The key can only be
-	 * validated here, once the reference is resolved. */
+	 * "@path" convention and the loader are identical.  conf_check_psk()
+	 * already validated every inline key; a loaded one can only be validated
+	 * here, once the reference is resolved. */
 	for (size_t i = 0; i < conf->tls_psk_count; i++) {
 		struct psk_entry *const restrict e = &conf->tls_psk[i];
+		if (e->hex[0] != '@') {
+			continue;
+		}
 		if (!inline_field(&e->hex, "tls.psk")) {
 			return false;
 		}
@@ -1425,6 +1506,37 @@ bool conf_inline_pem(struct config *conf)
 
 	return true;
 }
+
+void conf_erase_credentials(const struct config *restrict conf)
+{
+	if (conf->tls_cert != NULL) {
+		tls_secure_erase(conf->tls_cert, strlen(conf->tls_cert));
+	}
+	if (conf->tls_key != NULL) {
+		tls_secure_erase(conf->tls_key, strlen(conf->tls_key));
+	}
+	for (size_t i = 0; i < conf->tls_authcerts_count; i++) {
+		if (conf->tls_authcerts[i] != NULL) {
+			tls_secure_erase(
+				conf->tls_authcerts[i],
+				strlen(conf->tls_authcerts[i]));
+		}
+	}
+	if (conf->tls_authcerts_bundle != NULL) {
+		tls_secure_erase(
+			conf->tls_authcerts_bundle,
+			strlen(conf->tls_authcerts_bundle));
+	}
+	/* The hex form is what struct config holds, so strlen covers it; the
+	 * decoded copies live in struct psk_table and are erased with it. */
+	for (size_t i = 0; i < conf->tls_psk_count; i++) {
+		if (conf->tls_psk[i].hex != NULL) {
+			tls_secure_erase(
+				conf->tls_psk[i].hex,
+				strlen(conf->tls_psk[i].hex));
+		}
+	}
+}
 #endif /* WITH_TLS */
 
 void conf_free(struct config *restrict conf)
@@ -1440,6 +1552,7 @@ void conf_free(struct config *restrict conf)
 	free(conf->connect);
 	free(conf->log);
 #if WITH_TLS
+	conf_erase_credentials(conf);
 	free(conf->tls_cert);
 	free(conf->tls_key);
 	free(conf->tls_ciphersuites);

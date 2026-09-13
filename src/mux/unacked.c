@@ -6,11 +6,11 @@
  * @brief Internal mux session-level reliability implementation (spec §5.7).
  */
 
-#include "mux/unacked.h"
+#include "unacked.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/session.h"
+#include "frame.h"
+#include "mux.h"
+#include "session.h"
 
 #include "binary/serial.h"
 #include "utils/debug.h"
@@ -44,7 +44,7 @@ static bool ring_push(
  * log can no longer reconstruct what the peer received -- an unrecoverable
  * desync, not a transient failure to retry. */
 static void unacked_push(
-	struct mux_session *restrict ss, struct mux_frame *restrict frame,
+	struct mux_session *ss, struct mux_frame *restrict frame,
 	const size_t count)
 {
 	if (!ring_push(ss, frame, count)) {
@@ -75,7 +75,7 @@ static void unacked_push(
  * stream-0 controls are one-shot; retransmit copies only advance the cursor;
  * walks all header entries to handle mixed PUSH/non-PUSH staging frames. */
 void mux_unacked_track_sent(
-	struct mux_session *restrict ss, struct mux_frame *restrict frame)
+	struct mux_session *ss, struct mux_frame *restrict frame)
 {
 	ASSERT(frame->len >= MUX_FRAME_HEADER_SIZE);
 	struct mux_header hdr;
@@ -103,6 +103,7 @@ void mux_unacked_track_sent(
 		 * live only while retransmit_copy is (unacked.h). */
 		ss->unacked.retransmit_copy = NULL;
 		ss->unacked.retransmit_copy_count = 0;
+		ss->unacked.retransmit_copy_sent = 0;
 		mux_frame_put(&ss->pool, frame);
 		return;
 	}
@@ -164,6 +165,67 @@ void mux_unacked_track_sent(
 	}
 	frame->len = (size_t)(dst - frame->data);
 	unacked_push(ss, frame, n);
+}
+
+/* frame is held by ss->wire.sendbuf; reset can recycle it through ss. */
+void mux_unacked_track_partial(struct mux_session *ss, struct mux_frame *frame)
+{
+	ASSERT(frame->pos < frame->len);
+	struct mux_header hdr;
+	mux_read_header(frame->data, &hdr);
+	/* Hello frames never enter the resume log (mux_unacked_track_sent). */
+	if (hdr.version == 0) {
+		return;
+	}
+	/* Measure the leading sub-frames that are complete within [0, pos). */
+	size_t done = 0;
+	size_t n = 0;
+	while (frame->pos - done >= MUX_FRAME_HEADER_SIZE) {
+		mux_read_header(frame->data + done, &hdr);
+		const size_t entry_len = MUX_FRAME_HEADER_SIZE + hdr.length;
+		if (frame->pos - done < entry_len) {
+			break;
+		}
+		done += entry_len;
+		if (hdr.stream_id != STREAMID_CTRL) {
+			n++;
+		}
+	}
+	if (n == 0) {
+		return;
+	}
+
+	struct mux_frame *prefix = NULL;
+	if (frame == ss->unacked.retransmit_copy) {
+		/* The original entry is already in the ring; only the replay
+		 * bound needs to learn these sub-frames reached the peer. */
+		ss->unacked.retransmit_copy_sent += n;
+	} else {
+		prefix = mux_frame_get(&ss->pool, ss->max_payload);
+		if (prefix == NULL) {
+			/* The peer may already ACK the completed sub-frames;
+			 * waiting for the remainder leaves their log missing. */
+			MUX_LOG(ERROR, ss,
+				"unacked prefix OOM after partial flush: resume log"
+				" desynced from peer, resetting session");
+			mux_session_reset(ss);
+			return;
+		}
+		ASSERT(done <= MUX_FRAME_HEADER_SIZE + (size_t)prefix->cap);
+		memcpy(prefix->data, frame->data, done);
+		prefix->len = done;
+	}
+	/* Cut the accounted prefix so neither the final mux_unacked_track_sent
+	 * nor a suspend-time capture tracks it a second time. Safe for a TLS
+	 * transport too: this runs only after a write that committed bytes,
+	 * never between a WANT_* and its identical retry. */
+	memmove(frame->data, frame->data + done, frame->len - done);
+	frame->len -= done;
+	frame->pos -= done;
+	/* Last: a ring-push OOM resets the session and frees @p frame. */
+	if (prefix != NULL) {
+		mux_unacked_track_sent(ss, prefix);
+	}
 }
 
 /* Sum the payload bytes of @p count concatenated frame headers starting at
@@ -254,6 +316,16 @@ mux_unacked_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
 			ss->unacked.partial_offset = (uint_least32_t)offset;
 			if (popped < off0) {
 				trimmed_retransmitted += remaining;
+			} else if (
+				popped == off0 &&
+				ss->unacked.retransmit_copy != NULL) {
+				/* The entry whose replay copy is in flight: the
+				 * trimmed sub-frames are among those it already
+				 * wrote (mux_unacked_ack_recv's bound). */
+				ASSERT(remaining <=
+				       ss->unacked.retransmit_copy_sent);
+				ss->unacked.retransmit_copy_count -= remaining;
+				ss->unacked.retransmit_copy_sent -= remaining;
 			}
 			f->unacked_count -= remaining;
 			remaining = 0;
@@ -334,9 +406,12 @@ static size_t retransmitted_frames_verify(const struct mux_session *restrict ss)
 #endif /* NDEBUG */
 
 /* mux_unacked_ack_recv bounds a peer-supplied ACK received mid-replay by
- * retransmitted_frames so it can never trim an entry that has not actually been
- * retransmitted yet on this connection -- a coordinating send-side safeguard is
- * what keeps a conformant peer from ever reaching this bound in the first place.
+ * retransmitted_frames plus the in-flight copy's fully written sub-frames
+ * (retransmit_copy_sent), so it can never trim a frame that has not actually
+ * been retransmitted yet on this connection -- a coordinating send-side
+ * safeguard is what keeps a conformant peer from ever reaching this bound in
+ * the first place, and mux_unacked_track_partial counts every frame that fully
+ * reached the peer even while its physical entry is still partially written.
  * Not applicable to mux_unacked_resume_ack_recv's own trim call below: that one
  * reconciles the peer's resume_seq against deliveries on the *old* connection,
  * and mux_session_suspend() pre-arms retransmit_off=0 in anticipation of the
@@ -347,7 +422,10 @@ mux_unacked_ack_recv(struct mux_session *restrict ss, const uint_fast32_t count)
 	if (ss->unacked.retransmit_off != SIZE_MAX) {
 		ASSERT(ss->unacked.retransmitted_frames ==
 		       retransmitted_frames_verify(ss));
-		const size_t retransmitted = ss->unacked.retransmitted_frames;
+		size_t retransmitted = ss->unacked.retransmitted_frames;
+		if (ss->unacked.retransmit_copy != NULL) {
+			retransmitted += ss->unacked.retransmit_copy_sent;
+		}
 		if (count > retransmitted) {
 			MUX_LOG_F(
 				ERROR, ss,
@@ -429,6 +507,7 @@ void mux_unacked_free_all(struct mux_session *restrict ss)
 	 * build. */
 	ss->unacked.retransmit_copy = NULL;
 	ss->unacked.retransmit_copy_count = 0;
+	ss->unacked.retransmit_copy_sent = 0;
 	/* stalled is a pure function of bytes against the session window, so it
 	 * falls with them: a session left holding the gate over an empty ring
 	 * would never send another data frame. */

@@ -69,19 +69,20 @@ json_lookup_conf_identity(const char *str, size_t len)
 /* --- json_conf_mux --- */
 typedef struct { const char *name; size_t len; int idx; } json_lookup_conf_mux_entry_;
 static const json_lookup_conf_mux_entry_ json_lookup_conf_mux_keys_[] = {
-	{"tcp", 3, 13},
-	{"nodelay", 7, 7},
+	{"tcp", 3, 14},
+	{"nodelay", 7, 8},
+	{"lossymux", 8, 3},
 	{"keepalive", 9, 2},
-	{"readahead", 9, 8},
-	{"max_streams", 11, 5},
+	{"readahead", 9, 9},
+	{"max_streams", 11, 6},
 	{"idle_timeout", 12, 1},
-	{"max_halfopen", 12, 4},
-	{"mem_pressure", 12, 6},
-	{"send_timeout", 12, 10},
-	{"stream_window", 13, 12},
-	{"max_frame_size", 14, 3},
-	{"resume_timeout", 14, 9},
-	{"session_window", 14, 11},
+	{"max_halfopen", 12, 5},
+	{"mem_pressure", 12, 7},
+	{"send_timeout", 12, 11},
+	{"stream_window", 13, 13},
+	{"max_frame_size", 14, 4},
+	{"resume_timeout", 14, 10},
+	{"session_window", 14, 12},
 	{"connect_timeout", 15, 0},
 };
 static int json_lookup_conf_mux_cmp_(const void *key_, const void *entry_)
@@ -97,8 +98,24 @@ json_lookup_conf_mux(const char *str, size_t len)
 {
 	const json_lookup_conf_mux_entry_ key_ = {str, len, 0};
 	const json_lookup_conf_mux_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_mux_keys_, 14, sizeof(*json_lookup_conf_mux_keys_), json_lookup_conf_mux_cmp_);
+		bsearch(&key_, json_lookup_conf_mux_keys_, 15, sizeof(*json_lookup_conf_mux_keys_), json_lookup_conf_mux_cmp_);
 	return e_ ? e_->idx : -1;
+}
+
+/* --- json_conf_mux_lossymux --- */
+static int
+json_lookup_conf_mux_lossymux(const char *str, size_t len)
+{
+	if (len < 1) { return -1; }
+	switch ((unsigned char)str[0]) {
+	case 'e':
+		return len == 7 && memcmp(str, "enabled", 7) == 0 ? 0 : -1;
+	case 'i':
+		return len == 12 && memcmp(str, "idle_timeout", 12) == 0 ? 1 : -1;
+	case 'q':
+		return len == 5 && memcmp(str, "queue", 5) == 0 ? 2 : -1;
+	default: return -1;
+	}
 }
 
 /* --- json_conf_mux_mem_pressure --- */
@@ -207,8 +224,8 @@ json_lookup_conf_tls(const char *str, size_t len)
  *  @{ */
 
 static const struct json_constraint json_conf_tls_authcerts_c = {
-	.flags = JSON_C_MIN_ITEMS,
-	.min_items = 1,
+	.flags = JSON_C_MIN_ITEMS | (JSON_C_MAX_ITEMS * (UINT64_C(1) > SIZE_MAX)),
+	.min_items = ((UINT64_C(1) <= SIZE_MAX) ? (size_t)UINT64_C(1) : SIZE_MAX),
 };
 static const struct json_conf_tls json_conf_tls_defaults = {
 	.kernel_offload = true,
@@ -310,6 +327,33 @@ static const struct json_schema json_conf_mux_mem_pressure_schema = {
 	.present_field = -1,
 };
 
+static const struct json_constraint json_conf_mux_lossymux_idle_timeout_c = {
+	.flags = JSON_C_MIN | JSON_C_MAX,
+	.u = { .min = UINTMAX_C(1), .max = UINTMAX_C(86400) },
+};
+static const struct json_constraint json_conf_mux_lossymux_queue_c = {
+	.flags = JSON_C_MIN | JSON_C_MAX,
+	.u = { .min = UINTMAX_C(1), .max = UINTMAX_C(65535) },
+};
+static const struct json_conf_mux_lossymux json_conf_mux_lossymux_defaults = {
+	.enabled = false,
+	.idle_timeout = 60u,
+	.queue = 64u,
+};
+static const struct json_field json_conf_mux_lossymux_fields[] = {
+	{ .name = "enabled", .name_len = 7, .kind = JSON_K_BOOL, .req_bit = -1, .offset = offsetof(struct json_conf_mux_lossymux, enabled) },
+	{ .name = "idle_timeout", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux_lossymux, idle_timeout), .constraint = &json_conf_mux_lossymux_idle_timeout_c },
+	{ .name = "queue", .name_len = 5, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux_lossymux, queue), .constraint = &json_conf_mux_lossymux_queue_c },
+};
+static const struct json_schema json_conf_mux_lossymux_schema = {
+	.fields = json_conf_mux_lossymux_fields,
+	.n_fields = 3,
+	.obj_size = sizeof(struct json_conf_mux_lossymux),
+	.lookup = json_lookup_conf_mux_lossymux,
+	.defaults = &json_conf_mux_lossymux_defaults,
+	.present_field = -1,
+};
+
 static const struct json_constraint json_conf_mux_connect_timeout_c = {
 	.flags = JSON_C_MAX,
 	.u = { .max = UINTMAX_C(86400) },
@@ -354,6 +398,11 @@ static const struct json_conf_mux json_conf_mux_defaults = {
 	.connect_timeout = 15u,
 	.idle_timeout = 0u,
 	.keepalive = 7200u,
+	.lossymux = {
+		.enabled = false,
+		.idle_timeout = 60u,
+		.queue = 64u,
+	},
 	.max_frame_size = 16384u,
 	.max_halfopen = 256u,
 	.mem_pressure = {
@@ -378,6 +427,7 @@ static const struct json_field json_conf_mux_fields[] = {
 	{ .name = "connect_timeout", .name_len = 15, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, connect_timeout), .constraint = &json_conf_mux_connect_timeout_c },
 	{ .name = "idle_timeout", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, idle_timeout), .constraint = &json_conf_mux_idle_timeout_c },
 	{ .name = "keepalive", .name_len = 9, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, keepalive), .constraint = &json_conf_mux_keepalive_c },
+	{ .name = "lossymux", .name_len = 8, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, lossymux), .child = &json_conf_mux_lossymux_schema },
 	{ .name = "max_frame_size", .name_len = 14, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, max_frame_size), .constraint = &json_conf_mux_max_frame_size_c },
 	{ .name = "max_halfopen", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, max_halfopen), .constraint = &json_conf_mux_max_halfopen_c },
 	{ .name = "max_streams", .name_len = 11, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux, max_streams) },
@@ -392,7 +442,7 @@ static const struct json_field json_conf_mux_fields[] = {
 };
 static const struct json_schema json_conf_mux_schema = {
 	.fields = json_conf_mux_fields,
-	.n_fields = 14,
+	.n_fields = 15,
 	.obj_size = sizeof(struct json_conf_mux),
 	.lookup = json_lookup_conf_mux,
 	.defaults = &json_conf_mux_defaults,
@@ -400,12 +450,12 @@ static const struct json_schema json_conf_mux_schema = {
 };
 
 static const struct json_constraint json_conf_identity_claim_c = {
-	.flags = JSON_C_MAX_LEN,
-	.str = { .max_len = 63 },
+	.flags = (JSON_C_MAX_LEN * (UINT64_C(63) <= SIZE_MAX)),
+	.str = { .max_len = ((UINT64_C(63) <= SIZE_MAX) ? (size_t)UINT64_C(63) : 0) },
 };
 static const struct json_constraint json_conf_identity_mux_connect_c = {
-	.flags = JSON_C_MAX_LEN,
-	.str = { .max_len = 261 },
+	.flags = (JSON_C_MAX_LEN * (UINT64_C(261) <= SIZE_MAX)),
+	.str = { .max_len = ((UINT64_C(261) <= SIZE_MAX) ? (size_t)UINT64_C(261) : 0) },
 };
 static const struct json_conf_identity json_conf_identity_defaults = {
 	.verify = false,
@@ -426,16 +476,16 @@ static const struct json_schema json_conf_identity_schema = {
 };
 
 static const struct json_constraint json_conf_api_listen_c = {
-	.flags = JSON_C_MAX_LEN,
-	.str = { .max_len = 261 },
+	.flags = (JSON_C_MAX_LEN * (UINT64_C(261) <= SIZE_MAX)),
+	.str = { .max_len = ((UINT64_C(261) <= SIZE_MAX) ? (size_t)UINT64_C(261) : 0) },
 };
 static const struct json_constraint json_conf_connect_c = {
-	.flags = JSON_C_MAX_LEN,
-	.str = { .max_len = 261 },
+	.flags = (JSON_C_MAX_LEN * (UINT64_C(261) <= SIZE_MAX)),
+	.str = { .max_len = ((UINT64_C(261) <= SIZE_MAX) ? (size_t)UINT64_C(261) : 0) },
 };
 static const struct json_constraint json_conf_listen_c = {
-	.flags = JSON_C_MAX_LEN,
-	.str = { .max_len = 261 },
+	.flags = (JSON_C_MAX_LEN * (UINT64_C(261) <= SIZE_MAX)),
+	.str = { .max_len = ((UINT64_C(261) <= SIZE_MAX) ? (size_t)UINT64_C(261) : 0) },
 };
 static const struct json_string json_conf_log_enum[] = {
 	{ .len = 6, .str = "stdout" },
@@ -449,12 +499,12 @@ static const struct json_constraint json_conf_log_c = {
 	.str = { .enums = json_conf_log_enum, .n_enum = 5 },
 };
 static const struct json_constraint json_conf_mux_connect_c = {
-	.flags = JSON_C_MAX_LEN,
-	.str = { .max_len = 261 },
+	.flags = (JSON_C_MAX_LEN * (UINT64_C(261) <= SIZE_MAX)),
+	.str = { .max_len = ((UINT64_C(261) <= SIZE_MAX) ? (size_t)UINT64_C(261) : 0) },
 };
 static const struct json_constraint json_conf_mux_listen_c = {
-	.flags = JSON_C_MAX_LEN,
-	.str = { .max_len = 261 },
+	.flags = (JSON_C_MAX_LEN * (UINT64_C(261) <= SIZE_MAX)),
+	.str = { .max_len = ((UINT64_C(261) <= SIZE_MAX) ? (size_t)UINT64_C(261) : 0) },
 };
 static const struct json_conf json_conf_defaults = {
 	.identity = {
@@ -465,6 +515,11 @@ static const struct json_conf json_conf_defaults = {
 		.connect_timeout = 15u,
 		.idle_timeout = 0u,
 		.keepalive = 7200u,
+		.lossymux = {
+			.enabled = false,
+			.idle_timeout = 60u,
+			.queue = 64u,
+		},
 		.max_frame_size = 16384u,
 		.max_halfopen = 256u,
 		.mem_pressure = {

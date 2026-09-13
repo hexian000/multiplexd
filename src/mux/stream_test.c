@@ -5,13 +5,13 @@
  * window/credit accounting, half-close/RST); stream.c #included, sched/send
  * collaborators mocked below. */
 
-#include "mux/stream.h"
+#include "stream.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/session.h"
-#include "mux/stream.c"
-#include "mux/stream_io.h"
+#include "frame.h"
+#include "mux.h"
+#include "session.h"
+#include "stream.c"
+#include "stream_io.h"
 
 #include "algo/hashtable.h"
 #include "utils/slog.h"
@@ -21,6 +21,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +101,7 @@ void mux_sched_free_streams(struct mux_session *restrict ss)
 	}
 	ss->sched.delay_head = NULL;
 	ss->sched.num_tombstones = 0;
+	ss->sched.num_closed = 0;
 	ss->sched.next_stream_id = 0;
 	if (ss->sched.streams != NULL) {
 		table_iterate(ss->sched.streams, st_free_stream_cb, ss);
@@ -107,13 +110,26 @@ void mux_sched_free_streams(struct mux_session *restrict ss)
 	}
 }
 
+void mux_sched_free_orphan(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
+{
+	(void)ss;
+	mux_stream_free(s);
+}
+
+/* Records the last delay request so a case can see which hold armed it. */
+static int g_sched_delay_calls;
+static const struct mux_stream *g_sched_delay_stream;
+static uint_fast8_t g_sched_delay_ticks;
+
 void mux_sched_delay(
 	struct mux_session *restrict ss, struct mux_stream *restrict s,
 	const uint_fast8_t ticks)
 {
 	(void)ss;
-	(void)s;
-	(void)ticks;
+	g_sched_delay_calls++;
+	g_sched_delay_stream = s;
+	g_sched_delay_ticks = ticks;
 }
 
 void mux_sched_delay_remove(
@@ -135,7 +151,7 @@ static int g_sched_check_no_active_streams_calls;
  * file's mux_sched_free_streams() mock. */
 static bool g_free_streams_on_check;
 
-void mux_sched_check_no_active_streams(struct mux_session *restrict ss)
+void mux_sched_check_no_active_streams(struct mux_session *ss)
 {
 	g_sched_check_no_active_streams_calls++;
 	if (g_free_streams_on_check) {
@@ -182,7 +198,7 @@ void mux_session_discard_stream_frames(
 	(void)stream_id;
 }
 
-void mux_session_flush(struct mux_session *restrict ss)
+void mux_session_flush(struct mux_session *ss)
 {
 	(void)ss;
 }
@@ -265,6 +281,9 @@ static int setup_fixture(struct stream_fixture *restrict fx)
 	g_free_streams_on_check = false;
 	g_sched_check_no_active_streams_calls = 0;
 	g_session_send_ctrl_fail = false;
+	g_sched_delay_calls = 0;
+	g_sched_delay_stream = NULL;
+	g_sched_delay_ticks = 0;
 
 	*fx = (struct stream_fixture){
 		.fds = { -1, -1 },
@@ -486,6 +505,89 @@ T_DECLARE_CASE(test_stream_dequeue_send_admits_close_wait)
 	T_EXPECT(!fin_wait_sends);
 }
 
+/* A Nagle hold arms its own delayed flush: the scheduler does not re-derive
+ * why the dequeue failed, so a hold that armed nothing would leave the small
+ * frame waiting for a peer ACK. */
+T_DECLARE_CASE(test_stream_dequeue_send_nagle_hold_arms_flush)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	struct mux_frame *const small = make_payload_frame(&fx.ss.pool, 53);
+	T_CHECK(small != NULL);
+	mux_stream_queue_send(s, small);
+	s->unacked_bytes = 37;
+
+	const bool held = mux_stream_dequeue_send(s) == NULL;
+	const bool still_queued = s->send_queue.head == small;
+	const int delay_calls = g_sched_delay_calls;
+	const bool delay_stream = g_sched_delay_stream == s;
+	const uint_fast8_t delay_ticks = g_sched_delay_ticks;
+
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT(held);
+	T_EXPECT(still_queued);
+	T_EXPECT_EQ(delay_calls, 1);
+	T_EXPECT(delay_stream);
+	T_EXPECT_EQ(delay_ticks, (uint_fast8_t)MUX_NAGLE_TICKS);
+}
+
+/* Only a Nagle hold arms the flush: a credit-blocked small frame arms nothing,
+ * and neither does one that nodelay or the one-shot bypass lets through. */
+T_DECLARE_CASE(test_stream_dequeue_send_no_hold_arms_no_flush)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	struct mux_frame *const first = make_payload_frame(&fx.ss.pool, 53);
+	struct mux_frame *const second = make_payload_frame(&fx.ss.pool, 53);
+	T_CHECK(first != NULL && second != NULL);
+	mux_stream_queue_send(s, first);
+	mux_stream_queue_send(s, second);
+	s->unacked_bytes = 37;
+
+	const uint_least32_t send_window = s->send_window;
+	s->send_window = s->bytes_sent;
+	const bool credit_blocked = mux_stream_dequeue_send(s) == NULL;
+	s->send_window = send_window;
+
+	fx.ss.conf.nodelay = true;
+	struct mux_frame *const nodelay_frame = mux_stream_dequeue_send(s);
+	fx.ss.conf.nodelay = false;
+	const bool nodelay_sent = nodelay_frame == first;
+
+	s->nagle_flush = true;
+	struct mux_frame *const bypass_frame = mux_stream_dequeue_send(s);
+	const bool bypass_sent = bypass_frame == second;
+	const int delay_calls = g_sched_delay_calls;
+
+	if (nodelay_frame != NULL) {
+		mux_frame_put(&fx.ss.pool, nodelay_frame);
+	}
+	if (bypass_frame != NULL) {
+		mux_frame_put(&fx.ss.pool, bypass_frame);
+	}
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT(credit_blocked);
+	T_EXPECT(nodelay_sent);
+	T_EXPECT(bypass_sent);
+	T_EXPECT_EQ(delay_calls, 0);
+}
+
 T_DECLARE_CASE(test_stream_recv_window_grows_send_credit)
 {
 	struct stream_fixture fx;
@@ -562,6 +664,98 @@ T_DECLARE_CASE(test_stream_recv_window_gates_ev_write_on_sendable_state)
 
 	T_EXPECT(established_revents & EV_WRITE);
 	T_EXPECT(!(closing_revents & EV_WRITE));
+}
+
+/* mux_stream_notify_recv() runs right after a push that may have carried the
+ * local FIN: its direct-mode EV_WRITE feed must apply the full
+ * stream_direct_write_ready() predicate, so the credit left over does not
+ * signal a stream that can no longer originate data (FIN_WAIT). */
+T_DECLARE_CASE(test_stream_notify_recv_gates_ev_write_after_fin)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	mux_stream_io w;
+	mux_stream_io_init(&w, stream_test_notify_cb, s, EV_WRITE);
+	w.loop = fx.loop;
+	s->is_direct = true;
+	s->direct.w_io = &w;
+	s->send_window = 2 * MUX_WINDOW_UNIT;
+	s->bytes_sent = 0;
+
+	/* Sendable with credit: the post-push notify feeds EV_WRITE. */
+	g_notify_write_revents = 0;
+	mux_stream_notify_recv(s);
+	ev_invoke_pending(fx.loop);
+	const int established_revents = g_notify_write_revents;
+
+	/* The push carried the local FIN: credit remains, but the stream is
+	 * past its send side. */
+	s->state = STREAM_FIN_WAIT;
+	g_notify_write_revents = 0;
+	mux_stream_notify_recv(s);
+	ev_invoke_pending(fx.loop);
+	const int fin_wait_revents = g_notify_write_revents;
+
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT(established_revents & EV_WRITE);
+	T_EXPECT(!(fin_wait_revents & EV_WRITE));
+}
+
+/* A WINDOW/ACK grant that queued data already spends leaves no read credit, so
+ * mux_stream_send would queue nothing: the direct-mode EV_WRITE feed from
+ * mux_stream_recv_window() must apply the credit half of
+ * stream_direct_write_ready() as well as the state half. */
+T_DECLARE_CASE(test_stream_recv_window_gates_ev_write_on_read_credit)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	mux_stream_io w;
+	mux_stream_io_init(&w, stream_test_notify_cb, s, EV_WRITE);
+	w.loop = fx.loop;
+	s->is_direct = true;
+	s->direct.w_io = &w;
+	s->send_window = 0;
+	s->bytes_sent = 0;
+
+	/* The grant exceeds what is queued: read credit remains, EV_WRITE fed. */
+	s->queued_send_bytes = MUX_WINDOW_UNIT;
+	g_notify_write_revents = 0;
+	mux_stream_recv_window(s, 2);
+	ev_invoke_pending(fx.loop);
+	const int spare_revents = g_notify_write_revents;
+	const uint_fast32_t spare_credit = stream_read_credit_avail(s);
+
+	/* The next grant is spoken for entirely by queued data. */
+	s->send_window = 0;
+	s->queued_send_bytes = 2 * MUX_WINDOW_UNIT;
+	g_notify_write_revents = 0;
+	mux_stream_recv_window(s, 2);
+	ev_invoke_pending(fx.loop);
+	const int consumed_revents = g_notify_write_revents;
+	const uint_fast32_t consumed_credit = stream_read_credit_avail(s);
+	s->queued_send_bytes = 0;
+
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(spare_credit, (uint_fast32_t)MUX_WINDOW_UNIT);
+	T_EXPECT(spare_revents & EV_WRITE);
+	T_EXPECT_EQ(consumed_credit, (uint_fast32_t)0);
+	T_EXPECT(!(consumed_revents & EV_WRITE));
 }
 
 T_DECLARE_CASE(test_stream_recv_fin_advances_state)
@@ -777,16 +971,13 @@ T_DECLARE_CASE(test_stream_recv_copy_bytes_received_wraps)
 	T_EXPECT_EQ(buffered, (uint_least32_t)8u);
 }
 
-/* A direct-mode stream fully closed by the application (user_closed) while
- * already in CLOSING (both FINs exchanged, empty recvbuf) must be completed by
- * mux_stream_do_shutdown, not stranded: no mux_stream_recv caller remains to finish
- * it, so it would otherwise sit in CLOSING for the session's life. */
-/* A direct-mode stream already in CLOSING (both FINs exchanged) that the app has
- * closed has no mux_stream_recv caller left, so mux_stream_do_shutdown must complete the
- * close itself rather than strand it in CLOSING for the session's life. A
- * still-owned direct stream (no user_closed) must keep deferring -- the library
- * may not free a stream the app still holds (a half-close via mux_stream_shutdown
- * never sets user_closed, so it must not complete here). */
+/* A direct-mode stream already in CLOSING (both FINs exchanged, empty recvbuf)
+ * that the app has closed (user_closed) has no mux_stream_recv caller left, so
+ * mux_stream_do_shutdown must complete the close itself rather than strand it in
+ * CLOSING for the session's life. A still-owned direct stream (no user_closed)
+ * must keep deferring -- the library may not free a stream the app still holds
+ * (a half-close via mux_stream_shutdown never sets user_closed, so it must not
+ * complete here). */
 T_DECLARE_CASE(test_stream_shutdown_completes_user_closed_closing_direct)
 {
 	struct stream_fixture fx;
@@ -1182,6 +1373,96 @@ T_DECLARE_CASE(test_stream_mark_fin_sent_user_closed_direct_rsts_buffered_data)
 	T_EXPECT(hdr.flags & MUX_FLAG_RST);
 	T_EXPECT_EQ(readable, (size_t)0);
 	T_EXPECT_EQ(buffered, (uint_least32_t)0);
+}
+
+/* A direct-mode stream the app closed with an empty buffer sent FIN and sits in
+ * FIN_WAIT, where the peer may keep sending (spec §4.2.1). With no reader left,
+ * that payload must reset the stream (close(fd) semantics) instead of being
+ * buffered forever: a peer with more data than credit never sends FIN, so the
+ * stream would hold its slot and pressure accounting for the session's life. A
+ * still-owned direct stream in FIN_WAIT keeps buffering for its reader. */
+T_DECLARE_CASE(test_stream_recv_copy_user_closed_direct_rsts_without_fin)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	unsigned char payload[8] = { 0 };
+
+	struct mux_stream *const owned = make_stream(&fx, 1);
+	T_CHECK(owned != NULL);
+	owned->is_direct = true;
+	stream_set_state(owned, STREAM_FIN_WAIT);
+	mux_stream_recv_copy(owned, payload, sizeof(payload));
+	const size_t owned_readable = bytebuf_readable(owned->recvbuf);
+	const enum stream_state owned_state = owned->state;
+	mux_stream_free(owned);
+
+	struct mux_stream *const s = make_stream(&fx, 3);
+	T_CHECK(s != NULL);
+	s->is_direct = true;
+	s->user_closed = true;
+	stream_set_state(s, STREAM_FIN_WAIT);
+	mux_stream_recv_copy(s, payload, sizeof(payload));
+
+	const enum stream_state state = s->state;
+	const bool rst_sent = s->rst_sent;
+	const bool aborted = s->aborted;
+	const size_t readable = bytebuf_readable(s->recvbuf);
+	const size_t session_buffered = fx.ss.recv_buffered_bytes;
+	const bool frame_out = fx.ss.wire.sendbuf.head != NULL;
+	struct mux_header hdr = { 0 };
+	if (frame_out) {
+		mux_read_header(fx.ss.wire.sendbuf.head->data, &hdr);
+	}
+
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(owned_readable, sizeof(payload));
+	T_EXPECT_EQ(owned_state, (enum stream_state)STREAM_FIN_WAIT);
+	T_EXPECT_EQ(state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(rst_sent);
+	T_EXPECT(aborted);
+	T_CHECK(frame_out);
+	T_EXPECT(hdr.flags & MUX_FLAG_RST);
+	T_EXPECT_EQ(hdr.stream_id, (uint_least16_t)3);
+	T_EXPECT_EQ(hdr.extra, (uint_least16_t)MUX_STATUS_CANCEL);
+	T_EXPECT_EQ(readable, (size_t)0);
+	T_EXPECT_EQ(session_buffered, (size_t)0);
+}
+
+/* mux_stream_close() on a direct stream the library already closed (peer RST)
+ * reaches mux_stream_do_release, which gives the kept stream up (user_closed)
+ * so lifecycle cleanup may free it; releasing it again is inert. */
+T_DECLARE_CASE(test_stream_do_release_marks_rst_direct_stream_closed)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	s->is_direct = true;
+	mux_stream_recv_rst(s, MUX_STATUS_CANCEL);
+	const enum stream_state state = s->state;
+	const bool held = !s->user_closed;
+
+	mux_stream_do_release(s);
+	const bool released = s->user_closed;
+	mux_stream_do_release(s);
+	const bool still_released = s->user_closed;
+
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(held);
+	T_EXPECT(released);
+	T_EXPECT(still_released);
 }
 
 T_DECLARE_CASE(test_stream_shutdown_marks_rx_eof)
@@ -1680,7 +1961,7 @@ T_DECLARE_CASE(test_halfopen_release_before_free)
 }
 
 /* mux_stream_format_tag endpoint rendering: identity strings, peer_identity,
- * peer_id, and the fd-fallback when no address is available. */
+ * and the fd-fallback when no address is available. */
 T_DECLARE_CASE(test_stream_format_tag_endpoint_variants)
 {
 	struct stream_fixture fx;
@@ -1694,23 +1975,19 @@ T_DECLARE_CASE(test_stream_format_tag_endpoint_variants)
 
 	char id_buf[] = "local-id";
 	char peer_ident[] = "peer-ident";
-	char peer_id_buf[] = "peer-id";
 
 	/* identity set -> "%s" branch for the local endpoint. */
 	fx.ss.handshake.identity = id_buf;
 	fx.ss.handshake.peer_identity = peer_ident; /* peer_identity branch */
 	const bool r1 = (mux_stream_format_tag(buf, sizeof(buf), s) > 0);
 
-	/* No identity and an unusable fd -> "[fd:%d]" local fallback; peer_id
-	 * branch for the peer endpoint. */
+	/* No identity and an unusable fd -> "[fd:%d]" local fallback. */
 	fx.ss.handshake.identity = NULL;
 	fx.ss.handshake.peer_identity = NULL;
-	fx.ss.handshake.peer_id = peer_id_buf;
 	const int saved_fd = fx.ss.w_socket.fd;
 	fx.ss.w_socket.fd = -1;
 	const bool r2 = (mux_stream_format_tag(buf, sizeof(buf), s) > 0);
 	fx.ss.w_socket.fd = saved_fd;
-	fx.ss.handshake.peer_id = NULL;
 
 	mux_stream_free(s);
 	teardown_fixture(&fx);
@@ -1949,11 +2226,14 @@ T_DECLARE_CASE(test_stream_tombstone_cb_decrements)
 	T_CHECK(s != NULL);
 	s->state = STREAM_CLOSED;
 	fx.ss.sched.num_tombstones = 1;
+	fx.ss.sched.num_closed = 1;
 	tombstone_cb(fx.ss.loop, &s->w_tombstone, EV_TIMER);
 	const size_t num_tombstones = fx.ss.sched.num_tombstones;
+	const size_t num_closed = fx.ss.sched.num_closed;
 	mux_stream_free(s);
 	teardown_fixture(&fx);
 	T_EXPECT_EQ(num_tombstones, (size_t)0);
+	T_EXPECT_EQ(num_closed, (size_t)1);
 }
 
 /* mux_stream_do_close on an already-CLOSED stream is a no-op. */
@@ -2030,6 +2310,7 @@ T_DECLARE_CASE(test_stream_close_checks_no_active_streams_immediately)
 
 	const enum stream_state state = s->state;
 	const size_t num_tombstones = fx.ss.sched.num_tombstones;
+	const size_t num_closed = fx.ss.sched.num_closed;
 	const int calls = g_sched_check_no_active_streams_calls;
 
 	mux_stream_free(s);
@@ -2037,6 +2318,7 @@ T_DECLARE_CASE(test_stream_close_checks_no_active_streams_immediately)
 
 	T_EXPECT_EQ(state, (enum stream_state)STREAM_CLOSED);
 	T_EXPECT_EQ(num_tombstones, (size_t)1);
+	T_EXPECT_EQ(num_closed, (size_t)1);
 	T_EXPECT_EQ(calls, 1);
 }
 
@@ -2059,6 +2341,7 @@ T_DECLARE_CASE(test_stream_close_from_init_skips_no_active_streams_check)
 
 	const enum stream_state state = s->state;
 	const size_t num_tombstones = fx.ss.sched.num_tombstones;
+	const size_t num_closed = fx.ss.sched.num_closed;
 	const int calls = g_sched_check_no_active_streams_calls;
 
 	mux_stream_free(s);
@@ -2067,6 +2350,7 @@ T_DECLARE_CASE(test_stream_close_from_init_skips_no_active_streams_check)
 	T_EXPECT_EQ(initial_state, (enum stream_state)STREAM_INIT);
 	T_EXPECT_EQ(state, (enum stream_state)STREAM_CLOSED);
 	T_EXPECT_EQ(num_tombstones, (size_t)0);
+	T_EXPECT_EQ(num_closed, (size_t)1);
 	T_EXPECT_EQ(calls, 0);
 }
 
@@ -2300,6 +2584,70 @@ T_DECLARE_CASE(test_stream_abort_survives_reentrant_close_freeing_stream)
 	T_EXPECT_EQ(w_active, 0);
 }
 
+/* The stream a direct watcher is moved onto by stream_io_rebind_cb. */
+static struct mux_stream *g_rebind_target;
+
+/* Direct-mode user watcher callback that releases its watcher without closing
+ * the stream -- what mux_stream_io_stop() does (mux.c, not linked into this
+ * white-box TU) -- then binds the same watcher to another stream, as an
+ * application reusing its watcher is free to do from the callback. */
+static void
+stream_io_rebind_cb(struct ev_loop *loop, struct mux_stream_io *w, int revents)
+{
+	(void)loop;
+	(void)revents;
+	w->stream->direct.w_io = NULL;
+	w->stream = g_rebind_target;
+	g_rebind_target->is_direct = true;
+	g_rebind_target->direct.w_io = w;
+}
+
+/* Regression: mux_stream_abort() fires the direct watcher's EV_READ callback,
+ * and a callback that releases the watcher leaves s open, so the abort goes on
+ * to detach whatever watcher s still has. It must read s->direct.w_io again
+ * after the callback: detaching the pre-callback watcher would unbind a watcher
+ * the application already owns again. */
+T_DECLARE_CASE(test_stream_abort_leaves_watcher_released_by_callback)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	struct mux_stream *const s2 = make_stream(&fx, 3);
+	T_CHECK(s2 != NULL);
+
+	struct mux_stream_io w = { 0 };
+	mux_stream_io_init(&w, stream_io_rebind_cb, s, EV_READ);
+	w.loop = fx.loop;
+	w.active = 1;
+	s->is_direct = true;
+	s->direct.w_io = &w;
+	g_rebind_target = s2;
+
+	mux_stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
+
+	const bool closed = (s->state == STREAM_CLOSED);
+	const bool s_released = (s->direct.w_io == NULL);
+	const bool w_bound = (w.stream == s2);
+	const int w_active = w.active;
+	const bool s2_bound = (s2->direct.w_io == &w);
+
+	s2->direct.w_io = NULL;
+	mux_stream_free(s2);
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT(closed);
+	T_EXPECT(s_released);
+	T_EXPECT(w_bound);
+	T_EXPECT_EQ(w_active, 1);
+	T_EXPECT(s2_bound);
+}
+
 /* Socket-mode local read path -- the only mode the shipped daemon uses.
  * local_cb's EV_READ branch drives stream_on_recv, which reads the local fd,
  * clamps the read to stream_read_credit_avail(), and queues the payload as a
@@ -2420,12 +2768,68 @@ T_DECLARE_CASE(test_local_cb_ev_read_pauses_on_zero_credit)
 	T_EXPECT(!rx_eof);
 }
 
+/* STREAM_INIT queues a single fast-open payload: the SYN carries only the
+ * send-queue head, so once one frame is queued stream_on_recv must stop reading
+ * even with credit left, and update_watcher must drop EV_READ. The default
+ * frame capacity (16376) is below the initial credit (16384), so a 16 KiB+
+ * burst would otherwise leave an 8-byte second frame queued behind the SYN. */
+T_DECLARE_CASE(test_local_cb_ev_read_init_queues_one_fast_open_frame)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = mux_stream_new(&fx.ss, 1, true);
+	T_CHECK(s != NULL);
+	s->is_direct = false;
+	s->socket.connected = true;
+	ev_io_set(&s->socket.w_io, fx.fds[1], EV_READ);
+	(void)fcntl(fx.fds[1], F_SETFL, O_NONBLOCK);
+
+	static unsigned char payload[MUX_DEFAULT_SEND_WINDOW + 64];
+	const ssize_t nw = write(fx.fds[0], payload, sizeof(payload));
+	T_CHECK(nw == (ssize_t)sizeof(payload));
+
+	const enum stream_state state = s->state;
+	const uint_fast32_t credit_before = stream_read_credit_avail(s);
+	ev_invoke(fx.loop, &s->socket.w_io, EV_READ);
+
+	const struct mux_frame *const head = s->send_queue.head;
+	const bool queued = (head != NULL);
+	const size_t head_len =
+		head != NULL ? head->len - MUX_FRAME_HEADER_SIZE : 0;
+	const bool second_frame = (head != NULL && head->next != NULL);
+	const uint_least32_t queued_bytes = s->queued_send_bytes;
+	const uint_fast32_t credit_after = stream_read_credit_avail(s);
+	/* modify_io_events stops the watcher rather than clearing its events. */
+	const bool read_armed = ev_is_active(&s->socket.w_io) &&
+				(s->socket.w_io.events & EV_READ) != 0;
+	/* The bytes past the first frame must still be unread on the socket. */
+	static unsigned char rest[sizeof(payload)];
+	const ssize_t nrest = recv(fx.fds[1], rest, sizeof(rest), MSG_DONTWAIT);
+
+	fx.fds[1] = -1;
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(state, (enum stream_state)STREAM_INIT);
+	T_EXPECT_EQ(credit_before, (uint_fast32_t)MUX_DEFAULT_SEND_WINDOW);
+	T_EXPECT(queued);
+	T_EXPECT(!second_frame);
+	T_EXPECT_EQ(queued_bytes, (uint_least32_t)head_len);
+	T_EXPECT(head_len < MUX_DEFAULT_SEND_WINDOW);
+	T_EXPECT(credit_after > 0);
+	T_EXPECT(!read_armed);
+	T_EXPECT_EQ(nrest, (ssize_t)(sizeof(payload) - head_len));
+}
+
 /* Socket-mode fast path in mux_stream_recv_copy: with an empty recvbuf and a
  * connected socket, the payload is written straight to the local fd, skipping
  * the recvbuf. EV_WRITE is armed so stream_notify_readable would NOT eager-
  * flush -- the bytes therefore reach the peer via the fast path, not a later
  * drain -- and buffered_bytes/recvbuf stay untouched. */
-T_DECLARE_CASE(test_stream_recv_copy_socket_fast_path_writes_to_fd)
+T_DECLARE_SUBCASE(recv_copy_socket_fast_path, const enum stream_state state)
 {
 	struct stream_fixture fx;
 	if (setup_fixture(&fx) != 0) {
@@ -2434,6 +2838,10 @@ T_DECLARE_CASE(test_stream_recv_copy_socket_fast_path_writes_to_fd)
 	}
 	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
+	s->state = state;
+	/* FIN_WAIT: the local reader hit EOF and our FIN has left, while the
+	 * local write side stays open for the peer's data. */
+	s->rx_eof = (state == STREAM_FIN_WAIT);
 	s->is_direct = false;
 	s->socket.connected = true;
 	ev_io_set(&s->socket.w_io, fx.fds[1], EV_WRITE);
@@ -2464,6 +2872,14 @@ T_DECLARE_CASE(test_stream_recv_copy_socket_fast_path_writes_to_fd)
 	T_EXPECT_EQ(buffered, (uint_least32_t)0);
 	T_EXPECT_EQ(recvbuf_readable, (size_t)0);
 	T_EXPECT(payload_matches);
+}
+
+/* The fast path covers every state that still receives PUSH from the peer:
+ * ESTABLISHED and FIN_WAIT (spec §4.2.1, half-closed download). */
+T_DECLARE_CASE(test_stream_recv_copy_socket_fast_path_writes_to_fd)
+{
+	T_CALL_SUBCASE(recv_copy_socket_fast_path, STREAM_ESTABLISHED);
+	T_CALL_SUBCASE(recv_copy_socket_fast_path, STREAM_FIN_WAIT);
 }
 
 /* stream_notify_readable's socket branch, happy path: with the write watcher
@@ -2595,13 +3011,201 @@ T_DECLARE_CASE(test_stream_notify_readable_survives_last_stream_freed)
 	T_EXPECT(freed);
 }
 
+/* A loopback TCP connection: fds[0] is the side a socket-mode stream is
+ * attached to, fds[1] the local client. A socketpair cannot tell an abortive
+ * close from a graceful one; TCP delivers the RST as ECONNRESET. */
+static int tcp_loopback_pair(int fds[2])
+{
+	fds[0] = fds[1] = -1;
+	struct sockaddr_in sa = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	socklen_t len = sizeof(sa);
+	const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (lfd == -1) {
+		return -1;
+	}
+	if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+	    listen(lfd, 1) != 0 ||
+	    getsockname(lfd, (struct sockaddr *)&sa, &len) != 0) {
+		(void)close(lfd);
+		return -1;
+	}
+	fds[1] = socket(AF_INET, SOCK_STREAM, 0);
+	if (fds[1] == -1 ||
+	    connect(fds[1], (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		(void)close(lfd);
+		if (fds[1] != -1) {
+			(void)close(fds[1]);
+			fds[1] = -1;
+		}
+		return -1;
+	}
+	fds[0] = accept(lfd, NULL, NULL);
+	(void)close(lfd);
+	if (fds[0] == -1) {
+		(void)close(fds[1]);
+		fds[1] = -1;
+		return -1;
+	}
+	return 0;
+}
+
+/* How the local client sees its connection end: 0 for a clean EOF, the recv
+ * errno for a reset, -1 for data or no end within the timeout. */
+static int local_close_outcome(const int fd)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	if (poll(&pfd, 1, 1000) != 1) {
+		return -1;
+	}
+	unsigned char b;
+	const ssize_t n = recv(fd, &b, sizeof(b), 0);
+	if (n == 0) {
+		return 0;
+	}
+	return (n < 0) ? errno : -1;
+}
+
+/* A locally aborted socket-mode stream sends RST to the mux peer; the local
+ * client must see a reset too, not a clean EOF it cannot tell from the end of
+ * a complete response. Driven by a flow-control violation, one of the local
+ * abort paths into mux_stream_abort. */
+T_DECLARE_CASE(test_stream_abort_resets_local_socket)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	int local_fds[2];
+	T_CHECK(tcp_loopback_pair(local_fds) == 0);
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	ev_io_set(&s->socket.w_io, local_fds[0], EV_NONE);
+	s->socket.connected = true;
+	s->grant_sent = 16;
+	s->recv_window = 65536;
+
+	unsigned char payload[24] = { 0 };
+	mux_stream_recv_copy(s, payload, sizeof(payload));
+	const enum stream_state state = s->state;
+	const bool rst_sent = s->rst_sent;
+	const int outcome = local_close_outcome(local_fds[1]);
+
+	(void)close(local_fds[1]);
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(rst_sent);
+	T_EXPECT_EQ(outcome, ECONNRESET);
+}
+
+/* Closing a socket-mode stream with data not yet delivered to the local client
+ * discards that data and resets the mux peer; the local client must be reset
+ * as well rather than handed a truncated stream ending in EOF. */
+T_DECLARE_CASE(test_stream_close_with_unread_data_resets_local_socket)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	int local_fds[2];
+	T_CHECK(tcp_loopback_pair(local_fds) == 0);
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	/* Local connect still in progress: received data stays buffered. */
+	ev_io_set(&s->socket.w_io, local_fds[0], EV_WRITE);
+	s->socket.connected = false;
+	s->grant_sent = 65536;
+	s->recv_window = 65536;
+	unsigned char payload[8] = { 0 };
+	mux_stream_recv_copy(s, payload, sizeof(payload));
+	const size_t unread = bytebuf_readable(s->recvbuf);
+
+	mux_stream_do_close(s);
+	const enum stream_state state = s->state;
+	const int outcome = local_close_outcome(local_fds[1]);
+
+	(void)close(local_fds[1]);
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(unread, sizeof(payload));
+	T_EXPECT_EQ(state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT_EQ(outcome, ECONNRESET);
+}
+
+/* Session teardown frees streams that are still live; per spec §5.6 they are
+ * implicitly aborted, so a socket-mode stream's local client must be reset. */
+T_DECLARE_CASE(test_stream_free_live_stream_resets_local_socket)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	int local_fds[2];
+	T_CHECK(tcp_loopback_pair(local_fds) == 0);
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	ev_io_set(&s->socket.w_io, local_fds[0], EV_NONE);
+	s->socket.connected = true;
+	T_CHECK(mux_sched_add_stream(&fx.ss, s));
+
+	/* The session's bulk teardown frees the still-ESTABLISHED stream. */
+	mux_sched_free_streams(&fx.ss);
+	const int outcome = local_close_outcome(local_fds[1]);
+
+	(void)close(local_fds[1]);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(outcome, ECONNRESET);
+}
+
+/* The counterpart: a stream that ends cleanly -- both FINs exchanged, every
+ * byte delivered -- must still end the local connection with a FIN. */
+T_DECLARE_CASE(test_stream_clean_close_ends_local_socket_with_eof)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	int local_fds[2];
+	T_CHECK(tcp_loopback_pair(local_fds) == 0);
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	s->state = STREAM_CLOSE_WAIT;
+	ev_io_set(&s->socket.w_io, local_fds[0], EV_NONE);
+	s->socket.connected = true;
+
+	mux_stream_mark_fin_sent(s);
+	const enum stream_state state = s->state;
+	const int outcome = local_close_outcome(local_fds[1]);
+
+	(void)close(local_fds[1]);
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(state, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT_EQ(outcome, 0);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_stream_grant_inc_uses_available_window),
 	T_CASE(test_stream_grant_inc_scales_under_pressure),
 	T_CASE(test_stream_dequeue_send_updates_queue_counters),
 	T_CASE(test_stream_dequeue_send_admits_close_wait),
+	T_CASE(test_stream_dequeue_send_nagle_hold_arms_flush),
+	T_CASE(test_stream_dequeue_send_no_hold_arms_no_flush),
 	T_CASE(test_stream_recv_window_grows_send_credit),
 	T_CASE(test_stream_recv_window_gates_ev_write_on_sendable_state),
+	T_CASE(test_stream_notify_recv_gates_ev_write_after_fin),
+	T_CASE(test_stream_recv_window_gates_ev_write_on_read_credit),
 	T_CASE(test_stream_close_oom_abortive_rst_counts_failed),
 	T_CASE(test_stream_recv_fin_advances_state),
 	T_CASE(test_stream_recv_rst_discards_buffered_data),
@@ -2619,6 +3223,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_stream_recv_fin_closes_user_closed_direct_stream),
 	T_CASE(test_stream_recv_fin_user_closed_direct_rsts_buffered_data),
 	T_CASE(test_stream_mark_fin_sent_user_closed_direct_rsts_buffered_data),
+	T_CASE(test_stream_recv_copy_user_closed_direct_rsts_without_fin),
+	T_CASE(test_stream_do_release_marks_rst_direct_stream_closed),
 	T_CASE(test_stream_shutdown_marks_rx_eof),
 	T_CASE(test_stream_recv_fin_ignored_after_mid_frame_abort),
 	T_CASE(test_stream_recv_fin_with_rx_eof_shuts_down_write),
@@ -2651,13 +3257,19 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_stream_io_start_rejects_gracefully_after_close),
 	T_CASE(test_stream_recv_rst_survives_reentrant_close_freeing_stream),
 	T_CASE(test_stream_abort_survives_reentrant_close_freeing_stream),
+	T_CASE(test_stream_abort_leaves_watcher_released_by_callback),
 	T_CASE(test_local_cb_ev_read_queues_frame_clamped_to_credit),
 	T_CASE(test_local_cb_ev_read_marks_rx_eof_on_peer_close),
 	T_CASE(test_local_cb_ev_read_pauses_on_zero_credit),
+	T_CASE(test_local_cb_ev_read_init_queues_one_fast_open_frame),
 	T_CASE(test_stream_recv_copy_socket_fast_path_writes_to_fd),
 	T_CASE(test_stream_recv_copy_notify_readable_eager_flush),
 	T_CASE(test_stream_recv_copy_fast_path_survives_last_stream_freed),
 	T_CASE(test_stream_notify_readable_survives_last_stream_freed),
+	T_CASE(test_stream_abort_resets_local_socket),
+	T_CASE(test_stream_close_with_unread_data_resets_local_socket),
+	T_CASE(test_stream_free_live_stream_resets_local_socket),
+	T_CASE(test_stream_clean_close_ends_local_socket_with_eof),
 	T_SUITE_END,
 };
 

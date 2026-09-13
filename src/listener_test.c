@@ -13,7 +13,9 @@
 
 #include <ev.h>
 
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -25,6 +27,14 @@ static const struct conf_socket_opts g_socket_opts = {
 	.backlog = 4,
 };
 
+/* Options for the accepted sockets only. The listening socket is opened with
+ * g_socket_opts, so an accepted socket cannot inherit TCP_NODELAY from it:
+ * only accept_cb() applying these can set it. */
+static const struct conf_socket_opts g_accept_opts = {
+	.tcp_nodelay = true,
+	.backlog = 4,
+};
+
 static int g_serve_fd;
 static int g_serve_calls;
 /* Peer address the serve callback received (accept-time @p accepted_sa) and the
@@ -32,6 +42,10 @@ static int g_serve_calls;
 static union sockaddr_max g_serve_peer;
 static union sockaddr_max g_serve_getpeer;
 static bool g_serve_getpeer_ok;
+/* The accepted descriptor's O_NONBLOCK, FD_CLOEXEC and TCP_NODELAY state. */
+static bool g_serve_nonblock;
+static bool g_serve_cloexec;
+static bool g_serve_nodelay;
 
 static void watchdog_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 {
@@ -56,6 +70,16 @@ static void test_serve(
 	g_serve_getpeer_ok =
 		fd >= 0 &&
 		getpeername(fd, &g_serve_getpeer.sa, &getpeerlen) == 0;
+	const int fl = fcntl(fd, F_GETFL);
+	g_serve_nonblock = fl != -1 && (fl & O_NONBLOCK) != 0;
+	const int fdfl = fcntl(fd, F_GETFD);
+	g_serve_cloexec = fdfl != -1 && (fdfl & FD_CLOEXEC) != 0;
+	int nodelay = 0;
+	socklen_t nodelaylen = sizeof(nodelay);
+	g_serve_nodelay = getsockopt(
+				  fd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
+				  &nodelaylen) == 0 &&
+			  nodelay != 0;
 	(void)close(fd);
 }
 
@@ -64,6 +88,9 @@ static void reset_serve_spy(void)
 	g_serve_fd = -1;
 	g_serve_calls = 0;
 	g_serve_getpeer_ok = false;
+	g_serve_nonblock = false;
+	g_serve_cloexec = false;
+	g_serve_nodelay = false;
 	memset(&g_serve_peer, 0, sizeof(g_serve_peer));
 	memset(&g_serve_getpeer, 0, sizeof(g_serve_getpeer));
 }
@@ -197,6 +224,37 @@ T_DECLARE_CASE(test_listener_stop_after_start)
 	T_EXPECT_EQ(accept_fd, -1);
 }
 
+/* listener_get_addr reports the bound address only while a socket is held. */
+T_DECLARE_CASE(test_listener_get_addr_tracks_socket)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+
+	struct listener l;
+	listener_init(&l, &g_socket_opts, test_serve, NULL, NULL);
+	union sockaddr_max before;
+	const bool has_before = listener_get_addr(&l, &before);
+
+	const union sockaddr_max sa = make_loopback_any(AF_INET);
+	T_CHECK(listener_start(&l, loop, &sa.sa));
+	union sockaddr_max started;
+	const bool has_started = listener_get_addr(&l, &started);
+	const bool started_loopback =
+		has_started && is_loopback_with_port(&started);
+	const int port = get_bound_port(&l);
+
+	listener_stop(&l, loop);
+	union sockaddr_max stopped;
+	const bool has_stopped = listener_get_addr(&l, &stopped);
+	ev_loop_destroy(loop);
+
+	T_EXPECT(!has_before);
+	T_EXPECT(has_started);
+	T_EXPECT(started_loopback);
+	T_EXPECT_EQ(has_started ? (int)ntohs(started.in.sin_port) : -1, port);
+	T_EXPECT(!has_stopped);
+}
+
 T_DECLARE_CASE(test_listener_start_bad_addr_fails)
 {
 	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
@@ -233,6 +291,9 @@ struct serve_capture {
 	int serve_fd;
 	bool getpeer_ok;
 	bool client_ok;
+	bool nonblock;
+	bool cloexec;
+	bool nodelay;
 	union sockaddr_max serve_peer;
 	union sockaddr_max serve_getpeer;
 	union sockaddr_max client;
@@ -266,6 +327,16 @@ T_DECLARE_SUBCASE(
 	T_EXPECT(is_loopback_with_port(&c->serve_peer));
 }
 
+/* Assert accept_cb() configured the accepted descriptor before serving it: the
+ * serve callbacks hand it straight to non-blocking libev I/O, it must not leak
+ * across exec, and the accept options' TCP_NODELAY is applied to it. */
+T_DECLARE_SUBCASE(assert_serve_fd_configured, const struct serve_capture *c)
+{
+	T_EXPECT(c->nonblock);
+	T_EXPECT(c->cloexec);
+	T_EXPECT(c->nodelay);
+}
+
 /* Drive one accepted connection through the listener for @p family, snapshot
  * the result, tear down, then assert — so a failing T_EXPECT can never leak the
  * loop or sockets. */
@@ -278,10 +349,12 @@ T_DECLARE_SUBCASE(serve_one_connection, int family)
 
 	struct listener l;
 	uint_least64_t accepted = 0;
-	listener_init(&l, &g_socket_opts, test_serve, NULL, &accepted);
+	listener_init(&l, &g_accept_opts, test_serve, NULL, &accepted);
 
 	const union sockaddr_max sa = make_loopback_any(family);
-	T_CHECK(listener_start(&l, loop, &sa.sa));
+	const int lfd = listener_open(&g_socket_opts, &sa.sa);
+	T_CHECK(lfd >= 0);
+	listener_start_fd(&l, loop, lfd);
 
 	const int port = get_bound_port(&l);
 	T_CHECK(port > 0);
@@ -320,6 +393,9 @@ T_DECLARE_SUBCASE(serve_one_connection, int family)
 	cap.accepted = accepted;
 	cap.serve_fd = g_serve_fd;
 	cap.getpeer_ok = g_serve_getpeer_ok;
+	cap.nonblock = g_serve_nonblock;
+	cap.cloexec = g_serve_cloexec;
+	cap.nodelay = g_serve_nodelay;
 	cap.serve_peer = g_serve_peer;
 	cap.serve_getpeer = g_serve_getpeer;
 
@@ -328,6 +404,7 @@ T_DECLARE_SUBCASE(serve_one_connection, int family)
 	ev_loop_destroy(loop);
 
 	T_CALL_SUBCASE(assert_serve_capture, family, &cap);
+	T_CALL_SUBCASE(assert_serve_fd_configured, &cap);
 }
 
 T_DECLARE_CASE(test_listener_serve_fn_called)
@@ -557,6 +634,7 @@ T_DECLARE_CASE(test_listener_accept_backoff_timer_restarts_accept)
 static const struct testing_suite suite[] = {
 	T_CASE(test_listener_start_binds_port),
 	T_CASE(test_listener_stop_after_start),
+	T_CASE(test_listener_get_addr_tracks_socket),
 	T_CASE(test_listener_start_bad_addr_fails),
 	T_CASE(test_listener_serve_fn_called),
 	T_CASE(test_listener_serve_fn_called_ipv6),

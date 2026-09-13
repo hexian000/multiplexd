@@ -8,12 +8,12 @@
  *        phase pair per direction.
  */
 
-#include "mux/estimator.h"
+#include "estimator.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/send.h"
-#include "mux/session.h"
+#include "frame.h"
+#include "mux.h"
+#include "send.h"
+#include "session.h"
 
 #include "algo/wndfilter.h"
 #include "binary/serialize.h"
@@ -157,10 +157,18 @@ static void phase_startup(
 		return;
 	}
 
-	/* fast-startup: increase effective BDP aggressively */
-	if (demand + demand / 2 > d->effective_bdp) {
-		d->effective_bdp = MIN(
-			d->effective_bdp * STARTUP_GROWTH_FACTOR, WNDSIZE_MAX);
+	/* fast-startup: increase effective BDP aggressively.  Neither product
+	 * may wrap: demand reaches SIZE_MAX through bdp_to_size, and a
+	 * TRACK→STARTUP re-entry keeps TRACK's uncapped effective_bdp.  The
+	 * demand × 1.5 > effective_bdp test is rearranged to subtract instead,
+	 * and the growth saturates at the cap it is clamped to anyway. */
+	const size_t demand_half = demand / 2;
+	if (demand_half > d->effective_bdp ||
+	    demand > d->effective_bdp - demand_half) {
+		d->effective_bdp =
+			d->effective_bdp > WNDSIZE_MAX / STARTUP_GROWTH_FACTOR ?
+				WNDSIZE_MAX :
+				d->effective_bdp * STARTUP_GROWTH_FACTOR;
 		d->stable_rounds = 0;
 		return;
 	}
@@ -198,8 +206,11 @@ static void phase_track(
 		return;
 	}
 
-	/* steady-state tracking: BDP × 1.25. */
-	d->effective_bdp = d->bdp + d->bdp / 4;
+	/* steady-state tracking: BDP × 1.25, saturated before window_size()
+	 * applies the protocol window cap. */
+	const size_t headroom = d->bdp / 4;
+	d->effective_bdp =
+		d->bdp > SIZE_MAX - headroom ? SIZE_MAX : d->bdp + headroom;
 }
 
 /* Per-PONG cycle inputs shared by both directions' calculations. */

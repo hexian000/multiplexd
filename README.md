@@ -26,6 +26,7 @@ multiplexd is a TCP stream multiplexer that solves most of the problems of tunne
   - [Client (client.json)](#client-clientjson)
   - [Multi-Peer Routing (`identity` block)](#multi-peer-routing-identity-block)
   - [Parallel Tunnels](#parallel-tunnels)
+  - [UDP Relay (`mux.lossymux`)](#udp-relay-muxlossymux)
 - [Observability](#observability)
   - [Endpoints](#endpoints)
     - [`GET /healthy`](#get-healthy)
@@ -67,6 +68,7 @@ multiplexd is a TCP stream multiplexer that solves most of the problems of tunne
 - **Transparent session resumption**: Reconnect replays unacknowledged frames; active streams survive transport loss.
 - **TCP half-close**: FIN semantics preserved end to end.
 - **Bidirectional forwarding**: Forward and reverse forwarding over one session.
+- **Best-effort UDP relay**: With `mux.lossymux`, UDP datagrams share the session. Under congestion they are dropped, never queued behind TCP.
 
 ### Performance and Fairness
 
@@ -122,7 +124,7 @@ The wire format is a fixed 8-byte frame header followed by an optional payload; 
 | **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)        | Per-channel byte window only                                               |
 | **Adaptive window tuning** | Per-direction 2-phase BDP estimator                                              | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
 | **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                           | None                                                                       |
-| **Config reload**          | Drains existing sessions in-process                                              | None built-in                                                                  | Re-execs the master process; existing child processes drain naturally      |
+| **Config reload**          | Updates live settings; normally drains existing sessions in-process               | None built-in                                                                  | Re-execs the master process; existing child processes drain naturally      |
 | **Observability**          | Health check, plain-text stats, Prometheus metrics                               | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors | Logging only                                                               |
 
 See [doc/spec.md](doc/spec.md) for the full wire protocol and state-machine specification.
@@ -286,8 +288,13 @@ Notes:
 - **When dialing, only the first entry is offered** — both TLS backends accept
   a single client-side PSK. A node that dials while holding several keys logs a
   warning naming the one it will use.
+- A PSK is always bound to SHA-256, on either TLS backend, so only the
+  SHA-256 suites of `tls.ciphersuites` are used, in their listed order, and a
+  list with no SHA-256 suite stops startup. Certificate mode uses the whole
+  list.
 - Values are lowercase hex or `@path`; a loaded file may end with a newline.
-  `tls.sni` has no effect, since there is no certificate to select.
+  `tls.sni` is not sent: the ClientHello carries no server name, since there
+  is no certificate for it to select.
 
 ### Multi-Peer Routing (`identity` block)
 
@@ -349,7 +356,7 @@ Traffic arriving on `127.0.1.1:8022` is sent over the session whose peer claimed
 
 ### Parallel Tunnels
 
-When `ENABLE_THREADS=ON`, each entry in `identity.mux_connect` runs on a dedicated thread. Repeating the same address opens multiple independent tunnels to that peer; new connections arriving on the matching `identity.listen` address are distributed across them round-robin.
+When `ENABLE_THREADS=ON`, each entry in `identity.mux_connect` runs on a dedicated thread. Repeating the same address opens multiple independent tunnels to that peer; new connections arriving on the matching `identity.listen` address are distributed round-robin across those currently established, so one tunnel reconnecting does not cost any connections while another is up.
 
 ```json
 {
@@ -374,6 +381,29 @@ When `ENABLE_THREADS=ON`, each entry in `identity.mux_connect` runs on a dedicat
 ```
 
 This configuration opens three parallel tunnels to `east.example.com:8443`. Each tunnel saturates one CPU core independently, so aggregate throughput scales with the number of tunnels.
+
+### UDP Relay (`mux.lossymux`)
+
+Enable `mux.lossymux` on **both** ends to relay UDP as well as TCP. It is a bilateral hello extension, so it stays inactive unless both peers enable it.
+
+```json
+{
+    "mux_connect": "server.example.com:8443",
+    "listen": "127.0.0.1:5353",
+    "mux": {
+        "lossymux": { "enabled": true, "idle_timeout": 60, "queue": 64 }
+    }
+}
+```
+
+- **Same addresses as TCP.** A UDP socket is bound on every `listen` and `identity.listen` address, on the same host and port as the TCP listener. The peer delivers each flow to its `connect` target over UDP, and replies return the same way. Reverse forwarding and identity routing work exactly as for TCP.
+- **One flow per client address.** Each client address:port is a flow, pinned to one tunnel. A flow lasts until `idle_timeout` seconds (default 60) pass without a datagram in either direction.
+- **Best effort.** Datagrams carry no retransmission, flow control or ordering guarantee beyond the TCP transport's own. A datagram is dropped, not delayed, in any of these cases:
+  - `queue` datagrams (default 64) are already waiting to be sent on a session;
+  - the session is down or reconnecting;
+  - the datagram is larger than `mux.max_frame_size` minus 8 bytes (16376 by default).
+- **Visible drops.** Drops appear in `/stats` (the "Datagrams" line) and in `/metrics` (`multiplexd_datagrams_dropped_total`).
+- **Reload.** The UDP sockets follow their TCP listeners across reloads. A session negotiates `lossymux` at its handshake, so enabling it on a running pair takes effect as the sessions reconnect.
 
 ## Observability
 
@@ -409,7 +439,7 @@ Same as `GET /stats`, plus per-interval bandwidth rates and server CPU load deri
 
 Returns metrics in Prometheus exposition format, including cumulative counters and gauges for current session/stream counts and server load.
 
-Metrics come in two flavours:
+Metrics come in two flavours (lossymux adds `multiplexd_datagrams_total`, `multiplexd_datagram_bytes_total`, `multiplexd_datagrams_dropped_total`, `multiplexd_udp_flows` and their `multiplexd_session_*` counterparts):
 
 - **Process-wide totals** — the unlabeled series, e.g. `multiplexd_send_buffered_frames`. These cover every tunnel, and monotonic counters keep accumulating across tunnel closures.
 - **Per-tunnel series** — the `multiplexd_session_*` family, labeled `identity` (the peer's identity) and `tunnel` (a monotonic, never-reused per-process index that stays stable across a tunnel's reconnects). Paired directional values carry `direction="rx"` / `direction="tx"`.
@@ -428,7 +458,7 @@ Returns the currently active configuration as JSON. TLS private key material is 
 
 #### `PUT /config`
 
-Replaces the active configuration with the JSON body of the request and performs a hot reload, identical in effect to `SIGHUP` with a new config file. The body must carry the full configuration, including TLS credentials (as `@path` references or inline PEM), and is capped at the same 65535-byte maximum as a config file loaded from disk. Returns `204 No Content` on success or `400 Bad Request` if the body fails to parse.
+Replaces the active configuration with the JSON body of the request and performs a hot reload, identical in effect to `SIGHUP` with a new config file except for `api_listen` (below). The body must carry the full configuration, including TLS credentials (as `@path` references or inline PEM), and is capped at the same 65535-byte maximum as a config file loaded from disk. The body cannot change `api_listen`: its value must equal the running one exactly (as written, not as resolved), and an `api_listen` added, removed or changed is refused with `403 Forbidden` and a `text/plain` explanation, applying nothing — only a `SIGHUP` reload of the config file can move the API listener, so a page that reaches a loopback API (e.g. through DNS rebinding) cannot re-expose it on another address. Returns `204 No Content` on success, `400 Bad Request` if the body fails to parse, `403 Forbidden` if it changes `api_listen`, or `500 Internal Server Error` if the configuration cannot be applied — for instance a listener fails to bind, or the server has received `SIGINT`/`SIGTERM` and is shutting down (an API connection opened earlier stays usable until shutdown finishes, but a reload is refused throughout). The running configuration is left unchanged in every failure case.
 
 ## Usage
 
@@ -507,6 +537,8 @@ To build without TLS support:
 ```bash
 cmake -DUSE_TLS_LIBRARY=none ..
 ```
+
+Such a build runs every connection in plaintext. A config that sets `tls.cert`, `tls.key`, `tls.authcerts` or a non-empty `tls.psk` makes it fail at startup rather than run unencrypted; the other `tls` keys are ignored.
 
 ### Convenience Builds
 
@@ -600,7 +632,7 @@ An idle multiplexd holds no periodic timer of its own: the maintenance tick is a
 
 Configuration:
 
-- **`mux.idle_timeout`** (default `0`, disabled) is the largest single lever. With no streams open, a dialed session closes completely — no keepalive frames, no socket, no timers, and no reconnect backoff — and the next connection redials on demand. A value of `60`–`300` suits interactive use. The cost is that the first connection after an idle period waits for a TCP and TLS handshake before its first byte.
+- **`mux.idle_timeout`** (default `0`, disabled) is the largest single lever. With no streams open, a dialed session closes completely — no keepalive frames, no socket, no timers, and no reconnect backoff — and the next connection redials on demand. A value of `60`–`300` suits interactive use. The cost is that the first connection after an idle period waits for a TCP and TLS handshake before its first byte. The close is graceful, so a TLS server releases its side at once; a plaintext server cannot tell it from a dropped connection and keeps the session suspended for `mux.resume_timeout`.
 - **`mux.nodelay: false`** enables in-tunnel coalescing, batching small writes into fewer frames at up to 40 ms of added delay each. For interactive traffic this cuts the packet count substantially.
 - **`mux.keepalive`** should be as *high* as the path allows, not low. It exists to hold a NAT binding open, and each probe is one radio wakeup; carrier NAT typically tolerates `300`–`600`. Leave it at the default `7200` if nothing on the path requires less. The inactivity deadline is derived from it and is not separately configurable.
 - **`mux.tcp.keepalive`** should stay `false` (the default) — it would duplicate the mux keepalive at the kernel level.
@@ -618,15 +650,17 @@ Build options:
 
 ### Configuration Reload
 
-There are two ways to trigger a reload: send `SIGHUP` to the process, or issue a `PUT /config` request to the API server. Both are equivalent in effect. `PUT /config` accepts the new configuration as a JSON body instead of reading from the config file, which makes it scriptable without touching the filesystem.
+There are two ways to trigger a reload: send `SIGHUP` to the process, or issue a `PUT /config` request to the API server. Both are equivalent in effect, except that `PUT /config` cannot change `api_listen` (it answers `403 Forbidden`); only `SIGHUP` can. `PUT /config` accepts the new configuration as a JSON body instead of reading from the config file, which makes it scriptable without touching the filesystem.
 
-On reload, all existing sessions drain: each session stops accepting new inbound streams, completes its current streams gracefully, then reconnects with the updated configuration. There is no timeout on the drain phase — a session with long-lived streams may remain open indefinitely. Settings that can be changed at runtime include:
+On reload, existing sessions normally drain: each session stops accepting new inbound streams, completes its current streams gracefully, then outbound sessions reconnect with the updated configuration. Lowering `max_sessions` to a positive limit preserves retained sessions instead of newly draining them, including when the old limit was unlimited. Their capacity reservations remain held, and new reservations cannot succeed until usage falls below the new limit. Explicitly removed outbound tunnels still drain, and removed identity peers still close immediately. There is no timeout on the drain phase — a session with long-lived streams may remain open indefinitely. Settings that can be changed at runtime include:
 
 - `loglevel` — applied immediately.
-- Live mux behavior applied to sessions before they drain: timeouts, keepalive, stream and session windows, `max_streams`, `max_halfopen`, `nodelay`, and `mem_pressure` thresholds.
-- Admission controls: `max_sessions` and `max_startups`.
-- Listener bind addresses (`listen`, `mux_listen`, `api_listen`): the listener is stopped and restarted on the new address.
-- Forward target (`connect`) and outbound addresses (`mux_connect`, `identity.mux_connect`): reconnects after drain use the new address.
+- Live mux behavior applied immediately to existing sessions: timeouts, keepalive, stream and session windows, `max_streams`, `max_halfopen`, `nodelay`, `mem_pressure` thresholds, and `lossymux.idle_timeout` / `lossymux.queue`.
+- `lossymux.enabled`: UDP sockets are bound or closed immediately; the extension itself is negotiated at each session's next handshake.
+- Admission controls: `max_sessions` and `max_startups`. `max_sessions` is a shared budget: outbound sessions count from creation, inbound sessions count before fresh establishment, and both keep their slot through suspension until destruction. Temporary inbound transports consume no slot and may resume an existing session at capacity, subject to `max_startups`. A zero session limit is unlimited; configured outbound sessions blocked by capacity are deferred and retried, with a warning at startup.
+- Listener bind addresses (`listen`, `mux_listen`, `api_listen`): the listener is stopped and restarted on the new address. `api_listen` changes only through `SIGHUP`; `PUT /config` refuses it.
+- Identity peers (`identity.listen`): only a peer whose listen address changed has its listener rebound; an unchanged peer's listener keeps its socket. Removing a peer does not drain its sessions: its listener and every session pooled for it are closed immediately, streams included.
+- Forward target (`connect`) and outbound addresses (`mux_connect`, `identity.mux_connect`): the next reconnect uses the new address.
 - TLS certificates, keys, trust roots, and TLS 1.3 cipher suites: applied to newly accepted sessions and future outbound reconnects.
 - `identity.verify`: read when a hello is processed, so it applies to newly accepted sessions and to the next handshake (resume or reconnect) of an existing one, never mid-session.
 

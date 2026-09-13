@@ -5,11 +5,11 @@
  * estimator.c is #included; clock_monotonic_ns redirected to a scripted mock;
  * mux_session_send_oob is the only other mocked collaborator; no siblings linked. */
 
-#include "mux/estimator.h"
+#include "estimator.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/session.h"
+#include "frame.h"
+#include "mux.h"
+#include "session.h"
 
 #include "algo/wndfilter.h"
 #include "binary/serialize.h"
@@ -28,7 +28,7 @@
 static int_fast64_t estimator_test_clock_monotonic_ns(void);
 
 #define clock_monotonic_ns estimator_test_clock_monotonic_ns
-#include "mux/estimator.c"
+#include "estimator.c"
 #undef clock_monotonic_ns
 
 /* mock - scripted monotonic clock, mux_session_send_oob spy, reset helper */
@@ -823,6 +823,71 @@ T_DECLARE_CASE(test_estimator_track_bdp_exceeds_effective_returns_to_startup)
 	T_EXPECT(!ss.estimator.ping_in_flight);
 }
 
+/* The first BDP above the size_t boundary for a 25% headroom calculation must
+ * saturate instead of wrapping to zero.  SIZE_MAX is UINT32_MAX on the affected
+ * 32-bit targets, while the same expression keeps the test reproducible on
+ * wider hosts. */
+T_DECLARE_CASE(test_estimator_track_saturates_large_bdp)
+{
+	struct mux_session ss = make_session();
+	const size_t bdp = SIZE_MAX - SIZE_MAX / 5 + 1;
+
+	ss.estimator.rx.phase = ESTIMATOR_TRACK;
+	ss.estimator.rx.bdp = bdp;
+	ss.estimator.rx.effective_bdp = bdp;
+
+	phase_track(&ss, &ss.estimator.rx, "rx");
+
+	T_EXPECT_EQ(ss.estimator.rx.phase, ESTIMATOR_TRACK);
+	T_EXPECT_EQ(ss.estimator.rx.effective_bdp, (size_t)SIZE_MAX);
+	T_EXPECT_EQ(
+		mux_estimator_rx_window_size(&ss.estimator),
+		(size_t)WNDSIZE_MAX);
+}
+
+/* A TRACK→STARTUP re-entry keeps TRACK's uncapped effective_bdp, so STARTUP's
+ * growth can start above SIZE_MAX / 3; it must saturate at the window cap
+ * instead of wrapping to a tiny window. */
+T_DECLARE_CASE(test_estimator_startup_growth_saturates_large_effective_bdp)
+{
+	struct mux_session ss = make_session();
+	const size_t effective_bdp = SIZE_MAX / STARTUP_GROWTH_FACTOR + 1;
+
+	wndfilter_reset(&ss.estimator.rx.bw_wnd, 0, INT64_C(100000000));
+	ss.estimator.rx.phase = ESTIMATOR_STARTUP;
+	ss.estimator.rx.effective_bdp = effective_bdp;
+	ss.estimator.rx.stable_rounds = 5;
+
+	/* demand × 1.5 > effective_bdp: window-limited. */
+	phase_startup(&ss, &ss.estimator.rx, effective_bdp, "rx");
+
+	T_EXPECT_EQ(ss.estimator.rx.phase, ESTIMATOR_STARTUP);
+	T_EXPECT_EQ(ss.estimator.rx.effective_bdp, (size_t)WNDSIZE_MAX);
+	T_EXPECT_EQ(ss.estimator.rx.stable_rounds, (size_t)0);
+	T_EXPECT_EQ(
+		mux_estimator_rx_window_size(&ss.estimator),
+		(size_t)WNDSIZE_MAX);
+}
+
+/* A saturated demand (bdp_to_size returns SIZE_MAX) must still read as
+ * window-limited: demand × 1.5 wrapping below effective_bdp would count a
+ * headroom round and, on the last one, exit STARTUP. */
+T_DECLARE_CASE(test_estimator_startup_saturated_demand_is_window_limited)
+{
+	struct mux_session ss = make_session();
+
+	wndfilter_reset(&ss.estimator.rx.bw_wnd, 0, INT64_C(100000000));
+	ss.estimator.rx.phase = ESTIMATOR_STARTUP;
+	ss.estimator.rx.effective_bdp = SIZE_MAX / 2;
+	ss.estimator.rx.stable_rounds = STARTUP_STABLE_ROUNDS - 1;
+
+	phase_startup(&ss, &ss.estimator.rx, SIZE_MAX, "rx");
+
+	T_EXPECT_EQ(ss.estimator.rx.phase, ESTIMATOR_STARTUP);
+	T_EXPECT_EQ(ss.estimator.rx.effective_bdp, (size_t)WNDSIZE_MAX);
+	T_EXPECT_EQ(ss.estimator.rx.stable_rounds, (size_t)0);
+}
+
 /* Mirror of test_estimator_track_bdp_exceeds_effective_returns_to_startup
  * for the tx direction: ack-clock alone must trigger TRACK→STARTUP
  * while the idle rx direction stays untouched. */
@@ -982,6 +1047,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_estimator_startup_window_limited_resets_stable_rounds),
 	T_CASE(test_estimator_track_bdp_within_effective_stays_track),
 	T_CASE(test_estimator_track_bdp_exceeds_effective_returns_to_startup),
+	T_CASE(test_estimator_track_saturates_large_bdp),
+	T_CASE(test_estimator_startup_growth_saturates_large_effective_bdp),
+	T_CASE(test_estimator_startup_saturated_demand_is_window_limited),
 	T_CASE(test_estimator_track_ack_bdp_exceeds_effective_returns_to_startup),
 	T_CASE(test_estimator_asymmetric_samples_grow_independently),
 	T_CASE(test_estimator_rtt_spike_does_not_inflate_window),

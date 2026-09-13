@@ -5,19 +5,21 @@
  * §5.7); unacked.c #included, real frame.c linked; benches opt-in via
  * TESTING_BENCH env. */
 
-#include "mux/unacked.h"
+#include "unacked.h"
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/session.h"
-#include "mux/unacked.c"
+#include "frame.h"
+#include "mux.h"
+#include "session.h"
+#include "unacked.c"
 
 #include "utils/slog.h"
 #include "utils/testing.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* mock - the test frame allocator and session fixture
  * Fixture: a minimal session carrying only the fields unacked.c touches. */
@@ -25,11 +27,17 @@
 struct frame_pool_ctx {
 	uint_least32_t alloc_calls;
 	uint_least32_t free_calls;
+	uint_least32_t failed_calls;
+	bool fail;
 };
 
 static struct mux_frame *unacked_test_alloc(void *data, const size_t size)
 {
 	struct frame_pool_ctx *const ctx = data;
+	if (ctx->fail) {
+		ctx->failed_calls++;
+		return NULL;
+	}
 	struct mux_frame *const frame = malloc(size);
 	if (frame != NULL) {
 		ctx->alloc_calls++;
@@ -44,12 +52,9 @@ static void unacked_test_free(void *data, struct mux_frame *frame)
 	free(frame);
 }
 
-/* session.c is not linked; mux_unacked_track_sent and unacked_push call
- * mux_session_reset directly on an unrecoverable desync, so stub it (counting
- * calls) to satisfy the link and let the malformed-layout tests assert it
- * fired. The unacked_push OOM path that also calls it is not exercised: forcing
- * mux_frame_ring_push's malloc to fail has no seam here (no fault-injection
- * allocator in this project's test style), and faking the ring's capacity to
+/* session.c is not linked: record resets for malformed layouts and prefix-copy
+ * OOM; cases retain ownership of any live send-buffer entry. The ring-growth
+ * OOM path has no frame-pool allocation seam, and faking the ring's capacity to
  * force an oversized grow doesn't work under ASan either -- sizes near its
  * allocation ceiling abort instead of returning NULL, and smaller ones aren't
  * guaranteed to fail (overcommit). */
@@ -88,7 +93,7 @@ static void uf_setup(struct unacked_fixture *restrict fx)
 /* Drain any frames left in the ring; returns true when every allocation was
  * freed.  Callers wrap this in T_EXPECT so the leak check counts as the case's
  * final assertion (this helper has no testing context of its own). */
-static bool uf_teardown(struct unacked_fixture *restrict fx)
+static bool uf_teardown(struct unacked_fixture *fx)
 {
 	mux_unacked_free_all(&fx->ss);
 	return fx->pool_ctx.alloc_calls == fx->pool_ctx.free_calls;
@@ -343,6 +348,208 @@ T_DECLARE_CASE(test_track_sent_rejects_overlong_header)
 	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)0);
 	T_EXPECT(mux_frame_ring_size(fx.ss.unacked.ring) == 0);
 	T_EXPECT_EQ(g_reset_calls, 1);
+
+	T_EXPECT(uf_teardown(&fx));
+}
+
+/* mux_unacked_track_partial: accounting of a partially written sendbuf head. */
+
+/* The complete leading sub-frames of a partially written entry enter the ring
+ * (stream-0 controls stripped, as for a fully sent entry) and are cut from the
+ * entry, which keeps only the in-flight remainder. */
+T_DECLARE_CASE(test_track_partial_moves_complete_prefix)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+
+	/* Layout: ctrl(len 4) | data(len 50) | data(len 70). */
+	const uint_least16_t ctrl_len[1] = { 4 };
+	struct mux_frame *const f = make_frame(
+		&fx, MUX_PROTOCOL_VERSION, STREAMID_CTRL, ctrl_len, 1);
+	T_CHECK(f != NULL);
+	const uint_least16_t data_len[2] = { 50, 70 };
+	struct mux_frame *const data =
+		make_frame(&fx, MUX_PROTOCOL_VERSION, 1, data_len, 2);
+	T_CHECK(data != NULL);
+	memcpy(f->data + f->len, data->data, data->len);
+	f->len += data->len;
+	mux_frame_put(&fx.ss.pool, data);
+	const size_t done = 2 * MUX_FRAME_HEADER_SIZE + 4 + 50;
+	f->pos = done + 10; /* 10 bytes into the last sub-frame */
+
+	mux_unacked_track_partial(&fx.ss, f);
+
+	struct mux_header hdr;
+	mux_read_header(f->data, &hdr);
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)1);
+	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)50);
+	T_EXPECT(mux_frame_ring_size(fx.ss.unacked.ring) == 1);
+	T_EXPECT_EQ(f->pos, (size_t)10);
+	T_EXPECT_EQ(f->len, (size_t)MUX_FRAME_HEADER_SIZE + 70);
+	T_EXPECT_EQ(hdr.length, 70);
+
+	/* Once the rest is written only the remainder is tracked. */
+	mux_unacked_track_sent(&fx.ss, f);
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)2);
+	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)(50 + 70));
+
+	T_EXPECT(uf_teardown(&fx));
+}
+
+/* A completed sequenced prefix cannot wait for its unsent remainder to be
+ * tracked: the peer can ACK it now. Failure to copy it resets the session. */
+T_DECLARE_CASE(test_track_partial_prefix_oom_resets)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+	g_reset_calls = 0;
+	const uint_least16_t lengths[2] = { 10, 10 };
+	struct mux_frame *const f =
+		make_frame(&fx, MUX_PROTOCOL_VERSION, 1, lengths, 2);
+	T_CHECK(f != NULL);
+	f->pos = MUX_FRAME_HEADER_SIZE + 10 + 1;
+	fx.pool_ctx.fail = true;
+	mux_unacked_track_partial(&fx.ss, f);
+	const int resets = g_reset_calls;
+	const uint_least32_t failures = fx.pool_ctx.failed_calls;
+	fx.pool_ctx.fail = false;
+	/* The reset spy only records calls; release the live entry ourselves. */
+	mux_frame_put(&fx.ss.pool, f);
+	const bool no_leak = uf_teardown(&fx);
+
+	T_EXPECT_EQ(resets, 1);
+	T_EXPECT_EQ(failures, (uint_least32_t)1);
+	T_EXPECT(no_leak);
+}
+
+/* Complete stream-0 controls require no resume record and therefore no
+ * allocation, even when the next sequenced frame is still only partly sent. */
+T_DECLARE_CASE(test_track_partial_ctrl_prefix_needs_no_allocation)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+	g_reset_calls = 0;
+	const uint_least16_t lengths[2] = { 4, 10 };
+	struct mux_frame *const f = make_frame(
+		&fx, MUX_PROTOCOL_VERSION, STREAMID_CTRL, lengths, 2);
+	T_CHECK(f != NULL);
+	struct mux_header hdr;
+	mux_read_header(f->data, &hdr);
+	hdr.flags = 0;
+	hdr.extra = MUX_CTRL_PING;
+	mux_write_header(f->data, &hdr);
+	mux_read_header(f->data + MUX_FRAME_HEADER_SIZE + 4, &hdr);
+	hdr.stream_id = 1;
+	mux_write_header(f->data + MUX_FRAME_HEADER_SIZE + 4, &hdr);
+	f->pos = MUX_FRAME_HEADER_SIZE + 4 + 1;
+	fx.pool_ctx.fail = true;
+	mux_unacked_track_partial(&fx.ss, f);
+	const int resets = g_reset_calls;
+	const uint_least32_t failures = fx.pool_ctx.failed_calls;
+	const size_t position = f->pos;
+	const size_t tracked = fx.ss.unacked.frames;
+	fx.pool_ctx.fail = false;
+	mux_unacked_track_sent(&fx.ss, f);
+	const size_t finished = fx.ss.unacked.frames;
+	const size_t bytes = fx.ss.unacked.bytes;
+	const bool ack_ok = mux_unacked_ack_recv(&fx.ss, 1).ok;
+	const bool no_leak = uf_teardown(&fx);
+
+	T_EXPECT_EQ(resets, 0);
+	T_EXPECT_EQ(failures, (uint_least32_t)0);
+	T_EXPECT_EQ(position, (size_t)MUX_FRAME_HEADER_SIZE + 4 + 1);
+	T_EXPECT_EQ(tracked, (size_t)0);
+	T_EXPECT_EQ(finished, (size_t)1);
+	T_EXPECT_EQ(bytes, (size_t)10);
+	T_EXPECT(ack_ok);
+	T_EXPECT(no_leak);
+}
+
+/* A write that completed no sub-frame, or a hello (never tracked), changes
+ * nothing and allocates nothing. */
+T_DECLARE_CASE(test_track_partial_without_complete_subframe_is_noop)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+
+	const uint_least16_t lengths[2] = { 40, 40 };
+	struct mux_frame *const f =
+		make_frame(&fx, MUX_PROTOCOL_VERSION, 1, lengths, 2);
+	T_CHECK(f != NULL);
+	struct mux_frame *const hello = make_frame(&fx, 0, 1, lengths, 2);
+	T_CHECK(hello != NULL);
+	f->pos = MUX_FRAME_HEADER_SIZE + 39;
+	hello->pos = MUX_FRAME_HEADER_SIZE + 45;
+	const uint_least32_t allocs = fx.pool_ctx.alloc_calls;
+
+	fx.pool_ctx.fail = true;
+	mux_unacked_track_partial(&fx.ss, f);
+	mux_unacked_track_partial(&fx.ss, hello);
+	fx.pool_ctx.fail = false;
+
+	T_EXPECT_EQ(fx.pool_ctx.alloc_calls, allocs);
+	T_EXPECT_EQ(fx.pool_ctx.failed_calls, (uint_least32_t)0);
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)0);
+	T_EXPECT_EQ(f->pos, (size_t)MUX_FRAME_HEADER_SIZE + 39);
+	T_EXPECT_EQ(hello->pos, (size_t)MUX_FRAME_HEADER_SIZE + 45);
+	T_EXPECT_EQ(hello->len, (size_t)2 * (MUX_FRAME_HEADER_SIZE + 40));
+
+	mux_frame_put(&fx.ss.pool, f);
+	mux_frame_put(&fx.ss.pool, hello);
+	T_EXPECT(uf_teardown(&fx));
+}
+
+/* A partially written replay copy's complete sub-frames widen the replay ACK
+ * bound by exactly that many; an ACK trimming into its entry shrinks both copy
+ * counters, so the copy's retirement folds in the entry's current count. */
+T_DECLARE_CASE(test_track_partial_replay_copy_bounds_ack)
+{
+	struct unacked_fixture fx;
+	uf_setup(&fx);
+
+	const uint_least16_t lengths[3] = { 10, 20, 30 };
+	mux_unacked_track_sent(
+		&fx.ss, make_frame(&fx, MUX_PROTOCOL_VERSION, 1, lengths, 3));
+	T_CHECK(fx.ss.unacked.frames == 3);
+	unacked_set_replay_off(&fx.ss.unacked, 0);
+	struct mux_frame *const copy =
+		make_frame(&fx, MUX_PROTOCOL_VERSION, 1, lengths, 3);
+	T_CHECK(copy != NULL);
+	fx.ss.unacked.retransmit_copy = copy;
+	fx.ss.unacked.retransmit_copy_count = 3;
+	fx.ss.unacked.retransmit_copy_sent = 0;
+	copy->pos = 2 * MUX_FRAME_HEADER_SIZE + 10 + 20 + 4;
+
+	fx.pool_ctx.fail = true;
+	mux_unacked_track_partial(&fx.ss, copy);
+	fx.pool_ctx.fail = false;
+	const size_t sent = fx.ss.unacked.retransmit_copy_sent;
+	const size_t copy_len = copy->len;
+	const size_t copy_pos = copy->pos;
+
+	const bool beyond_ok = mux_unacked_ack_recv(&fx.ss, 3).ok;
+	const bool within_ok = mux_unacked_ack_recv(&fx.ss, 2).ok;
+	const size_t left = fx.ss.unacked.frames;
+	const size_t copy_count = fx.ss.unacked.retransmit_copy_count;
+	const size_t copy_sent = fx.ss.unacked.retransmit_copy_sent;
+	const bool next_ok = mux_unacked_ack_recv(&fx.ss, 1).ok;
+
+	mux_unacked_track_sent(&fx.ss, copy); /* the copy retires */
+
+	T_EXPECT_EQ(sent, (size_t)2);
+	T_EXPECT_EQ(fx.pool_ctx.failed_calls, (uint_least32_t)0);
+	T_EXPECT_EQ(copy_len, (size_t)MUX_FRAME_HEADER_SIZE + 30);
+	T_EXPECT_EQ(copy_pos, (size_t)4);
+	T_EXPECT(!beyond_ok);
+	T_EXPECT(within_ok);
+	T_EXPECT_EQ(left, (size_t)1);
+	T_EXPECT_EQ(copy_count, (size_t)1);
+	T_EXPECT_EQ(copy_sent, (size_t)0);
+	T_EXPECT(!next_ok); /* the last sub-frame is not on the wire yet */
+	T_EXPECT_EQ(fx.ss.unacked.retransmitted_frames, (size_t)1);
+	T_EXPECT_EQ(fx.ss.unacked.retransmit_off, (size_t)1);
+	T_EXPECT_EQ(fx.ss.unacked.retransmit_copy_sent, (size_t)0);
+	T_EXPECT(mux_unacked_ack_recv(&fx.ss, 1).ok);
 
 	T_EXPECT(uf_teardown(&fx));
 }
@@ -1095,6 +1302,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_track_sent_retransmit_copy_advances_cursor),
 	T_CASE(test_track_sent_rejects_truncated_trailer),
 	T_CASE(test_track_sent_rejects_overlong_header),
+	T_CASE(test_track_partial_moves_complete_prefix),
+	T_CASE(test_track_partial_prefix_oom_resets),
+	T_CASE(test_track_partial_ctrl_prefix_needs_no_allocation),
+	T_CASE(test_track_partial_without_complete_subframe_is_noop),
+	T_CASE(test_track_partial_replay_copy_bounds_ack),
 	T_CASE(test_stall_gate_raise_and_clear),
 	T_CASE(test_ack_trim_overflow_rejected),
 	T_CASE(test_ack_trim_zero_noop),

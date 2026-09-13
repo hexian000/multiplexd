@@ -5,13 +5,14 @@
  * allocation, coalescing, control-frame emission); sched.c #included, its
  * collaborators mocked; benches opt-in via TESTING_BENCH env. */
 
-#include "mux/frame.h"
-#include "mux/mux.h"
-#include "mux/sched.c"
-#include "mux/session.h"
-#include "mux/stream.h"
+#include "frame.h"
+#include "mux.h"
+#include "sched.c"
+#include "session.h"
+#include "stream.h"
 
 #include "algo/hashtable.h"
+#include "meta/arraysize.h"
 #include "utils/testing.h"
 
 #include <ev.h>
@@ -51,9 +52,15 @@ static int g_notify_recv_calls;
 static int g_flush_calls;
 static int g_mark_syn_sent_calls;
 static int g_stream_free_calls;
+static int g_stream_orphan_calls;
 static int g_emit_ack_calls;
 static int g_stream_check_ack_calls;
 static int g_session_initiate_shutdown_calls;
+/* When set, mux_session_send_ctrl() fails as on frame-pool OOM. */
+static bool g_send_ctrl_fail;
+static int g_abort_unopened_calls;
+/* Stream ids in the order mux_stream_mark_syn_sent() saw them. */
+static uint_least16_t g_syn_ids[4];
 
 static void sched_test_reset(void)
 {
@@ -72,9 +79,13 @@ static void sched_test_reset(void)
 	g_flush_calls = 0;
 	g_mark_syn_sent_calls = 0;
 	g_stream_free_calls = 0;
+	g_stream_orphan_calls = 0;
 	g_emit_ack_calls = 0;
 	g_stream_check_ack_calls = 0;
 	g_session_initiate_shutdown_calls = 0;
+	g_send_ctrl_fail = false;
+	g_abort_unopened_calls = 0;
+	memset(g_syn_ids, 0, sizeof(g_syn_ids));
 }
 
 static void
@@ -107,15 +118,28 @@ void mux_session_notify(struct mux_session *restrict ss)
 	}
 }
 
+/* Models mux_wire_sendbuf_push()'s effect on an occupied sendbuf without
+ * materialising the frame: it packs onto the open staging tail or is appended
+ * by reference as the new one, so the tail is open for packing either way. */
+static void sched_test_model_sendbuf_push(struct mux_session *restrict ss)
+{
+	if (ss->wire.sendbuf.head != NULL) {
+		ss->wire.sendbuf_staging = true;
+	}
+}
+
 bool mux_session_send_ctrl(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id,
 	const uint_fast8_t flags, const uint_fast32_t extra)
 {
-	(void)ss;
 	g_send_ctrl_calls++;
 	g_last_ctrl_stream_id = stream_id;
 	g_last_ctrl_flags = flags;
 	g_last_ctrl_extra = extra;
+	if (g_send_ctrl_fail) {
+		return false;
+	}
+	sched_test_model_sendbuf_push(ss);
 	return true;
 }
 
@@ -132,10 +156,10 @@ void mux_stream_mark_fin_sent(struct mux_stream *s)
 }
 
 void mux_session_send_push(
-	struct mux_session *ss, struct mux_stream *restrict s,
+	struct mux_session *ss, struct mux_stream *s,
 	struct mux_frame *restrict frame)
 {
-	(void)ss;
+	sched_test_model_sendbuf_push(ss);
 	g_send_push_calls++;
 	g_last_sent_frame = frame;
 	g_last_push_stream_id = s->id;
@@ -157,7 +181,7 @@ void mux_stream_notify_recv(struct mux_stream *restrict s)
 	g_notify_recv_calls++;
 }
 
-void mux_session_flush(struct mux_session *restrict ss)
+void mux_session_flush(struct mux_session *ss)
 {
 	(void)ss;
 	g_flush_calls++;
@@ -165,6 +189,10 @@ void mux_session_flush(struct mux_session *restrict ss)
 
 void mux_stream_mark_syn_sent(struct mux_stream *s)
 {
+	const size_t n = (size_t)g_mark_syn_sent_calls;
+	if (n < ARRAY_SIZE(g_syn_ids)) {
+		g_syn_ids[n] = s->id;
+	}
 	g_mark_syn_sent_calls++;
 	s->state = STREAM_SYN_SENT;
 }
@@ -175,9 +203,18 @@ void mux_stream_free(struct mux_stream *s)
 	free(s);
 }
 
-void mux_stream_do_close(struct mux_stream *s)
+void mux_stream_orphan(struct mux_stream *s)
 {
-	(void)s;
+	g_stream_orphan_calls++;
+	s->state = STREAM_CLOSED;
+	s->orphaned = true;
+}
+
+void mux_stream_abort_unopened(struct mux_stream *s)
+{
+	g_abort_unopened_calls++;
+	s->state = STREAM_CLOSED;
+	s->session->sched.num_closed++;
 }
 
 void mux_session_emit_ack(struct mux_session *restrict ss)
@@ -192,7 +229,7 @@ void mux_stream_check_ack(struct mux_stream *restrict s)
 	g_stream_check_ack_calls++;
 }
 
-void mux_session_initiate_shutdown(struct mux_session *restrict ss)
+void mux_session_initiate_shutdown(struct mux_session *ss)
 {
 	(void)ss;
 	g_session_initiate_shutdown_calls++;
@@ -390,11 +427,14 @@ T_DECLARE_CASE(test_sched_free_streams_clears_stream_counter)
 	T_EXPECT(mux_sched_add_stream(&ss, first));
 	T_EXPECT(mux_sched_add_stream(&ss, second));
 	ss.unacked.stalled = true;
+	first->state = STREAM_CLOSED;
+	ss.sched.num_closed = 1;
 
 	mux_sched_free_streams(&ss);
 	T_EXPECT(ss.cnt.stream.num_stream_failed == NULL);
 	T_EXPECT_EQ(g_stream_free_calls, 2);
 	T_EXPECT(ss.sched.streams == NULL);
+	T_EXPECT_EQ(ss.sched.num_closed, (size_t)0);
 	/* The send-stall gate is not the scheduler's to clear: it belongs to the
 	 * reliability module and falls with the unacked bytes in
 	 * mux_unacked_free_all(), which every teardown caller pairs with this. Assert
@@ -590,32 +630,31 @@ T_DECLARE_CASE(test_sched_flush_ctrl_skips_closed_streams)
 	cleanup_session(&ss);
 }
 
-/* mux_sched_check_no_active_streams treats a table of only tombstones (CLOSED
- * streams awaiting late-frame suppression) as "no active streams": it compares
- * table_size against num_tombstones, not against zero. Verify a draining
- * ESTABLISHED session shuts down only once the last live entry is counted as a
- * tombstone. */
-T_DECLARE_CASE(test_sched_check_no_active_streams_subtracts_tombstones)
+/* CLOSED entries remain inactive independently of tombstone timer ownership. */
+T_DECLARE_CASE(test_sched_check_no_active_streams_subtracts_closed_entries)
 {
 	struct mux_session ss;
 	make_session(&ss);
-	struct mux_stream tomb = { .id = 3, .state = STREAM_CLOSED };
+	struct mux_stream stream = { .id = 3, .state = STREAM_ESTABLISHED };
 
 	sched_test_reset();
 	ss.draining = true;
-	T_EXPECT(mux_sched_add_stream(&ss, &tomb));
-
-	/* num_tombstones (0) < table_size (1): the CLOSED entry still counts as
-	 * active, so no drain-shutdown. */
-	ss.sched.num_tombstones = 0;
+	T_EXPECT(mux_sched_add_stream(&ss, &stream));
 	mux_sched_check_no_active_streams(&ss);
 	T_EXPECT_EQ(g_session_initiate_shutdown_calls, 0);
 
-	/* num_tombstones (1) == table_size (1): the sole entry is a tombstone,
-	 * so the session has no active streams and the drain completes. */
-	ss.sched.num_tombstones = 1;
+	stream.state = STREAM_CLOSED;
+	ss.sched.num_closed = 1;
+	/* No timer is active: an application-held CLOSED entry still cannot
+	 * block drain, and its removal balances the table count. */
 	mux_sched_check_no_active_streams(&ss);
 	T_EXPECT_EQ(g_session_initiate_shutdown_calls, 1);
+	ss.draining = false;
+	ss.conf.idle_timeout = 1;
+	mux_sched_check_no_active_streams(&ss);
+	T_EXPECT(ev_is_active(&ss.w_idle_timeout));
+	sched_remove_stream(&ss, &stream);
+	T_EXPECT_EQ(ss.sched.num_closed, (size_t)0);
 
 	cleanup_session(&ss);
 }
@@ -703,6 +742,104 @@ T_DECLARE_CASE(test_sched_sole_stream_drains_without_requeue)
 	cleanup_session(&ss);
 }
 
+/* Drive one mux_sched_next_data pass over an ESTABLISHED stream with an ACK and
+ * a FIN pending while mux_session_send_ctrl fails as on frame-pool OOM. */
+static void sched_test_ctrl_oom_pass(
+	struct mux_session *restrict ss, struct mux_stream *restrict s)
+{
+	*s = (struct mux_stream){
+		.id = 7,
+		.state = STREAM_ESTABLISHED,
+		.ack_pending = true,
+		.rx_eof = true,
+		.recv_window = 4 * MUX_WINDOW_UNIT,
+	};
+	sched_test_reset();
+	g_stream_grant_inc = 2;
+	g_send_ctrl_fail = true;
+	sched_enqueue(ss, s);
+	T_CHECK(!mux_sched_next_data(ss));
+	g_send_ctrl_fail = false;
+}
+
+/* A failed ACK|FIN send (frame-pool OOM) must re-arm the stream: it is already
+ * dequeued and mux_stream_check_ack bails while ack_pending is set, so without
+ * a retry a receive-only stream never grants credit again and its FIN never
+ * leaves. */
+T_DECLARE_CASE(test_sched_send_ctrl_flags_oom_rearms_stream)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	struct mux_stream stream;
+	sched_test_ctrl_oom_pass(&ss, &stream);
+
+	const bool rearmed = stream.delay_pending &&
+			     ss.sched.delay_head == &stream &&
+			     stream.delay_ticks == 1;
+	const bool coalesce_armed = ev_is_active(&ss.sched.w_coalesce);
+
+	mux_sched_delay_remove(&ss, &stream);
+	ev_timer_stop(ss.loop, &ss.sched.w_coalesce);
+	cleanup_session(&ss);
+
+	T_EXPECT_EQ(g_send_ctrl_calls, 1);
+	T_EXPECT(rearmed);
+	T_EXPECT(coalesce_armed);
+	T_EXPECT(stream.ack_pending);
+	T_EXPECT_EQ(g_mark_fin_sent_calls, 0);
+}
+
+/* Once the pool recovers, the coalescing tick re-wakes the stream and the
+ * retried ACK|FIN goes out. */
+T_DECLARE_CASE(test_sched_send_ctrl_flags_oom_retries_next_tick)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	struct mux_stream stream;
+	sched_test_ctrl_oom_pass(&ss, &stream);
+
+	sched_coalesce_cb(ss.loop, &ss.sched.w_coalesce, EV_TIMER);
+	const bool rewoken = ss.sched.sched_head == &stream;
+	(void)mux_sched_next_data(&ss);
+
+	ev_timer_stop(ss.loop, &ss.sched.w_coalesce);
+	cleanup_session(&ss);
+
+	T_EXPECT(rewoken);
+	T_EXPECT_EQ(g_send_ctrl_calls, 2);
+	T_EXPECT_EQ(
+		g_last_ctrl_flags, (uint_fast8_t)(MUX_FLAG_ACK | MUX_FLAG_FIN));
+	T_EXPECT(!stream.ack_pending);
+	T_EXPECT_EQ(g_mark_fin_sent_calls, 1);
+}
+
+/* A SYN the frame pool cannot allocate aborts the stream as a failed open
+ * (no RST: nothing reached the peer) rather than closing it gracefully. */
+T_DECLARE_CASE(test_sched_drain_lp_syn_oom_aborts_unopened)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	struct mux_stream stream = {
+		.id = 11,
+		.state = STREAM_INIT,
+		.session = &ss,
+	};
+
+	sched_test_reset();
+	g_stream_grant_inc = 3;
+	g_send_ctrl_fail = true;
+	sched_lp_enqueue(&ss, &stream);
+	mux_sched_drain_lp(&ss);
+
+	cleanup_session(&ss);
+
+	T_EXPECT_EQ(g_send_ctrl_calls, 1);
+	T_EXPECT_EQ(g_last_ctrl_flags, (uint_fast8_t)MUX_FLAG_SYN);
+	T_EXPECT_EQ(g_abort_unopened_calls, 1);
+	T_EXPECT_EQ(g_mark_syn_sent_calls, 0);
+	T_EXPECT_EQ(stream.state, (enum stream_state)STREAM_CLOSED);
+}
+
 T_DECLARE_CASE(test_sched_drain_lp_sends_syn_for_init_stream)
 {
 	struct mux_session ss;
@@ -722,6 +859,117 @@ T_DECLARE_CASE(test_sched_drain_lp_sends_syn_for_init_stream)
 	T_EXPECT_EQ(g_mark_syn_sent_calls, 1);
 	T_EXPECT_EQ(stream.state, (enum stream_state)STREAM_SYN_SENT);
 
+	cleanup_session(&ss);
+}
+
+/* A partially written frame at the sendbuf head defers the INIT SYN batch
+ * without popping: the first-opened stream stays at lp_head across repeated
+ * passes, and once the head drains the SYNs leave in open order. */
+T_DECLARE_CASE(test_sched_drain_lp_defers_syn_behind_partial_write_in_order)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	struct mux_stream s1 = { .id = 1, .state = STREAM_INIT };
+	struct mux_stream s3 = { .id = 3, .state = STREAM_INIT };
+	struct mux_frame inflight = {
+		.pos = 5,
+		.len = MUX_FRAME_HEADER_SIZE + 16,
+	};
+
+	sched_test_reset();
+	sched_lp_enqueue(&ss, &s1);
+	sched_lp_enqueue(&ss, &s3);
+	/* A partial write freezes the head (flush_sendbuf_head closes staging). */
+	mux_frame_list_push(&ss.wire.sendbuf, &inflight);
+	ss.wire.sendbuf_staging = false;
+
+	for (int pass = 0; pass < 2; pass++) {
+		mux_sched_drain_lp(&ss);
+		T_EXPECT(ss.sched.lp_head == &s1);
+		T_EXPECT(s1.next == &s3);
+		T_EXPECT(ss.sched.lp_tail == &s3);
+		T_EXPECT(s1.sched_queue == SCHED_QUEUE_LP);
+	}
+	T_EXPECT_EQ(g_send_ctrl_calls, 0);
+	T_EXPECT_EQ(g_mark_syn_sent_calls, 0);
+
+	/* The head is fully written and popped; the re-armed drain proceeds. */
+	(void)mux_frame_list_pop(&ss.wire.sendbuf);
+	mux_sched_drain_lp(&ss);
+	T_EXPECT_EQ(g_mark_syn_sent_calls, 2);
+	T_EXPECT_EQ(g_syn_ids[0], (uint_least16_t)1);
+	T_EXPECT_EQ(g_syn_ids[1], (uint_least16_t)3);
+	T_EXPECT(ss.sched.lp_head == NULL);
+	T_EXPECT(ss.sched.lp_tail == NULL);
+
+	cleanup_session(&ss);
+}
+
+/* A frozen head that has not started writing (pos == 0, a blocked flush) does
+ * not defer the batch, and a SYN|PUSH appended by reference behind it opens a
+ * new staging tail, so the following SYN still joins the same batch. */
+T_DECLARE_CASE(test_sched_drain_lp_batches_syn_after_by_reference_push)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	struct mux_stream s1 = { .id = 1, .state = STREAM_INIT };
+	struct mux_stream s3 = { .id = 3, .state = STREAM_INIT };
+	struct mux_frame blocked = { .len = MUX_FRAME_HEADER_SIZE + 16 };
+	struct mux_frame fastopen = { .len = MUX_FRAME_HEADER_SIZE + 32 };
+
+	sched_test_reset();
+	mux_frame_list_push(&s1.send_queue, &fastopen);
+	sched_lp_enqueue(&ss, &s1);
+	sched_lp_enqueue(&ss, &s3);
+	mux_frame_list_push(&ss.wire.sendbuf, &blocked);
+	ss.wire.sendbuf_staging = false;
+
+	mux_sched_drain_lp(&ss);
+	T_EXPECT_EQ(g_send_push_calls, 1);
+	T_EXPECT(g_last_sent_frame == &fastopen);
+	T_EXPECT_EQ(g_send_ctrl_calls, 1);
+	T_EXPECT_EQ(g_last_ctrl_flags, (uint_fast8_t)MUX_FLAG_SYN);
+	T_EXPECT_EQ(g_mark_syn_sent_calls, 2);
+	T_EXPECT_EQ(g_syn_ids[0], (uint_least16_t)1);
+	T_EXPECT_EQ(g_syn_ids[1], (uint_least16_t)3);
+	T_EXPECT(ss.sched.lp_head == NULL);
+
+	ss.wire.sendbuf = (struct mux_frame_list){ 0 };
+	cleanup_session(&ss);
+}
+
+/* A SYN that fails (frame-pool OOM) while the sendbuf tail is frozen leaves no
+ * staging tail to pack into, so the batch stops there: the next INIT stream
+ * stays queued for the drain the sendbuf's drain re-arms, rather than taking
+ * its own SYN attempt into the same shortage. */
+T_DECLARE_CASE(test_sched_drain_lp_failed_syn_behind_frozen_tail_stops_batch)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	struct mux_stream s1 = { .id = 1,
+				 .state = STREAM_INIT,
+				 .session = &ss };
+	struct mux_stream s3 = { .id = 3,
+				 .state = STREAM_INIT,
+				 .session = &ss };
+	struct mux_frame blocked = { .len = MUX_FRAME_HEADER_SIZE + 16 };
+
+	sched_test_reset();
+	g_send_ctrl_fail = true;
+	sched_lp_enqueue(&ss, &s1);
+	sched_lp_enqueue(&ss, &s3);
+	mux_frame_list_push(&ss.wire.sendbuf, &blocked);
+	ss.wire.sendbuf_staging = false;
+
+	mux_sched_drain_lp(&ss);
+	T_EXPECT_EQ(g_send_ctrl_calls, 1);
+	T_EXPECT_EQ(g_last_ctrl_stream_id, (uint_fast16_t)1);
+	T_EXPECT_EQ(g_mark_syn_sent_calls, 0);
+	T_EXPECT(ss.sched.lp_head == &s3);
+	T_EXPECT(ss.sched.lp_tail == &s3);
+	T_EXPECT_EQ(s3.state, (enum stream_state)STREAM_INIT);
+
+	ss.wire.sendbuf = (struct mux_frame_list){ 0 };
 	cleanup_session(&ss);
 }
 
@@ -850,6 +1098,7 @@ T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 	}
 	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)4);
 	ss.sched.num_tombstones = 2;
+	ss.sched.num_closed = 2;
 	/* Live count = 4 - 2 = 2 < max_streams(4), so admission OK. */
 	{
 		struct mux_stream *const s = calloc(1, sizeof(*s));
@@ -1292,6 +1541,60 @@ T_DECLARE_CASE(test_sched_drain_lp_frees_closed_stream)
 	cleanup_session(&ss);
 }
 
+/* A CLOSED direct stream the application has not closed yet (a peer RST or
+ * local abort closed it under the application) must not be freed when its
+ * tombstone hands it to cleanup: the application still holds the pointer. It
+ * stays in the stream table until mux_stream_close() releases it (user_closed)
+ * and wakes it again, and is freed on that pass. */
+T_DECLARE_CASE(test_sched_drain_lp_holds_unreleased_direct_stream)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	sched_test_reset();
+
+	struct mux_stream *const s = malloc(sizeof(*s));
+	T_CHECK(s != NULL);
+	*s = (struct mux_stream){
+		.id = 7,
+		.state = STREAM_CLOSED,
+		.is_direct = true,
+	};
+	void *elem = s;
+	ss.sched.streams = table_set(
+		ss.sched.streams, (const void *)(uintptr_t)s->id, &elem);
+	T_CHECK(ss.sched.streams != NULL);
+	ss.sched.num_closed = 1;
+	sched_lp_enqueue(&ss, s);
+
+	mux_sched_drain_lp(&ss);
+	const int held_free_calls = g_stream_free_calls;
+	const size_t held_table_size = table_size(ss.sched.streams);
+	bool held_dequeued = false;
+
+	/* Reach the stream through the table, so it is touched again only if
+	 * the first pass kept it allocated. */
+	struct mux_stream *const held = mux_sched_find_stream(&ss, 7);
+	if (held != NULL) {
+		held_dequeued = ss.sched.lp_head == NULL &&
+				held->sched_queue == SCHED_QUEUE_NONE;
+		held->user_closed = true;
+		mux_sched_wake(&ss, held);
+		mux_sched_drain_lp(&ss);
+	}
+	const int released_free_calls = g_stream_free_calls;
+	const size_t released_table_size = table_size(ss.sched.streams);
+	const size_t released_closed = ss.sched.num_closed;
+
+	cleanup_session(&ss);
+
+	T_EXPECT_EQ(held_free_calls, 0);
+	T_EXPECT_EQ(held_table_size, (size_t)1);
+	T_EXPECT(held_dequeued);
+	T_EXPECT_EQ(released_free_calls, 1);
+	T_EXPECT_EQ(released_table_size, (size_t)0);
+	T_EXPECT_EQ(released_closed, (size_t)0);
+}
+
 /* sched_coalesce_cb decrements a multi-tick delay without expiring it. */
 T_DECLARE_CASE(test_sched_coalesce_cb_decrements_multi_tick)
 {
@@ -1312,6 +1615,50 @@ T_DECLARE_CASE(test_sched_coalesce_cb_decrements_multi_tick)
 	cleanup_session(&ss);
 }
 
+/* A delay entry re-arming the coalescing timer while SUSPENDED: once the entry
+ * is released the timer stops, even though the session-ACK backlog is kept for
+ * resume (it cannot be emitted until the session is ESTABLISHED again). */
+T_DECLARE_CASE(test_sched_coalesce_stops_when_suspended_with_ack_backlog)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	ss.state = SESSION_SUSPENDED;
+	ss.unacked.unreported = 4;
+	struct mux_stream stream = { .id = 5, .state = STREAM_ESTABLISHED };
+
+	sched_test_reset();
+	mux_sched_delay(&ss, &stream, 1);
+	T_EXPECT(ev_is_active(&ss.sched.w_coalesce));
+
+	sched_coalesce_cb(ss.loop, &ss.sched.w_coalesce, EV_TIMER);
+	T_EXPECT(ss.sched.delay_head == NULL);
+	T_EXPECT(ss.sched.sched_head == &stream);
+	T_EXPECT(!ev_is_active(&ss.sched.w_coalesce));
+	T_EXPECT_EQ(ss.unacked.unreported, (uint_least32_t)4);
+	T_EXPECT_EQ(g_emit_ack_calls, 0);
+
+	ss.sched.sched_head = ss.sched.sched_tail = NULL;
+	cleanup_session(&ss);
+}
+
+/* While ESTABLISHED the timer keeps running for a pending session-ACK backlog
+ * even with an empty delay list: it is what emits the deferred ACK. */
+T_DECLARE_CASE(test_sched_coalesce_keeps_running_for_established_backlog)
+{
+	struct mux_session ss;
+	make_session(&ss);
+	ss.unacked.unreported = 1;
+
+	sched_test_reset();
+	mux_sched_coalesce_arm(&ss);
+	sched_coalesce_cb(ss.loop, &ss.sched.w_coalesce, EV_TIMER);
+	T_EXPECT(ev_is_active(&ss.sched.w_coalesce));
+	T_EXPECT_EQ(ss.unacked.ack_ticks, (uint_least8_t)1);
+
+	ev_timer_stop(ss.loop, &ss.sched.w_coalesce);
+	cleanup_session(&ss);
+}
+
 static const struct testing_suite suite[] = {
 	T_CASE(test_sched_alloc_stream_id_nearly_full),
 	T_CASE(test_sched_alloc_stream_id_starts_at_minimum),
@@ -1324,11 +1671,17 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_sched_send_ctrl_flags_emits_ack_and_fin),
 	T_CASE(test_sched_flush_ctrl_includes_drr_active),
 	T_CASE(test_sched_flush_ctrl_skips_closed_streams),
-	T_CASE(test_sched_check_no_active_streams_subtracts_tombstones),
+	T_CASE(test_sched_check_no_active_streams_subtracts_closed_entries),
 	T_CASE(test_sched_next_data_reroutes_closed_stream_to_lp),
 	T_CASE(test_sched_next_data_sends_frame_and_resets_deficit_on_drain),
 	T_CASE(test_sched_sole_stream_drains_without_requeue),
+	T_CASE(test_sched_send_ctrl_flags_oom_rearms_stream),
+	T_CASE(test_sched_send_ctrl_flags_oom_retries_next_tick),
+	T_CASE(test_sched_drain_lp_syn_oom_aborts_unopened),
 	T_CASE(test_sched_drain_lp_sends_syn_for_init_stream),
+	T_CASE(test_sched_drain_lp_defers_syn_behind_partial_write_in_order),
+	T_CASE(test_sched_drain_lp_batches_syn_after_by_reference_push),
+	T_CASE(test_sched_drain_lp_failed_syn_behind_frozen_tail_stops_batch),
 	T_CASE(test_sched_coalesce_forces_session_ack_after_tick_budget),
 	T_CASE(test_sched_next_data_skips_empty_queue_stream),
 	T_CASE(test_sched_next_data_exhausts_queue_returns_false),
@@ -1347,7 +1700,10 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_sched_send_ctrl_flags_subunit_clears_ack),
 	T_CASE(test_sched_remove_stream_drain_and_absent),
 	T_CASE(test_sched_drain_lp_frees_closed_stream),
+	T_CASE(test_sched_drain_lp_holds_unreleased_direct_stream),
 	T_CASE(test_sched_coalesce_cb_decrements_multi_tick),
+	T_CASE(test_sched_coalesce_stops_when_suspended_with_ack_backlog),
+	T_CASE(test_sched_coalesce_keeps_running_for_established_backlog),
 	/* Opt-in micro-benchmark: ~1s, skipped by the default (unfiltered) run.
 	 * Select with `--bench <ere>` or TESTING_BENCH. */
 	T_BENCH(bench_sched_enqueue_dequeue),

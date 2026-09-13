@@ -5,27 +5,32 @@
  * re-arming, graceful/forced shutdown, drain, socket-option helper);
  * session.c #included; all sibling-module collaborators mocked below. */
 
-#include "mux/session.h"
+#include "session.h"
 
-#include "mux/estimator.h"
-#include "mux/frame.h"
-#include "mux/handshake.h"
-#include "mux/mux.h"
-#include "mux/recv.h"
-#include "mux/sched.h"
-#include "mux/send.h"
-#include "mux/session.c"
-#include "mux/stream.h"
-#include "mux/unacked.h"
-#include "mux/wire.h"
+#include "estimator.h"
+#include "frame.h"
+#include "handshake.h"
+#include "mux.h"
+#include "recv.h"
+#include "sched.h"
+#include "send.h"
+#include "session.c"
+#include "stream.h"
+#include "unacked.h"
+#include "wire.h"
 
 #include "algo/hashtable.h"
+#include "meta/arraysize.h"
+#include "os/socket.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
 #include <ev.h>
 
+#include <errno.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -38,12 +43,16 @@
 /* Configurable mock results: each test sets these before driving the code under
  * test, then restores the inert default.  Declared here so the mock bodies
  * below can read them. */
+static int g_drop_dgrams_calls;
 static bool g_session_send_oob_result = true;
 static int g_session_send_oob_calls;
 static uint_fast8_t g_last_send_oob_extra;
+static size_t g_last_send_oob_len;
 static enum wire_shutdown_state g_wire_shutdown_result = WIRE_SHUTDOWN_DONE;
 static enum wire_eof_result g_wire_wait_eof_result = WIRE_EOF_CONFIRMED;
 static bool g_wire_tls_start_result = true;
+static int g_adopt_tlsconn_calls;
+static bool g_last_adopt_offload;
 static uint_least16_t g_alloc_stream_id_result = STREAMID_CTRL;
 static struct mux_stream *g_stream_new_result = NULL;
 static bool g_sched_add_stream_result = true;
@@ -107,6 +116,7 @@ void mux_sched_free_streams(struct mux_session *restrict ss)
 	ss->sched.lp_tail = NULL;
 	ss->sched.delay_head = NULL;
 	ss->sched.num_tombstones = 0;
+	ss->sched.num_closed = 0;
 	ss->sched.next_stream_id = 0;
 	if (ss->sched.streams != NULL) {
 		table_free(ss->sched.streams);
@@ -114,12 +124,17 @@ void mux_sched_free_streams(struct mux_session *restrict ss)
 	}
 }
 
+void mux_sched_free_orphans(struct mux_session *restrict ss)
+{
+	(void)ss;
+}
+
 /* Mirror the real sched.c helper (mux_session_initiate_shutdown is the linked
  * session.c one) so the handshake_done drain/idle-arm cases keep observing its
  * effect without pulling in the rest of sched.c. */
-void mux_sched_check_no_active_streams(struct mux_session *restrict ss)
+void mux_sched_check_no_active_streams(struct mux_session *ss)
 {
-	if (table_size(ss->sched.streams) != ss->sched.num_tombstones) {
+	if (table_size(ss->sched.streams) != ss->sched.num_closed) {
 		return;
 	}
 	if (ss->state != SESSION_ESTABLISHED) {
@@ -199,12 +214,12 @@ void mux_session_flush_oob(struct mux_session *restrict ss)
 	(void)ss;
 }
 
-void mux_session_on_recv(struct mux_session *restrict ss)
+void mux_session_on_recv(struct mux_session *ss)
 {
 	(void)ss;
 }
 
-void mux_session_on_send(struct mux_session *restrict ss)
+void mux_session_on_send(struct mux_session *ss)
 {
 	(void)ss;
 }
@@ -215,10 +230,17 @@ bool mux_session_send_oob(
 {
 	(void)ss;
 	(void)payload;
-	(void)payload_len;
 	g_session_send_oob_calls++;
 	g_last_send_oob_extra = extra;
+	g_last_send_oob_len = payload_len;
 	return g_session_send_oob_result;
+}
+
+/* Mirrors send.c: frees every queued datagram frame. */
+void mux_session_drop_dgrams(struct mux_session *restrict ss)
+{
+	g_drop_dgrams_calls++;
+	mux_frame_list_clear(&ss->wire.dgrambuf, &ss->pool);
 }
 
 struct mux_stream *mux_stream_new(
@@ -247,7 +269,7 @@ static int g_unacked_track_sent_calls = 0;
 static const struct mux_frame *g_last_track_sent_frame;
 
 void mux_unacked_track_sent(
-	struct mux_session *restrict ss, struct mux_frame *restrict frame)
+	struct mux_session *ss, struct mux_frame *restrict frame)
 {
 	/* Real mux_unacked_track_sent takes ownership; reclaim here to avoid leaks
 	 * when a test routes a captured sendbuf frame through this path. Record
@@ -258,10 +280,13 @@ void mux_unacked_track_sent(
 }
 
 void mux_wire_adopt_tlsconn(
-	struct mux_session *restrict ss, struct tls_connection *restrict conn)
+	struct mux_session *restrict ss, struct tls_connection *restrict conn,
+	const bool offload)
 {
 	(void)ss;
 	(void)conn;
+	g_adopt_tlsconn_calls++;
+	g_last_adopt_offload = offload;
 }
 
 void mux_wire_tlsconn_free(struct tls_connection *restrict conn)
@@ -368,10 +393,45 @@ static void session_test_on_event(
 static int g_reentrant_attach_fd = -1;
 static int g_suspended_event_count = 0;
 static int g_connect_event_count = 0;
+static int g_connect_failed_event_count = 0;
+
+static int g_reentrant_lost_event_count = 0;
+static enum session_state g_reentrant_lost_observed_state;
+static int g_reentrant_connect_failed_event_count = 0;
+static enum session_state g_reentrant_connect_failed_observed_state;
+
+/* A lifecycle callback may synchronously tear down the session.  The state
+ * transition must be visible before the callback so this reset is a no-op and
+ * does not re-emit MUX_EVENT_LOST. */
+static void session_test_on_event_reentrant_reset(
+	void *data, struct mux_session *ss, const enum mux_event event,
+	const union mux_event_data edata)
+{
+	(void)data;
+	(void)edata;
+	if (event == MUX_EVENT_CONNECT_FAILED) {
+		g_reentrant_connect_failed_event_count++;
+		g_reentrant_connect_failed_observed_state = ss->state;
+		if (g_reentrant_connect_failed_event_count == 1) {
+			mux_session_reset(ss);
+		}
+		return;
+	}
+	if (event != MUX_EVENT_LOST) {
+		return;
+	}
+	g_reentrant_lost_event_count++;
+	g_reentrant_lost_observed_state = ss->state;
+	if (g_reentrant_lost_event_count == 1) {
+		mux_session_reset(ss);
+	}
+}
 
 /* Mimics tunnel_on_event reconnecting synchronously on MUX_EVENT_SUSPENDED
- * (handle_transport_lost -> tunnel_do_connect): reenters mux_session_attach_fd
- * from inside mux_session_suspend's own emit; only on the first SUSPENDED. */
+ * (handle_transport_lost -> tunnel_do_connect), or an owner that redials as
+ * soon as a resume attempt reports MUX_EVENT_CONNECT_FAILED: reenters
+ * mux_session_attach_fd from inside mux_session_suspend's own emit; only on the
+ * first such event. */
 static void session_test_on_event_reentrant_reconnect(
 	void *data, struct mux_session *ss, const enum mux_event event,
 	const union mux_event_data edata)
@@ -380,8 +440,14 @@ static void session_test_on_event_reentrant_reconnect(
 	(void)edata;
 	switch (event) {
 	case MUX_EVENT_SUSPENDED:
-		g_suspended_event_count++;
-		if (g_suspended_event_count == 1) {
+	case MUX_EVENT_CONNECT_FAILED:
+		if (event == MUX_EVENT_SUSPENDED) {
+			g_suspended_event_count++;
+		} else {
+			g_connect_failed_event_count++;
+		}
+		if (g_suspended_event_count + g_connect_failed_event_count ==
+		    1) {
 			mux_session_attach_fd(ss, g_reentrant_attach_fd);
 		}
 		break;
@@ -808,30 +874,64 @@ T_DECLARE_CASE(test_socket_user_timeout_sets_option)
 	(void)close(fd);
 }
 
-/* mux_session_log_frame_header / format_frame_flags: VERYVERBOSE-gated diagnostic.
- * Exercises the flag-name join, the unknown-bit branch, and the NONE branch. */
+/* format_frame_flags: the "|" join in names[] order, the UNKNOWN(...) suffix for
+ * bits outside MUX_FLAG_MASK, NONE for no flags, and NUL-terminated truncation
+ * that never writes past buflen; then the VERYVERBOSE log wrapper around it. */
+T_DECLARE_SUBCASE(
+	expect_frame_flags, const size_t buflen, const uint_fast8_t flags,
+	const char *expect)
+{
+	char buf[64];
+	T_CHECK(buflen < sizeof(buf));
+	(void)memset(buf, 'x', sizeof(buf));
+	format_frame_flags(buf, buflen, flags);
+	/* Bytes at and past buflen stay untouched. */
+	for (size_t i = buflen; i < sizeof(buf); i++) {
+		T_EXPECT_EQ(buf[i], 'x');
+	}
+	if (buflen == 0) {
+		return;
+	}
+	/* NUL-terminated within buflen, even when truncated. */
+	T_EXPECT(memchr(buf, '\0', buflen) != NULL);
+	T_EXPECT_STREQ(buf, expect);
+}
+
 T_DECLARE_CASE(test_session_log_frame_header_formats_flags)
 {
+	const uint_fast8_t all = MUX_FLAG_SYN | MUX_FLAG_ACK | MUX_FLAG_FIN |
+				 MUX_FLAG_RST | MUX_FLAG_PUSH;
+	const uint_fast8_t unknown = (uint_least8_t)(~MUX_FLAG_MASK);
+
+	T_CALL_SUBCASE(expect_frame_flags, 63, all, "SYN|ACK|FIN|RST|PUSH");
+	T_CALL_SUBCASE(expect_frame_flags, 63, MUX_FLAG_FIN, "FIN");
+	T_CALL_SUBCASE(
+		expect_frame_flags, 63, MUX_FLAG_ACK | MUX_FLAG_PUSH,
+		"ACK|PUSH");
+	T_CALL_SUBCASE(
+		expect_frame_flags, 63, MUX_FLAG_SYN | unknown,
+		"SYN|UNKNOWN(0xe0)");
+	T_CALL_SUBCASE(expect_frame_flags, 63, 0x40, "UNKNOWN(0x40)");
+	T_CALL_SUBCASE(expect_frame_flags, 63, 0, "NONE");
+
+	/* Truncation: the separator and names stop one byte short of buflen. */
+	T_CALL_SUBCASE(expect_frame_flags, 0, all, "");
+	T_CALL_SUBCASE(expect_frame_flags, 1, all, "");
+	T_CALL_SUBCASE(expect_frame_flags, 4, all, "SYN");
+	T_CALL_SUBCASE(expect_frame_flags, 5, all, "SYN|");
+	T_CALL_SUBCASE(expect_frame_flags, 6, all, "SYN|A");
+	T_CALL_SUBCASE(
+		expect_frame_flags, 8, MUX_FLAG_SYN | unknown, "SYN|UNK");
+	T_CALL_SUBCASE(expect_frame_flags, 3, 0, "NO");
+
 	struct session_fixture fx;
 	if (setup_fixture(&fx) != 0) {
 		T_FATAL("setup_fixture failed");
 		return;
 	}
-
 	unsigned char raw[MUX_FRAME_HEADER_SIZE] = { 0 };
-	/* Multiple known flags: exercises the "|" separator join. */
-	struct mux_header hdr = {
-		.flags = MUX_FLAG_SYN | MUX_FLAG_ACK | MUX_FLAG_FIN |
-			 MUX_FLAG_RST | MUX_FLAG_PUSH,
-	};
+	struct mux_header hdr = { .flags = (uint_least8_t)all };
 	mux_session_log_frame_header(&fx.ss, "all-flags", raw, &hdr);
-	/* Known flag plus unknown bits: exercises the UNKNOWN(...) branch. */
-	hdr.flags = MUX_FLAG_SYN | (uint_least8_t)(~MUX_FLAG_MASK);
-	mux_session_log_frame_header(&fx.ss, "unknown", raw, &hdr);
-	/* No flags: exercises the NONE branch. */
-	hdr.flags = 0;
-	mux_session_log_frame_header(&fx.ss, "none", raw, &hdr);
-
 	teardown_fixture(&fx);
 }
 
@@ -1048,6 +1148,104 @@ T_DECLARE_CASE(test_attach_fd_clears_stale_transport_error)
 
 	T_EXPECT_EQ(after_attach, 0);
 	T_EXPECT_EQ(data.closed.err, 0);
+}
+
+/* The graceful-close and resume deadlines are one-shot reuses of
+ * w_connect_timeout that leave repeat at 0.0, and a dialed session either one
+ * closed is redialed from CLOSED. That attach must still arm the connect
+ * deadline, or a blackholed SYN or a stalled handshake wedges the redial. */
+T_DECLARE_CASE(test_attach_fd_from_closed_arms_connect_deadline)
+{
+	for (int i = 0; i < 2; i++) {
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_ESTABLISHED;
+		fx.ss.conf.connect_timeout = 15;
+		fx.ss.conf.resume_timeout = 30;
+		/* As mux_session_new arms it. */
+		ev_timer_set(&fx.ss.w_connect_timeout, 0.0, 15.0);
+		if (i == 0) {
+			/* Graceful close: CLOSING -> CLOSE_WAIT -> CLOSED. */
+			mux_session_initiate_shutdown(&fx.ss);
+			T_CHECK(fx.ss.state == SESSION_CLOSING);
+			closing_cb(&fx.ss);
+			T_CHECK(fx.ss.state == SESSION_CLOSE_WAIT);
+			close_wait_cb(&fx.ss);
+		} else {
+			/* Resume-deadline expiry: SUSPENDED -> CLOSED. */
+			fx.ss.handshake.has_session_id = true;
+			mux_session_suspend(&fx.ss);
+			T_CHECK(fx.ss.state == SESSION_SUSPENDED);
+			connect_timeout_cb(
+				fx.ss.loop, &fx.ss.w_connect_timeout, EV_TIMER);
+		}
+		T_CHECK(fx.ss.state == SESSION_CLOSED);
+		fx.fds[0] = -1; /* closed with the old transport */
+
+		mux_session_attach_fd(&fx.ss, fx.fds[1]);
+
+		const enum session_state state = fx.ss.state;
+		const bool active = ev_is_active(&fx.ss.w_connect_timeout);
+		const ev_tstamp repeat = fx.ss.w_connect_timeout.repeat;
+		ev_timer_stop(fx.ss.loop, &fx.ss.w_connect_timeout);
+		teardown_fixture(&fx);
+
+		T_EXPECT_EQ(state, (enum session_state)SESSION_CONNECT);
+		T_EXPECT(active);
+		T_EXPECT_EQ(repeat, 15.0);
+	}
+}
+
+/* mux_session_attach_fd un-drains only a genuinely fresh (re)connect: a drain
+ * requested on a CLOSED client is dropped by the next attach, which starts a new
+ * session rather than resuming the drained one. */
+T_DECLARE_CASE(test_attach_fd_fresh_connect_clears_draining)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_CLOSED;
+	mux_session_drain(&fx.ss);
+	const bool draining_before = fx.ss.draining;
+
+	mux_session_attach_fd(&fx.ss, fx.fds[1]);
+	const enum session_state state_after = fx.ss.state;
+	const bool draining_after = fx.ss.draining;
+
+	teardown_fixture(&fx);
+
+	T_EXPECT(draining_before);
+	T_EXPECT_EQ(state_after, (enum session_state)SESSION_CONNECT);
+	T_EXPECT(!draining_after);
+}
+
+/* ...while a reattach from SESSION_SUSPENDED is a resume attempt and keeps the
+ * pending drain, so a transport blip cannot cancel a reload drain. */
+T_DECLARE_CASE(test_attach_fd_resume_keeps_draining)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_SUSPENDED;
+	mux_session_drain(&fx.ss);
+	const bool draining_before = fx.ss.draining;
+
+	mux_session_attach_fd(&fx.ss, fx.fds[1]);
+	const enum session_state state_after = fx.ss.state;
+	const bool draining_after = fx.ss.draining;
+
+	teardown_fixture(&fx);
+
+	T_EXPECT(draining_before);
+	T_EXPECT_EQ(state_after, (enum session_state)SESSION_CONNECT);
+	T_EXPECT(draining_after);
 }
 
 /* session_on_dead_link: a negotiated session id suspends for resume; without
@@ -1352,8 +1550,11 @@ T_DECLARE_CASE(test_timeout_and_send_timeout_callbacks)
 	}
 }
 
-/* keepalive_cb emits a PROBE (or logs and skips on pool exhaustion) and re-arms
- * the keepalive timer; the session stays ESTABLISHED either way. */
+/* keepalive_cb emits an empty PING (or logs and skips on pool exhaustion) and
+ * re-arms the keepalive timer; the session stays ESTABLISHED either way.  The
+ * PING, unlike a one-way PROBE, obliges the peer to answer, so an idle
+ * session's inbound deadline never depends on the peer's keepalive setting;
+ * the empty payload keeps its PONG out of the estimator's RTT cycle. */
 T_DECLARE_CASE(test_keepalive_cb_emits_and_rearms)
 {
 	struct session_fixture fx;
@@ -1374,26 +1575,30 @@ T_DECLARE_CASE(test_keepalive_cb_emits_and_rearms)
 	const bool armed_after_skip = ev_is_active(&fx.ss.w_keepalive);
 	const double repeat_after_skip = fx.ss.w_keepalive.repeat;
 
-	g_session_send_oob_result = true; /* normal PROBE branch */
+	g_session_send_oob_result = true; /* normal PING branch */
+	g_last_send_oob_len = SIZE_MAX;
 	keepalive_cb(fx.ss.loop, &fx.ss.w_keepalive, EV_TIMER);
 	const int calls_after_probe = g_session_send_oob_calls;
 	const uint_fast8_t probe_extra = g_last_send_oob_extra;
+	const size_t probe_len = g_last_send_oob_len;
 	const bool armed_after_probe = ev_is_active(&fx.ss.w_keepalive);
 	const double repeat_after_probe = fx.ss.w_keepalive.repeat;
+	const enum session_state state = fx.ss.state;
+	/* Teardown up front; a failing check below must not leak it. */
+	teardown_fixture(&fx);
 
-	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_ESTABLISHED);
-	/* A PROBE is emitted on both branches; only the pool result differs. */
+	T_EXPECT_EQ(state, (enum session_state)SESSION_ESTABLISHED);
+	/* A PING is emitted on both branches; only the pool result differs. */
 	T_EXPECT_EQ(calls_after_skip, 1);
 	T_EXPECT_EQ(calls_after_probe, 2);
-	T_EXPECT_EQ(probe_extra, (uint_fast8_t)MUX_CTRL_PROBE);
-	/* Re-armed for the next cycle on both branches -- a skipped PROBE must
+	T_EXPECT_EQ(probe_extra, (uint_fast8_t)MUX_CTRL_PING);
+	T_EXPECT_EQ(probe_len, (size_t)0);
+	/* Re-armed for the next cycle on both branches -- a skipped PING must
 	 * not stop keepalive. */
 	T_EXPECT(armed_after_skip);
 	T_EXPECT(armed_after_probe);
 	T_EXPECT(repeat_after_skip > lo && repeat_after_skip <= 5.0);
 	T_EXPECT(repeat_after_probe > lo && repeat_after_probe <= 5.0);
-
-	teardown_fixture(&fx);
 }
 
 /* connect_timeout_cb covers the resume-timeout (SUSPENDED) and close-timeout
@@ -1444,10 +1649,9 @@ T_DECLARE_CASE(test_connect_timeout_cb_states)
 		teardown_fixture(&fx);
 	}
 	{
-		/* mux_session_suspend()'s own precondition excludes SESSION_CONNECT
-		 * (transport not up yet), so a resumable session timing out
-		 * there must still fall through to the ordinary close path,
-		 * not attempt to suspend. */
+		/* Likewise a resume attempt whose SYN was blackholed: the
+		 * server still holds the session, so timing out in CONNECT
+		 * must not destroy it either. */
 		struct session_fixture fx;
 		if (setup_handshake_fixture(&fx) != 0) {
 			T_FATAL("setup_handshake_fixture failed");
@@ -1458,18 +1662,219 @@ T_DECLARE_CASE(test_connect_timeout_cb_states)
 		fx.ss.handshake.has_session_id = true;
 		connect_timeout_cb(
 			fx.ss.loop, &fx.ss.w_connect_timeout, EV_TIMER);
+		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_SUSPENDED);
+		T_EXPECT(fx.ss.handshake.has_session_id);
+		fx.fds[0] = -1; /* mux_session_suspend closed it */
+		teardown_fixture(&fx);
+	}
+	{
+		/* A fresh connect (no session id yet) has nothing to resume
+		 * and still closes. */
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		fx.ss.state = SESSION_CONNECT;
+		fx.ss.accepted = false;
+		fx.ss.handshake.has_session_id = false;
+		connect_timeout_cb(
+			fx.ss.loop, &fx.ss.w_connect_timeout, EV_TIMER);
 		T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
 		fx.fds[0] = -1;
 		teardown_fixture(&fx);
 	}
 }
 
-/* mux_session_suspend() must pay back the num_session_halfopen increment when
- * suspending out of SESSION_HANDSHAKE, since mux_session_set_state()'s own
- * accounting deliberately excludes SUSPENDED from that payback (a suspended
- * resume attempt is still "pending") -- and if this session is later torn
- * down straight from SUSPENDED, oldstate is SUSPENDED then too, so nothing
- * else pays the debt. */
+/* Events a failed resume attempt reports, recorded by
+ * session_test_on_event_record. */
+struct recorded_events {
+	int connect_failed;
+	int connect_failed_err;
+	int suspended;
+	int closed;
+};
+static struct recorded_events g_recorded;
+
+static void session_test_on_event_record(
+	void *data, struct mux_session *ss, const enum mux_event event,
+	const union mux_event_data edata)
+{
+	(void)data;
+	(void)ss;
+	switch (event) {
+	case MUX_EVENT_CONNECT_FAILED:
+		g_recorded.connect_failed++;
+		g_recorded.connect_failed_err = edata.connect_failed.err;
+		break;
+	case MUX_EVENT_SUSPENDED:
+		g_recorded.suspended++;
+		break;
+	case MUX_EVENT_CLOSED:
+		g_recorded.closed++;
+		break;
+	default:
+		break;
+	}
+}
+
+/* A dialed session whose resume attempt fails -- timing out in CONNECT or in
+ * HANDSHAKE -- returns to SUSPENDED and reports the attempt as
+ * MUX_EVENT_CONNECT_FAILED (what mux.h promises for any attempt that ends
+ * before ESTABLISHED), not as a fresh SUSPENDED: the owner paces its retry by
+ * that event.  The resume deadline keeps counting from the transport loss
+ * instead of restarting, so repeated failures cannot hold the session past
+ * resume_timeout. */
+T_DECLARE_CASE(test_resume_attempt_failure_reports_connect_failed)
+{
+	static const enum session_state attempt_states[] = {
+		SESSION_CONNECT,
+		SESSION_HANDSHAKE,
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(attempt_states); i++) {
+		struct session_fixture fx;
+		if (setup_handshake_fixture(&fx) != 0) {
+			T_FATAL("setup_handshake_fixture failed");
+			return;
+		}
+		mux_gauge halfopen = 1; /* the attempt's CONNECT-entry +1 */
+		fx.ss.cnt.session.num_session_halfopen = &halfopen;
+		fx.ss.state = attempt_states[i];
+		fx.ss.accepted = false;
+		fx.ss.handshake.has_session_id = true;
+		fx.ss.conf.resume_timeout = 600;
+		/* The established transport was lost 100 s ago. */
+		fx.ss.suspended_at = ev_now(fx.loop) - 100.0;
+		fx.ss.callbacks.on_event = session_test_on_event_record;
+		g_recorded = (struct recorded_events){ 0 };
+
+		connect_timeout_cb(
+			fx.ss.loop, &fx.ss.w_connect_timeout, EV_TIMER);
+
+		const enum session_state state = fx.ss.state;
+		const bool deadline_armed =
+			ev_is_active(&fx.ss.w_connect_timeout);
+		const double remaining =
+			ev_timer_remaining(fx.loop, &fx.ss.w_connect_timeout);
+		const uint_least64_t halfopen_after = halfopen;
+
+		fx.ss.callbacks.on_event = NULL;
+		fx.fds[0] = -1; /* mux_session_suspend closed it */
+		teardown_fixture(&fx);
+
+		T_LOGF("from %s: remaining %.3f s",
+		       session_state_str[attempt_states[i]], remaining);
+		T_EXPECT_EQ(state, (enum session_state)SESSION_SUSPENDED);
+		T_EXPECT_EQ(g_recorded.connect_failed, 1);
+		T_EXPECT_EQ(g_recorded.suspended, 0);
+		T_EXPECT_EQ(g_recorded.closed, 0);
+		T_EXPECT_EQ(halfopen_after, (uint_least64_t)0);
+		T_EXPECT(deadline_armed);
+		T_EXPECT(remaining > 499.0 && remaining <= 500.0);
+	}
+}
+
+/* Start a non-blocking loopback connect(2) that the peer answers with RST:
+ * the port is bound but not listening.  Returns the connecting socket once it
+ * is writable (its SO_ERROR then pending), or -1; *bound_out receives the
+ * bound socket, which the caller closes. */
+static int connect_refused_async(int *restrict bound_out)
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	socklen_t addrlen = sizeof(addr);
+	const int bound = socket(AF_INET, SOCK_STREAM, 0);
+	*bound_out = bound;
+	if (bound < 0 ||
+	    bind(bound, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+	    getsockname(bound, (struct sockaddr *)&addr, &addrlen) != 0) {
+		return -1;
+	}
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		return -1;
+	}
+	struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+	/* Only an EINPROGRESS connect takes the asynchronous path under test. */
+	if (socket_set_nonblock(fd) != 0 ||
+	    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 ||
+	    errno != EINPROGRESS || poll(&pfd, 1, 1000) != 1) {
+		(void)close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* A resume attempt whose connect(2) returned EINPROGRESS and then failed --
+ * here a loopback RST -- must re-suspend like one that failed synchronously
+ * (which never left SUSPENDED), keeping its streams and session id, and hand
+ * the owner the errno so its backoff can classify the failure. */
+T_DECLARE_CASE(test_connect_async_failure_resuspends)
+{
+	int bound = -1;
+	const int fd = connect_refused_async(&bound);
+	if (fd < 0) {
+		if (bound >= 0) {
+			(void)close(bound);
+		}
+		T_FATAL("could not start an asynchronously refused connect");
+		return;
+	}
+
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		(void)close(fd);
+		(void)close(bound);
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	(void)close(fx.fds[0]);
+	fx.fds[0] = -1;
+	ev_io_set(&fx.ss.w_socket, fd, EV_WRITE);
+	mux_gauge halfopen = 1;
+	fx.ss.cnt.session.num_session_halfopen = &halfopen;
+	fx.ss.state = SESSION_CONNECT;
+	fx.ss.accepted = false;
+	fx.ss.handshake.has_session_id = true;
+	fx.ss.conf.resume_timeout = 600;
+	fx.ss.suspended_at = ev_now(fx.loop);
+	fx.ss.callbacks.on_event = session_test_on_event_record;
+	g_recorded = (struct recorded_events){ 0 };
+
+	connect_cb(&fx.ss);
+
+	const enum session_state state = fx.ss.state;
+	const bool has_session_id = fx.ss.handshake.has_session_id;
+	const bool streams_kept = fx.ss.sched.streams != NULL;
+	const int socket_fd = fx.ss.w_socket.fd;
+	const bool deadline_armed = ev_is_active(&fx.ss.w_connect_timeout);
+	const uint_least64_t halfopen_after = halfopen;
+
+	fx.ss.callbacks.on_event = NULL;
+	if (socket_fd >= 0) {
+		/* A failure path that kept the transport would leak it. */
+		fx.fds[0] = socket_fd;
+	}
+	teardown_fixture(&fx);
+	(void)close(bound);
+
+	T_EXPECT_EQ(state, (enum session_state)SESSION_SUSPENDED);
+	T_EXPECT(has_session_id);
+	T_EXPECT(streams_kept);
+	T_EXPECT_EQ(socket_fd, -1);
+	T_EXPECT(deadline_armed);
+	T_EXPECT_EQ(halfopen_after, (uint_least64_t)0);
+	T_EXPECT_EQ(g_recorded.connect_failed, 1);
+	T_EXPECT_EQ(g_recorded.connect_failed_err, ECONNREFUSED);
+	T_EXPECT_EQ(g_recorded.suspended, 0);
+	T_EXPECT_EQ(g_recorded.closed, 0);
+}
+
+/* Re-suspending out of SESSION_HANDSHAKE must pay back the attempt's
+ * num_session_halfopen increment: if this session is later torn down straight
+ * from SUSPENDED, oldstate is SUSPENDED then, so nothing else pays the debt. */
 T_DECLARE_CASE(test_session_suspend_pays_back_halfopen_from_handshake)
 {
 	struct session_fixture fx;
@@ -1555,6 +1960,41 @@ T_DECLARE_CASE(test_session_suspend_migrates_pending_oobbuf_frame)
 	teardown_fixture(&fx);
 }
 
+/* lossymux datagrams are best effort (spec §5.2.3.3): a suspend drops whatever
+ * is still queued rather than carrying it into the resume log. */
+T_DECLARE_CASE(test_session_suspend_drops_queued_dgrams)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+
+	struct mux_frame *const dgram =
+		mux_frame_get(&fx.ss.pool, fx.ss.max_payload);
+	T_CHECK(dgram != NULL);
+	mux_write_header(
+		dgram->data,
+		&(struct mux_header){ .version = MUX_PROTOCOL_VERSION,
+				      .flags = MUX_FLAG_PUSH,
+				      .extra = 7 });
+	dgram->len = MUX_FRAME_HEADER_SIZE;
+	mux_frame_list_push(&fx.ss.wire.dgrambuf, dgram);
+
+	g_drop_dgrams_calls = 0;
+	g_unacked_track_sent_calls = 0;
+	mux_session_suspend(&fx.ss);
+
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_SUSPENDED);
+	T_EXPECT_EQ(g_drop_dgrams_calls, 1);
+	T_EXPECT(fx.ss.wire.dgrambuf.head == NULL);
+	/* Dropped, never handed to the resume log. */
+	T_EXPECT_EQ(g_unacked_track_sent_calls, 0);
+
+	fx.fds[0] = -1; /* mux_session_suspend closed it */
+	teardown_fixture(&fx);
+}
+
 /* session_resume_attach must clear wire.rx_eof the way the fresh-attach path
  * does: the FIN that suspended the session belongs to the transport that just
  * died, so carrying it across makes every later teardown of the resumed session
@@ -1587,6 +2027,65 @@ T_DECLARE_CASE(test_resume_attach_clears_stale_rx_eof)
 	T_EXPECT(!rx_eof);
 }
 
+/* A reload while SUSPENDED re-derives kernel_send_timeout with no fd to install
+ * TCP_USER_TIMEOUT on, clearing it. The resumed transport is a TCP socket that
+ * can carry the option, so the resume must derive the flag again for it, or the
+ * userspace watchdog suspends a peer that is merely applying backpressure. */
+T_DECLARE_CASE(test_resume_attach_rederives_kernel_send_timeout)
+{
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.accepted = true;
+	fx.ss.handshake.has_session_id = true;
+	mux_session_suspend(&fx.ss);
+	fx.fds[0] = -1; /* mux_session_suspend closed it */
+	T_CHECK(fx.ss.state == SESSION_SUSPENDED);
+
+	const struct mux_session_config conf = {
+		.timeout = 30,
+		.keepalive = 15,
+		.send_timeout = 10,
+		.connect_timeout = 10,
+		.resume_timeout = 30,
+	};
+	mux_session_set_config(&fx.ss, &conf);
+	T_CHECK(!fx.ss.wire.kernel_send_timeout);
+
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	T_CHECK(fd >= 0);
+	struct mux_transport t = { .fd = fd };
+	session_resume_attach(&fx.ss, &t, 0);
+
+	const enum session_state state = fx.ss.state;
+	const bool kernel = fx.ss.wire.kernel_send_timeout;
+	const ev_tstamp repeat = fx.ss.w_send_timeout.repeat;
+#if WITH_TCP_USER_TIMEOUT
+	int user_timeout = 0;
+	socklen_t len = sizeof(user_timeout);
+	const int got = getsockopt(
+		fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, &len);
+#endif /* WITH_TCP_USER_TIMEOUT */
+
+	ev_io_stop(fx.ss.loop, &fx.ss.w_socket);
+	(void)close(fd); /* the resumed session owns it now */
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(state, (enum session_state)SESSION_ESTABLISHED);
+#if WITH_TCP_USER_TIMEOUT
+	T_EXPECT(kernel);
+	T_EXPECT_EQ(repeat, 0.0);
+	T_EXPECT_EQ(got, 0);
+	T_EXPECT_EQ(user_timeout, 10000);
+#else /* WITH_TCP_USER_TIMEOUT */
+	T_EXPECT(!kernel);
+	T_EXPECT_EQ(repeat, 10.0);
+#endif /* WITH_TCP_USER_TIMEOUT */
+}
+
 /* Spec §5.2.2 defines the active extension set from the hello exchange, and a
  * resume is one. The resume ClientHello's extensions are parsed into the
  * transient session that mux_transport_detach then discards, so they ride
@@ -1603,6 +2102,7 @@ T_DECLARE_CASE(test_resume_attach_adopts_hello_extensions)
 	fx.ss.state = SESSION_ESTABLISHED;
 	fx.ss.handshake.has_session_id = true;
 	fx.ss.handshake.peer_rejects_inbound_streams = false;
+	fx.ss.handshake.peer_lossymux = false;
 	fx.ss.handshake.peer_identity = strdup("old-peer");
 	T_CHECK(fx.ss.handshake.peer_identity != NULL);
 	mux_session_suspend(&fx.ss);
@@ -1615,10 +2115,12 @@ T_DECLARE_CASE(test_resume_attach_adopts_hello_extensions)
 		.fd = fx.fds[1],
 		.peer_identity = fresh,
 		.reject_inbound = true,
+		.lossymux = true,
 	};
 	session_resume_attach(&fx.ss, &t, 0);
 
 	const bool rejects = fx.ss.handshake.peer_rejects_inbound_streams;
+	const bool lossymux = fx.ss.handshake.peer_lossymux;
 	char identity[32] = { 0 };
 	if (fx.ss.handshake.peer_identity != NULL) {
 		(void)snprintf(
@@ -1635,8 +2137,66 @@ T_DECLARE_CASE(test_resume_attach_adopts_hello_extensions)
 	teardown_fixture(&fx);
 
 	T_EXPECT(rejects);
+	T_EXPECT(lossymux);
 	T_EXPECT_STREQ(identity, "new-peer");
 	T_EXPECT(transport_consumed);
+}
+
+/* A TLS connection's I/O mode (socket offload vs memory transport) describes
+ * how the connection was built, so it is latched on the wire, not read from
+ * ss->conf: a reload's mux_session_set_config must leave it alone, and a resume
+ * handoff must carry it from the transient session that built the connection
+ * to the resumed one, which may have been created under a different config. */
+T_DECLARE_CASE(test_tls_offload_mode_latched_across_reload_and_resume)
+{
+#if WITH_TLS
+	struct session_fixture fx;
+	if (setup_handshake_fixture(&fx) != 0) {
+		T_FATAL("setup_handshake_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.conf.tls_socket_offload = true;
+	fx.ss.wire.tls_offload = true;
+
+	struct mux_session_config conf = fx.ss.conf;
+	conf.tls_socket_offload = false;
+	mux_session_set_config(&fx.ss, &conf);
+	const bool kept_on_reload = fx.ss.wire.tls_offload;
+
+	/* Detach moves the mode out with the connection; reattach restores it. */
+	unsigned char sentinel;
+	fx.ss.wire.tlsconn = (struct tls_connection *)&sentinel;
+	struct mux_transport t = { .fd = -1 };
+	mux_transport_detach(&fx.ss, &t);
+	const bool detached_mode = t.tls_offload;
+	fx.ss.wire.tls_offload = false;
+	mux_transport_reattach(&fx.ss, &t);
+	const bool reattached_mode = fx.ss.wire.tls_offload;
+	fx.ss.wire.tlsconn = NULL;
+
+	/* A resume installs the transport's mode on the suspended session. */
+	mux_session_suspend(&fx.ss);
+	fx.fds[0] = -1; /* mux_session_suspend closed it */
+	T_CHECK(fx.ss.state == SESSION_SUSPENDED);
+	g_adopt_tlsconn_calls = 0;
+	g_last_adopt_offload = false;
+	struct mux_transport rt = { .fd = fx.fds[1], .tls_offload = true };
+	session_resume_attach(&fx.ss, &rt, 0);
+	const int adopt_calls = g_adopt_tlsconn_calls;
+	const bool adopted_mode = g_last_adopt_offload;
+
+	fx.fds[1] = -1; /* the resumed session owns it now */
+	teardown_fixture(&fx);
+
+	T_EXPECT(kept_on_reload);
+	T_EXPECT(detached_mode);
+	T_EXPECT(reattached_mode);
+	T_EXPECT_EQ(adopt_calls, 1);
+	T_EXPECT(adopted_mode);
+#else /* WITH_TLS */
+	T_SKIP();
+#endif /* WITH_TLS */
 }
 
 /* A stream can independently abort/close while a session is SUSPENDED, queuing
@@ -1734,6 +2294,7 @@ T_DECLARE_CASE(test_dead_link_reentrant_reconnect_reaches_connect)
 
 	g_reentrant_attach_fd = fx.fds[1];
 	g_suspended_event_count = 0;
+	g_connect_failed_event_count = 0;
 	g_connect_event_count = 0;
 	g_closed_event_count = 0;
 
@@ -1753,8 +2314,56 @@ T_DECLARE_CASE(test_dead_link_reentrant_reconnect_reaches_connect)
 	teardown_fixture(&fx);
 }
 
-/* Same scenario as above, through connect_timeout_cb's SESSION_HANDSHAKE
- * case -- the other caller commit 2c397eb's reentrancy fix touched. */
+/* MUX_EVENT_LOST is synchronous.  A callback that resets the session must see
+ * the target state already published; otherwise the nested reset observes the
+ * old ESTABLISHED state and emits LOST a second time. */
+T_DECLARE_CASE(test_lost_callback_reentrant_reset_is_single_transition)
+{
+	struct session_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.callbacks.on_event = session_test_on_event_reentrant_reset;
+	g_reentrant_lost_event_count = 0;
+	g_reentrant_lost_observed_state = SESSION_INIT;
+	g_reentrant_connect_failed_event_count = 0;
+	g_reentrant_connect_failed_observed_state = SESSION_INIT;
+
+	mux_session_set_state(&fx.ss, SESSION_CLOSED);
+
+	T_EXPECT_EQ(g_reentrant_lost_event_count, 1);
+	T_EXPECT_EQ(
+		g_reentrant_lost_observed_state,
+		(enum session_state)SESSION_CLOSED);
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+
+	fx.fds[0] = -1;
+	teardown_fixture(&fx);
+
+	/* The pre-establishment failure path has the same synchronous callback
+	 * ordering requirement. */
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	fx.ss.state = SESSION_HANDSHAKE;
+	fx.ss.callbacks.on_event = session_test_on_event_reentrant_reset;
+	mux_session_set_state(&fx.ss, SESSION_CLOSED);
+
+	T_EXPECT_EQ(g_reentrant_connect_failed_event_count, 1);
+	T_EXPECT_EQ(
+		g_reentrant_connect_failed_observed_state,
+		(enum session_state)SESSION_CLOSED);
+	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CLOSED);
+
+	fx.fds[0] = -1;
+	teardown_fixture(&fx);
+}
+
+/* Same scenario as test_dead_link_reentrant_reconnect_reaches_connect, through
+ * connect_timeout_cb's SESSION_HANDSHAKE case -- the other caller commit
+ * 2c397eb's reentrancy fix touched. */
 T_DECLARE_CASE(test_connect_timeout_cb_reentrant_reconnect_reaches_connect)
 {
 	struct session_fixture fx;
@@ -1768,14 +2377,18 @@ T_DECLARE_CASE(test_connect_timeout_cb_reentrant_reconnect_reaches_connect)
 
 	g_reentrant_attach_fd = fx.fds[1];
 	g_suspended_event_count = 0;
+	g_connect_failed_event_count = 0;
 	g_connect_event_count = 0;
 	g_closed_event_count = 0;
 
 	connect_timeout_cb(fx.ss.loop, &fx.ss.w_connect_timeout, EV_TIMER);
 
+	/* A resume attempt that times out reports CONNECT_FAILED, and the
+	 * reentrant redial from it lands on CONNECT. */
 	T_EXPECT_EQ(fx.ss.state, (enum session_state)SESSION_CONNECT);
 	T_EXPECT_EQ(fx.ss.w_socket.fd, fx.fds[1]);
-	T_EXPECT_EQ(g_suspended_event_count, 1);
+	T_EXPECT_EQ(g_suspended_event_count, 0);
+	T_EXPECT_EQ(g_connect_failed_event_count, 1);
 	T_EXPECT_EQ(g_connect_event_count, 1);
 	T_EXPECT_EQ(g_closed_event_count, 0);
 
@@ -1901,6 +2514,166 @@ T_DECLARE_CASE(test_set_config_live_session_branches)
 	teardown_fixture(&fx);
 }
 
+/* Reload must decide from live eligibility, including a disabled-to-enabled
+ * timeout, tombstone-only tables, and states in which idle closing is invalid. */
+T_DECLARE_CASE(test_set_config_rederives_idle_eligibility)
+{
+	struct session_fixture fx;
+	T_CHECK(setup_handshake_fixture(&fx) == 0);
+	fx.ss.state = SESSION_ESTABLISHED;
+	struct mux_session_config conf = fx.ss.conf;
+	conf.idle_timeout = 0;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(!ev_is_active(&fx.ss.w_idle_timeout));
+	conf.idle_timeout = 5;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(ev_is_active(&fx.ss.w_idle_timeout));
+	T_EXPECT_EQ(ev_timer_remaining(fx.loop, &fx.ss.w_idle_timeout), 5.0);
+
+	/* One active stream prevents the timer, even if it was armed before. */
+	struct mux_stream stream = { .id = 1 };
+	void *entry = &stream;
+	fx.ss.sched.streams =
+		table_set(fx.ss.sched.streams, (void *)(uintptr_t)1, &entry);
+	T_CHECK(fx.ss.sched.streams != NULL);
+	T_CHECK(entry == NULL);
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(!ev_is_active(&fx.ss.w_idle_timeout));
+	/* A tombstone carries no live traffic and must not suppress idle closing. */
+	stream.state = STREAM_CLOSED;
+	fx.ss.sched.num_tombstones = 1;
+	fx.ss.sched.num_closed = 1;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(ev_is_active(&fx.ss.w_idle_timeout));
+	/* Expiry leaves an application-held CLOSED entry inactive. Reload
+	 * must re-arm idle closing despite there being no tombstone timer. */
+	fx.ss.sched.num_tombstones = 0;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(ev_is_active(&fx.ss.w_idle_timeout));
+	conf.idle_timeout = 7;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT_EQ(ev_timer_remaining(fx.loop, &fx.ss.w_idle_timeout), 7.0);
+	conf.idle_timeout = 0;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(!ev_is_active(&fx.ss.w_idle_timeout));
+	conf.idle_timeout = 5;
+	fx.ss.accepted = true;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(!ev_is_active(&fx.ss.w_idle_timeout));
+	fx.ss.accepted = false;
+	const enum session_state ineligible[] = {
+		SESSION_INIT,	   SESSION_CONNECT, SESSION_HANDSHAKE,
+		SESSION_SUSPENDED, SESSION_CLOSING, SESSION_CLOSE_WAIT,
+		SESSION_CLOSED
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(ineligible); i++) {
+		fx.ss.state = ineligible[i];
+		ev_timer_again(fx.loop, &fx.ss.w_idle_timeout);
+		mux_session_set_config(&fx.ss, &conf);
+		T_EXPECT(!ev_is_active(&fx.ss.w_idle_timeout));
+	}
+	teardown_fixture(&fx);
+}
+
+struct connected_shutdown {
+	bool reset;
+	int connected_events;
+	enum mux_event event;
+};
+
+static void shutdown_on_connected_event(
+	void *data, struct mux_session *ss, const enum mux_event event,
+	const union mux_event_data edata)
+{
+	(void)edata;
+	if (event != MUX_EVENT_ESTABLISHED && event != MUX_EVENT_RESUMED) {
+		return;
+	}
+	struct connected_shutdown *const action = data;
+	action->connected_events++;
+	action->event = event;
+	if (action->reset) {
+		mux_session_reset(ss);
+	} else {
+		mux_session_initiate_shutdown(ss);
+	}
+}
+
+T_DECLARE_SUBCASE(
+	check_connected_callback_stops_completion, bool reset, bool resume)
+{
+	struct session_fixture fx;
+	T_CHECK(setup_handshake_fixture(&fx) == 0);
+	struct connected_shutdown action = { .reset = reset };
+	fx.ss.callbacks.on_event = shutdown_on_connected_event;
+	fx.ss.userdata = &action;
+	fx.ss.conf.connect_timeout = 5;
+	fx.ss.conf.idle_timeout = 5;
+	fx.ss.w_idle_timeout.repeat = 5.0;
+	if (resume) {
+		fx.ss.peer_addr.sa.sa_family = AF_INET;
+	}
+	mux_session_handshake_done(&fx.ss);
+	const enum session_state state = fx.ss.state;
+	const bool timeout_active = ev_is_active(&fx.ss.w_timeout);
+	const bool keepalive_active = ev_is_active(&fx.ss.w_keepalive);
+	const bool idle_active = ev_is_active(&fx.ss.w_idle_timeout);
+	const bool coalesce_active = ev_is_active(&fx.ss.sched.w_coalesce);
+	if (reset) {
+		fx.fds[0] = -1;
+	}
+	teardown_fixture(&fx);
+	T_EXPECT_EQ(action.connected_events, 1);
+	T_EXPECT_EQ(
+		action.event,
+		resume ? MUX_EVENT_RESUMED : MUX_EVENT_ESTABLISHED);
+	T_EXPECT_EQ(state, reset ? SESSION_CLOSED : SESSION_CLOSING);
+	T_EXPECT(
+		!timeout_active && !keepalive_active && !idle_active &&
+		!coalesce_active);
+}
+
+T_DECLARE_CASE(test_handshake_callback_shutdown_leaves_timers_stopped)
+{
+	T_CALL_SUBCASE(check_connected_callback_stops_completion, false, false);
+	T_CALL_SUBCASE(check_connected_callback_stops_completion, false, true);
+}
+
+T_DECLARE_CASE(test_handshake_callback_reset_leaves_timers_stopped)
+{
+	T_CALL_SUBCASE(check_connected_callback_stops_completion, true, false);
+	T_CALL_SUBCASE(check_connected_callback_stops_completion, true, true);
+}
+
+T_DECLARE_CASE(test_resume_callback_reset_does_not_restart_socket)
+{
+	struct session_fixture fx;
+	T_CHECK(setup_handshake_fixture(&fx) == 0);
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.accepted = true;
+	fx.ss.handshake.has_session_id = true;
+	mux_session_suspend(&fx.ss);
+	fx.fds[0] = -1;
+	fx.ss.peer_addr.sa.sa_family = AF_INET;
+	struct connected_shutdown action = { .reset = true };
+	fx.ss.callbacks.on_event = shutdown_on_connected_event;
+	fx.ss.userdata = &action;
+	struct mux_transport transport = { .fd = fx.fds[1] };
+	mux_resume_attach(&fx.ss, &transport, 0);
+	fx.fds[1] = -1;
+	const enum session_state state = fx.ss.state;
+	const bool socket_active = ev_is_active(&fx.ss.w_socket);
+	const bool timeout_active = ev_is_active(&fx.ss.w_timeout);
+	const int fd = fx.ss.w_socket.fd;
+	teardown_fixture(&fx);
+	T_EXPECT_EQ(action.connected_events, 1);
+	T_EXPECT_EQ(action.event, MUX_EVENT_RESUMED);
+	T_EXPECT_EQ(state, SESSION_CLOSED);
+	T_EXPECT_EQ(fd, -1);
+	T_EXPECT(!socket_active && !timeout_active);
+	T_EXPECT_EQ(transport.fd, -1);
+}
+
 /* mux_session_start aborts and resets when the TLS layer fails to start. */
 T_DECLARE_CASE(test_session_start_tls_failed)
 {
@@ -1977,6 +2750,7 @@ T_DECLARE_CASE(test_handshake_done_drain_subtracts_tombstones)
 		fx.ss.sched.streams, (const void *)(uintptr_t)7, &elem);
 	T_CHECK(fx.ss.sched.streams != NULL);
 	fx.ss.sched.num_tombstones = 1;
+	fx.ss.sched.num_closed = 1;
 	fx.ss.draining = true;
 
 	mux_session_handshake_done(&fx.ss);
@@ -2005,6 +2779,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_connect_cb_tls_paths),
 	T_CASE(test_connect_cb_reports_socket_error_on_closed),
 	T_CASE(test_attach_fd_clears_stale_transport_error),
+	T_CASE(test_attach_fd_from_closed_arms_connect_deadline),
+	T_CASE(test_attach_fd_fresh_connect_clears_draining),
+	T_CASE(test_attach_fd_resume_keeps_draining),
 	T_CASE(test_dead_link_suspend_for_resume),
 	T_CASE(test_capture_frame_list_skips_frames_once_session_closed),
 	T_CASE(test_dead_link_close_without_session_id),
@@ -2017,17 +2794,27 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_timeout_and_send_timeout_callbacks),
 	T_CASE(test_keepalive_cb_emits_and_rearms),
 	T_CASE(test_connect_timeout_cb_states),
+	T_CASE(test_resume_attempt_failure_reports_connect_failed),
+	T_CASE(test_connect_async_failure_resuspends),
 	T_CASE(test_session_suspend_pays_back_halfopen_from_handshake),
 	T_CASE(test_session_suspend_skips_resume_deadline_when_disabled),
 	T_CASE(test_session_suspend_migrates_pending_oobbuf_frame),
+	T_CASE(test_session_suspend_drops_queued_dgrams),
 	T_CASE(test_resume_attach_clears_stale_rx_eof),
+	T_CASE(test_resume_attach_rederives_kernel_send_timeout),
 	T_CASE(test_resume_attach_adopts_hello_extensions),
+	T_CASE(test_tls_offload_mode_latched_across_reload_and_resume),
 	T_CASE(test_session_attach_fd_captures_pending_sendbuf_frame),
 	T_CASE(test_session_attach_fd_captures_pending_oobbuf_frame),
 	T_CASE(test_dead_link_reentrant_reconnect_reaches_connect),
+	T_CASE(test_lost_callback_reentrant_reset_is_single_transition),
 	T_CASE(test_connect_timeout_cb_reentrant_reconnect_reaches_connect),
 	T_CASE(test_open_stream_rejections),
 	T_CASE(test_set_config_live_session_branches),
+	T_CASE(test_set_config_rederives_idle_eligibility),
+	T_CASE(test_handshake_callback_shutdown_leaves_timers_stopped),
+	T_CASE(test_handshake_callback_reset_leaves_timers_stopped),
+	T_CASE(test_resume_callback_reset_does_not_restart_socket),
 	T_CASE(test_session_start_tls_failed),
 	T_CASE(test_handshake_done_sched_head_and_drain),
 	T_CASE(test_handshake_done_drain_subtracts_tombstones),

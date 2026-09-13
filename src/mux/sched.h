@@ -23,9 +23,13 @@ struct hashtable;
 struct sched_ctx {
 	/* Per-session stream table, keyed by uint_least16_t stream ID. */
 	struct hashtable *streams;
-	/* CLOSED (tombstone) streams in the stream table; linger for
-	 * MUX_TOMBSTONE_PERIOD_S but are no longer live. */
+	/* CLOSED entries whose tombstone timers still own them for
+	 * MUX_TOMBSTONE_PERIOD_S of late-frame suppression. */
 	size_t num_tombstones;
+	/* All CLOSED entries, including application-held streams whose tombstone
+	 * has expired. Excluded from admission and idle/drain accounting until
+	 * their table entry is removed. */
+	size_t num_closed;
 	/* Round-robin ready queue head and tail. */
 	struct mux_stream *sched_head;
 	struct mux_stream *sched_tail;
@@ -44,6 +48,10 @@ struct sched_ctx {
 	/* Fixed-period coalescing timer: flushes Nagle-held frames and
 	 * sub-threshold window updates every MUX_COALESCING_INTERVAL seconds. */
 	ev_timer w_coalesce;
+	/* Streams whose session tore the stream table down while the
+	 * application still held them (see mux_stream::orphaned); doubly linked
+	 * through delay_prev/delay_next. Survives mux_sched_free_streams. */
+	struct mux_stream *orphans;
 	/* Wrap-around stream-ID counter: client assigns odd IDs, server even;
 	 * +2 per allocation, wrapping to the parity base. */
 	uint_least16_t next_stream_id;
@@ -53,8 +61,20 @@ struct sched_ctx {
  * delay queue, stream table, stream-ID allocation, and per-stream send-event
  * emission (SYN, ACK/FIN) at scheduling time. */
 
-/* Free all streams; clear the ready queue, delay list, and stream table. */
+/* Tear down every stream; clear the ready queue, delay list, and stream table.
+ * A stream the application still holds (mux_stream_app_held) is orphaned
+ * rather than freed (mux_stream_orphan); every other stream is freed. Each
+ * stream is written through the pointer the table holds, not one a caller
+ * passed in, so a function that holds a stream across a call that can reach
+ * this teardown must not declare that stream pointer restrict. */
 void mux_sched_free_streams(struct mux_session *restrict ss);
+
+/* Unlink an orphaned stream from the session's orphan list and free it. */
+void mux_sched_free_orphan(
+	struct mux_session *restrict ss, struct mux_stream *restrict s);
+
+/* Free every orphaned stream; the session itself is being freed. */
+void mux_sched_free_orphans(struct mux_session *restrict ss);
 
 /* Insert a stream into the table; returns false on alloc failure or duplicate ID. */
 bool mux_sched_add_stream(
@@ -79,11 +99,11 @@ void mux_sched_delay_remove(
 void mux_sched_wake(
 	struct mux_session *restrict ss, struct mux_stream *restrict s);
 
-/* React to the stream table's active (non-tombstone) count possibly having
+/* React to the stream table's active (non-CLOSED) count possibly having
  * just reached zero: initiate drain-shutdown, or arm the idle timer. Safe to
- * call whenever the table or tombstone count changes; a no-op when streams
+ * call whenever the table or CLOSED count changes; a no-op when streams
  * remain active or the session isn't ESTABLISHED. */
-void mux_sched_check_no_active_streams(struct mux_session *restrict ss);
+void mux_sched_check_no_active_streams(struct mux_session *ss);
 
 /* Request a drain of the low-priority lifecycle queue: arm EV_WRITE (via
  * mux_session_notify) when there is queued work and the sendbuf is clear.  Safe to
@@ -92,7 +112,7 @@ void mux_sched_schedule(struct mux_session *restrict ss);
 
 /* Drain the low-priority lifecycle queue (INIT -> SYN batching, CLOSED ->
  * cleanup).  Run by mux_session_on_send before it pumps. */
-void mux_sched_drain_lp(struct mux_session *restrict ss);
+void mux_sched_drain_lp(struct mux_session *ss);
 
 /* Arm the coalescing delay list for a stream. */
 void mux_sched_delay(
@@ -102,12 +122,12 @@ void mux_sched_delay(
 /* Scan the DRR ready queue and stage at most one PUSH frame into sendbuf,
  * skipping streams that cannot produce (credit, queue empty, Nagle, or a state
  * stream_can_send_data() rejects).  Returns true if a frame was produced. */
-bool mux_sched_next_data(struct mux_session *restrict ss);
+bool mux_sched_next_data(struct mux_session *ss);
 
 /* Emit pending per-stream ACK/FIN control headers for all DRR-queued streams,
  * packed into a single sendbuf staging entry.  Safe to call regardless of
  * send_stalled. */
-void mux_sched_flush_ctrl(struct mux_session *restrict ss);
+void mux_sched_flush_ctrl(struct mux_session *ss);
 
 /* Arm the coalescing timer if it is not already active.  Called when a
  * stream enters the delay list or when a deferred session ACK is pending. */
