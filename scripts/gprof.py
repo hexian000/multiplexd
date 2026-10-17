@@ -18,12 +18,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from smoke_test import BUILTIN_CERT_PEM, BUILTIN_KEY_PEM
+
 
 ROOT = Path.cwd().resolve()
 DEFAULT_BUILD_DIR = ROOT / "build"
 DEFAULT_PROFILE_BUILD_DIR = DEFAULT_BUILD_DIR / "gprof"
 DEFAULT_MARKDOWN_OUTPUT = DEFAULT_BUILD_DIR / "gprof.md"
 CACHE_LINE_RE = re.compile(r"^([A-Za-z0-9_]+):[^=]+=(.*)$")
+# Inputs only: do not transplant generated paths or feature-probe results.
+PROFILE_CACHE_OPTIONS = (
+    "USE_TLS_LIBRARY", "ENABLE_THREADS", "FORCE_POSIX", "ENABLE_SYSTEMD",
+    "BUILD_STATIC", "LINK_STATIC_LIBS",
+    "CMAKE_C_COMPILER", "CMAKE_C_COMPILER_TARGET",
+    "CMAKE_C_COMPILER_EXTERNAL_TOOLCHAIN", "CMAKE_TOOLCHAIN_FILE",
+    "CMAKE_SYSROOT", "CMAKE_SYSROOT_COMPILE", "CMAKE_SYSROOT_LINK",
+    "CMAKE_PREFIX_PATH", "CMAKE_INCLUDE_PATH", "CMAKE_LIBRARY_PATH",
+    "CMAKE_PROGRAM_PATH", "CMAKE_FIND_ROOT_PATH",
+    "CMAKE_FIND_ROOT_PATH_MODE_PROGRAM", "CMAKE_FIND_ROOT_PATH_MODE_LIBRARY",
+    "CMAKE_FIND_ROOT_PATH_MODE_INCLUDE", "CMAKE_FIND_ROOT_PATH_MODE_PACKAGE",
+    "OPENSSL_ROOT_DIR", "OPENSSL_INCLUDE_DIR", "OPENSSL_SSL_LIBRARY",
+    "OPENSSL_CRYPTO_LIBRARY", "OPENSSL_USE_STATIC_LIBS",
+    "MbedTLS_ROOT", "MbedTLS_DIR", "TFPSACrypto_ROOT", "TFPSACrypto_DIR",
+    "LIBEV_INCLUDE_DIR", "LIBEV_LIBRARY", "LIBBACKTRACE_INCLUDE_DIR",
+    "LIBBACKTRACE_LIBRARY", "LIBUNWIND_INCLUDE_DIR", "LIBUNWIND_LIBRARY",
+    "SYSTEMD_INCLUDE_DIR", "SYSTEMD_LIBRARY",
+)
+PER_CALL_US = {"s": 1e6, "ms": 1e3, "us": 1.0, "ns": 1e-3}
 
 
 @dataclass
@@ -349,15 +370,18 @@ def build_configure_command(
         "-DBUILD_TESTING=OFF",
         "-DENABLE_SANITIZERS=OFF",
         "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF",
+        "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION_%s=OFF" % build_type.upper(),
+        "-DBUILD_PIE=OFF",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=OFF",
         "-DCMAKE_C_FLAGS=-pg -fno-pie",
         "-DCMAKE_EXE_LINKER_FLAGS=-pg -no-pie",
         "-DCMAKE_SHARED_LINKER_FLAGS=-pg",
         "-DCMAKE_MODULE_LINKER_FLAGS=-pg",
         "-DCMAKE_BUILD_TYPE=%s" % build_type,
     ]
-    compiler = base_cache.get("CMAKE_C_COMPILER")
-    if compiler:
-        command.append("-DCMAKE_C_COMPILER=%s" % compiler)
+    for key in PROFILE_CACHE_OPTIONS:
+        if key in base_cache:
+            command.append("-D%s=%s" % (key, base_cache[key]))
     return command
 
 
@@ -383,15 +407,16 @@ def terminate_process(
 
 
 def ensure_certificates(binary_path: Path, runtime_dir: Path) -> None:
-    server_cert = runtime_dir / "server-cert.pem"
-    client_cert = runtime_dir / "client-cert.pem"
-    if server_cert.exists() and client_cert.exists():
+    # Use the same mutually pinned, backend-independent fixture as bench.py.
+    # Rewrite the whole set after an interrupted write to keep keys paired.
+    if all((runtime_dir / ("%s-%s.pem" % (role, kind))).is_file()
+           for role in ("server", "client") for kind in ("cert", "key")):
         return
-    run_command(
-        [str(binary_path), "--gencerts", "client,server"],
-        cwd=runtime_dir,
-        timeout=30.0,
-    )
+    for role in ("server", "client"):
+        (runtime_dir / ("%s-cert.pem" % role)).write_text(
+            BUILTIN_CERT_PEM, encoding="utf-8")
+        (runtime_dir / ("%s-key.pem" % role)).write_text(
+            BUILTIN_KEY_PEM, encoding="utf-8")
 
 
 def prepare_runtime_assets(
@@ -530,9 +555,10 @@ def run_benchmark(
 def parse_flat_profile(gprof_output: str) -> List[FlatProfileRow]:
     rows: List[FlatProfileRow] = []
     in_table = False
+    per_call_scales: Optional[tuple[float, float]] = None
     for raw_line in gprof_output.splitlines():
         line = raw_line.rstrip()
-        if line.startswith("  %   cumulative"):
+        if re.match(r"\s*%\s+cumulative", line):
             in_table = True
             continue
         if not in_table:
@@ -540,6 +566,13 @@ def parse_flat_profile(gprof_output: str) -> List[FlatProfileRow]:
         if not line.strip():
             if rows:
                 break
+            continue
+        units = re.findall(r"(\S+)/call", line)
+        if units:
+            if len(units) != 2 or any(unit not in PER_CALL_US for unit in units):
+                raise SystemExit(
+                    "unsupported gprof per-call units: %s" % line.strip())
+            per_call_scales = (PER_CALL_US[units[0]], PER_CALL_US[units[1]])
             continue
         parts = line.split()
         if len(parts) < 4:
@@ -559,6 +592,10 @@ def parse_flat_profile(gprof_output: str) -> List[FlatProfileRow]:
                 calls = int(parts[3])
                 self_us_per_call = float(parts[4])
                 total_us_per_call = float(parts[5])
+                if per_call_scales is None:
+                    raise SystemExit("gprof flat profile has no per-call unit header")
+                self_us_per_call *= per_call_scales[0]
+                total_us_per_call *= per_call_scales[1]
                 name = parts[6]
             except ValueError:
                 name = parts[3]
