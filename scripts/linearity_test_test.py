@@ -33,6 +33,75 @@ _PROCESS_PORTS = {
 }
 
 
+def _bidir_report():
+    return {"end": {"streams": [
+        {"sender": {"socket": 5, "sender": True,
+                    "bits_per_second": 1_250_000},
+         "receiver": {"socket": 5, "sender": True,
+                      "bits_per_second": 1_200_000}},
+        {"sender": {"socket": 7, "sender": False,
+                    "bits_per_second": 2_600_000},
+         "receiver": {"socket": 7, "sender": False,
+                      "bits_per_second": 2_500_000}},
+        {"sender": {"socket": 9, "sender": True,
+                    "bits_per_second": 3_750_000.0},
+         "receiver": {"socket": 9, "sender": True,
+                      "bits_per_second": 3_700_000.0}},
+        {"sender": {"socket": 11, "sender": False,
+                    "bits_per_second": 5_100_000.0},
+         "receiver": {"socket": 11, "sender": False,
+                      "bits_per_second": 5_000_000.0}},
+    ]}}
+
+
+class LinearityThroughputTests(unittest.TestCase):
+    def test_summary_bits_accepts_numbers_and_defaults_invalid_values(self) -> None:
+        for value in (0, 1_250_000, 2_500_000.5):
+            with self.subTest(value=value):
+                self.assertEqual(linearity_test.parse_summary_bits(
+                    {"bits_per_second": value}), float(value))
+        for summary in (None, [], "invalid", {}, {"bits_per_second": None},
+                        {"bits_per_second": "1250000"},
+                        {"bits_per_second": []}):
+            with self.subTest(summary=summary):
+                self.assertEqual(linearity_test.parse_summary_bits(summary), 0.0)
+
+    def test_bidir_selects_each_direction_once_and_scales_to_mbps(self) -> None:
+        streams = _bidir_report()["end"]["streams"]
+        for stream, expected in zip(streams, (1.25, 2.5, 3.75, 5.0)):
+            with self.subTest(socket=stream["sender"]["socket"]):
+                self.assertEqual(linearity_test.extract_bidir_throughput_mbps(
+                    {"end": {"streams": [stream]}}), expected)
+        self.assertEqual(linearity_test.extract_bidir_throughput_mbps(
+            _bidir_report()), 12.5)
+
+    def test_bidir_requires_end_and_streams_containers(self) -> None:
+        for report in ({}, {"end": None}, {"end": []}):
+            with self.subTest(report=report), self.assertRaisesRegex(
+                    SystemExit, "missing end summary"):
+                linearity_test.extract_bidir_throughput_mbps(report)
+        for end in ({}, {"streams": None}, {"streams": {}}):
+            with self.subTest(end=end), self.assertRaisesRegex(
+                    SystemExit, "missing end.streams"):
+                linearity_test.extract_bidir_throughput_mbps({"end": end})
+        self.assertEqual(linearity_test.extract_bidir_throughput_mbps(
+            {"end": {"streams": []}}), 0.0)
+
+    def test_bidir_skips_malformed_entries_without_losing_valid_streams(self) -> None:
+        report = _bidir_report()
+        report["end"]["streams"] += [
+            None, [], "invalid", {}, {"sender": None, "receiver": []},
+            {"sender": {"sender": True, "bits_per_second": "1000000"},
+             "receiver": {"sender": False}},
+        ]
+        for flag in (None, 0, 1, "true", "false"):
+            report["end"]["streams"].append({
+                "sender": {"sender": flag, "bits_per_second": 100_000_000},
+                "receiver": {"sender": flag, "bits_per_second": 100_000_000},
+            })
+        self.assertEqual(linearity_test.extract_bidir_throughput_mbps(report), 12.5)
+
+
 class _HealthHandler(http.server.BaseHTTPRequestHandler):
     # Status of each successive GET; the last one repeats.
     statuses: List[int] = [200]
@@ -261,6 +330,158 @@ class LinearityTeardownTests(LinearityTestCase):
         self.fake.fail_spawn = 1
         self.fake.spawn_error = KeyboardInterrupt()
         self._run_expecting_teardown()
+
+
+class LinearityMeasurementTests(LinearityTestCase):
+    def test_nonempty_iperf_report_reaches_throughput_and_cpu_efficiency(self) -> None:
+        self._setup()
+        with self._patched(), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(linearity_test, "_read_ticks", return_value=0), \
+                mock.patch.object(linearity_test.TickSnap, "cpu_since",
+                                  side_effect=[7.25, 0.0, 4.0, 0.0]), \
+                mock.patch.object(linearity_test, "run_iperf_json",
+                                  return_value=_bidir_report()):
+            rows = self.test.sweep(1.0, 1.0)
+        self.assertEqual(rows[0]["thr_mbps"], 12.5)
+        self.assertEqual(rows[0]["cpu_per_mbps"], 0.5)
+        report = self.test.render_report(rows, 1.0, 1.0, 0.0, 0.0)
+        self.assertIn("| unlimited | 12.5 |", report)
+        self.assertIn("| 0.500 |", report)
+
+    def _run_measurement(self, *, sleep=None, iperf=None, render=None,
+                         ticks=None) -> str:
+        output = io.StringIO()
+        report = {"end": {"streams": []}}
+        with self._patched(), contextlib.redirect_stderr(output), \
+                contextlib.redirect_stdout(output), \
+                mock.patch.object(linearity_test, "_read_ticks", side_effect=ticks,
+                                  return_value=0), \
+                mock.patch.object(linearity_test.time, "sleep", side_effect=sleep), \
+                mock.patch.object(linearity_test, "run_iperf_json",
+                                  side_effect=iperf, return_value=report):
+            if render is not None:
+                with mock.patch.object(self.test, "render_report", side_effect=render):
+                    rc = self.test.run()
+            else:
+                rc = self.test.run()
+        self.assertEqual(rc, 1, output.getvalue())
+        self.assertFalse(self.test.output.exists())
+        self.assertNotIn("Final CPU returned", output.getvalue())
+        self.assertTrue(all(p.terminated for p in self.fake.procs))
+        return output.getvalue()
+
+    def test_run_rejects_exit_during_each_measurement_interval(self) -> None:
+        # Idle settle, idle sampling, post-traffic settle, tombstone settle,
+        # final sampling. Keep ticks readable: even an exited zombie can
+        # retain /proc stats, so missing-sample detection alone is insufficient.
+        for proc_index in range(3):
+            for interval in range(5):
+                with self.subTest(process=proc_index, interval=interval):
+                    self._reset()
+                    sleeps = []
+
+                    def exit_during_interval(seconds):
+                        sleeps.append(seconds)
+                        if len(sleeps) == interval + 1:
+                            self.fake.procs[proc_index].returncode = 1
+
+                    output = self._run_measurement(sleep=exit_during_interval)
+                    self.assertIn("exited with status 1", output)
+
+    def test_run_rejects_exit_during_traffic(self) -> None:
+        def exit_during_traffic(*args, **kwargs):
+            self.test._srv.returncode = 1
+            return {"end": {"streams": []}}
+
+        self.assertIn("exited with status 1",
+                      self._run_measurement(iperf=exit_during_traffic))
+
+    def test_run_rejects_exit_while_sampling(self) -> None:
+        def exit_during_sample(pid):
+            self.test._cli.returncode = 1
+            return 0
+
+        self.assertIn("exited with status 1",
+                      self._run_measurement(ticks=exit_during_sample))
+
+    def test_run_rechecks_liveness_before_publishing(self) -> None:
+        def exit_before_publish(*args):
+            self.test._cli.returncode = 1
+            return "Final CPU returned"
+
+        self.assertIn("before publishing report",
+                      self._run_measurement(render=exit_before_publish))
+
+    def test_live_run_can_report_zero_cpu(self) -> None:
+        with self._patched(), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(linearity_test, "_read_ticks", return_value=0), \
+                mock.patch.object(linearity_test, "run_iperf_json",
+                                  return_value={"end": {"streams": []}}):
+            self.assertEqual(self.test.run(), 0)
+        self.assertIn("Final CPU after cleanup", self.test.output.read_text())
+
+
+class LinearitySampleTests(unittest.TestCase):
+    def test_unavailable_ticks_are_errors(self) -> None:
+        for error in (FileNotFoundError(), PermissionError(), OSError("read failed")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(pathlib.Path, "read_text", side_effect=error):
+                with self.assertRaisesRegex(RuntimeError, "cannot read CPU ticks"):
+                    linearity_test._read_ticks(123)
+
+    def test_malformed_ticks_are_errors(self) -> None:
+        for raw in ("bad stat", "123 (name) S", "123 (name) " + "x " * 13):
+            with self.subTest(raw=raw), \
+                    mock.patch.object(pathlib.Path, "read_text", return_value=raw):
+                with self.assertRaises(RuntimeError):
+                    linearity_test._read_ticks(123)
+
+    def test_valid_ticks_allow_spaces_and_parentheses_in_name(self) -> None:
+        raw = "123 (name (with spaces)) S " + "0 " * 10 + "12 34"
+        with mock.patch.object(pathlib.Path, "read_text", return_value=raw):
+            self.assertEqual(linearity_test._read_ticks(123), 46)
+
+    def test_invalid_cpu_intervals_are_errors(self) -> None:
+        for values in ((1.0, 10, 2.0, 0), (1.0, 10, 1.0, 10), (2.0, 10, 1.0, 10)):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                linearity_test.cpu_pct_interval(*values)
+        self.assertEqual(linearity_test.cpu_pct_interval(1.0, 0, 2.0, 0), 0)
+        self.assertEqual(linearity_test.cpu_pct_interval(
+            1.0, 0, 2.0, linearity_test._CLK_TCK), 100)
+
+
+class LinearityProbeTests(unittest.TestCase):
+    def test_listening_probes_configure_subprocess_timeouts(self) -> None:
+        for probe in (lambda: linearity_test.listening_conflicts([5201]),
+                      lambda: linearity_test.port_listening(5201)):
+            with self.subTest(probe=probe):
+                def unresponsive_ss(command, **kwargs):
+                    if kwargs.get("timeout") is None:
+                        self.fail("ss would wait indefinitely without timeout")
+                    self.assertGreater(kwargs["timeout"], 0)
+                    self.assertLessEqual(kwargs["timeout"], 1.0)
+                    self.assertTrue(kwargs["check"])
+                    raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+                with mock.patch.object(linearity_test.subprocess, "run",
+                                       side_effect=unresponsive_ss):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        probe()
+
+    def test_readiness_passes_remaining_deadline_to_probe(self) -> None:
+        probe = mock.Mock(return_value=False)
+        with mock.patch.object(linearity_test.time, "monotonic",
+                               side_effect=[10.0, 10.75, 11.0]):
+            with self.assertRaises(SystemExit):
+                linearity_test.wait_ready("listener", probe, {}, 1.0)
+        probe.assert_called_once_with(0.25)
+
+    def test_readiness_rejects_late_success(self) -> None:
+        with mock.patch.object(linearity_test.time, "monotonic",
+                               side_effect=[10.0, 10.0, 12.0]):
+            with self.assertRaises(SystemExit):
+                linearity_test.wait_ready("listener", lambda timeout: True, {}, 1.0)
 
 
 class LinearityReportTests(LinearityTestCase):

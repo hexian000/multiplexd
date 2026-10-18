@@ -300,6 +300,7 @@ class BenchReadinessTests(unittest.TestCase):
         self.session_steps: List[Tuple[float, int]] = [(0.0, 0)]
         # Ports the fake daemons hold; a pid missing here holds none.
         self.held_ports: Dict[int, Set[int]] = {}
+        self.processes: List[_FakeProcess] = []
         self.sessions_at_scenario_start: List[int] = []
         self.sessions_queries = 0
 
@@ -323,6 +324,7 @@ class BenchReadinessTests(unittest.TestCase):
     def _popen(self, *args: object, **kwargs: object) -> _FakeProcess:
         proc = _FakeProcess()
         self.held_ports[proc.pid] = set(BENCH_PORTS)
+        self.processes.append(proc)
         return proc
 
     def _run_json_command(self, *args: object,
@@ -410,6 +412,66 @@ class BenchReadinessTests(unittest.TestCase):
             with self.assertRaises(SystemExit), \
                     contextlib.redirect_stderr(io.StringIO()):
                 bench.parse_args(argv)
+
+    def test_daemon_exit_during_measurement_refuses_the_report(self) -> None:
+        self.session_steps = [(0.0, 2)]
+        run_command = self._run_json_command
+        names = ("iperf3 server", "multiplexd server", "multiplexd client")
+        for scenario_count in (1, len(bench.SCENARIOS)):
+            for index, name in enumerate(names):
+                for status in (0, 1):
+                    with self.subTest(scenario_count=scenario_count,
+                                      daemon=name, status=status):
+                        self.processes.clear()
+                        self.sessions_at_scenario_start.clear()
+
+                        def exit_during_command(*args: object,
+                                                **kwargs: object
+                                                ) -> Dict[str, object]:
+                            report = run_command(*args, **kwargs)
+                            if (len(self.sessions_at_scenario_start)
+                                    == scenario_count):
+                                self.processes[index].returncode = status
+                            return report
+
+                        with mock.patch.object(self, "_run_json_command",
+                                               side_effect=exit_during_command), \
+                                mock.patch.object(_NullSampler, "results",
+                                                  return_value=[]) as samples:
+                            with self.assertRaises(SystemExit) as caught:
+                                self._main()
+                        self.assertEqual(samples.call_count, scenario_count - 1)
+                        self.assertIn(
+                            "%s exited early (status %d)" % (name, status),
+                            str(caught.exception))
+                        self.assertEqual(len(self.sessions_at_scenario_start),
+                                         scenario_count)
+                        self.assertFalse((self.build_dir / "bench.md").exists())
+                        self.assertTrue(all(proc.poll() is not None
+                                            for proc in self.processes))
+
+    def test_daemon_exit_while_assembling_final_result_refuses_report(
+            self) -> None:
+        self.session_steps = [(0.0, 2)]
+        collect_intervals = bench.collect_interval_throughputs
+
+        def exit_during_collection(
+                reports: Sequence[Dict[str, object]]) -> List[float]:
+            intervals = collect_intervals(reports)
+            if len(self.sessions_at_scenario_start) == len(bench.SCENARIOS):
+                self.processes[-1].returncode = 1
+            return intervals
+
+        with mock.patch.object(bench, "collect_interval_throughputs",
+                               side_effect=exit_during_collection):
+            with self.assertRaises(SystemExit) as caught:
+                self._main()
+        self.assertIn("multiplexd client exited early (status 1)",
+                      str(caught.exception))
+        self.assertEqual(len(self.sessions_at_scenario_start),
+                         len(bench.SCENARIOS))
+        self.assertFalse((self.build_dir / "bench.md").exists())
+        self.assertTrue(all(proc.poll() is not None for proc in self.processes))
 
     def test_nonempty_measurements_reach_the_markdown_report(self) -> None:
         self.session_steps = [(0.0, 2)]

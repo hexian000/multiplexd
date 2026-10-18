@@ -1413,6 +1413,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ]
             finally:
                 sampler.stop()
+            for service in services:
+                ensure_process_alive(service.proc, service.name,
+                                     service.log_path)
             resource_usage = sampler.results()
             total, sent, received, seconds = combine_throughput(
                 reports, scenario)
@@ -1434,6 +1437,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     resource_usage=resource_usage,
                 )
             )
+        # Check once more before intentional shutdown and report publication:
+        # a daemon may have exited while the final result was assembled.
+        for service in services:
+            ensure_process_alive(service.proc, service.name, service.log_path)
     finally:
         if client_proc is not None:
             terminate_process(

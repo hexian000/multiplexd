@@ -54,6 +54,7 @@ API_PORT = 9081
 # server listening, the tunnel reported healthy).
 READY_TIMEOUT = 20.0
 READY_POLL_INTERVAL = 0.2
+LISTEN_PROBE_TIMEOUT = 1.0
 # Bypass any http_proxy in the environment: the API is on loopback.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -84,7 +85,8 @@ def listening_conflicts(ports: Sequence[int]) -> Dict[int, str]:
     by this user (a concurrent run, another checkout), so this run inspects
     only the specific ports it is about to bind and reports the holder.
     """
-    r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True)
+    r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True,
+                       timeout=LISTEN_PROBE_TIMEOUT, check=True)
     conflicts: Dict[int, str] = {}
     for line in r.stdout.splitlines():
         for port in ports:
@@ -95,41 +97,53 @@ def listening_conflicts(ports: Sequence[int]) -> Dict[int, str]:
     return conflicts
 
 
-def port_listening(port: int) -> bool:
-    r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True)
+def port_listening(port: int, timeout: float = LISTEN_PROBE_TIMEOUT) -> bool:
+    r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True,
+                       timeout=timeout, check=True)
     return f":{port} " in r.stdout
 
 
-def api_healthy(port: int) -> bool:
+def api_healthy(port: int, timeout: float = 1.0) -> bool:
     """True if GET /healthy answers 200: every forwarding listener has a
     tunnel, i.e. the client's session to the server is up."""
     try:
         with _OPENER.open(f"http://127.0.0.1:{port}/healthy",
-                          timeout=1.0) as resp:
+                          timeout=timeout) as resp:
             return resp.status == 200
     except OSError:  # connection refused, HTTP error status, timeout
         return False
 
 
-def wait_ready(what: str, probe: Callable[[], bool],
+def check_running(procs: Dict[str, subprocess.Popen], what: str) -> None:
+    for name, proc in procs.items():
+        status = proc.poll()
+        if status is not None:
+            raise RuntimeError(f"{name} exited with status {status} {what}")
+
+
+def wait_ready(what: str, probe: Callable[[float], bool],
                procs: Dict[str, subprocess.Popen], timeout: float) -> None:
-    """Poll *probe* until it holds.
+    """Poll *probe* until it holds, passing its remaining time budget.
 
     Raises SystemExit as soon as one of *procs* has exited, or once *timeout*
     seconds pass without *probe* holding.
     """
     deadline = time.monotonic() + timeout
     while True:
-        for name, proc in procs.items():
-            if proc.poll() is not None:
-                raise SystemExit(
-                    f"{name} exited with status {proc.returncode} "
-                    f"while waiting for {what}")
-        if probe():
-            return
-        if time.monotonic() >= deadline:
+        try:
+            check_running(procs, f"while waiting for {what}")
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise SystemExit(f"{what}: not ready within {timeout:.0f} s")
-        time.sleep(READY_POLL_INTERVAL)
+        ready = probe(min(LISTEN_PROBE_TIMEOUT, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SystemExit(f"{what}: not ready within {timeout:.0f} s")
+        if ready:
+            return
+        time.sleep(min(READY_POLL_INTERVAL, remaining))
 
 
 def write_builtin_certs(cert_dir: Path) -> None:
@@ -159,7 +173,7 @@ _CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 
 
 def _read_ticks(pid: int) -> int:
-    """Return utime+stime in clock ticks for *pid*, or 0 if gone.
+    """Return utime+stime in clock ticks for *pid*; fail if unavailable.
 
     Parses /proc/<pid>/stat.  The comm field (field 2) is enclosed in
     parentheses and may contain spaces, so we cannot naively split().
@@ -171,16 +185,19 @@ def _read_ticks(pid: int) -> int:
     """
     try:
         raw = (Path("/proc") / str(pid) / "stat").read_text()
-    except (FileNotFoundError, PermissionError):
-        return 0
+    except OSError as exc:
+        raise RuntimeError(f"cannot read CPU ticks for pid {pid}: {exc}") from exc
     rp = raw.rfind(")")
     if rp < 0:
-        return 0
+        raise RuntimeError(f"invalid CPU stat for pid {pid}")
     suffix = raw[rp + 1:].split()
     # suffix[0]=state, [1]=ppid, ..., [11]=utime, [12]=stime
     if len(suffix) < 13:
-        return 0
-    return int(suffix[11]) + int(suffix[12])
+        raise RuntimeError(f"invalid CPU stat for pid {pid}")
+    try:
+        return int(suffix[11]) + int(suffix[12])
+    except ValueError as exc:
+        raise RuntimeError(f"invalid CPU ticks for pid {pid}") from exc
 
 
 def _total_ticks(*pids: int) -> int:
@@ -191,11 +208,11 @@ def cpu_pct_interval(t_start: float, ticks_start: int,
                      t_end: float, ticks_end: int) -> float:
     """Average CPU% over [t_start, t_end] from two tick snapshots."""
     if t_end <= t_start:
-        return 0.0
+        raise ValueError("CPU sample interval did not advance")
     dt = t_end - t_start
     dticks = ticks_end - ticks_start
-    if dticks < 0:          # pid restarted / counter wrapped
-        return 0.0
+    if dticks < 0:
+        raise ValueError("CPU tick counter decreased")
     return dticks / (dt * _CLK_TCK) * 100.0
 
 
@@ -409,7 +426,7 @@ class LinearityTest:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self.wait_ready(f"iperf3 listening on port {IPERF3_PORT}",
-                        lambda: port_listening(IPERF3_PORT))
+                        lambda timeout: port_listening(IPERF3_PORT, timeout))
 
         # multiplexd server; the client dials it once it listens
         self._srv = subprocess.Popen(
@@ -418,7 +435,7 @@ class LinearityTest:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self.wait_ready(f"multiplexd server listening on port {MUX_PORT}",
-                        lambda: port_listening(MUX_PORT))
+                        lambda timeout: port_listening(MUX_PORT, timeout))
 
         # multiplexd client
         self._cli = subprocess.Popen(
@@ -426,18 +443,28 @@ class LinearityTest:
             cwd=str(self.work_dir),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        self.wait_ready("multiplexd /healthy", lambda: api_healthy(API_PORT))
+        self.wait_ready("multiplexd /healthy",
+                        lambda timeout: api_healthy(API_PORT, timeout))
 
         self._srv_pid = self._srv.pid
         self._cli_pid = self._cli.pid
         log(f"multiplexd ready  srv={self._srv_pid}  cli={self._cli_pid}")
 
-    def wait_ready(self, what: str, probe: Callable[[], bool]) -> None:
-        procs = {name: p for name, p in (("iperf3", self._iperf),
-                                         ("multiplexd server", self._srv),
-                                         ("multiplexd client", self._cli))
-                 if p is not None}
-        wait_ready(what, probe, procs, self.ready_timeout)
+    def owned_processes(self) -> Dict[str, subprocess.Popen]:
+        return {name: p for name, p in (("iperf3", self._iperf),
+                                       ("multiplexd server", self._srv),
+                                       ("multiplexd client", self._cli))
+                if p is not None}
+
+    def wait_ready(self, what: str, probe: Callable[[float], bool]) -> None:
+        wait_ready(what, probe, self.owned_processes(), self.ready_timeout)
+
+    def snapshots(self) -> tuple[TickSnap, TickSnap]:
+        procs = self.owned_processes()
+        check_running(procs, "while measuring CPU")
+        snapshots = (TickSnap(self._srv_pid), TickSnap(self._cli_pid))
+        check_running(procs, "while measuring CPU")
+        return snapshots
 
     def teardown(self) -> None:
         # Tear down only the processes this run spawned -- never a global
@@ -474,8 +501,7 @@ class LinearityTest:
         timeout = float(self.duration) + 30.0
 
         # --- snapshots just before iperf3 starts --------------------------
-        snap0_srv = TickSnap(self._srv_pid)
-        snap0_cli = TickSnap(self._cli_pid)
+        snap0_srv, snap0_cli = self.snapshots()
 
         cmd = ["iperf3", "-c", "127.0.0.1", "-p", str(MUX_LISTEN),
                "-t", str(self.duration), "-P", "1", "--bidir", "--json"]
@@ -484,11 +510,9 @@ class LinearityTest:
         report = run_iperf_json(cmd, log_path=logfile, timeout_seconds=timeout)
 
         # --- snapshots right after iperf3 exits, then after settle --------
-        snap1_srv = TickSnap(self._srv_pid)
-        snap1_cli = TickSnap(self._cli_pid)
+        snap1_srv, snap1_cli = self.snapshots()
         time.sleep(2.0)
-        snap2_srv = TickSnap(self._srv_pid)
-        snap2_cli = TickSnap(self._cli_pid)
+        snap2_srv, snap2_cli = self.snapshots()
 
         srv_dur = snap1_srv.cpu_since(snap0_srv)
         srv_aft = snap2_srv.cpu_since(snap1_srv)
@@ -677,11 +701,9 @@ class LinearityTest:
 
             # idle baseline: single 2 s interval after settling
             time.sleep(2)
-            idle0_srv = TickSnap(self._srv_pid)
-            idle0_cli = TickSnap(self._cli_pid)
+            idle0_srv, idle0_cli = self.snapshots()
             time.sleep(2.0)
-            idle1_srv = TickSnap(self._srv_pid)
-            idle1_cli = TickSnap(self._cli_pid)
+            idle1_srv, idle1_cli = self.snapshots()
             idle_srv = idle1_srv.cpu_since(idle0_srv)
             idle_cli = idle1_cli.cpu_since(idle0_cli)
             log(f"idle CPU: srv={idle_srv:.1f}%  cli={idle_cli:.1f}%")
@@ -690,11 +712,9 @@ class LinearityTest:
 
             # final CPU after tombstone cleanup (12 s interval)
             time.sleep(12)
-            final0_srv = TickSnap(self._srv_pid)
-            final0_cli = TickSnap(self._cli_pid)
+            final0_srv, final0_cli = self.snapshots()
             time.sleep(2.0)
-            final1_srv = TickSnap(self._srv_pid)
-            final1_cli = TickSnap(self._cli_pid)
+            final1_srv, final1_cli = self.snapshots()
             final_srv = final1_srv.cpu_since(final0_srv)
             final_cli = final1_cli.cpu_since(final0_cli)
             log(f"final CPU after cleanup: srv={final_srv:.1f}%  "
@@ -702,6 +722,7 @@ class LinearityTest:
 
             report = self.render_report(rows, idle_srv, idle_cli,
                                         final_srv, final_cli)
+            check_running(self.owned_processes(), "before publishing report")
             self.output.write_text(report, encoding="utf-8")
             print(report)
             log(f"report written to {self.output}")

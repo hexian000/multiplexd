@@ -158,6 +158,10 @@ if(BUILD_TESTING)
             COMMAND "${Python3_EXECUTABLE}"
                 "${PROJECT_SOURCE_DIR}/scripts/bench_test.py"
             WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+        add_test(NAME gprof_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${PROJECT_SOURCE_DIR}/scripts/gprof_test.py"
+            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
     endif()
 endif()
 

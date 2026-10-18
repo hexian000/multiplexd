@@ -6,8 +6,10 @@ Run from the project root: python3 scripts/gprof_test.py
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -73,6 +75,179 @@ class ConfigureTests(unittest.TestCase):
             "cmake", {}, Path("build/gprof"), "Debug")
         self.assertNotIn("-DENABLE_THREADS=", " ".join(command))
         self.assertIn("-DCMAKE_BUILD_TYPE=Debug", command)
+
+
+class MainTests(unittest.TestCase):
+    def setUp(self):
+        scratch = Path("build/tmp")
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=scratch)
+        self.addCleanup(self.temp.cleanup)
+        self.runtime = Path(self.temp.name).resolve()
+        self.binary = self.runtime / "bin/multiplexd"
+        self.binary.parent.mkdir()
+        self.binary.touch()
+        self.profile = self.runtime / "gmon.out"
+        self.profile.touch()
+        self.output = self.runtime / "report.md"
+        self.args = ["--build-dir", str(self.runtime),
+                     "--profile-build-dir", str(self.runtime),
+                     "--output", str(self.output)]
+        self.skip_all = ["--skip-configure", "--skip-build", "--skip-benchmark"]
+
+    def test_offline_report_needs_only_gprof(self):
+        result = subprocess.CompletedProcess(
+            [], 0, stdout=FlatProfileTests.profile())
+        with mock.patch.object(gprof.shutil, "which", side_effect=lambda name:
+                               "/tools/gprof" if name == "gprof" else None) as which:
+            with mock.patch.object(gprof, "run_command", return_value=result) as run:
+                self.assertEqual(gprof.main(self.args + self.skip_all), 0)
+        which.assert_called_once_with("gprof")
+        run.assert_called_once_with(
+            ["/tools/gprof", str(self.binary), str(self.profile)],
+            cwd=gprof.ROOT, capture_output=True)
+        self.assertIn("| work |", self.output.read_text())
+        self.assertTrue((self.runtime / "gprof.txt").is_file())
+
+    def test_offline_report_preserves_runtime_evidence(self):
+        for saved_tls in (False, True):
+            with self.subTest(saved_tls=saved_tls):
+                evidence = {
+                    self.runtime / "server.json": json.dumps(
+                        gprof.build_server_config(saved_tls)).encode(),
+                    self.runtime / "client.json": json.dumps(
+                        gprof.build_client_config(saved_tls)).encode(),
+                    self.runtime / "server-cert.pem": b"saved certificate",
+                    self.runtime / "server-key.pem": b"saved key",
+                    self.profile: b"saved profile",
+                }
+                for path, content in evidence.items():
+                    path.write_bytes(content)
+                result = subprocess.CompletedProcess(
+                    [], 0, stdout=FlatProfileTests.profile())
+                cli_tls = [] if saved_tls else ["--tls"]
+                with mock.patch.object(gprof.shutil, "which", return_value="gprof"):
+                    with mock.patch.object(gprof, "run_command", return_value=result):
+                        self.assertEqual(gprof.main(
+                            self.args + self.skip_all + cli_tls), 0)
+                for path, content in evidence.items():
+                    self.assertEqual(path.read_bytes(), content)
+                report = self.output.read_text()
+                for field in ("TLS", "Benchmark timeout", "Shutdown grace"):
+                    self.assertIn("| %s | unknown |" % field, report)
+                self.assertIn("unknown (reused profile data)", report)
+                self.assertNotIn("--bidir", report)
+
+    def test_offline_report_does_not_create_runtime_assets(self):
+        result = subprocess.CompletedProcess(
+            [], 0, stdout=FlatProfileTests.profile())
+        (self.runtime / "iperf3-parallel.stdout").write_text("saved traffic\n")
+        with mock.patch.object(gprof.shutil, "which", return_value="gprof"):
+            with mock.patch.object(gprof, "run_command", return_value=result):
+                self.assertEqual(gprof.main(
+                    self.args + self.skip_all + ["--tls"]), 0)
+        for name in ("server.json", "client.json", "server-cert.pem",
+                     "client-cert.pem", "server-key.pem", "client-key.pem"):
+            self.assertFalse((self.runtime / name).exists())
+        report = self.output.read_text()
+        self.assertIn("saved traffic", report)
+        self.assertIn("reused existing benchmark log", report)
+        self.assertIn("| TLS | unknown |", report)
+
+    def benchmark_collaborators(self, stack, processes, benchmark):
+        stack.enter_context(mock.patch.object(
+            gprof.shutil, "which", side_effect=lambda name: "/tools/" + name))
+        stack.enter_context(mock.patch.object(
+            gprof, "check_port_available", return_value=True))
+        stack.enter_context(mock.patch.object(gprof.time, "sleep"))
+        spawn = stack.enter_context(mock.patch.object(
+            gprof.subprocess, "Popen", side_effect=processes))
+        run = stack.enter_context(mock.patch.object(
+            gprof, "run_benchmark", side_effect=benchmark))
+        command = stack.enter_context(mock.patch.object(
+            gprof, "run_command", return_value=subprocess.CompletedProcess(
+                [], 0, stdout=FlatProfileTests.profile())))
+        terminate = stack.enter_context(mock.patch.object(
+            gprof, "terminate_process"))
+        return spawn, run, command, terminate
+
+    def test_benchmark_refuses_service_exits_before_teardown(self):
+        names = ("iperf3 server", "multiplexd server", "multiplexd client")
+        for when in ("before", "during"):
+            for failed, name in enumerate(names):
+                for status in (0, -11):
+                    with self.subTest(when=when, name=name, status=status):
+                        processes = [mock.Mock(pid=100 + i) for i in range(3)]
+                        for proc in processes:
+                            proc.poll.return_value = None
+                        if when == "before":
+                            processes[failed].poll.side_effect = [None, status]
+
+                        def benchmark(*args, **kwargs):
+                            if when == "during":
+                                processes[failed].poll.return_value = status
+                            return "successful traffic"
+
+                        self.output.write_text("previous report\n")
+                        with ExitStack() as stack:
+                            spawn, run, command, terminate = self.benchmark_collaborators(
+                                stack, processes, benchmark)
+                            with self.assertRaisesRegex(
+                                    SystemExit, "%s exited early \\(status %d\\)" % (name, status)):
+                                gprof.main(self.args + [
+                                    "--skip-configure", "--skip-build", "--keep-profile-data"])
+                        self.assertEqual(run.call_count, when == "during")
+                        command.assert_not_called()
+                        self.assertEqual(self.output.read_text(), "previous report\n")
+                        self.assertEqual(terminate.call_count, 3)
+                        self.assertTrue(all(call.kwargs["stdout"].closed
+                                            for call in spawn.call_args_list))
+
+    def test_benchmark_publishes_when_every_service_stays_alive(self):
+        processes = [mock.Mock(pid=100 + i) for i in range(3)]
+        for proc in processes:
+            proc.poll.return_value = None
+        with ExitStack() as stack:
+            _, run, command, terminate = self.benchmark_collaborators(
+                stack, processes, lambda *args, **kwargs: "successful traffic")
+            self.assertEqual(gprof.main(self.args + [
+                "--skip-configure", "--skip-build", "--keep-profile-data", "--tls"]), 0)
+        run.assert_called_once()
+        command.assert_called_once()
+        self.assertEqual(terminate.call_count, 3)
+        self.assertTrue(all(proc.poll.call_count == 3 for proc in processes))
+        report = self.output.read_text()
+        self.assertIn("| TLS | on |", report)
+        self.assertNotIn("unknown", report)
+        self.assertIn("successful traffic", report)
+
+    def test_each_enabled_cmake_stage_requires_cmake(self):
+        for skipped in ("--skip-configure", "--skip-build"):
+            with self.subTest(skipped=skipped):
+                with mock.patch.object(gprof.shutil, "which", return_value=None):
+                    with self.assertRaisesRegex(SystemExit, "required tool not found: cmake"):
+                        gprof.main(self.args + [skipped, "--skip-benchmark"])
+
+    def test_enabled_benchmark_requires_iperf3(self):
+        with mock.patch.object(gprof.shutil, "which", side_effect=lambda name:
+                               "/tools/gprof" if name == "gprof" else None):
+            with self.assertRaisesRegex(SystemExit, "required tool not found: iperf3"):
+                gprof.main(self.args + ["--skip-configure", "--skip-build"])
+
+    def test_offline_report_still_requires_gprof(self):
+        with mock.patch.object(gprof.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(SystemExit, "required tool not found: gprof"):
+                gprof.main(self.args + self.skip_all)
+
+    def test_offline_report_still_validates_binary_and_profile(self):
+        with mock.patch.object(gprof.shutil, "which", return_value="/tools/gprof"):
+            self.binary.unlink()
+            with self.assertRaisesRegex(SystemExit, "expected binary not found"):
+                gprof.main(self.args + self.skip_all)
+            self.binary.touch()
+            self.profile.unlink()
+            with self.assertRaisesRegex(SystemExit, "no gprof data files found"):
+                gprof.main(self.args + self.skip_all)
 
 
 class CredentialTests(unittest.TestCase):
@@ -158,6 +333,37 @@ class FlatProfileTests(unittest.TestCase):
         self.assertEqual(row.self_us_per_call, 10)
         self.assertEqual(row.total_us_per_call, 20)
 
+    def test_gnu_large_and_small_units_are_normalized_in_each_column(self):
+        for unit, factor in (("Ts", 1e18), ("Gs", 1e15), ("Ms", 1e12),
+                             ("Ks", 1e9), ("ps", 1e-6), ("fs", 1e-9), ("as", 1e-12)):
+            with self.subTest(unit=unit):
+                row = gprof.parse_flat_profile(self.profile(unit, "us"))[0]
+                self.assertEqual(row.self_us_per_call, 10 * factor)
+                self.assertEqual(row.total_us_per_call, 20)
+                row = gprof.parse_flat_profile(self.profile("us", unit))[0]
+                self.assertEqual(row.self_us_per_call, 10)
+                self.assertEqual(row.total_us_per_call, 20 * factor)
+
+    def test_zero_sample_terasecond_profile_preserves_zero_and_call_counts(self):
+        text = ("Flat profile:\n\nEach sample counts as 0.01 seconds.\n"
+                " no time accumulated\n"
+                "  %   cumulative   self              self     total\n"
+                " time   seconds   seconds    calls  Ts/call  Ts/call  name\n"
+                "  0.00      0.00     0.00        3     0.00     0.00  work\n"
+                "  0.00      0.00     0.00                            uncounted\n\n")
+        rows = gprof.parse_flat_profile(text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].calls, 3)
+        self.assertEqual(rows[0].percent, 0)
+        self.assertEqual(rows[0].cumulative_seconds, 0)
+        self.assertEqual(rows[0].self_seconds, 0)
+        self.assertEqual(rows[0].self_us_per_call, 0)
+        self.assertEqual(rows[0].total_us_per_call, 0)
+        self.assertEqual(rows[1].name, "uncounted")
+        self.assertIsNone(rows[1].calls)
+        self.assertIsNone(rows[1].self_us_per_call)
+        self.assertIsNone(rows[1].total_us_per_call)
+
     def test_seconds_nanoseconds_and_independent_column_units(self):
         for unit, factor in (("s", 1e6), ("ns", 1e-3)):
             with self.subTest(unit=unit):
@@ -166,8 +372,10 @@ class FlatProfileTests(unittest.TestCase):
                 self.assertEqual(row.total_us_per_call, 20)
 
     def test_missing_or_unknown_units_are_rejected(self):
-        with self.assertRaisesRegex(SystemExit, "unsupported gprof"):
-            gprof.parse_flat_profile(self.profile("unknown"))
+        for unit in ("unknown", "ks"):
+            with self.subTest(unit=unit):
+                with self.assertRaisesRegex(SystemExit, "unsupported gprof"):
+                    gprof.parse_flat_profile(self.profile(unit))
         text = self.profile().replace(
             " time   seconds   seconds    calls  ms/call  ms/call  name\n", "")
         with self.assertRaisesRegex(SystemExit, "no per-call unit header"):

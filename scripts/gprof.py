@@ -44,7 +44,12 @@ PROFILE_CACHE_OPTIONS = (
     "LIBBACKTRACE_LIBRARY", "LIBUNWIND_INCLUDE_DIR", "LIBUNWIND_LIBRARY",
     "SYSTEMD_INCLUDE_DIR", "SYSTEMD_LIBRARY",
 )
-PER_CALL_US = {"s": 1e6, "ms": 1e3, "us": 1.0, "ns": 1e-3}
+# GNU gprof's SI table uses an uppercase K for kilo.
+PER_CALL_US = {
+    "Ts": 1e18, "Gs": 1e15, "Ms": 1e12, "Ks": 1e9,
+    "s": 1e6, "ms": 1e3, "us": 1.0, "ns": 1e-3,
+    "ps": 1e-6, "fs": 1e-9, "as": 1e-12,
+}
 
 
 @dataclass
@@ -652,9 +657,9 @@ def render_markdown_report(
         benchmark_output: str,
         gprof_text_path: Path,
         gprof_output: str,
-        use_tls: bool,
-        command_timeout_seconds: float,
-        shutdown_budget: ProcessShutdownBudget,
+        use_tls: Optional[bool],
+        command_timeout_seconds: Optional[float],
+        shutdown_budget: Optional[ProcessShutdownBudget],
 ) -> str:
     output_dir = output_path.parent
     rows = parse_flat_profile(gprof_output)
@@ -681,6 +686,16 @@ def render_markdown_report(
         output_dir, benchmark_stderr_path)
     benchmark_output_text = sanitize_report_text(benchmark_output).rstrip()
     gprof_output_text = sanitize_report_text(gprof_output).rstrip()
+    tls_text = "unknown" if use_tls is None else "on" if use_tls else "off"
+    timeout_text = (
+        "unknown" if command_timeout_seconds is None
+        else "%.1f s" % command_timeout_seconds)
+    shutdown_text = (
+        "unknown" if shutdown_budget is None
+        else "SIGINT %.1f s, terminate %.1f s" % (
+            shutdown_budget.sigint_wait_seconds,
+            shutdown_budget.terminate_wait_seconds,
+        ))
     lines = [
         "# gprof Profile",
         "",
@@ -690,13 +705,9 @@ def render_markdown_report(
         "| --- | --- |",
         "| Profile build dir | %s |" % profile_build_dir_text,
         "| Binary | %s |" % binary_path_text,
-        "| TLS | %s |" % ("on" if use_tls else "off"),
-        "| Benchmark timeout | %.1f s |" % command_timeout_seconds,
-        "| Shutdown grace | SIGINT %.1f s, terminate %.1f s |"
-        % (
-            shutdown_budget.sigint_wait_seconds,
-            shutdown_budget.terminate_wait_seconds,
-        ),
+        "| TLS | %s |" % tls_text,
+        "| Benchmark timeout | %s |" % timeout_text,
+        "| Shutdown grace | %s |" % shutdown_text,
         "| Benchmark command | `%s` |" % benchmark_command_text,
         "| Raw gprof output | [%s](%s) |" % (
             raw_gprof_text, raw_gprof_link),
@@ -853,9 +864,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    cmake = ensure_tool(args.cmake)
+    if not args.skip_configure or not args.skip_build:
+        cmake = ensure_tool(args.cmake)
     gprof = ensure_tool(args.gprof)
-    iperf3 = ensure_tool(args.iperf3)
+    iperf3 = args.iperf3 if args.skip_benchmark else ensure_tool(args.iperf3)
     ensure_project_root(ROOT)
 
     base_build_dir = resolve_path(ROOT, args.build_dir)
@@ -898,11 +910,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.startup_wait,
         scenario_count=1,
     )
-    server_config_path, client_config_path = prepare_runtime_assets(
-        binary_path,
-        profile_build_dir,
-        use_tls=args.tls,
-    )
     benchmark_commands = [
         [
             iperf3,
@@ -927,6 +934,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         if not args.skip_benchmark:
+            server_config_path, client_config_path = prepare_runtime_assets(
+                binary_path,
+                profile_build_dir,
+                use_tls=args.tls,
+            )
             if not args.keep_profile_data:
                 removed = remove_stale_profile_data(profile_build_dir)
                 log("removed %d stale gprof files" % removed)
@@ -1028,6 +1040,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             remaining_wait = max(0.0, args.startup_wait - 1.5)
             if remaining_wait > 0:
                 time.sleep(remaining_wait)
+            services = (
+                (iperf_server_proc, "iperf3 server", iperf_server_log_path),
+                (server_proc, "multiplexd server", server_log_path),
+                (client_proc, "multiplexd client", client_log_path),
+            )
+            for proc, name, log_path in services:
+                verify_process_running(
+                    proc, name, log_path=log_path, wait_seconds=0.0)
             benchmark_output = run_benchmark(
                 benchmark_commands,
                 cwd=profile_build_dir,
@@ -1036,6 +1056,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 timeout_seconds=command_timeout_seconds,
                 shutdown_budget=shutdown_budget,
             )
+            for proc, name, log_path in services:
+                verify_process_running(
+                    proc, name, log_path=log_path, wait_seconds=0.0)
     finally:
         if client_proc is not None:
             terminate_process(
@@ -1065,9 +1088,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "no gprof data files found; expected gmon.out or GMON_OUT_PREFIX outputs")
     log("found %d gprof data files" % len(profile_files))
     benchmark_stdout_path = profile_build_dir / "iperf3-parallel.stdout"
-    benchmark_command_text = " ; ".join(
-        format_command_for_report(command) for command in benchmark_commands
-    )
+    if args.skip_benchmark:
+        benchmark_command_text = "unknown (reused profile data)"
+    else:
+        benchmark_command_text = " ; ".join(
+            format_command_for_report(command) for command in benchmark_commands
+        )
     if not benchmark_output and benchmark_stdout_path.exists():
         benchmark_output = benchmark_stdout_path.read_text(
             encoding="utf-8", errors="replace")
@@ -1093,9 +1119,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         benchmark_output=benchmark_output,
         gprof_text_path=gprof_text_path,
         gprof_output=gprof_output,
-        use_tls=args.tls,
-        command_timeout_seconds=command_timeout_seconds,
-        shutdown_budget=shutdown_budget,
+        use_tls=None if args.skip_benchmark else args.tls,
+        command_timeout_seconds=(
+            None if args.skip_benchmark else command_timeout_seconds),
+        shutdown_budget=None if args.skip_benchmark else shutdown_budget,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(report, encoding="utf-8")
