@@ -28,6 +28,7 @@
 #include <ev.h>
 
 #include <errno.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -39,6 +40,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+/* libev rounds when converting between relative timeouts and deadlines. */
+static const double timer_tolerance = 1e-6;
 
 /* Configurable mock results: each test sets these before driving the code under
  * test, then restores the inert default.  Declared here so the mock bodies
@@ -1762,7 +1766,7 @@ T_DECLARE_CASE(test_resume_attempt_failure_reports_connect_failed)
 		fx.fds[0] = -1; /* mux_session_suspend closed it */
 		teardown_fixture(&fx);
 
-		T_LOGF("from %s: remaining %.3f s",
+		T_LOGF("from %s: remaining %.17g s",
 		       session_state_str[attempt_states[i]], remaining);
 		T_EXPECT_EQ(state, (enum session_state)SESSION_SUSPENDED);
 		T_EXPECT_EQ(g_recorded.connect_failed, 1);
@@ -1770,7 +1774,7 @@ T_DECLARE_CASE(test_resume_attempt_failure_reports_connect_failed)
 		T_EXPECT_EQ(g_recorded.closed, 0);
 		T_EXPECT_EQ(halfopen_after, (uint_least64_t)0);
 		T_EXPECT(deadline_armed);
-		T_EXPECT(remaining > 499.0 && remaining <= 500.0);
+		T_EXPECT(fabs(remaining - 500.0) < timer_tolerance);
 	}
 }
 
@@ -2528,7 +2532,9 @@ T_DECLARE_CASE(test_set_config_rederives_idle_eligibility)
 	conf.idle_timeout = 5;
 	mux_session_set_config(&fx.ss, &conf);
 	T_EXPECT(ev_is_active(&fx.ss.w_idle_timeout));
-	T_EXPECT_EQ(ev_timer_remaining(fx.loop, &fx.ss.w_idle_timeout), 5.0);
+	T_EXPECT(
+		fabs(ev_timer_remaining(fx.loop, &fx.ss.w_idle_timeout) - 5.0) <
+		timer_tolerance);
 
 	/* One active stream prevents the timer, even if it was armed before. */
 	struct mux_stream stream = { .id = 1 };
@@ -2552,7 +2558,9 @@ T_DECLARE_CASE(test_set_config_rederives_idle_eligibility)
 	T_EXPECT(ev_is_active(&fx.ss.w_idle_timeout));
 	conf.idle_timeout = 7;
 	mux_session_set_config(&fx.ss, &conf);
-	T_EXPECT_EQ(ev_timer_remaining(fx.loop, &fx.ss.w_idle_timeout), 7.0);
+	T_EXPECT(
+		fabs(ev_timer_remaining(fx.loop, &fx.ss.w_idle_timeout) - 7.0) <
+		timer_tolerance);
 	conf.idle_timeout = 0;
 	mux_session_set_config(&fx.ss, &conf);
 	T_EXPECT(!ev_is_active(&fx.ss.w_idle_timeout));
