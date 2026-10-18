@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """multiplexd throughput / CPU linearity benchmark.
 
-Generates TLS certificates, starts a server and client pair, then runs
-iperf3 bidirectional (``--bidir``) with a single stream (``-P 1``) at
-increasing bandwidth limits.  For each step the script records:
+Writes the builtin TLS certificate pair (omitting TLS on a build without it),
+starts a server and client pair, then runs iperf3 bidirectional (``--bidir``)
+with a single stream (``-P 1``) at increasing bandwidth limits.  For each step
+the script records:
 
 * achieved throughput (Mbps, sum of both directions)
 * multiplexd CPU usage during the test
@@ -33,8 +34,13 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Union
+
+# Sibling script, same scripts/ directory: reuse its builtin RSA-4096 pair, as
+# bench.py does, since --gencerts exists only in OpenSSL builds.
+from smoke_test import BUILTIN_CERT_PEM, BUILTIN_KEY_PEM, build_has_tls
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BUILD_DIR = ROOT / "build"
@@ -44,6 +50,12 @@ MUX_LISTEN = 5202
 SERVER_LISTEN = 5203
 MUX_PORT = 8443
 API_PORT = 9081
+# Deadline for each readiness wait in setup (iperf3 listening, multiplexd
+# server listening, the tunnel reported healthy).
+READY_TIMEOUT = 20.0
+READY_POLL_INTERVAL = 0.2
+# Bypass any http_proxy in the environment: the API is on loopback.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 # ---------------------------------------------------------------------------
@@ -58,9 +70,10 @@ def quote_cmd(cmd: Sequence[str]) -> str:
     return " ".join(shlex.quote(p) for p in cmd)
 
 
-def run(cmd: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
-    log(f"+ {quote_cmd(cmd)}")
-    return subprocess.run(list(cmd), **kwargs)
+def output_text(value: Optional[Union[str, bytes]]) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
 
 def listening_conflicts(ports: Sequence[int]) -> Dict[int, str]:
@@ -76,20 +89,60 @@ def listening_conflicts(ports: Sequence[int]) -> Dict[int, str]:
     for line in r.stdout.splitlines():
         for port in ports:
             # Match ":<port> " in the local-address column, the same anchored
-            # form wait_port() uses, so e.g. :5201 does not match :45201.
+            # form port_listening() uses, so e.g. :5201 does not match :45201.
             if port not in conflicts and f":{port} " in line:
                 conflicts[port] = line.strip()
     return conflicts
 
 
-def wait_port(port: int, timeout: float = 10.0) -> bool:
+def port_listening(port: int) -> bool:
+    r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True)
+    return f":{port} " in r.stdout
+
+
+def api_healthy(port: int) -> bool:
+    """True if GET /healthy answers 200: every forwarding listener has a
+    tunnel, i.e. the client's session to the server is up."""
+    try:
+        with _OPENER.open(f"http://127.0.0.1:{port}/healthy",
+                          timeout=1.0) as resp:
+            return resp.status == 200
+    except OSError:  # connection refused, HTTP error status, timeout
+        return False
+
+
+def wait_ready(what: str, probe: Callable[[], bool],
+               procs: Dict[str, subprocess.Popen], timeout: float) -> None:
+    """Poll *probe* until it holds.
+
+    Raises SystemExit as soon as one of *procs* has exited, or once *timeout*
+    seconds pass without *probe* holding.
+    """
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True)
-        if f":{port} " in r.stdout:
-            return True
-        time.sleep(0.3)
-    return False
+    while True:
+        for name, proc in procs.items():
+            if proc.poll() is not None:
+                raise SystemExit(
+                    f"{name} exited with status {proc.returncode} "
+                    f"while waiting for {what}")
+        if probe():
+            return
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"{what}: not ready within {timeout:.0f} s")
+        time.sleep(READY_POLL_INTERVAL)
+
+
+def write_builtin_certs(cert_dir: Path) -> None:
+    """Write the builtin pair as both peers' certificate and key.
+
+    All four files are rewritten on every run, so a partial or stale set left
+    by an earlier run can never be picked up.
+    """
+    for role in ("server", "client"):
+        (cert_dir / f"{role}-cert.pem").write_text(
+            BUILTIN_CERT_PEM, encoding="utf-8")
+        (cert_dir / f"{role}-key.pem").write_text(
+            BUILTIN_KEY_PEM, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +258,8 @@ def run_iperf_json(
 ) -> Dict[str, object]:
     """Run iperf3 with --json, write output to *log_path*, return parsed dict.
 
-    Raises SystemExit on timeout, non-zero exit, malformed JSON, or stderr
-    output from iperf3.
+    Raises SystemExit on timeout, non-zero exit, or malformed JSON.
+    Stderr output is logged, including warnings from a successful invocation.
     """
     log(f"+ {quote_cmd(command)}")
     try:
@@ -217,12 +270,16 @@ def run_iperf_json(
             stderr=subprocess.PIPE,
             timeout=timeout_seconds,
         )
-        output = proc.stdout or ""
-        stderr_output = proc.stderr or ""
+        output = output_text(proc.stdout)
+        stderr_output = output_text(proc.stderr)
     except subprocess.TimeoutExpired as exc:
-        output = exc.stdout or ""
-        stderr_output = exc.stderr or ""
+        output = output_text(exc.stdout)
+        stderr_output = output_text(exc.stderr)
         log_path.write_text(output, encoding="utf-8")
+        stderr_lines = [line.strip() for line in stderr_output.splitlines()
+                        if line.strip()]
+        if stderr_lines:
+            log(f"iperf3 stderr: {stderr_lines[0]}")
         raise SystemExit(
             f"iperf3 timed out after {timeout_seconds:.0f}s: "
             f"{quote_cmd(command)}"
@@ -308,6 +365,9 @@ class LinearityTest:
 
         self.work_dir = self.build_dir / "linearity_work"
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.ready_timeout = READY_TIMEOUT
+        # A build whose TLS support cannot be determined is assumed to have it.
+        self.use_tls = build_has_tls(self.build_dir) is not False
 
         self._srv: Optional[subprocess.Popen] = None
         self._cli: Optional[subprocess.Popen] = None
@@ -332,17 +392,15 @@ class LinearityTest:
         if not self.binary.exists():
             raise SystemExit(f"multiplexd not found: {self.binary}")
 
-        # write configs
+        # write configs; a build without TLS rejects any TLS credential
         for name, cfg in [("server.json", SERVER_CONF),
                           ("client.json", CLIENT_CONF)]:
+            if not self.use_tls:
+                cfg = {k: v for k, v in cfg.items() if k != "tls"}
             (self.work_dir / name).write_text(
                 json.dumps(cfg, indent=4) + "\n", encoding="utf-8")
-
-        # generate certs (idempotent)
-        cert_dir = self.work_dir
-        if not (cert_dir / "server-cert.pem").exists():
-            run([str(self.binary), "--gencerts", "client,server"],
-                cwd=str(cert_dir), timeout=30)
+        if self.use_tls:
+            write_builtin_certs(self.work_dir)
 
         # iperf3 server (foreground, not daemon)
         self._iperf = subprocess.Popen(
@@ -350,16 +408,17 @@ class LinearityTest:
             cwd=str(self.work_dir),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        if not wait_port(IPERF3_PORT):
-            raise SystemExit("iperf3 server did not start")
+        self.wait_ready(f"iperf3 listening on port {IPERF3_PORT}",
+                        lambda: port_listening(IPERF3_PORT))
 
-        # multiplexd server
+        # multiplexd server; the client dials it once it listens
         self._srv = subprocess.Popen(
             [str(self.binary), "-c", "server.json"],
             cwd=str(self.work_dir),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        time.sleep(2)
+        self.wait_ready(f"multiplexd server listening on port {MUX_PORT}",
+                        lambda: port_listening(MUX_PORT))
 
         # multiplexd client
         self._cli = subprocess.Popen(
@@ -367,19 +426,18 @@ class LinearityTest:
             cwd=str(self.work_dir),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        time.sleep(3)
-
-        # health check
-        r = subprocess.run(
-            ["curl", "-s", f"http://127.0.0.1:{API_PORT}/healthy"],
-            capture_output=True,
-        )
-        if r.returncode != 0:
-            raise SystemExit("multiplexd not healthy")
+        self.wait_ready("multiplexd /healthy", lambda: api_healthy(API_PORT))
 
         self._srv_pid = self._srv.pid
         self._cli_pid = self._cli.pid
         log(f"multiplexd ready  srv={self._srv_pid}  cli={self._cli_pid}")
+
+    def wait_ready(self, what: str, probe: Callable[[], bool]) -> None:
+        procs = {name: p for name, p in (("iperf3", self._iperf),
+                                         ("multiplexd server", self._srv),
+                                         ("multiplexd client", self._cli))
+                 if p is not None}
+        wait_ready(what, probe, procs, self.ready_timeout)
 
     def teardown(self) -> None:
         # Tear down only the processes this run spawned -- never a global
@@ -497,6 +555,9 @@ class LinearityTest:
         lines.append("")
         lines.append(f"**Date**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f"**Binary**: `{self.binary}`")
+        transport = ("TLS (TLS_CHACHA20_POLY1305_SHA256)" if self.use_tls
+                     else "plaintext (build without TLS)")
+        lines.append(f"**Transport**: {transport}")
         lines.append(f"**iperf3 duration per step**: {self.duration} s")
         lines.append(
             f"**Idle CPU (srv / cli)**: {idle_srv:.1f} % / {idle_cli:.1f} %")
@@ -534,32 +595,41 @@ class LinearityTest:
         if len(valid) >= 2:
             first_eff = valid[0]["cpu_per_mbps"]
             last_eff = valid[-1]["cpu_per_mbps"]
-            ratio = last_eff / first_eff if first_eff > 0 else float("inf")
+            ratio = last_eff / first_eff if first_eff > 0 else None
             lines.append("## Analysis")
             lines.append("")
-            if ratio < 2.0:
+            if ratio is None:
+                conclusion = ("shows no increase" if last_eff == 0
+                              else "increased from a zero baseline")
+                lines.append(
+                    f"**CPU/Mbps {conclusion}** "
+                    f"(first={first_eff:.3f}, last={last_eff:.3f}).  "
+                    f"The growth ratio is undefined because the first "
+                    f"measurement is zero."
+                )
+            elif ratio < 2.0:
                 lines.append(
                     f"**CPU/Mbps is roughly constant** "
                     f"(first={first_eff:.3f}, last={last_eff:.3f}, "
                     f"ratio={ratio:.2f}×).  "
-                    f"The per-stream scheduling overhead is low and the "
-                    f"multiplexer scales linearly with throughput."
+                    f"CPU usage scales linearly with throughput across the "
+                    f"bandwidth sweep."
                 )
             elif ratio < 5.0:
                 lines.append(
                     f"**CPU/Mbps shows moderate growth** "
                     f"(first={first_eff:.3f}, last={last_eff:.3f}, "
                     f"ratio={ratio:.2f}×).  "
-                    f"Per-stream overhead increases at higher stream counts "
-                    f"but remains within acceptable bounds."
+                    f"Each Mbps costs more CPU at higher throughput, but the "
+                    f"growth remains within acceptable bounds."
                 )
             else:
                 lines.append(
                     f"**CPU/Mbps grows super-linearly** "
                     f"(first={first_eff:.3f}, last={last_eff:.3f}, "
                     f"ratio={ratio:.2f}×).  "
-                    f"This indicates significant per-stream scheduling "
-                    f"overhead that may need investigation."
+                    f"The CPU cost of each Mbps rises steeply at higher "
+                    f"throughput, which may need investigation."
                 )
 
             # check for post-test CPU anomaly
@@ -596,14 +666,15 @@ class LinearityTest:
     # -- main ---------------------------------------------------------------
 
     def run(self) -> int:
+        # setup() is inside the try so that whatever it raises after spawning
+        # a process -- not only its own SystemExit -- still reaches teardown().
         try:
-            self.setup()
-        except SystemExit as e:
-            log(f"setup failed: {e}")
-            self.teardown()
-            return 1
+            try:
+                self.setup()
+            except SystemExit as e:
+                log(f"setup failed: {e}")
+                return 1
 
-        try:
             # idle baseline: single 2 s interval after settling
             time.sleep(2)
             idle0_srv = TickSnap(self._srv_pid)

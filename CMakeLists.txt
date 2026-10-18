@@ -140,8 +140,26 @@ else()
     list(APPEND CMAKE_REQUIRED_DEFINITIONS "-D_GNU_SOURCE")
 endif()
 
-include(CTest)
-add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND})
+if(BUILD_TESTING)
+    add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND})
+
+    # Unit tests of the smoke and benchmark scripts themselves; they spawn no
+    # real process and bind at most an ephemeral loopback port.
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME linearity_test_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${PROJECT_SOURCE_DIR}/scripts/linearity_test_test.py")
+        add_test(NAME smoke_test_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${PROJECT_SOURCE_DIR}/scripts/smoke_test_test.py")
+        # bench.py refuses to run outside the project root.
+        add_test(NAME bench_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${PROJECT_SOURCE_DIR}/scripts/bench_test.py"
+            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+    endif()
+endif()
 
 include(CheckCSourceCompiles)
 include(CheckLibraryExists)

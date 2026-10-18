@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import os
@@ -17,19 +18,26 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, TextIO
+from typing import Dict, List, Optional, Sequence, Set, TextIO, Union
 
 # Sibling script, same scripts/ directory (Python puts a script's own directory
 # on sys.path[0]): reuse its builtin RSA-4096 pair instead of a third copy of
 # the same PEM data (the first two are smoke_test.py's own BUILTIN_CERT_PEM/
 # KEY_PEM doc comment and src/tlsutil_test.c's embedded fixture).
-from smoke_test import BUILTIN_CERT_PEM, BUILTIN_KEY_PEM, build_has_tls
+from smoke_test import (BUILTIN_CERT_PEM, BUILTIN_KEY_PEM, api_request,
+                        build_has_tls, parse_stats)
 
 ROOT = Path.cwd().resolve()
 DEFAULT_BUILD_DIR = ROOT / "build"
 DEFAULT_OUTPUT = DEFAULT_BUILD_DIR / "bench.md"
 BENCH_NETNS_ENV = "BENCH_NETNS"
 MUX_TLS_PORT = 8443
+IPERF_PORT = 5201
+FORWARD_PORT = 5202
+SERVER_API_PORT = 9081
+CLIENT_API_PORT = 9082
+READY_POLL_INTERVAL = 0.05
+TCP_LISTEN_STATE = "0A"
 CLK_TCK = float(os.sysconf("SC_CLK_TCK"))
 PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
 RESOURCE_SAMPLE_INTERVAL = 0.1
@@ -67,6 +75,14 @@ class ScenarioResult:
 
 
 @dataclass(frozen=True)
+class Service:
+    proc: subprocess.Popen[str]
+    name: str
+    log_path: Path
+    listen_ports: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class ProcessShutdownBudget:
     sigint_wait_seconds: float
     terminate_wait_seconds: float
@@ -86,6 +102,12 @@ def log(message: str) -> None:
 
 def quote_command(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
+
+
+def output_text(value: Optional[Union[str, bytes]]) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
 
 def read_proc_cpu_ticks(pid: int) -> Optional[tuple[int, int]]:
@@ -335,9 +357,9 @@ def build_server_config(*, use_tls: bool, window: Optional[int] = None, max_fram
     if max_frame_size is not None:
         mux["max_frame_size"] = max_frame_size
     config: Dict[str, object] = {
-        "api_listen": "127.0.0.1:9081",
-        "mux_listen": "127.0.0.1:8443",
-        "connect": "127.0.0.1:5201",
+        "api_listen": "127.0.0.1:%d" % SERVER_API_PORT,
+        "mux_listen": "127.0.0.1:%d" % MUX_TLS_PORT,
+        "connect": "127.0.0.1:%d" % IPERF_PORT,
         "identity": {
             "claim": "server",
             "listen": {"client": "127.0.0.1:5203"},
@@ -368,11 +390,12 @@ def build_client_config(*, use_tls: bool, tunnels: int = 1, window: Optional[int
     if max_frame_size is not None:
         mux["max_frame_size"] = max_frame_size
     config: Dict[str, object] = {
-        "connect": "127.0.0.1:5201",
+        "api_listen": "127.0.0.1:%d" % CLIENT_API_PORT,
+        "connect": "127.0.0.1:%d" % IPERF_PORT,
         "identity": {
             "claim": "client",
-            "mux_connect": ["127.0.0.1:8443"] * tunnels,
-            "listen": {"server": "127.0.0.1:5202"},
+            "mux_connect": ["127.0.0.1:%d" % MUX_TLS_PORT] * tunnels,
+            "listen": {"server": "127.0.0.1:%d" % FORWARD_PORT},
         },
         "mux": mux,
         "loglevel": 4,
@@ -398,9 +421,10 @@ def ensure_certificates(runtime_dir: Path) -> None:
     # binary just to key-generate on every fresh runtime_dir, and is
     # OpenSSL-only (GENCERTS_SOURCES is empty for mbedTLS/no-TLS builds), so a
     # backend-agnostic benchmark needs a backend-agnostic certificate anyway.
-    server_cert = runtime_dir / "server-cert.pem"
-    client_cert = runtime_dir / "client-cert.pem"
-    if server_cert.exists() and client_cert.exists():
+    # Skip only a complete set: a key left missing by an interrupted write
+    # would otherwise never be regenerated.
+    if all((runtime_dir / ("%s-%s.pem" % (role, kind))).exists()
+           for role in ("server", "client") for kind in ("cert", "key")):
         return
     for role in ("server", "client"):
         (runtime_dir / ("%s-cert.pem" % role)).write_text(
@@ -484,6 +508,134 @@ def ensure_process_alive(
         % (name, ret, _log_tail(log_path)))
 
 
+def socket_inodes(pid: int) -> Set[str]:
+    """Return the inode numbers of the sockets pid holds open."""
+    fd_dir = "/proc/%d/fd" % pid
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return set()
+    inodes: Set[str] = set()
+    for name in names:
+        try:
+            target = os.readlink(os.path.join(fd_dir, name))
+        except OSError:
+            continue  # closed between listdir and readlink
+        if target.startswith("socket:[") and target.endswith("]"):
+            inodes.add(target[len("socket:["):-1])
+    return inodes
+
+
+def listening_ports(pid: int) -> Set[int]:
+    """Return the TCP ports pid itself holds in LISTEN state, IPv4 and IPv6.
+
+    Matching the listener's socket inode against pid's own descriptors, rather
+    than probing the port, is what tells our daemon apart from a stale one
+    left holding the same fixed port."""
+    inodes = socket_inodes(pid)
+    ports: Set[int] = set()
+    if not inodes:
+        return ports
+    for table in ("tcp", "tcp6"):
+        try:
+            with open("/proc/%d/net/%s" % (pid, table), "r",
+                      encoding="ascii") as handle:
+                rows = handle.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()
+            # sl local_address rem_address st ... uid timeout inode
+            if len(fields) < 10 or fields[3] != TCP_LISTEN_STATE:
+                continue
+            if fields[9] not in inodes:
+                continue
+            _addr, _sep, port_hex = fields[1].rpartition(":")
+            try:
+                ports.add(int(port_hex, 16))
+            except ValueError:
+                continue
+    return ports
+
+
+def established_sessions(api_port: int) -> Optional[int]:
+    """Return the established mux session count /stats reports, or None while
+    the API does not answer with one."""
+    try:
+        status, text = api_request(api_port, "/stats", timeout=1.0)
+    except (OSError, http.client.HTTPException):
+        return None
+    if status != 200:
+        return None
+    # "Sessions: <established> / <active> (+<half-open>)"
+    field = parse_stats(text).get("Sessions", "")
+    try:
+        return int(field.split("/", 1)[0])
+    except ValueError:
+        return None
+
+
+def readiness_gaps(
+        services: Sequence[Service],
+        *,
+        sessions_from: Service,
+        api_port: int,
+        tunnels: int,
+) -> List[str]:
+    """Return what still keeps the services from being benchmarked, or an
+    empty list once every listener is up and every tunnel is established."""
+    for service in services:
+        ensure_process_alive(service.proc, service.name, service.log_path)
+    gaps: List[str] = []
+    for service in services:
+        held = listening_ports(service.proc.pid)
+        missing = [port for port in service.listen_ports if port not in held]
+        if missing:
+            gaps.append("%s is not listening on port %s" % (
+                service.name, ", ".join(str(port) for port in missing)))
+    if gaps:
+        # Until the client owns api_port, /stats may be a stale daemon's.
+        return gaps
+    sessions = established_sessions(api_port)
+    if sessions is None:
+        gaps.append("%s /stats reports no session count" %
+                    sessions_from.name)
+    elif sessions < tunnels:
+        gaps.append("%s has %d of %d tunnel sessions established" % (
+            sessions_from.name, sessions, tunnels))
+    return gaps
+
+
+def wait_until_ready(
+        services: Sequence[Service],
+        *,
+        sessions_from: Service,
+        api_port: int,
+        tunnels: int,
+        timeout_seconds: float,
+) -> None:
+    """Poll until every service listens and every tunnel is established.
+
+    The client spreads iperf3's connections over the sessions it has
+    established, so a tunnel still on a reconnect backoff rung would silently
+    shrink the tunnel count the report states. Raise SystemExit on a daemon
+    exit or once timeout_seconds pass without readiness."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        gaps = readiness_gaps(services, sessions_from=sessions_from,
+                              api_port=api_port, tunnels=tunnels)
+        if not gaps:
+            return
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                "services not ready after %.1f s: %s; refusing to record a "
+                "benchmark over fewer tunnels than requested. Last %s log "
+                "lines:\n%s" % (timeout_seconds, "; ".join(gaps),
+                                sessions_from.name,
+                                _log_tail(sessions_from.log_path)))
+        time.sleep(READY_POLL_INTERVAL)
+
+
 def open_log(path: Path) -> TextIO:
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.open("w", encoding="utf-8")
@@ -500,7 +652,7 @@ def build_scenario_commands(
         "-c",
         "127.0.0.1",
         "-p",
-        "5202",
+        str(FORWARD_PORT),
         "-t",
         str(duration),
         "--json",
@@ -534,11 +686,11 @@ def run_json_command(
             stderr=subprocess.PIPE,
             timeout=timeout_seconds,
         )
-        output = proc.stdout or ""
-        stderr_output = proc.stderr or ""
+        output = output_text(proc.stdout)
+        stderr_output = output_text(proc.stderr)
     except subprocess.TimeoutExpired as exc:
-        output = exc.stdout or ""
-        stderr_output = exc.stderr or ""
+        output = output_text(exc.stdout)
+        stderr_output = output_text(exc.stderr)
         log_path.write_text(output, encoding="utf-8")
         stderr_path.write_text(stderr_output, encoding="utf-8")
         raise SystemExit(
@@ -877,6 +1029,7 @@ def render_markdown_report(
     max_frame_size: Optional[int],
     command_timeout_seconds: float,
     shutdown_budget: ProcessShutdownBudget,
+    ready_timeout_seconds: float,
     ciphersuites: Optional[str] = None,
     socket_offload: Optional[bool] = None,
     kernel_offload: Optional[bool] = None,
@@ -898,6 +1051,8 @@ def render_markdown_report(
         "| TLS kernel_offload | %s |"
         % ("default" if kernel_offload is None else ("on" if kernel_offload else "off")),
         "| Tunnels | %d |" % tunnels,
+        "| Readiness gate | every tunnel established before each scenario, "
+        "timeout %.1f s |" % ready_timeout_seconds,
         "| Stream/session window | %s |" % (str(window)
                                             if window is not None else "default"),
         "| Max frame size | %s |" % (
@@ -1025,10 +1180,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="parallel stream count for the parallel scenario (default: 10)",
     )
     parser.add_argument(
+        "--ready-timeout",
+        type=float,
+        default=30.0,
+        help="seconds to wait for the services to listen and every tunnel to "
+             "establish, before the first scenario and again before each "
+             "one (default: 30)",
+    )
+    parser.add_argument(
         "--startup-wait",
         type=float,
-        default=1.0,
-        help="seconds to wait after starting services before running iperf3",
+        default=0.0,
+        help="extra seconds to wait once the services are ready, before the "
+             "first scenario (default: 0)",
     )
     parser.add_argument(
         "--no-tls",
@@ -1082,7 +1246,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--iperf3", default="iperf3",
                         help="iperf3 executable name")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.tunnels < 1:
+        parser.error("--tunnels must be at least 1")
+    if not args.ready_timeout > 0:
+        parser.error("--ready-timeout must be positive")
+    if not args.startup_wait >= 0:
+        parser.error("--startup-wait must not be negative")
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1143,9 +1314,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         client_log = open_log(build_dir / "multiplexd-client.log")
         iperf_server_log = open_log(build_dir / "iperf3-server.log")
 
-        log("+ %s" % quote_command([iperf3, "-s", "-p", "5201"]))
+        iperf_server_command = [iperf3, "-s", "-p", str(IPERF_PORT)]
+        log("+ %s" % quote_command(iperf_server_command))
         iperf_server_proc = subprocess.Popen(
-            [iperf3, "-s", "-p", "5201"],
+            iperf_server_command,
             cwd=str(build_dir),
             stdout=iperf_server_log,
             stderr=subprocess.STDOUT,
@@ -1172,26 +1344,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             text=True,
         )
 
-        time.sleep(args.startup_wait)
-
-        # Fail fast if any daemon died during startup (typically a port held by
-        # a stale listener), before iperf3 can connect to the wrong process.
-        daemons = (
-            (iperf_server_proc, "iperf3 server",
-             build_dir / "iperf3-server.log"),
-            (server_proc, "multiplexd server",
-             build_dir / "multiplexd-server.log"),
-            (client_proc, "multiplexd client",
-             build_dir / "multiplexd-client.log"),
+        client = Service(client_proc, "multiplexd client",
+                         build_dir / "multiplexd-client.log",
+                         (FORWARD_PORT, CLIENT_API_PORT))
+        services = (
+            Service(iperf_server_proc, "iperf3 server",
+                    build_dir / "iperf3-server.log", (IPERF_PORT,)),
+            Service(server_proc, "multiplexd server",
+                    build_dir / "multiplexd-server.log",
+                    (MUX_TLS_PORT, SERVER_API_PORT)),
+            client,
         )
-        for proc, name, lp in daemons:
-            ensure_process_alive(proc, name, lp)
+
+        def ready() -> None:
+            wait_until_ready(services, sessions_from=client,
+                             api_port=CLIENT_API_PORT, tunnels=args.tunnels,
+                             timeout_seconds=args.ready_timeout)
+
+        ready()
+        if args.startup_wait > 0:
+            time.sleep(args.startup_wait)
 
         for scenario in SCENARIOS:
             # Re-check before recording: a daemon that crashed mid-run would
-            # otherwise be sampled as a dead pid (0% CPU / 0 B RSS).
-            for proc, name, lp in daemons:
-                ensure_process_alive(proc, name, lp)
+            # otherwise be sampled as a dead pid (0% CPU / 0 B RSS), and a
+            # tunnel that dropped would carry this scenario on fewer sessions.
+            ready()
             commands = build_scenario_commands(
                 iperf3, scenario, args.duration, args.parallel)
             log_paths = [
@@ -1292,6 +1470,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_frame_size=args.max_frame_size,
         command_timeout_seconds=command_timeout_seconds,
         shutdown_budget=shutdown_budget,
+        ready_timeout_seconds=args.ready_timeout,
         ciphersuites=args.ciphersuites,
         socket_offload=args.socket_offload,
         kernel_offload=args.kernel_offload,

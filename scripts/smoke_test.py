@@ -21,6 +21,14 @@ Parallel topology (identity routing, N mux tunnels)
   * parallel_tunnels    - concurrent streams spread across N sessions, both
                           directions, byte-exact verification
 
+UDP topology (lossymux enabled on both ends, plain and identity-routed pairs)
+  * udp_forward         - datagram echo client listen -> server connect target
+  * udp_reverse         - datagram echo server listen -> client connect target
+  * udp_burst           - a burst of datagrams: echoes arrive intact (best
+                          effort, so some may be dropped)
+  * udp_stats           - /stats "Datagrams" counts the relayed traffic
+  * udp_identity        - datagram echo over identity.listen routing
+
 Resumption topology (single tunnel through a kill-able TCP relay)
   * session_resumption  - transport is RST mid-transfer; the client reconnects
                           and replays unacked frames; the byte stream survives
@@ -34,7 +42,8 @@ Usage::
     python3 scripts/smoke_test.py [options]
 
     --build-dir DIR   CMake build directory (default: build)
-    --log-dir   DIR   Log and work directory (default: build/smoke_<timestamp>)
+    --log-dir   DIR   Log and work directory (default: a new
+                      build/smoke_<timestamp>)
     --seed      INT   Random seed for reproducibility
     --duration  FLOAT Time budget (s) for time-based scenarios (default: 8)
     --quick           Smaller sizes/counts for a fast run
@@ -383,6 +392,74 @@ class EchoServer:
                 pass
 
 
+class UdpEchoServer:
+    """Thread-backed UDP echo server: the lossymux forwarding target.
+
+    Binds the same port number as the TCP echo server it accompanies, since a
+    lossymux peer relays each flow to its ``connect`` address over UDP.
+    """
+
+    def __init__(self, port: int, name: str = "udp-echo") -> None:
+        self._port = port
+        self._name = name
+        self._sock: Optional[socket.socket] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind(("127.0.0.1", self._port))
+        self._sock.settimeout(0.5)
+        self._thread = threading.Thread(
+            target=self._serve, daemon=True, name=self._name
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+    def _serve(self) -> None:
+        assert self._sock is not None
+        while not self._stop.is_set():
+            try:
+                data, addr = self._sock.recvfrom(65536)
+                self._sock.sendto(data, addr)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+
+def udp_echo(port: int, payload: bytes, *, timeout: float = 10.0) -> bool:
+    """Send *payload* to a localhost UDP *port* until its echo comes back.
+
+    Datagrams are best effort (and dropped until the session is ready), so the
+    request is resent every 200 ms within *timeout*.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.2)
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            s.sendto(payload, ("127.0.0.1", port))
+            try:
+                data, _addr = s.recvfrom(65536)
+            except socket.timeout:
+                continue
+            if data == payload:
+                return True
+        return False
+    finally:
+        s.close()
+
+
 # ---------------------------------------------------------------------------
 # Kill-able TCP relay for session-resumption testing
 # ---------------------------------------------------------------------------
@@ -528,6 +605,30 @@ def parse_stats(text: str) -> Dict[str, str]:
 def stat_reconnects(api_port: int) -> int:
     _status, text = api_request(api_port, "/stats")
     return int(parse_stats(text).get("Reconnects", "0"))
+
+
+def wait_sessions(api_port: int, want: int, *,
+                  timeout: float = 20.0) -> Tuple[bool, str]:
+    """Poll /stats until at least *want* mux sessions are up, or time out.
+
+    /healthy turns 200 once each listener has one tunnel, but every tunnel
+    dials on its own jittered backoff, so a tunnel whose first dial was
+    refused can trail the others by a whole backoff step.  Returns whether
+    the count was reached and the last "Sessions" field seen.
+    """
+    deadline = time.monotonic() + timeout
+    sessions_field = ""
+    while True:
+        try:
+            _status, text = api_request(api_port, "/stats")
+            sessions_field = parse_stats(text).get("Sessions", "")
+            if int(sessions_field.split("/")[0]) >= want:
+                return True, sessions_field
+        except (OSError, ValueError):
+            pass
+        if time.monotonic() >= deadline:
+            return False, sessions_field
+        time.sleep(0.1)
 
 
 def wait_forward_ready(port: int, rng: random.Random,
@@ -823,17 +924,18 @@ class Daemons:
         self.client = self._spawn(self._client_cfg, "client")
 
     def start(self) -> bool:
+        """Start both processes and wait until each reports healthy.
+
+        Healthy means every forwarding listener has one tunnel; a scenario
+        that needs more sessions than that waits for them itself.
+        """
         self.server = self._spawn(self._server_cfg, "server")
         self.client = self._spawn(self._client_cfg, "client")
         if not wait_healthy(self.server_api, "%s server" % self.tag,
                             proc=self.server):
             return False
-        if not wait_healthy(self.client_api, "%s client" % self.tag,
-                            proc=self.client):
-            return False
-        # Give the client a moment to dial and establish its mux session(s).
-        time.sleep(0.5)
-        return True
+        return wait_healthy(self.client_api, "%s client" % self.tag,
+                            proc=self.client)
 
     def shutdown(self) -> Tuple[Optional[int], Optional[int]]:
         """Stop client then server; return (client_rc, server_rc).
@@ -891,6 +993,32 @@ class Daemons:
 # regression without masking the rest of the suite.
 KNOWN_FAILING: set = set()
 
+# Every scenario name, grouped by the topology (or daemon pair) that runs it.
+# Registered before anything starts, so --only is checked up front and a
+# topology whose scenarios --only leaves out is never started at all.
+STANDALONE_SCENARIOS = ("dump_config", "loglevel_range")
+LOAD_SCENARIOS = (
+    "forward_integrity", "reverse_integrity", "concurrent_streams",
+    "half_close", "coexistence", "observability", "hot_reload", "random_fuzz",
+    "graceful_shutdown",
+)
+PARALLEL_SCENARIOS = ("parallel_tunnels", "parallel_shutdown")
+PSK_MATCH_SCENARIOS = ("psk_match",)
+PSK_MISMATCH_SCENARIOS = ("psk_mismatch",)
+IDENTITY_VERIFY_MATCH_SCENARIOS = ("identity_verify_match",)
+IDENTITY_VERIFY_MISMATCH_SCENARIOS = ("identity_verify_mismatch",)
+UDP_SCENARIOS = (
+    "udp_forward", "udp_reverse", "udp_burst", "udp_stats", "udp_identity",
+    "udp_shutdown",
+)
+RESUMPTION_SCENARIOS = ("session_resumption", "resumption_shutdown")
+ALL_SCENARIOS = (
+    STANDALONE_SCENARIOS + LOAD_SCENARIOS + PARALLEL_SCENARIOS
+    + PSK_MATCH_SCENARIOS + PSK_MISMATCH_SCENARIOS
+    + IDENTITY_VERIFY_MATCH_SCENARIOS + IDENTITY_VERIFY_MISMATCH_SCENARIOS
+    + UDP_SCENARIOS + RESUMPTION_SCENARIOS
+)
+
 
 @dataclass
 class ScenarioResult:
@@ -910,12 +1038,36 @@ class ScenarioResult:
 class Suite:
     only: Optional[set] = None
     results: List[ScenarioResult] = field(default_factory=list)
-    # Every scenario name run() has been offered, whether or not --only ran it.
-    # main() validates --only against this so a typo can't silently skip all.
-    known: set = field(default_factory=set)
+    # Every scenario name the suite can run, known before any topology starts
+    # -- including one whose topology then fails to start.
+    known: set = field(default_factory=lambda: set(ALL_SCENARIOS))
+
+    def selected(self, names: Sequence[str]) -> List[str]:
+        """Return the scenarios in *names* that --only selects."""
+        return [n for n in names if self.only is None or n in self.only]
+
+    def start_failed(self, name: str, names: Sequence[str],
+                     detail: str) -> None:
+        """Record *name* failing to start the daemons *names* run on.
+
+        Only a failure that blocks a selected scenario is recorded, and the
+        detail lists those scenarios so the selected names stay visible.
+        """
+        blocked = self.selected(names)
+        if not blocked:
+            return
+        detail = "%s; not run: %s" % (detail, ", ".join(blocked))
+        self.results.append(ScenarioResult(name, False, detail, 0.0, "FAIL"))
+        log("  [FAIL] %s %s" % (name, detail))
+
+    def skip(self, names: Sequence[str], detail: str) -> None:
+        """Record the selected scenarios in *names* as not runnable here."""
+        for name in self.selected(names):
+            self.results.append(
+                ScenarioResult(name, True, detail, 0.0, "SKIP"))
 
     def run(self, name: str, fn: Callable[[], Tuple[bool, str]]) -> ScenarioResult:
-        self.known.add(name)
+        assert name in self.known, "unregistered scenario %r" % name
         if self.only is not None and name not in self.only:
             return ScenarioResult(name, True, "skipped", 0.0, "SKIP")
         log("")
@@ -1091,18 +1243,26 @@ def scen_coexistence(port: int, rng: random.Random, *,
     interactive streams responsive rather than letting bulk monopolise the
     link.
     """
+    if bulk_count <= 0 or bulk_size <= 0:
+        return False, "bulk load must contain nonempty transfers"
     stop = threading.Event()
     bulk_errors: List[str] = []
+    bulk_completed = [0] * bulk_count
     bulk_payloads = [make_payload(rng, bulk_size) for _ in range(bulk_count)]
 
     def bulk(i: int) -> None:
         # Loop the transfer so bulk pressure persists for the ping phase.
-        while not stop.is_set():
-            ok, detail = bulk_exchange(
-                port, bulk_payloads[i], timeout=max(30.0, bulk_size / (1 << 20) * 8))
-            if not ok:
-                bulk_errors.append("bulk %d: %s" % (i, detail))
-                return
+        try:
+            while not stop.is_set():
+                ok, detail = bulk_exchange(
+                    port, bulk_payloads[i],
+                    timeout=max(30.0, bulk_size / (1 << 20) * 8))
+                if not ok:
+                    bulk_errors.append("bulk %d: %s" % (i, detail))
+                    return
+                bulk_completed[i] += 1
+        except Exception as exc:  # noqa: BLE001
+            bulk_errors.append("bulk %d: %r" % (i, exc))
 
     workers = [threading.Thread(target=bulk, args=(i,), daemon=True)
                for i in range(bulk_count)]
@@ -1138,6 +1298,10 @@ def scen_coexistence(port: int, rng: random.Random, *,
             len(ping_errors), pings, ping_errors[0])
     if bulk_errors:
         return False, bulk_errors[0]
+    if any(t.is_alive() for t in workers):
+        return False, "bulk workers did not finish"
+    if not all(bulk_completed):
+        return False, "not every bulk worker completed a verified transfer"
     if not rtts:
         return False, "no ping samples collected"
     rtts.sort()
@@ -1149,8 +1313,9 @@ def scen_coexistence(port: int, rng: random.Random, *,
     if worst > 5.0:
         return False, "interactive ping starved: max=%.3fs p90=%.3fs" % (
             worst, p90)
-    return True, "%d pings under bulk load: p50=%.1fms p90=%.1fms max=%.1fms" % (
-        pings, p50 * 1e3, p90 * 1e3, worst * 1e3)
+    return True, ("%d pings under bulk load (%d transfers verified): "
+                  "p50=%.1fms p90=%.1fms max=%.1fms") % (
+        pings, sum(bulk_completed), p50 * 1e3, p90 * 1e3, worst * 1e3)
 
 
 def scen_random_fuzz(
@@ -1427,6 +1592,8 @@ class Sizes:
 def run_load_topology(binary: Path, log_dir: Path, suite: Suite,
                       rng: random.Random, sizes: Sizes, *,
                       window: Optional[int], loglevel: int) -> None:
+    if not suite.selected(LOAD_SCENARIOS):
+        return
     (echo_f, echo_r, mux, srv_api, cli_api, fwd_listen,
      rev_listen) = free_ports(7)
     log("load topology ports: echoF=%d echoR=%d mux=%d srv_api=%d cli_api=%d "
@@ -1447,9 +1614,8 @@ def run_load_topology(binary: Path, log_dir: Path, suite: Suite,
         server_api=srv_api, client_api=cli_api, tag="load")
     try:
         if not daemons.start():
-            suite.results.append(ScenarioResult(
-                "load_topology_start", False,
-                "daemons did not become healthy", 0.0, "FAIL"))
+            suite.start_failed("load_topology_start", LOAD_SCENARIOS,
+                               "daemons did not become healthy")
             return
 
         suite.run("forward_integrity", lambda: scen_integrity(
@@ -1521,46 +1687,54 @@ def run_psk_topology(binary: Path, log_dir: Path, suite: Suite,
     Unlike the certificate scenarios this runs on every TLS backend, because
     --genpsk needs only randomness and the label derivation.
     """
+    if not suite.selected(PSK_MATCH_SCENARIOS + PSK_MISMATCH_SCENARIOS):
+        return
     key_file = "smoke~psk.psk"
     if not (log_dir / key_file).exists():
         cmd = [str(binary), "--genpsk", "smoke~psk"]
         log("+ %s" % quote_command(cmd))
+        # --genpsk logs its diagnostics to stdout, not stderr.
         r = subprocess.run(cmd, cwd=str(log_dir), stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=30.0)
+                           stderr=subprocess.STDOUT, timeout=30.0)
         if r.returncode != 0:
-            suite.results.append(ScenarioResult(
-                "psk_genkey", False, r.stderr.decode(errors="replace")[:200],
-                0.0, "FAIL"))
+            output = r.stdout.decode(errors="replace")
+            suite.start_failed(
+                "psk_genkey", PSK_MATCH_SCENARIOS + PSK_MISMATCH_SCENARIOS,
+                " | ".join(output.splitlines())[:200])
             return
 
     # --- honest pair -------------------------------------------------------
-    (echo_f, echo_r, mux, srv_api, cli_api, fwd, rev) = free_ports(7)
-    ef, er = EchoServer(echo_f, "k-echo-fwd"), EchoServer(echo_r, "k-echo-rev")
-    ef.start()
-    er.start()
-    daemons = Daemons(
-        binary, log_dir,
-        server_cfg=build_psk_server(
-            mux_port=mux, echo_port=echo_f, reverse_listen=rev,
-            api_port=srv_api, key_file=key_file, loglevel=loglevel),
-        client_cfg=build_psk_client(
-            mux_port=mux, echo_port=echo_r, forward_listen=fwd,
-            api_port=cli_api, key_file=key_file, claim="psk-spoke",
-            loglevel=loglevel),
-        server_api=srv_api, client_api=cli_api, tag="psk-ok")
-    try:
-        if not daemons.start():
-            suite.results.append(ScenarioResult(
-                "psk_match", False, "daemons not healthy", 0.0, "FAIL"))
-        else:
-            suite.run("psk_match", lambda: scen_integrity(
-                fwd, rng, sizes.stream_msg, "forward"))
-    finally:
-        daemons.shutdown()
-        ef.stop()
-        er.stop()
+    if suite.selected(PSK_MATCH_SCENARIOS):
+        (echo_f, echo_r, mux, srv_api, cli_api, fwd, rev) = free_ports(7)
+        ef = EchoServer(echo_f, "k-echo-fwd")
+        er = EchoServer(echo_r, "k-echo-rev")
+        ef.start()
+        er.start()
+        daemons = Daemons(
+            binary, log_dir,
+            server_cfg=build_psk_server(
+                mux_port=mux, echo_port=echo_f, reverse_listen=rev,
+                api_port=srv_api, key_file=key_file, loglevel=loglevel),
+            client_cfg=build_psk_client(
+                mux_port=mux, echo_port=echo_r, forward_listen=fwd,
+                api_port=cli_api, key_file=key_file, claim="psk-spoke",
+                loglevel=loglevel),
+            server_api=srv_api, client_api=cli_api, tag="psk-ok")
+        try:
+            if not daemons.start():
+                suite.start_failed("psk_match", PSK_MATCH_SCENARIOS,
+                                   "daemons not healthy")
+            else:
+                suite.run("psk_match", lambda: scen_integrity(
+                    fwd, rng, sizes.stream_msg, "forward"))
+        finally:
+            daemons.shutdown()
+            ef.stop()
+            er.stop()
 
     # --- impostor: same key, a claim it does not own -----------------------
+    if not suite.selected(PSK_MISMATCH_SCENARIOS):
+        return
     (echo_f2, echo_r2, mux2, srv_api2, cli_api2, fwd2, rev2) = free_ports(7)
     ef2 = EchoServer(echo_f2, "k-echo-fwd2")
     er2 = EchoServer(echo_r2, "k-echo-rev2")
@@ -1624,38 +1798,46 @@ def run_identity_verify_topology(binary: Path, log_dir: Path, suite: Suite,
     certificates.  The caller only invokes this when --gencerts produced the
     certificate set.
     """
+    if not suite.selected(IDENTITY_VERIFY_MATCH_SCENARIOS
+                          + IDENTITY_VERIFY_MISMATCH_SCENARIOS):
+        return
     # --- honest peer: claim matches the certificate, traffic flows ----------
-    (echo_f, echo_r, mux, srv_api, cli_api, fwd_listen,
-     rev_listen) = free_ports(7)
-    log("identity-verify topology ports: echoF=%d echoR=%d mux=%d" % (
-        echo_f, echo_r, mux))
-    ef, er = EchoServer(echo_f, "v-echo-fwd"), EchoServer(echo_r, "v-echo-rev")
-    ef.start()
-    er.start()
-    daemons = Daemons(
-        binary, log_dir,
-        server_cfg=build_identity_server(
-            mux_port=mux, echo_port=echo_f, reverse_listen=rev_listen,
-            api_port=srv_api, window=window, loglevel=loglevel, verify=True),
-        client_cfg=build_identity_client(
-            mux_port=mux, echo_port=echo_r, forward_listen=fwd_listen,
-            api_port=cli_api, tunnels=1, window=window, loglevel=loglevel,
-            verify=True),
-        server_api=srv_api, client_api=cli_api, tag="idverify-ok")
-    try:
-        if not daemons.start():
-            suite.results.append(ScenarioResult(
-                "identity_verify_match", False,
-                "daemons not healthy with a matching identity", 0.0, "FAIL"))
-        else:
-            suite.run("identity_verify_match", lambda: scen_integrity(
-                fwd_listen, rng, sizes.stream_msg, "forward"))
-    finally:
-        daemons.shutdown()
-        ef.stop()
-        er.stop()
+    if suite.selected(IDENTITY_VERIFY_MATCH_SCENARIOS):
+        (echo_f, echo_r, mux, srv_api, cli_api, fwd_listen,
+         rev_listen) = free_ports(7)
+        log("identity-verify topology ports: echoF=%d echoR=%d mux=%d" % (
+            echo_f, echo_r, mux))
+        ef = EchoServer(echo_f, "v-echo-fwd")
+        er = EchoServer(echo_r, "v-echo-rev")
+        ef.start()
+        er.start()
+        daemons = Daemons(
+            binary, log_dir,
+            server_cfg=build_identity_server(
+                mux_port=mux, echo_port=echo_f, reverse_listen=rev_listen,
+                api_port=srv_api, window=window, loglevel=loglevel,
+                verify=True),
+            client_cfg=build_identity_client(
+                mux_port=mux, echo_port=echo_r, forward_listen=fwd_listen,
+                api_port=cli_api, tunnels=1, window=window, loglevel=loglevel,
+                verify=True),
+            server_api=srv_api, client_api=cli_api, tag="idverify-ok")
+        try:
+            if not daemons.start():
+                suite.start_failed(
+                    "identity_verify_match", IDENTITY_VERIFY_MATCH_SCENARIOS,
+                    "daemons not healthy with a matching identity")
+            else:
+                suite.run("identity_verify_match", lambda: scen_integrity(
+                    fwd_listen, rng, sizes.stream_msg, "forward"))
+        finally:
+            daemons.shutdown()
+            ef.stop()
+            er.stop()
 
     # --- impostor: same certificate, a claim it does not name ---------------
+    if not suite.selected(IDENTITY_VERIFY_MISMATCH_SCENARIOS):
+        return
     # The certificate still chains to authcerts, so the TLS handshake succeeds
     # and only the post-handshake identity check rejects it.  That is the whole
     # point: without identity.verify this peer would be routed as "server".
@@ -1719,6 +1901,8 @@ def run_identity_verify_topology(binary: Path, log_dir: Path, suite: Suite,
 def run_parallel_topology(binary: Path, log_dir: Path, suite: Suite,
                           rng: random.Random, sizes: Sizes, *,
                           window: Optional[int], loglevel: int) -> None:
+    if not suite.selected(PARALLEL_SCENARIOS):
+        return
     (echo_f, echo_r, mux, srv_api, cli_api, fwd_listen,
      rev_listen) = free_ports(7)
     log("parallel topology ports: echoF=%d echoR=%d mux=%d tunnels=%d" % (
@@ -1738,17 +1922,14 @@ def run_parallel_topology(binary: Path, log_dir: Path, suite: Suite,
         server_api=srv_api, client_api=cli_api, tag="parallel")
     try:
         if not daemons.start():
-            suite.results.append(ScenarioResult(
-                "parallel_topology_start", False, "daemons not healthy",
-                0.0, "FAIL"))
+            suite.start_failed("parallel_topology_start", PARALLEL_SCENARIOS,
+                               "daemons not healthy")
             return
 
         def parallel() -> Tuple[bool, str]:
             # The client should hold one session per configured tunnel.
-            _status, text = api_request(cli_api, "/stats")
-            sessions_field = parse_stats(text).get("Sessions", "0")
-            current = sessions_field.split("/")[0].strip()
-            if int(current) < sizes.tunnels:
+            ok, sessions_field = wait_sessions(cli_api, sizes.tunnels)
+            if not ok:
                 return False, "expected %d sessions, /stats shows %r" % (
                     sizes.tunnels, sessions_field)
             ok, detail = scen_concurrent_streams(
@@ -1778,9 +1959,179 @@ def run_parallel_topology(binary: Path, log_dir: Path, suite: Suite,
         er.stop()
 
 
+def _enable_lossymux(cfg: Dict[str, object]) -> Dict[str, object]:
+    mux = cfg["mux"]
+    assert isinstance(mux, dict)
+    mux["lossymux"] = {"enabled": True, "idle_timeout": 30, "queue": 256}
+    return cfg
+
+
+def scen_udp_burst(port: int, rng: random.Random, count: int,
+                   size: int) -> Tuple[bool, str]:
+    """Fire *count* datagrams back to back and collect the echoes.
+
+    lossymux may drop under load, so success is: at least one echo, and every
+    echo byte-identical to a datagram that was sent.
+    """
+    if not udp_echo(port, b"warmup"):
+        return False, "no echo before the burst"
+    sent = set()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.5)
+    try:
+        for i in range(count):
+            payload = struct.pack("!I", i) + make_payload(rng, size - 4)
+            sent.add(payload)
+            s.sendto(payload, ("127.0.0.1", port))
+        received = 0
+        while True:
+            try:
+                data, _addr = s.recvfrom(65536)
+            except socket.timeout:
+                break
+            if data == b"warmup":
+                continue
+            if data not in sent:
+                return False, "echo of %d bytes matches nothing sent" % len(
+                    data)
+            received += 1
+    finally:
+        s.close()
+    if received == 0:
+        return False, "0/%d echoed" % count
+    return True, "%d/%d echoed intact" % (received, count)
+
+
+def scen_udp_stats(api_port: int, forward_port: int) -> Tuple[bool, str]:
+    def counters() -> Tuple[int, int, str]:
+        status, text = api_request(api_port, "/stats")
+        if status != 200:
+            raise ValueError("/stats returned HTTP %d" % status)
+        line = parse_stats(text).get("Datagrams")
+        if line is None:
+            raise ValueError("/stats has no Datagrams line")
+        # "Rx <n> (<bytes>), Tx <n> (<bytes>), Dropped <n>, Flows <n>"
+        fields = line.replace(",", "").split()
+        try:
+            rx = int(fields[fields.index("Rx") + 1])
+            tx = int(fields[fields.index("Tx") + 1])
+        except (ValueError, IndexError):
+            raise ValueError("unparsable Datagrams line: %r" % line) from None
+        return rx, tx, line
+
+    try:
+        before_rx, before_tx, _line = counters()
+        if not udp_echo(forward_port, b"lossymux-stats"):
+            return False, "no echo for stats probe"
+        rx, tx, line = counters()
+    except ValueError as exc:
+        return False, str(exc)
+    if rx <= before_rx or tx <= before_tx:
+        return False, "stats probe did not advance Rx and Tx: %r" % line
+    return True, line
+
+
+def run_udp_topology(binary: Path, log_dir: Path, suite: Suite,
+                     rng: random.Random, sizes: Sizes, *,
+                     window: Optional[int], loglevel: int) -> None:
+    plain_scenarios = ("udp_forward", "udp_reverse", "udp_burst", "udp_stats",
+                       "udp_shutdown")
+    identity_scenarios = ("udp_identity", "udp_shutdown")
+    need_plain = bool(suite.selected(plain_scenarios))
+    need_identity = bool(suite.selected(identity_scenarios))
+    if not need_plain and not need_identity:
+        return
+    (echo_f, echo_r, mux, srv_api, cli_api, fwd_listen, rev_listen,
+     id_mux, id_srv_api, id_cli_api, id_fwd_listen,
+     id_rev_listen) = free_ports(12)
+    log("udp topology ports: echoF=%d echoR=%d mux=%d idmux=%d" % (
+        echo_f, echo_r, mux, id_mux))
+    echoes = [EchoServer(echo_f, "u-echo-fwd"),
+              EchoServer(echo_r, "u-echo-rev"),
+              UdpEchoServer(echo_f, "u-udp-echo-fwd"),
+              UdpEchoServer(echo_r, "u-udp-echo-rev")]
+    for e in echoes:
+        e.start()
+    pairs = []
+    plain = ident = None
+    if need_plain:
+        plain = Daemons(
+            binary, log_dir,
+            server_cfg=_enable_lossymux(build_plain_server(
+                mux_port=mux, echo_port=echo_f, reverse_listen=rev_listen,
+                api_port=srv_api, window=window, loglevel=loglevel)),
+            client_cfg=_enable_lossymux(build_plain_client(
+                mux_port=mux, echo_port=echo_r, forward_listen=fwd_listen,
+                api_port=cli_api, window=window, loglevel=loglevel)),
+            server_api=srv_api, client_api=cli_api, tag="udp")
+        pairs.append((plain, plain_scenarios))
+    if need_identity:
+        ident = Daemons(
+            binary, log_dir,
+            server_cfg=_enable_lossymux(build_identity_server(
+                mux_port=id_mux, echo_port=echo_f, reverse_listen=id_rev_listen,
+                api_port=id_srv_api, window=window, loglevel=loglevel)),
+            client_cfg=_enable_lossymux(build_identity_client(
+                mux_port=id_mux, echo_port=echo_r, forward_listen=id_fwd_listen,
+                api_port=id_cli_api, tunnels=1, window=window,
+                loglevel=loglevel)),
+            server_api=id_srv_api, client_api=id_cli_api, tag="udp-identity")
+        pairs.append((ident, identity_scenarios))
+    try:
+        ready = []
+        for daemons, scenarios in pairs:
+            if daemons.start():
+                ready.append(daemons)
+            else:
+                suite.start_failed("%s_topology_start" % daemons.tag, scenarios,
+                                   "daemons not healthy")
+
+        def forward() -> Tuple[bool, str]:
+            ok = udp_echo(fwd_listen, b"lossymux-forward")
+            return ok, "echoed" if ok else "no echo"
+
+        def reverse() -> Tuple[bool, str]:
+            ok = udp_echo(rev_listen, b"lossymux-reverse")
+            return ok, "echoed" if ok else "no echo"
+
+        def identity() -> Tuple[bool, str]:
+            if not udp_echo(id_fwd_listen, b"lossymux-identity-fwd"):
+                return False, "no forward echo"
+            if not udp_echo(id_rev_listen, b"lossymux-identity-rev"):
+                return False, "no reverse echo"
+            return True, "both directions echoed"
+
+        if plain in ready:
+            suite.run("udp_forward", forward)
+            suite.run("udp_reverse", reverse)
+            suite.run("udp_burst", lambda: scen_udp_burst(
+                fwd_listen, rng, sizes.pings * 10, 1200))
+            suite.run("udp_stats", lambda: scen_udp_stats(cli_api, fwd_listen))
+        if ident in ready:
+            suite.run("udp_identity", identity)
+
+        def shutdown() -> Tuple[bool, str]:
+            for daemons in ready:
+                client_rc, server_rc = daemons.shutdown()
+                if client_rc != 0 or server_rc != 0:
+                    return False, "client rc=%s server rc=%s" % (
+                        client_rc, server_rc)
+            return True, "clean exit"
+
+        if len(ready) == len(pairs):
+            suite.run("udp_shutdown", shutdown)
+    finally:
+        for daemons, _scenarios in pairs:
+            daemons.kill()
+        for e in echoes:
+            e.stop()
+
+
 def run_resumption_topology(binary: Path, log_dir: Path, suite: Suite,
                             rng: random.Random, sizes: Sizes, *,
                             window: Optional[int], loglevel: int) -> None:
+    if not suite.selected(RESUMPTION_SCENARIOS):
+        return
     (echo_f, echo_r, mux_real, relay_front, srv_api, cli_api, fwd_listen,
      rev_listen) = free_ports(8)
     log("resumption topology: relay %d -> server mux %d" %
@@ -1802,9 +2153,8 @@ def run_resumption_topology(binary: Path, log_dir: Path, suite: Suite,
         server_api=srv_api, client_api=cli_api, tag="resume")
     try:
         if not daemons.start():
-            suite.results.append(ScenarioResult(
-                "resumption_topology_start", False, "daemons not healthy",
-                0.0, "FAIL"))
+            suite.start_failed("resumption_topology_start",
+                               RESUMPTION_SCENARIOS, "daemons not healthy")
             return
 
         suite.run("session_resumption", lambda: scen_resumption(
@@ -1918,8 +2268,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--build-dir", default="build",
                         help="CMake build directory (default: build)")
-    parser.add_argument("--log-dir",
-                        help="logs/work dir (default: build/smoke_<timestamp>)")
+    parser.add_argument(
+        "--log-dir",
+        help="logs/work dir (default: a new build/smoke_<timestamp>)")
     parser.add_argument("--seed", type=int,
                         help="random seed for reproducibility")
     parser.add_argument("--duration", type=float, default=8.0,
@@ -1933,6 +2284,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--only",
                         help="comma-separated scenario names to run")
     return parser.parse_args(argv)
+
+
+def parse_only(value: Optional[str]) -> Optional[set]:
+    """Parse --only, rejecting any name that is not a registered scenario.
+
+    Checked before anything starts: a mistyped name would otherwise skip every
+    scenario and still report [PASS].
+    """
+    if not value:
+        return None
+    only = set(s.strip() for s in value.split(","))
+    unknown = only - set(ALL_SCENARIOS)
+    if unknown:
+        raise SystemExit(
+            "--only names no known scenario: %s\nknown scenarios: %s"
+            % (", ".join(sorted(unknown)), ", ".join(sorted(ALL_SCENARIOS))))
+    return only
 
 
 def make_sizes(args: argparse.Namespace) -> Sizes:
@@ -1949,8 +2317,29 @@ def make_sizes(args: argparse.Namespace) -> Sizes:
         resume_seconds=max(4.0, args.duration), drops=2)
 
 
+def make_default_log_dir(build_dir: Path) -> Path:
+    """Create a log dir no other run is using: build/smoke_<timestamp>[_N].
+
+    Two runs started within the same second must not share one: --gencerts
+    refuses to overwrite the other run's certificates, and the scenario configs
+    and daemon logs would collide as well.  mkdir() without exist_ok claims a
+    name atomically, so a run that loses the race moves on to the next suffix.
+    """
+    stem = "smoke_%s" % time.strftime("%Y%m%d_%H%M%S")
+    log_dir = build_dir / stem
+    suffix = 0
+    while True:
+        try:
+            log_dir.mkdir()
+            return log_dir
+        except FileExistsError:
+            suffix += 1
+            log_dir = build_dir / ("%s_%d" % (stem, suffix))
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    only = parse_only(args.only)
     ensure_project_root(ROOT)
 
     build_dir = resolve_path(ROOT, args.build_dir)
@@ -1970,13 +2359,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.log_dir:
         log_dir = resolve_path(ROOT, args.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
     else:
-        log_dir = build_dir / ("smoke_%s" % time.strftime("%Y%m%d_%H%M%S"))
-    log_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = make_default_log_dir(build_dir)
 
     sizes = make_sizes(args)
     rng = random.Random(args.seed)
-    only = set(s.strip() for s in args.only.split(",")) if args.only else None
 
     log("multiplexd : %s" % binary)
     log("log dir    : %s" % log_dir)
@@ -2001,11 +2389,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                "--identity", "server,client",
                "--sni", "smoke.test.local", "--keytype", "ed25519"]
         log("+ %s" % quote_command(cmd))
+        # --gencerts logs its diagnostics to stdout, not stderr.
         result = subprocess.run(cmd, cwd=str(log_dir), stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, timeout=30.0)
+                                stderr=subprocess.STDOUT, timeout=30.0)
         if result.returncode != 0:
             raise SystemExit("gencerts failed (code %d):\n%s" % (
-                result.returncode, result.stderr.decode(errors="replace")))
+                result.returncode, result.stdout.decode(errors="replace")))
     else:
         log("")
         log("build has no --gencerts (non-OpenSSL backend); "
@@ -2034,6 +2423,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("")
         log("skipping identity-verify topology: the builtin certificate "
             "carries no identity subjectAltName")
+        suite.skip(IDENTITY_VERIFY_MATCH_SCENARIOS
+                   + IDENTITY_VERIFY_MISMATCH_SCENARIOS,
+                   "builtin certificate carries no identity")
+    run_udp_topology(binary, log_dir, suite, rng, sizes,
+                     window=args.window, loglevel=args.loglevel)
     run_resumption_topology(binary, log_dir, suite, rng, sizes,
                             window=args.window, loglevel=args.loglevel)
 
@@ -2069,15 +2463,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if xpass:
         extras.append("%d unexpectedly passing (xpass)" % xpass)
     suffix = (" [%s]" % ", ".join(extras)) if extras else ""
-    # A mistyped --only name would otherwise skip every scenario and still
-    # report [PASS]; reject any name that matched no registered scenario.
-    if suite.only is not None:
-        unknown = suite.only - suite.known
-        if unknown:
-            raise SystemExit(
-                "--only names no known scenario: %s\nknown scenarios: %s"
-                % (", ".join(sorted(unknown)),
-                   ", ".join(sorted(suite.known))))
     if gating_failures:
         log("[FAIL] %d/%d scenario(s) failed%s" %
             (gating_failures, total, suffix))

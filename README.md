@@ -575,7 +575,7 @@ Run these helper scripts from the repository root:
 - [`scripts/gcov.py`](scripts/gcov.py) configures a gcov coverage build, runs the test suite, and writes `build/gcov.md`
 - [`scripts/gen_schema.py`](scripts/gen_schema.py) generates C structs, marshal/unmarshal functions, and perfect-hash key dispatchers from JSON Schema files (also invoked by `./m.sh gen`)
 - [`scripts/gprof.py`](scripts/gprof.py) runs a focused gprof benchmark build and writes `build/gprof.md`
-- [`scripts/linearity_test.py`](scripts/linearity_test.py) runs a bidirectional throughput/CPU linearity benchmark across increasing bandwidth limits and writes `build/linearity_report.md`
+- [`scripts/linearity_test.py`](scripts/linearity_test.py) runs a bidirectional throughput/CPU linearity benchmark across increasing bandwidth limits and writes `build/linearity_report.md`; it works on every TLS backend, and in plaintext on a build without TLS. Its own unit tests, [`scripts/linearity_test_test.py`](scripts/linearity_test_test.py), are registered with `ctest` when CMake finds a Python 3 interpreter
 - [`scripts/lint.py`](scripts/lint.py) runs clang-tidy on production sources and writes `build/lint.md`
 - [`scripts/smoke_test.py`](scripts/smoke_test.py) runs a multi-scenario end-to-end smoke test against live server/client topologies: byte-exact bidirectional transfers, high stream concurrency, TCP half-close, bulk/interactive (DRR) coexistence, the observability API, hot config reload, identity routing with parallel tunnels, randomised TCP fuzzing, session resumption across transport loss, and graceful shutdown under load (`--quick` for a fast run)
 
