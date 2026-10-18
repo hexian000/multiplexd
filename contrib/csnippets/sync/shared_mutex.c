@@ -5,6 +5,7 @@
 
 #include <assert.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <threads.h>
 
@@ -58,6 +59,13 @@ int smtx_lock(smtx_t *mutex)
 				 * (exclusive || exclusive_waiting > 0) with no
 				 * release to follow, so wake them here or never */
 				notify = cnd_broadcast(&mutex->shared_cond);
+			} else if (
+				!mutex->state.exclusive &&
+				mutex->state.shared_count == 0) {
+				/* The failed wait may have consumed the only writer
+				 * wakeup. Pass it on now that another writer can
+				 * acquire the lock. */
+				notify = cnd_signal(&mutex->exclusive_cond);
 			}
 			const int unlock = mtx_unlock(&mutex->state_mu);
 			return first_error(wait, first_error(notify, unlock));
@@ -134,6 +142,11 @@ int smtx_sharedlock(smtx_t *mutex)
 			return first_error(wait, unlock);
 		}
 	}
+	if (mutex->state.shared_count == UINT_LEAST32_MAX) {
+		/* Refuse another share rather than wrap to the no-readers state. */
+		(void)mtx_unlock(&mutex->state_mu);
+		return thrd_error;
+	}
 	mutex->state.shared_count++;
 	return mtx_unlock(&mutex->state_mu);
 }
@@ -147,6 +160,11 @@ int smtx_trysharedlock(smtx_t *mutex)
 	if (mutex->state.exclusive || mutex->state.exclusive_waiting > 0) {
 		const int unlock = mtx_unlock(&mutex->state_mu);
 		return first_error(unlock, thrd_busy);
+	}
+	if (mutex->state.shared_count == UINT_LEAST32_MAX) {
+		/* Refuse another share rather than wrap to the no-readers state. */
+		(void)mtx_unlock(&mutex->state_mu);
+		return thrd_error;
 	}
 	mutex->state.shared_count++;
 	return mtx_unlock(&mutex->state_mu);
