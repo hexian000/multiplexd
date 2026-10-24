@@ -8,6 +8,7 @@
 
 #include "conf.h"
 
+#include "conf_presence.gen.h"
 #include "conf_schema.gen.h"
 #include "mux/mux.h"
 #include "shim/tls.h"
@@ -15,7 +16,6 @@
 
 #include "codec/json.h"
 #include "meta/minmax.h"
-#include "utils/buffer.h"
 #include "utils/ctype_ascii.h"
 #include "utils/debug.h"
 #include "utils/slog.h"
@@ -81,11 +81,15 @@ static bool parse_startups_field(
 	return true;
 }
 
-static bool
-conf_parse_max_startups(struct config *restrict cfg, const char *restrict s)
+static bool conf_parse_max_startups(
+	struct config *restrict cfg, const char *restrict s, const size_t len)
 {
 	if (s == NULL) {
 		return true;
+	}
+	if (memchr(s, '\0', len) != NULL) {
+		LOGE("max_startups: contains an embedded NUL character");
+		return false;
 	}
 	const char *nptr = s;
 	int start, rate, full;
@@ -167,7 +171,7 @@ static struct identity_peer *identity_listen_add(
 }
 
 #if WITH_TLS
-/* conf_map_fn for tls.psk: append one entry, preserving document order so the
+/* Append one tls.psk entry, preserving document order so the
  * first entry is well-defined as the key a dialing node offers.  Unlike
  * identity.listen this does not dedup: a repeated identity is a configuration
  * error the caller reports, not a last-value-wins field. */
@@ -322,63 +326,55 @@ static bool identity_listen_cb(
 	return true;
 }
 
-/* Receives one string-valued pair of a dynamic config map: the decoded key and
- * value, each NUL-terminated inside the JSON buffer.  False fails the load. */
-typedef bool (*conf_map_fn)(
-	struct config *restrict conf, const char *restrict key, size_t key_len,
-	const char *restrict val, size_t val_len);
-
-/* Walk a dynamic config map -- a JSON object with no fixed key set, which the
- * schema keeps as a raw fragment pointing into the JSON buffer -- calling @p cb
- * on each pair in document order, so the copies it makes outlive
- * json_free_conf.  An absent fragment is an empty map.  Every value must be a
- * string, except under a "-"-prefixed comment key: json_unmarshal already
- * ignores any unrecognized key generically (schema is non-strict), so that
- * prefix is purely a human authoring convention for marking a
- * deliberately-disabled entry, not a rule the dispatcher itself enforces -- but
- * a map has no fixed key set for the generic dispatcher to apply that tolerance
- * to, so the walk has to skip it explicitly. */
-static bool conf_walk_map(
-	struct config *restrict conf, const char *restrict field,
-	const struct json_string *restrict frag, const conf_map_fn cb)
+static void conf_log_map_type_error(
+	const char *restrict field, const char *restrict key,
+	const size_t key_len)
 {
-	if (frag->str == NULL) {
-		return true;
+	/* Bound the preview before encoding, ending at a UTF-8 boundary. Each
+	 * input byte needs at most six output bytes (a JSON Unicode escape). */
+	size_t len = MIN(key_len, (size_t)32);
+	while (len < key_len && ((unsigned char)key[len] & 0xC0u) == 0x80u) {
+		len--;
 	}
-	size_t frag_len = frag->len;
-	const struct json_val parsed = json_parse(frag->str, &frag_len);
-	if (parsed.type != JSON_OBJECT) {
-		LOGE_F("%s: must be an object", field);
-		return false;
+	char encoded[32 * 6 + 3];
+	if (json_marshal_string(encoded, sizeof(encoded), key, len) < 0) {
+		LOGE_F("%s: map key cannot be encoded; value must be a string",
+		       field);
+		return;
 	}
-	json_iter it = parsed.iter;
-	char *key;
-	size_t key_len;
-	char *val;
-	size_t val_len;
-	int r;
-	while ((r = json_obj_next(
-			frag->str, &frag->len, &it, &key, &key_len, &val,
-			&val_len)) == JSON_NEXT_ITEM) {
-		if (key_len > 0 && key[0] == '-') {
-			continue;
-		}
-		char *s;
-		size_t slen;
-		if (!json_parse_string(val, val_len, &s, &slen)) {
-			LOGE_F("%s.%s: must be a string", field, key);
-			return false;
-		}
-		if (!cb(conf, key, key_len, s, slen)) {
-			return false;
-		}
-	}
-	if (r != JSON_NEXT_END) {
-		LOGE_F("%s: malformed object", field);
-		return false;
-	}
-	return true;
+	LOGE_F("%s[%s%s]: must be a string", field, encoded,
+	       len < key_len ? "..." : "");
 }
+
+/* Disabled map entries are filtered before the codec checks their values. */
+static bool conf_map_filter(
+	void *context, const struct json_path *map, const char *key,
+	const size_t key_len)
+{
+	(void)context;
+	(void)map;
+	return key_len == 0 || key[0] != '-';
+}
+
+static void conf_json_error(void *context, const struct json_error *error)
+{
+	(void)context;
+	const struct json_path *path = error->path;
+	if (error->kind == JSON_E_TYPE && path != NULL &&
+	    path->kind == JSON_PATH_MAP) {
+		const struct json_string name = path->parent->key;
+		const char *field =
+			name.len == 3 && memcmp(name.str, "psk", 3) == 0 ?
+				"tls.psk" :
+				"identity.listen";
+		conf_log_map_type_error(field, path->key.str, path->key.len);
+	}
+}
+
+static const struct json_options conf_json_options = {
+	.filter = conf_map_filter,
+	.error = conf_json_error,
+};
 
 /* Dup a json_string field into a config field, using the pointer/length
  * the schema already parsed (no re-scanning); fails only when the source
@@ -424,8 +420,9 @@ static bool conf_load_string_arr(
 }
 
 #if WITH_TLS
-static bool
-conf_load_tls(struct config *restrict cfg, const struct json_conf *restrict obj)
+static bool conf_load_tls(
+	struct config *restrict cfg, const struct json_conf *restrict obj,
+	const struct present_conf_tls_psk *restrict psk)
 {
 	STRNDUP_FIELD("tls.cert", cfg->tls_cert, obj->tls.cert);
 	STRNDUP_FIELD("tls.key", cfg->tls_key, obj->tls.key);
@@ -440,45 +437,31 @@ conf_load_tls(struct config *restrict cfg, const struct json_conf *restrict obj)
 		    &cfg->tls_authcerts_count)) {
 		return false;
 	}
+	cfg->tls_system_trust = obj->tls.system_trust;
 	cfg->tls_socket_offload = obj->tls.socket_offload;
 	/* KTLS requires the library to own the socket fd. */
 	cfg->tls_kernel_offload =
 		cfg->tls_socket_offload && obj->tls.kernel_offload;
-	/* json_obj_next preserves document order, which is what makes "the
-	 * first entry" well-defined. */
-	return conf_walk_map(cfg, "tls.psk", &obj->tls.psk_json, psk_map_cb);
+	for (size_t i = 0; i < psk->count; i++) {
+		const struct present_conf_tls_psk_entry *entry =
+			&psk->entries[i];
+		if (!psk_map_cb(
+			    cfg, entry->key.str, entry->key.len,
+			    entry->value.str, entry->value.len)) {
+			return false;
+		}
+	}
+	return true;
 }
 #else /* WITH_TLS */
-/* Whether a tls.psk fragment carries at least one entry.  An empty object is
- * no key at all -- a TLS build runs it in plaintext mode -- while anything
- * else, a malformed value included, asks for a PSK handshake. */
-static bool conf_psk_nonempty(const struct json_string *restrict psk)
-{
-	if (psk->str == NULL) {
-		return false;
-	}
-	size_t frag_len = psk->len;
-	const struct json_val parsed = json_parse(psk->str, &frag_len);
-	if (parsed.type != JSON_OBJECT) {
-		return true;
-	}
-	json_iter it = parsed.iter;
-	char *key;
-	size_t key_len;
-	char *val;
-	size_t val_len;
-	return json_obj_next(
-		       psk->str, &psk->len, &it, &key, &key_len, &val,
-		       &val_len) != JSON_NEXT_END;
-}
-
 /* Reject a TLS credential in a build that cannot use it.  The whole tls object
  * is still parsed, but nothing loads it, so a configuration that asks for an
  * encrypted transport would otherwise start in cleartext without a word --
  * the same "asks for a security control, silently does not get it" case
  * conf_check refuses for identity.verify.  Only the credentials select TLS;
  * the tuning keys beside them are inert without one in either build. */
-static bool conf_check_no_tls(const struct json_conf *restrict obj)
+static bool
+conf_check_no_tls(const struct json_conf *restrict obj, const bool has_psk)
 {
 	const char *field = NULL;
 	if (obj->tls.cert.str != NULL) {
@@ -487,7 +470,9 @@ static bool conf_check_no_tls(const struct json_conf *restrict obj)
 		field = "tls.key";
 	} else if (obj->tls.authcerts_count > 0) {
 		field = "tls.authcerts";
-	} else if (conf_psk_nonempty(&obj->tls.psk_json)) {
+	} else if (obj->tls.system_trust) {
+		field = "tls.system_trust";
+	} else if (has_psk) {
 		field = "tls.psk";
 	}
 	if (field != NULL) {
@@ -596,7 +581,8 @@ conf_load_tcp(struct config *restrict cfg, const struct json_conf *restrict obj)
 #undef LOAD_NOTSENT_LOWAT
 
 static bool conf_load_identity(
-	struct config *restrict cfg, const struct json_conf *restrict obj)
+	struct config *restrict cfg, const struct json_conf *restrict obj,
+	const struct present_conf_identity_listen *restrict listen)
 {
 	STRNDUP_FIELD(
 		"identity.claim", cfg->identity.claim, obj->identity.claim);
@@ -607,15 +593,106 @@ static bool conf_load_identity(
 		    &cfg->identity.mux_connect_count)) {
 		return false;
 	}
-	return conf_walk_map(
-		cfg, "identity.listen", &obj->identity.listen_json,
-		identity_listen_cb);
+	for (size_t i = 0; i < listen->count; i++) {
+		const struct present_conf_identity_listen_entry *entry =
+			&listen->entries[i];
+		if (!identity_listen_cb(
+			    cfg, entry->key.str, entry->key.len,
+			    entry->value.str, entry->value.len)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Overlay explicit input on generated defaults. Missing strings without a
+ * schema default stay NULL, preserving their distinction from an empty string.
+ * This temporary view borrows both objects; neither allocation is transferred. */
+static struct json_conf
+conf_merge(const struct json_conf *defaults, const struct present_conf *input)
+{
+	struct json_conf obj = *defaults;
+#define COPY_FIELD(dst, src, field)                                            \
+	do {                                                                   \
+		if ((src).has_##field) {                                       \
+			(dst).field = (src).field;                             \
+		}                                                              \
+	} while (0)
+#define COPY_STRING(dst, src, field)                                           \
+	((dst).field =                                                         \
+		 (src).has_##field ? (src).field : (struct json_string){ 0 })
+	COPY_STRING(obj, (*input), api_listen);
+	COPY_STRING(obj, (*input), connect);
+	COPY_STRING(obj.identity, (*input).identity, claim);
+	COPY_FIELD(obj.identity, (*input).identity, mux_connect);
+	if (input->identity.has_mux_connect) {
+		obj.identity.mux_connect_count =
+			input->identity.mux_connect_count;
+	}
+	COPY_FIELD(obj.identity, (*input).identity, verify);
+	COPY_STRING(obj, (*input), listen);
+	COPY_STRING(obj, (*input), log);
+	COPY_FIELD(obj, (*input), loglevel);
+	COPY_FIELD(obj, (*input), max_sessions);
+	COPY_STRING(obj, (*input), max_startups);
+	COPY_FIELD(obj.mux, (*input).mux, connect_timeout);
+	COPY_FIELD(obj.mux, (*input).mux, idle_timeout);
+	COPY_FIELD(obj.mux, (*input).mux, keepalive);
+	COPY_FIELD(obj.mux.lossymux, (*input).mux.lossymux, enabled);
+	COPY_FIELD(obj.mux.lossymux, (*input).mux.lossymux, idle_timeout);
+	COPY_FIELD(obj.mux.lossymux, (*input).mux.lossymux, queue);
+	COPY_FIELD(obj.mux, (*input).mux, max_frame_size);
+	COPY_FIELD(obj.mux, (*input).mux, max_halfopen);
+	COPY_FIELD(obj.mux, (*input).mux, max_streams);
+	COPY_FIELD(obj.mux.mem_pressure, (*input).mux.mem_pressure, hi);
+	COPY_FIELD(obj.mux.mem_pressure, (*input).mux.mem_pressure, lo);
+	COPY_FIELD(obj.mux, (*input).mux, nodelay);
+	COPY_FIELD(obj.mux, (*input).mux, readahead);
+	COPY_FIELD(obj.mux, (*input).mux, resume_timeout);
+	COPY_FIELD(obj.mux, (*input).mux, send_timeout);
+	COPY_FIELD(obj.mux, (*input).mux, session_window);
+	COPY_FIELD(obj.mux, (*input).mux, stream_window);
+	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, backlog);
+	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, keepalive);
+	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, nodelay);
+	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, notsent_lowat);
+	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, rcvbuf);
+	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, reuseport);
+	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, sndbuf);
+	COPY_STRING(obj, (*input), mux_connect);
+	COPY_STRING(obj, (*input), mux_listen);
+	COPY_FIELD(obj.tcp, (*input).tcp, backlog);
+	COPY_FIELD(obj.tcp, (*input).tcp, keepalive);
+	COPY_FIELD(obj.tcp, (*input).tcp, nodelay);
+	COPY_FIELD(obj.tcp, (*input).tcp, notsent_lowat);
+	COPY_FIELD(obj.tcp, (*input).tcp, rcvbuf);
+	COPY_FIELD(obj.tcp, (*input).tcp, reuseport);
+	COPY_FIELD(obj.tcp, (*input).tcp, sndbuf);
+	COPY_STRING(obj.tls, (*input).tls, alpn);
+	COPY_FIELD(obj.tls, (*input).tls, authcerts);
+	if (input->tls.has_authcerts) {
+		obj.tls.authcerts_count = input->tls.authcerts_count;
+	}
+	COPY_STRING(obj.tls, (*input).tls, cert);
+	COPY_STRING(obj.tls, (*input).tls, ciphersuites);
+	COPY_FIELD(obj.tls, (*input).tls, kernel_offload);
+	COPY_STRING(obj.tls, (*input).tls, key);
+	COPY_FIELD(obj.tls, (*input).tls, sni);
+	COPY_FIELD(obj.tls, (*input).tls, socket_offload);
+	COPY_FIELD(obj.tls, (*input).tls, system_trust);
+	COPY_STRING(obj, (*input), type);
+#undef COPY_STRING
+#undef COPY_FIELD
+	return obj;
 }
 
 /* Load schema struct into config struct (strings strdup'd).  False on error. */
-static bool
-conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
+static bool conf_load(
+	struct config *restrict cfg, const struct json_conf *defaults,
+	const struct present_conf *input)
 {
+	const struct json_conf merged = conf_merge(defaults, input);
+	const struct json_conf *obj = &merged;
 	/* Root string fields: strndup zero-copy pointers using known lengths. */
 	STRNDUP_FIELD("type", cfg->type, obj->type);
 	STRNDUP_FIELD("api_listen", cfg->api_listen, obj->api_listen);
@@ -633,22 +710,23 @@ conf_load(struct config *restrict cfg, const struct json_conf *restrict obj)
 	/* Clamp to INT_MAX: a value past it would wrap to a negative limit and
 	 * silently disable the "max_sessions > 0" admission check. */
 	cfg->max_sessions = (int)MIN(obj->max_sessions, (uintmax_t)INT_MAX);
-	if (!conf_parse_max_startups(cfg, obj->max_startups.str)) {
+	if (!conf_parse_max_startups(
+		    cfg, obj->max_startups.str, obj->max_startups.len)) {
 		return false;
 	}
 
 #if WITH_TLS
-	if (!conf_load_tls(cfg, obj)) {
+	if (!conf_load_tls(cfg, obj, &input->tls.psk)) {
 		return false;
 	}
 #else /* WITH_TLS */
-	if (!conf_check_no_tls(obj)) {
+	if (!conf_check_no_tls(obj, input->tls.psk.count > 0)) {
 		return false;
 	}
 #endif /* WITH_TLS */
 	conf_load_mux(cfg, obj);
 	conf_load_tcp(cfg, obj);
-	if (!conf_load_identity(cfg, obj)) {
+	if (!conf_load_identity(cfg, obj, &input->identity.listen)) {
 		return false;
 	}
 
@@ -769,19 +847,20 @@ static bool conf_check(struct config *restrict conf)
 	const bool has_key = (conf->tls_key != NULL);
 	const bool has_authcerts = (conf->tls_authcerts_count > 0);
 	const bool has_psk = (conf->tls_psk_count > 0);
+	const bool has_trust = has_authcerts || conf->tls_system_trust;
 
-	if (has_psk && (has_cert || has_key || has_authcerts)) {
+	if (has_psk && (has_cert || has_key || has_trust)) {
 		LOGE("tls.psk is mutually exclusive with tls.cert, tls.key and"
-		     " tls.authcerts: a PSK handshake sends no certificate");
+		     " tls.authcerts or tls.system_trust: a PSK handshake sends no certificate");
 		return false;
 	}
 	if (has_psk) {
 		if (!conf_check_psk(conf)) {
 			return false;
 		}
-	} else if (has_cert && has_key && has_authcerts) {
-		/* all three set: secure mode */
-	} else if (!has_cert && !has_key && !has_authcerts) {
+	} else if (has_cert && has_key && has_trust) {
+		/* Complete certificate credentials and at least one trust source. */
+	} else if (!has_cert && !has_key && !has_trust) {
 		LOGW("running in plaintext mode: connection is NOT encrypted");
 	} else {
 		LOGE("incomplete TLS configuration");
@@ -815,7 +894,7 @@ static bool conf_check(struct config *restrict conf)
 	 * start.  Do not "fix" this inconsistency. */
 	if (conf->identity.verify && !has_cert) {
 		LOGE("identity.verify requires TLS:"
-		     " set tls.cert, tls.key and tls.authcerts");
+		     " set tls.cert, tls.key and either tls.authcerts or tls.system_trust");
 		return false;
 	}
 #else /* WITH_TLS */
@@ -999,7 +1078,8 @@ struct config *conf_new_default(void)
 		free(conf);
 		return NULL;
 	}
-	const bool ok = conf_load(conf, &obj);
+	const struct present_conf input = { 0 };
+	const bool ok = conf_load(conf, &obj, &input);
 	json_free_conf(&obj);
 	if (!ok) {
 		conf_free(conf);
@@ -1026,15 +1106,23 @@ struct config *conf_parse(char *json, const size_t len)
 		return NULL;
 	}
 	*conf = (struct config){ 0 };
-	struct json_conf obj = { 0 };
-	if (!json_unmarshal_conf(&obj, json, len)) {
+	struct present_conf input = { 0 };
+	if (!present_unmarshal_ex_conf(&input, json, len, &conf_json_options)) {
 		LOGE("failed to process configuration");
-		json_free_conf(&obj);
 		conf_free(conf);
 		return NULL;
 	}
-	const bool ok = conf_load(conf, &obj);
-	json_free_conf(&obj);
+	char empty[] = "{}";
+	struct json_conf defaults = { 0 };
+	if (!json_unmarshal_conf(&defaults, empty, sizeof(empty) - 1)) {
+		LOGOOM();
+		present_free_conf(&input);
+		conf_free(conf);
+		return NULL;
+	}
+	const bool ok = conf_load(conf, &defaults, &input);
+	json_free_conf(&defaults);
+	present_free_conf(&input);
 	if (!ok) {
 		LOGE("failed to process configuration");
 		conf_free(conf);
@@ -1062,130 +1150,6 @@ struct config *conf_parsefile(const char *path)
 	return conf;
 }
 
-/* Append one "key":"value" pair to a JSON object body under construction,
- * inserting the separating comma when *first is false.  Shared by the
- * identity.listen and tls.psk builders, whose only difference is which pairs
- * they emit.  On failure the buffer is freed and *vbufp set to NULL. */
-static bool json_map_append(
-	struct vbuffer **restrict vbufp, bool *restrict first,
-	const char *restrict field, const char *restrict key,
-	const char *restrict val)
-{
-	struct vbuffer *vbuf = *vbufp;
-	if (!*first) {
-		VBUF_APPEND(vbuf, ",", 1);
-	}
-	const size_t key_len = strlen(key);
-	const size_t val_len = strlen(val);
-	const int r_key = json_marshal_string(NULL, 0, key, key_len);
-	const int r_val = json_marshal_string(NULL, 0, val, val_len);
-	if (r_key < 0 || r_val < 0) {
-		VBUF_FREE(vbuf);
-		*vbufp = NULL;
-		LOGE_F("%s.%s: value too large to encode", field, key);
-		return false;
-	}
-	const size_t need = (size_t)r_key + 1u + (size_t)r_val;
-	/* 1 extra byte is reserved for detecting allocation failures,
-	 * matching vbuf_append/vbuf_vappendf's own convention -- without
-	 * it, an exact-fit grow leaves cap == len after this append,
-	 * which VBUF_HAS_OOM and a later VBUF_APPEND both read as "a
-	 * previous append already failed". */
-	vbuf = vbuf_grow(vbuf, vbuf->len + need + 1);
-	if (vbuf->cap < vbuf->len + need + 1) {
-		VBUF_FREE(vbuf);
-		*vbufp = NULL;
-		LOGOOM();
-		return false;
-	}
-	char *wp = (char *)vbuf->data + vbuf->len;
-	wp += json_marshal_string(wp, (size_t)r_key + 1, key, key_len);
-	*wp++ = ':';
-	(void)json_marshal_string(wp, (size_t)r_val + 1, val, val_len);
-	vbuf->len += need;
-	*first = false;
-	*vbufp = vbuf;
-	return true;
-}
-
-/* Close an object body built with json_map_append.  An empty map yields
- * *out == NULL, which the caller renders as an absent field. */
-static bool json_map_finish(
-	struct vbuffer *restrict vbuf, const bool empty,
-	struct vbuffer **restrict out)
-{
-	if (empty) {
-		VBUF_FREE(vbuf);
-		return true; /* *out stays NULL */
-	}
-	VBUF_APPEND(vbuf, "}", 1);
-	if (VBUF_HAS_OOM(vbuf)) {
-		VBUF_FREE(vbuf);
-		LOGOOM();
-		return false;
-	}
-	/* The reserved byte provides NUL-termination for the caller. */
-	vbuf->data[vbuf->len] = '\0';
-	*out = vbuf;
-	return true;
-}
-
-/* Build a vbuffer containing the JSON object for the identity.listen map
- * into *out (left NULL if no peer has a listen address). Returns false
- * only on an allocation/encoding failure. */
-static bool build_listen_json(
-	const struct config *restrict conf, struct vbuffer **restrict out)
-{
-	*out = NULL;
-	struct vbuffer *vbuf = VBUF_NEW(64);
-	if (vbuf == NULL) {
-		LOGOOM();
-		return false;
-	}
-	VBUF_APPEND(vbuf, "{", 1);
-	bool first = true;
-	for (size_t i = 0; i < conf->identity.peers_count; i++) {
-		const struct identity_peer *restrict p =
-			&conf->identity.peers[i];
-		if (p->listen == NULL) {
-			continue;
-		}
-		if (!json_map_append(
-			    &vbuf, &first, "identity.listen", p->id,
-			    p->listen)) {
-			return false;
-		}
-	}
-	return json_map_finish(vbuf, first, out);
-}
-
-#if WITH_TLS
-/* tls.psk for --dump-config.  GET /config sees the erased values instead: the
- * keys are wiped once the TLS contexts hold them, exactly as for tls.key. */
-static bool build_psk_json(
-	const struct config *restrict conf, struct vbuffer **restrict out)
-{
-	*out = NULL;
-	if (conf->tls_psk_count == 0) {
-		return true;
-	}
-	struct vbuffer *vbuf = VBUF_NEW(64);
-	if (vbuf == NULL) {
-		LOGOOM();
-		return false;
-	}
-	VBUF_APPEND(vbuf, "{", 1);
-	bool first = true;
-	for (size_t i = 0; i < conf->tls_psk_count; i++) {
-		const struct psk_entry *restrict e = &conf->tls_psk[i];
-		if (!json_map_append(&vbuf, &first, "tls.psk", e->id, e->hex)) {
-			return false;
-		}
-	}
-	return json_map_finish(vbuf, first, out);
-}
-#endif /* WITH_TLS */
-
 /* Build a struct json_string view of s (NULL-safe: NULL maps to {NULL, 0}). */
 static struct json_string json_str(char *s)
 {
@@ -1194,6 +1158,55 @@ static struct json_string json_str(char *s)
 		.len = s != NULL ? strlen(s) : 0,
 	};
 }
+
+/* The generated maps borrow config strings; only the entry arrays are owned. */
+static bool build_listen_map(
+	const struct config *conf, struct present_conf_identity_listen *out)
+{
+	if (conf->identity.peers_count == 0) {
+		return true;
+	}
+	out->entries =
+		calloc(conf->identity.peers_count, sizeof(*out->entries));
+	if (out->entries == NULL) {
+		LOGOOM();
+		return false;
+	}
+	for (size_t i = 0; i < conf->identity.peers_count; i++) {
+		const struct identity_peer *peer = &conf->identity.peers[i];
+		if (peer->listen != NULL) {
+			out->entries[out->count++] =
+				(struct present_conf_identity_listen_entry){
+					.key = json_str(peer->id),
+					.value = json_str(peer->listen),
+				};
+		}
+	}
+	return true;
+}
+
+#if WITH_TLS
+static bool
+build_psk_map(const struct config *conf, struct present_conf_tls_psk *out)
+{
+	if (conf->tls_psk_count == 0) {
+		return true;
+	}
+	out->entries = calloc(conf->tls_psk_count, sizeof(*out->entries));
+	if (out->entries == NULL) {
+		LOGOOM();
+		return false;
+	}
+	out->count = conf->tls_psk_count;
+	for (size_t i = 0; i < out->count; i++) {
+		out->entries[i] = (struct present_conf_tls_psk_entry){
+			.key = json_str(conf->tls_psk[i].id),
+			.value = json_str(conf->tls_psk[i].hex),
+		};
+	}
+	return true;
+}
+#endif /* WITH_TLS */
 
 /* Build an array of struct json_string views over strs[0..count) into *out
  * (left NULL when count == 0). Returns false only on allocation failure. */
@@ -1222,29 +1235,26 @@ char *conf_dump(
 	const struct config *restrict conf, size_t *restrict lenp,
 	const char *restrict indent)
 {
-	/* Three heap temporaries feed the `raw` literal below; they are released
+	/* Heap temporaries feed the `raw` literal below; they are released
 	 * once at the cleanup label so a future addition need only be freed there.
 	 * out is freed on the failure branch (NULL'd once handed to result). */
-	struct vbuffer *listen_vbuf = NULL;
+	struct present_conf_identity_listen listen_map = { 0 };
 	struct json_string *id_mc_arr = NULL;
 #if WITH_TLS
 	struct json_string *authcerts_arr = NULL;
-	struct vbuffer *psk_vbuf = NULL;
+	struct present_conf_tls_psk psk_map = { 0 };
 #endif
 	char *out = NULL;
 	char *result = NULL;
 
-	if (!build_listen_json(conf, &listen_vbuf)) {
+	if (!build_listen_map(conf, &listen_map)) {
 		goto cleanup;
 	}
 #if WITH_TLS
-	if (!build_psk_json(conf, &psk_vbuf)) {
+	if (!build_psk_map(conf, &psk_map)) {
 		goto cleanup;
 	}
 #endif
-	char *const listen_json =
-		listen_vbuf != NULL ? (char *)listen_vbuf->data : NULL;
-	const size_t listen_len = listen_vbuf != NULL ? listen_vbuf->len : 0;
 
 	if (!build_json_string_arr(
 		    conf->identity.mux_connect,
@@ -1281,101 +1291,156 @@ char *conf_dump(
 	const uintmax_t stream_window_bytes =
 		(uintmax_t)conf->mux.stream_window * MUX_WINDOW_UNIT;
 
-	const struct json_conf raw = {
+	const struct present_conf raw = {
 		/* Always dump the canonical CONF_TYPE literal rather than
 		 * conf->type: conf_check_type accepts equivalent variants
 		 * (different case, whitespace, parameter order, or extra
 		 * parameters), so the original string need not match it. */
+		.has_type = true,
 		.type = { .str = CONF_TYPE, .len = sizeof(CONF_TYPE) - 1 },
+		.has_api_listen = conf->api_listen != NULL,
 		.api_listen = json_str(conf->api_listen),
+		.has_mux_listen = conf->mux_listen != NULL,
 		.mux_listen = json_str(conf->mux_listen),
+		.has_mux_connect = conf->mux_connect != NULL,
 		.mux_connect = json_str(conf->mux_connect),
+		.has_listen = conf->listen != NULL,
 		.listen = json_str(conf->listen),
+		.has_connect = conf->connect != NULL,
 		.connect = json_str(conf->connect),
+		.has_log = conf->log != NULL,
 		.log = json_str(conf->log),
+		.has_loglevel = true,
 		.loglevel = (unsigned)conf->loglevel,
+		.has_max_sessions = true,
 		.max_sessions = (uintmax_t)conf->max_sessions,
+		.has_max_startups = max_startups != NULL,
 		.max_startups = {
 			.str = max_startups,
 			.len = max_startups_len,
 		},
 #if WITH_TLS
+		.has_tls = true,
 		.tls = {
+			.has_cert = conf->tls_cert != NULL,
 			.cert = json_str(conf->tls_cert),
+			.has_key = conf->tls_key != NULL,
 			.key = json_str(conf->tls_key),
+			.has_ciphersuites = conf->tls_ciphersuites != NULL,
 			.ciphersuites = json_str(conf->tls_ciphersuites),
+			.has_sni = conf->tls_sni != NULL,
 			.sni = json_str(conf->tls_sni),
+			.has_alpn = conf->tls_alpn != NULL,
 			.alpn = json_str(conf->tls_alpn),
+			.has_authcerts = conf->tls_authcerts_count > 0,
 			.authcerts = authcerts_arr,
 			.authcerts_count = conf->tls_authcerts_count,
+			.has_system_trust = true,
+			.system_trust = conf->tls_system_trust,
+			.has_kernel_offload = true,
 			.kernel_offload = conf->tls_kernel_offload,
+			.has_socket_offload = true,
 			.socket_offload = conf->tls_socket_offload,
-			.psk_json = {
-				.str = psk_vbuf != NULL ?
-					       (char *)psk_vbuf->data :
-					       NULL,
-				.len = psk_vbuf != NULL ? psk_vbuf->len : 0,
-			},
+			.has_psk = psk_map.count > 0,
+			.psk = psk_map,
 		},
 #endif /* WITH_TLS */
+		.has_mux = true,
 		.mux = {
+			.has_nodelay = true,
 			.nodelay = conf->mux.nodelay,
+			.has_tcp = true,
 			.tcp = {
+				.has_reuseport = true,
 				.reuseport = conf->mux_tcp.tcp_reuseport,
+				.has_keepalive = true,
 				.keepalive = conf->mux_tcp.tcp_keepalive,
+				.has_nodelay = true,
 				.nodelay = conf->mux_tcp.tcp_nodelay,
+				.has_sndbuf = true,
 				.sndbuf = (uintmax_t)conf->mux_tcp.tcp_sndbuf,
+				.has_rcvbuf = true,
 				.rcvbuf = (uintmax_t)conf->mux_tcp.tcp_rcvbuf,
 #if WITH_TCP_NOTSENT_LOWAT
+				.has_notsent_lowat = true,
 				.notsent_lowat =
 					(uintmax_t)conf->mux_tcp
 						.tcp_notsent_lowat,
 #endif
+				.has_backlog = true,
 				.backlog = (unsigned)conf->mux_tcp.backlog,
 			},
+			.has_max_halfopen = true,
 			.max_halfopen = (unsigned)conf->mux.max_halfopen,
+			.has_max_streams = true,
 			.max_streams = (uintmax_t)conf->mux.max_streams,
+			.has_connect_timeout = true,
 			.connect_timeout = (unsigned)conf->mux.connect_timeout,
+			.has_keepalive = true,
 			.keepalive = (unsigned)conf->mux.keepalive,
+			.has_send_timeout = true,
 			.send_timeout = (unsigned)conf->mux.send_timeout,
+			.has_idle_timeout = true,
 			.idle_timeout = (unsigned)conf->mux.idle_timeout,
+			.has_resume_timeout = true,
 			.resume_timeout = (unsigned)conf->mux.resume_timeout,
+			.has_session_window = true,
 			.session_window = (unsigned)session_window_bytes,
+			.has_stream_window = true,
 			.stream_window = (unsigned)stream_window_bytes,
+			.has_readahead = true,
 			.readahead = (unsigned)conf->mux.readahead,
+			.has_max_frame_size = true,
 			.max_frame_size = (unsigned)(
 				(uint_least32_t)conf->mux.max_frame_payload +
 				MUX_FRAME_HEADER_SIZE),
+			.has_mem_pressure = true,
 			.mem_pressure = {
+				.has_hi = true,
 				.hi = (uintmax_t)conf->mux.mem_pressure_hi,
+				.has_lo = true,
 				.lo = (uintmax_t)conf->mux.mem_pressure_lo,
 			},
+			.has_lossymux = true,
 			.lossymux = {
+				.has_enabled = true,
 				.enabled = conf->mux.lossymux,
+				.has_idle_timeout = true,
 				.idle_timeout =
 					(unsigned)conf->mux.lossymux_idle_timeout,
+				.has_queue = true,
 				.queue = (unsigned)conf->mux.lossymux_queue,
 			},
 		},
+		.has_tcp = true,
 		.tcp = {
+			.has_reuseport = true,
 			.reuseport = conf->tcp.tcp_reuseport,
+			.has_keepalive = true,
 			.keepalive = conf->tcp.tcp_keepalive,
+			.has_nodelay = true,
 			.nodelay = conf->tcp.tcp_nodelay,
+			.has_sndbuf = true,
 			.sndbuf = (uintmax_t)conf->tcp.tcp_sndbuf,
+			.has_rcvbuf = true,
 			.rcvbuf = (uintmax_t)conf->tcp.tcp_rcvbuf,
 #if WITH_TCP_NOTSENT_LOWAT
+			.has_notsent_lowat = true,
 			.notsent_lowat = (uintmax_t)conf->tcp.tcp_notsent_lowat,
 #endif
+			.has_backlog = true,
 			.backlog = (unsigned)conf->tcp.backlog,
 		},
+		.has_identity = true,
 		.identity = {
+			.has_claim = conf->identity.claim != NULL,
 			.claim = json_str(conf->identity.claim),
+			.has_mux_connect = conf->identity.mux_connect_count > 0,
 			.mux_connect = id_mc_arr,
 			.mux_connect_count = conf->identity.mux_connect_count,
-			.listen_json = {
-				.str = listen_json,
-				.len = listen_len,
-			},
+			.has_listen = listen_map.count > 0,
+			.listen = listen_map,
+			.has_verify = true,
 			.verify = conf->identity.verify,
 		},
 	};
@@ -1388,7 +1453,7 @@ char *conf_dump(
 		goto cleanup;
 	}
 	const int json_sz =
-		json_marshal_conf(out, CONF_MAXSIZE + 1, &raw, indent);
+		present_marshal_conf(out, CONF_MAXSIZE + 1, &raw, indent);
 	if (json_sz <= 0 || json_sz > CONF_MAXSIZE) {
 		LOGE_F("config dump failed or exceeds maximum size of %d bytes",
 		       CONF_MAXSIZE);
@@ -1403,11 +1468,11 @@ char *conf_dump(
 	out = NULL;
 
 cleanup:
-	VBUF_FREE(listen_vbuf);
+	free(listen_map.entries);
 	free(id_mc_arr);
 #if WITH_TLS
 	free(authcerts_arr);
-	VBUF_FREE(psk_vbuf);
+	free(psk_map.entries);
 #endif
 	free(out);
 	return result;

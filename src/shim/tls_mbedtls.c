@@ -322,6 +322,22 @@ bool tls_load_authcerts(
 	return true;
 }
 
+static bool tls_load_system_trust(struct tls_context *ctx)
+{
+	const char *const path = tls_system_ca_file();
+	if (path == NULL) {
+		return false;
+	}
+	struct tls_ctx_impl *const c = tls_ctx_raw(ctx);
+	if (!tls_crt_parse_ok(
+		    mbedtls_x509_crt_parse_file(&c->ca_chain, path)) ||
+	    c->ca_chain.raw.len == 0) {
+		return false;
+	}
+	c->ca_chain_loaded = true;
+	return true;
+}
+
 /* Mutable copy for tokenizing; cap includes one terminator slot. */
 static char *dup_for_tokens(
 	const char *restrict list, const char delim, size_t *restrict cap)
@@ -857,6 +873,11 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 	mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
 #endif
 	const bool is_psk = tls_conf_is_psk(conf);
+	if (is_psk && conf->system_trust) {
+		LOGE("tls.system_trust cannot be combined with PSK");
+		tls_ctx_free(ctx);
+		return NULL;
+	}
 	if (is_psk) {
 		/* A PSK handshake carries no certificate in either direction, so
 		 * no trust store applies and no verification callback runs. */
@@ -870,8 +891,8 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 			return NULL;
 		}
 	} else {
-		/* See OpenSSL backend for the rationale: private CA gates transport
-		 * authentication; application-level identity comes from the hello. */
+		/* Configured trust gates transport authentication; application-level
+		 * identity comes from the hello. */
 		mbedtls_ssl_conf_authmode(
 			&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 		/* tls_client always calls mbedtls_ssl_set_hostname(); this callback clears
@@ -914,6 +935,12 @@ tls_ctx_init(const struct tls_config *restrict conf, const bool is_server)
 			return NULL;
 		}
 #endif /* MBEDTLS_LEGACY_RNG */
+
+		if (conf->system_trust && !tls_load_system_trust(ctx)) {
+			LOGE("tls.system_trust: failed to load system PEM CA bundle");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
 
 		if (!tls_load_authcerts(
 			    ctx, conf->authcerts, conf->authcerts_count)) {

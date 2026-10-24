@@ -1432,6 +1432,7 @@ static bool server_make_tls_contexts(
 		.key = conf->tls_key,
 		.authcerts = authcerts_arr,
 		.authcerts_count = authcerts_count,
+		.system_trust = conf->tls_system_trust,
 		/* Only one client-side PSK is possible, so a dialing node offers
 		 * the first configured entry; conf_check_psk warns when there is
 		 * more than one to choose from. */

@@ -795,6 +795,22 @@ bool tls_load_authcerts(
 	return true;
 }
 
+static bool tls_load_system_trust(struct tls_context *ctx)
+{
+	const char *const path = tls_system_ca_file();
+	if (path == NULL) {
+		return false;
+	}
+	BIO *const bio = BIO_new_file(path, "r");
+	if (bio == NULL) {
+		LOG_SSLERROR(ERROR, "BIO_new_file(system CA bundle)");
+		return false;
+	}
+	const bool ok = load_authcert_from_bio(tls_ssl_ctx(ctx), bio);
+	BIO_free(bio);
+	return ok;
+}
+
 void tls_secure_erase(void *ptr, size_t len)
 {
 	if (ptr != NULL && len > 0) {
@@ -1237,6 +1253,11 @@ struct tls_context *tls_ctx_server(const struct tls_config *conf)
 	tls_ctx_tune(ssl_ctx, conf->kernel_offload, conf->readahead);
 
 	const bool is_psk = tls_conf_is_psk(conf);
+	if (is_psk && conf->system_trust) {
+		LOGE("tls.system_trust cannot be combined with PSK");
+		tls_ctx_free(ctx);
+		return NULL;
+	}
 	if (!is_psk) {
 		if (!tls_load_cert(ctx, conf->cert)) {
 			LOGE("failed to load TLS certificate");
@@ -1252,6 +1273,12 @@ struct tls_context *tls_ctx_server(const struct tls_config *conf)
 
 		if (!SSL_CTX_check_private_key(ssl_ctx)) {
 			LOG_SSLERROR(ERROR, "SSL_CTX_check_private_key");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+
+		if (conf->system_trust && !tls_load_system_trust(ctx)) {
+			LOGE("tls.system_trust: failed to load system PEM CA bundle");
 			tls_ctx_free(ctx);
 			return NULL;
 		}
@@ -1311,6 +1338,11 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf)
 	tls_ctx_tune(ssl_ctx, conf->kernel_offload, conf->readahead);
 
 	const bool is_psk = tls_conf_is_psk(conf);
+	if (is_psk && conf->system_trust) {
+		LOGE("tls.system_trust cannot be combined with PSK");
+		tls_ctx_free(ctx);
+		return NULL;
+	}
 	if (!is_psk) {
 		/* Client certificate is mandatory for mutual authentication */
 		if (!tls_load_cert(ctx, conf->cert)) {
@@ -1331,14 +1363,20 @@ struct tls_context *tls_ctx_client(const struct tls_config *conf)
 			return NULL;
 		}
 
+		if (conf->system_trust && !tls_load_system_trust(ctx)) {
+			LOGE("tls.system_trust: failed to load system PEM CA bundle");
+			tls_ctx_free(ctx);
+			return NULL;
+		}
+
 		if (!tls_load_authcerts(
 			    ctx, conf->authcerts, conf->authcerts_count)) {
 			LOGE("failed to load authorized certificates");
 			tls_ctx_free(ctx);
 			return NULL;
 		}
-		/* Verify the peer certificate against the pinned CA store; hostname check is
-		 * omitted (see "Deployment Notes" in README.md). */
+		/* Verify the peer certificate against the configured trust store;
+		 * hostname checks are omitted (see "Deployment Notes" in README.md). */
 		SSL_CTX_set_verify(
 			ssl_ctx, SSL_VERIFY_PEER, tls_verify_cert_strength_cb);
 	} else {

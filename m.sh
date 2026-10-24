@@ -6,9 +6,12 @@ set -ex
 case "$1" in
 "gen")
     # conf: parsed once at startup — optimize for binary size
-    python3 scripts/gen_schema.py --prefix json_ --optimize size src/conf_schema.json
+    python3 scripts/gen_schema.py --prefix json_ --optimize size --generate structs,unmarshal src/conf_schema.json
+    # Parse and dump explicit fields separately from the complete defaults.
+    python3 scripts/gen_schema.py --prefix present_ --optimize size --presence \
+        --output-name conf_presence src/conf_schema.json
     # proto: parsed on every mux frame — optimize for speed
-    python3 scripts/gen_schema.py --prefix json_ --optimize fast src/mux/proto_schema.json
+    python3 scripts/gen_schema.py --prefix json_ --optimize fast --presence src/mux/proto_schema.json
     ;;
 "fmt")
     # format code

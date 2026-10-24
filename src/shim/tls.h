@@ -90,8 +90,8 @@ typedef bool (*tls_psk_lookup_fn)(
  * @brief Runtime TLS parameters for @c tls_ctx_server / @c tls_ctx_client.
  *
  * Exactly one credential set must be supplied: the certificate fields
- * (@c cert, @c key, @c authcerts) or the PSK fields.  They are mutually
- * exclusive -- a PSK handshake sends no Certificate message in either
+ * (@c cert, @c key, and @c authcerts or @c system_trust) or the PSK fields.
+ * They are mutually exclusive -- a PSK handshake sends no Certificate message in either
  * direction, which is the point of offering it.
  *
  * String fields are PEM data or "@filename" (see @c tls_load_cert), only borrowed
@@ -104,6 +104,11 @@ struct tls_config {
 	/* Authorized certificate PEMs/filenames; may be NULL. */
 	char *const *authcerts;
 	size_t authcerts_count;
+	/* Opt in to the system PEM CA bundle in addition to authcerts. False by
+	 * default. Both backends use SSL_CERT_FILE when set, otherwise a standard
+	 * Unix bundle (see README). Context creation fails if it cannot be loaded.
+	 * Does not enable DNS hostname verification. Forbidden with PSK. */
+	bool system_trust;
 	/* Client role: the single PSK offered.  Both backends accept only one
 	 * client-side PSK, so a node that dials several peers offers the first
 	 * key it has configured.  Borrowed; the implementation copies it. */
@@ -233,7 +238,8 @@ struct tls_context *tls_ctx_server(const struct tls_config *conf);
 /**
  * @brief Create a TLS 1.3 client context.
  * @param[in] conf Parameters; exactly one credential set -- conf->cert with
- * conf->key, verifying the peer against conf->authcerts, or conf->psk.
+ * conf->key, verifying the peer against conf->authcerts and the optional system
+ * trust bundle, or conf->psk.
  * @return The context, or NULL on failure.
  * @note With conf->psk the server must authenticate with that PSK: a server
  * that ignores the offer and presents a certificate fails the handshake.

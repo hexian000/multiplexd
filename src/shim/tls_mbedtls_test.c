@@ -68,6 +68,9 @@ bio_fault_recv(const int fd, void *buf, const size_t len, const int flags)
 
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/ssl.h>
+#include <psa/crypto.h>
+#include <psa/crypto_extra.h>
+#include <psa/crypto_values.h>
 
 #include <assert.h>
 #include <stdbool.h>
@@ -123,6 +126,25 @@ static void bio_pair_open(int fds[2])
 	T_CHECK(socket_set_nonblock(fds[1]) == 0);
 }
 
+#if !defined(MBEDTLS_LEGACY_RNG) || defined(MBEDTLS_PSA_CRYPTO_C)
+static void cleanup_ctx(void *data)
+{
+	tls_ctx_free(data);
+}
+#endif /* !defined(MBEDTLS_LEGACY_RNG) || defined(MBEDTLS_PSA_CRYPTO_C) */
+
+static void bio_pair_cleanup(void *data)
+{
+	int *const fds = data;
+	for (size_t i = 0; i < 2; i++) {
+		if (fds[i] >= 0) {
+			(void)close(fds[i]);
+			fds[i] = -1;
+		}
+	}
+	bio_fault_errno = 0;
+}
+
 static void *bio_ctx(const int fd)
 {
 	return (void *)(intptr_t)fd;
@@ -132,8 +154,9 @@ static void *bio_ctx(const int fd)
  * is WANT_READ: mbedTLS retries it once the loop reports the fd readable. */
 T_DECLARE_CASE(test_bio_moves_bytes_and_empty_read_wants_read)
 {
-	int fds[2];
+	static int fds[2];
 	bio_pair_open(fds);
+	T_CLEANUP(bio_pair_cleanup, fds);
 	unsigned char buf[8];
 
 	T_EXPECT_EQ(
@@ -154,15 +177,18 @@ T_DECLARE_CASE(test_bio_moves_bytes_and_empty_read_wants_read)
 	T_EXPECT_EQ(memcmp(buf, msg, sizeof(msg)), 0);
 
 	(void)close(fds[0]);
+	fds[0] = -1;
 	(void)close(fds[1]);
+	fds[1] = -1;
 }
 
 /* A full kernel send buffer is backpressure: WANT_WRITE, never a send failure
  * that would tear the whole TLS+mux session down. */
 T_DECLARE_CASE(test_bio_full_send_buffer_wants_write)
 {
-	int fds[2];
+	static int fds[2];
 	bio_pair_open(fds);
+	T_CLEANUP(bio_pair_cleanup, fds);
 	static const unsigned char chunk[4096];
 
 	int ret = 0;
@@ -174,7 +200,9 @@ T_DECLARE_CASE(test_bio_full_send_buffer_wants_write)
 	T_EXPECT_EQ(ret, MBEDTLS_ERR_SSL_WANT_WRITE);
 
 	(void)close(fds[0]);
+	fds[0] = -1;
 	(void)close(fds[1]);
+	fds[1] = -1;
 }
 
 /* After the peer closes, a read is EOF (0) and a send fails with EPIPE -- no
@@ -182,9 +210,11 @@ T_DECLARE_CASE(test_bio_full_send_buffer_wants_write)
  * generic send failure. */
 T_DECLARE_CASE(test_bio_after_peer_close_is_eof_then_reset)
 {
-	int fds[2];
+	static int fds[2];
 	bio_pair_open(fds);
+	T_CLEANUP(bio_pair_cleanup, fds);
 	(void)close(fds[1]);
+	fds[1] = -1;
 	unsigned char buf[8] = { 0 };
 
 	T_EXPECT_EQ(tls_bio_recv(bio_ctx(fds[0]), buf, sizeof(buf)), 0);
@@ -193,6 +223,7 @@ T_DECLARE_CASE(test_bio_after_peer_close_is_eof_then_reset)
 		MBEDTLS_ERR_NET_CONN_RESET);
 
 	(void)close(fds[0]);
+	fds[0] = -1;
 }
 
 /* An invalid descriptor (EBADF) is a plain I/O failure, not a reset. */
@@ -215,8 +246,9 @@ T_DECLARE_CASE(test_bio_transient_errnos_are_retriable)
 {
 	static const int k_transient[] = { EAGAIN, EWOULDBLOCK, ENOBUFS,
 					   ENOMEM };
-	int fds[2];
+	static int fds[2];
 	bio_pair_open(fds);
+	T_CLEANUP(bio_pair_cleanup, fds);
 	unsigned char buf[8] = { 0 };
 
 	for (size_t i = 0; i < ARRAY_SIZE(k_transient); i++) {
@@ -231,15 +263,18 @@ T_DECLARE_CASE(test_bio_transient_errnos_are_retriable)
 	}
 
 	(void)close(fds[0]);
+	fds[0] = -1;
 	(void)close(fds[1]);
+	fds[1] = -1;
 }
 
 /* ECONNRESET is a reset in both directions; the receive side cannot be made to
  * see one deterministically on a socketpair, so it is injected. */
 T_DECLARE_CASE(test_bio_econnreset_is_conn_reset)
 {
-	int fds[2];
+	static int fds[2];
 	bio_pair_open(fds);
+	T_CLEANUP(bio_pair_cleanup, fds);
 	unsigned char buf[8] = { 0 };
 
 	bio_fault_errno = ECONNRESET;
@@ -252,15 +287,18 @@ T_DECLARE_CASE(test_bio_econnreset_is_conn_reset)
 		MBEDTLS_ERR_NET_CONN_RESET);
 
 	(void)close(fds[0]);
+	fds[0] = -1;
 	(void)close(fds[1]);
+	fds[1] = -1;
 }
 
 /* An interrupted call is retried, not reported: the retry reaches the socket
  * and returns what it returns. */
 T_DECLARE_CASE(test_bio_eintr_is_retried)
 {
-	int fds[2];
+	static int fds[2];
 	bio_pair_open(fds);
+	T_CLEANUP(bio_pair_cleanup, fds);
 	unsigned char buf[8] = { 0 };
 
 	bio_fault_errno = EINTR;
@@ -273,7 +311,9 @@ T_DECLARE_CASE(test_bio_eintr_is_retried)
 		(int)sizeof(buf));
 
 	(void)close(fds[0]);
+	fds[0] = -1;
 	(void)close(fds[1]);
+	fds[1] = -1;
 }
 
 #if !defined(MBEDTLS_LEGACY_RNG) || defined(MBEDTLS_PSA_CRYPTO_C)
@@ -317,11 +357,9 @@ T_DECLARE_CASE(test_ctx_init_initializes_psa)
 	mbedtls_psa_crypto_free();
 	struct tls_context *const ctx = tls_ctx_server(&(struct tls_config){
 		.cert = test_p256_cert_pem, .key = test_p256_key_pem });
+	T_CLEANUP(cleanup_ctx, ctx);
 	T_EXPECT(ctx != NULL);
 	T_EXPECT(psa_is_initialized());
-	if (ctx != NULL) {
-		tls_ctx_free(ctx);
-	}
 #else
 	T_LOG("mbedTLS built without PSA crypto");
 	T_SKIPNOW();

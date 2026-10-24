@@ -60,6 +60,11 @@ static bool proto_hello_build(
 	}
 	/* Strings in raw are borrowed; do not call json_free_proto(). */
 	const struct json_proto raw = {
+		.has_type = true,
+		.has_msgid = true,
+		.has_session_id = msg->has_session_id,
+		.has_resume_seq = true,
+		.has_extensions = true,
 		.type = { .str = (char *)PROTO_TYPE, .len = sizeof(PROTO_TYPE) - 1 },
 		.msgid = msg->msgid,
 		.session_id = {
@@ -68,6 +73,9 @@ static bool proto_hello_build(
 		},
 		.resume_seq = msg->has_resume_seq ? (unsigned)msg->resume_seq : 0,
 		.extensions = {
+			.has_reject_inbound = true,
+			.has_lossymux = true,
+			.has_identity = msg->has_identity,
 			.reject_inbound = msg->reject_inbound,
 			.lossymux = msg->lossymux,
 			.identity = {

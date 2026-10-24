@@ -1,5 +1,6 @@
 add_executable(multiplexd
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
+    conf_presence.gen.c conf_presence.gen.h
     genpsk.c genpsk.h
     listener.c listener.h
     server.c server.h
@@ -256,6 +257,7 @@ endfunction()
 
 add_src_test(conf_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
+    conf_presence.gen.c conf_presence.gen.h
     mux/frame.c mux/frame.h
     conf_test.c
 )
@@ -303,6 +305,7 @@ add_src_test(genpsk_test
 # real.
 add_src_test(tunnel_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
+    conf_presence.gen.c conf_presence.gen.h
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
@@ -314,6 +317,7 @@ target_link_libraries(tunnel_test PRIVATE mux)
 
 add_src_test(server_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
+    conf_presence.gen.c conf_presence.gen.h
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
@@ -330,6 +334,7 @@ endif()
 
 add_src_test(api_server_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
+    conf_presence.gen.c conf_presence.gen.h
     ${GENCERTS_SOURCES}
     listener.c listener.h
     server.c server.h
@@ -345,6 +350,7 @@ target_link_libraries(api_server_test PRIVATE mux)
 # resolves, but only parse_args/print_usage are exercised.
 add_src_test(main_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
+    conf_presence.gen.c conf_presence.gen.h
     genpsk.c genpsk.h
     ${GENCERTS_SOURCES}
     listener.c listener.h

@@ -69,7 +69,7 @@
             ]
         },
         "tls": {
-            "description": "TLS credentials. cert, key, and authcerts must all be set or all absent (plaintext mode).",
+            "description": "TLS credentials. Certificate mode requires cert, key and at least one trust source (authcerts or system_trust). With no credentials or trust source, plaintext mode is used.",
             "type": "object",
             "properties": {
                 "cert": {
@@ -94,10 +94,10 @@
                     "type": "string"
                 },
                 "psk": {
-                    "description": "External pre-shared keys, keyed by peer identity. Values are lowercase hex (at least 32 octets) or '@path' to a file holding the same. Mutually exclusive with cert/key/authcerts: a PSK handshake sends no certificate in either direction. Generate with --genpsk; a hand-written key is unsafe, because the identity label published on the wire is derived from it. When dialing, the first entry is the one offered.",
+                    "description": "External pre-shared keys, keyed by peer identity. Values are lowercase hex (at least 32 octets) or '@path' to a file holding the same. Mutually exclusive with cert/key/authcerts/system_trust: a PSK handshake sends no certificate in either direction. Generate with --genpsk; a hand-written key is unsafe, because the identity label published on the wire is derived from it. When dialing, the first entry is the one offered.",
                     "type": "object",
                     "additionalProperties": {
-                        "description": "Lowercase hex key, or '@path'. A map value, so it bypasses generated per-field checks; conf.c enforces length and format instead, on an inline key when the config is parsed and on an '@path' key once the file is loaded.",
+                        "description": "Lowercase hex key, or '@path'. The codec checks the string type; conf.c enforces key length and format, on an inline key when the config is parsed and on an '@path' key once the file is loaded.",
                         "type": "string"
                     }
                 },
@@ -108,6 +108,11 @@
                         "type": "string"
                     },
                     "minItems": 1
+                },
+                "system_trust": {
+                    "description": "Opt in to the system PEM CA bundle alongside authcerts. Disabled by default. Both backends use SSL_CERT_FILE when set, otherwise the first installed standard Unix CA bundle (see README). An unavailable, empty or malformed bundle is a startup error. Native OS certificate databases and SSL_CERT_DIR are not used. Requires cert/key; mutually exclusive with psk. This widens trusted issuers but does not verify DNS hostnames or authorize a claimed identity; use identity.verify for certificate-bound identity claims.",
+                    "type": "boolean",
+                    "default": false
                 },
                 "socket_offload": {
                     "description": "Enable the TLS library to own the socket and perform record I/O directly. When disabled (the default) the mux drives the library over in-memory buffers and batches records into larger socket writes, which is faster on loopback and low-latency links; enable it to let the library (or the kernel, via 'kernel_offload') own the socket fd.",
@@ -120,7 +125,7 @@
                     "default": true
                 }
             },
-            "additionalProperties": false
+            "additionalProperties": true
         },
         "mux": {
             "description": "Mux session and socket settings.",
@@ -174,7 +179,7 @@
                             "default": 16
                         }
                     },
-                    "additionalProperties": false
+                    "additionalProperties": true
                 },
                 "max_halfopen": {
                     "description": "Maximum half-open streams per session. 0 = no limit.",
@@ -268,7 +273,7 @@
                             "default": 0
                         }
                     },
-                    "additionalProperties": false
+                    "additionalProperties": true
                 },
                 "lossymux": {
                     "description": "Best-effort UDP relay over the mux session (the bilateral 'lossymux' hello extension). Active on a session only when both peers enable it.",
@@ -294,10 +299,10 @@
                             "default": 64
                         }
                     },
-                    "additionalProperties": false
+                    "additionalProperties": true
                 }
             },
-            "additionalProperties": false
+            "additionalProperties": true
         },
         "tcp": {
             "description": "TCP socket options for local (application-side) connections.",
@@ -342,7 +347,7 @@
                     "default": 16
                 }
             },
-            "additionalProperties": false
+            "additionalProperties": true
         },
         "identity": {
             "description": "Identity and peer-routing configuration.",
@@ -372,15 +377,15 @@
                     "description": "Per-peer local listen addresses. Keys are peer identity strings; values are local TCP addresses.",
                     "type": "object",
                     "additionalProperties": {
-                        "description": "Local TCP address to accept traffic for this peer. A map value, so it bypasses generated per-field checks; maxLength is enforced by conf_check in conf.c instead.",
+                        "description": "Local TCP address to accept traffic for this peer. The codec enforces the string type and maxLength; conf_check also validates caller-built configurations.",
                         "type": "string",
                         "$comment": "maxLength must equal shim/util.h ADDR_MAX_STRLEN",
                         "maxLength": 261
                     }
                 }
             },
-            "additionalProperties": false
+            "additionalProperties": true
         }
     },
-    "additionalProperties": false
+    "additionalProperties": true
 }

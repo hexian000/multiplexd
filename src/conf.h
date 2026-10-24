@@ -93,6 +93,8 @@ struct config {
 	size_t tls_authcerts_count;
 	/* Concatenated PEM bundle of trusted certificates (owned); NULL when none. */
 	char *tls_authcerts_bundle;
+	/* Opt in to the system PEM trust bundle, in addition to authcerts. */
+	bool tls_system_trust;
 	/* OpenSSL only: request kernel TLS (KTLS) offload so the kernel frames
 	 * and encrypts records and can coalesce them into full segments. */
 	bool tls_kernel_offload;

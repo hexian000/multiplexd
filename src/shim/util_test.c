@@ -14,13 +14,100 @@
 #include "utils/testing.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
+
+#if WITH_TLS
+/* Interpose only the bundle-discovery probes; all other tests retain the
+ * real filesystem operation through the equivalent POSIX fstatat call. */
+static bool mock_bundle_stat;
+static int bundle_stat_error;
+static mode_t bundle_stat_mode;
+static size_t bundle_stat_hit;
+static size_t bundle_stat_calls;
+
+int stat(const char *path, struct stat *st)
+{
+	if (!mock_bundle_stat) {
+		return fstatat(AT_FDCWD, path, st, 0);
+	}
+	if (bundle_stat_calls++ == bundle_stat_hit) {
+		if (bundle_stat_error == 0) {
+			memset(st, 0, sizeof(*st));
+			st->st_mode = bundle_stat_mode;
+			return 0;
+		}
+		errno = bundle_stat_error;
+		return -1;
+	}
+	errno = ENOENT;
+	return -1;
+}
+
+static void restore_bundle_discovery(void *data)
+{
+	mock_bundle_stat = false;
+	if (data == NULL) {
+		(void)unsetenv("SSL_CERT_FILE");
+	} else {
+		(void)setenv("SSL_CERT_FILE", data, 1);
+		free(data);
+	}
+}
+
+T_DECLARE_CASE(test_tls_system_ca_discovery)
+{
+	const char *const env = getenv("SSL_CERT_FILE");
+	char *const saved = env == NULL ? NULL : strdup(env);
+	T_CHECK(env == NULL || saved != NULL);
+	T_CLEANUP(restore_bundle_discovery, saved);
+	T_CHECK(unsetenv("SSL_CERT_FILE") == 0);
+	mock_bundle_stat = true;
+	bundle_stat_error = 0;
+	bundle_stat_mode = S_IFREG;
+	for (size_t i = 0; i < 7; i++) {
+		bundle_stat_calls = 0;
+		bundle_stat_hit = i;
+		const char *const path = tls_system_ca_file();
+		T_CHECK(path != NULL);
+		T_EXPECT_EQ(bundle_stat_calls, i + 1);
+		T_EXPECT(path[0] == '/');
+	}
+	bundle_stat_hit = SIZE_MAX;
+	bundle_stat_calls = 0;
+	T_EXPECT(tls_system_ca_file() == NULL);
+	T_EXPECT_EQ(bundle_stat_calls, (size_t)7);
+	bundle_stat_hit = 0;
+	bundle_stat_mode = S_IFDIR;
+	bundle_stat_calls = 0;
+	T_EXPECT(tls_system_ca_file() == NULL);
+	T_EXPECT_EQ(bundle_stat_calls, (size_t)1);
+	bundle_stat_error = EACCES;
+	bundle_stat_calls = 0;
+	T_EXPECT(tls_system_ca_file() == NULL);
+	T_EXPECT_EQ(bundle_stat_calls, (size_t)1);
+	bundle_stat_error = ENOTDIR;
+	bundle_stat_calls = 0;
+	T_EXPECT(tls_system_ca_file() == NULL);
+	T_EXPECT_EQ(bundle_stat_calls, (size_t)7);
+	bundle_stat_calls = 0;
+	T_CHECK(setenv("SSL_CERT_FILE", "controlled-ca.pem", 1) == 0);
+	T_EXPECT_STREQ(tls_system_ca_file(), "controlled-ca.pem");
+	T_EXPECT_EQ(bundle_stat_calls, (size_t)0);
+	T_CHECK(setenv("SSL_CERT_FILE", "", 1) == 0);
+	T_EXPECT(tls_system_ca_file() == NULL);
+	T_EXPECT_EQ(bundle_stat_calls, (size_t)0);
+}
+#endif /* WITH_TLS */
 
 T_DECLARE_CASE(test_resolve_addr_ipv4_parses_correctly)
 {
@@ -197,16 +284,23 @@ T_DECLARE_CASE(test_csprng_bytes_fails_when_fd_exhausted)
 {
 	struct rlimit orig;
 	T_CHECK(getrlimit(RLIMIT_NOFILE, &orig) == 0);
+	/* Own the seed descriptor: stdin may be closed by the test runner. */
+	const int seed = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	T_CHECK(seed >= 0);
 	struct rlimit low = orig;
-	low.rlim_cur = 64; /* bounded exhaustion; existing fds stay open */
+	if (low.rlim_cur > 64) {
+		low.rlim_cur = 64; /* bounded exhaustion; never raise a limit */
+	}
 	T_CHECK(setrlimit(RLIMIT_NOFILE, &low) == 0);
 
 	int dups[64];
 	size_t n = 0;
+	int dup_err = 0;
 	for (; n < sizeof(dups) / sizeof(dups[0]); n++) {
-		const int d = dup(STDIN_FILENO);
+		const int d = dup(seed);
 		if (d < 0) {
-			break; /* EMFILE: the table is now full */
+			dup_err = errno;
+			break;
 		}
 		dups[n] = d;
 	}
@@ -217,7 +311,9 @@ T_DECLARE_CASE(test_csprng_bytes_fails_when_fd_exhausted)
 	for (size_t i = 0; i < n; i++) {
 		(void)close(dups[i]);
 	}
+	(void)close(seed);
 	T_CHECK(setrlimit(RLIMIT_NOFILE, &orig) == 0);
+	T_EXPECT_EQ(dup_err, EMFILE);
 	T_EXPECT(!ok);
 }
 
@@ -461,6 +557,9 @@ T_DECLARE_CASE(test_sock_would_block_admits_only_transient_backpressure)
 
 static const struct testing_suite suite[] = {
 	T_CASE(test_resolve_addr_ipv4_parses_correctly),
+#if WITH_TLS
+	T_CASE(test_tls_system_ca_discovery),
+#endif /* WITH_TLS */
 	T_CASE(test_resolve_addr_ipv6_parses_correctly),
 	T_CASE(test_resolve_addr_invalid_returns_false),
 	T_CASE(test_resolve_addr_oversized_returns_false),

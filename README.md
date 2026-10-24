@@ -245,10 +245,10 @@ Because JSON has no comments, multiplexd ignores any key whose name begins with 
 
 Omit the `tls` object on trusted networks if the lower overhead outweighs the loss of protocol confidentiality, integrity, and peer authentication.
 
-**TLS**: `cert`, `key`, and `authcerts` must all be present or all absent. The `@path` prefix loads a PEM file at startup; bare strings are treated as inline PEM. Mutual authentication (mTLS) is always enforced — the system CA store is never consulted. `tls.ciphersuites` restricts the TLS 1.3 suites by IANA name, colon-separated (e.g. `TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256`); those names work with both the OpenSSL and the mbedTLS build, so one config serves either. Any name that is not a TLS 1.3 suite the build supports stops startup rather than being skipped.
+**TLS**: Certificate mode requires `cert`, `key`, and a trust source: `authcerts`, `system_trust: true`, or both. With no TLS credentials or trust source, the transport is plaintext. The `@path` prefix loads a PEM file at startup; bare strings are treated as inline PEM. Mutual authentication (mTLS) is always enforced. `system_trust` defaults to `false`; see the [TLS Security Model](#tls-security-model) before enabling it.
 
 **Pre-shared keys**: `tls.psk` replaces certificates entirely — it is mutually
-exclusive with `cert`, `key` and `authcerts`, and a PSK handshake sends no
+exclusive with `cert`, `key`, `authcerts` and `system_trust: true`, and a PSK handshake sends no
 certificate in either direction. It maps a peer identity to the key shared with
 that peer:
 
@@ -305,7 +305,7 @@ The `identity` block lets a node advertise its own identity and maintain simulta
 - `identity.listen` maps peer identities to local TCP listen addresses. Each listener routes accepted connections over the session whose peer announced that identity.
 - All inbound mux streams, regardless of peer identity, are forwarded to the root `connect` target.
 - If `identity.mux_connect` or `identity.listen` is configured, `identity.claim` is required.
-- `identity.verify` (default `false`) binds the claim to the certificate: a peer that claims an identity is accepted only if the certificate it presented carries `multiplexd:<identity>` (percent-encoded) as a URI subjectAltName. A peer claiming no identity is unaffected and stays unidentified. It requires TLS — enabling it without `tls.cert`, `tls.key` and `tls.authcerts`, or in a build without TLS, is a startup error rather than being ignored. Generate matching certificates with `--identity`.
+- `identity.verify` (default `false`) binds the claim to the certificate: a peer that claims an identity is accepted only if the certificate it presented carries `multiplexd:<identity>` (percent-encoded) as a URI subjectAltName. A peer claiming no identity is unaffected and stays unidentified. It requires TLS — enabling it without `tls.cert`, `tls.key` and either `tls.authcerts` or `tls.system_trust`, or in a build without TLS, is a startup error rather than being ignored. Generate matching certificates with `--identity`.
 
 **Hub node** — accepts inbound mux sessions from multiple clients and exposes each remote peer as a dedicated local listener:
 
@@ -538,7 +538,7 @@ To build without TLS support:
 cmake -DUSE_TLS_LIBRARY=none ..
 ```
 
-Such a build runs every connection in plaintext. A config that sets `tls.cert`, `tls.key`, `tls.authcerts` or a non-empty `tls.psk` makes it fail at startup rather than run unencrypted; the other `tls` keys are ignored.
+Such a build runs every connection in plaintext. A config that sets `tls.cert`, `tls.key`, `tls.authcerts`, `tls.system_trust: true` or a non-empty `tls.psk` makes it fail at startup rather than run unencrypted; the other `tls` keys are ignored.
 
 ### Convenience Builds
 
@@ -583,7 +583,33 @@ Run these helper scripts from the repository root:
 
 ### TLS Security Model
 
-With TLS enabled, multiplexd uses TLS 1.3 with mutual certificate authentication and a private trust store defined solely by `authcerts`. Each peer must present a certificate and matching private key, and a peer is accepted only if its certificate chains to a certificate explicitly configured in `authcerts`. Tunnel confidentiality, integrity, and peer authentication therefore depend on your provisioned certificate set, not on the system CA store, DNS names, or the public Web PKI.
+With TLS enabled, multiplexd uses TLS 1.3 with mutual certificate authentication. By default, only the private trust store in `authcerts` is used: each peer must present a certificate and matching private key, and its certificate must chain to a configured trust anchor.
+
+`tls.system_trust` is an explicit opt-in, disabled by default. Enabling it adds the system PEM CA bundle to `authcerts`; `authcerts` may then be omitted, but `cert` and `key` are still mandatory. This authorizes certificates from a wider set of issuers, potentially including public Web PKI CAs, for **both inbound and outbound peers**. Certificate strength checks and mutual authentication still apply. Trust selection does not perform DNS hostname verification: `tls.sni` selects a server certificate but does not authenticate the tunnel's address. Keep a private trust store unless all issuers in the system bundle are suitable transport authenticators for this deployment.
+
+Both OpenSSL and mbedTLS load a PEM bundle using the same discovery order: if `SSL_CERT_FILE` is set, use exactly that file; otherwise use the first existing file in this list:
+
+1. `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu and derivatives)
+2. `/etc/pki/tls/certs/ca-bundle.crt` (Red Hat and derivatives)
+3. `/etc/ssl/ca-bundle.pem` (SUSE)
+4. `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`
+5. `/etc/ssl/cert.pem` (including systems with an OpenSSL-compatible bundle)
+6. `/usr/local/share/certs/ca-root-nss.crt` (FreeBSD)
+7. `/usr/ssl/cert.pem` (MSYS)
+
+No native Windows certificate database or macOS Keychain is read, and `SSL_CERT_DIR` is not used. On systems without one of these bundles, export the desired system roots to PEM and set `SSL_CERT_FILE`. An empty override, absent bundle, unreadable file, empty store, or certificate parse failure is a startup/reload error, even if `authcerts` is also present; verification is never disabled as a fallback. The bundle is loaded when contexts are created, so reload the configuration after changing it.
+
+For example, a certificate-mode configuration using only the system bundle contains:
+
+```json
+"tls": {
+    "cert": "@node-cert.pem",
+    "key": "@node-key.pem",
+    "system_trust": true
+}
+```
+
+Add `"authcerts": ["@private-ca.pem"]` to trust a private CA alongside the system roots. `tls.psk` cannot be combined with certificate trust configuration, including `system_trust: true`.
 
 Operational requirements:
 
@@ -591,7 +617,7 @@ Operational requirements:
 - A CA certificate in `authcerts` authorizes every peer certificate issued by that CA; a leaf certificate entry authorizes only that specific peer.
 - Compromise of a trusted CA key or an endpoint private key compromises peer authentication.
 - `*-key.pem` files and `--dump-config` output contain private key material and must be protected accordingly.
-- By default the `identity` extension (`identity.claim`) is a self-declared routing key, not cryptographically bound to the presenting certificate. If `authcerts` is a shared CA, any peer holding a certificate issued by that CA can claim any identity string. Close this either by setting `identity.verify` (below) or by listing per-peer leaf certificates in `authcerts` instead of a shared CA.
+- By default the `identity` extension (`identity.claim`) is a self-declared routing key, not cryptographically bound to the presenting certificate. With a shared CA or `system_trust`, any peer holding a certificate accepted by that trust store can claim any identity string. Bind claims with `identity.verify` (below), or disable `system_trust` and list per-peer leaf certificates in `authcerts` instead of a shared CA. Every trusted issuer must enforce which `multiplexd:` identities it certifies when `identity.verify` is used; trusting more issuers also gives each of them authority to certify those identities.
 - `identity.verify` binds the claim to the certificate: a claimed identity must appear as a URI subjectAltName `multiplexd:<identity>` (percent-encoded, RFC 5280 §4.2.1.6) in the certificate the peer presented on that transport. This makes a shared CA safe against peer-to-peer impersonation, since the CA decides which identity each certificate may claim. Enforcement is local and per-direction: an enforcing node interoperates with a non-enforcing one, and each side independently decides whether to check the other. The check runs before any stream is admitted, and again on every resume, so a reconnecting transport cannot inherit a session's verified identity without proving it.
 - `identity.verify` does not deny an *unidentified* peer. A peer that claims nothing is still accepted if its certificate chains to `authcerts`, and reaches the root `connect` target; only identity-routed access is gated. Claiming the empty string is not the same as claiming nothing: it is an identity like any other, so it must be named by the certificate (`--identity ""`) to pass.
 - Rolling `identity.verify` out: upgrade binaries first, then reissue certificates, then enable the option. The `identity` config object rejects unknown keys, so a config containing `identity.verify` fails to load on an older binary; adding the URI subjectAltName is inert on every version, since nothing reads subjectAltNames unless the option is on.
@@ -604,7 +630,7 @@ encrypted flight, before it has seen the client's, so **anyone who can reach
 `mux_listen` and complete a key exchange can read it** — no client certificate
 needed. A hub's `identity.verify` subjectAltName is therefore public to
 scanners. Spoke certificates are not: a dialing client verifies the server
-against its own `authcerts` and aborts before sending its own.
+against its configured trust store and aborts before sending its own.
 
 There is no way around this within certificate mode. TLS 1.3 has no
 post-handshake *server* authentication, no anonymous suites, and a fixed flight

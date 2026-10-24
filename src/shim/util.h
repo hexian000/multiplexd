@@ -184,6 +184,10 @@ void escape_identity(
 	enum escape_ctx ctx);
 
 #if WITH_TLS
+/* System PEM CA bundle: SSL_CERT_FILE if set, else the first installed
+ * standard Unix bundle. Borrowed path; NULL on failure (logged). */
+const char *tls_system_ca_file(void);
+
 /**
  * @brief Callback for alpn_tokenize(): invoked once per non-empty ALPN
  * protocol name (NUL-terminated, len == strlen(name)).

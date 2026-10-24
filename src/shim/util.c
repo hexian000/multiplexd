@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -274,6 +275,46 @@ void escape_identity(
 }
 
 #if WITH_TLS
+const char *tls_system_ca_file(void)
+{
+	const char *const override = getenv("SSL_CERT_FILE");
+	if (override != NULL) {
+		if (override[0] == '\0') {
+			LOGE("tls.system_trust: SSL_CERT_FILE is empty");
+			return NULL;
+		}
+		return override;
+	}
+	static const char *const paths[] = {
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/etc/pki/tls/certs/ca-bundle.crt",
+		"/etc/ssl/ca-bundle.pem",
+		"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+		"/etc/ssl/cert.pem",
+		"/usr/local/share/certs/ca-root-nss.crt",
+		"/usr/ssl/cert.pem",
+	};
+	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		struct stat st;
+		if (stat(paths[i], &st) == 0) {
+			if (!S_ISREG(st.st_mode)) {
+				LOGE_F("tls.system_trust: CA bundle is not a regular file: %s",
+				       paths[i]);
+				return NULL;
+			}
+			return paths[i];
+		}
+		const int err = errno;
+		if (err != ENOENT && err != ENOTDIR) {
+			LOGE_F("tls.system_trust: stat %s: (%d) %s", paths[i],
+			       err, strerror(err));
+			return NULL;
+		}
+	}
+	LOGE("tls.system_trust: no system PEM CA bundle found; set SSL_CERT_FILE");
+	return NULL;
+}
+
 bool alpn_tokenize(
 	char *restrict work, const char *restrict list, const alpn_field_fn fn,
 	void *ctx)

@@ -40,6 +40,42 @@
 #include <stdio.h>
 #include <string.h>
 
+static void
+retain_cleanup(struct testing_ctx *_t_, void (*cleanup)(void *), void *data)
+{
+	if (data != NULL) {
+		T_CLEANUP(cleanup, data);
+	}
+}
+
+/* An early release disarms the matching case cleanup. This also bounds the
+ * cleanup stack in cases that acquire and release resources in a loop. */
+static void
+release_cleanup(struct testing_ctx *t, void (*cleanup)(void *), void *data)
+{
+	for (int i = t->cleanup_count; i > 0; i--) {
+		if (t->cleanups[i - 1].fn == cleanup &&
+		    t->cleanups[i - 1].data == data) {
+			memmove(&t->cleanups[i - 1], &t->cleanups[i],
+				(size_t)(t->cleanup_count - i) *
+					sizeof(t->cleanups[0]));
+			t->cleanup_count--;
+			break;
+		}
+	}
+	cleanup(data);
+}
+
+static void cleanup_key(void *data)
+{
+	EVP_PKEY_free(data);
+}
+
+static void cleanup_cert(void *data)
+{
+	X509_free(data);
+}
+
 /* Generate a key pair; a NULL result is a test-setup failure, not a case
  * failure, so abort via T_CHECK rather than returning it. */
 static EVP_PKEY *gen_rsa(const unsigned int bits)
@@ -151,8 +187,9 @@ T_DECLARE_CASE(test_ec_curve_allowlist)
 	};
 	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		EVP_PKEY *const key = gen_ec(cases[i].curve);
+		retain_cleanup(_t_, cleanup_key, key);
 		const bool got = tls_ec_curve_allowed(key);
-		EVP_PKEY_free(key);
+		release_cleanup(_t_, cleanup_key, key);
 		if (got != cases[i].allowed) {
 			T_LOGF("curve %s: expected %d, got %d", cases[i].curve,
 			       (int)cases[i].allowed, (int)got);
@@ -168,34 +205,40 @@ T_DECLARE_CASE(test_ec_curve_allowlist)
 T_DECLARE_CASE(test_cert_digest_floor)
 {
 	EVP_PKEY *const key = gen_rsa(2048);
+	retain_cleanup(_t_, cleanup_key, key);
 
 	X509 *c;
 	c = make_cert(key, EVP_sha256(), NULL);
+	retain_cleanup(_t_, cleanup_cert, c);
 	T_CHECK(c != NULL);
 	T_EXPECT(tls_cert_digest_allowed(c));
-	X509_free(c);
+	release_cleanup(_t_, cleanup_cert, c);
 
 	c = make_cert(key, EVP_sha384(), NULL);
+	retain_cleanup(_t_, cleanup_cert, c);
 	T_CHECK(c != NULL);
 	T_EXPECT(tls_cert_digest_allowed(c));
-	X509_free(c);
+	release_cleanup(_t_, cleanup_cert, c);
 
 	c = make_cert(key, EVP_sha512(), NULL);
+	retain_cleanup(_t_, cleanup_cert, c);
 	T_CHECK(c != NULL);
 	T_EXPECT(tls_cert_digest_allowed(c));
-	X509_free(c);
+	release_cleanup(_t_, cleanup_cert, c);
 
 	c = make_cert(key, EVP_sha1(), NULL);
+	retain_cleanup(_t_, cleanup_cert, c);
 	T_CHECK(c != NULL);
 	T_EXPECT(!tls_cert_digest_allowed(c));
-	X509_free(c);
+	release_cleanup(_t_, cleanup_cert, c);
 
 	c = make_cert(key, EVP_sha224(), NULL);
+	retain_cleanup(_t_, cleanup_cert, c);
 	T_CHECK(c != NULL);
 	T_EXPECT(!tls_cert_digest_allowed(c));
-	X509_free(c);
+	release_cleanup(_t_, cleanup_cert, c);
 
-	EVP_PKEY_free(key);
+	release_cleanup(_t_, cleanup_key, key);
 }
 
 /* The integrated verify callback over a peer chain: it rejects a sub-floor RSA
@@ -206,9 +249,13 @@ T_DECLARE_CASE(test_cert_digest_floor)
 T_DECLARE_CASE(test_verify_cert_strength_cb)
 {
 	EVP_PKEY *const rsa2048 = gen_rsa(2048);
+	retain_cleanup(_t_, cleanup_key, rsa2048);
 	EVP_PKEY *const rsa1024 = gen_rsa(1024);
+	retain_cleanup(_t_, cleanup_key, rsa1024);
 	EVP_PKEY *const ec256 = gen_ec("P-256");
+	retain_cleanup(_t_, cleanup_key, ec256);
 	EVP_PKEY *const ec224 = gen_ec("P-224");
+	retain_cleanup(_t_, cleanup_key, ec224);
 
 	/* want_err is checked only on a rejection (want_rv == 0); ERR_ANY skips
 	 * it.  A self-signed cert (issuer_cn == NULL) at depth > 0 is a trust
@@ -250,11 +297,12 @@ T_DECLARE_CASE(test_verify_cert_strength_cb)
 	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		X509 *const c = make_cert(
 			cases[i].key, cases[i].md, cases[i].issuer_cn);
+		retain_cleanup(_t_, cleanup_cert, c);
 		T_CHECK(c != NULL);
 		int err = X509_V_OK;
 		const int rv = run_strength_cb(
 			cases[i].preverify_ok, c, cases[i].depth, &err);
-		X509_free(c);
+		release_cleanup(_t_, cleanup_cert, c);
 		if (rv != cases[i].want_rv) {
 			T_LOGF("%s: expected rv %d, got %d", cases[i].desc,
 			       cases[i].want_rv, rv);
@@ -269,10 +317,10 @@ T_DECLARE_CASE(test_verify_cert_strength_cb)
 		}
 	}
 
-	EVP_PKEY_free(rsa2048);
-	EVP_PKEY_free(rsa1024);
-	EVP_PKEY_free(ec256);
-	EVP_PKEY_free(ec224);
+	release_cleanup(_t_, cleanup_key, rsa2048);
+	release_cleanup(_t_, cleanup_key, rsa1024);
+	release_cleanup(_t_, cleanup_key, ec256);
+	release_cleanup(_t_, cleanup_key, ec224);
 }
 
 /* Captures slog output so a case can assert on a diagnostic rather than only
