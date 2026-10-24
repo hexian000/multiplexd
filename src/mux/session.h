@@ -146,6 +146,7 @@ enum session_state {
 /* All fields of mux_session are accessed only from the owning ev_loop thread. */
 struct mux_session {
 	struct ev_loop *loop;
+	struct mux_session_guard *guards;
 	struct mux_session_config conf;
 	/* Internal owner admission hook, after resume lookup and before a fresh
 	 * server hello. NULL leaves admission unrestricted. */
@@ -189,6 +190,8 @@ struct mux_session {
 		ev_timer w_timeout;
 		ev_timer w_keepalive;
 		ev_timer w_send_timeout;
+		/* Lazily initialized when replay-copy allocation fails. */
+		ev_timer w_send_retry;
 		ev_timer w_connect_timeout;
 		ev_timer w_idle_timeout;
 	};
@@ -262,6 +265,33 @@ struct mux_session {
 	} while (0)
 #define MUX_LOG(level, ss, message) MUX_LOG_F(level, ss, "%s", message)
 
+/* Stack-local guards stop a caller after a nested CLOSED event, even if its
+ * handler reconnects. session_close also invalidates their session pointers
+ * before freeing storage, so unwinding never reads the released object. */
+struct mux_session_guard {
+	struct mux_session *session;
+	struct mux_session_guard *previous;
+	bool closed;
+};
+
+static inline void
+session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
+{
+	guard->session = ss;
+	guard->previous = ss->guards;
+	guard->closed = false;
+	ss->guards = guard;
+}
+
+static inline bool session_guard_end(struct mux_session_guard *guard)
+{
+	if (guard->session == NULL) {
+		return false;
+	}
+	guard->session->guards = guard->previous;
+	return !guard->closed;
+}
+
 /* Fire a session event to the owner's callback, if one is registered.
  *
  * The callback may act on the session through a handle it stored earlier
@@ -273,6 +303,12 @@ static inline void session_emit(
 	struct mux_session *ss, const enum mux_event event,
 	const union mux_event_data data)
 {
+	if (event == MUX_EVENT_CLOSED) {
+		for (struct mux_session_guard *guard = ss->guards;
+		     guard != NULL; guard = guard->previous) {
+			guard->closed = true;
+		}
+	}
 	if (ss->callbacks.on_event != NULL) {
 		ss->callbacks.on_event(ss->userdata, ss, event, data);
 	}
@@ -339,12 +375,10 @@ session_dgram_negotiated(const struct mux_session *restrict ss)
  * -> mux_sched_check_no_active_streams -> mux_session_initiate_shutdown ->
  * mux_sched_free_streams, which frees every struct mux_stream -- or orphans one
  * the application still holds, which the library no longer drives --
- * and nulls the scheduler's stream table (the struct mux_session itself
- * survives; the same shutdown also runs mux_wire_discard_buffers, resetting the
- * recvbuf). Within a single synchronous callback that is the only path that
- * frees a stream, so a recv/flush caller that just invoked such a path must
- * re-check this before touching the stream again -- or consuming the recvbuf,
- * which the cascade has reset out from under it. */
+ * and nulls the scheduler's stream table. The shutdown also resets recvbuf,
+ * and lifecycle callbacks can release the session itself. A recv/flush caller
+ * must first end its session guard successfully, then check this before
+ * touching the stream again or consuming the reset receive buffer. */
 static inline bool session_streams_freed(const struct mux_session *restrict ss)
 {
 	return ss->sched.streams == NULL;

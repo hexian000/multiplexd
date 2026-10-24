@@ -21,6 +21,7 @@
 #include "recv.h"
 #include "sched.h"
 #include "session.h"
+#include "shim/util.h"
 #include "stream.h"
 #include "unacked.h"
 #include "wire.h"
@@ -117,9 +118,19 @@ static inline bool send_head_must_flush(const struct mux_session *restrict ss)
 	return !(ss->wire.sendbuf_staging && h == ss->wire.sendbuf.tail);
 }
 
+/* Allocation availability is independent of socket writability.  A one-shot
+ * retry wakes the normal send path without moving the send-timeout deadline. */
+static void send_retry_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct mux_session *const ss = w->data;
+	ASSERT(loop == ss->loop);
+	(void)loop;
+	mux_session_notify(ss);
+}
+
 /* Copy the next unacked frame and queue it at the sendbuf head for resume
- * replay.  Returns false on allocation failure (caller stops and retries on
- * the next wakeup). */
+ * replay.  Returns false on allocation failure; retry after a 10 ms backoff. */
 static bool send_queue_retransmit(
 	struct mux_session *restrict ss, bool *restrict retransmitting)
 {
@@ -141,6 +152,10 @@ static bool send_queue_retransmit(
 		mux_frame_get(&ss->pool, ss->max_payload);
 	if (copy == NULL) {
 		LOGOOM();
+		ev_timer_stop(ss->loop, &ss->w_send_retry);
+		ev_timer_init(&ss->w_send_retry, send_retry_cb, 0.01, 0.0);
+		ss->w_send_retry.data = ss;
+		ev_timer_start(ss->loop, &ss->w_send_retry);
 		return false;
 	}
 	memcpy(copy->data, orig->data + skip, orig->len - skip);
@@ -203,7 +218,7 @@ static enum send_stage send_stage_idle_dgram(struct mux_session *restrict ss)
  * transmit — that is the surrounding send_pump's job. */
 static enum send_stage send_stage_next(
 	struct mux_session *ss, bool *restrict made_progress,
-	bool *restrict retransmitting)
+	bool *restrict retransmitting, bool *restrict stalled_ctrl_flushed)
 {
 	/* 1. Resume replay takes precedence over new traffic. */
 	if (ss->unacked.retransmit_off != SIZE_MAX) {
@@ -220,10 +235,12 @@ static enum send_stage send_stage_next(
 			/* Replay drained (or there was never a ring to replay): fall
 			 * through to OOB/data this round instead of peeking a NULL
 			 * ring in send_queue_retransmit. */
-		} else if (send_queue_retransmit(ss, retransmitting)) {
+		} else if (
+			!ev_is_active(&ss->w_send_retry) &&
+			send_queue_retransmit(ss, retransmitting)) {
 			return SEND_STAGE_PRODUCED;
 		} else {
-			return SEND_STAGE_DONE; /* OOM: retry on the next wakeup */
+			return SEND_STAGE_DONE; /* allocation backoff: wait for the timer */
 		}
 	}
 
@@ -254,14 +271,36 @@ static enum send_stage send_stage_next(
 			" limit=%" PRIuLEAST32 " ready=%d",
 			ss->unacked.frames, ss->session_window,
 			ss->sched.sched_head != NULL);
-		mux_sched_flush_ctrl(ss);
+		/* No receive/coalescing callback can add controls during this
+		 * pump. Keep draining datagrams without rescanning ready streams. */
+		if (!*stalled_ctrl_flushed) {
+			struct mux_session_guard guard;
+			session_guard_begin(ss, &guard);
+			mux_sched_flush_ctrl(ss);
+			if (!session_guard_end(&guard) ||
+			    ss->state != SESSION_ESTABLISHED) {
+				return SEND_STAGE_BLOCKED;
+			}
+			*stalled_ctrl_flushed = true;
+		}
 		return send_stage_idle_dgram(ss);
 	}
 
 	/* 5. Produce one data frame, else drain pending control frames and give
 	 * the idle turn to a datagram. */
-	if (!mux_sched_next_data(ss)) {
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
+	const bool produced = mux_sched_next_data(ss);
+	if (!session_guard_end(&guard) || ss->state != SESSION_ESTABLISHED) {
+		return SEND_STAGE_BLOCKED;
+	}
+	if (!produced) {
+		session_guard_begin(ss, &guard);
 		mux_sched_flush_ctrl(ss);
+		if (!session_guard_end(&guard) ||
+		    ss->state != SESSION_ESTABLISHED) {
+			return SEND_STAGE_BLOCKED;
+		}
 		return send_stage_idle_dgram(ss);
 	}
 	ss->wire.dgram_turn = true;
@@ -274,6 +313,7 @@ static enum send_stage send_stage_next(
 static void send_pump(struct mux_session *ss, bool *restrict made_progress)
 {
 	bool retransmitting = false;
+	bool stalled_ctrl_flushed = false;
 	for (;;) {
 		/* Transmit reference entries and EAGAIN residue before staging
 		 * more; the open staging tail (pos==0) stays to keep packing. */
@@ -287,8 +327,9 @@ static void send_pump(struct mux_session *ss, bool *restrict made_progress)
 			break; /* HANDSHAKE/CLOSING: flush leftover staging below */
 		}
 
-		const enum send_stage st =
-			send_stage_next(ss, made_progress, &retransmitting);
+		const enum send_stage st = send_stage_next(
+			ss, made_progress, &retransmitting,
+			&stalled_ctrl_flushed);
 		if (st == SEND_STAGE_BLOCKED) {
 			return;
 		}
@@ -304,16 +345,27 @@ static void send_pump(struct mux_session *ss, bool *restrict made_progress)
 	}
 }
 
-/* True when there is send-side work outstanding: queued bytes, a resume
+/* True when socket writability can advance send-side work: queued bytes, a resume
  * retransmit not yet fully replayed (including one stalled by a frame-pool
  * OOM before any copy reached wire.sendbuf -- send_queue_retransmit()'s
  * SEND_STAGE_DONE-on-failure path leaves retransmit_off set with sendbuf
- * still empty), or scheduler-side data/control waiting to be staged. */
-static bool send_has_pending_work(const struct mux_session *restrict ss)
+ * still empty), or scheduled payloads not held by the session window.
+ * Pending stream controls were flushed by send_pump even while stalled. */
+static bool send_has_sendable_work(const struct mux_session *restrict ss)
 {
 	return ss->wire.sendbuf.head != NULL || ss->wire.oobbuf.head != NULL ||
-	       ss->wire.dgrambuf.head != NULL || ss->sched.sched_head != NULL ||
+	       ss->wire.dgrambuf.head != NULL ||
+	       (!ss->unacked.stalled && (ss->sched.sched_head != NULL ||
+					 ss->sched.drr_active != NULL)) ||
 	       ss->unacked.retransmit_off != SIZE_MAX;
+}
+
+/* Window-blocked payloads still need the send-timeout watchdog while they
+ * wait for the peer's ACK, even though EV_WRITE cannot advance them. */
+static bool send_has_pending_work(const struct mux_session *restrict ss)
+{
+	return send_has_sendable_work(ss) || ss->sched.sched_head != NULL ||
+	       ss->sched.drr_active != NULL;
 }
 
 static void
@@ -330,7 +382,7 @@ update_send_timeout(struct mux_session *restrict ss, const bool progress)
 	 * acking data we already wrote to the socket", so this timer stays off
 	 * (repeat == 0.0). The exception is a resume retransmit stalled on a
 	 * frame-pool OOM: it never reached the socket, so the kernel has nothing
-	 * to time out on -- raise a real userspace interval to retry that one
+	 * to time out on -- raise a real userspace watchdog interval for that one
 	 * case, then restore repeat == 0.0 (handing the watchdog back to the
 	 * kernel) once the stall clears, so a redundant userspace watchdog does
 	 * not persist for the rest of the connection. */
@@ -386,7 +438,12 @@ static bool send_handle_rx_closed(struct mux_session *ss)
 	if (!ss->accepted) {
 		ss->handshake.has_session_id = false;
 	}
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_CLOSING);
+	if (!session_guard_end(&guard) || ss->state != SESSION_CLOSING) {
+		return true;
+	}
 	ss->wire.tx_pending = true;
 	return true;
 }
@@ -404,11 +461,21 @@ void mux_session_on_send(struct mux_session *ss)
 	if (ss->sched.lp_pending && ss->state == SESSION_ESTABLISHED &&
 	    ss->unacked.retransmit_off == SIZE_MAX) {
 		ss->sched.lp_pending = false;
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		mux_sched_drain_lp(ss);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 	}
 
 	bool made_progress = false;
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
 	send_pump(ss, &made_progress);
+	if (!session_guard_end(&guard)) {
+		return;
+	}
 	if (ss->state == SESSION_SUSPENDED || ss->state == SESSION_CLOSED) {
 		/* flush_sendbuf_head suspended or reset the session mid-pump;
 		 * mux_session_suspend/reset already settled the watchers and cleared
@@ -437,12 +504,18 @@ void mux_session_on_send(struct mux_session *ss)
 			return;
 		}
 	}
-	/* send_has_pending_work also catches a resume retransmit stalled by a
+	/* send_has_sendable_work also catches a resume retransmit stalled by a
 	 * frame-pool OOM on the very first replay copy: send_pump's priority
 	 * ladder returns before ever attempting oobbuf/sched_head in that
 	 * case, so neither residue nor cipher_residue would otherwise notice
 	 * that work is still queued there too. */
-	if (residue || cipher_residue || send_has_pending_work(ss)) {
+	/* Producers may have notified writes while the pump drained their frames.
+	 * Recompute established-session readiness after that drain; blocked stream
+	 * payloads wake again on ACK, controls on their receive/coalescing event. */
+	if (ss->state == SESSION_ESTABLISHED) {
+		ss->wire.tx_pending = false;
+	}
+	if (residue || cipher_residue || send_has_sendable_work(ss)) {
 		ss->wire.tx_pending = true;
 	}
 	ss->wire.send_blocked = residue;
@@ -866,7 +939,12 @@ void mux_session_discard_stream_frames(
  * ESTABLISHED with a clear pipe (sendbuf empty, no TLS poll pending). */
 static void session_flush_inline(struct mux_session *ss)
 {
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
 	mux_session_on_send(ss);
+	if (!session_guard_end(&guard)) {
+		return;
+	}
 	if (ss->state == SESSION_CLOSED) {
 		/* Teardown inside mux_session_on_send (mirrors socket_cb epilogue);
 		 * the reset path already stopped the watchers. */

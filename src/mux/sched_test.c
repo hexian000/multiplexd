@@ -35,6 +35,9 @@ const struct mux_session_config mux_session_config_default = {
 
 /* mock - collaborator spies and reset helper */
 
+static struct mux_stream *g_owned_streams[5];
+static bool g_fail_fixture_expectation;
+static struct mux_session *g_failed_fixture;
 static int g_update_watcher_calls;
 static int g_send_ctrl_calls;
 static uint_fast16_t g_last_ctrl_stream_id;
@@ -200,6 +203,11 @@ void mux_stream_mark_syn_sent(struct mux_stream *s)
 void mux_stream_free(struct mux_stream *s)
 {
 	g_stream_free_calls++;
+	for (size_t i = 0; i < ARRAY_SIZE(g_owned_streams); i++) {
+		if (g_owned_streams[i] == s) {
+			g_owned_streams[i] = NULL;
+		}
+	}
 	free(s);
 }
 
@@ -273,6 +281,49 @@ static void cleanup_session(struct mux_session *restrict ss)
 	}
 }
 
+/* Cleanup runs after longjmp, so cases using this helper keep the session
+ * in static storage. Its table contains borrowed stream pointers and is freed
+ * without dereferencing those case-local objects. */
+static void cleanup_case_session(void *data)
+{
+	cleanup_session(data);
+	sched_test_reset();
+}
+
+T_DECLARE_SUBCASE(make_case_session, struct mux_session *ss)
+{
+	make_session(ss);
+	T_CLEANUP(cleanup_case_session, ss);
+	if (g_fail_fixture_expectation) {
+		g_failed_fixture = ss;
+		T_EXPECT(false);
+	}
+}
+
+static void cleanup_owned_streams(void *data)
+{
+	(void)data;
+	for (size_t i = 0; i < ARRAY_SIZE(g_owned_streams); i++) {
+		free(g_owned_streams[i]);
+		g_owned_streams[i] = NULL;
+	}
+}
+
+struct sched_test_frames {
+	size_t count;
+	struct mux_frame *frames[6 + 9 + 9];
+};
+
+static void cleanup_owned_frames(void *data)
+{
+	struct sched_test_frames *const owned = data;
+	for (size_t i = 0; i < owned->count; i++) {
+		free(owned->frames[i]);
+		owned->frames[i] = NULL;
+	}
+	owned->count = 0;
+}
+
 /* Adds the last-sent frame's payload to whichever accumulator (a, b, c)
  * matches g_last_push_stream_id, and returns the amount added. */
 static size_t sched_test_tally_push(
@@ -313,8 +364,8 @@ static void sched_test_push_frames(
 
 T_DECLARE_CASE(test_sched_alloc_stream_id_nearly_full)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 
 	/* Server session: even IDs.  Occupy all even IDs except 65534. */
 	ss.accepted = true;
@@ -355,8 +406,8 @@ T_DECLARE_CASE(test_sched_alloc_stream_id_nearly_full)
 
 T_DECLARE_CASE(test_sched_alloc_stream_id_starts_at_minimum)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 
 	/* Client (odd IDs): first allocation returns ID 1. */
 	ss.accepted = false;
@@ -369,10 +420,30 @@ T_DECLARE_CASE(test_sched_alloc_stream_id_starts_at_minimum)
 	cleanup_session(&ss);
 }
 
+/* Exercise a real case's setup under the framework's nonlocal failure path,
+ * then run the same case again to check that its next fixture is independent. */
+T_DECLARE_CASE(test_sched_fixture_cleanup_after_failed_expectation)
+{
+	T_DECLARE_CTX(probe);
+	probe.out = _t_->out;
+	T_LOG("the following inner expectation failure is intentional");
+	g_failed_fixture = NULL;
+	g_fail_fixture_expectation = true;
+	T_RUN_CASE(probe, test_sched_alloc_stream_id_starts_at_minimum);
+	g_fail_fixture_expectation = false;
+	const bool released = g_failed_fixture != NULL &&
+			      g_failed_fixture->loop == NULL &&
+			      g_failed_fixture->sched.streams == NULL;
+	T_RUN_CASE(probe, test_sched_alloc_stream_id_starts_at_minimum);
+	T_EXPECT(released);
+	T_EXPECT_EQ(probe.failed, 1);
+	T_EXPECT_EQ(probe.passed, 1);
+}
+
 T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = { .id = 3 };
 
 	sched_test_reset();
@@ -383,6 +454,7 @@ T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
 
 	sched_remove_stream(&ss, &stream);
 	T_EXPECT_EQ(table_size(ss.sched.streams), (size_t)0);
+	mux_sched_check_no_active_streams(&ss);
 	T_EXPECT(ev_is_active(&ss.w_idle_timeout));
 
 	cleanup_session(&ss);
@@ -393,8 +465,8 @@ T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
  * collision through, returning true and silently overwriting the mapping). */
 T_DECLARE_CASE(test_sched_add_stream_rejects_duplicate_id)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream first = { .id = 7 };
 	struct mux_stream second = { .id = 7 };
 
@@ -414,10 +486,13 @@ T_DECLARE_CASE(test_sched_add_stream_rejects_duplicate_id)
 
 T_DECLARE_CASE(test_sched_free_streams_clears_stream_counter)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
+	T_CLEANUP(cleanup_owned_streams, NULL);
 	struct mux_stream *const first = calloc(1, sizeof(*first));
+	g_owned_streams[0] = first;
 	struct mux_stream *const second = calloc(1, sizeof(*second));
+	g_owned_streams[1] = second;
 
 	T_CHECK(first != NULL);
 	T_CHECK(second != NULL);
@@ -448,8 +523,8 @@ T_DECLARE_CASE(test_sched_free_streams_clears_stream_counter)
 
 T_DECLARE_CASE(test_sched_wake_enqueues_only_once)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = {
 		.id = 5,
 		.state = STREAM_ESTABLISHED,
@@ -468,14 +543,16 @@ T_DECLARE_CASE(test_sched_wake_enqueues_only_once)
 	 * happened rather than pinning the count. */
 	T_EXPECT(g_update_watcher_calls >= 1);
 	ss.w_socket.fd = -1;
+	ss.sched.sched_head = NULL;
+	ss.sched.sched_tail = NULL;
 
 	cleanup_session(&ss);
 }
 
 T_DECLARE_CASE(test_sched_dequeue_preserves_fifo_order)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream first = { .id = 1 };
 	struct mux_stream second = { .id = 3 };
 	struct mux_stream third = { .id = 5 };
@@ -494,8 +571,8 @@ T_DECLARE_CASE(test_sched_dequeue_preserves_fifo_order)
 
 T_DECLARE_CASE(test_sched_delay_remove_handles_head_middle_and_tail)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream first = { .id = 1, .delay_pending = true };
 	struct mux_stream second = { .id = 3, .delay_pending = true };
 	struct mux_stream third = { .id = 5, .delay_pending = true };
@@ -523,8 +600,8 @@ T_DECLARE_CASE(test_sched_delay_remove_handles_head_middle_and_tail)
 
 T_DECLARE_CASE(test_sched_send_ctrl_flags_emits_ack_and_fin)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = {
 		.id = 7,
 		.state = STREAM_ESTABLISHED,
@@ -556,8 +633,8 @@ T_DECLARE_CASE(test_sched_send_ctrl_flags_emits_ack_and_fin)
  * same call, since mux_sched_flush_ctrl previously had no test of its own. */
 T_DECLARE_CASE(test_sched_flush_ctrl_includes_drr_active)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream active = {
 		.id = 7,
 		.state = STREAM_ESTABLISHED,
@@ -592,8 +669,8 @@ T_DECLARE_CASE(test_sched_flush_ctrl_includes_drr_active)
  * control frame. */
 T_DECLARE_CASE(test_sched_flush_ctrl_skips_closed_streams)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream closed_active = {
 		.id = 7,
 		.state = STREAM_CLOSED,
@@ -633,8 +710,8 @@ T_DECLARE_CASE(test_sched_flush_ctrl_skips_closed_streams)
 /* CLOSED entries remain inactive independently of tombstone timer ownership. */
 T_DECLARE_CASE(test_sched_check_no_active_streams_subtracts_closed_entries)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = { .id = 3, .state = STREAM_ESTABLISHED };
 
 	sched_test_reset();
@@ -664,8 +741,8 @@ T_DECLARE_CASE(test_sched_check_no_active_streams_subtracts_closed_entries)
  * of trying to send its data. */
 T_DECLARE_CASE(test_sched_next_data_reroutes_closed_stream_to_lp)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream closed = { .id = 3, .state = STREAM_CLOSED };
 
 	sched_test_reset();
@@ -684,8 +761,8 @@ T_DECLARE_CASE(test_sched_next_data_reroutes_closed_stream_to_lp)
 
 T_DECLARE_CASE(test_sched_next_data_sends_frame_and_resets_deficit_on_drain)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = {
 		.id = 9,
 		.state = STREAM_ESTABLISHED,
@@ -712,8 +789,8 @@ T_DECLARE_CASE(test_sched_next_data_sends_frame_and_resets_deficit_on_drain)
  * the queue empties. */
 T_DECLARE_CASE(test_sched_sole_stream_drains_without_requeue)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	sched_test_reset();
 	struct mux_stream stream = {
 		.id = 9,
@@ -768,8 +845,8 @@ static void sched_test_ctrl_oom_pass(
  * leaves. */
 T_DECLARE_CASE(test_sched_send_ctrl_flags_oom_rearms_stream)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream;
 	sched_test_ctrl_oom_pass(&ss, &stream);
 
@@ -793,8 +870,8 @@ T_DECLARE_CASE(test_sched_send_ctrl_flags_oom_rearms_stream)
  * retried ACK|FIN goes out. */
 T_DECLARE_CASE(test_sched_send_ctrl_flags_oom_retries_next_tick)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream;
 	sched_test_ctrl_oom_pass(&ss, &stream);
 
@@ -817,8 +894,8 @@ T_DECLARE_CASE(test_sched_send_ctrl_flags_oom_retries_next_tick)
  * (no RST: nothing reached the peer) rather than closing it gracefully. */
 T_DECLARE_CASE(test_sched_drain_lp_syn_oom_aborts_unopened)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = {
 		.id = 11,
 		.state = STREAM_INIT,
@@ -842,8 +919,8 @@ T_DECLARE_CASE(test_sched_drain_lp_syn_oom_aborts_unopened)
 
 T_DECLARE_CASE(test_sched_drain_lp_sends_syn_for_init_stream)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = {
 		.id = 11,
 		.state = STREAM_INIT,
@@ -867,8 +944,8 @@ T_DECLARE_CASE(test_sched_drain_lp_sends_syn_for_init_stream)
  * passes, and once the head drains the SYNs leave in open order. */
 T_DECLARE_CASE(test_sched_drain_lp_defers_syn_behind_partial_write_in_order)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream s1 = { .id = 1, .state = STREAM_INIT };
 	struct mux_stream s3 = { .id = 3, .state = STREAM_INIT };
 	struct mux_frame inflight = {
@@ -910,8 +987,8 @@ T_DECLARE_CASE(test_sched_drain_lp_defers_syn_behind_partial_write_in_order)
  * new staging tail, so the following SYN still joins the same batch. */
 T_DECLARE_CASE(test_sched_drain_lp_batches_syn_after_by_reference_push)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream s1 = { .id = 1, .state = STREAM_INIT };
 	struct mux_stream s3 = { .id = 3, .state = STREAM_INIT };
 	struct mux_frame blocked = { .len = MUX_FRAME_HEADER_SIZE + 16 };
@@ -944,8 +1021,8 @@ T_DECLARE_CASE(test_sched_drain_lp_batches_syn_after_by_reference_push)
  * its own SYN attempt into the same shortage. */
 T_DECLARE_CASE(test_sched_drain_lp_failed_syn_behind_frozen_tail_stops_batch)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream s1 = { .id = 1,
 				 .state = STREAM_INIT,
 				 .session = &ss };
@@ -975,8 +1052,8 @@ T_DECLARE_CASE(test_sched_drain_lp_failed_syn_behind_frozen_tail_stops_batch)
 
 T_DECLARE_CASE(test_sched_coalesce_forces_session_ack_after_tick_budget)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 
 	sched_test_reset();
 	ss.unacked.unreported = 4;
@@ -991,8 +1068,8 @@ T_DECLARE_CASE(test_sched_coalesce_forces_session_ack_after_tick_budget)
 
 T_DECLARE_CASE(test_stream_id_exhaustion)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	ss.accepted = false;
 	/* Fill all odd IDs. */
 	for (unsigned i = 1; i <= 65535; i += 2) {
@@ -1009,8 +1086,8 @@ T_DECLARE_CASE(test_stream_id_exhaustion)
 
 T_DECLARE_CASE(test_stream_id_wraparound_client)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	ss.accepted = false;
 	/* Fill all odd IDs except 65535. */
 	for (unsigned i = 1; i <= 65533; i += 2) {
@@ -1046,8 +1123,8 @@ T_DECLARE_CASE(test_stream_id_wraparound_client)
 
 T_DECLARE_CASE(test_stream_id_wraparound_server)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	ss.accepted = true;
 	/* Fill all even IDs except 65534. */
 	for (unsigned i = 2; i <= 65532; i += 2) {
@@ -1083,14 +1160,16 @@ T_DECLARE_CASE(test_stream_id_wraparound_server)
 
 T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	ss.accepted = false;
 	ss.conf.max_streams = 4;
 	sched_test_reset();
+	T_CLEANUP(cleanup_owned_streams, NULL);
 
 	for (int i = 0; i < 4; i++) {
 		struct mux_stream *const s = calloc(1, sizeof(*s));
+		g_owned_streams[i] = s;
 		T_CHECK(s != NULL);
 		s->id = (uint_least16_t)(i * 2 + 1);
 		s->state = STREAM_ESTABLISHED;
@@ -1102,6 +1181,7 @@ T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 	/* Live count = 4 - 2 = 2 < max_streams(4), so admission OK. */
 	{
 		struct mux_stream *const s = calloc(1, sizeof(*s));
+		g_owned_streams[4] = s;
 		T_CHECK(s != NULL);
 		s->id = 9;
 		s->state = STREAM_INIT;
@@ -1113,8 +1193,8 @@ T_DECLARE_CASE(test_tombstone_excluded_from_max_streams)
 
 T_DECLARE_CASE(test_stream_id_collision_skip)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	ss.accepted = true;
 	/* Occupy ID 2; allocator must skip to 4. */
 	{
@@ -1132,11 +1212,13 @@ T_DECLARE_CASE(test_stream_id_collision_skip)
 
 T_DECLARE_CASE(test_sched_wake_double_enqueue_idempotent)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	sched_test_reset();
+	T_CLEANUP(cleanup_owned_streams, NULL);
 
 	struct mux_stream *const s = calloc(1, sizeof(*s));
+	g_owned_streams[0] = s;
 	T_CHECK(s != NULL);
 	s->id = 1;
 	s->state = STREAM_ESTABLISHED;
@@ -1155,11 +1237,13 @@ T_DECLARE_CASE(test_sched_wake_double_enqueue_idempotent)
 
 T_DECLARE_CASE(test_lp_queue_double_enqueue_prevented)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	sched_test_reset();
+	T_CLEANUP(cleanup_owned_streams, NULL);
 
 	struct mux_stream *const s = calloc(1, sizeof(*s));
+	g_owned_streams[0] = s;
 	T_CHECK(s != NULL);
 	s->id = 1;
 	s->state = STREAM_INIT;
@@ -1177,8 +1261,8 @@ T_DECLARE_CASE(test_lp_queue_double_enqueue_prevented)
 
 T_DECLARE_CASE(test_sched_next_data_skips_empty_queue_stream)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 
 	/* Stream A: ESTABLISHED but no frame to produce (send_queue empty). */
 	struct mux_stream stream_a = {
@@ -1215,8 +1299,8 @@ T_DECLARE_CASE(test_sched_next_data_skips_empty_queue_stream)
 
 T_DECLARE_CASE(test_sched_next_data_exhausts_queue_returns_false)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 
 	/* Two ESTABLISHED streams, neither can produce a frame. */
 	struct mux_stream stream_a = {
@@ -1248,8 +1332,8 @@ T_DECLARE_CASE(test_sched_next_data_exhausts_queue_returns_false)
  * one-quantum-per-round budget as its still-backlogged peers. */
 T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	sched_test_reset();
 	/* Small quantum so a handful of small frames cross round boundaries. */
 	ss.max_payload = 30;
@@ -1260,16 +1344,18 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 
 	/* A: a tiny opener frame, then a 40-byte backlog -- bigger than one
 	 * quantum. B and C: 90 bytes each, so both stay ready throughout. */
-	struct mux_frame *all_frames[6 + 9 + 9];
-	size_t nframes = 0;
+	static struct sched_test_frames owned;
+	owned = (struct sched_test_frames){ 0 };
+	T_CLEANUP(cleanup_owned_frames, &owned);
+	struct mux_frame **const all_frames = owned.frames;
 	sched_test_push_frames(
-		&stream_a.send_queue, all_frames, &nframes, 1, 2);
+		&stream_a.send_queue, all_frames, &owned.count, 1, 2);
 	sched_test_push_frames(
-		&stream_a.send_queue, all_frames, &nframes, 5, 8);
+		&stream_a.send_queue, all_frames, &owned.count, 5, 8);
 	sched_test_push_frames(
-		&stream_b.send_queue, all_frames, &nframes, 9, 10);
+		&stream_b.send_queue, all_frames, &owned.count, 9, 10);
 	sched_test_push_frames(
-		&stream_c.send_queue, all_frames, &nframes, 9, 10);
+		&stream_c.send_queue, all_frames, &owned.count, 9, 10);
 
 	sched_enqueue(&ss, &stream_a);
 	sched_enqueue(&ss, &stream_b);
@@ -1359,9 +1445,7 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
 	T_EXPECT_EQ(bytes_b, (size_t)90);
 	T_EXPECT_EQ(bytes_c, (size_t)90);
 
-	for (size_t i = 0; i < nframes; i++) {
-		free(all_frames[i]);
-	}
+	cleanup_owned_frames(&owned);
 	cleanup_session(&ss);
 }
 
@@ -1370,8 +1454,8 @@ T_DECLARE_CASE(test_sched_next_data_blocked_stream_does_not_bank_deficit)
  * when there is queued work and the sendbuf is clear. */
 T_DECLARE_CASE(test_sched_schedule_self_guards_on_queue_and_sendbuf)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = { .id = 1, .state = STREAM_INIT };
 	struct mux_frame staged = { 0 };
 
@@ -1406,6 +1490,8 @@ T_DECLARE_CASE(test_sched_schedule_self_guards_on_queue_and_sendbuf)
 
 	ss.w_socket.fd = -1;
 	ss.wire.sendbuf.head = NULL;
+	ss.sched.lp_head = NULL;
+	ss.sched.lp_tail = NULL;
 	cleanup_session(&ss);
 }
 
@@ -1429,8 +1515,8 @@ T_DECLARE_BENCH(bench_sched_enqueue_dequeue)
  * queue rather than the DRR/LP split. */
 T_DECLARE_CASE(test_sched_wake_before_established_uses_single_queue)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	ss.state = SESSION_HANDSHAKE;
 	struct mux_stream stream = { .id = 5, .state = STREAM_ESTABLISHED };
 
@@ -1446,8 +1532,8 @@ T_DECLARE_CASE(test_sched_wake_before_established_uses_single_queue)
  * stream already in the delay list. */
 T_DECLARE_CASE(test_sched_delay_shortens_pending_deadline)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = {
 		.id = 5,
 		.delay_pending = true,
@@ -1467,21 +1553,22 @@ T_DECLARE_CASE(test_sched_delay_shortens_pending_deadline)
 /* mux_sched_find_stream returns NULL when the stream table has not been created. */
 T_DECLARE_CASE(test_sched_find_stream_null_table)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct hashtable *const saved = ss.sched.streams;
 	ss.sched.streams = NULL;
-	T_EXPECT(mux_sched_find_stream(&ss, 1) == NULL);
+	const bool not_found = mux_sched_find_stream(&ss, 1) == NULL;
 	ss.sched.streams = saved;
 	cleanup_session(&ss);
+	T_EXPECT(not_found);
 }
 
 /* sched_send_ctrl_flags clears ack_pending when the grantable amount is
  * sub-unit (grant_inc == 0) and no FIN is pending. */
 T_DECLARE_CASE(test_sched_send_ctrl_flags_subunit_clears_ack)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	sched_test_reset();
 	struct mux_stream stream = {
 		.id = 5,
@@ -1497,12 +1584,12 @@ T_DECLARE_CASE(test_sched_send_ctrl_flags_subunit_clears_ack)
 	cleanup_session(&ss);
 }
 
-/* sched_remove_stream of the last live stream while draining triggers a
- * graceful shutdown; removing an absent stream is a no-op. */
+/* Removal updates the table before the caller releases the stream and checks
+ * for a completed drain; removing an absent stream is a no-op. */
 T_DECLARE_CASE(test_sched_remove_stream_drain_and_absent)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	sched_test_reset();
 
 	struct mux_stream stream = { .id = 5, .state = STREAM_ESTABLISHED };
@@ -1510,6 +1597,8 @@ T_DECLARE_CASE(test_sched_remove_stream_drain_and_absent)
 	ss.draining = true;
 	ss.state = SESSION_ESTABLISHED;
 	sched_remove_stream(&ss, &stream);
+	T_EXPECT_EQ(g_session_initiate_shutdown_calls, 0);
+	mux_sched_check_no_active_streams(&ss);
 	T_EXPECT_EQ(g_session_initiate_shutdown_calls, 1);
 
 	/* Removing a stream that is no longer present is inert. */
@@ -1522,11 +1611,13 @@ T_DECLARE_CASE(test_sched_remove_stream_drain_and_absent)
 /* mux_sched_drain_lp frees a CLOSED stream parked on the low-priority queue. */
 T_DECLARE_CASE(test_sched_drain_lp_frees_closed_stream)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	sched_test_reset();
 
+	T_CLEANUP(cleanup_owned_streams, NULL);
 	struct mux_stream *const s = malloc(sizeof(*s));
+	g_owned_streams[0] = s;
 	T_CHECK(s != NULL);
 	*s = (struct mux_stream){ .id = 7, .state = STREAM_CLOSED };
 	s->sched_queue = SCHED_QUEUE_LP;
@@ -1548,11 +1639,13 @@ T_DECLARE_CASE(test_sched_drain_lp_frees_closed_stream)
  * and wakes it again, and is freed on that pass. */
 T_DECLARE_CASE(test_sched_drain_lp_holds_unreleased_direct_stream)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	sched_test_reset();
 
+	T_CLEANUP(cleanup_owned_streams, NULL);
 	struct mux_stream *const s = malloc(sizeof(*s));
+	g_owned_streams[0] = s;
 	T_CHECK(s != NULL);
 	*s = (struct mux_stream){
 		.id = 7,
@@ -1598,8 +1691,8 @@ T_DECLARE_CASE(test_sched_drain_lp_holds_unreleased_direct_stream)
 /* sched_coalesce_cb decrements a multi-tick delay without expiring it. */
 T_DECLARE_CASE(test_sched_coalesce_cb_decrements_multi_tick)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	struct mux_stream stream = {
 		.id = 5,
 		.delay_pending = true,
@@ -1620,8 +1713,8 @@ T_DECLARE_CASE(test_sched_coalesce_cb_decrements_multi_tick)
  * resume (it cannot be emitted until the session is ESTABLISHED again). */
 T_DECLARE_CASE(test_sched_coalesce_stops_when_suspended_with_ack_backlog)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	ss.state = SESSION_SUSPENDED;
 	ss.unacked.unreported = 4;
 	struct mux_stream stream = { .id = 5, .state = STREAM_ESTABLISHED };
@@ -1645,8 +1738,8 @@ T_DECLARE_CASE(test_sched_coalesce_stops_when_suspended_with_ack_backlog)
  * even with an empty delay list: it is what emits the deferred ACK. */
 T_DECLARE_CASE(test_sched_coalesce_keeps_running_for_established_backlog)
 {
-	struct mux_session ss;
-	make_session(&ss);
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
 	ss.unacked.unreported = 1;
 
 	sched_test_reset();
@@ -1662,6 +1755,7 @@ T_DECLARE_CASE(test_sched_coalesce_keeps_running_for_established_backlog)
 static const struct testing_suite suite[] = {
 	T_CASE(test_sched_alloc_stream_id_nearly_full),
 	T_CASE(test_sched_alloc_stream_id_starts_at_minimum),
+	T_CASE(test_sched_fixture_cleanup_after_failed_expectation),
 	T_CASE(test_sched_add_remove_updates_table_and_idle_timeout),
 	T_CASE(test_sched_add_stream_rejects_duplicate_id),
 	T_CASE(test_sched_free_streams_clears_stream_counter),

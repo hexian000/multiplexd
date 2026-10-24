@@ -208,6 +208,64 @@ T_DECLARE_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight)
 	T_EXPECT(ss.estimator.ping_in_flight);
 }
 
+T_DECLARE_CASE(test_estimator_samples_saturate_while_ping_in_flight)
+{
+	struct mux_session ss = make_session();
+	const int_fast64_t now = INT64_C(1000000000);
+
+	estimator_test_reset();
+	set_clock_sequence(&now, 1);
+	ss.estimator.ping_in_flight = true;
+	ss.estimator.rx.sample = SIZE_MAX - 9;
+	ss.estimator.tx.sample = SIZE_MAX - 9;
+
+	mux_estimator_add(&ss, 8);
+	mux_estimator_add_acked(&ss, 8);
+	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)(SIZE_MAX - 1));
+	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)(SIZE_MAX - 1));
+	mux_estimator_add(&ss, 1);
+	mux_estimator_add_acked(&ss, 1);
+	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)SIZE_MAX);
+	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)SIZE_MAX);
+	mux_estimator_add(&ss, 20);
+	mux_estimator_add_acked(&ss, 20);
+	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)SIZE_MAX);
+	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)SIZE_MAX);
+	mux_estimator_add(&ss, UINT_FAST64_MAX);
+	mux_estimator_add_acked(&ss, UINT_FAST64_MAX);
+	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)SIZE_MAX);
+	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)SIZE_MAX);
+	T_EXPECT_EQ(g_send_oob_calls, 0);
+	T_EXPECT(ss.estimator.ping_in_flight);
+}
+
+T_DECLARE_CASE(test_estimator_initial_samples_saturate)
+{
+	struct mux_session ss = make_session();
+	const int_fast64_t now = INT64_C(1000000000);
+#if SIZE_MAX < UINT_FAST64_MAX
+	const uint_fast64_t bytes = (uint_fast64_t)SIZE_MAX + 1;
+#else
+	const uint_fast64_t bytes = UINT_FAST64_MAX;
+#endif
+
+	estimator_test_reset();
+	set_clock_sequence(&now, 1);
+	mux_estimator_add(&ss, bytes);
+	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)SIZE_MAX);
+	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)0);
+	T_EXPECT_EQ(g_send_oob_calls, 1);
+	T_EXPECT(ss.estimator.ping_in_flight);
+
+	mux_estimator_suspend(&ss);
+	ss.estimator.last_probe_ns = 0;
+	mux_estimator_add_acked(&ss, bytes);
+	T_EXPECT_EQ(ss.estimator.tx.sample, (size_t)SIZE_MAX);
+	T_EXPECT_EQ(ss.estimator.rx.sample, (size_t)0);
+	T_EXPECT_EQ(g_send_oob_calls, 2);
+	T_EXPECT(ss.estimator.ping_in_flight);
+}
+
 /* A PONG is not guaranteed on a healthy transport: spec §5.3.2 lets a
  * conforming peer rate-limit inbound PINGs and discard the excess, and
  * mux_session_recv_ping drops one on frame-pool OOM. An unanswered probe must
@@ -1025,6 +1083,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_estimator_init_resets_all_state),
 	T_CASE(test_estimator_suspend_clears_probe_preserves_learned),
 	T_CASE(test_estimator_add_accumulates_sample_while_ping_in_flight),
+	T_CASE(test_estimator_samples_saturate_while_ping_in_flight),
+	T_CASE(test_estimator_initial_samples_saturate),
 	T_CASE(test_estimator_abandons_unanswered_probe),
 	T_CASE(test_estimator_add_starts_cycle_after_rate_limit),
 	T_CASE(test_estimator_add_track_enforces_rate_limit),

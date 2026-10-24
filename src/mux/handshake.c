@@ -583,12 +583,22 @@ bool mux_handshake_process_hello(
 	 * hello, so an identity a confirmed resume inherits from an earlier
 	 * transport is re-proved against the credentials presented on this
 	 * one. */
-	if (ss->callbacks.on_verify_identity != NULL &&
-	    !ss->callbacks.on_verify_identity(
-		    ss->userdata, ss, ss->handshake.peer_identity)) {
-		MUX_LOG(ERROR, ss, "peer identity rejected");
-		mux_session_reset(ss);
-		return false;
+	if (ss->callbacks.on_verify_identity != NULL) {
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
+		const bool accepted = ss->callbacks.on_verify_identity(
+			ss->userdata, ss, ss->handshake.peer_identity);
+		if (!session_guard_end(&guard)) {
+			return false;
+		}
+		if (ss->state != SESSION_HANDSHAKE) {
+			return false;
+		}
+		if (!accepted) {
+			MUX_LOG(ERROR, ss, "peer identity rejected");
+			mux_session_reset(ss);
+			return false;
+		}
 	}
 	bytebuf_consume(ss->wire.recvbuf, frame_size);
 
@@ -597,7 +607,12 @@ bool mux_handshake_process_hello(
 	if (!ok) {
 		return false;
 	}
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
 	mux_session_handshake_done(ss);
+	if (!session_guard_end(&guard)) {
+		return false;
+	}
 	if (ss->state != SESSION_ESTABLISHED) {
 		return false;
 	}

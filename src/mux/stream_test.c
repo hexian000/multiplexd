@@ -27,7 +27,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 /* mock - collaborator mocks, frame pool, session/stream fixtures */
@@ -222,6 +221,8 @@ void mux_wire_discard_buffers(struct mux_session *restrict ss)
 struct frame_pool_ctx {
 	uint_least32_t alloc_calls;
 	uint_least32_t free_calls;
+	uint_least32_t failed_calls;
+	bool fail_alloc;
 };
 
 struct stream_fixture {
@@ -234,6 +235,10 @@ struct stream_fixture {
 static struct mux_frame *stream_test_alloc(void *data, const size_t size)
 {
 	struct frame_pool_ctx *const ctx = data;
+	if (ctx->fail_alloc) {
+		ctx->failed_calls++;
+		return NULL;
+	}
 	struct mux_frame *const frame = malloc(size);
 	if (frame != NULL) {
 		ctx->alloc_calls++;
@@ -1246,6 +1251,43 @@ T_DECLARE_CASE(test_stream_mark_fin_sent_closes_user_closed_direct_stream)
 	T_EXPECT_EQ(closed_state, (enum stream_state)STREAM_CLOSED);
 }
 
+/* Local FIN after a consumed peer EOF must re-notify the reader, while the
+ * stream remains application-owned until that reader observes terminal EOF. */
+T_DECLARE_CASE(test_stream_mark_fin_sent_notifies_owned_direct_reader)
+{
+	struct stream_fixture fx;
+	if (setup_fixture(&fx) != 0) {
+		T_FATAL("setup_fixture failed");
+		return;
+	}
+	struct mux_stream *const s = make_stream(&fx, 1);
+	T_CHECK(s != NULL);
+	mux_stream_io w;
+	mux_stream_io_init(&w, stream_test_notify_cb, s, EV_READ | EV_WRITE);
+	w.loop = fx.loop;
+	s->is_direct = true;
+	s->direct.w_io = &w;
+	stream_set_state(s, STREAM_CLOSE_WAIT);
+	mux_stream_mark_fin_sent(s);
+	const int events = ev_clear_pending(fx.loop, &w);
+	const bool retained =
+		s->state == STREAM_CLOSING && !s->user_closed && w.stream == s;
+	mux_stream_mark_fin_sent(s);
+	const int duplicate_events = ev_clear_pending(fx.loop, &w);
+	/* Read notifications respect the watcher's registered interest. */
+	w.events = EV_WRITE;
+	stream_set_state(s, STREAM_CLOSE_WAIT);
+	mux_stream_mark_fin_sent(s);
+	const int uninterested_events = ev_clear_pending(fx.loop, &w);
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+
+	T_EXPECT_EQ(events, EV_READ);
+	T_EXPECT(retained);
+	T_EXPECT_EQ(duplicate_events, 0);
+	T_EXPECT_EQ(uninterested_events, 0);
+}
+
 /* The mirror image on the receive side: the peer's FIN arriving after the app
  * closed a direct-mode stream must complete the close, without touching the
  * socket half of the I/O union (there is no local socket in this mode). */
@@ -2060,20 +2102,40 @@ T_DECLARE_CASE(test_stream_pressure_scale_branches)
 
 	/* pressure enabled but nothing buffered -> scale 1.0 */
 	fx.ss.recv_buffered_bytes = 0;
-	const bool b1 = (mux_stream_grant_inc(s) > 0);
+	const uint_fast32_t empty = mux_stream_grant_inc(s);
 	/* buffered below the low watermark -> scale 1.0 */
 	fx.ss.recv_buffered_bytes = (size_t)MUX_MAX_FRAME_SIZE;
-	const bool b2 = (mux_stream_grant_inc(s) > 0);
-	/* buffered in the linear-decay band -> 0 < scale < 1.0 */
+	const uint_fast32_t below_low = mux_stream_grant_inc(s);
+	fx.ss.recv_buffered_bytes = 2 * (size_t)MUX_MAX_FRAME_SIZE;
+	const uint_fast32_t at_low = mux_stream_grant_inc(s);
+	/* Linear decay scales eight units to 6.25, 4.5 and 2.75 units;
+	 * wire grants truncate to whole units. */
+	fx.ss.recv_buffered_bytes = 5 * (size_t)MUX_MAX_FRAME_SIZE / 2;
+	const uint_fast32_t quarter = mux_stream_grant_inc(s);
 	fx.ss.recv_buffered_bytes = 3 * (size_t)MUX_MAX_FRAME_SIZE;
-	const bool b3 = (mux_stream_grant_inc(s) > 0);
+	const uint_fast32_t midpoint = mux_stream_grant_inc(s);
+	fx.ss.recv_buffered_bytes = 7 * (size_t)MUX_MAX_FRAME_SIZE / 2;
+	const uint_fast32_t three_quarters = mux_stream_grant_inc(s);
+	fx.ss.recv_buffered_bytes = 4 * (size_t)MUX_MAX_FRAME_SIZE;
+	const uint_fast32_t at_high = mux_stream_grant_inc(s);
+	fx.ss.recv_buffered_bytes = 5 * (size_t)MUX_MAX_FRAME_SIZE;
+	const uint_fast32_t above_high = mux_stream_grant_inc(s);
+	/* Scaling a one-unit window below one unit must retain the safety floor. */
+	s->recv_window = MUX_WINDOW_UNIT;
+	const uint_fast32_t safety_floor = mux_stream_grant_inc(s);
 
 	mux_stream_free(s);
 	teardown_fixture(&fx);
 
-	T_EXPECT(b1);
-	T_EXPECT(b2);
-	T_EXPECT(b3);
+	T_EXPECT_EQ(empty, (uint_fast32_t)8);
+	T_EXPECT_EQ(below_low, (uint_fast32_t)8);
+	T_EXPECT_EQ(at_low, (uint_fast32_t)8);
+	T_EXPECT_EQ(quarter, (uint_fast32_t)6);
+	T_EXPECT_EQ(midpoint, (uint_fast32_t)4);
+	T_EXPECT_EQ(three_quarters, (uint_fast32_t)2);
+	T_EXPECT_EQ(at_high, (uint_fast32_t)1);
+	T_EXPECT_EQ(above_high, (uint_fast32_t)1);
+	T_EXPECT_EQ(safety_floor, (uint_fast32_t)1);
 }
 
 /* mux_stream_recv_copy: discards data in CLOSED state, and aborts on a receive
@@ -2698,6 +2760,153 @@ T_DECLARE_CASE(test_local_cb_ev_read_queues_frame_clamped_to_credit)
 	T_EXPECT_EQ(credit_after, (uint_fast32_t)0);
 }
 
+static void read_retry_fixture_cleanup(void *data)
+{
+	teardown_fixture(data);
+	free(data);
+}
+
+T_DECLARE_SUBCASE(local_read_allocation_retry, const enum stream_state state)
+{
+	struct stream_fixture *const fx = malloc(sizeof(*fx));
+	T_EXPECT(fx != NULL);
+	if (setup_fixture(fx) != 0) {
+		free(fx);
+		T_FATAL("setup_fixture failed");
+	}
+	T_CLEANUP(read_retry_fixture_cleanup, fx);
+	struct mux_stream *const s = make_stream(fx, 1);
+	T_EXPECT(s != NULL);
+	if (!mux_sched_add_stream(&fx->ss, s)) {
+		mux_stream_free(s);
+		T_FATAL("mux_sched_add_stream failed");
+	}
+	s->state = state;
+	s->send_window = 1;
+	T_EXPECT_EQ(fcntl(fx->fds[1], F_SETFL, O_NONBLOCK), 0);
+	mux_stream_do_attach_fd(s, fx->fds[1]);
+	fx->fds[1] = -1;
+	T_EXPECT_EQ(write(fx->fds[0], "x", 1), (ssize_t)1);
+	fx->pool_ctx.fail_alloc = true;
+	ev_invoke(fx->loop, &s->socket.w_io, EV_READ);
+	/* This is the original defect: the unread byte must no longer drive
+	 * a level-triggered read watcher after the allocator failed. */
+	T_EXPECT(!ev_is_active(&s->socket.w_io));
+	T_EXPECT(ev_is_active(&s->socket.w_read_retry));
+	T_EXPECT(ev_timer_remaining(fx->loop, &s->socket.w_read_retry) > 0.0);
+	T_EXPECT(
+		ev_timer_remaining(fx->loop, &s->socket.w_read_retry) <= 0.011);
+	T_EXPECT_EQ(fx->pool_ctx.failed_calls, (uint_least32_t)1);
+	char peek = 0;
+	T_EXPECT_EQ(
+		recv(s->socket.w_io.fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT),
+		(ssize_t)1);
+	T_EXPECT_EQ(peek, 'x');
+	T_EXPECT_EQ(s->queued_send_bytes, (uint_least32_t)0);
+	/* Keep the backoff from expiring while deliberately pumping the loop
+	 * and stale readiness callbacks, without relying on execution speed. */
+	ev_timer_stop(fx->loop, &s->socket.w_read_retry);
+	ev_timer_set(&s->socket.w_read_retry, 60.0, 0.0);
+	ev_timer_start(fx->loop, &s->socket.w_read_retry);
+	for (int i = 0; i < 1000; i++) {
+		ev_invoke(fx->loop, &s->socket.w_io, EV_READ);
+		(void)ev_run(fx->loop, EVRUN_NOWAIT);
+	}
+	T_EXPECT_EQ(fx->pool_ctx.failed_calls, (uint_least32_t)1);
+	/* A peer window update must not bypass the allocation gate. */
+	mux_stream_recv_window(s, 1);
+	T_EXPECT(!ev_is_active(&s->socket.w_io));
+	/* Simulate expiry, then fail once more: each failed retry must arm a
+	 * fresh backoff even when there is no session-level send work. */
+	ev_timer_stop(fx->loop, &s->socket.w_read_retry);
+	ev_invoke(fx->loop, &s->socket.w_read_retry, EV_TIMER);
+	T_EXPECT(ev_is_active(&s->socket.w_io));
+	ev_invoke(fx->loop, &s->socket.w_io, EV_READ);
+	T_EXPECT_EQ(fx->pool_ctx.failed_calls, (uint_least32_t)2);
+	T_EXPECT(ev_is_active(&s->socket.w_read_retry));
+	T_EXPECT(!ev_is_active(&s->socket.w_io));
+	fx->pool_ctx.fail_alloc = false;
+	/* One byte of credit makes successful recovery stop at the queued
+	 * payload, rather than allocating again to probe the now-empty socket. */
+	s->send_window = 1;
+	ev_timer_stop(fx->loop, &s->socket.w_read_retry);
+	ev_invoke(fx->loop, &s->socket.w_read_retry, EV_TIMER);
+	ev_invoke(fx->loop, &s->socket.w_io, EV_READ);
+	T_EXPECT_EQ(s->queued_send_bytes, (uint_least32_t)1);
+	T_EXPECT_EQ(s->send_queue.count, (size_t)1);
+	T_EXPECT_EQ(
+		s->send_queue.head->data[MUX_FRAME_HEADER_SIZE],
+		(unsigned char)'x');
+	T_EXPECT(!ev_is_active(&s->socket.w_read_retry));
+	T_EXPECT(!ev_is_active(&s->socket.w_io));
+}
+
+T_DECLARE_CASE(test_local_cb_allocation_failure_backs_off_and_recovers)
+{
+	T_CALL_SUBCASE(local_read_allocation_retry, STREAM_INIT);
+	T_CALL_SUBCASE(local_read_allocation_retry, STREAM_ESTABLISHED);
+	T_CALL_SUBCASE(local_read_allocation_retry, STREAM_CLOSE_WAIT);
+}
+
+T_DECLARE_CASE(test_local_read_retry_preserves_writes_and_cancels_on_close)
+{
+	struct stream_fixture *const fx = malloc(sizeof(*fx));
+	T_EXPECT(fx != NULL);
+	if (setup_fixture(fx) != 0) {
+		free(fx);
+		T_FATAL("setup_fixture failed");
+	}
+	T_CLEANUP(read_retry_fixture_cleanup, fx);
+	struct mux_stream *const s = make_stream(fx, 1);
+	T_EXPECT(s != NULL);
+	if (!mux_sched_add_stream(&fx->ss, s)) {
+		mux_stream_free(s);
+		T_FATAL("mux_sched_add_stream failed");
+	}
+	T_EXPECT_EQ(fcntl(fx->fds[1], F_SETFL, O_NONBLOCK), 0);
+	mux_stream_do_attach_fd(s, fx->fds[1]);
+	fx->fds[1] = -1;
+	fx->pool_ctx.fail_alloc = true;
+	ev_invoke(fx->loop, &s->socket.w_io, EV_READ);
+	T_EXPECT(ev_is_active(&s->socket.w_read_retry));
+	/* Pending peer data still drains to the local application while its
+	 * own reads are held. Populate the same accounting as recv_copy. */
+	*bytebuf_write_ptr(s->recvbuf) = 'y';
+	bytebuf_produce(s->recvbuf, 1);
+	s->buffered_bytes = 1;
+	fx->ss.recv_buffered_bytes = 1;
+	mux_stream_notify_recv(s);
+	T_EXPECT(ev_is_active(&s->socket.w_io));
+	T_EXPECT_EQ(s->socket.w_io.events & (EV_READ | EV_WRITE), EV_WRITE);
+	ev_invoke(fx->loop, &s->socket.w_io, EV_WRITE);
+	char got = 0;
+	T_EXPECT_EQ(recv(fx->fds[0], &got, 1, MSG_DONTWAIT), (ssize_t)1);
+	T_EXPECT_EQ(got, 'y');
+	T_EXPECT_EQ(fx->ss.recv_buffered_bytes, (size_t)0);
+	T_EXPECT(!ev_is_active(&s->socket.w_io));
+	/* Expiry observes current flow control rather than restoring stale
+	 * read interest. EOF likewise prevents rearming. */
+	s->send_window = 0;
+	ev_timer_stop(fx->loop, &s->socket.w_read_retry);
+	ev_invoke(fx->loop, &s->socket.w_read_retry, EV_TIMER);
+	T_EXPECT(!ev_is_active(&s->socket.w_io));
+	s->rx_eof = true;
+	s->send_window = 1;
+	ev_invoke(fx->loop, &s->socket.w_read_retry, EV_TIMER);
+	T_EXPECT(!ev_is_active(&s->socket.w_io));
+	s->rx_eof = false;
+	ev_invoke(fx->loop, &s->socket.w_io, EV_READ);
+	T_EXPECT(ev_is_active(&s->socket.w_read_retry));
+	/* Teardown must also clear a queued timer callback, so it cannot use
+	 * the stream after the socket or stream allocation is released. */
+	ev_feed_event(fx->loop, &s->socket.w_read_retry, EV_TIMER);
+	mux_stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
+	T_EXPECT_EQ(s->state, STREAM_CLOSED);
+	T_EXPECT(!ev_is_active(&s->socket.w_read_retry));
+	T_EXPECT(!ev_is_pending(&s->socket.w_read_retry));
+	(void)ev_run(fx->loop, EVRUN_NOWAIT);
+}
+
 /* stream_on_recv's EOF branch: a zero-length read (peer closed the socket)
  * sets rx_eof and queues no frame. */
 T_DECLARE_CASE(test_local_cb_ev_read_marks_rx_eof_on_peer_close)
@@ -3220,6 +3429,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_stream_close_with_unread_data_sends_rst),
 	T_CASE(test_stream_close_after_peer_rst_sends_no_rst),
 	T_CASE(test_stream_mark_fin_sent_closes_user_closed_direct_stream),
+	T_CASE(test_stream_mark_fin_sent_notifies_owned_direct_reader),
 	T_CASE(test_stream_recv_fin_closes_user_closed_direct_stream),
 	T_CASE(test_stream_recv_fin_user_closed_direct_rsts_buffered_data),
 	T_CASE(test_stream_mark_fin_sent_user_closed_direct_rsts_buffered_data),
@@ -3259,6 +3469,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_stream_abort_survives_reentrant_close_freeing_stream),
 	T_CASE(test_stream_abort_leaves_watcher_released_by_callback),
 	T_CASE(test_local_cb_ev_read_queues_frame_clamped_to_credit),
+	T_CASE(test_local_cb_allocation_failure_backs_off_and_recovers),
+	T_CASE(test_local_read_retry_preserves_writes_and_cancels_on_close),
 	T_CASE(test_local_cb_ev_read_marks_rx_eof_on_peer_close),
 	T_CASE(test_local_cb_ev_read_pauses_on_zero_credit),
 	T_CASE(test_local_cb_ev_read_init_queues_one_fast_open_frame),

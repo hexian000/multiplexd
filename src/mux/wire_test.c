@@ -113,10 +113,14 @@ make_push_frame(struct mux_frame *restrict frame, const size_t payload_len)
 	memset(frame->data + MUX_FRAME_HEADER_SIZE, 0, payload_len);
 }
 
+/* Resource-owning cases record verdicts first, release their resources,
+ * then use fatal expectations. Each operation still runs after a prior mismatch. */
+
 /* regression - targeted cases for one wire behavior each */
 
 T_DECLARE_CASE(test_wire_send_plain_tcp_writes_bytes)
 {
+	bool correct = true;
 	int fds[2];
 	struct frame_pool_ctx pool_ctx = { 0 };
 	unsigned char payload[] = "hello";
@@ -126,15 +130,18 @@ T_DECLARE_CASE(test_wire_send_plain_tcp_writes_bytes)
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 	struct mux_session ss = make_session(&pool_ctx, fds[0]);
 
-	T_EXPECT(mux_wire_send(&ss, payload, &len));
-	T_EXPECT_EQ(len, sizeof(payload) - 1);
-	T_EXPECT(
-		read(fds[1], recvbuf, sizeof(payload) - 1) ==
-		(ssize_t)(sizeof(payload) - 1));
-	T_EXPECT(memcmp(recvbuf, payload, sizeof(payload) - 1) == 0);
+	correct = (mux_wire_send(&ss, payload, &len)) && correct;
+	correct = (len == sizeof(payload) - 1) && correct;
+	correct = (recv(fds[1], recvbuf, sizeof(payload) - 1, MSG_DONTWAIT) ==
+		   (ssize_t)(sizeof(payload) - 1)) &&
+		  correct;
+	correct =
+		(memcmp(recvbuf, payload, sizeof(payload) - 1) == 0) && correct;
 
 	(void)close(fds[0]);
 	(void)close(fds[1]);
+
+	T_EXPECT(correct);
 }
 
 /* mux_wire_send's plain-TCP EAGAIN branch: on a nonblocking socket with a tiny send
@@ -204,6 +211,7 @@ T_DECLARE_CASE(test_wire_send_plain_tcp_hard_error_returns_false)
 
 T_DECLARE_CASE(test_wire_recv_plain_tcp_reads_payload)
 {
+	bool correct = true;
 	int fds[2];
 	struct frame_pool_ctx pool_ctx = { 0 };
 	unsigned char sendbuf[] = "mux";
@@ -215,16 +223,20 @@ T_DECLARE_CASE(test_wire_recv_plain_tcp_reads_payload)
 	T_CHECK(write(fds[1], sendbuf, sizeof(sendbuf) - 1) ==
 		(ssize_t)(sizeof(sendbuf) - 1));
 
-	T_EXPECT(mux_wire_recv(&ss, recvbuf, &len));
-	T_EXPECT_EQ(len, sizeof(sendbuf) - 1);
-	T_EXPECT(memcmp(recvbuf, sendbuf, sizeof(sendbuf) - 1) == 0);
+	correct = (mux_wire_recv(&ss, recvbuf, &len)) && correct;
+	correct = (len == sizeof(sendbuf) - 1) && correct;
+	correct =
+		(memcmp(recvbuf, sendbuf, sizeof(sendbuf) - 1) == 0) && correct;
 
 	(void)close(fds[0]);
 	(void)close(fds[1]);
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_wire_recv_eof_clears_rx_open_and_sets_tx_pending)
 {
+	bool correct = true;
 	int fds[2];
 	struct frame_pool_ctx pool_ctx = { 0 };
 	unsigned char recvbuf[8] = { 0 };
@@ -235,17 +247,20 @@ T_DECLARE_CASE(test_wire_recv_eof_clears_rx_open_and_sets_tx_pending)
 	ss.wire.rx_open = true;
 	T_CHECK(shutdown(fds[1], SHUT_WR) == 0);
 
-	T_EXPECT(mux_wire_recv(&ss, recvbuf, &len));
-	T_EXPECT_EQ(len, (size_t)0);
-	T_EXPECT(!ss.wire.rx_open);
-	T_EXPECT(ss.wire.tx_pending);
+	correct = (mux_wire_recv(&ss, recvbuf, &len)) && correct;
+	correct = (len == (size_t)0) && correct;
+	correct = (!ss.wire.rx_open) && correct;
+	correct = (ss.wire.tx_pending) && correct;
 
 	(void)close(fds[0]);
 	(void)close(fds[1]);
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_wire_discard_buffers_frees_all_pending_frames)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -271,18 +286,26 @@ T_DECLARE_CASE(test_wire_discard_buffers_frees_all_pending_frames)
 	mux_frame_list_push(&ss.wire.oobbuf, ob2);
 
 	mux_wire_discard_buffers(&ss);
-	T_EXPECT_EQ(pool_ctx.free_calls, 4);
-	T_EXPECT(ss.wire.sendbuf.head == NULL);
-	T_EXPECT(ss.wire.sendbuf.tail == NULL);
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)0);
-	T_EXPECT(ss.wire.oobbuf.head == NULL);
-	T_EXPECT(ss.wire.oobbuf.tail == NULL);
-	T_EXPECT_EQ(ss.wire.oobbuf.count, (size_t)0);
-	T_EXPECT(ss.wire.recvbuf != NULL);
-	T_EXPECT_EQ(ss.wire.recvbuf->cap, (size_t)32);
-	T_EXPECT_EQ(ss.wire.recvbuf->len, (size_t)0);
-	T_EXPECT_EQ(ss.wire.recvbuf->off, (size_t)0);
+	correct = (pool_ctx.free_calls == 4) && correct;
+	correct = (ss.wire.sendbuf.head == NULL) && correct;
+	correct = (ss.wire.sendbuf.tail == NULL) && correct;
+	correct = (ss.wire.sendbuf.count == (size_t)0) && correct;
+	correct = (ss.wire.oobbuf.head == NULL) && correct;
+	correct = (ss.wire.oobbuf.tail == NULL) && correct;
+	correct = (ss.wire.oobbuf.count == (size_t)0) && correct;
+	correct = (ss.wire.recvbuf != NULL) && correct;
+	correct = (ss.wire.recvbuf != NULL &&
+		   (ss.wire.recvbuf->cap) == ((size_t)32)) &&
+		  correct;
+	correct = (ss.wire.recvbuf != NULL &&
+		   (ss.wire.recvbuf->len) == ((size_t)0)) &&
+		  correct;
+	correct = (ss.wire.recvbuf != NULL &&
+		   (ss.wire.recvbuf->off) == ((size_t)0)) &&
+		  correct;
 	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(correct);
 }
 
 /* mux_wire_has_pending had zero test references. Its body is
@@ -327,6 +350,7 @@ T_DECLARE_CASE(test_wire_flush_done_without_memory_transport_tls)
 
 T_DECLARE_CASE(test_wire_shutdown_plain_tcp_returns_done)
 {
+	bool correct = true;
 	int fds[2];
 	struct frame_pool_ctx pool_ctx = { 0 };
 	unsigned char recvbuf[1] = { 0 };
@@ -334,17 +358,21 @@ T_DECLARE_CASE(test_wire_shutdown_plain_tcp_returns_done)
 	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 	struct mux_session ss = make_session(&pool_ctx, fds[0]);
 
-	T_EXPECT_EQ(
-		mux_wire_shutdown(&ss),
-		(enum wire_shutdown_state)WIRE_SHUTDOWN_DONE);
-	T_EXPECT(read(fds[1], recvbuf, sizeof(recvbuf)) == 0);
+	correct = (mux_wire_shutdown(&ss) ==
+		   (enum wire_shutdown_state)WIRE_SHUTDOWN_DONE) &&
+		  correct;
+	correct = (recv(fds[1], recvbuf, sizeof(recvbuf), MSG_DONTWAIT) == 0) &&
+		  correct;
 
 	(void)close(fds[0]);
 	(void)close(fds[1]);
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_wire_wait_eof_confirmed_on_clean_peer_close)
 {
+	bool correct = true;
 	int fds[2];
 	struct frame_pool_ctx pool_ctx = { 0 };
 
@@ -352,10 +380,12 @@ T_DECLARE_CASE(test_wire_wait_eof_confirmed_on_clean_peer_close)
 	struct mux_session ss = make_session(&pool_ctx, fds[0]);
 	T_CHECK(shutdown(fds[1], SHUT_WR) == 0);
 
-	T_EXPECT_EQ(mux_wire_wait_eof(&ss), WIRE_EOF_CONFIRMED);
+	correct = (mux_wire_wait_eof(&ss) == WIRE_EOF_CONFIRMED) && correct;
 
 	(void)close(fds[0]);
 	(void)close(fds[1]);
+
+	T_EXPECT(correct);
 }
 
 /* A spurious wakeup with nothing pending yet (EAGAIN, no
@@ -363,6 +393,7 @@ T_DECLARE_CASE(test_wire_wait_eof_confirmed_on_clean_peer_close)
  * from a confirmed close -- previously both were the same boolean true. */
 T_DECLARE_CASE(test_wire_wait_eof_pending_on_eagain)
 {
+	bool correct = true;
 	int fds[2];
 	struct frame_pool_ctx pool_ctx = { 0 };
 
@@ -372,16 +403,19 @@ T_DECLARE_CASE(test_wire_wait_eof_pending_on_eagain)
 	/* Peer's socket left open and silent: fds[0] has nothing to read and no
 	 * FIN, so socket_recv reports EAGAIN rather than EOF. */
 
-	T_EXPECT_EQ(mux_wire_wait_eof(&ss), WIRE_EOF_PENDING);
+	correct = (mux_wire_wait_eof(&ss) == WIRE_EOF_PENDING) && correct;
 
 	(void)close(fds[0]);
 	(void)close(fds[1]);
+
+	T_EXPECT(correct);
 }
 
 /* Unexpected application data after the local shutdown must be reported as a
  * hard error, not confused with either a confirmed close or a pending one. */
 T_DECLARE_CASE(test_wire_wait_eof_error_on_unexpected_data)
 {
+	bool correct = true;
 	int fds[2];
 	struct frame_pool_ctx pool_ctx = { 0 };
 	unsigned char stray[] = "oops";
@@ -392,10 +426,12 @@ T_DECLARE_CASE(test_wire_wait_eof_error_on_unexpected_data)
 	T_CHECK(write(fds[1], stray, sizeof(stray) - 1) ==
 		(ssize_t)(sizeof(stray) - 1));
 
-	T_EXPECT_EQ(mux_wire_wait_eof(&ss), WIRE_EOF_ERROR);
+	correct = (mux_wire_wait_eof(&ss) == WIRE_EOF_ERROR) && correct;
 
 	(void)close(fds[0]);
 	(void)close(fds[1]);
+
+	T_EXPECT(correct);
 }
 
 #if WITH_TLS
@@ -1929,6 +1965,7 @@ T_DECLARE_CASE(test_wire_tls_offload_mode_survives_reload)
  * alloc). */
 T_DECLARE_CASE(test_sendbuf_push_small_frame_by_reference)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -1940,20 +1977,26 @@ T_DECLARE_CASE(test_sendbuf_push_small_frame_by_reference)
 	mux_wire_sendbuf_push(&ss, f);
 
 	/* The frame is the open tail by reference: no copy, no extra alloc. */
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
-	T_EXPECT(ss.wire.sendbuf_staging);
-	T_EXPECT(ss.wire.sendbuf.head == f);
-	T_EXPECT_EQ(ss.wire.sendbuf.tail->len, (size_t)MUX_FRAME_HEADER_SIZE);
-	T_EXPECT_EQ(pool_ctx.alloc_calls, 1);
-	T_EXPECT_EQ(pool_ctx.free_calls, 0);
+	correct = (ss.wire.sendbuf.count == (size_t)1) && correct;
+	correct = (ss.wire.sendbuf_staging) && correct;
+	correct = (ss.wire.sendbuf.head == f) && correct;
+	correct =
+		ss.wire.sendbuf.tail != NULL &&
+		(ss.wire.sendbuf.tail->len == (size_t)MUX_FRAME_HEADER_SIZE) &&
+		correct;
+	correct = (pool_ctx.alloc_calls == 1) && correct;
+	correct = (pool_ctx.free_calls == 0) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 /* A second corkable frame is memcpy-appended onto the open tail (the first
  * frame's buffer) without allocating a new frame. */
 T_DECLARE_CASE(test_sendbuf_push_second_small_frame_packs_onto_tail)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -1969,15 +2012,19 @@ T_DECLARE_CASE(test_sendbuf_push_second_small_frame_packs_onto_tail)
 	mux_wire_sendbuf_push(&ss, f2);
 
 	/* Still one entry: f2's header packed onto f1's tail; f2 is freed. */
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
-	T_EXPECT(ss.wire.sendbuf_staging);
-	T_EXPECT(ss.wire.sendbuf.tail == f1);
-	T_EXPECT_EQ(
-		ss.wire.sendbuf.tail->len, (size_t)(2 * MUX_FRAME_HEADER_SIZE));
-	T_EXPECT_EQ(pool_ctx.alloc_calls, 2);
-	T_EXPECT_EQ(pool_ctx.free_calls, 1);
+	correct = (ss.wire.sendbuf.count == (size_t)1) && correct;
+	correct = (ss.wire.sendbuf_staging) && correct;
+	correct = (ss.wire.sendbuf.tail == f1) && correct;
+	correct = ss.wire.sendbuf.tail != NULL &&
+		  (ss.wire.sendbuf.tail->len ==
+		   (size_t)(2 * MUX_FRAME_HEADER_SIZE)) &&
+		  correct;
+	correct = (pool_ctx.alloc_calls == 2) && correct;
+	correct = (pool_ctx.free_calls == 1) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 /* The first frame has no open tail to pack onto, so it is appended by reference
@@ -1985,6 +2032,7 @@ T_DECLARE_CASE(test_sendbuf_push_second_small_frame_packs_onto_tail)
  * can fill. */
 T_DECLARE_CASE(test_sendbuf_push_large_frame_by_reference)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -1995,14 +2043,16 @@ T_DECLARE_CASE(test_sendbuf_push_large_frame_by_reference)
 
 	mux_wire_sendbuf_push(&ss, f);
 
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
+	correct = (ss.wire.sendbuf.count == (size_t)1) && correct;
 	/* By reference, yet still the open tail (its spare capacity can absorb
 	 * later frames up to one record). */
-	T_EXPECT(ss.wire.sendbuf_staging);
-	T_EXPECT(ss.wire.sendbuf.head == f);
-	T_EXPECT_EQ(pool_ctx.free_calls, 0);
+	correct = (ss.wire.sendbuf_staging) && correct;
+	correct = (ss.wire.sendbuf.head == f) && correct;
+	correct = (pool_ctx.free_calls == 0) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 /* The headline behavior: a corkable frame packs onto the tail of a large
@@ -2010,6 +2060,7 @@ T_DECLARE_CASE(test_sendbuf_push_large_frame_by_reference)
  * not), so both ride in one entry / one TLS record. */
 T_DECLARE_CASE(test_sendbuf_push_corkable_packs_onto_large_tail)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -2024,23 +2075,27 @@ T_DECLARE_CASE(test_sendbuf_push_corkable_packs_onto_large_tail)
 	mux_wire_sendbuf_push(&ss, large); /* by reference, opens tail */
 	mux_wire_sendbuf_push(&ss, small); /* packs onto large's tail */
 
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
-	T_EXPECT(ss.wire.sendbuf_staging);
-	T_EXPECT(ss.wire.sendbuf.tail == large);
-	T_EXPECT_EQ(
-		ss.wire.sendbuf.tail->len,
-		(size_t)(MUX_FRAME_HEADER_SIZE + 1000u +
-			 MUX_FRAME_HEADER_SIZE));
+	correct = (ss.wire.sendbuf.count == (size_t)1) && correct;
+	correct = (ss.wire.sendbuf_staging) && correct;
+	correct = (ss.wire.sendbuf.tail == large) && correct;
+	correct = ss.wire.sendbuf.tail != NULL &&
+		  (ss.wire.sendbuf.tail->len ==
+		   (size_t)(MUX_FRAME_HEADER_SIZE + 1000u +
+			    MUX_FRAME_HEADER_SIZE)) &&
+		  correct;
 	/* Only the small frame was returned to the pool; large stays by reference. */
-	T_EXPECT_EQ(pool_ctx.free_calls, 1);
+	correct = (pool_ctx.free_calls == 1) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 /* A frame larger than one TLS record cannot pack onto the open tail; it starts a
  * new by-reference entry (count == 2) that becomes the new open tail. */
 T_DECLARE_CASE(test_sendbuf_push_large_after_corkable_adds_entry)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -2055,18 +2110,21 @@ T_DECLARE_CASE(test_sendbuf_push_large_after_corkable_adds_entry)
 	mux_wire_sendbuf_push(&ss, small); /* opens tail by reference */
 	mux_wire_sendbuf_push(&ss, large); /* exceeds one record; count -> 2 */
 
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)2);
+	correct = (ss.wire.sendbuf.count == (size_t)2) && correct;
 	/* The large frame is now the open tail. */
-	T_EXPECT(ss.wire.sendbuf_staging);
-	T_EXPECT(ss.wire.sendbuf.tail == large);
+	correct = (ss.wire.sendbuf_staging) && correct;
+	correct = (ss.wire.sendbuf.tail == large) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 /* Medium frames that together still fit one TLS record are coalesced: the second
  * is copy-packed onto the first, leaving a single entry. */
 T_DECLARE_CASE(test_sendbuf_push_medium_frames_coalesce)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -2083,22 +2141,26 @@ T_DECLARE_CASE(test_sendbuf_push_medium_frames_coalesce)
 	mux_wire_sendbuf_push(&ss, m2);
 
 	/* One entry: m2 packed onto m1's tail; m2 is freed. */
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
-	T_EXPECT(ss.wire.sendbuf_staging);
-	T_EXPECT(ss.wire.sendbuf.head == m1);
-	T_EXPECT(ss.wire.sendbuf.tail == m1);
-	T_EXPECT_EQ(
-		ss.wire.sendbuf.tail->len,
-		(size_t)(2u * (MUX_FRAME_HEADER_SIZE + 4096u)));
-	T_EXPECT_EQ(pool_ctx.free_calls, 1);
+	correct = (ss.wire.sendbuf.count == (size_t)1) && correct;
+	correct = (ss.wire.sendbuf_staging) && correct;
+	correct = (ss.wire.sendbuf.head == m1) && correct;
+	correct = (ss.wire.sendbuf.tail == m1) && correct;
+	correct = (ss.wire.sendbuf.tail != NULL &&
+		   ss.wire.sendbuf.tail->len ==
+			   (size_t)(2u * (MUX_FRAME_HEADER_SIZE + 4096u))) &&
+		  correct;
+	correct = (pool_ctx.free_calls == 1) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 /* A full-size frame (len == MUX_MAX_FRAME_SIZE) is appended by reference (zero-copy);
  * it does not fit any tail and leaves no spare capacity. */
 T_DECLARE_CASE(test_sendbuf_push_full_frame_by_reference)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -2110,20 +2172,25 @@ T_DECLARE_CASE(test_sendbuf_push_full_frame_by_reference)
 
 	mux_wire_sendbuf_push(&ss, f);
 
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
-	T_EXPECT(ss.wire.sendbuf_staging);
-	T_EXPECT_EQ(ss.wire.sendbuf.tail->len, (size_t)MUX_MAX_FRAME_SIZE);
+	correct = (ss.wire.sendbuf.count == (size_t)1) && correct;
+	correct = (ss.wire.sendbuf_staging) && correct;
+	correct = ss.wire.sendbuf.tail != NULL &&
+		  (ss.wire.sendbuf.tail->len == (size_t)MUX_MAX_FRAME_SIZE) &&
+		  correct;
 	/* The frame is by reference, not copied. */
-	T_EXPECT(ss.wire.sendbuf.head == f);
-	T_EXPECT_EQ(pool_ctx.free_calls, 0);
+	correct = (ss.wire.sendbuf.head == f) && correct;
+	correct = (pool_ctx.free_calls == 0) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 /* mux_wire_discard_buffers frees sendbuf frames (including the packed tail) and
  * resets sendbuf_staging. */
 T_DECLARE_CASE(test_sendbuf_discard_clears_staging)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 	ss.wire.recvbuf = bytebuf_new(32);
@@ -2139,23 +2206,26 @@ T_DECLARE_CASE(test_sendbuf_discard_clears_staging)
 	make_ctrl_frame(f2, 2);
 	mux_wire_sendbuf_push(&ss, f1);
 	mux_wire_sendbuf_push(&ss, f2);
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
+	correct = (ss.wire.sendbuf.count == (size_t)1) && correct;
 
 	mux_wire_discard_buffers(&ss);
 
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)0);
-	T_EXPECT(ss.wire.sendbuf.head == NULL);
-	T_EXPECT(!ss.wire.sendbuf_staging);
+	correct = (ss.wire.sendbuf.count == (size_t)0) && correct;
+	correct = (ss.wire.sendbuf.head == NULL) && correct;
+	correct = (!ss.wire.sendbuf_staging) && correct;
 	/* pool: 2 allocs (f1 + f2); both freed: f2 when packed, f1 on discard. */
-	T_EXPECT_EQ(pool_ctx.free_calls, 2);
+	correct = (pool_ctx.free_calls == 2) && correct;
 
 	bytebuf_free(ss.wire.recvbuf);
+
+	T_EXPECT(correct);
 }
 
 /* When the open tail already spans more than one record (len == MUX_MAX_FRAME_SIZE)
  * a further frame cannot pack; it starts a new by-reference entry. */
 T_DECLARE_CASE(test_sendbuf_push_full_tail_starts_new_entry)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -2165,8 +2235,7 @@ T_DECLARE_CASE(test_sendbuf_push_full_tail_starts_new_entry)
 	T_CHECK(seed != NULL);
 	make_ctrl_frame(seed, 1);
 	mux_wire_sendbuf_push(&ss, seed); /* opens tail by reference */
-	ss.wire.sendbuf.tail->len =
-		MUX_MAX_FRAME_SIZE; /* fill it to capacity */
+	seed->len = MUX_MAX_FRAME_SIZE; /* fill it to capacity */
 
 	pool_ctx.alloc_calls = 0;
 	pool_ctx.free_calls = 0;
@@ -2178,16 +2247,21 @@ T_DECLARE_CASE(test_sendbuf_push_full_tail_starts_new_entry)
 	make_ctrl_frame(f2, 2);
 	mux_wire_sendbuf_push(&ss, f2);
 
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)2);
+	correct = (ss.wire.sendbuf.count == (size_t)2) && correct;
 	/* f2 is the new open tail, by reference (not copied). */
-	T_EXPECT(ss.wire.sendbuf_staging);
-	T_EXPECT(ss.wire.sendbuf.tail == f2);
-	T_EXPECT_EQ(ss.wire.sendbuf.tail->len, (size_t)MUX_FRAME_HEADER_SIZE);
+	correct = (ss.wire.sendbuf_staging) && correct;
+	correct = (ss.wire.sendbuf.tail == f2) && correct;
+	correct =
+		ss.wire.sendbuf.tail != NULL &&
+		(ss.wire.sendbuf.tail->len == (size_t)MUX_FRAME_HEADER_SIZE) &&
+		correct;
 	/* After reset: only f2 allocated; nothing freed (f2 kept by reference). */
-	T_EXPECT_EQ(pool_ctx.alloc_calls, 1);
-	T_EXPECT_EQ(pool_ctx.free_calls, 0);
+	correct = (pool_ctx.alloc_calls == 1) && correct;
+	correct = (pool_ctx.free_calls == 0) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 /* Packing fills exactly one TLS record (MUX_MAX_RECORD); a frame at the
@@ -2195,6 +2269,7 @@ T_DECLARE_CASE(test_sendbuf_push_full_tail_starts_new_entry)
  * physical buffer still has room. */
 T_DECLARE_CASE(test_sendbuf_push_fills_record_then_new_entry)
 {
+	bool correct = true;
 	struct frame_pool_ctx pool_ctx = { 0 };
 	struct mux_session ss = make_session(&pool_ctx, -1);
 
@@ -2204,7 +2279,7 @@ T_DECLARE_CASE(test_sendbuf_push_fills_record_then_new_entry)
 	T_CHECK(seed != NULL);
 	make_ctrl_frame(seed, 1);
 	mux_wire_sendbuf_push(&ss, seed);
-	ss.wire.sendbuf.tail->len = MUX_MAX_RECORD - MUX_FRAME_HEADER_SIZE;
+	seed->len = MUX_MAX_RECORD - MUX_FRAME_HEADER_SIZE;
 
 	/* An 8 B control frame fits exactly to the record boundary: packs. */
 	struct mux_frame *const fit =
@@ -2212,8 +2287,10 @@ T_DECLARE_CASE(test_sendbuf_push_fills_record_then_new_entry)
 	T_CHECK(fit != NULL);
 	make_ctrl_frame(fit, 2);
 	mux_wire_sendbuf_push(&ss, fit);
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)1);
-	T_EXPECT_EQ(ss.wire.sendbuf.tail->len, (size_t)MUX_MAX_RECORD);
+	correct = (ss.wire.sendbuf.count == (size_t)1) && correct;
+	correct = ss.wire.sendbuf.tail != NULL &&
+		  (ss.wire.sendbuf.tail->len == (size_t)MUX_MAX_RECORD) &&
+		  correct;
 
 	/* The next frame would cross the record boundary: new entry, by reference,
 	 * even though the tail's buffer still has spare capacity. */
@@ -2222,10 +2299,12 @@ T_DECLARE_CASE(test_sendbuf_push_fills_record_then_new_entry)
 	T_CHECK(overflow != NULL);
 	make_ctrl_frame(overflow, 3);
 	mux_wire_sendbuf_push(&ss, overflow);
-	T_EXPECT_EQ(ss.wire.sendbuf.count, (size_t)2);
-	T_EXPECT(ss.wire.sendbuf.tail == overflow);
+	correct = (ss.wire.sendbuf.count == (size_t)2) && correct;
+	correct = (ss.wire.sendbuf.tail == overflow) && correct;
 
 	mux_frame_list_clear(&ss.wire.sendbuf, &ss.pool);
+
+	T_EXPECT(correct);
 }
 
 static const struct testing_suite suite[] = {

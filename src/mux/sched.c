@@ -350,7 +350,6 @@ static void sched_remove_stream(struct mux_session *ss, struct mux_stream *s)
 		ASSERT(ss->sched.num_closed > 0);
 		ss->sched.num_closed--;
 	}
-	mux_sched_check_no_active_streams(ss);
 }
 
 /* Drain the low-priority lifecycle queue (INIT→SYN batching, CLOSED→
@@ -402,6 +401,15 @@ void mux_sched_drain_lp(struct mux_session *ss)
 			}
 			sched_remove_stream(ss, s);
 			mux_stream_free(s);
+			/* Release the removed stream before a drain can synchronously
+			 * close and release its session from the LOST callback. */
+			struct mux_session_guard guard;
+			session_guard_begin(ss, &guard);
+			mux_sched_check_no_active_streams(ss);
+			if (!session_guard_end(&guard) ||
+			    ss->state != SESSION_ESTABLISHED) {
+				return;
+			}
 			continue;
 		}
 
@@ -614,8 +622,11 @@ bool mux_sched_next_data(struct mux_session *ss)
 			    s->deficit < (uint_least32_t)payload) {
 				s->deficit += ss->max_payload;
 			}
+			struct mux_session_guard guard;
+			session_guard_begin(ss, &guard);
 			mux_session_send_push(ss, s, frame);
-			if (ss->state != SESSION_ESTABLISHED) {
+			if (!session_guard_end(&guard) ||
+			    ss->state != SESSION_ESTABLISHED) {
 				/* A piggybacked FIN may free s during a drain;
 				 * leaving ESTABLISHED is the signal used in recv.c too. */
 				return true;
@@ -633,7 +644,13 @@ bool mux_sched_next_data(struct mux_session *ss)
 		s->deficit = 0;
 		/* A Nagle hold has already armed its delayed flush inside
 		 * mux_stream_dequeue_send(). */
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		sched_send_ctrl_flags(ss, s);
+		if (!session_guard_end(&guard) ||
+		    ss->state != SESSION_ESTABLISHED) {
+			return false;
+		}
 	}
 }
 
@@ -649,15 +666,24 @@ void mux_sched_flush_ctrl(struct mux_session *ss)
 {
 	if (ss->sched.drr_active != NULL &&
 	    ss->sched.drr_active->state != STREAM_CLOSED) {
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		sched_send_ctrl_flags(ss, ss->sched.drr_active);
+		if (!session_guard_end(&guard) ||
+		    ss->state != SESSION_ESTABLISHED) {
+			return;
+		}
 	}
 	for (struct mux_stream *s = ss->sched.sched_head; s != NULL;) {
 		/* A piggybacked FIN may free this chain during a drain; keep
 		 * next only until the session leaves ESTABLISHED. */
 		struct mux_stream *const next = s->next;
 		if (s->state != STREAM_CLOSED) {
+			struct mux_session_guard guard;
+			session_guard_begin(ss, &guard);
 			sched_send_ctrl_flags(ss, s);
-			if (ss->state != SESSION_ESTABLISHED) {
+			if (!session_guard_end(&guard) ||
+			    ss->state != SESSION_ESTABLISHED) {
 				return;
 			}
 		}

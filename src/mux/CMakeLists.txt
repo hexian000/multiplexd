@@ -148,3 +148,11 @@ add_mux_test(unacked_test
     frame.c frame.h
     unacked_test.c
 )
+
+# Inject ring allocation failures in the separately compiled frame support.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(unacked_test PRIVATE "-Wl,--wrap=malloc")
+    target_link_options(session_test PRIVATE "-Wl,--wrap=malloc")
+    target_compile_definitions(unacked_test PRIVATE MUX_TEST_WRAP_MALLOC=1)
+    target_compile_definitions(session_test PRIVATE MUX_TEST_WRAP_MALLOC=1)
+endif()

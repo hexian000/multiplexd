@@ -21,6 +21,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+static size_t fail_ring_alloc_size;
+#if defined(MUX_TEST_WRAP_MALLOC)
+static unsigned int failed_ring_allocs;
+
+void *test_real_malloc(size_t size) __asm__("__real_malloc");
+void *test_wrap_malloc(size_t size) __asm__("__wrap_malloc");
+void *test_wrap_malloc(size_t size)
+{
+	if (fail_ring_alloc_size != 0 && size == fail_ring_alloc_size) {
+		failed_ring_allocs++;
+		return NULL;
+	}
+	return test_real_malloc(size);
+}
+
+#endif /* MUX_TEST_WRAP_MALLOC */
+
+static void clear_ring_alloc_failure(void *data)
+{
+	(void)data;
+	fail_ring_alloc_size = 0;
+}
+
 /* mock - the test frame allocator and session fixture
  * Fixture: a minimal session carrying only the fields unacked.c touches. */
 
@@ -52,22 +75,20 @@ static void unacked_test_free(void *data, struct mux_frame *frame)
 	free(frame);
 }
 
-/* session.c is not linked: record resets for malformed layouts and prefix-copy
- * OOM; cases retain ownership of any live send-buffer entry. The ring-growth
- * OOM path has no frame-pool allocation seam, and faking the ring's capacity to
- * force an oversized grow doesn't work under ASan either -- sizes near its
- * allocation ceiling abort instead of returning NULL, and smaller ones aren't
- * guaranteed to fail (overcommit). */
+/* session.c is not linked: record resets and mirror its reliability-log
+ * cleanup so allocation failures exercise frame and counter ownership. */
 static int g_reset_calls;
 void mux_session_reset(struct mux_session *ss)
 {
-	(void)ss;
 	g_reset_calls++;
+	mux_unacked_free_all(ss);
 }
 
 struct unacked_fixture {
 	struct mux_session ss;
 	struct frame_pool_ctx pool_ctx;
+	/* Frames not yet transferred to a ring or released by the test. */
+	struct mux_frame *owned[2];
 	/* Backs ss.cnt.buffers.unacked_frames so the frames <-> gauge mirror invariant
 	 * (unacked.h) is observable; without it COUNTER_ADD/SUB are NULL no-ops
 	 * and the mirror can drift undetected. */
@@ -90,13 +111,26 @@ static void uf_setup(struct unacked_fixture *restrict fx)
 	fx->ss.cnt.buffers.unacked_frames = &fx->unacked_frames;
 }
 
-/* Drain any frames left in the ring; returns true when every allocation was
- * freed.  Callers wrap this in T_EXPECT so the leak check counts as the case's
+/* Drain the ring and release locally owned frames; returns true when every
+ * allocation was freed.  Callers wrap this in T_EXPECT so the leak check counts as the case's
  * final assertion (this helper has no testing context of its own). */
 static bool uf_teardown(struct unacked_fixture *fx)
 {
 	mux_unacked_free_all(&fx->ss);
+	for (size_t i = 0; i < 2; i++) {
+		if (fx->owned[i] != NULL) {
+			mux_frame_put(&fx->ss.pool, fx->owned[i]);
+			fx->owned[i] = NULL;
+		}
+	}
 	return fx->pool_ctx.alloc_calls == fx->pool_ctx.free_calls;
+}
+
+static void uf_cleanup(void *data)
+{
+	struct unacked_fixture *const fx = data;
+	(void)uf_teardown(fx);
+	clear_ring_alloc_failure(NULL);
 }
 
 /* Build a frame holding @p n concatenated headers with the given payload
@@ -139,13 +173,52 @@ static struct mux_frame *make_data_frame(
 
 /* regression - targeted cases for one ring/counter behavior each */
 
+T_DECLARE_CASE(test_track_sent_ring_allocation_failure_resets)
+{
+#if defined(MUX_TEST_WRAP_MALLOC)
+	for (int growing = 0; growing <= 1; growing++) {
+		static struct unacked_fixture fx;
+		uf_setup(&fx);
+		T_CLEANUP(uf_cleanup, &fx);
+		if (growing) {
+			for (size_t i = 0; i < MUX_FRAME_RING_MIN; i++) {
+				mux_unacked_track_sent(
+					&fx.ss, make_data_frame(&fx, 7));
+			}
+			T_EXPECT_EQ(
+				fx.ss.unacked.frames,
+				(size_t)MUX_FRAME_RING_MIN);
+		}
+		fail_ring_alloc_size = sizeof(struct mux_frame_ring) +
+				       (size_t)MUX_FRAME_RING_MIN *
+					       (growing ? 2u : 1u) *
+					       sizeof(struct mux_frame *);
+		failed_ring_allocs = 0;
+		g_reset_calls = 0;
+		mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 11));
+		clear_ring_alloc_failure(NULL);
+		T_EXPECT_EQ(failed_ring_allocs, 1u);
+		T_EXPECT_EQ(g_reset_calls, 1);
+		T_EXPECT(fx.ss.unacked.ring == NULL);
+		T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)0);
+		T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)0);
+		T_EXPECT_EQ(COUNTER_LOAD(fx.ss.cnt.buffers.unacked_frames), 0);
+		T_EXPECT_EQ(fx.pool_ctx.alloc_calls, fx.pool_ctx.free_calls);
+		T_EXPECT(uf_teardown(&fx));
+	}
+#else
+	T_SKIPNOW();
+#endif /* MUX_TEST_WRAP_MALLOC */
+}
+
 /* mux_unacked_track_sent: classification of flushed frames. */
 
 /* A hello frame (version 0) is handshake-only and must never enter the ring. */
 T_DECLARE_CASE(test_track_sent_drops_hello)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	const uint_least16_t lengths[1] = { 16 };
 	struct mux_frame *const f =
@@ -163,8 +236,9 @@ T_DECLARE_CASE(test_track_sent_drops_hello)
 /* A lone stream-0 control frame is one-shot; the fast path drops it. */
 T_DECLARE_CASE(test_track_sent_drops_single_ctrl)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	const uint_least16_t lengths[1] = { 0 };
 	struct mux_frame *const f = make_frame(
@@ -182,8 +256,9 @@ T_DECLARE_CASE(test_track_sent_drops_single_ctrl)
 /* A single data frame takes the fast path: one ring entry, payload counted. */
 T_DECLARE_CASE(test_track_sent_pushes_single_data)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 
@@ -198,8 +273,9 @@ T_DECLARE_CASE(test_track_sent_pushes_single_data)
  * (compacted out), only the data sub-frames are tracked. */
 T_DECLARE_CASE(test_track_sent_strips_ctrl_from_mixed)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	/* Layout: ctrl(len 4) | data(len 50) | ctrl(len 0) | data(len 70). */
 	struct mux_frame *const f =
@@ -238,8 +314,9 @@ T_DECLARE_CASE(test_track_sent_strips_ctrl_from_mixed)
  * is dropped without touching the ring. */
 T_DECLARE_CASE(test_track_sent_drops_all_ctrl_mixed)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	const uint_least16_t lengths[2] = { 8, 0 };
 	struct mux_frame *const f = make_frame(
@@ -258,8 +335,9 @@ T_DECLARE_CASE(test_track_sent_drops_all_ctrl_mixed)
  * and is freed without re-entering the ring. */
 T_DECLARE_CASE(test_track_sent_retransmit_copy_advances_cursor)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	/* One real entry so the cursor has somewhere to point. */
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
@@ -292,8 +370,9 @@ T_DECLARE_CASE(test_track_sent_retransmit_copy_advances_cursor)
  * the session is reset instead of silently desyncing from the peer. */
 T_DECLARE_CASE(test_track_sent_rejects_truncated_trailer)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 	g_reset_calls = 0;
 
 	/* First header (data, len 0) then 4 stray bytes: not a whole header. */
@@ -324,8 +403,9 @@ T_DECLARE_CASE(test_track_sent_rejects_truncated_trailer)
  * is likewise freed and resets the session (already flushed to the wire). */
 T_DECLARE_CASE(test_track_sent_rejects_overlong_header)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 	g_reset_calls = 0;
 
 	struct mux_frame *const f =
@@ -359,13 +439,15 @@ T_DECLARE_CASE(test_track_sent_rejects_overlong_header)
  * entry, which keeps only the in-flight remainder. */
 T_DECLARE_CASE(test_track_partial_moves_complete_prefix)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	/* Layout: ctrl(len 4) | data(len 50) | data(len 70). */
 	const uint_least16_t ctrl_len[1] = { 4 };
 	struct mux_frame *const f = make_frame(
 		&fx, MUX_PROTOCOL_VERSION, STREAMID_CTRL, ctrl_len, 1);
+	fx.owned[0] = f;
 	T_CHECK(f != NULL);
 	const uint_least16_t data_len[2] = { 50, 70 };
 	struct mux_frame *const data =
@@ -389,6 +471,7 @@ T_DECLARE_CASE(test_track_partial_moves_complete_prefix)
 	T_EXPECT_EQ(hdr.length, 70);
 
 	/* Once the rest is written only the remainder is tracked. */
+	fx.owned[0] = NULL;
 	mux_unacked_track_sent(&fx.ss, f);
 	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)2);
 	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)(50 + 70));
@@ -400,8 +483,9 @@ T_DECLARE_CASE(test_track_partial_moves_complete_prefix)
  * tracked: the peer can ACK it now. Failure to copy it resets the session. */
 T_DECLARE_CASE(test_track_partial_prefix_oom_resets)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 	g_reset_calls = 0;
 	const uint_least16_t lengths[2] = { 10, 10 };
 	struct mux_frame *const f =
@@ -426,8 +510,9 @@ T_DECLARE_CASE(test_track_partial_prefix_oom_resets)
  * allocation, even when the next sequenced frame is still only partly sent. */
 T_DECLARE_CASE(test_track_partial_ctrl_prefix_needs_no_allocation)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 	g_reset_calls = 0;
 	const uint_least16_t lengths[2] = { 4, 10 };
 	struct mux_frame *const f = make_frame(
@@ -469,14 +554,17 @@ T_DECLARE_CASE(test_track_partial_ctrl_prefix_needs_no_allocation)
  * nothing and allocates nothing. */
 T_DECLARE_CASE(test_track_partial_without_complete_subframe_is_noop)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	const uint_least16_t lengths[2] = { 40, 40 };
 	struct mux_frame *const f =
 		make_frame(&fx, MUX_PROTOCOL_VERSION, 1, lengths, 2);
+	fx.owned[0] = f;
 	T_CHECK(f != NULL);
 	struct mux_frame *const hello = make_frame(&fx, 0, 1, lengths, 2);
+	fx.owned[1] = hello;
 	T_CHECK(hello != NULL);
 	f->pos = MUX_FRAME_HEADER_SIZE + 39;
 	hello->pos = MUX_FRAME_HEADER_SIZE + 45;
@@ -494,8 +582,6 @@ T_DECLARE_CASE(test_track_partial_without_complete_subframe_is_noop)
 	T_EXPECT_EQ(hello->pos, (size_t)MUX_FRAME_HEADER_SIZE + 45);
 	T_EXPECT_EQ(hello->len, (size_t)2 * (MUX_FRAME_HEADER_SIZE + 40));
 
-	mux_frame_put(&fx.ss.pool, f);
-	mux_frame_put(&fx.ss.pool, hello);
 	T_EXPECT(uf_teardown(&fx));
 }
 
@@ -504,8 +590,9 @@ T_DECLARE_CASE(test_track_partial_without_complete_subframe_is_noop)
  * counters, so the copy's retirement folds in the entry's current count. */
 T_DECLARE_CASE(test_track_partial_replay_copy_bounds_ack)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	const uint_least16_t lengths[3] = { 10, 20, 30 };
 	mux_unacked_track_sent(
@@ -558,8 +645,9 @@ T_DECLARE_CASE(test_track_partial_replay_copy_bounds_ack)
  * gate; a later ACK that drops back below the limit clears it. */
 T_DECLARE_CASE(test_stall_gate_raise_and_clear)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 	fx.ss.session_window = 1; /* limit = 16384 bytes */
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 10000));
@@ -583,8 +671,9 @@ T_DECLARE_CASE(test_stall_gate_raise_and_clear)
 /* Acking more frames than were ever sent is a peer protocol violation. */
 T_DECLARE_CASE(test_ack_trim_overflow_rejected)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 
@@ -599,8 +688,9 @@ T_DECLARE_CASE(test_ack_trim_overflow_rejected)
 /* A zero-count ACK is a no-op that still reports success. */
 T_DECLARE_CASE(test_ack_trim_zero_noop)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 
@@ -617,8 +707,9 @@ T_DECLARE_CASE(test_ack_trim_zero_noop)
  * all advance, and every popped frame is freed. */
 T_DECLARE_CASE(test_ack_trim_full_pop)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 200));
@@ -645,8 +736,9 @@ T_DECLARE_CASE(test_ack_trim_full_pop)
  * call partial-trims in place (saving a byte offset), the second pops it. */
 T_DECLARE_CASE(test_ack_trim_partial_then_complete)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	const uint_least16_t lengths[3] = { 100, 200, 300 };
 	mux_unacked_track_sent(
@@ -684,8 +776,9 @@ T_DECLARE_CASE(test_ack_trim_partial_then_complete)
  * rather than reading past the end. */
 T_DECLARE_CASE(test_ack_trim_clamps_when_ring_underflows)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	/* Corrupt the logical counter to exceed the one physical entry. */
@@ -707,8 +800,9 @@ T_DECLARE_CASE(test_ack_trim_clamps_when_ring_underflows)
  * when it still points within the ring. */
 T_DECLARE_CASE(test_ack_trim_shifts_retransmit_cursor)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
@@ -729,8 +823,9 @@ T_DECLARE_CASE(test_ack_trim_shifts_retransmit_cursor)
  * cursor floors at zero and is then invalidated (SIZE_MAX). */
 T_DECLARE_CASE(test_ack_trim_invalidates_cursor_past_end)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
@@ -755,8 +850,9 @@ T_DECLARE_CASE(test_ack_trim_invalidates_cursor_past_end)
  * within the overall unacked total. */
 T_DECLARE_CASE(test_ack_recv_rejects_past_retransmit_cursor)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
@@ -778,8 +874,9 @@ T_DECLARE_CASE(test_ack_recv_rejects_past_retransmit_cursor)
 /* A count exactly matching the retransmitted prefix is accepted. */
 T_DECLARE_CASE(test_ack_recv_accepts_within_retransmit_cursor)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
@@ -801,8 +898,9 @@ T_DECLARE_CASE(test_ack_recv_accepts_within_retransmit_cursor)
  * mux_unacked_ack_trim: bounded only by the overall unacked total. */
 T_DECLARE_CASE(test_ack_recv_unbounded_when_not_replaying)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
@@ -822,8 +920,9 @@ T_DECLARE_CASE(test_ack_recv_unbounded_when_not_replaying)
  * accepted; one past it is rejected with no state change. */
 T_DECLARE_CASE(test_ack_recv_bounds_coalesced_prefix_accept)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	const uint_least16_t lengths[3] = { 100, 100, 100 };
 	mux_unacked_track_sent(
@@ -845,8 +944,9 @@ T_DECLARE_CASE(test_ack_recv_bounds_coalesced_prefix_accept)
 
 T_DECLARE_CASE(test_ack_recv_bounds_coalesced_prefix_reject)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	const uint_least16_t lengths[3] = { 100, 100, 100 };
 	mux_unacked_track_sent(
@@ -891,8 +991,9 @@ static size_t replay_prefix_sum(const struct unacked_fixture *restrict fx)
  * has actually been retransmitted while accepting the batch. */
 T_DECLARE_CASE(test_replay_counter_consistency_stress)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	enum { N = 1500 };
 	size_t pushed = 0;
@@ -968,8 +1069,9 @@ T_DECLARE_CASE(test_replay_counter_consistency_stress)
  * the first surviving entry. */
 T_DECLARE_CASE(test_resume_ack_positions_cursor)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
@@ -989,8 +1091,9 @@ T_DECLARE_CASE(test_resume_ack_positions_cursor)
  * skip logic is built for, which the single-header cases never produce. */
 T_DECLARE_CASE(test_resume_ack_trims_into_coalesced_entry)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	/* One ring entry coalescing three data sub-frames on stream 1. */
 	const uint_least16_t lengths[3] = { 100, 200, 300 };
@@ -1017,8 +1120,9 @@ T_DECLARE_CASE(test_resume_ack_trims_into_coalesced_entry)
 /* A resume hello acking everything leaves an empty ring and an invalid cursor. */
 T_DECLARE_CASE(test_resume_ack_empties_ring)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
@@ -1033,8 +1137,9 @@ T_DECLARE_CASE(test_resume_ack_empties_ring)
 /* A peer_ack that regresses below what was already acked is a protocol error. */
 T_DECLARE_CASE(test_resume_ack_regress_rejected)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	fx.ss.unacked.last_ack_recv = 5;
@@ -1050,8 +1155,9 @@ T_DECLARE_CASE(test_resume_ack_regress_rejected)
  * serial space (wrapped past UINT32_MAX) must be accepted, not rejected. */
 T_DECLARE_CASE(test_resume_ack_wrap_accepted)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	/* Wind last_ack_recv to the top of the 32-bit serial space, then track one
 	 * outstanding frame, so a peer_ack of 0 sits just past it across the wrap. */
@@ -1071,8 +1177,9 @@ T_DECLARE_CASE(test_resume_ack_wrap_accepted)
  * the session down). */
 T_DECLARE_CASE(test_resume_ack_overflow_rejected)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 
@@ -1087,8 +1194,9 @@ T_DECLARE_CASE(test_resume_ack_overflow_rejected)
 /* ack_emitted subtracts the reported count and resets the emission timer. */
 T_DECLARE_CASE(test_ack_emitted_clears_unreported)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	fx.ss.unacked.unreported = 3;
 	fx.ss.unacked.ack_ticks = 3;
@@ -1106,8 +1214,9 @@ T_DECLARE_CASE(test_ack_emitted_clears_unreported)
  * send.c and is covered by send_test.c. */
 T_DECLARE_CASE(test_ack_emitted_partial_keeps_remainder)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	fx.ss.unacked.unreported = 5;
 
@@ -1120,8 +1229,9 @@ T_DECLARE_CASE(test_ack_emitted_partial_keeps_remainder)
 /* free_all discards a non-empty ring and resets all derived state. */
 T_DECLARE_CASE(test_free_all_resets_state)
 {
-	struct unacked_fixture fx;
+	static struct unacked_fixture fx;
 	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
 
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 100));
 	mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 200));
@@ -1129,6 +1239,7 @@ T_DECLARE_CASE(test_free_all_resets_state)
 	fx.ss.unacked.partial_offset = 7;
 	/* A replay in flight: the copy tracks the ring entry about to be freed. */
 	struct mux_frame *const copy = make_data_frame(&fx, 50);
+	fx.owned[0] = copy;
 	fx.ss.unacked.retransmit_copy = copy;
 	fx.ss.unacked.stalled = true;
 
@@ -1149,8 +1260,7 @@ T_DECLARE_CASE(test_free_all_resets_state)
 	T_EXPECT(!fx.ss.unacked.stalled);
 	/* The copy itself belongs to the send buffer that queued it (production
 	 * frees it in mux_wire_discard_buffers); mux_unacked_free_all only drops the
-	 * tracking pointer, so release it here to keep the pool balanced. */
-	mux_frame_put(&fx.ss.pool, copy);
+	 * tracking pointer, so the fixture retains it until teardown. */
 	/* mux_unacked_free_all must decrement the gauge by the frames it drops, not
 	 * just zero the local mirror (regression: it left the server-wide gauge
 	 * permanently inflated). */
@@ -1294,6 +1404,7 @@ T_DECLARE_BENCH(bench_unacked_replay_accounting)
 }
 
 static const struct testing_suite suite[] = {
+	T_CASE(test_track_sent_ring_allocation_failure_resets),
 	T_CASE(test_track_sent_drops_hello),
 	T_CASE(test_track_sent_drops_single_ctrl),
 	T_CASE(test_track_sent_pushes_single_data),

@@ -1928,6 +1928,9 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			const bool ret = mux_handshake_process_hello(
 				&ss, &hdr, frame_size);
 
+			/* Release ownership before any invariant can abort the case. */
+			teardown_session(&ss);
+
 			/* Invariant 2: state must be a valid session_state. */
 			if ((unsigned)ss.state > (unsigned)SESSION_CLOSED) {
 				print_fuzz_context(
@@ -1965,8 +1968,6 @@ T_DECLARE_CASE(test_handshake_fuzz)
 					"mux_session_handshake_done and "
 					"mux_session_reset both called");
 			}
-
-			teardown_session(&ss);
 		}
 	}
 }

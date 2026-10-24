@@ -166,6 +166,7 @@ static void stream_stop(struct mux_stream *s)
 	struct ev_loop *const loop = s->session->loop;
 	ev_io_stop(loop, &s->socket.w_io);
 	ev_timer_stop(loop, &s->socket.w_timeout);
+	ev_timer_stop(loop, &s->socket.w_read_retry);
 }
 
 /* Discard the stream's payload storage and hand its bytes back to the session
@@ -294,7 +295,7 @@ static bool stream_finish_drained_write(struct mux_stream *s)
  * second frame would only wait for ESTABLISHED as a tiny PUSH of its own. */
 static bool stream_local_read_allowed(const struct mux_stream *restrict s)
 {
-	if (s->rx_eof) {
+	if (s->rx_eof || ev_is_active(&s->socket.w_read_retry)) {
 		return false;
 	}
 	if (s->state == STREAM_INIT) {
@@ -466,12 +467,17 @@ static void stream_flush_local(struct mux_stream *s)
 	bool made_progress = false;
 	/* stream_local_write may mux_stream_abort on a hard error, which on the last
 	 * active stream of a draining session frees s via the drain cascade; the
-	 * session survives, so capture it and check the free before touching s. */
+	 * session may be released too, so guard the call before checking s. */
 	struct mux_session *const ss = s->session;
 	while (bytebuf_readable(s->recvbuf) > 0) {
 		const size_t len = bytebuf_readable(s->recvbuf);
 		const unsigned char *const data = bytebuf_read_ptr(s->recvbuf);
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		const size_t nwrite = stream_local_write(s, data, len);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 		if (nwrite == 0) {
 			/* nwrite == 0 is either EAGAIN (re-arm the send timeout) or a
 			 * hard error that stream_local_write already turned into a
@@ -546,6 +552,8 @@ static bool stream_on_recv(struct mux_stream *s)
 		mux_frame_get(&s->session->pool, s->session->max_payload);
 	if (frame == NULL) {
 		STREAM_LOG(WARNING, s, "out of memory for send frame");
+		ev_timer_set(&s->socket.w_read_retry, 0.01, 0.0);
+		ev_timer_start(s->session->loop, &s->socket.w_read_retry);
 		return false;
 	}
 
@@ -609,11 +617,16 @@ static void stream_on_send(struct mux_stream *s)
 	if (!s->socket.connected) {
 		/* local_on_connected() aborts the stream on a connect failure; on
 		 * the last active stream of a draining session that frees s via the
-		 * drain cascade. Capture the surviving session and stop touching s --
+		 * drain cascade. Guard the session and stop touching s --
 		 * both the state read below and stream_flush_local() -- once the free
 		 * is detected. */
 		struct mux_session *const ss = s->session;
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		local_on_connected(s);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
 			return;
 		}
@@ -639,23 +652,47 @@ static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	STREAM_LOG_F(
 		VERBOSE, s, "stream socket: state=%s revents=%d",
 		stream_state_str[s->state], revents);
-	/* stream_on_recv/stream_on_send can, on the last active stream of a
-	 * draining session, cascade into mux_session_initiate_shutdown ->
-	 * mux_sched_free_streams and free s; the session object survives, so capture
-	 * it and stop touching s once session_streams_freed() reports the free. */
+	/* Stream I/O can finish a drain and synchronously close the session.
+	 * Guard each operation before inspecting either object again. */
 	struct mux_session *const ss = s->session;
+	struct mux_session_guard guard;
 	if (revents & EV_READ) {
-		while (stream_on_recv(s) && s->state != STREAM_CLOSED) {
+		for (;;) {
+			session_guard_begin(ss, &guard);
+			const bool more = stream_on_recv(s);
+			if (!session_guard_end(&guard)) {
+				return;
+			}
+			if (session_streams_freed(ss) || !more ||
+			    s->state == STREAM_CLOSED) {
+				break;
+			}
 		}
 	}
 	if (!session_streams_freed(ss) && (revents & EV_WRITE) &&
 	    s->state != STREAM_CLOSED) {
+		session_guard_begin(ss, &guard);
 		stream_on_send(s);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 	}
 	if (!session_streams_freed(ss)) {
 		update_watcher(s);
 	}
 	mux_session_flush(ss);
+}
+
+static void read_retry_cb(struct ev_loop *loop, ev_timer *w, const int revents)
+{
+	CHECK_REVENTS(revents, EV_TIMER);
+	struct mux_stream *const s = w->data;
+	ASSERT(loop == s->session->loop);
+	ASSERT(!s->is_direct);
+	/* A one-shot timer is inactive before its callback. Restore read
+	 * interest only if the stream still has credit and may originate data. */
+	(void)loop;
+	update_watcher(s);
 }
 
 static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
@@ -667,7 +704,12 @@ static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	ASSERT(!s->is_direct);
 	struct mux_session *const ss = s->session;
 	STREAM_LOG(WARNING, s, "local socket timeout");
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
 	mux_stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
+	if (!session_guard_end(&guard)) {
+		return;
+	}
 	mux_session_flush(ss);
 }
 
@@ -713,6 +755,8 @@ struct mux_stream *mux_stream_new(
 	const double timeout = (double)conf->send_timeout;
 	ev_timer_init(&s->socket.w_timeout, timeout_cb, 0.0, timeout);
 	s->socket.w_timeout.data = s;
+	ev_timer_init(&s->socket.w_read_retry, read_retry_cb, 0.0, 0.0);
+	s->socket.w_read_retry.data = s;
 	s->recvbuf = bytebuf_new(ss->max_payload);
 	if (s->recvbuf == NULL) {
 		free(s);
@@ -1146,7 +1190,12 @@ static inline void stream_notify_readable(struct mux_stream *s)
 	 * and the coalesced EV_WRITE drain delivers it in one write. */
 	if (s->socket.connected && !(s->socket.w_io.events & EV_WRITE)) {
 		struct mux_session *const ss = s->session;
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		stream_flush_local(s);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 		/* stream_flush_local can close the last active stream of a
 		 * draining session and free s via the drain cascade. */
 		if (session_streams_freed(ss)) {
@@ -1165,11 +1214,16 @@ static void stream_abort_notify_close(struct mux_stream *s)
 		/* Fire EV_READ before detach so the callback sees `aborted`; it may
 		 * call mux_stream_close(). On the last active stream of a draining
 		 * session that cascades into mux_session_initiate_shutdown ->
-		 * mux_sched_free_streams and frees s (the session object survives), so
+		 * mux_sched_free_streams and may release the session too, so
 		 * capture it and stop touching s -- the plain STREAM_CLOSED read
 		 * below would otherwise be a use-after-free -- once the free shows. */
 		struct mux_session *const ss = s->session;
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		stream_rst_notify_direct(s);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
 			return;
 		}
@@ -1279,8 +1333,13 @@ void mux_stream_recv_copy(
 		 * capture the session first, then check the free before touching
 		 * s. The short-circuit keeps the s->state read on the alive path. */
 		struct mux_session *const ss = s->session;
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		const size_t nwrite =
 			stream_local_write(s, payload, payload_len);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
 			return;
 		}
@@ -1459,6 +1518,11 @@ void mux_stream_mark_fin_sent(struct mux_stream *s)
 			 * life; it applies close(fd) semantics to any unread data. */
 			if (s->user_closed) {
 				mux_stream_do_close(s);
+			} else {
+				/* Peer EOF may already have been consumed in CLOSE_WAIT.
+				 * Wake the reader again to complete the terminal EOF now
+				 * that the local FIN has also left. */
+				stream_feed_user(s, EV_READ);
 			}
 		} else if (bytebuf_readable(s->recvbuf) == 0) {
 			/* Socket mode, recv drained: half-close the write side (as our
@@ -1558,12 +1622,17 @@ void mux_stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
 		/* Fire EV_READ before detach so the callback sees rst_received; it
 		 * may call mux_stream_close(). On the last active stream of a
 		 * draining session that cascades into mux_session_initiate_shutdown ->
-		 * mux_sched_free_streams and frees s (the session object survives), so
+		 * mux_sched_free_streams and may release the session too, so
 		 * capture it and stop touching s -- both the STREAM_CLOSED read below
 		 * and the recv-buffer bookkeeping after it, which the cascade already
 		 * tore down -- once the free shows. */
 		struct mux_session *const ss = s->session;
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		stream_rst_notify_direct(s);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 		if (session_streams_freed(ss)) {
 			return;
 		}

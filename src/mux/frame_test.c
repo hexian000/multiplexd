@@ -23,7 +23,7 @@
 struct frame_pool_ctx {
 	int alloc_calls;
 	int free_calls;
-	struct mux_frame *last_freed;
+	uintptr_t last_freed_address;
 	bool poison_new_frame;
 };
 
@@ -48,7 +48,7 @@ static void frame_test_free(void *data, struct mux_frame *frame)
 {
 	struct frame_pool_ctx *const ctx = data;
 	ctx->free_calls++;
-	ctx->last_freed = frame;
+	ctx->last_freed_address = (uintptr_t)frame;
 	free(frame);
 }
 
@@ -61,10 +61,14 @@ static struct mux_frame_allocator make_pool(struct frame_pool_ctx *ctx)
 	};
 }
 
+/* Resource-owning cases record verdicts first, release their resources,
+ * then use fatal expectations. Each operation still runs after a prior mismatch. */
+
 /* regression - targeted cases for one container/codec behavior each */
 
 T_DECLARE_CASE(test_frame_get_resets_runtime_fields)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = {
 		.poison_new_frame = true,
 	};
@@ -73,31 +77,37 @@ T_DECLARE_CASE(test_frame_get_resets_runtime_fields)
 	struct mux_frame *const frame =
 		mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(frame != NULL);
-	T_EXPECT_EQ(ctx.alloc_calls, 1);
-	T_EXPECT_EQ(frame->pos, (size_t)0);
-	T_EXPECT_EQ(frame->len, (size_t)0);
-	T_EXPECT(frame->next == NULL);
+	correct = (ctx.alloc_calls == 1) && correct;
+	correct = (frame->pos == (size_t)0) && correct;
+	correct = (frame->len == (size_t)0) && correct;
+	correct = (frame->next == NULL) && correct;
 	/* cap must be stamped from the requested size: it bounds payload writes
 	 * at mux.c/stream.c/handshake.c, so a dropped `frame->cap = cap;` would
 	 * ship silently. */
-	T_EXPECT_EQ(frame->cap, (size_t)MUX_MAX_PAYLOAD_SIZE);
+	correct = (frame->cap == (size_t)MUX_MAX_PAYLOAD_SIZE) && correct;
 
 	mux_frame_put(&pool, frame);
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_frame_put_calls_allocator_free)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
 	struct mux_frame *const frame =
 		mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(frame != NULL);
-	T_EXPECT_EQ(ctx.free_calls, 0);
+	correct = (ctx.free_calls == 0) && correct;
 
+	const uintptr_t frame_address = (uintptr_t)frame;
 	mux_frame_put(&pool, frame);
-	T_EXPECT_EQ(ctx.free_calls, 1);
-	T_EXPECT(ctx.last_freed == frame);
+	correct = (ctx.free_calls == 1) && correct;
+	correct = (ctx.last_freed_address == frame_address) && correct;
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_header_roundtrip_preserves_all_fields)
@@ -189,6 +199,7 @@ T_DECLARE_CASE(test_frame_list_push_pop_fifo)
 
 T_DECLARE_CASE(test_frame_list_drain_clears_head_tail_and_count)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 	struct mux_frame_list list = { 0 };
@@ -200,13 +211,15 @@ T_DECLARE_CASE(test_frame_list_drain_clears_head_tail_and_count)
 		mux_frame_list_push(&list, frames[i]);
 	}
 
-	T_EXPECT_EQ(list.count, (size_t)3);
+	correct = (list.count == (size_t)3) && correct;
 	mux_frame_list_clear(&list, &pool);
 
-	T_EXPECT_EQ(ctx.free_calls, 3);
-	T_EXPECT_EQ(list.count, (size_t)0);
-	T_EXPECT(list.head == NULL);
-	T_EXPECT(list.tail == NULL);
+	correct = (ctx.free_calls == 3) && correct;
+	correct = (list.count == (size_t)0) && correct;
+	correct = (list.head == NULL) && correct;
+	correct = (list.tail == NULL) && correct;
+
+	T_EXPECT(correct);
 }
 
 /* push_front sets tail only when the list was previously empty; otherwise it
@@ -300,28 +313,32 @@ T_DECLARE_CASE(test_frame_list_remove_after_head_interior_tail)
 
 T_DECLARE_CASE(test_frame_ring_null_and_empty_ops)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
 	/* NULL ring: size/peek/pop must not crash or lie. */
-	T_EXPECT_EQ(mux_frame_ring_size(NULL), (size_t)0);
-	T_EXPECT(mux_frame_ring_peek(NULL, 0) == NULL);
-	T_EXPECT(mux_frame_ring_pop(NULL) == NULL);
+	correct = (mux_frame_ring_size(NULL) == (size_t)0) && correct;
+	correct = (mux_frame_ring_peek(NULL, 0) == NULL) && correct;
+	correct = (mux_frame_ring_pop(NULL) == NULL) && correct;
 
 	/* Empty ring: same expectations after allocation. */
 	struct mux_frame_ring *r = mux_frame_ring_new(MUX_FRAME_RING_MIN);
 	T_CHECK(r != NULL);
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
-	T_EXPECT(mux_frame_ring_peek(r, 0) == NULL);
-	T_EXPECT(mux_frame_ring_pop(r) == NULL);
+	correct = (mux_frame_ring_size(r) == (size_t)0) && correct;
+	correct = (mux_frame_ring_peek(r, 0) == NULL) && correct;
+	correct = (mux_frame_ring_pop(r) == NULL) && correct;
 
 	mux_frame_ring_free(&r, &pool);
-	T_EXPECT(r == NULL);
-	T_EXPECT_EQ(ctx.free_calls, 0);
+	correct = (r == NULL) && correct;
+	correct = (ctx.free_calls == 0) && correct;
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_frame_ring_push_pop_fifo)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
@@ -334,32 +351,35 @@ T_DECLARE_CASE(test_frame_ring_push_pop_fifo)
 		T_CHECK(pushed[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, pushed[i]));
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), n);
+	correct = (mux_frame_ring_size(r) == n) && correct;
 
 	/* peek should return items in push order */
 	for (size_t i = 0; i < n; i++) {
-		T_EXPECT(mux_frame_ring_peek(r, i) == pushed[i]);
+		correct = (mux_frame_ring_peek(r, i) == pushed[i]) && correct;
 	}
 
 	/* pop should return items in FIFO order */
 	for (size_t i = 0; i < n; i++) {
-		T_EXPECT(mux_frame_ring_pop(r) == pushed[i]);
+		correct = (mux_frame_ring_pop(r) == pushed[i]) && correct;
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
+	correct = (mux_frame_ring_size(r) == (size_t)0) && correct;
 
 	mux_frame_ring_free(&r, &pool);
 	/* All frames were already popped; ring_free frees 0 more. */
-	T_EXPECT_EQ(ctx.free_calls, 0);
+	correct = (ctx.free_calls == 0) && correct;
 
 	/* Free the popped frames manually. */
 	for (size_t i = 0; i < n; i++) {
 		mux_frame_put(&pool, pushed[i]);
 	}
-	T_EXPECT_EQ(ctx.free_calls, (int)n);
+	correct = (ctx.free_calls == (int)n) && correct;
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_frame_ring_grow_contiguous)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
@@ -373,30 +393,33 @@ T_DECLARE_CASE(test_frame_ring_grow_contiguous)
 		T_CHECK(frames[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, frames[i]));
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)cap0);
+	correct = (mux_frame_ring_size(r) == (size_t)cap0) && correct;
 
 	/* One more push must trigger grow to 2×MIN capacity. */
 	frames[cap0] = mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(frames[cap0] != NULL);
 	T_CHECK(mux_frame_ring_push(&r, frames[cap0]));
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)(cap0 + 1));
-	T_EXPECT_EQ(r->capacity, (size_t)(cap0 * 2));
+	correct = (mux_frame_ring_size(r) == (size_t)cap0 + 1) && correct;
+	correct = (r->capacity == (size_t)cap0 * 2) && correct;
 
 	/* FIFO order must be preserved across the grow. */
 	for (int i = 0; i <= cap0; i++) {
-		T_EXPECT(mux_frame_ring_pop(r) == frames[i]);
+		correct = (mux_frame_ring_pop(r) == frames[i]) && correct;
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
+	correct = (mux_frame_ring_size(r) == (size_t)0) && correct;
 
 	mux_frame_ring_free(&r, &pool);
 	for (int i = 0; i <= cap0; i++) {
 		mux_frame_put(&pool, frames[i]);
 	}
-	T_EXPECT_EQ(ctx.free_calls, cap0 + 1);
+	correct = (ctx.free_calls == cap0 + 1) && correct;
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
@@ -414,9 +437,9 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 	}
 	/* Pop 10: head advances into the ring (head = 10). */
 	for (int i = 0; i < pop_n; i++) {
-		T_EXPECT(mux_frame_ring_pop(r) == frames[i]);
+		correct = (mux_frame_ring_pop(r) == frames[i]) && correct;
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)(cap0 - pop_n));
+	correct = (mux_frame_ring_size(r) == (size_t)(cap0 - pop_n)) && correct;
 
 	/* Round 2: push total - cap0 == 14 more; after the pop, 6 + 14 = 20 > 16,
 	 * so slots wrap around and then the grow fires. */
@@ -425,13 +448,14 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 		T_CHECK(frames[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, frames[i]));
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)(total - pop_n));
+	correct =
+		(mux_frame_ring_size(r) == (size_t)(total - pop_n)) && correct;
 
 	/* FIFO order must be fully intact after the wrapped grow. */
 	for (int i = pop_n; i < total; i++) {
-		T_EXPECT(mux_frame_ring_pop(r) == frames[i]);
+		correct = (mux_frame_ring_pop(r) == frames[i]) && correct;
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)0);
+	correct = (mux_frame_ring_size(r) == (size_t)0) && correct;
 
 	mux_frame_ring_free(&r, &pool);
 	/* Free frames[0..pop_n-1] that were already popped above. */
@@ -441,6 +465,8 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
 	for (int i = pop_n; i < total; i++) {
 		mux_frame_put(&pool, frames[i]);
 	}
+
+	T_EXPECT(correct);
 }
 
 /* mux_frame_ring_peek and mux_frame_ring_free both re-implement the wrap
@@ -451,6 +477,7 @@ T_DECLARE_CASE(test_frame_ring_grow_wrapped)
  * wrap and free with live entries. */
 T_DECLARE_CASE(test_frame_ring_peek_and_free_wrapped)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
@@ -470,7 +497,7 @@ T_DECLARE_CASE(test_frame_ring_peek_and_free_wrapped)
 	}
 	/* Pop 10 (head advances to 10); free the popped frames now. */
 	for (int i = 0; i < pop_n; i++) {
-		T_EXPECT(mux_frame_ring_pop(r) == pushed[i]);
+		correct = (mux_frame_ring_pop(r) == pushed[i]) && correct;
 		mux_frame_put(&pool, pushed[i]);
 	}
 	/* Push push2 == 4 more; they wrap into slots 0..3 while head stays at 10. */
@@ -479,25 +506,29 @@ T_DECLARE_CASE(test_frame_ring_peek_and_free_wrapped)
 		T_CHECK(pushed[i] != NULL);
 		T_CHECK(mux_frame_ring_push(&r, pushed[i]));
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)held);
+	correct = (mux_frame_ring_size(r) == (size_t)held) && correct;
 
 	/* Peek must walk the wrapped ring in FIFO order: pushed[10..19]. */
 	for (int i = 0; i < held; i++) {
-		T_EXPECT(
-			mux_frame_ring_peek(r, (size_t)i) == pushed[pop_n + i]);
+		correct = (mux_frame_ring_peek(r, (size_t)i) ==
+			   pushed[pop_n + i]) &&
+			  correct;
 	}
 
 	/* Free the wrapped ring holding 10 live entries: exactly those are freed. */
 	const int freed_before = ctx.free_calls;
 	mux_frame_ring_free(&r, &pool);
-	T_EXPECT(r == NULL);
-	T_EXPECT_EQ(ctx.free_calls - freed_before, held);
+	correct = (r == NULL) && correct;
+	correct = (ctx.free_calls - freed_before == held) && correct;
+
+	T_EXPECT(correct);
 }
 
 /* Slots past the live entries must read as NULL after a grow, exactly like a
  * freshly allocated ring (mux_frame_ring_new), not leftover malloc bytes. */
 T_DECLARE_CASE(test_frame_ring_grow_zeroes_new_slots)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
@@ -515,21 +546,24 @@ T_DECLARE_CASE(test_frame_ring_grow_zeroes_new_slots)
 		mux_frame_get(&pool, MUX_MAX_PAYLOAD_SIZE);
 	T_CHECK(last != NULL);
 	T_CHECK(mux_frame_ring_push(&r, last));
-	T_EXPECT_EQ(r->capacity, (size_t)(cap0 * 2));
-	T_EXPECT_EQ(r->count, (size_t)(cap0 + 1));
+	correct = (r->capacity == (size_t)cap0 * 2) && correct;
+	correct = (r->count == (size_t)cap0 + 1) && correct;
 
 	for (size_t i = r->count; i < r->capacity; i++) {
-		T_EXPECT(r->entries[i] == NULL);
+		correct = (r->entries[i] == NULL) && correct;
 	}
 	/* The last live slot must still be the frame that triggered the grow. */
-	T_EXPECT(mux_frame_ring_peek(r, r->count - 1) == last);
+	correct = (mux_frame_ring_peek(r, r->count - 1) == last) && correct;
 
 	mux_frame_ring_free(&r, &pool);
-	T_EXPECT_EQ(ctx.free_calls, cap0 + 1);
+	correct = (ctx.free_calls == cap0 + 1) && correct;
+
+	T_EXPECT(correct);
 }
 
 T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 {
+	bool correct = true;
 	struct frame_pool_ctx ctx = { 0 };
 	const struct mux_frame_allocator pool = make_pool(&ctx);
 
@@ -542,13 +576,15 @@ T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 		T_CHECK(f != NULL);
 		T_CHECK(mux_frame_ring_push(&r, f));
 	}
-	T_EXPECT_EQ(mux_frame_ring_size(r), (size_t)n);
-	T_EXPECT_EQ(ctx.alloc_calls, n);
+	correct = (mux_frame_ring_size(r) == (size_t)n) && correct;
+	correct = (ctx.alloc_calls == n) && correct;
 
 	mux_frame_ring_free(&r, &pool);
 
-	T_EXPECT(r == NULL);
-	T_EXPECT_EQ(ctx.free_calls, n);
+	correct = (r == NULL) && correct;
+	correct = (ctx.free_calls == n) && correct;
+
+	T_EXPECT(correct);
 }
 
 /* Direct coverage of mux_bytebuf_reserve's four decision points: fast-path (space
@@ -556,20 +592,23 @@ T_DECLARE_CASE(test_frame_ring_free_releases_all_frames)
 
 T_DECLARE_CASE(test_bytebuf_reserve_noop_when_space_available)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(16);
 	T_CHECK(rb != NULL);
 	bytebuf_produce(rb, 4);
 
-	T_EXPECT(mux_bytebuf_reserve(&rb, 12, false));
-	T_EXPECT_EQ(rb->cap, (size_t)16);
-	T_EXPECT_EQ(rb->off, (size_t)0);
+	correct = (mux_bytebuf_reserve(&rb, 12, false)) && correct;
+	correct = (rb->cap == (size_t)16) && correct;
+	correct = (rb->off == (size_t)0) && correct;
 
 	/* need == 0 is always satisfied too, even with zero space left. */
 	bytebuf_produce(rb, 12);
-	T_EXPECT_EQ(bytebuf_write_space(rb), (size_t)0);
-	T_EXPECT(mux_bytebuf_reserve(&rb, 0, false));
+	correct = (bytebuf_write_space(rb) == (size_t)0) && correct;
+	correct = (mux_bytebuf_reserve(&rb, 0, false)) && correct;
 
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* A partially-consumed buffer (off > 0, len > 0) has write_space trapped
@@ -577,34 +616,41 @@ T_DECLARE_CASE(test_bytebuf_reserve_noop_when_space_available)
  * growing, proving can_grow=false does not spuriously fail here. */
 T_DECLARE_CASE(test_bytebuf_reserve_compaction_recovers_space)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(10);
 	T_CHECK(rb != NULL);
 	bytebuf_produce(rb, 8);
 	bytebuf_consume(
 		rb, 5); /* off=5, len=3: partial consume, no off reset */
 	T_CHECK(rb->off == 5 && rb->len == 3);
-	T_EXPECT_EQ(bytebuf_write_space(rb), (size_t)2);
+	correct = (bytebuf_write_space(rb) == (size_t)2) && correct;
 
-	T_EXPECT(mux_bytebuf_reserve(&rb, 5, false));
-	T_EXPECT_EQ(rb->off, (size_t)0);
-	T_EXPECT_EQ(rb->len, (size_t)3);
-	T_EXPECT_EQ(rb->cap, (size_t)10); /* compaction alone; no realloc */
+	correct = (mux_bytebuf_reserve(&rb, 5, false)) && correct;
+	correct = (rb->off == (size_t)0) && correct;
+	correct = (rb->len == (size_t)3) && correct;
+	correct = (rb->cap == (size_t)10) &&
+		  correct; /* compaction alone; no realloc */
 
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* can_grow=false with neither immediate space nor anything to compact must
  * fail cleanly rather than attempt to grow. */
 T_DECLARE_CASE(test_bytebuf_reserve_returns_false_when_cannot_grow)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(4);
 	T_CHECK(rb != NULL);
 	bytebuf_produce(rb, 4); /* off=0 already: compact is a no-op */
 
-	T_EXPECT(!mux_bytebuf_reserve(&rb, 1, false));
-	T_EXPECT_EQ(rb->cap, (size_t)4);
+	correct = (!mux_bytebuf_reserve(&rb, 1, false)) && correct;
+	correct = (rb->cap == (size_t)4) && correct;
 
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* A request well beyond one doubling forces the growth loop to iterate
@@ -612,6 +658,7 @@ T_DECLARE_CASE(test_bytebuf_reserve_returns_false_when_cannot_grow)
  * original capacity that is >= len+need, not merely >= need. */
 T_DECLARE_CASE(test_bytebuf_reserve_doubling_growth_loop)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(4);
 	T_CHECK(rb != NULL);
 	bytebuf_produce(rb, 4);
@@ -619,11 +666,13 @@ T_DECLARE_CASE(test_bytebuf_reserve_doubling_growth_loop)
 	T_CHECK(rb->off == 0 && rb->len == 0);
 
 	/* min_cap = 0 + 20 = 20; doubling from 4: 4, 8, 16, 32 (first >= 20). */
-	T_EXPECT(mux_bytebuf_reserve(&rb, 20, true));
-	T_EXPECT_EQ(rb->cap, (size_t)32);
-	T_EXPECT(bytebuf_write_space(rb) >= (size_t)20);
+	correct = (mux_bytebuf_reserve(&rb, 20, true)) && correct;
+	correct = (rb->cap == (size_t)32) && correct;
+	correct = (bytebuf_write_space(rb) >= (size_t)20) && correct;
 
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* A need large enough that len+need lands exactly on SIZE_MAX forces the growth
@@ -632,14 +681,18 @@ T_DECLARE_CASE(test_bytebuf_reserve_doubling_growth_loop)
  * pushes the true request past SIZE_MAX) must then reject it before allocating. */
 T_DECLARE_CASE(test_bytebuf_reserve_overflow_clamp_rejects)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(4);
 	T_CHECK(rb != NULL);
 
-	T_EXPECT(!mux_bytebuf_reserve(&rb, SIZE_MAX - rb->len, true));
-	T_EXPECT_EQ(
-		rb->cap, (size_t)4); /* untouched: rejected before realloc */
+	correct = (!mux_bytebuf_reserve(&rb, SIZE_MAX - rb->len, true)) &&
+		  correct;
+	correct = (rb->cap == (size_t)4) &&
+		  correct; /* untouched: rejected before realloc */
 
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* The sibling above starts from len == 0, so `need > SIZE_MAX - rb->len` is
@@ -648,22 +701,26 @@ T_DECLARE_CASE(test_bytebuf_reserve_overflow_clamp_rejects)
  * before any doubling or allocation. */
 T_DECLARE_CASE(test_bytebuf_reserve_len_plus_need_overflow_rejects)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(4);
 	T_CHECK(rb != NULL);
 	bytebuf_produce(rb, 4); /* len = 4 so len + need can overflow */
 	T_CHECK(rb->len == 4);
 
-	T_EXPECT(!mux_bytebuf_reserve(&rb, SIZE_MAX - 3, true));
-	T_EXPECT_EQ(
-		rb->cap, (size_t)4); /* untouched: rejected before realloc */
+	correct = (!mux_bytebuf_reserve(&rb, SIZE_MAX - 3, true)) && correct;
+	correct = (rb->cap == (size_t)4) &&
+		  correct; /* untouched: rejected before realloc */
 
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* Consuming one frame from the front of a receive buffer must leave the next
  * frame's bytes readable and intact. */
 T_DECLARE_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes)
 {
+	bool correct = true;
 	struct mux_header hdr = {
 		.version = MUX_PROTOCOL_VERSION,
 		.flags = MUX_FLAG_PUSH,
@@ -684,16 +741,20 @@ T_DECLARE_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes)
 	bytebuf_produce(rb, sizeof(bytes));
 
 	bytebuf_consume(rb, MUX_FRAME_HEADER_SIZE + 1);
-	T_EXPECT_EQ(
-		bytebuf_readable(rb),
-		sizeof(bytes) - ((size_t)MUX_FRAME_HEADER_SIZE + 1));
-	T_EXPECT(bytebuf_read_ptr(rb)[MUX_FRAME_HEADER_SIZE] == 'B');
+	correct = (bytebuf_readable(rb) ==
+		   sizeof(bytes) - ((size_t)MUX_FRAME_HEADER_SIZE + 1)) &&
+		  correct;
+	correct =
+		(bytebuf_read_ptr(rb)[MUX_FRAME_HEADER_SIZE] == 'B') && correct;
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* A partial consume advances the read offset rather than moving bytes. */
 T_DECLARE_CASE(test_bytebuf_consume_advances_offset_without_copy)
 {
+	bool correct = true;
 	unsigned char bytes[2 * MUX_FRAME_HEADER_SIZE] = { 0 };
 
 	struct bytebuf *rb = bytebuf_new(sizeof(bytes));
@@ -702,42 +763,48 @@ T_DECLARE_CASE(test_bytebuf_consume_advances_offset_without_copy)
 	bytebuf_produce(rb, sizeof(bytes));
 
 	bytebuf_consume(rb, MUX_FRAME_HEADER_SIZE);
-	T_EXPECT_EQ(rb->off, (size_t)MUX_FRAME_HEADER_SIZE);
-	T_EXPECT_EQ(
-		bytebuf_readable(rb),
-		sizeof(bytes) - (size_t)MUX_FRAME_HEADER_SIZE);
+	correct = (rb->off == (size_t)MUX_FRAME_HEADER_SIZE) && correct;
+	correct = (bytebuf_readable(rb) ==
+		   sizeof(bytes) - (size_t)MUX_FRAME_HEADER_SIZE) &&
+		  correct;
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* mux_bytebuf_shrink reclaims a grown buffer down to the target, compacting the
  * live bytes to the front and preserving them. */
 T_DECLARE_CASE(test_bytebuf_shrink_reclaims_capacity)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(4096);
 	T_CHECK(rb != NULL);
 	memset(bytebuf_write_ptr(rb), 'X', 100);
 	bytebuf_produce(rb, 100);
 	bytebuf_consume(rb, 10); /* off=10, len=90: forces compaction */
-	T_EXPECT_EQ(rb->cap, (size_t)4096);
+	correct = (rb->cap == (size_t)4096) && correct;
 
 	mux_bytebuf_shrink(&rb, 256);
 
-	T_EXPECT_EQ(rb->cap, (size_t)256);
-	T_EXPECT_EQ(rb->off, (size_t)0);
-	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)90);
+	correct = (rb->cap == (size_t)256) && correct;
+	correct = (rb->off == (size_t)0) && correct;
+	correct = (bytebuf_readable(rb) == (size_t)90) && correct;
 	const unsigned char *const p = bytebuf_read_ptr(rb);
 	bool intact = true;
 	for (size_t i = 0; i < 90; i++) {
 		intact = intact && (p[i] == 'X');
 	}
-	T_EXPECT(intact);
+	correct = (intact) && correct;
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* mux_bytebuf_shrink never drops below the live byte count, even when the target is
  * smaller. */
 T_DECLARE_CASE(test_bytebuf_shrink_keeps_live_bytes)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(4096);
 	T_CHECK(rb != NULL);
 	memset(bytebuf_write_ptr(rb), 'Y', 500);
@@ -745,21 +812,26 @@ T_DECLARE_CASE(test_bytebuf_shrink_keeps_live_bytes)
 
 	mux_bytebuf_shrink(&rb, 256);
 
-	T_EXPECT_EQ(rb->cap, (size_t)500);
-	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)500);
+	correct = (rb->cap == (size_t)500) && correct;
+	correct = (bytebuf_readable(rb) == (size_t)500) && correct;
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* mux_bytebuf_shrink is a no-op when the capacity is already at or below target. */
 T_DECLARE_CASE(test_bytebuf_shrink_noop_when_small)
 {
+	bool correct = true;
 	struct bytebuf *rb = bytebuf_new(128);
 	T_CHECK(rb != NULL);
 
 	mux_bytebuf_shrink(&rb, 256);
 
-	T_EXPECT_EQ(rb->cap, (size_t)128);
+	correct = (rb->cap == (size_t)128) && correct;
 	bytebuf_free(rb);
+
+	T_EXPECT(correct);
 }
 
 /* bench - per-frame hot-path micro-benchmarks (opt-in: run with TESTING_BENCH set) */

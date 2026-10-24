@@ -91,10 +91,12 @@ static void run_probe_cycle(
 	const char *restrict label, const uint_fast64_t bytes)
 {
 	struct estimator_ctx *const restrict est = &ss->estimator;
+	const size_t sample =
+		(size_t)MIN((uintmax_t)bytes, (uintmax_t)SIZE_MAX);
 	const int_fast64_t sent_ns = clock_monotonic_ns();
 	if (est->ping_in_flight) {
 		if (sent_ns - est->last_probe_ns < MUX_PING_PROBE_TIMEOUT_NS) {
-			d->sample += (size_t)bytes;
+			d->sample += MIN(sample, SIZE_MAX - d->sample);
 			LOGD_F("PING in flight; accumulating %s sample, %zu bytes",
 			       label, d->sample);
 			return;
@@ -132,8 +134,8 @@ static void run_probe_cycle(
 		LOGD("failed to send PING; skipping estimator cycle");
 		return;
 	}
-	LOGD_F("probe starting, %s sample=%zu", label, (size_t)bytes);
-	d->sample = (size_t)bytes;
+	LOGD_F("probe starting, %s sample=%zu", label, sample);
+	d->sample = sample;
 }
 
 void mux_estimator_add(

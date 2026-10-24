@@ -120,6 +120,8 @@ struct mux_stream {
 		struct {
 			ev_io w_io;
 			ev_timer w_timeout;
+			/* Local frame allocation backoff; does not gate socket writes. */
+			ev_timer w_read_retry;
 			/* true once the non-blocking connect() has completed */
 			bool connected : 1;
 		} socket;

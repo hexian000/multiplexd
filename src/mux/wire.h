@@ -84,14 +84,14 @@ struct wire_ctx {
 #endif /* WITH_TLS */
 };
 
-/* Result of mux_wire_shutdown: indicates whether the TLS/TCP close handshake
- * completed, is still in progress, or encountered an unrecoverable error. */
+/* Result of mux_wire_shutdown: local shutdown progress.  Peer close
+ * confirmation is handled separately by mux_wire_wait_eof. */
 enum wire_shutdown_state {
 	/* Unrecoverable error; caller must reset the session. */
 	WIRE_SHUTDOWN_ERROR = -1,
-	/* TLS close_notify exchanged (or plain TCP): ready for TCP half-close. */
+	/* Local TLS close_notify flushed (when used) and TCP SHUT_WR issued. */
 	WIRE_SHUTDOWN_DONE = 0,
-	/* Handshake in progress; retry when I/O is ready (tls_want updated). */
+	/* Local shutdown in progress; retry when I/O is ready (tls_want updated). */
 	WIRE_SHUTDOWN_PENDING = 1,
 };
 
@@ -170,9 +170,10 @@ void mux_wire_tlsconn_free(struct tls_connection *restrict conn);
  * No-op in plain-TCP builds. */
 void mux_wire_conn_free(struct mux_session *restrict ss);
 
-/* Drive TLS close_notify (WITH_TLS) or issue TCP SHUT_WR; returns
+/* Flush the local TLS close_notify (when used), then issue TCP SHUT_WR; returns
  * WIRE_SHUTDOWN_PENDING when more I/O is needed, WIRE_SHUTDOWN_DONE
- * when shut down, or WIRE_SHUTDOWN_ERROR on error. */
+ * when local shutdown completes, or WIRE_SHUTDOWN_ERROR on error.
+ * Does not await the peer's close; use mux_wire_wait_eof for confirmation. */
 enum wire_shutdown_state mux_wire_shutdown(struct mux_session *restrict ss);
 
 /* Result of mux_wire_wait_eof. */

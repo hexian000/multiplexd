@@ -140,9 +140,14 @@ static bool deliver_push_payload(
 	const struct mux_header *restrict hdr, const size_t frame_size)
 {
 	COUNTER_ADD(ss->cnt.traffic.byt_push_recv, (uint_least64_t)hdr->length);
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
 	mux_stream_recv_copy(
 		s, bytebuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE,
 		hdr->length);
+	if (!session_guard_end(&guard)) {
+		return false;
+	}
 	if (session_streams_freed(ss)) {
 		return false;
 	}
@@ -185,7 +190,12 @@ static void process_syn_payload(
 				": fast-open payload exceeds granted credit:"
 				" length=%" PRIuLEAST16 " grant=%" PRIuLEAST32,
 				s->id, hdr->length, s->grant_sent);
+			struct mux_session_guard guard;
+			session_guard_begin(ss, &guard);
 			mux_stream_abort(s, MUX_STATUS_FLOW_CONTROL_ERROR);
+			if (!session_guard_end(&guard)) {
+				return;
+			}
 			/* mux_stream_abort can free the last active stream of a
 			 * draining session, whose shutdown resets this recvbuf -- do
 			 * not consume a ring it already reset. */
@@ -212,9 +222,6 @@ stream_report_established(struct mux_session *ss, struct mux_stream *s)
 	}
 	const int_fast64_t latency = clock_monotonic_ns() - s->syn_sent_ns;
 	s->syn_sent_ns = 0;
-	session_emit(
-		ss, MUX_EVENT_STREAM_ESTABLISHED,
-		(union mux_event_data){ .stream_established.ns = latency });
 	if (LOGLEVEL(DEBUG)) {
 		char stream_tag_[256];
 		char latency_str[32];
@@ -226,6 +233,9 @@ stream_report_established(struct mux_session *ss, struct mux_stream *s)
 		LOG_F(DEBUG, "%s stream connected, latency=%s", stream_tag_,
 		      latency_str);
 	}
+	session_emit(
+		ss, MUX_EVENT_STREAM_ESTABLISHED,
+		(union mux_event_data){ .stream_established.ns = latency });
 }
 
 static void dispatch_by_stream(
@@ -324,7 +334,12 @@ static void dispatch_by_stream(
 	 * SYN|ACK carries its own window update in the SYN branch below. */
 	if ((flags & MUX_FLAG_ACK) && !(flags & MUX_FLAG_SYN)) {
 		s->unacked_bytes = 0;
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		mux_stream_recv_window(s, hdr->extra);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 		/* mux_stream_recv_window() may mux_stream_abort on a spec §6.6 excessive-
 		 * credit overflow; on the last active stream of a draining session
 		 * that cascades into mux_sched_free_streams() (frees s) +
@@ -358,7 +373,12 @@ static void dispatch_by_stream(
 		/* Clear unacked bytes before mux_stream_recv_window so its watcher
 		 * update and wakeup see the unlocked Nagle state. */
 		s->unacked_bytes = 0;
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		mux_stream_recv_window(s, hdr->extra);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
 		/* Defense-in-depth, mirroring the ACK-only guard above: a SYN|ACK
 		 * grant on the initial send window cannot overflow §6.6 today (a
 		 * SYN_SENT stream has been granted no prior credit), but keep every
@@ -376,7 +396,16 @@ static void dispatch_by_stream(
 				ss,
 				mux_estimator_tx_window_size(&ss->estimator));
 		}
+		session_guard_begin(ss, &guard);
 		stream_report_established(ss, s);
+		if (!session_guard_end(&guard)) {
+			return;
+		}
+		/* The lifecycle callback may shut down the session, freeing or
+		 * orphaning s and discarding the receive buffer. */
+		if (session_streams_freed(ss)) {
+			return;
+		}
 		mux_stream_start(s);
 		process_syn_payload(ss, s, hdr, frame_size);
 		return;
@@ -735,7 +764,12 @@ static void dispatch_frame(struct mux_session *ss)
 
 		/* Dispatch hello frames (version = 0). */
 		if (hdr.version == 0) {
+			struct mux_session_guard guard;
+			session_guard_begin(ss, &guard);
 			mux_handshake_process_hello(ss, &hdr, frame_size);
+			if (!session_guard_end(&guard)) {
+				return;
+			}
 			if (ss->state == SESSION_CLOSED) {
 				return;
 			}
@@ -814,10 +848,15 @@ static void dispatch_frame(struct mux_session *ss)
 
 		struct mux_stream *const s =
 			mux_sched_find_stream(ss, hdr.stream_id);
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
 		if (s != NULL) {
 			dispatch_by_stream(ss, s, &hdr);
 		} else {
 			dispatch_no_stream(ss, &hdr);
+		}
+		if (!session_guard_end(&guard)) {
+			return;
 		}
 		if (ss->state != SESSION_ESTABLISHED) {
 			return;
@@ -897,13 +936,26 @@ static bool recv_one(struct mux_session *ss)
 
 void mux_session_on_recv(struct mux_session *ss)
 {
-	if (recv_one(ss)) {
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
+	const bool received = recv_one(ss);
+	if (guard.session == NULL) {
+		return;
+	}
+	if (received) {
 		while (ss->state == SESSION_ESTABLISHED &&
 		       mux_wire_has_pending(ss)) {
-			if (!recv_one(ss)) {
+			const bool more = recv_one(ss);
+			if (guard.session == NULL) {
+				return;
+			}
+			if (!more) {
 				break;
 			}
 		}
+	}
+	if (!session_guard_end(&guard)) {
+		return;
 	}
 	/* Reclaim capacity grown for oversized frames; floor is one read-ahead
 	 * window plus one partial frame to avoid regrowth churn. */

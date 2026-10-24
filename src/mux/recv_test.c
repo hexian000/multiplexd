@@ -565,6 +565,11 @@ static void rf_teardown(struct recv_fixture *restrict fx)
 	}
 }
 
+static void rf_cleanup(void *data)
+{
+	rf_teardown(data);
+}
+
 /* Write one frame (header + zeroed payload) into the receive ring. */
 static void push_frame(
 	struct recv_fixture *restrict fx, const struct mux_header *restrict hdr)
@@ -771,11 +776,12 @@ T_DECLARE_CASE(test_update_session_window_clears_stall_on_growth)
 
 T_DECLARE_CASE(test_update_stream_window_grows_and_iterates)
 {
-	struct recv_fixture fx;
+	static struct recv_fixture fx;
 	if (rf_setup(&fx) != 0) {
 		T_FATAL("rf_setup failed");
 		return;
 	}
+	T_CLEANUP(rf_cleanup, &fx);
 	/* Two streams in the table (the fixture provides an empty one): one below
 	 * the new window (grown by the callback) and one already above it (left
 	 * untouched, the early return). */
@@ -786,13 +792,15 @@ T_DECLARE_CASE(test_update_stream_window_grows_and_iterates)
 	s_high.recv_window =
 		100u * MUX_WINDOW_UNIT; /* already past the target */
 	void *elem = &s_low;
-	fx.ss.sched.streams = table_set(
+	struct hashtable *const table = table_set(
 		fx.ss.sched.streams, (const void *)(uintptr_t)s_low.id, &elem);
-	T_EXPECT(fx.ss.sched.streams != NULL);
+	T_CHECK(table != NULL && elem == NULL);
+	fx.ss.sched.streams = table;
 	elem = &s_high;
-	fx.ss.sched.streams = table_set(
+	struct hashtable *const next = table_set(
 		fx.ss.sched.streams, (const void *)(uintptr_t)s_high.id, &elem);
-	T_EXPECT(fx.ss.sched.streams != NULL);
+	T_CHECK(next != NULL && elem == NULL);
+	fx.ss.sched.streams = next;
 
 	fx.ss.stream_window = 1;
 	session_update_stream_window(&fx.ss, (size_t)5u * MUX_WINDOW_UNIT);
@@ -1035,6 +1043,40 @@ T_DECLARE_CASE(test_dispatch_by_stream_synack_reports_established_once)
 	/* The one-shot reset ran, so the replay reported nothing further. */
 	T_EXPECT_EQ(syn_sent_after, (int_least64_t)0);
 	T_EXPECT_EQ(event_calls_second, 1);
+}
+
+static void shutdown_on_stream_established(
+	void *data, struct mux_session *ss, enum mux_event event,
+	union mux_event_data edata)
+{
+	event_spy_cb(data, ss, event, edata);
+	table_free(ss->sched.streams);
+	ss->sched.streams = NULL;
+	bytebuf_reset(ss->wire.recvbuf);
+}
+
+T_DECLARE_CASE(test_dispatch_by_stream_synack_callback_teardown)
+{
+	struct recv_fixture fx;
+	T_CHECK(rf_setup(&fx) == 0);
+	fx.ss.callbacks.on_event = shutdown_on_stream_established;
+	struct mux_stream s = make_stream(1, STREAM_SYN_SENT);
+	s.syn_sent_ns = clock_monotonic_ns();
+	struct mux_header h = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_SYN | MUX_FLAG_ACK | MUX_FLAG_PUSH,
+		.stream_id = 1,
+		.extra = 3,
+		.length = 4,
+	};
+	push_frame(&fx, &h);
+	dispatch_by_stream(&fx.ss, &s, &h);
+	const bool discarded = bytebuf_readable(fx.ss.wire.recvbuf) == 0;
+	rf_teardown(&fx);
+	T_EXPECT_EQ(g.event_calls, 1);
+	T_EXPECT_EQ(g.stream_start_calls, 0);
+	T_EXPECT_EQ(g.recv_copy_calls, 0);
+	T_EXPECT(discarded);
 }
 
 T_DECLARE_CASE(test_dispatch_by_stream_synack_idempotent)
@@ -1422,18 +1464,20 @@ T_DECLARE_CASE(test_dispatch_no_stream_draining_refuses)
 
 T_DECLARE_CASE(test_dispatch_no_stream_max_streams_refuses)
 {
-	struct recv_fixture fx;
+	static struct recv_fixture fx;
 	if (rf_setup(&fx) != 0) {
 		T_FATAL("rf_setup failed");
 		return;
 	}
 	fx.ss.accepted = true;
 	fx.ss.conf.max_streams = 1;
+	T_CLEANUP(rf_cleanup, &fx);
 	/* Populate the fixture's table so its size reaches the cap. */
 	void *elem = (void *)(uintptr_t)0x1;
-	fx.ss.sched.streams = table_set(
+	struct hashtable *const table = table_set(
 		fx.ss.sched.streams, (const void *)(uintptr_t)9, &elem);
-	T_EXPECT(fx.ss.sched.streams != NULL);
+	T_CHECK(table != NULL && elem == NULL);
+	fx.ss.sched.streams = table;
 
 	struct mux_header h = { .version = MUX_PROTOCOL_VERSION,
 				.flags = MUX_FLAG_SYN,
@@ -3305,6 +3349,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_dispatch_by_stream_invalid_flags_rst_oom_retryable),
 	T_CASE(test_dispatch_by_stream_synack_establishes),
 	T_CASE(test_dispatch_by_stream_synack_reports_established_once),
+	T_CASE(test_dispatch_by_stream_synack_callback_teardown),
 	T_CASE(test_dispatch_by_stream_synack_idempotent),
 	T_CASE(test_dispatch_by_stream_push_fin),
 	T_CASE(test_dispatch_by_stream_push_fin_survives_stream_freed),

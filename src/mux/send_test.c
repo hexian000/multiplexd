@@ -2546,13 +2546,15 @@ T_DECLARE_CASE(test_send_stage_next_alternates_dgram_and_data)
 	static const char k_expect[] = "DGDGGG";
 	char order[sizeof(k_expect) + 1] = { 0 };
 	size_t n = 0;
+	bool stalled_ctrl_flushed = false;
 	for (;;) {
 		bool progress = false;
 		bool retransmitting = false;
 		const int data_before = g_sched_next_data_frames;
 		const int push_before = g_sendbuf_push_calls;
-		const enum send_stage r =
-			send_stage_next(&fx.ss, &progress, &retransmitting);
+		const enum send_stage r = send_stage_next(
+			&fx.ss, &progress, &retransmitting,
+			&stalled_ctrl_flushed);
 		if (r != SEND_STAGE_PRODUCED || n >= sizeof(order) - 1) {
 			break;
 		}
@@ -2588,8 +2590,9 @@ T_DECLARE_CASE(test_send_stage_next_dgram_bypasses_stall)
 
 	bool progress = false;
 	bool retransmitting = false;
-	const enum send_stage r =
-		send_stage_next(&fx.ss, &progress, &retransmitting);
+	bool stalled_ctrl_flushed = false;
+	const enum send_stage r = send_stage_next(
+		&fx.ss, &progress, &retransmitting, &stalled_ctrl_flushed);
 	const int pushed = g_sendbuf_push_calls;
 	const int next_data = g_sched_next_data_calls;
 	const int flush_ctrl = g_sched_flush_ctrl_calls;
@@ -2600,6 +2603,91 @@ T_DECLARE_CASE(test_send_stage_next_dgram_bypasses_stall)
 	T_EXPECT_EQ(pushed, 1);
 	T_EXPECT_EQ(next_data, 0);
 	T_EXPECT_EQ(flush_ctrl, 1);
+	T_EXPECT(drained);
+}
+
+/* A stalled pump needs one control scan even when datagrams keep the pump
+ * running. A later callback must scan again for newly pending ACK/FIN. */
+T_DECLARE_CASE(test_stalled_dgram_pump_flushes_ctrl_once_per_callback)
+{
+	static const int counts[] = { 0, 1, 64 };
+	for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++) {
+		for (int first_dgram = 0; first_dgram < 2; first_dgram++) {
+			struct si_fixture fx;
+			if (si_setup_dgram(&fx, 64) != 0) {
+				T_FATAL("si_setup_dgram failed");
+				return;
+			}
+			spies_reset();
+			fx.ss.unacked.stalled = true;
+			fx.ss.wire.dgram_turn = first_dgram != 0;
+			g_sched_next_data_frames = 2;
+			mux_counter sent = 0;
+			fx.ss.cnt.dgram.pkt_dgram_sent = &sent;
+			for (int i = 0; i < counts[c]; i++) {
+				T_CHECK(mux_session_send_dgram(
+					&fx.ss, MUX_FLAG_PUSH, 5, "x", 1));
+			}
+
+			mux_session_on_send(&fx.ss);
+			const int first_scans = g_sched_flush_ctrl_calls;
+			const bool first_drained =
+				fx.ss.wire.dgrambuf.head == NULL &&
+				fx.ss.wire.sendbuf.head == NULL;
+			const uint_least64_t first_sent = (uint_least64_t)sent;
+
+			T_CHECK(mux_session_send_dgram(
+				&fx.ss, MUX_FLAG_PUSH, 7, "y", 1));
+			mux_session_on_send(&fx.ss);
+			const int second_scans = g_sched_flush_ctrl_calls;
+			const int data_calls = g_sched_next_data_calls;
+			const bool second_drained =
+				fx.ss.wire.dgrambuf.head == NULL &&
+				fx.ss.wire.sendbuf.head == NULL;
+			si_teardown(&fx);
+
+			T_EXPECT_EQ(first_scans, 1);
+			T_EXPECT(first_drained);
+			T_EXPECT_EQ(first_sent, (uint_least64_t)counts[c]);
+			T_EXPECT_EQ(second_scans, 2);
+			T_EXPECT_EQ(data_calls, 0);
+			T_EXPECT(second_drained);
+		}
+	}
+}
+
+/* Transport blockage ends the pump. The next writable callback must repeat
+ * the control scan while draining the remaining datagrams. */
+T_DECLARE_CASE(test_stalled_dgram_pump_rescans_after_transport_block)
+{
+	struct si_fixture fx;
+	if (si_setup_dgram(&fx, 8) != 0) {
+		T_FATAL("si_setup_dgram failed");
+		return;
+	}
+	spies_reset();
+	fx.ss.unacked.stalled = true;
+	for (int i = 0; i < 4; i++) {
+		T_CHECK(mux_session_send_dgram(
+			&fx.ss, MUX_FLAG_PUSH, 5, "x", 1));
+	}
+	g_wire_send_nsend = 0;
+	mux_session_on_send(&fx.ss);
+	const int blocked_scans = g_sched_flush_ctrl_calls;
+	const size_t remaining = fx.ss.wire.dgrambuf.count;
+	const bool blocked = fx.ss.wire.send_blocked;
+
+	g_wire_send_nsend = SIZE_MAX;
+	mux_session_on_send(&fx.ss);
+	const int resumed_scans = g_sched_flush_ctrl_calls;
+	const bool drained = fx.ss.wire.dgrambuf.head == NULL &&
+			     fx.ss.wire.sendbuf.head == NULL;
+	si_teardown(&fx);
+
+	T_EXPECT_EQ(blocked_scans, 1);
+	T_EXPECT_EQ(remaining, (size_t)3);
+	T_EXPECT(blocked);
+	T_EXPECT_EQ(resumed_scans, 2);
 	T_EXPECT(drained);
 }
 
@@ -2914,6 +3002,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_send_dgram_drops),
 	T_CASE(test_send_stage_next_alternates_dgram_and_data),
 	T_CASE(test_send_stage_next_dgram_bypasses_stall),
+	T_CASE(test_stalled_dgram_pump_flushes_ctrl_once_per_callback),
+	T_CASE(test_stalled_dgram_pump_rescans_after_transport_block),
 	T_CASE(test_drop_dgrams_counts_datagrams),
 	T_CASE(test_session_flush_resp_noop_before_established),
 	T_CASE(test_session_flush_resp_noop_without_tx_pending),
