@@ -392,8 +392,9 @@ void server_stop(struct server *s);
  * s->conf since a reload may have replaced it. */
 void server_free(struct server *s);
 
-/* Allocate a consistent snapshot of all server statistics (caller frees);
- * NULL on OOM (logged).
+/* Allocate approximate server statistics (caller frees); NULL on OOM (logged).
+ * Fields and tunnels are sampled independently and may reflect different
+ * updates; no coherent cross-field snapshot is guaranteed.
  *
  * @p want_tunnel_latency additionally derives each tunnel's own
  * stream_establish_p50/p90/p99 from its latency ring, which sorts up to

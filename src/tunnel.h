@@ -69,7 +69,10 @@ struct tunnel_context {
  *
  * With threads, relayed events are posted to the owner's task ring in order.
  * An event the full ring refuses is retried, not dropped, until the owner
- * closes the tunnel. */
+ * closes the tunnel. Allocation failure terminates this tunnel instance and
+ * disables reconnect/resume: intermediate callbacks and their latency/log
+ * records may be lost, but CLOSED is delivered without allocation, retrying a
+ * full ring until delivery or explicit owner teardown. */
 struct tunnel_callbacks {
 	void (*on_event)(
 		void *data, struct tunnel *t, enum mux_event,
@@ -305,7 +308,9 @@ struct tunnel_stats {
 	int_least64_t stream_establish_p99;
 };
 
-/* Populate *out with a consistent snapshot of this tunnel's own statistics.
+/* Populate *out with approximate statistics for this tunnel. Fields are
+ * individually sampled and may reflect different updates; no coherent
+ * cross-field snapshot is guaranteed.
  * out->peer_identity and out->num_tunnels are server-level facts this function
  * does not touch, and the stream_establish percentiles are derived by
  * server_stats(); the caller owns those and sets them around this call.  Every
@@ -330,8 +335,11 @@ struct tunnel_reload_opts {
 #if WITH_TLS
 	/* When non-NULL, the new per-tunnel TLS context, whose ownership transfers
 	 * to tunnel_reload(): the tunnel adopts it and frees its previous one.
-	 * NULL leaves the current context in place. */
+	 * NULL leaves the current context in place unless update_tlsctx is set. */
 	struct tls_context *tlsctx;
+	/* Replace the context even when tlsctx is NULL, selecting plaintext for
+	 * the next connection. The current transport keeps its I/O mode. */
+	bool update_tlsctx;
 #endif
 	struct conf_socket_opts mux_socket;
 	struct conf_socket_opts local_socket;

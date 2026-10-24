@@ -149,13 +149,16 @@ struct tunnel {
 	 * lifetime fence is thrd_join(). */
 #if WITH_THREADS
 	atomic_bool relay_disconnected;
+	/* OOM makes this instance terminal. Also read by the owner to discard
+	 * queued intermediate callbacks, and by other tunnels before resume. */
+	atomic_bool relay_failed;
 	/* Relay backlog: events the relay loop's ring refused, oldest first,
 	 * re-posted by w_relay_retry.  Only this tunnel's thread touches them
 	 * until tunnel_close_final() has joined it. */
 	struct relayed_event *relay_head;
 	struct relayed_event *relay_tail;
 	ev_timer w_relay_retry;
-#endif
+#endif /* WITH_THREADS */
 
 	/* Callback data passed to wrapped callbacks. */
 	void *callback_data;
@@ -571,8 +574,23 @@ static void relay_dispatch(void *p)
 	const union mux_event_data data = ev->data;
 	free(ev);
 	if (!atomic_load_explicit(
-		    &t->relay_disconnected, memory_order_relaxed)) {
+		    &t->relay_disconnected, memory_order_relaxed) &&
+	    !atomic_load_explicit(&t->relay_failed, memory_order_relaxed)) {
 		relay_invoke(t, event, data);
+	}
+}
+
+/* Allocation-independent terminal task. The owner closes t from this callback;
+ * its join and dispatcher drain fence this task just like ordinary relays. */
+static void relay_terminal_dispatch(void *p)
+{
+	struct tunnel *const t = p;
+	if (!atomic_load_explicit(
+		    &t->relay_disconnected, memory_order_relaxed) &&
+	    relay_wanted(t, MUX_EVENT_CLOSED)) {
+		relay_invoke(
+			t, MUX_EVENT_CLOSED,
+			(union mux_event_data){ .closed.err = ENOMEM });
 	}
 }
 
@@ -606,6 +624,19 @@ static void relay_retry_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 		ev_timer_stop(loop, w);
 		return;
 	}
+	if (atomic_load_explicit(&t->relay_failed, memory_order_relaxed)) {
+		/* Outside the session's event callback: reset closes the transport
+		 * and streams without freeing the session or allocating a relay.
+		 * Keep ss alive for already-queued control tasks until owner teardown. */
+		mux_session_reset(t->ss);
+		udp_flows_reset(t->flows);
+		if (t->relay.parent.post_task(
+			    t->relay.parent.user,
+			    (struct task){ relay_terminal_dispatch, t })) {
+			ev_timer_stop(loop, w);
+		}
+		return;
+	}
 	while (t->relay_head != NULL) {
 		struct relayed_event *const ev = t->relay_head;
 		struct relayed_event *const next = ev->next;
@@ -631,12 +662,25 @@ static void relay_event(
 		return;
 	}
 #if WITH_THREADS
-	if (atomic_load_explicit(&t->relay_disconnected, memory_order_relaxed)) {
+	if (atomic_load_explicit(&t->relay_disconnected, memory_order_relaxed) ||
+	    atomic_load_explicit(&t->relay_failed, memory_order_relaxed)) {
 		return;
 	}
 	struct relayed_event *const restrict ev = malloc(sizeof(*ev));
 	if (ev == NULL) {
-		LOGOOM();
+		TUNNEL_LOG_F(
+			ERROR, t,
+			"tunnel %" PRIuLEAST64
+			": OOM relaying lifecycle event %d; terminating",
+			t->tunnel_index, (int)event);
+		atomic_store_explicit(
+			&t->relay_failed, true, memory_order_relaxed);
+		t->shutting_down = true;
+		t->redial_on_closed = false;
+		ev_timer_stop(t->loop, &t->w_reconnect);
+		ev_timer_stop(t->loop, &t->w_park);
+		relay_backlog_free(t);
+		ev_timer_again(t->loop, &t->w_relay_retry);
 		return;
 	}
 	*ev = (struct relayed_event){
@@ -1118,6 +1162,11 @@ static void tunnel_on_event(
 	union mux_event_data edata)
 {
 	struct tunnel *t = data;
+#if WITH_THREADS
+	if (atomic_load_explicit(&t->relay_failed, memory_order_relaxed)) {
+		return;
+	}
+#endif
 
 	/* Any lifecycle event may end the redial the parked connections wait on.
 	 * Settle them from the loop rather than here: this callback runs inside
@@ -1339,7 +1388,13 @@ static void tunnel_resume_attach_task(void *p)
 	 * *exclusive*, which cannot proceed until the shared lock this post ran
 	 * under is released, so the teardown task is enqueued strictly after this
 	 * attach task in old_t's queue -- old_t->ss is still live here. */
-	mux_resume_attach(arg->old_t->ss, &arg->transport, arg->resume_seq);
+	if (atomic_load_explicit(
+		    &arg->old_t->relay_failed, memory_order_relaxed)) {
+		mux_transport_discard(&arg->transport);
+	} else {
+		mux_resume_attach(
+			arg->old_t->ss, &arg->transport, arg->resume_seq);
+	}
 	free(arg);
 }
 #endif /* WITH_THREADS */
@@ -1353,6 +1408,9 @@ static bool tunnel_handoff_resume(
 	const uint_least32_t resume_seq)
 {
 #if WITH_THREADS
+	if (atomic_load_explicit(&old_t->relay_failed, memory_order_relaxed)) {
+		return false;
+	}
 	/* Allocate before detaching: a transport taken off new_ss and then not
 	 * handed off would leave the session with nothing to be served fresh on. */
 	struct resume_attach_arg *restrict arg = malloc(sizeof(*arg));
@@ -2155,7 +2213,11 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 		 * filtering dispatcher variant (contrib/csnippets, read-only). */
 		t->relay.parent.flush_tasks(t->relay.parent.user);
 	} else {
-		/* Thread never started; release the session here. */
+		/* No consumer ever ran: finish queued dispatches while their
+		 * session is still live, returning payloads and resolver holds.
+		 * The relay is disconnected, and no new connection is wanted. */
+		t->shutting_down = true;
+		dispatcher_tick(t->disp);
 		tunnel_close_session(t);
 		ev_async_stop(t->loop, &t->w_async);
 	}
@@ -2482,8 +2544,9 @@ struct reload_arg {
 	struct mux_session_config conf;
 #if WITH_TLS
 	/* New per-tunnel TLS context; owned (adopted in reload_task, freed on the
-	 * failure paths). NULL leaves the current context in place. */
+	 * failure paths). update_tlsctx allows replacement with NULL. */
 	struct tls_context *tlsctx;
+	bool update_tlsctx;
 #endif
 	struct conf_socket_opts mux_socket;
 	struct conf_socket_opts local_socket;
@@ -2553,14 +2616,14 @@ static void reload_task(void *p)
 	 * reload).  mux_set_tlsctx() below repoints the wire to it, after which the
 	 * old one is safe to free here on this (the owning) thread. */
 	struct tls_context *old_tlsctx = NULL;
-	if (arg->tlsctx != NULL) {
+	if (arg->update_tlsctx) {
 		old_tlsctx = t->tlsctx;
 		t->tlsctx = arg->tlsctx;
 	}
 #endif /* WITH_TLS */
 	mux_set_config(arg->ss, &arg->conf);
 #if WITH_TLS
-	if (arg->tlsctx != NULL) {
+	if (arg->update_tlsctx) {
 		mux_set_tlsctx(arg->ss, arg->tlsctx);
 	}
 	tls_ctx_free(old_tlsctx);
@@ -2596,6 +2659,7 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		.conf = opts->conf,
 #if WITH_TLS
 		.tlsctx = opts->tlsctx,
+		.update_tlsctx = opts->update_tlsctx || opts->tlsctx != NULL,
 #endif
 		.mux_socket = opts->mux_socket,
 		.local_socket = opts->local_socket,

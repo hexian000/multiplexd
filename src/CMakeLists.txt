@@ -328,8 +328,9 @@ add_src_test(server_test
 )
 target_link_libraries(server_test PRIVATE mux)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_options(server_test PRIVATE "-Wl,--wrap=realloc")
-    target_compile_definitions(server_test PRIVATE SERVER_TEST_WRAP_REALLOC=1)
+    set_property(TARGET server_test PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
+    target_link_options(server_test PRIVATE "-Wl,--wrap=realloc,--wrap=server_stats,--wrap=tunnel_stats,--wrap=strdup")
+    target_compile_definitions(server_test PRIVATE SERVER_TEST_WRAP_SYMBOLS=1)
 endif()
 
 add_src_test(api_server_test

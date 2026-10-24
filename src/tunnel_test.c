@@ -13,8 +13,14 @@
 #include "mux/mux.h"
 #include "mux/session.h"
 #include "mux/stream.h"
+#if WITH_TLS
+#include "mux/wire.h"
+#include "shim/tls.h"
+#endif
 #include "server.h"
+#include "udp.h"
 
+#include "algo/hashtable.h"
 #include "meta/arraysize.h"
 #include "os/socket.h"
 #if WITH_THREADS
@@ -51,6 +57,20 @@
 #include <unistd.h>
 
 #if WITH_THREADS
+static _Thread_local bool relay_fail_allocations;
+static _Thread_local size_t relay_failed_allocations;
+
+static void *relay_test_malloc(const size_t size)
+{
+	if (relay_fail_allocations) {
+		relay_failed_allocations++;
+		errno = ENOMEM;
+		return NULL;
+	}
+	return malloc(size);
+}
+
+#define malloc relay_test_malloc
 static bool
 ring_probe_dispatcher_invoke(struct dispatcher *d, struct task task);
 
@@ -68,11 +88,38 @@ static char *capacity_test_strdup(const char *text)
 	return strdup(text);
 }
 
+#if WITH_THREADS
+static unsigned char dgram_delivered[8];
+static size_t dgram_delivered_count;
+static size_t dgram_discarded_count;
+static void dgram_probe_input(struct udp_flows *flows, struct udp_dgram *d);
+static void dgram_probe_free(struct udp_dgram *d);
+#define udp_flows_input dgram_probe_input
+#define udp_dgram_free dgram_probe_free
+#endif
 #define strdup capacity_test_strdup
 #include "tunnel.c"
 #undef strdup
 #if WITH_THREADS
+#undef udp_flows_input
+#undef udp_dgram_free
+static void dgram_probe_input(struct udp_flows *flows, struct udp_dgram *d)
+{
+	if (d->len > 0 && dgram_delivered_count < ARRAY_SIZE(dgram_delivered)) {
+		dgram_delivered[dgram_delivered_count] = d->data[0];
+	}
+	dgram_delivered_count++;
+	udp_flows_input(flows, d);
+}
+
+static void dgram_probe_free(struct udp_dgram *d)
+{
+	dgram_discarded_count++;
+	udp_dgram_free(d);
+}
+
 #undef dispatcher_invoke
+#undef malloc
 #endif /* WITH_THREADS */
 
 static const struct mux_session_config g_conf = {
@@ -263,6 +310,35 @@ static bool wait_for_reconnects(
 }
 #endif /* !WITH_THREADS */
 
+#if !WITH_THREADS
+static void listener_ready_cb(struct ev_loop *loop, ev_io *w, int revents)
+{
+	(void)revents;
+	*(bool *)w->data = true;
+	ev_break(loop, EVBREAK_ONE);
+}
+
+static bool wait_for_listener(struct ev_loop *loop, int fd, double timeout)
+{
+	bool ready = false;
+	bool timed_out = false;
+	ev_io io;
+	ev_io_init(&io, listener_ready_cb, fd, EV_READ);
+	io.data = &ready;
+	ev_timer guard;
+	ev_timer_init(&guard, reconnect_timeout_cb, timeout, 0.0);
+	guard.data = &timed_out;
+	ev_io_start(loop, &io);
+	ev_timer_start(loop, &guard);
+	while (!ready && !timed_out) {
+		ev_run(loop, EVRUN_ONCE);
+	}
+	ev_timer_stop(loop, &guard);
+	ev_io_stop(loop, &io);
+	return ready;
+}
+#endif
+
 /* Capacity callbacks run only on these unstarted tunnels' test-owned loops. */
 static bool capacity_test_reserve(void *user)
 {
@@ -305,30 +381,40 @@ T_DECLARE_CASE(test_tunnel_capacity_creation_failure_and_teardown)
 	capacity_fail_strdup = target;
 	struct tunnel *const failed = tunnel_new(&ctx, &opts);
 	capacity_fail_strdup = NULL;
-	T_EXPECT(failed == NULL);
+	const bool creation_failed = failed == NULL;
 	if (failed != NULL) {
 		tunnel_close(failed);
 	}
-	T_EXPECT_EQ(srv.session_slots, (size_t)0);
-	T_EXPECT_EQ(srv.counters.num_rejected, (uint_least64_t)1);
+	const size_t slots_after_failure = srv.session_slots;
+	const uint_least64_t rejected_after_failure = srv.counters.num_rejected;
 	struct tunnel *const outbound = tunnel_new(&ctx, &opts);
 	T_CHECK(outbound != NULL);
-	T_EXPECT_EQ(srv.session_slots, (size_t)1);
+	const size_t slots_after_create = srv.session_slots;
 	struct tunnel *const blocked = tunnel_new(&ctx, &opts);
 	const int blocked_error = errno;
 	if (blocked != NULL) {
 		tunnel_close(blocked);
 	}
-	T_EXPECT(blocked == NULL);
-	T_EXPECT_EQ(blocked_error, ENOSPC);
-	T_EXPECT(tunnel_admit_session(outbound));
-	T_EXPECT_EQ(srv.session_slots, (size_t)1);
+	const bool capacity_blocked = blocked == NULL;
+
+	const bool admitted = tunnel_admit_session(outbound);
+	const size_t slots_after_admit = srv.session_slots;
 	tunnel_close(outbound);
-	T_EXPECT_EQ(srv.session_slots, (size_t)0);
-	T_EXPECT_EQ(srv.counters.num_rejected, (uint_least64_t)2);
+	const size_t slots_after_close = srv.session_slots;
+	const uint_least64_t rejected_after_close = srv.counters.num_rejected;
 #if !WITH_THREADS
 	ev_loop_destroy(srv.loop);
 #endif
+	T_EXPECT(creation_failed);
+	T_EXPECT_EQ(slots_after_failure, (size_t)0);
+	T_EXPECT_EQ(rejected_after_failure, (uint_least64_t)1);
+	T_EXPECT_EQ(slots_after_create, (size_t)1);
+	T_EXPECT(capacity_blocked);
+	T_EXPECT_EQ(blocked_error, ENOSPC);
+	T_EXPECT(admitted);
+	T_EXPECT_EQ(slots_after_admit, (size_t)1);
+	T_EXPECT_EQ(slots_after_close, (size_t)0);
+	T_EXPECT_EQ(rejected_after_close, (uint_least64_t)2);
 }
 
 T_DECLARE_CASE(test_tunnel_new_close_no_start)
@@ -370,15 +456,19 @@ T_DECLARE_CASE(test_tunnel_new_close_no_start)
 
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	T_CHECK(t != NULL);
+	const size_t queued_startups = srv.counters.num_session_halfopen;
 
 	/* fds[0] is owned by the tunnel; close only the other end. */
 	(void)close(fds[1]);
 
 	tunnel_close(t);
+	const size_t closed_startups = srv.counters.num_session_halfopen;
 
 #if !WITH_THREADS
 	ev_loop_destroy(loop);
 #endif
+	T_EXPECT_EQ(queued_startups, (size_t)1);
+	T_EXPECT_EQ(closed_startups, (size_t)0);
 }
 
 T_DECLARE_CASE(test_tunnel_accessors_after_new)
@@ -1132,6 +1222,93 @@ T_DECLARE_CASE(test_tunnel_on_demand_redials_after_close_in_flight)
 	T_EXPECT(closed_after_attempt);
 }
 
+#if WITH_TLS
+T_DECLARE_CASE(test_tunnel_reload_clears_tls_context_for_next_connection)
+{
+	static const unsigned char key[TLS_PSK_MIN_LEN] = { 1 };
+	const struct tls_config tls_conf = { .psk = key,
+					     .psk_len = sizeof(key) };
+	struct tls_context *const original = tls_ctx_client(&tls_conf);
+	T_CHECK(original != NULL);
+	struct server srv = { 0 };
+#if !WITH_THREADS
+	srv.loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(srv.loop != NULL);
+#endif
+	const struct tunnel_session_counters cnt =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.mux_conf = &g_conf,
+		.fd = -1,
+		.id = g_zero_id,
+		.connect_addr = "127.0.0.1:1",
+		.cnt = &cnt,
+		.tlsctx = original,
+	};
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+	struct tls_connection *const live = tls_client(original, -1);
+	T_CHECK(live != NULL);
+	const struct tls_callback callback = { 0 };
+	tls_set_callback(live, &callback);
+	t->ss->wire.tlsconn = live;
+	struct tunnel_reload_opts reload = { .conf = g_conf };
+	/* An omitted replacement preserves the context, including callers that
+	 * only reload socket/session options. */
+	tunnel_reload(t, &reload);
+#if WITH_THREADS
+	dispatcher_tick(t->disp);
+#endif
+	const bool preserved =
+		t->tlsctx == original && t->ss->wire.tlsctx == original;
+	/* Existing callers supplying a non-NULL handle still transfer it without
+	 * having to set the new flag. */
+	reload.tlsctx = tls_ctx_client(&tls_conf);
+	T_CHECK(reload.tlsctx != NULL);
+	tunnel_reload(t, &reload);
+#if WITH_THREADS
+	dispatcher_tick(t->disp);
+#endif
+	const bool adopted = t->tlsctx == reload.tlsctx &&
+			     t->ss->wire.tlsctx == reload.tlsctx;
+	/* Clearing twice is safe, and neither replacement changes the active
+	 * connection whose credentials it already owns. */
+	reload.tlsctx = NULL;
+	reload.update_tlsctx = true;
+	bool cleared = true;
+	bool live_preserved = true;
+	for (int i = 0; i < 2; i++) {
+		tunnel_reload(t, &reload);
+#if WITH_THREADS
+		dispatcher_tick(t->disp);
+#endif
+		cleared = cleared && t->tlsctx == NULL &&
+			  t->ss->wire.tlsctx == NULL;
+		live_preserved = live_preserved && t->ss->wire.tlsconn == live;
+	}
+	/* The old connection still works after both context handles were freed;
+	 * once it is gone, the next connection takes the plaintext path. */
+	const enum tls_error handshake = tls_handshake(live);
+	mux_wire_conn_free(t->ss);
+	const bool next_plain =
+		mux_wire_tls_start(t->ss) && t->ss->wire.tlsconn == NULL;
+	tunnel_close(t);
+#if !WITH_THREADS
+	ev_loop_destroy(srv.loop);
+#endif
+	T_EXPECT(preserved);
+	T_EXPECT(adopted);
+	T_EXPECT(cleared);
+	T_EXPECT(live_preserved);
+	T_EXPECT(
+		handshake == TLS_ERROR_WANT_READ ||
+		handshake == TLS_ERROR_WANT_WRITE);
+	T_EXPECT(next_plain);
+}
+#endif /* WITH_TLS */
+
 /* tunnel.h documents update_connect_addr with a NULL address as "clears and
  * disables reconnect", but reload_task only cleared it -- a backoff timer armed
  * before the reload then fired into tunnel_do_connect with no address, and that
@@ -1411,6 +1588,7 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 	T_CHECK(lfd >= 0);
 	T_CHECK(bind(lfd, (struct sockaddr *)&laddr, sizeof(laddr)) == 0);
 	T_CHECK(listen(lfd, 1) == 0);
+	T_CHECK(socket_set_nonblock(lfd) == 0);
 	socklen_t laddrlen = sizeof(laddr);
 	T_CHECK(getsockname(lfd, (struct sockaddr *)&laddr, &laddrlen) == 0);
 	char connect_addr[32];
@@ -1451,25 +1629,23 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 	T_CHECK(tunnel_start(t));
 
 	/* Accept the initial connection and immediately close it. */
-#if WITH_THREADS
 	bool accept_ready;
-#endif
 	{
 #if !WITH_THREADS
-		/* tunnel_do_connect ran inline in tunnel_start; the TCP connection
-		 * is already in the accept queue before we reach this point. */
-		const int cfd = accept(lfd, NULL, NULL);
-		if (cfd >= 0) {
-			(void)close(cfd);
+		accept_ready = wait_for_listener(srv.loop, lfd, 1.0);
+		if (accept_ready) {
+			const int cfd = accept(lfd, NULL, NULL);
+			accept_ready = cfd >= 0;
+			if (cfd >= 0) {
+				(void)close(cfd);
+			}
 		}
 #else /* WITH_THREADS */
 		struct pollfd pfd = { .fd = lfd, .events = POLLIN };
 		accept_ready = poll(&pfd, 1, 1000) > 0;
-		/* lfd is a blocking listen socket, so only accept once poll has
-		 * reported a pending connection; on a poll timeout (loaded host,
-		 * or the connect failure this test probes) skip the accept and
-		 * let the T_EXPECT(accept_ready) below fail cleanly instead of
-		 * blocking forever. */
+		/* Wait for readiness rather than assuming the worker has
+		 * connected already. The nonblocking listener also bounds accept
+		 * if the pending connection disappears after poll returns. */
 		if (accept_ready) {
 			const int cfd = accept(lfd, NULL, NULL);
 			if (cfd >= 0) {
@@ -1501,10 +1677,10 @@ T_DECLARE_CASE(test_tunnel_reconnect_on_transport_lost)
 
 #if WITH_THREADS
 	dispatcher_destroy(srv.disp);
-	T_EXPECT(accept_ready);
 #else
 	ev_loop_destroy(loop);
 #endif
+	T_EXPECT(accept_ready);
 	T_EXPECT(reconnected);
 }
 
@@ -1899,6 +2075,8 @@ T_DECLARE_CASE(test_tunnel_open_stream_burst_not_dropped)
 struct relay_probe {
 	enum mux_event events[4];
 	size_t num_events;
+	size_t num_closed;
+	int closed_error;
 };
 
 static void relay_probe_on_event(
@@ -1906,8 +2084,11 @@ static void relay_probe_on_event(
 	const union mux_event_data edata)
 {
 	(void)t;
-	(void)edata;
 	struct relay_probe *const restrict probe = data;
+	if (event == MUX_EVENT_CLOSED) {
+		probe->num_closed++;
+		probe->closed_error = edata.closed.err;
+	}
 	if (probe->num_events < ARRAY_SIZE(probe->events)) {
 		probe->events[probe->num_events] = event;
 	}
@@ -2027,6 +2208,412 @@ T_DECLARE_CASE(test_tunnel_relay_retries_events_a_full_ring_refused)
 	T_EXPECT_EQ((int)probe.events[0], (int)MUX_EVENT_LOST);
 	T_EXPECT_EQ((int)probe.events[1], (int)MUX_EVENT_CLOSED);
 #endif /* WITH_THREADS */
+}
+
+#if WITH_THREADS
+static void
+relay_probe_on_connected(void *data, struct tunnel *t, int_fast64_t ns)
+{
+	(void)t;
+	(void)ns;
+	((struct relay_probe *)data)->num_events++;
+}
+#endif
+
+/* Keep allocation failure armed through reset, refused terminal posting and
+ * retry. Both accepted and dialed instances must become terminal even if the
+ * allocation that failed was not itself for CLOSED. */
+T_DECLARE_CASE(test_tunnel_relay_oom_is_terminal_and_retries_without_allocation)
+{
+#if !WITH_THREADS
+	(void)_t_;
+	T_SKIPNOW();
+#else
+	const enum mux_event events[] = { MUX_EVENT_CLOSED,
+					  MUX_EVENT_ESTABLISHED,
+					  MUX_EVENT_RESUMED, MUX_EVENT_LOST };
+	for (size_t i = 0; i < ARRAY_SIZE(events); i++) {
+		for (int accepted = 1; accepted >= 0; accepted--) {
+			struct server srv = { .session_limit = 1 };
+			srv.loop = ev_loop_new(EVFLAG_AUTO);
+			T_CHECK(srv.loop != NULL);
+			ev_async_init(&srv.w_async, relay_owner_async_cb);
+			ev_async_start(srv.loop, &srv.w_async);
+			srv.disp = dispatcher_create(4);
+			T_CHECK(srv.disp != NULL);
+			struct tunnel_context ctx =
+				test_make_tunnel_context(&srv);
+			ctx.reserve_session = capacity_test_reserve;
+			ctx.release_session = capacity_test_release;
+			const struct tunnel_session_counters cnt =
+				test_make_tunnel_counters(&srv);
+			struct relay_probe probe = { 0 };
+			const struct tunnel_callbacks cb = {
+				.on_event = relay_probe_on_event,
+				.on_established = relay_probe_on_connected,
+				.on_resumed = relay_probe_on_connected
+			};
+			int pair[2];
+			T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+			const struct tunnel_opts opts = {
+				.cb = &cb,
+				.data = &probe,
+				.mux_conf = &g_conf,
+				.fd = accepted ? pair[0] : -1,
+				.id = g_zero_id,
+				.cnt = &cnt,
+				.connect_addr = accepted ? NULL : "127.0.0.1:9"
+			};
+			struct tunnel *const t = tunnel_new(&ctx, &opts);
+			T_CHECK(t != NULL);
+			T_CHECK(tunnel_admit_session(t));
+			if (!accepted) {
+				(void)close(pair[0]);
+			}
+			/* Queue an ordinary callback, fill the ring, then leave an
+			 * allocated backlog. All intermediate callbacks may be dropped. */
+			relay_event(
+				t, MUX_EVENT_LOST, (union mux_event_data){ 0 });
+			for (int n = 0; n < 16; n++) {
+				if (!dispatcher_invoke(
+					    srv.disp,
+					    (struct task){ relay_filler_task,
+							   NULL })) {
+					break;
+				}
+			}
+			relay_event(
+				t, MUX_EVENT_LOST, (union mux_event_data){ 0 });
+			ev_timer_again(t->loop, &t->w_reconnect);
+			t->redial_on_closed = true;
+			struct log_capture cap = { 0 };
+			log_capture_start(&cap);
+			relay_failed_allocations = 0;
+			relay_fail_allocations = true;
+			relay_event(t, events[i], (union mux_event_data){ 0 });
+			log_capture_stop();
+			const bool stopped = t->shutting_down &&
+					     !t->redial_on_closed &&
+					     !ev_is_active(&t->w_reconnect);
+			/* Exercise the real timer callback directly, without waiting. */
+			relay_retry_cb(t->loop, &t->w_relay_retry, EV_TIMER);
+			const bool retrying = ev_is_active(&t->w_relay_retry);
+			dispatcher_tick(srv.disp);
+			const size_t before_retry = probe.num_events;
+			relay_retry_cb(t->loop, &t->w_relay_retry, EV_TIMER);
+			dispatcher_tick(srv.disp);
+			const bool retry_stopped =
+				!ev_is_active(&t->w_relay_retry);
+			/* Further events cannot allocate or report another terminal. */
+			tunnel_on_event(
+				t, t->ss, MUX_EVENT_SUSPENDED,
+				(union mux_event_data){ 0 });
+			relay_event(
+				t, MUX_EVENT_CLOSED,
+				(union mux_event_data){ 0 });
+			const size_t allocations = relay_failed_allocations;
+			relay_fail_allocations = false;
+			const bool closed =
+				mux_state(t->ss) == MUX_STATE_CLOSED;
+			const uint_least64_t reconnects =
+				test_num_reconnects(t);
+			tunnel_close(t);
+			(void)close(pair[1]);
+			dispatcher_destroy(srv.disp);
+			ev_async_stop(srv.loop, &srv.w_async);
+			ev_loop_destroy(srv.loop);
+			T_EXPECT_EQ(probe.num_closed, (size_t)1);
+			T_EXPECT(stopped);
+			T_EXPECT(retrying);
+			T_EXPECT(retry_stopped);
+			T_EXPECT(closed);
+			T_EXPECT_EQ(before_retry, (size_t)0);
+			T_EXPECT_EQ(probe.num_events, (size_t)1);
+			T_EXPECT_EQ(
+				(int)probe.events[0], (int)MUX_EVENT_CLOSED);
+			T_EXPECT_EQ(probe.closed_error, ENOMEM);
+			T_EXPECT_EQ(allocations, (size_t)1);
+			T_EXPECT_EQ(reconnects, (uint_least64_t)0);
+			T_EXPECT_EQ(srv.session_slots, (size_t)0);
+			T_EXPECT_EQ(
+				srv.counters.num_rejected, (uint_least64_t)1);
+			T_EXPECT(
+				strstr(cap.buf,
+				       "OOM relaying lifecycle event") != NULL);
+		}
+	}
+#endif
+}
+
+#if WITH_THREADS
+static struct config *relay_oom_config(const char *claim, const char *peer)
+{
+	struct config *const conf = conf_new_default();
+	T_CHECK(conf != NULL);
+	conf->max_sessions = 1;
+	conf->identity.claim = strdup(claim);
+	conf->identity.peers = calloc(1, sizeof(*conf->identity.peers));
+	T_CHECK(conf->identity.claim != NULL && conf->identity.peers != NULL);
+	conf->identity.peers_count = 1;
+	conf->identity.peers[0].id = strdup(peer);
+	T_CHECK(conf->identity.peers[0].id != NULL);
+	return conf;
+}
+
+static void relay_arm_oom_task(void *p)
+{
+	(void)p;
+	/* Fault injection only. tunnel_shutdown below drives the real lifecycle. */
+	relay_fail_allocations = true;
+}
+#endif /* WITH_THREADS */
+
+/* A real plaintext handshake creates identity pool membership and a session
+ * reservation on both ends. Public shutdown with relay allocation unavailable
+ * must drive the real server CLOSED handler, remove the registration/pool,
+ * join the tunnel, and release capacity, for both accepted and dialed tunnels. */
+T_DECLARE_CASE(test_tunnel_relay_oom_server_cleanup)
+{
+#if !WITH_THREADS
+	(void)_t_;
+	T_SKIPNOW();
+#else
+	for (int accepted = 0; accepted < 2; accepted++) {
+		struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+		T_CHECK(loop != NULL);
+		struct config *const passive_conf =
+			relay_oom_config("owner", "dialer");
+		passive_conf->mux_listen = strdup("127.0.0.1:0");
+		T_CHECK(passive_conf->mux_listen != NULL);
+		struct server *const passive = server_new(loop, passive_conf);
+		T_CHECK(passive != NULL && server_start(passive));
+		struct sockaddr_in addr = { 0 };
+		socklen_t len = sizeof(addr);
+		T_CHECK(getsockname(
+				passive->mux_listener.w_accept.fd,
+				(struct sockaddr *)&addr, &len) == 0);
+		char target[64];
+		(void)snprintf(
+			target, sizeof(target), "127.0.0.1:%u",
+			(unsigned)ntohs(addr.sin_port));
+		struct config *const dialed_conf =
+			relay_oom_config("dialer", "owner");
+		/* Keep the healthy peer on demand so its normal reconnect policy
+		 * cannot create a replacement while we observe failed-owner cleanup. */
+		dialed_conf->mux.idle_timeout = 60;
+		dialed_conf->mux_connect = strdup(target);
+		T_CHECK(dialed_conf->mux_connect != NULL);
+		struct server *const dialed = server_new(loop, dialed_conf);
+		T_CHECK(dialed != NULL && server_start(dialed));
+		void *elem = NULL;
+		T_CHECK(table_find(passive->identities, "dialer", &elem));
+		struct identity_listener *const passive_pool = elem;
+		T_CHECK(table_find(dialed->identities, "owner", &elem));
+		struct identity_listener *const dialed_pool = elem;
+		bool timed_out = false;
+		ev_timer guard;
+		ev_timer_init(&guard, relay_guard_cb, 5.0, 0.0);
+		guard.data = &timed_out;
+		ev_timer_start(loop, &guard);
+		while (!timed_out && (passive_pool->num_tunnels != 1 ||
+				      dialed_pool->num_tunnels != 1)) {
+			ev_run(loop, EVRUN_ONCE);
+		}
+		const bool established = !timed_out;
+		struct server *const owner = accepted ? passive : dialed;
+		struct identity_listener *const pool =
+			accepted ? passive_pool : dialed_pool;
+		if (established) {
+			struct tunnel *const t = pool->tunnels[0];
+			T_CHECK(tunnel_post(
+				t, (struct task){ relay_arm_oom_task, NULL }));
+			tunnel_shutdown(t);
+			while (!timed_out && pool->num_tunnels != 0) {
+				ev_run(loop, EVRUN_ONCE);
+			}
+		}
+		const bool cleaned = established && !timed_out &&
+				     pool->num_tunnels == 0 &&
+				     owner->session_slots == 0 &&
+				     owner->mux_tunnel == NULL &&
+				     table_size(owner->accepted_tunnels) == 0;
+		const uint_least64_t finalized =
+			owner->counters.num_session_finalized;
+		ev_timer_stop(loop, &guard);
+		server_stop(dialed);
+		server_stop(passive);
+		server_free(dialed);
+		server_free(passive);
+		conf_free(dialed_conf);
+		conf_free(passive_conf);
+		ev_loop_destroy(loop);
+		T_EXPECT(established);
+		T_EXPECT(cleaned);
+		T_EXPECT_EQ(finalized, (uint_least64_t)1);
+	}
+#endif
+}
+
+#if WITH_THREADS
+struct startup_fixture {
+	struct ev_loop *loop;
+	struct config *conf;
+	struct server *srv;
+	struct tunnel *pending;
+	int peers[3];
+};
+
+static void startup_fixture_cleanup(void *data)
+{
+	struct startup_fixture *const fx = data;
+	if (fx->pending != NULL) {
+		tunnel_close(fx->pending);
+		fx->pending = NULL;
+	}
+	if (fx->srv != NULL) {
+		server_stop(fx->srv);
+		server_free(fx->srv);
+		fx->srv = NULL;
+	}
+	conf_free(fx->conf);
+	fx->conf = NULL;
+	for (size_t i = 0; i < ARRAY_SIZE(fx->peers); i++) {
+		if (fx->peers[i] >= 0) {
+			(void)close(fx->peers[i]);
+			fx->peers[i] = -1;
+		}
+	}
+	if (fx->loop != NULL) {
+		ev_loop_destroy(fx->loop);
+		fx->loop = NULL;
+	}
+}
+#endif /* WITH_THREADS */
+
+/* A real accepted tunnel whose worker has not started must block another
+ * accept at the startup cap, even though it owns no max_sessions slot yet. */
+T_DECLARE_CASE(test_server_startup_limit_counts_queued_tunnel)
+{
+#if !WITH_THREADS
+	T_SKIPNOW();
+#else
+	static struct startup_fixture fx;
+	fx = (struct startup_fixture){ .peers = { -1, -1, -1 } };
+	T_CLEANUP(startup_fixture_cleanup, &fx);
+	fx.loop = ev_loop_new(EVFLAG_AUTO);
+	T_EXPECT(fx.loop != NULL);
+	fx.conf = conf_new_default();
+	T_EXPECT(fx.conf != NULL);
+	fx.conf->max_sessions = 1;
+	fx.conf->startup_limit_start = 0;
+	fx.conf->startup_limit_rate = 0;
+	fx.conf->startup_limit_full = 1;
+	fx.conf->mux_listen = strdup("127.0.0.1:0");
+	T_EXPECT(fx.conf->mux_listen != NULL);
+	fx.srv = server_new(fx.loop, fx.conf);
+	T_EXPECT(fx.srv != NULL);
+	T_EXPECT(server_start(fx.srv));
+	int fds[2];
+	T_EXPECT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	fx.peers[0] = fds[1];
+	const struct tunnel_session_counters cnt =
+		test_make_tunnel_counters(fx.srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(fx.srv);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.mux_conf = &g_conf,
+		.fd = fds[0],
+		.id = g_zero_id,
+		.cnt = &cnt,
+	};
+	fx.pending = tunnel_new(&ctx, &opts);
+	T_EXPECT(fx.pending != NULL);
+	const size_t queued = fx.srv->counters.num_session_halfopen;
+	const size_t session_slots = fx.srv->session_slots;
+	struct sockaddr_in addr = { 0 };
+	socklen_t addrlen = sizeof(addr);
+	T_EXPECT(
+		getsockname(
+			fx.srv->mux_listener.w_accept.fd,
+			(struct sockaddr *)&addr, &addrlen) == 0);
+	bool timed_out = false;
+	ev_timer guard;
+	ev_timer_init(&guard, relay_guard_cb, 5.0, 0.0);
+	guard.data = &timed_out;
+	ev_timer_start(fx.loop, &guard);
+	for (int probe = 1; probe <= 2; probe++) {
+		fx.peers[probe] = socket(AF_INET, SOCK_STREAM, 0);
+		T_EXPECT(fx.peers[probe] >= 0);
+		T_EXPECT(socket_set_nonblock(fx.peers[probe]) == 0);
+		const int rc =
+			connect(fx.peers[probe], (struct sockaddr *)&addr,
+				sizeof(addr));
+		T_EXPECT(rc == 0 || errno == EINPROGRESS);
+		while (!timed_out &&
+		       fx.srv->counters.num_accepted < (uint_least64_t)probe) {
+			ev_run(fx.loop, EVRUN_ONCE);
+		}
+		if (probe == 1) {
+			tunnel_close(fx.pending);
+			fx.pending = NULL;
+		}
+	}
+	ev_timer_stop(fx.loop, &guard);
+	const uint_least64_t served = fx.srv->counters.num_served;
+	const uint_least64_t rejected = fx.srv->counters.num_rejected;
+	server_stop(fx.srv);
+	const size_t stopped = fx.srv->counters.num_session_halfopen;
+	startup_fixture_cleanup(&fx);
+	T_EXPECT(!timed_out);
+	T_EXPECT_EQ(queued, (size_t)1);
+	T_EXPECT_EQ(session_slots, (size_t)0);
+	T_EXPECT_EQ(served, (uint_least64_t)1);
+	T_EXPECT_EQ(rejected, (uint_least64_t)1);
+	T_EXPECT_EQ(stopped, (size_t)0);
+#endif /* WITH_THREADS */
+}
+
+/* A resume selected before OOM may already be queued, and a later lookup may
+ * still find the failed instance before owner cleanup. Neither may revive it. */
+T_DECLARE_CASE(test_tunnel_relay_oom_refuses_resume)
+{
+#if !WITH_THREADS
+	(void)_t_;
+	T_SKIPNOW();
+#else
+	struct server srv = { 0 };
+	const struct tunnel_session_counters cnt =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+	const struct tunnel_callbacks cb = { .on_event = relay_probe_on_event };
+	const struct tunnel_opts opts = { .cb = &cb,
+					  .mux_conf = &g_conf,
+					  .fd = -1,
+					  .id = g_zero_id,
+					  .cnt = &cnt };
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+	relay_fail_allocations = true;
+	relay_event(t, MUX_EVENT_LOST, (union mux_event_data){ 0 });
+	relay_fail_allocations = false;
+	/* The failure arms the retry timer; do not run it or the owner here. */
+	int pair[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+	struct mux_session transient = { .w_socket.fd = pair[0] };
+	const bool handed_off = tunnel_handoff_resume(t, &transient, 1);
+	const bool retained = transient.w_socket.fd == pair[0];
+	struct resume_attach_arg *const arg = calloc(1, sizeof(*arg));
+	T_CHECK(arg != NULL);
+	arg->old_t = t;
+	arg->transport.fd = pair[0];
+	tunnel_resume_attach_task(arg);
+	const bool discarded = fcntl(pair[0], F_GETFD) == -1 && errno == EBADF;
+	tunnel_close(t);
+	(void)close(pair[1]);
+	T_EXPECT(!handed_off);
+	T_EXPECT(retained);
+	T_EXPECT(discarded);
+#endif
 }
 
 /* A reload that turns reconnect off for a dialed tunnel waiting out its backoff
@@ -2412,9 +2999,8 @@ T_DECLARE_CASE(test_tunnel_psk_dispatch_returns_hold_when_dropped)
 #else
 	/* A dispatch the ring refuses must give its hold back rather than take it
 	 * along: the owner is left holding the resolver on the tunnel's behalf
-	 * forever otherwise.  Nothing drains an unstarted tunnel's ring, so fill
-	 * it exactly with dispatches that carry no heap payload -- the ones left
-	 * queued at close are discarded, and only a payload-free one can be. */
+	 * forever otherwise. Fill the unstarted tunnel's ring with transport
+	 * drops to exercise refusal without allocating other dispatch payloads. */
 	enum { RING_CAPACITY = 16 };
 	struct server srv;
 	memset(&srv, 0, sizeof(srv));
@@ -2455,6 +3041,225 @@ T_DECLARE_CASE(test_tunnel_psk_dispatch_returns_hold_when_dropped)
 	T_EXPECT(!queued);
 	/* The hold went back to the caller rather than with the dispatch. */
 	T_EXPECT_EQ(releases, (size_t)1);
+#endif /* WITH_THREADS */
+}
+
+#if WITH_THREADS
+struct queued_fixture {
+	struct psk_hold_probe psk;
+	struct psk_hold_probe reload;
+	struct server srv;
+	struct tunnel *t;
+	struct udp_listener *listener;
+	struct udp_dgram *datagrams[5];
+	size_t received;
+	int sender;
+};
+
+static void queued_fixture_cleanup(void *data)
+{
+	struct queued_fixture *const fx = data;
+	if (fx->t != NULL) {
+		tunnel_close(fx->t);
+		fx->t = NULL;
+	}
+	udp_listener_free(fx->listener);
+	fx->listener = NULL;
+	for (size_t i = 0; i < ARRAY_SIZE(fx->datagrams); i++) {
+		if (fx->datagrams[i] != NULL) {
+			udp_dgram_free(fx->datagrams[i]);
+			fx->datagrams[i] = NULL;
+		}
+	}
+	if (fx->sender >= 0) {
+		(void)close(fx->sender);
+		fx->sender = -1;
+	}
+	if (fx->srv.loop != NULL) {
+		ev_loop_destroy(fx->srv.loop);
+		fx->srv.loop = NULL;
+	}
+}
+
+static void *queued_pick(void *data)
+{
+	return data;
+}
+
+static void queued_deliver(void *data, void *target, struct udp_dgram *d)
+{
+	(void)target;
+	struct queued_fixture *const fx = data;
+	if (fx->received < ARRAY_SIZE(fx->datagrams)) {
+		fx->datagrams[fx->received++] = d;
+	} else {
+		udp_dgram_free(d);
+	}
+}
+#endif /* WITH_THREADS */
+
+T_DECLARE_CASE(test_tunnel_close_unstarted_returns_dispatch_holds)
+{
+#if !WITH_THREADS
+	T_SKIPNOW();
+#else
+	static struct queued_fixture fx;
+	fx = (struct queued_fixture){ .sender = -1 };
+	T_CLEANUP(queued_fixture_cleanup, &fx);
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&fx.srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&fx.srv);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+		.cnt = &cnts,
+	};
+	fx.t = tunnel_new(&ctx, &opts);
+	T_EXPECT(fx.t != NULL);
+	T_EXPECT(tunnel_set_psk(
+		fx.t, psk_probe_identity_of, &fx.psk, psk_probe_release));
+	struct tunnel_reload_opts update = {
+		.conf = g_conf,
+		.update_connect_addr = true,
+		.connect_addr = "127.0.0.1:9",
+		.update_forward_addr = true,
+		.forward_addr = "127.0.0.1:10",
+		.psk_ctx = &fx.reload,
+		.psk_ctx_release = psk_probe_release,
+	};
+#if WITH_TLS
+	static const unsigned char key[TLS_PSK_MIN_LEN] = { 1 };
+	const struct tls_config tls_conf = { .psk = key,
+					     .psk_len = sizeof(key) };
+	update.tlsctx = tls_ctx_client(&tls_conf);
+	T_EXPECT(update.tlsctx != NULL);
+#endif
+	tunnel_reload(fx.t, &update);
+	const size_t before = fx.psk.releases + fx.reload.releases;
+	tunnel_close(fx.t);
+	fx.t = NULL;
+	T_EXPECT_EQ(before, (size_t)0);
+	T_EXPECT_EQ(fx.psk.releases, (size_t)1);
+	T_EXPECT_EQ(fx.reload.releases, (size_t)1);
+#endif
+}
+
+T_DECLARE_CASE(test_tunnel_pending_datagrams_limits_fifo_and_teardown)
+{
+#if !WITH_THREADS
+	T_SKIPNOW();
+#else
+	static struct queued_fixture fx;
+	fx = (struct queued_fixture){ .sender = -1 };
+	T_CLEANUP(queued_fixture_cleanup, &fx);
+	fx.srv.loop = ev_loop_new(EVFLAG_AUTO);
+	T_EXPECT(fx.srv.loop != NULL);
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&fx.srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&fx.srv);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+		.cnt = &cnts,
+	};
+	fx.t = tunnel_new(&ctx, &opts);
+	T_EXPECT(fx.t != NULL);
+	const struct sockaddr_in bind_addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	const struct udp_listener_cb cb = {
+		.pick = queued_pick,
+		.deliver = queued_deliver,
+		.ctx = &fx,
+	};
+	uint_least64_t listener_drops = 0;
+	fx.listener = udp_listener_new(
+		fx.srv.loop, (const struct sockaddr *)&bind_addr, false, &cb,
+		60, &listener_drops);
+	T_EXPECT(fx.listener != NULL);
+	union sockaddr_max addr;
+	T_EXPECT(udp_listener_get_addr(fx.listener, &addr));
+	fx.sender = socket(AF_INET, SOCK_DGRAM, 0);
+	T_EXPECT(fx.sender >= 0);
+	for (size_t i = 0; i < ARRAY_SIZE(fx.datagrams); i++) {
+		const unsigned char value = (unsigned char)i;
+		T_EXPECT_EQ(
+			sendto(fx.sender, &value, 1, 0, &addr.sa,
+			       sa_len(&addr.sa)),
+			(ssize_t)1);
+	}
+	bool timed_out = false;
+	ev_timer guard;
+	ev_timer_init(&guard, reconnect_timeout_cb, 1, 0);
+	guard.data = &timed_out;
+	ev_timer_start(fx.srv.loop, &guard);
+	while (!timed_out && fx.received < ARRAY_SIZE(fx.datagrams)) {
+		ev_run(fx.srv.loop, EVRUN_ONCE);
+	}
+	ev_timer_stop(fx.srv.loop, &guard);
+	T_EXPECT_EQ(fx.received, ARRAY_SIZE(fx.datagrams));
+	/* The datagrams now own every socket reference: drops, drain and close
+	 * must release them exactly once even after the listener has gone. */
+	udp_listener_free(fx.listener);
+	fx.listener = NULL;
+	dgram_delivered_count = dgram_discarded_count = 0;
+	for (size_t i = 0; i < 4; i++) {
+		struct udp_dgram *const d = fx.datagrams[i];
+		fx.datagrams[i] = NULL;
+		tunnel_send_dgram(fx.t, d, i == 0 ? 0 : 2);
+	}
+	T_EXPECT_EQ(fx.t->dgram_count, (size_t)2);
+	T_EXPECT_EQ(dgram_discarded_count, (size_t)2);
+	T_EXPECT_EQ(
+		TPUB_LOAD(fx.t->dgram_cnt.pkt_dgram_dropped),
+		(uint_least64_t)2);
+	T_EXPECT_EQ(fx.t->dgram_head->data[0], 1);
+	T_EXPECT_EQ(fx.t->dgram_tail->data[0], 2);
+	tunnel_drain_pending_dgrams(fx.t);
+	T_EXPECT_EQ(fx.t->dgram_count, (size_t)0);
+	T_EXPECT(fx.t->dgram_head == NULL && fx.t->dgram_tail == NULL);
+	T_EXPECT_EQ(dgram_delivered_count, (size_t)2);
+	T_EXPECT_EQ(dgram_delivered[0], 1);
+	T_EXPECT_EQ(dgram_delivered[1], 2);
+	struct udp_dgram *const last = fx.datagrams[4];
+	fx.datagrams[4] = NULL;
+	tunnel_send_dgram(fx.t, last, 1);
+	T_EXPECT_EQ(fx.t->dgram_count, (size_t)1);
+	tunnel_close(fx.t);
+	fx.t = NULL;
+	T_EXPECT_EQ(dgram_discarded_count, (size_t)3);
+#endif
+}
+
+T_DECLARE_CASE(test_tunnel_listener_wait_has_deadline)
+{
+#if WITH_THREADS
+	T_SKIPNOW();
+#else
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	T_CHECK(fd >= 0);
+	const struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	T_CHECK(bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) == 0);
+	T_CHECK(listen(fd, 1) == 0);
+	T_CHECK(socket_set_nonblock(fd) == 0);
+	const bool ready = wait_for_listener(loop, fd, 0);
+	(void)close(fd);
+	ev_loop_destroy(loop);
+	T_EXPECT(!ready);
 #endif /* WITH_THREADS */
 }
 
@@ -2806,6 +3611,7 @@ struct ring_stall {
 	bool running;
 	bool teardown_refused;
 	bool released;
+	bool fail_relay;
 	atomic_size_t fillers_run;
 };
 
@@ -2840,6 +3646,12 @@ static void ring_stall_wait(struct ring_stall *st, const bool *ready)
 static void ring_stall_task(void *p)
 {
 	struct ring_stall *const restrict st = p;
+	if (st->fail_relay) {
+		relay_fail_allocations = true;
+		relay_event(
+			st->t, MUX_EVENT_CLOSED, (union mux_event_data){ 0 });
+		relay_fail_allocations = false;
+	}
 	THRD_CHECK(mtx_lock(&st->mu));
 	st->running = true;
 	THRD_CHECK(cnd_signal(&st->progress));
@@ -2925,6 +3737,75 @@ T_DECLARE_CASE(test_tunnel_close_final_waits_out_a_full_ring)
 	/* ...and the queued tasks all ran before the teardown behind them. */
 	T_EXPECT_EQ(fillers_run, filled);
 #endif /* WITH_THREADS */
+}
+
+/* Failure is held inside the producing task until the owner has disconnected
+ * the relay and tried teardown behind a full tunnel ring. The queued terminal
+ * task must be cancelled by the close, which must still join without deadlock. */
+T_DECLARE_CASE(test_tunnel_relay_oom_concurrent_owner_teardown)
+{
+#if !WITH_THREADS
+	(void)_t_;
+	T_SKIPNOW();
+#else
+	struct ring_stall st = { .fail_relay = true };
+	struct server srv = { .session_limit = 1 };
+	srv.loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(srv.loop != NULL);
+	ev_async_init(&srv.w_async, relay_owner_async_cb);
+	ev_async_start(srv.loop, &srv.w_async);
+	srv.disp = dispatcher_create(4);
+	T_CHECK(srv.disp != NULL);
+	const struct tunnel_session_counters cnt =
+		test_make_tunnel_counters(&srv);
+	struct tunnel_context ctx = test_make_tunnel_context(&srv);
+	ctx.reserve_session = capacity_test_reserve;
+	ctx.release_session = capacity_test_release;
+	struct relay_probe probe = { 0 };
+	const struct tunnel_callbacks cb = { .on_event = relay_probe_on_event };
+	int pair[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+	const struct tunnel_opts opts = { .cb = &cb,
+					  .data = &probe,
+					  .mux_conf = &g_conf,
+					  .fd = pair[0],
+					  .id = g_zero_id,
+					  .cnt = &cnt };
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+	T_CHECK(tunnel_admit_session(t));
+	/* This already-posted callback must be drained without touching a freed t. */
+	relay_event(t, MUX_EVENT_LOST, (union mux_event_data){ 0 });
+	st.t = t;
+	THRD_CHECK(mtx_init(&st.mu, mtx_plain));
+	THRD_CHECK(cnd_init(&st.progress));
+	atomic_init(&st.fillers_run, 0);
+	g_ring_stall = &st;
+	T_CHECK(tunnel_start(t));
+	T_CHECK(tunnel_post(t, (struct task){ ring_stall_task, &st }));
+	THRD_CHECK(mtx_lock(&st.mu));
+	ring_stall_wait(&st, &st.running);
+	THRD_CHECK(mtx_unlock(&st.mu));
+	size_t filled = 0;
+	while (tunnel_post(t, (struct task){ ring_filler_task, &st })) {
+		filled++;
+	}
+	tunnel_close(t);
+	g_ring_stall = NULL;
+	dispatcher_tick(srv.disp);
+	cnd_destroy(&st.progress);
+	mtx_destroy(&st.mu);
+	(void)close(pair[1]);
+	dispatcher_destroy(srv.disp);
+	ev_async_stop(srv.loop, &srv.w_async);
+	ev_loop_destroy(srv.loop);
+	T_EXPECT(st.teardown_refused);
+	T_EXPECT(st.released);
+	T_EXPECT_EQ(atomic_load(&st.fillers_run), filled);
+	T_EXPECT_EQ(probe.num_events, (size_t)0);
+	T_EXPECT_EQ(srv.session_slots, (size_t)0);
+	T_EXPECT_EQ(srv.counters.num_rejected, (uint_least64_t)1);
+#endif
 }
 
 #if !WITH_THREADS
@@ -3025,7 +3906,96 @@ T_DECLARE_CASE(test_tunnel_close_relays_no_event_of_its_own)
 #endif /* WITH_THREADS */
 }
 
+/* No tunnel worker is started: publish a changed claim while deliberately
+ * retaining the server's old pool membership, exactly the relay window. */
+T_DECLARE_CASE(test_server_stats_uses_actual_pool_membership)
+{
+	struct server srv = { .loop = ev_loop_new(EVFLAG_AUTO) };
+	T_CHECK(srv.loop != NULL);
+	const struct tunnel_session_counters cnts =
+		test_make_tunnel_counters(&srv);
+	const struct tunnel_context ctx = test_make_tunnel_context(&srv);
+	const struct tunnel_opts opts = {
+		.cb = &g_empty_cbs,
+		.mux_conf = &g_conf,
+		.mux_socket = g_mux_socket,
+		.local_socket = g_local_socket,
+		.fd = -1,
+		.id = g_zero_id,
+		.connect_addr = "127.0.0.1:9",
+		.cnt = &cnts,
+	};
+	struct tunnel *const t = tunnel_new(&ctx, &opts);
+	T_CHECK(t != NULL);
+	t->stream_cnt.num_stream_opened = 7;
+	t->peer_identity = strdup("alice");
+	T_CHECK(t->peer_identity != NULL);
+	tunnel_publish_pub(t);
+	struct tunnel *members[] = { t };
+	struct identity_listener alice = {
+		.peer_identity = "alice",
+		.tunnels = members,
+		.num_tunnels = 1,
+	};
+	struct identity_listener bob = { .peer_identity = "bob" };
+	srv.identities = table_new(&TABLE_OPTS_STR);
+	srv.accepted_tunnels = table_new(&TABLE_OPTS_PTR);
+	T_CHECK(srv.identities != NULL && srv.accepted_tunnels != NULL);
+	void *slot = &alice;
+	srv.identities = table_set(srv.identities, alice.peer_identity, &slot);
+	T_CHECK(slot == NULL);
+	slot = &bob;
+	srv.identities = table_set(srv.identities, bob.peer_identity, &slot);
+	T_CHECK(slot == NULL);
+	slot = t;
+	srv.accepted_tunnels = table_set(srv.accepted_tunnels, t, &slot);
+	T_CHECK(slot == NULL);
+
+	size_t counts[6] = { 0 };
+	uint_least64_t opened[6] = { 0 };
+	for (size_t i = 0; i < ARRAY_SIZE(counts); i++) {
+		if (i == 1) {
+			free(t->peer_identity);
+			t->peer_identity = strdup("bob");
+			T_CHECK(t->peer_identity != NULL);
+			tunnel_publish_pub(t);
+		} else if (i == 2) {
+			free(t->peer_identity);
+			t->peer_identity = NULL;
+			tunnel_publish_pub(t);
+		} else if (i == 3) {
+			alice.num_tunnels = 0;
+		} else if (i == 4) {
+			/* The same publication window for a staged dial-out. */
+			table_free(srv.accepted_tunnels);
+			srv.accepted_tunnels = NULL;
+			srv.identity_tunnels = members;
+			srv.num_identity_tunnels = 1;
+			alice.num_tunnels = 1;
+		} else if (i == 5) {
+			/* A standalone dial-out may itself be pooled. */
+			srv.mux_tunnel = t;
+		}
+		struct server_stats *const stats = server_stats(&srv, true);
+		if (stats != NULL) {
+			counts[i] = stats->num_tunnels;
+			opened[i] = stats->num_stream_opened;
+			free(stats);
+		}
+	}
+	table_free(srv.accepted_tunnels);
+	table_free(srv.identities);
+	tunnel_close(t);
+	ev_loop_destroy(srv.loop);
+	for (size_t i = 0; i < ARRAY_SIZE(counts); i++) {
+		T_EXPECT_EQ(counts[i], (size_t)1);
+		T_EXPECT_EQ(opened[i], (uint_least64_t)7);
+	}
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_server_startup_limit_counts_queued_tunnel),
+	T_CASE(test_server_stats_uses_actual_pool_membership),
 	T_CASE(test_tunnel_new_close_no_start),
 	T_CASE(test_tunnel_capacity_creation_failure_and_teardown),
 	T_CASE(test_tunnel_capacity_failed_hello_releases_reservation),
@@ -3039,6 +4009,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_reconnect_backoff_after_failed_resume_attempt),
 	T_CASE(test_tunnel_on_demand_redials_after_close_in_flight),
 	T_CASE(test_tunnel_reload_null_addr_disables_reconnect),
+#if WITH_TLS
+	T_CASE(test_tunnel_reload_clears_tls_context_for_next_connection),
+#endif
 	T_CASE(test_tunnel_reconnect_count_skips_cancelled_backoff),
 	T_CASE(test_tunnel_reconnect_count_includes_demand_redial),
 	T_CASE(test_tunnel_reconnect_on_transport_lost),
@@ -3048,8 +4021,14 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_stats_initial_zero),
 	T_CASE(test_tunnel_open_stream_burst_not_dropped),
 	T_CASE(test_tunnel_relay_retries_events_a_full_ring_refused),
+	T_CASE(test_tunnel_relay_oom_is_terminal_and_retries_without_allocation),
+	T_CASE(test_tunnel_relay_oom_server_cleanup),
+	T_CASE(test_tunnel_relay_oom_refuses_resume),
 	T_CASE(test_tunnel_reload_retiring_idle_tunnel_relays_closed),
 	T_CASE(test_tunnel_reload_retiring_suspended_tunnel_relays_closed),
+	T_CASE(test_tunnel_close_unstarted_returns_dispatch_holds),
+	T_CASE(test_tunnel_pending_datagrams_limits_fifo_and_teardown),
+	T_CASE(test_tunnel_listener_wait_has_deadline),
 	T_CASE(test_tunnel_psk_dispatch_holds_resolver_until_adopted),
 	T_CASE(test_tunnel_psk_dispatch_returns_hold_when_dropped),
 	T_CASE(test_tunnel_verify_identity_logs_live_transport),
@@ -3057,6 +4036,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tunnel_resume_identity_continuity),
 	T_CASE(test_tunnel_reconnect_unclaimed_peer_retags),
 	T_CASE(test_tunnel_close_final_waits_out_a_full_ring),
+	T_CASE(test_tunnel_relay_oom_concurrent_owner_teardown),
 	T_CASE(test_tunnel_close_relays_no_event_of_its_own),
 	T_SUITE_END,
 };

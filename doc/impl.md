@@ -1264,6 +1264,15 @@ every 10 ms from the tunnel's own loop until it lands or the relay is
 disconnected. New events queue behind a non-empty backlog, so the server still
 sees each tunnel's events in order.
 
+If allocating a relay event fails, the tunnel logs its index and failed event,
+turns off reconnect and resume, and discards pending intermediate callbacks.
+The retry timer resets the session outside its lifecycle callback and posts an
+allocation-independent terminal CLOSED task, retrying a full owner ring until
+it succeeds or the owner explicitly tears the tunnel down. The tunnel remains
+alive through the ordinary owner cleanup, join, and dispatcher drain. Intermediate
+callbacks, setup-latency samples, and event-log entries may be lost in this
+terminal failure; ordinary delivery still preserves per-tunnel ordering.
+
 Resume lookup, session capacity reservation and final teardown synchronously
 return a result to the caller. Capacity release likewise runs directly under
 the lock. `handle_connected()`'s `identities` read (§20.1) is also synchronous
