@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import select
 import shlex
 import signal
 import socket
@@ -464,6 +465,16 @@ def udp_echo(port: int, payload: bytes, *, timeout: float = 10.0) -> bool:
 # Kill-able TCP relay for session-resumption testing
 # ---------------------------------------------------------------------------
 
+@dataclass
+class _RelayPair:
+    front: socket.socket
+    back: socket.socket
+    cancel_read: socket.socket
+    cancel_write: socket.socket
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    pumps: Tuple[threading.Thread, ...] = ()
+
+
 class MuxRelay:
     """TCP relay: listens on *front_port*, forwards to *back_port*.
 
@@ -481,7 +492,7 @@ class MuxRelay:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
-        self._pairs: List[Tuple[socket.socket, socket.socket]] = []
+        self._pairs: List[_RelayPair] = []
         self.drops = 0
 
     @property
@@ -516,57 +527,97 @@ class MuxRelay:
                 except OSError:
                     pass
                 continue
-            front.settimeout(None)
-            back.settimeout(None)
+            if self._stop.is_set():
+                front.close()
+                back.close()
+                break
+            front.setblocking(False)
+            back.setblocking(False)
+            cancel_read, cancel_write = socket.socketpair()
+            pair = _RelayPair(front, back, cancel_read, cancel_write)
             with self._lock:
-                self._pairs.append((front, back))
-            self._pump(front, back)
-            self._pump(back, front)
+                pair.pumps = (self._pump(pair, front, back),
+                              self._pump(pair, back, front))
+                self._pairs.append(pair)
 
-    def _pump(self, src: socket.socket, dst: socket.socket) -> None:
+    def _pump(self, pair: _RelayPair, src: socket.socket,
+              dst: socket.socket) -> threading.Thread:
         def run() -> None:
             try:
-                while True:
-                    data = src.recv(_CHUNK)
+                while not pair.cancelled.is_set():
+                    readable, _, _ = select.select(
+                        [src, pair.cancel_read], [], [])
+                    if pair.cancel_read in readable:
+                        return
+                    try:
+                        data = src.recv(_CHUNK)
+                    except BlockingIOError:
+                        continue
                     if not data:
-                        break
-                    dst.sendall(data)
+                        return
+                    pending = memoryview(data)
+                    while pending and not pair.cancelled.is_set():
+                        readable, _, _ = select.select(
+                            [pair.cancel_read], [dst], [])
+                        if readable:
+                            return
+                        try:
+                            sent = dst.send(pending)
+                        except BlockingIOError:
+                            continue
+                        if sent == 0:
+                            return
+                        pending = pending[sent:]
             except OSError:
                 pass
             finally:
-                try:
-                    dst.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-        threading.Thread(target=run, daemon=True, name="relay-pump").start()
+                if not pair.cancelled.is_set():
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+        thread = threading.Thread(target=run, daemon=True, name="relay-pump")
+        thread.start()
+        return thread
 
     def drop_all(self) -> int:
-        """RST every live pair; keep listening.  Returns pairs dropped."""
+        """RST every live pair after its pumps stop; keep listening."""
         with self._lock:
             pairs = self._pairs
             self._pairs = []
-        for a, b in pairs:
-            for s in (a, b):
+        for pair in pairs:
+            pair.cancelled.set()
+            # Leave the byte unread so both pumps wake, including a pump
+            # waiting for a backpressured destination to become writable.
+            pair.cancel_write.sendall(b"!")
+        for pair in pairs:
+            for thread in pair.pumps:
+                thread.join(timeout=3.0)
+                if thread.is_alive():
+                    raise RuntimeError("relay pump did not stop")
+            for sock in (pair.front, pair.back):
                 try:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                                 _LINGER_RST)
-                    s.close()
-                except OSError:
-                    pass
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                    _LINGER_RST)
+                finally:
+                    sock.close()
+            pair.cancel_read.close()
+            pair.cancel_write.close()
         if pairs:
             self.drops += 1
         return len(pairs)
 
     def stop(self) -> None:
         self._stop.set()
-        if self._listen is not None:
-            try:
-                self._listen.close()
-            except OSError:
-                pass
-        self.drop_all()
+        # The listener's bounded accept and connect calls finish before the
+        # final drop, so no newly accepted pair can outlive stop().
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=6.0)
+            if self._thread.is_alive():
+                raise RuntimeError("relay listener did not stop")
+        if self._listen is not None:
+            self._listen.close()
+        self.drop_all()
 
 
 # ---------------------------------------------------------------------------
@@ -962,24 +1013,6 @@ class Daemons:
         self._fhs = []
         return client_rc, server_rc
 
-    def kill(self) -> None:
-        # Best-effort teardown: keep the handle of any process that outlived
-        # SIGKILL (terminate_process returns None) so it is not forgotten.
-        if self.client is not None:
-            rc = terminate_process(self.client, "%s client" % self.tag)
-            if rc is not None:
-                self.client = None
-        if self.server is not None:
-            rc = terminate_process(self.server, "%s server" % self.tag)
-            if rc is not None:
-                self.server = None
-        for fh in self._fhs:
-            try:
-                fh.close()  # type: ignore[attr-defined]
-            except OSError:
-                pass
-        self._fhs = []
-
 
 # ---------------------------------------------------------------------------
 # Scenario result + runner
@@ -1057,6 +1090,20 @@ class Suite:
         if not blocked:
             return
         detail = "%s; not run: %s" % (detail, ", ".join(blocked))
+        self.results.append(ScenarioResult(name, False, detail, 0.0, "FAIL"))
+        log("  [FAIL] %s %s" % (name, detail))
+
+    def teardown(self, daemons: Daemons) -> None:
+        """Always gate the run on daemon exits, including with --only."""
+        try:
+            client_rc, server_rc = daemons.shutdown()
+            if client_rc == 0 and server_rc == 0:
+                return
+            detail = "client rc=%s server rc=%s (expected 0)" % (
+                client_rc, server_rc)
+        except Exception as exc:  # noqa: BLE001
+            detail = "exception during teardown: %r" % exc
+        name = "%s_teardown" % daemons.tag
         self.results.append(ScenarioResult(name, False, detail, 0.0, "FAIL"))
         log("  [FAIL] %s %s" % (name, detail))
 
@@ -1245,65 +1292,94 @@ def scen_coexistence(port: int, rng: random.Random, *,
     """
     if bulk_count <= 0 or bulk_size <= 0:
         return False, "bulk load must contain nonempty transfers"
+    if pings <= 0:
+        return False, "no ping samples requested"
+    sample_count = max(2, pings)
     stop = threading.Event()
+    progress = threading.Condition()
     bulk_errors: List[str] = []
     bulk_completed = [0] * bulk_count
     bulk_payloads = [make_payload(rng, bulk_size) for _ in range(bulk_count)]
+    bulk_timeout = max(30.0, bulk_size / (1 << 20) * 8)
 
     def bulk(i: int) -> None:
         # Loop the transfer so bulk pressure persists for the ping phase.
         try:
             while not stop.is_set():
                 ok, detail = bulk_exchange(
-                    port, bulk_payloads[i],
-                    timeout=max(30.0, bulk_size / (1 << 20) * 8))
+                    port, bulk_payloads[i], timeout=bulk_timeout)
+                with progress:
+                    if not ok:
+                        bulk_errors.append("bulk %d: %s" % (i, detail))
+                    else:
+                        bulk_completed[i] += 1
+                    progress.notify_all()
                 if not ok:
-                    bulk_errors.append("bulk %d: %s" % (i, detail))
                     return
-                bulk_completed[i] += 1
         except Exception as exc:  # noqa: BLE001
-            bulk_errors.append("bulk %d: %r" % (i, exc))
+            with progress:
+                bulk_errors.append("bulk %d: %r" % (i, exc))
+                progress.notify_all()
 
+    def wait_progress(before: List[int]) -> bool:
+        with progress:
+            return progress.wait_for(
+                lambda: bool(bulk_errors) or all(
+                    done > previous for done, previous
+                    in zip(bulk_completed, before)), timeout=bulk_timeout
+            ) and not bulk_errors
+
+    ping = make_payload(rng, 64)
     workers = [threading.Thread(target=bulk, args=(i,), daemon=True)
                for i in range(bulk_count)]
     for t in workers:
         t.start()
 
-    time.sleep(0.5)  # let bulk ramp up and fill windows
-
-    ping = make_payload(rng, 64)
     rtts: List[float] = []
     ping_errors: List[str] = []
-    for _ in range(pings):
-        try:
-            s = connect(port, timeout=10.0)
-            s.settimeout(10.0)
-            t0 = time.monotonic()
-            s.sendall(ping)
-            echo = recv_exact(s, len(ping), deadline=time.monotonic() + 10.0)
-            rtts.append(time.monotonic() - t0)
-            if echo != ping:
-                ping_errors.append("ping payload mismatch")
-            s.close()
-        except Exception as exc:  # noqa: BLE001
-            ping_errors.append("%r" % exc)
-        time.sleep(0.02)
-
-    stop.set()
-    for t in workers:
-        t.join(timeout=60.0)
+    load_error = ""
+    try:
+        if not wait_progress([0] * bulk_count):
+            load_error = "not every bulk worker completed a verified transfer"
+        else:
+            # Samples on both sides of fresh verified bulk progress prove the
+            # load ran during measurement, rather than only after teardown.
+            # Even a one-ping request needs two samples to bracket that work.
+            before = [0] * bulk_count
+            for i in range(sample_count):
+                if i == 1 and not wait_progress(before):
+                    load_error = "bulk made no verified progress during pings"
+                    break
+                try:
+                    with connect(port, timeout=10.0) as s:
+                        s.settimeout(10.0)
+                        t0 = time.monotonic()
+                        s.sendall(ping)
+                        echo = recv_exact(
+                            s, len(ping), deadline=time.monotonic() + 10.0)
+                        rtts.append(time.monotonic() - t0)
+                        if echo != ping:
+                            ping_errors.append("ping payload mismatch")
+                except Exception as exc:  # noqa: BLE001
+                    ping_errors.append("%r" % exc)
+                if i == 0:
+                    with progress:
+                        before = list(bulk_completed)
+                time.sleep(0.02)
+    finally:
+        stop.set()
+        for t in workers:
+            t.join(timeout=60.0)
 
     if ping_errors:
         return False, "%d/%d pings failed: %s" % (
-            len(ping_errors), pings, ping_errors[0])
+            len(ping_errors), sample_count, ping_errors[0])
     if bulk_errors:
         return False, bulk_errors[0]
     if any(t.is_alive() for t in workers):
         return False, "bulk workers did not finish"
-    if not all(bulk_completed):
-        return False, "not every bulk worker completed a verified transfer"
-    if not rtts:
-        return False, "no ping samples collected"
+    if load_error:
+        return False, load_error
     rtts.sort()
     p50 = rtts[len(rtts) // 2]
     p90 = rtts[min(len(rtts) - 1, int(len(rtts) * 0.9))]
@@ -1315,7 +1391,7 @@ def scen_coexistence(port: int, rng: random.Random, *,
             worst, p90)
     return True, ("%d pings under bulk load (%d transfers verified): "
                   "p50=%.1fms p90=%.1fms max=%.1fms") % (
-        pings, sum(bulk_completed), p50 * 1e3, p90 * 1e3, worst * 1e3)
+        len(rtts), sum(bulk_completed), p50 * 1e3, p90 * 1e3, worst * 1e3)
 
 
 def scen_random_fuzz(
@@ -1462,42 +1538,35 @@ def scen_hot_reload(client_proc: "subprocess.Popen[bytes]", client_api: int,
     old_level = int(json.loads(text).get("loglevel", 4))
     new_level = 5 if old_level != 5 else 6
 
-    # Open a stream and leave a verification in flight across the reload.
+    # A verified echoed prefix proves the mux stream is established. Keep
+    # that same socket open across PUT and verify the remaining chunks on it.
     payload = make_payload(rng, 256 * 1024)
     sock = connect(forward_port, timeout=10.0)
     sock.settimeout(30.0)
-    received = bytearray()
     deadline = time.monotonic() + 40.0
-
-    def receiver() -> None:
-        try:
-            received.extend(recv_exact(sock, len(payload), deadline=deadline))
-        except Exception:  # noqa: BLE001
-            pass
-
-    rx = threading.Thread(target=receiver, daemon=True)
-    rx.start()
-    sock.sendall(payload[:len(payload) // 2])
-
-    new_cfg = dict(base_cfg)
-    new_cfg["loglevel"] = new_level
-    status, _ = api_request(
-        client_api, "/config", method="PUT",
-        body=json.dumps(new_cfg).encode("utf-8"))
-    if status not in (200, 204):
-        sock.close()
-        return False, "PUT /config returned %d" % status
-
-    # Active stream must finish despite the reload-triggered session drain.
-    sock.sendall(payload[len(payload) // 2:])
-    rx.join(timeout=40.0)
     try:
+        prefix = payload[:_CHUNK]
+        sock.sendall(prefix)
+        if recv_exact(sock, len(prefix), deadline=deadline) != prefix:
+            return False, "active stream prefix corrupted before reload"
+
+        new_cfg = dict(base_cfg)
+        new_cfg["loglevel"] = new_level
+        status, _ = api_request(
+            client_api, "/config", method="PUT",
+            body=json.dumps(new_cfg).encode("utf-8"))
+        if status not in (200, 204):
+            return False, "PUT /config returned %d" % status
+
+        for off in range(len(prefix), len(payload), _CHUNK):
+            chunk = payload[off:off + _CHUNK]
+            sock.sendall(chunk)
+            if recv_exact(sock, len(chunk), deadline=deadline) != chunk:
+                return False, "active stream corrupted across reload"
+    except OSError as exc:
+        return False, "active stream failed across reload: %r" % exc
+    finally:
         sock.close()
-    except OSError:
-        pass
-    if bytes(received) != payload:
-        return False, "active stream corrupted across reload (%d/%d bytes)" % (
-            len(received), len(payload))
 
     # The reloaded config must be observable.
     status, text = api_request(client_api, "/config")
@@ -1525,49 +1594,51 @@ def scen_resumption(
     *, size: int, target_seconds: float, drops: int,
 ) -> Tuple[bool, str]:
     """Drop the mux transport mid-transfer; the byte stream must survive."""
+    if drops < 1 or size < drops + 2:
+        return False, "resumption needs a verified prefix and data after each drop"
     before = stat_reconnects(client_api)
     payload = make_payload(rng, size)
-    num_chunks = max(1, len(payload) // _CHUNK)
+    num_chunks = max(drops + 2, (len(payload) + _CHUNK - 1) // _CHUNK)
     pace = target_seconds / num_chunks
-    # Generous enough for a healthy paced transfer plus resume recovery, while
-    # bounding how long a stalled (currently-failing) resume blocks the suite.
     timeout = target_seconds + 30.0
+    deadline = time.monotonic() + timeout
+    # Space faults through the payload rather than racing a transfer thread.
+    # Every drop follows a verified prefix, with a newly sent chunk awaiting
+    # its echo and at least one further chunk still unsent on this same stream.
+    drop_chunks = {
+        (i + 1) * (num_chunks - 1) // (drops + 1) for i in range(drops)
+    }
+    sock = connect(forward_port, timeout=timeout)
+    sock.settimeout(timeout)
+    completed_drops = 0
+    try:
+        for i in range(num_chunks):
+            start = i * len(payload) // num_chunks
+            end = (i + 1) * len(payload) // num_chunks
+            chunk = payload[start:end]
+            sock.sendall(chunk)
+            if i in drop_chunks:
+                dropped = relay.drop_all()
+                completed_drops += 1
+                log("  relay drop #%d: RST %d connection pair(s)" % (
+                    completed_drops, dropped))
+                if dropped == 0:
+                    return False, "no active mux transport to drop"
+            if recv_exact(sock, len(chunk), deadline=deadline) != chunk:
+                return False, "integrity broken across resumption: payload mismatch"
+            if pace:
+                time.sleep(pace)
+    except OSError as exc:
+        return False, "integrity broken across resumption: %r" % exc
+    finally:
+        sock.close()
 
-    outcome: List[Tuple[bool, str]] = []
-
-    def transfer() -> None:
-        outcome.append(bulk_exchange(
-            forward_port, payload, timeout=timeout, pace_seconds=pace))
-
-    worker = threading.Thread(target=transfer, daemon=True, name="resume-xfer")
-    worker.start()
-
-    # Space the drops evenly through the transfer window. Each sleep is a delay
-    # relative to the previous drop, so a constant interval places drop k at an
-    # absolute k * target_seconds / (drops + 1); scaling by (i + 1) instead made
-    # the offsets accumulate, landing the last drop at or past the window end.
-    for i in range(drops):
-        time.sleep(target_seconds / (drops + 1))
-        dropped = relay.drop_all()
-        log("  relay drop #%d: RST %d connection pair(s)" % (i + 1, dropped))
-
-    worker.join(timeout=timeout + 10.0)
-    if worker.is_alive():
-        return False, "transfer hung after %d transport drop(s)" % drops
-    if not outcome:
-        return False, "transfer produced no result"
-    ok, detail = outcome[0]
-    if not ok:
-        return False, "integrity broken across resumption: %s" % detail
-
-    # Allow the reconnect bookkeeping to settle, then confirm it happened.
-    time.sleep(0.5)
     after = stat_reconnects(client_api)
     if after <= before:
         return False, "Reconnects did not advance (%d -> %d) after %d drop(s)" % (
             before, after, relay.drops)
-    return True, "%s; Reconnects %d->%d across %d drop(s)" % (
-        detail, before, after, relay.drops)
+    return True, "%d bytes verified; Reconnects %d->%d across %d drop(s)" % (
+        len(payload), before, after, relay.drops)
 
 
 # ---------------------------------------------------------------------------
@@ -1612,6 +1683,7 @@ def run_load_topology(binary: Path, log_dir: Path, suite: Suite,
             api_port=srv_api, window=window, loglevel=loglevel),
         client_cfg=client_cfg,
         server_api=srv_api, client_api=cli_api, tag="load")
+    open_conns: List[socket.socket] = []
     try:
         if not daemons.start():
             suite.start_failed("load_topology_start", LOAD_SCENARIOS,
@@ -1639,8 +1711,6 @@ def run_load_topology(binary: Path, log_dir: Path, suite: Suite,
             daemons.client, cli_api, fwd_listen, rng, client_cfg))
 
         # Random fuzz last so its leftover connections feed the shutdown test.
-        open_conns: List[socket.socket] = []
-
         def fuzz() -> Tuple[bool, str]:
             ok, detail, conns = scen_random_fuzz(
                 fwd_listen, duration=sizes.fuzz_duration, rng=rng,
@@ -1650,31 +1720,34 @@ def run_load_topology(binary: Path, log_dir: Path, suite: Suite,
 
         suite.run("random_fuzz", fuzz)
 
-        # Graceful shutdown with connections still open.
-        for _ in range(max(0, 3 - len(open_conns))):
-            try:
+        def shutdown() -> Tuple[bool, str]:
+            # Fresh streams have no unread fuzz traffic: an exact echoed
+            # prefix proves each reached the forwarding target before SIGTERM.
+            for i in range(3):
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                open_conns.append(s)
                 s.settimeout(2.0)
                 s.connect(("127.0.0.1", fwd_listen))
-                open_conns.append(s)
-            except OSError:
-                pass
-
-        def shutdown() -> Tuple[bool, str]:
+                prefix = make_payload(rng, 64)
+                s.sendall(prefix)
+                if recv_exact(s, len(prefix),
+                              deadline=time.monotonic() + 5.0) != prefix:
+                    return False, (
+                        "connection %d echo mismatch before shutdown" % i)
             client_rc, server_rc = daemons.shutdown()
-            for s in open_conns:
-                try:
-                    s.close()
-                except OSError:
-                    pass
             if client_rc != 0 or server_rc != 0:
                 return False, "client rc=%s server rc=%s (expected 0)" % (
                     client_rc, server_rc)
-            return True, "clean exit with %d open connection(s)" % len(open_conns)
+            return True, "clean exit with 3 verified active connection(s)"
 
         suite.run("graceful_shutdown", shutdown)
     finally:
-        daemons.kill()
+        for s in open_conns:
+            try:
+                s.close()
+            except OSError:
+                pass
+        suite.teardown(daemons)
         ef.stop()
         er.stop()
 
@@ -1728,7 +1801,7 @@ def run_psk_topology(binary: Path, log_dir: Path, suite: Suite,
                 suite.run("psk_match", lambda: scen_integrity(
                     fwd, rng, sizes.stream_msg, "forward"))
         finally:
-            daemons.shutdown()
+            suite.teardown(daemons)
             ef.stop()
             er.stop()
 
@@ -1783,7 +1856,7 @@ def run_psk_topology(binary: Path, log_dir: Path, suite: Suite,
     try:
         suite.run("psk_mismatch", mismatch)
     finally:
-        bad.kill()
+        suite.teardown(bad)
         ef2.stop()
         er2.stop()
 
@@ -1831,7 +1904,7 @@ def run_identity_verify_topology(binary: Path, log_dir: Path, suite: Suite,
                 suite.run("identity_verify_match", lambda: scen_integrity(
                     fwd_listen, rng, sizes.stream_msg, "forward"))
         finally:
-            daemons.shutdown()
+            suite.teardown(daemons)
             ef.stop()
             er.stop()
 
@@ -1893,7 +1966,7 @@ def run_identity_verify_topology(binary: Path, log_dir: Path, suite: Suite,
     try:
         suite.run("identity_verify_mismatch", mismatch)
     finally:
-        bad.kill()
+        suite.teardown(bad)
         ef2.stop()
         er2.stop()
 
@@ -1954,7 +2027,7 @@ def run_parallel_topology(binary: Path, log_dir: Path, suite: Suite,
 
         suite.run("parallel_shutdown", shutdown)
     finally:
-        daemons.kill()
+        suite.teardown(daemons)
         ef.stop()
         er.stop()
 
@@ -2122,7 +2195,7 @@ def run_udp_topology(binary: Path, log_dir: Path, suite: Suite,
             suite.run("udp_shutdown", shutdown)
     finally:
         for daemons, _scenarios in pairs:
-            daemons.kill()
+            suite.teardown(daemons)
         for e in echoes:
             e.stop()
 
@@ -2171,7 +2244,7 @@ def run_resumption_topology(binary: Path, log_dir: Path, suite: Suite,
 
         suite.run("resumption_shutdown", shutdown)
     finally:
-        daemons.kill()
+        suite.teardown(daemons)
         relay.stop()
         ef.stop()
         er.stop()
