@@ -344,6 +344,12 @@ add_src_test(api_server_test
     api_server_test.c
 )
 target_link_libraries(api_server_test PRIVATE mux)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Keep parser calls unresolved until the linker applies --wrap.
+    set_property(TARGET api_server_test PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
+    target_link_options(api_server_test PRIVATE "-Wl,--wrap=http_parse,--wrap=http_parsehdr")
+    target_compile_definitions(api_server_test PRIVATE API_TEST_WRAP_HTTP=1)
+endif()
 
 # White-box: compiles main.c into the TU (its main() renamed away) to reach the
 # static CLI parser; the daemon body's collaborators are linked real so it

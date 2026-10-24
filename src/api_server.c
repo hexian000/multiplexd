@@ -84,6 +84,8 @@ struct api_ctx {
 	size_t continue_pos;
 	/* parsed Content-Length from the request; 0 when absent */
 	size_t content_length;
+	/* Next head byte to inspect for CRLF; a trailing CR waits for its LF. */
+	size_t line_scan;
 	struct {
 		BUFFER_HDR;
 		unsigned char data[HTTP_MAX_ENTITY];
@@ -130,6 +132,7 @@ static void api_ctx_reset(struct ev_loop *loop, struct api_ctx *restrict ctx)
 	ctx->continue_pos = 0;
 	ctx->close_requested = false;
 	ctx->content_length = 0;
+	ctx->line_scan = 0;
 	BUF_RESET(ctx->wbuf);
 	VBUF_RESET(ctx->cbuf);
 	ctx->wpos = 0;
@@ -1586,21 +1589,38 @@ static bool host_is_valid(const char *restrict s)
 	return *s == '\0';
 }
 
-/* The strstr-based parser cannot see past a NUL, so a line holding one is
- * reported as partial forever and the request would stall until the buffer
- * fills or the idle timeout fires.  RFC 9110 5.5 requires rejecting a NUL in
- * a field value, so check the still-unparsed head for one whenever parsing
- * waits for more data.  Bytes before scan_off were already checked by an
- * earlier call and need not be rescanned. */
-static bool head_has_nul(const struct api_ctx *restrict ctx, size_t scan_off)
+/* Scan the head incrementally before invoking the strstr-based parser. Return
+ * 1 for a complete line, 0 for a partial line, or -1 for an embedded NUL.
+ * Stop at the line boundary so a request body may contain arbitrary bytes. */
+static int scan_head_line(struct api_ctx *restrict ctx)
 {
-	const size_t next_off =
-		(size_t)((const unsigned char *)ctx->next - ctx->rbuf.data);
-	if (scan_off < next_off) {
-		scan_off = next_off;
+	while (ctx->line_scan < ctx->rbuf.len) {
+		const unsigned char c = ctx->rbuf.data[ctx->line_scan];
+		if (c == '\0') {
+			return -1;
+		}
+		if (c == '\r') {
+			if (ctx->line_scan + 1 == ctx->rbuf.len) {
+				return 0;
+			}
+			if (ctx->rbuf.data[ctx->line_scan + 1] == '\n') {
+				ctx->line_scan += 2;
+				/* Match http_parse's leading-empty-line handling
+				 * without rescanning those lines on each fragment. */
+				const size_t next_off =
+					(size_t)((unsigned char *)ctx->next -
+						 ctx->rbuf.data);
+				if (ctx->msg.req.method == NULL &&
+				    ctx->line_scan == next_off + 2) {
+					ctx->next += 2;
+					continue;
+				}
+				return 1;
+			}
+		}
+		ctx->line_scan++;
 	}
-	return memchr(ctx->rbuf.data + scan_off, '\0',
-		      ctx->rbuf.len - scan_off) != NULL;
+	return 0;
 }
 
 /* Read and parse the request incrementally; dispatch to api_handle() once the
@@ -1635,23 +1655,23 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 		api_ctx_free(loop, ctx);
 		return;
 	}
-	const size_t scan_off = ctx->rbuf.len;
 	ctx->rbuf.len += n;
 	/* NUL-terminate so http_parse/http_parsehdr can use strstr; the byte
 	 * reserved above guarantees room. */
 	ctx->rbuf.data[ctx->rbuf.len] = '\0';
 
 	if (ctx->msg.req.method == NULL) {
+		const int status = scan_head_line(ctx);
+		if (status <= 0) {
+			if (status < 0) {
+				recv_error(loop, ctx, HTTP_BAD_REQUEST);
+			}
+			return;
+		}
 		char *const parsed = http_parse(ctx->next, &ctx->msg);
 		if (parsed == NULL) {
 			recv_error(loop, ctx, HTTP_BAD_REQUEST);
 			return;
-		}
-		if (parsed == ctx->next) {
-			if (head_has_nul(ctx, scan_off)) {
-				recv_error(loop, ctx, HTTP_BAD_REQUEST);
-			}
-			return; /* Partial line, wait for more data */
 		}
 		ctx->next = parsed;
 		/* http_parse() accepts the version token without interpreting
@@ -1665,17 +1685,18 @@ static void recv_cb(struct ev_loop *loop, ev_io *watcher, const int revents)
 	}
 
 	while (!ctx->hdr_done) {
+		const int status = scan_head_line(ctx);
+		if (status <= 0) {
+			if (status < 0) {
+				recv_error(loop, ctx, HTTP_BAD_REQUEST);
+			}
+			return;
+		}
 		char *key, *value;
 		char *const parsed = http_parsehdr(ctx->next, &key, &value);
 		if (parsed == NULL) {
 			recv_error(loop, ctx, HTTP_BAD_REQUEST);
 			return;
-		}
-		if (parsed == ctx->next) {
-			if (head_has_nul(ctx, scan_off)) {
-				recv_error(loop, ctx, HTTP_BAD_REQUEST);
-			}
-			return; /* Partial header, wait for more data */
 		}
 		ctx->next = parsed;
 		if (key == NULL) {
