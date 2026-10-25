@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -87,8 +88,60 @@ const struct mux_session_config mux_session_config_default = {
 	.lossymux_queue = 64,
 };
 
+enum table_failure_point {
+	TABLE_FAIL_NONE,
+	TABLE_FAIL_ID_NEW,
+	TABLE_FAIL_ID_SET,
+};
+
+static struct {
+	enum table_failure_point point;
+	struct udp_flows *flows;
+	struct udp_socket *sock;
+	size_t hits;
+	size_t clients;
+	size_t refs;
+} table_failure;
+
+static struct hashtable *test_table_new(const struct table_opts *opts);
+static struct hashtable *
+test_table_set(struct hashtable *table, const void *key, void **element);
+
 /* Pull in the unit under test after the fakes so its references bind here. */
+#define table_new test_table_new
+#define table_set test_table_set
 #include "udp.c"
+#undef table_new
+#undef table_set
+
+static void record_table_failure(void)
+{
+	table_failure.point = TABLE_FAIL_NONE;
+	table_failure.hits++;
+	table_failure.clients = table_size(table_failure.flows->by_client);
+	table_failure.refs = (size_t)table_failure.sock->refs;
+}
+
+static struct hashtable *test_table_new(const struct table_opts *opts)
+{
+	if (table_failure.point == TABLE_FAIL_ID_NEW &&
+	    opts == &TABLE_OPTS_PTR) {
+		record_table_failure();
+		return NULL;
+	}
+	return table_new(opts);
+}
+
+static struct hashtable *
+test_table_set(struct hashtable *table, const void *key, void **element)
+{
+	if (table_failure.point == TABLE_FAIL_ID_SET &&
+	    table == table_failure.flows->by_id) {
+		record_table_failure();
+		return table;
+	}
+	return table_set(table, key, element);
+}
 
 /* --- fixture --- */
 
@@ -338,6 +391,197 @@ T_DECLARE_CASE(test_flows_alloc_id_parity_and_wrap)
 	T_EXPECT_EQ(a_last, (uint_least16_t)65534);
 	T_EXPECT_EQ(a_wrap, (uint_least16_t)2);
 	T_EXPECT_EQ(d_skip, (uint_least16_t)7);
+}
+
+struct udp_client_fixture {
+	struct udp_fixture fx;
+	int client;
+};
+
+static void udp_client_fixture_free(void *data)
+{
+	struct udp_client_fixture *const ef = data;
+	table_failure.point = TABLE_FAIL_NONE;
+	if (ef->client >= 0) {
+		(void)close(ef->client);
+	}
+	udp_fixture_teardown(&ef->fx);
+	free(ef);
+}
+
+static void check_flows_exhaustion(struct testing_ctx *_t_, const bool accepted)
+{
+	struct udp_client_fixture *const ef = calloc(1, sizeof(*ef));
+	T_CHECK(ef != NULL);
+	ef->client = -1;
+	T_CLEANUP(udp_client_fixture_free, ef);
+	struct udp_fixture *const fx = &ef->fx;
+	T_EXPECT_EQ(udp_fixture_setup(fx, accepted), 0);
+	ef->client = client_socket();
+	T_EXPECT(ef->client >= 0);
+
+	const uint_fast32_t first = accepted ? 2u : 1u;
+	const size_t capacity = accepted ? 32767u : 32768u;
+	/* Fill the occupied-id table directly, sharing the listener socket
+	 * without creating thousands of clients or kernel descriptors. */
+	for (uint_fast32_t id = first; id <= UINT16_MAX; id += 2u) {
+		struct udp_flow *const flow = calloc(1, sizeof(*flow));
+		T_CHECK(flow != NULL);
+		flow->id = (uint_least16_t)id;
+		flow->owner = fx->flows;
+		flow->sock = udp_socket_ref(fx->listener->sock);
+		if (!flows_add(fx->flows, flow)) {
+			udp_socket_unref(flow->sock);
+			free(flow);
+			T_FATAL("flows_add failed");
+			return;
+		}
+	}
+	T_EXPECT_EQ(udp_flows_count(fx->flows), capacity);
+	T_EXPECT_EQ((size_t)fx->num_flows, capacity);
+	T_EXPECT_EQ(flows_alloc_id(fx->flows), (uint_least16_t)0);
+	const size_t refs = (size_t)fx->listener->sock->refs;
+
+	T_EXPECT(send_to(ef->client, &fx->listener_addr, "full"));
+	T_EXPECT(run_until_picks(fx, 1));
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)1);
+	T_EXPECT_EQ(fx->ss.num_sent, (size_t)0);
+	T_EXPECT_EQ(fx->ss.num_closed, (size_t)0);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), capacity);
+	T_EXPECT_EQ((size_t)fx->num_flows, capacity);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs);
+	T_EXPECT(fx->flows->by_client == NULL);
+	void *elem = NULL;
+	T_EXPECT(!table_find(fx->flows->by_id, flow_id_key(0), &elem));
+	for (uint_fast32_t id = first; id <= UINT16_MAX; id += 2u) {
+		T_EXPECT(table_find(fx->flows->by_id, flow_id_key(id), &elem));
+		const struct udp_flow *const flow = elem;
+		T_EXPECT_EQ(flow->id, (uint_least16_t)id);
+		T_EXPECT(flow->owner == fx->flows);
+		T_EXPECT(flow->sock == fx->listener->sock);
+	}
+
+	const uint_least16_t released = accepted ? 65534u : 65535u;
+	udp_flows_recv_close(fx->flows, released);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), capacity - 1u);
+	T_EXPECT_EQ((size_t)fx->num_flows, capacity - 1u);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs - 1u);
+	T_EXPECT_EQ(flows_alloc_id(fx->flows), released);
+	/* Restart at the beginning so the input path must find the one free
+	 * slot, including wraparound, rather than immediately hitting it. */
+	fx->flows->next_id = (uint_least16_t)first;
+	T_EXPECT(send_to(ef->client, &fx->listener_addr, "recovered"));
+	T_EXPECT(run_until_sent(fx, 1));
+	T_EXPECT(sent_is(&fx->ss.sent[0], released, "recovered"));
+	T_EXPECT_EQ(udp_flows_count(fx->flows), capacity);
+	T_EXPECT_EQ((size_t)fx->num_flows, capacity);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs);
+	T_EXPECT_EQ(flows_alloc_id(fx->flows), (uint_least16_t)0);
+	/* An existing client remains usable even with no free identifiers. */
+	T_EXPECT(send_to(ef->client, &fx->listener_addr, "again"));
+	T_EXPECT(run_until_sent(fx, 2));
+	T_EXPECT(sent_is(&fx->ss.sent[1], released, "again"));
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)1);
+	T_EXPECT_EQ((size_t)fx->num_flows, capacity);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs);
+	udp_flows_reset(fx->flows);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)0);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)0);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, (size_t)1);
+	T_EXPECT(!ev_is_active(&fx->flows->w_sweep));
+}
+
+T_DECLARE_CASE(test_flows_odd_id_exhaustion_and_recovery)
+{
+	check_flows_exhaustion(_t_, false);
+}
+
+T_DECLARE_CASE(test_flows_even_id_exhaustion_and_recovery)
+{
+	check_flows_exhaustion(_t_, true);
+}
+
+static void check_active_insert_rollback(
+	struct testing_ctx *_t_, const enum table_failure_point point)
+{
+	struct udp_client_fixture *const cf = calloc(1, sizeof(*cf));
+	T_CHECK(cf != NULL);
+	cf->client = -1;
+	T_CLEANUP(udp_client_fixture_free, cf);
+	struct udp_fixture *const fx = &cf->fx;
+	T_EXPECT_EQ(udp_fixture_setup(fx, false), 0);
+	cf->client = client_socket();
+	T_EXPECT(cf->client >= 0);
+	union sockaddr_max client = { 0 };
+	T_EXPECT_EQ(socket_get_addr(cf->client, &client), 0);
+	unsigned char key_data[UDP_FLOW_KEY_SIZE];
+	flow_key(key_data, fx->listener->sock, &client);
+	const struct hashkey key = {
+		.len = sizeof(key_data),
+		.data = key_data,
+	};
+	const size_t refs = (size_t)fx->listener->sock->refs;
+	table_failure.point = point;
+	table_failure.flows = fx->flows;
+	table_failure.sock = fx->listener->sock;
+	table_failure.hits = 0;
+
+	T_EXPECT(send_to(cf->client, &fx->listener_addr, "fail"));
+	T_EXPECT(run_until_picks(fx, 1));
+	/* Both failures occur after the client index and socket reference
+	 * have been acquired, with the datagram holding another reference. */
+	T_EXPECT_EQ(table_failure.hits, (size_t)1);
+	T_EXPECT_EQ(table_failure.clients, (size_t)1);
+	T_EXPECT_EQ(table_failure.refs, refs + 2u);
+	T_EXPECT_EQ(table_size(fx->flows->by_client), (size_t)0);
+	T_EXPECT_EQ(table_size(fx->flows->by_id), (size_t)0);
+	T_EXPECT_EQ(fx->flows->by_id == NULL, point == TABLE_FAIL_ID_NEW);
+	void *elem = NULL;
+	T_EXPECT(!table_find(fx->flows->by_client, &key, &elem));
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)0);
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)1);
+	T_EXPECT_EQ(fx->listener_dropped, (uint_least64_t)0);
+	T_EXPECT_EQ(fx->ss.num_sent, (size_t)0);
+	T_EXPECT_EQ(fx->ss.num_closed, (size_t)0);
+	T_EXPECT(!ev_is_active(&fx->flows->w_sweep));
+
+	T_EXPECT(send_to(cf->client, &fx->listener_addr, "retry"));
+	T_EXPECT(run_until_sent(fx, 1));
+	T_EXPECT(sent_is(&fx->ss.sent[0], 3, "retry"));
+	T_EXPECT_EQ(table_size(fx->flows->by_client), (size_t)1);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)1);
+	T_EXPECT(table_find(fx->flows->by_client, &key, &elem));
+	struct udp_flow *const flow = elem;
+	T_EXPECT(table_find(fx->flows->by_id, flow_id_key(3), &elem));
+	T_EXPECT(elem == flow);
+	T_EXPECT(flow->sock == fx->listener->sock);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)1);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs + 1u);
+	T_EXPECT(ev_is_active(&fx->flows->w_sweep));
+	T_EXPECT(send_to(cf->client, &fx->listener_addr, "again"));
+	T_EXPECT(run_until_sent(fx, 2));
+	T_EXPECT(sent_is(&fx->ss.sent[1], 3, "again"));
+	T_EXPECT_EQ(table_failure.hits, (size_t)1);
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)1);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)1);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs + 1u);
+	udp_flows_reset(fx->flows);
+	T_EXPECT_EQ(table_size(fx->flows->by_client), (size_t)0);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)0);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)0);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs);
+	T_EXPECT(!ev_is_active(&fx->flows->w_sweep));
+}
+
+T_DECLARE_CASE(test_flows_active_id_creation_rollback)
+{
+	check_active_insert_rollback(_t_, TABLE_FAIL_ID_NEW);
+}
+
+T_DECLARE_CASE(test_flows_active_id_insertion_rollback)
+{
+	check_active_insert_rollback(_t_, TABLE_FAIL_ID_SET);
 }
 
 /* A local client's datagrams become a flow of the local parity, stickily: the
@@ -916,6 +1160,10 @@ T_DECLARE_CASE(test_flows_reset_is_silent)
 
 static const struct testing_suite suite[] = {
 	T_CASE(test_flows_alloc_id_parity_and_wrap),
+	T_CASE(test_flows_odd_id_exhaustion_and_recovery),
+	T_CASE(test_flows_even_id_exhaustion_and_recovery),
+	T_CASE(test_flows_active_id_creation_rollback),
+	T_CASE(test_flows_active_id_insertion_rollback),
 	T_CASE(test_flows_active_roundtrip),
 	T_CASE(test_flows_passive_roundtrip),
 	T_CASE(test_flows_active_empty_roundtrip),

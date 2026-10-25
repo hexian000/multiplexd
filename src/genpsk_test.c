@@ -11,7 +11,6 @@
 
 #include "shim/tls.h"
 
-#include "utils/ctype_ascii.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
@@ -170,7 +169,7 @@ T_DECLARE_CASE(test_genpsk_writes_lowercase_hex_key)
 	bool all_lower_hex = true;
 	for (size_t i = 0; i + 1 < n; i++) {
 		const char c = buf[i];
-		if (!isxdigit(c) || isupper(c)) {
+		if ((c < '0' || c > '9') && (c < 'a' || c > 'f')) {
 			all_lower_hex = false;
 			break;
 		}

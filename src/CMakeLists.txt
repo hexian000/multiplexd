@@ -293,6 +293,12 @@ add_src_test(gencerts_test
     ${GENCERTS_SOURCES}
     gencerts_test.c
 )
+target_compile_definitions(gencerts_test PRIVATE
+    GENCERTS_TEST_TMPDIR="${CMAKE_BINARY_DIR}/tmp")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND WITH_OPENSSL)
+    target_link_options(gencerts_test PRIVATE "-Wl,--wrap=time" "-Wl,--wrap=X509_time_adj_ex")
+    target_compile_definitions(gencerts_test PRIVATE GENCERTS_TEST_WRAP_TIME=1)
+endif()
 
 # Always registered; no-op when TLS disabled.
 add_src_test(genpsk_test

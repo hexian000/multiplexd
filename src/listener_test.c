@@ -255,7 +255,7 @@ T_DECLARE_CASE(test_listener_get_addr_tracks_socket)
 	T_EXPECT(!has_stopped);
 }
 
-T_DECLARE_CASE(test_listener_start_bad_addr_fails)
+T_DECLARE_CASE(test_listener_start_occupied_addr_fails)
 {
 	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(loop != NULL);
@@ -263,23 +263,25 @@ T_DECLARE_CASE(test_listener_start_bad_addr_fails)
 	struct listener l;
 	listener_init(&l, &g_socket_opts, test_serve, NULL, NULL);
 
-	/* 192.0.2.1 is TEST-NET-1 (RFC 5737) and is never a local interface
-	 * address; bind() must fail with EADDRNOTAVAIL. */
-	struct sockaddr_in bad;
-	memset(&bad, 0, sizeof(bad));
-	bad.sin_family = AF_INET;
-	bad.sin_addr.s_addr = htonl(0xC0000201u); /* 192.0.2.1 */
-	bad.sin_port = 0;
+	/* Keep a real listener bound while attempting the same address again.
+	 * Nonlocal-binding policy cannot make this address available. */
+	const union sockaddr_max sa = make_loopback_any(AF_INET);
+	const int occupied_fd = listener_open(&g_socket_opts, &sa.sa);
+	T_CHECK(occupied_fd >= 0);
+	union sockaddr_max occupied;
+	socklen_t len = sizeof(occupied);
+	T_CHECK(getsockname(occupied_fd, &occupied.sa, &len) == 0);
 
-	const bool started =
-		listener_start(&l, loop, (const struct sockaddr *)&bad);
-	/* Defensive: on the unexpected success path, release the socket. */
-	if (started) {
-		listener_stop(&l, loop);
-	}
+	const bool started = listener_start(&l, loop, &occupied.sa);
+	const int accept_fd = l.w_accept.fd;
+	const bool accept_active = ev_is_active(&l.w_accept);
+	listener_stop(&l, loop);
+	(void)close(occupied_fd);
 	ev_loop_destroy(loop);
 
 	T_EXPECT(!started);
+	T_EXPECT_EQ(accept_fd, -1);
+	T_EXPECT(!accept_active);
 }
 
 /* Everything serve_one_connection observes about one accepted connection,
@@ -635,7 +637,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_listener_start_binds_port),
 	T_CASE(test_listener_stop_after_start),
 	T_CASE(test_listener_get_addr_tracks_socket),
-	T_CASE(test_listener_start_bad_addr_fails),
+	T_CASE(test_listener_start_occupied_addr_fails),
 	T_CASE(test_listener_serve_fn_called),
 	T_CASE(test_listener_serve_fn_called_ipv6),
 	T_CASE(test_listener_accept_drains_multiple_in_one_wakeup),
