@@ -16,8 +16,7 @@
 struct executor {
 	mtx_t mu;
 	cnd_t cond;
-	/* Bounded ring buffer; allocated separately because workers[] is the
-	 * flexible array member and a struct may have only one */
+	/* Bounded ring buffer, stored after the worker handles. */
 	struct task *buf;
 	size_t capacity;
 	size_t head;
@@ -33,7 +32,6 @@ static void free_executor(struct executor *restrict e)
 {
 	mtx_destroy(&e->mu);
 	cnd_destroy(&e->cond);
-	free(e->buf);
 	free(e);
 }
 
@@ -91,19 +89,24 @@ struct executor *executor_create(const size_t nworkers, const size_t capacity)
 	if (nworkers > (SIZE_MAX - sizeof(struct executor)) / sizeof(thrd_t)) {
 		return NULL;
 	}
-	if (capacity > SIZE_MAX / sizeof(struct task)) {
+	const size_t worker_size =
+		sizeof(struct executor) + nworkers * sizeof(thrd_t);
+	/* Thread handles need not have the task ring's alignment. */
+	const size_t align = _Alignof(struct task);
+	const size_t padding = (align - worker_size % align) % align;
+	if (worker_size > SIZE_MAX - padding) {
+		return NULL;
+	}
+	const size_t buf_offset = worker_size + padding;
+	if (capacity > (SIZE_MAX - buf_offset) / sizeof(struct task)) {
 		return NULL;
 	}
 	struct executor *restrict e =
-		malloc(sizeof(struct executor) + nworkers * sizeof(thrd_t));
+		malloc(buf_offset + capacity * sizeof(struct task));
 	if (e == NULL) {
 		return NULL;
 	}
-	e->buf = malloc(sizeof(struct task) * capacity);
-	if (e->buf == NULL) {
-		free(e);
-		return NULL;
-	}
+	e->buf = (struct task *)((unsigned char *)e + buf_offset);
 	e->exit_flag = false;
 	e->detached = false;
 	e->capacity = capacity;
@@ -112,13 +115,11 @@ struct executor *executor_create(const size_t nworkers, const size_t capacity)
 	e->nthreads = 0;
 	e->live = 0;
 	if (mtx_init(&e->mu, mtx_plain) != thrd_success) {
-		free(e->buf);
 		free(e);
 		return NULL;
 	}
 	if (cnd_init(&e->cond) != thrd_success) {
 		mtx_destroy(&e->mu);
-		free(e->buf);
 		free(e);
 		return NULL;
 	}

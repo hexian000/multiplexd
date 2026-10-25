@@ -9,10 +9,8 @@
 #include "math/rand.h"
 #include "meta/arraysize.h"
 #include "meta/minmax.h"
-#include "utils/slog.h"
 
 #include <assert.h>
-#include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -330,8 +328,6 @@ static inline void table_reseed(struct hashtable *restrict table)
 	}
 	table->reseeded = true;
 	table->seed = (uint_least32_t)rand64n(UINT32_C(0xFFFFFFFF));
-	LOGD_F("table reseed: size=%zu new_seed=%" PRIXLEAST32, table->size,
-	       table->seed);
 	table_compact(table);
 	table_rehash(table);
 }
@@ -401,8 +397,6 @@ table_reserve(struct hashtable *restrict table, const size_t new_size)
 	if (table->capacity == new_capacity) {
 		return table;
 	}
-	LOGD_F("table resize: size=%zu capacity=%zu new_capacity=%zu",
-	       table->size, table->capacity, new_capacity);
 	bump_version(table);
 	table_compact(table);
 	table = table_realloc(table, new_capacity);
@@ -601,7 +595,7 @@ struct hashtable *table_filter(
 		elemid_type *last_next = &table->p[bucket].bucket;
 		for (elemid_type i = *last_next; i != ID_NIL; i = *last_next) {
 			assert(version == table->version);
-			struct hash_element *restrict p = &(table->p[i]);
+			struct hash_element *p = &(table->p[i]);
 			const bool ok = f(table, p->key, p->element, data);
 			if (ok) {
 				last_next = &(p->next);
