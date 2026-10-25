@@ -283,12 +283,16 @@ session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
 	ss->guards = guard;
 }
 
-static inline bool session_guard_end(struct mux_session_guard *guard)
+/* Pass the same session as session_guard_begin so restoring the guard stack
+ * explicitly updates the original object, even across opaque callbacks. */
+static inline bool
+session_guard_end(struct mux_session *ss, struct mux_session_guard *guard)
 {
 	if (guard->session == NULL) {
 		return false;
 	}
-	guard->session->guards = guard->previous;
+	ASSERT(guard->session == ss);
+	ss->guards = guard->previous;
 	return !guard->closed;
 }
 

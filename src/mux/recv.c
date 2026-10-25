@@ -145,7 +145,7 @@ static bool deliver_push_payload(
 	mux_stream_recv_copy(
 		s, bytebuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE,
 		hdr->length);
-	if (!session_guard_end(&guard)) {
+	if (!session_guard_end(ss, &guard)) {
 		return false;
 	}
 	if (session_streams_freed(ss)) {
@@ -193,7 +193,7 @@ static void process_syn_payload(
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			mux_stream_abort(s, MUX_STATUS_FLOW_CONTROL_ERROR);
-			if (!session_guard_end(&guard)) {
+			if (!session_guard_end(ss, &guard)) {
 				return;
 			}
 			/* mux_stream_abort can free the last active stream of a
@@ -337,7 +337,7 @@ static void dispatch_by_stream(
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		mux_stream_recv_window(s, hdr->extra);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		/* mux_stream_recv_window() may mux_stream_abort on a spec §6.6 excessive-
@@ -376,7 +376,7 @@ static void dispatch_by_stream(
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		mux_stream_recv_window(s, hdr->extra);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		/* Defense-in-depth, mirroring the ACK-only guard above: a SYN|ACK
@@ -398,7 +398,7 @@ static void dispatch_by_stream(
 		}
 		session_guard_begin(ss, &guard);
 		stream_report_established(ss, s);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		/* The lifecycle callback may shut down the session, freeing or
@@ -767,7 +767,7 @@ static void dispatch_frame(struct mux_session *ss)
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			mux_handshake_process_hello(ss, &hdr, frame_size);
-			if (!session_guard_end(&guard)) {
+			if (!session_guard_end(ss, &guard)) {
 				return;
 			}
 			if (ss->state == SESSION_CLOSED) {
@@ -855,7 +855,7 @@ static void dispatch_frame(struct mux_session *ss)
 		} else {
 			dispatch_no_stream(ss, &hdr);
 		}
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		if (ss->state != SESSION_ESTABLISHED) {
@@ -954,7 +954,7 @@ void mux_session_on_recv(struct mux_session *ss)
 			}
 		}
 	}
-	if (!session_guard_end(&guard)) {
+	if (!session_guard_end(ss, &guard)) {
 		return;
 	}
 	/* Reclaim capacity grown for oversized frames; floor is one read-ahead

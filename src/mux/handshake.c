@@ -588,7 +588,7 @@ bool mux_handshake_process_hello(
 		session_guard_begin(ss, &guard);
 		const bool accepted = ss->callbacks.on_verify_identity(
 			ss->userdata, ss, ss->handshake.peer_identity);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return false;
 		}
 		if (ss->state != SESSION_HANDSHAKE) {
@@ -610,7 +610,7 @@ bool mux_handshake_process_hello(
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_handshake_done(ss);
-	if (!session_guard_end(&guard)) {
+	if (!session_guard_end(ss, &guard)) {
 		return false;
 	}
 	if (ss->state != SESSION_ESTABLISHED) {

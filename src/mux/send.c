@@ -277,7 +277,7 @@ static enum send_stage send_stage_next(
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			mux_sched_flush_ctrl(ss);
-			if (!session_guard_end(&guard) ||
+			if (!session_guard_end(ss, &guard) ||
 			    ss->state != SESSION_ESTABLISHED) {
 				return SEND_STAGE_BLOCKED;
 			}
@@ -291,13 +291,14 @@ static enum send_stage send_stage_next(
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	const bool produced = mux_sched_next_data(ss);
-	if (!session_guard_end(&guard) || ss->state != SESSION_ESTABLISHED) {
+	if (!session_guard_end(ss, &guard) ||
+	    ss->state != SESSION_ESTABLISHED) {
 		return SEND_STAGE_BLOCKED;
 	}
 	if (!produced) {
 		session_guard_begin(ss, &guard);
 		mux_sched_flush_ctrl(ss);
-		if (!session_guard_end(&guard) ||
+		if (!session_guard_end(ss, &guard) ||
 		    ss->state != SESSION_ESTABLISHED) {
 			return SEND_STAGE_BLOCKED;
 		}
@@ -441,7 +442,7 @@ static bool send_handle_rx_closed(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_CLOSING);
-	if (!session_guard_end(&guard) || ss->state != SESSION_CLOSING) {
+	if (!session_guard_end(ss, &guard) || ss->state != SESSION_CLOSING) {
 		return true;
 	}
 	ss->wire.tx_pending = true;
@@ -464,7 +465,7 @@ void mux_session_on_send(struct mux_session *ss)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		mux_sched_drain_lp(ss);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 	}
@@ -473,7 +474,7 @@ void mux_session_on_send(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	send_pump(ss, &made_progress);
-	if (!session_guard_end(&guard)) {
+	if (!session_guard_end(ss, &guard)) {
 		return;
 	}
 	if (ss->state == SESSION_SUSPENDED || ss->state == SESSION_CLOSED) {
@@ -942,7 +943,7 @@ static void session_flush_inline(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_on_send(ss);
-	if (!session_guard_end(&guard)) {
+	if (!session_guard_end(ss, &guard)) {
 		return;
 	}
 	if (ss->state == SESSION_CLOSED) {

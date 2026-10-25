@@ -119,7 +119,7 @@ static bool handshake_start(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_HANDSHAKE);
-	if (!session_guard_end(&guard) || ss->state != SESSION_HANDSHAKE) {
+	if (!session_guard_end(ss, &guard) || ss->state != SESSION_HANDSHAKE) {
 		return false;
 	}
 	if (!ss->accepted) {
@@ -255,7 +255,7 @@ static void socket_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		FAILMSGF("unexpected session state %d", ss->state);
 	}
 
-	if (!session_guard_end(&guard)) {
+	if (!session_guard_end(ss, &guard)) {
 		return;
 	}
 	if (ss->state == SESSION_CLOSED) {
@@ -291,7 +291,7 @@ session_on_dead_link(struct mux_session *ss, const char *restrict reason)
 		struct mux_session_guard call_guard;
 		session_guard_begin(ss, &call_guard);
 		mux_session_suspend(ss);
-		if (!session_guard_end(&call_guard)) {
+		if (!session_guard_end(ss, &call_guard)) {
 			return;
 		}
 		if (ss->state == SESSION_CLOSED) {
@@ -330,7 +330,7 @@ connect_timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 			struct mux_session_guard call_guard;
 			session_guard_begin(ss, &call_guard);
 			mux_session_suspend(ss);
-			if (!session_guard_end(&call_guard)) {
+			if (!session_guard_end(ss, &call_guard)) {
 				return;
 			}
 			if (ss->state == SESSION_CLOSED) {
@@ -697,7 +697,7 @@ void mux_session_close(struct mux_session *ss)
 	if (call_guard.session == NULL) {
 		return;
 	}
-	(void)session_guard_end(&call_guard);
+	(void)session_guard_end(ss, &call_guard);
 	session_stop(ss);
 	session_cleanup(ss);
 	/* The session goes with them: free the streams the application still
@@ -989,7 +989,7 @@ void mux_session_initiate_shutdown(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_CLOSING);
-	if (!session_guard_end(&guard) || ss->state != SESSION_CLOSING) {
+	if (!session_guard_end(ss, &guard) || ss->state != SESSION_CLOSING) {
 		return;
 	}
 	/* connect_timeout == 0 means disabled (schema-legal, conf_check() no
@@ -1251,7 +1251,7 @@ void mux_session_reset(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_CLOSED);
-	if (!session_guard_end(&guard) || ss->state != SESSION_CLOSED) {
+	if (!session_guard_end(ss, &guard) || ss->state != SESSION_CLOSED) {
 		return;
 	}
 	session_stop(ss);
@@ -1281,7 +1281,7 @@ void mux_session_notify_closed(struct mux_session *ss, const bool expired)
 	struct mux_session_guard call_guard;
 	session_guard_begin(ss, &call_guard);
 	mux_session_reset(ss);
-	if (!session_guard_end(&call_guard)) {
+	if (!session_guard_end(ss, &call_guard)) {
 		return;
 	}
 	if (!was_closed && ss->state == SESSION_CLOSED) {
@@ -1309,7 +1309,7 @@ void mux_session_suspend(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_SUSPENDED);
-	if (!session_guard_end(&guard) || ss->state != SESSION_SUSPENDED) {
+	if (!session_guard_end(ss, &guard) || ss->state != SESSION_SUSPENDED) {
 		return;
 	}
 
@@ -1420,7 +1420,8 @@ void mux_session_handshake_done(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_ESTABLISHED);
-	if (!session_guard_end(&guard) || ss->state != SESSION_ESTABLISHED) {
+	if (!session_guard_end(ss, &guard) ||
+	    ss->state != SESSION_ESTABLISHED) {
 		return;
 	}
 	ev_timer_again(ss->loop, &ss->w_timeout);
@@ -1547,7 +1548,7 @@ static void session_resume_attach(
 		struct mux_session_guard call_guard;
 		session_guard_begin(ss, &call_guard);
 		mux_session_suspend(ss);
-		if (!session_guard_end(&call_guard)) {
+		if (!session_guard_end(ss, &call_guard)) {
 			return;
 		}
 		if (ss->state != SESSION_SUSPENDED) {
@@ -1636,7 +1637,7 @@ static void session_resume_attach(
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_HANDSHAKE);
-	if (!session_guard_end(&guard) || ss->state != SESSION_HANDSHAKE) {
+	if (!session_guard_end(ss, &guard) || ss->state != SESSION_HANDSHAKE) {
 		return;
 	}
 	/* Preserve draining across resume: a drain requested by a config reload
@@ -1660,7 +1661,7 @@ static void session_resume_attach(
 	struct mux_session_guard handshake_guard;
 	session_guard_begin(ss, &handshake_guard);
 	mux_session_handshake_done(ss);
-	if (!session_guard_end(&handshake_guard)) {
+	if (!session_guard_end(ss, &handshake_guard)) {
 		return;
 	}
 	if (ss->state != SESSION_ESTABLISHED) {

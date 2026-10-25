@@ -475,7 +475,7 @@ static void stream_flush_local(struct mux_stream *s)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		const size_t nwrite = stream_local_write(s, data, len);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		if (nwrite == 0) {
@@ -624,7 +624,7 @@ static void stream_on_send(struct mux_stream *s)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		local_on_connected(s);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
@@ -660,7 +660,7 @@ static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		for (;;) {
 			session_guard_begin(ss, &guard);
 			const bool more = stream_on_recv(s);
-			if (!session_guard_end(&guard)) {
+			if (!session_guard_end(ss, &guard)) {
 				return;
 			}
 			if (session_streams_freed(ss) || !more ||
@@ -673,7 +673,7 @@ static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	    s->state != STREAM_CLOSED) {
 		session_guard_begin(ss, &guard);
 		stream_on_send(s);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 	}
@@ -707,7 +707,7 @@ static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
-	if (!session_guard_end(&guard)) {
+	if (!session_guard_end(ss, &guard)) {
 		return;
 	}
 	mux_session_flush(ss);
@@ -1193,7 +1193,7 @@ static inline void stream_notify_readable(struct mux_stream *s)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		stream_flush_local(s);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		/* stream_flush_local can close the last active stream of a
@@ -1221,7 +1221,7 @@ static void stream_abort_notify_close(struct mux_stream *s)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		stream_rst_notify_direct(s);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
@@ -1337,7 +1337,7 @@ void mux_stream_recv_copy(
 		session_guard_begin(ss, &guard);
 		const size_t nwrite =
 			stream_local_write(s, payload, payload_len);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
@@ -1630,7 +1630,7 @@ void mux_stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		stream_rst_notify_direct(s);
-		if (!session_guard_end(&guard)) {
+		if (!session_guard_end(ss, &guard)) {
 			return;
 		}
 		if (session_streams_freed(ss)) {

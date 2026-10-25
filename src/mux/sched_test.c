@@ -279,6 +279,8 @@ static void cleanup_session(struct mux_session *restrict ss)
 		ev_loop_destroy(ss->loop);
 		ss->loop = NULL;
 	}
+	/* Static fixtures must not retain borrowed pointers to case-local streams. */
+	*ss = (struct mux_session){ 0 };
 }
 
 /* Cleanup runs after longjmp, so cases using this helper keep the session
@@ -438,6 +440,20 @@ T_DECLARE_CASE(test_sched_fixture_cleanup_after_failed_expectation)
 	T_EXPECT(released);
 	T_EXPECT_EQ(probe.failed, 1);
 	T_EXPECT_EQ(probe.passed, 1);
+}
+
+T_DECLARE_CASE(test_sched_fixture_cleanup_drops_borrowed_streams)
+{
+	static struct mux_session ss;
+	T_CALL_SUBCASE(make_case_session, &ss);
+	struct mux_stream stream = { .id = 1, .state = STREAM_INIT };
+	sched_lp_enqueue(&ss, &stream);
+	T_EXPECT(ss.sched.lp_head == &stream);
+	T_EXPECT(ss.sched.lp_tail == &stream);
+
+	cleanup_session(&ss);
+	T_EXPECT(ss.sched.lp_head == NULL);
+	T_EXPECT(ss.sched.lp_tail == NULL);
 }
 
 T_DECLARE_CASE(test_sched_add_remove_updates_table_and_idle_timeout)
@@ -1756,6 +1772,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_sched_alloc_stream_id_nearly_full),
 	T_CASE(test_sched_alloc_stream_id_starts_at_minimum),
 	T_CASE(test_sched_fixture_cleanup_after_failed_expectation),
+	T_CASE(test_sched_fixture_cleanup_drops_borrowed_streams),
 	T_CASE(test_sched_add_remove_updates_table_and_idle_timeout),
 	T_CASE(test_sched_add_stream_rejects_duplicate_id),
 	T_CASE(test_sched_free_streams_clears_stream_counter),
