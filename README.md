@@ -19,14 +19,14 @@ multiplexd is a TCP stream multiplexer that solves most of the problems of tunne
   - [Implementation](#implementation)
 - [Generating Certificates](#generating-certificates)
   - [Generate Self-Signed Certificates](#generate-self-signed-certificates)
-  - [Generate CA-Signed Certificates](#generate-ca-signed-certificates)
+  - [Generate Self-Signed Certificate Chains](#generate-self-signed-certificate-chains)
   - [Certificate Options](#certificate-options)
 - [Configuration](#configuration)
   - [Server (server.json)](#server-serverjson)
   - [Client (client.json)](#client-clientjson)
-  - [Multi-Peer Routing (`identity` block)](#multi-peer-routing-identity-block)
   - [Parallel Tunnels](#parallel-tunnels)
-  - [UDP Relay (`mux.lossymux`)](#udp-relay-muxlossymux)
+  - [Multi-Peer Routing (`identity` extension)](#multi-peer-routing-identity-extension)
+  - [UDP Relay (`lossymux` extension)](#udp-relay-lossymux-extension)
 - [Observability](#observability)
   - [Endpoints](#endpoints)
     - [`GET /healthy`](#get-healthy)
@@ -49,7 +49,8 @@ multiplexd is a TCP stream multiplexer that solves most of the problems of tunne
 - [Deployment Notes](#deployment-notes)
   - [TLS Security Model](#tls-security-model)
   - [Connection Backoff](#connection-backoff)
-  - [Battery-Constrained Deployment (Mobile)](#battery-constrained-deployment-mobile)
+  - [Power-Constrained Deployment](#power-constrained-deployment)
+  - [Memory-Constrained Deployment](#memory-constrained-deployment)
   - [API Server](#api-server)
   - [Configuration Reload](#configuration-reload)
 - [Credits](#credits)
@@ -84,7 +85,7 @@ multiplexd is a TCP stream multiplexer that solves most of the problems of tunne
 - **Hot configuration reload**: `SIGHUP` reloads config and gracefully drains existing sessions.
 - **Multi-peer routing**: The `identity` block maintains simultaneous sessions with multiple named peers.
 - **Built-in observability**: Health check, plain-text stats, and Prometheus metrics endpoints.
-- **Standards-compliant**: ISO C11 and POSIX.1-2008.
+- **Portability**: ISO C11 and POSIX.1-2008 compliant.
 
 ## Architecture
 
@@ -137,7 +138,7 @@ See [doc/impl.md](doc/impl.md) for runtime topology, send/receive paths, and mai
 
 ## Generating Certificates
 
-multiplexd includes a built-in certificate generator for creating self-signed or CA-signed certificates. This feature requires building with OpenSSL (`USE_TLS_LIBRARY=openssl`).
+multiplexd includes a built-in certificate generator for creating self-signed certificates and certificate chains rooted in a self-signed private CA. This feature requires building with OpenSSL (`USE_TLS_LIBRARY=openssl`).
 
 ### Generate Self-Signed Certificates
 
@@ -155,13 +156,13 @@ multiplexd --gencerts client,server --keytype ecdsa --keysize 256
 multiplexd --gencerts mycert --keytype ed25519
 ```
 
-### Generate CA-Signed Certificates
+### Generate Self-Signed Certificate Chains
 
 ```bash
-# First, generate a CA certificate
+# First, generate a self-signed private CA certificate
 multiplexd --gencerts ca
 
-# Then generate certificates signed by the CA, so only the CA certificate needs to be listed in authcerts for verification
+# Then generate certificates signed by this private CA, so only its certificate needs to be listed in authcerts for verification
 multiplexd --gencerts client1,client2,client3 --sign ca
 
 # For identity.verify, name each peer's identity explicitly; certificates carry none by default
@@ -288,15 +289,40 @@ Notes:
 - **When dialing, only the first entry is offered** — both TLS backends accept
   a single client-side PSK. A node that dials while holding several keys logs a
   warning naming the one it will use.
-- A PSK is always bound to SHA-256, on either TLS backend, so only the
-  SHA-256 suites of `tls.ciphersuites` are used, in their listed order, and a
-  list with no SHA-256 suite stops startup. Certificate mode uses the whole
-  list.
+- A PSK is always bound to SHA-256 on either TLS backend.
 - Values are lowercase hex or `@path`; a loaded file may end with a newline.
   `tls.sni` is not sent: the ClientHello carries no server name, since there
   is no certificate for it to select.
 
-### Multi-Peer Routing (`identity` block)
+### Parallel Tunnels
+
+When `ENABLE_THREADS=ON`, each entry in `identity.mux_connect` runs on a dedicated thread. Repeating the same address opens multiple independent tunnels to that peer; new connections arriving on the matching `identity.listen` address are distributed round-robin across those currently established, so one tunnel reconnecting does not cost any connections while another is up.
+
+```json
+{
+    "connect": "127.0.0.1:22",
+    "identity": {
+        "claim": "client-a",
+        "mux_connect": [
+            "east.example.com:8443",
+            "east.example.com:8443",
+            "east.example.com:8443"
+        ],
+        "listen": {
+            "hub-east": "127.0.0.2:1080"
+        }
+    },
+    "tls": {
+        "cert": "@client-a-cert.pem",
+        "key": "@client-a-key.pem",
+        "authcerts": ["@ca-cert.pem"]
+    }
+}
+```
+
+This configuration opens three parallel tunnels to `east.example.com:8443`. Each tunnel saturates one CPU core independently, so aggregate throughput scales with the number of tunnels.
+
+### Multi-Peer Routing (`identity` extension)
 
 The `identity` block lets a node advertise its own identity and maintain simultaneous sessions with multiple named peers.
 
@@ -354,35 +380,7 @@ The `identity` block lets a node advertise its own identity and maintain simulta
 
 Traffic arriving on `127.0.1.1:8022` is sent over the session whose peer claimed `client-a`; traffic on `127.0.1.2:8022` goes to `client-b`. On the spoke, traffic arriving on `127.0.0.2:1080` is multiplexed over the session whose peer claimed `hub-east` and is forwarded to the remote node's root `connect` target; traffic on `127.0.0.3:1080` goes via `hub-west`.
 
-### Parallel Tunnels
-
-When `ENABLE_THREADS=ON`, each entry in `identity.mux_connect` runs on a dedicated thread. Repeating the same address opens multiple independent tunnels to that peer; new connections arriving on the matching `identity.listen` address are distributed round-robin across those currently established, so one tunnel reconnecting does not cost any connections while another is up.
-
-```json
-{
-    "connect": "127.0.0.1:22",
-    "identity": {
-        "claim": "client-a",
-        "mux_connect": [
-            "east.example.com:8443",
-            "east.example.com:8443",
-            "east.example.com:8443"
-        ],
-        "listen": {
-            "hub-east": "127.0.0.2:1080"
-        }
-    },
-    "tls": {
-        "cert": "@client-a-cert.pem",
-        "key": "@client-a-key.pem",
-        "authcerts": ["@ca-cert.pem"]
-    }
-}
-```
-
-This configuration opens three parallel tunnels to `east.example.com:8443`. Each tunnel saturates one CPU core independently, so aggregate throughput scales with the number of tunnels.
-
-### UDP Relay (`mux.lossymux`)
+### UDP Relay (`lossymux` extension)
 
 Enable `mux.lossymux` on **both** ends to relay UDP as well as TCP. It is a bilateral hello extension, so it stays inactive unless both peers enable it.
 
@@ -446,7 +444,7 @@ Metrics come in two flavours (lossymux adds `multiplexd_datagrams_total`, `multi
 
 A tunnel is only labeled once its peer's announced identity names an `identity.listen` entry — whether the session was accepted on that listener or dialed from `identity.mux_connect`. Tunnels outside any identity, such as the top-level `mux_connect` session, inbound sessions from unconfigured peers, and dial-outs to a peer with no `identity.listen` entry, are counted in the totals but emit no per-tunnel series. Configuring `identity.listen` is therefore what turns per-tunnel breakdown on, and it also bounds label cardinality to what the configuration declares.
 
-Aggregate across tunnels with `sum()`, e.g. `sum(multiplexd_session_stream_open_total)`. Note this counts only live tunnels, whereas `multiplexd_stream_open_total` also includes tunnels that have since closed.
+Per-tunnel counters cover live tunnels; process-wide counters also retain activity from tunnels that have closed.
 
 `multiplexd_session_stream_establish_latency_seconds` is a summary over each tunnel's most recent 256 **active-open** stream establishments — a passive open records no SYN-to-SYN|ACK latency and is never observed. Quantiles come from that sliding window; `_count` is the monotonic number of observations behind them, so it tracks neither `multiplexd_session_stream_open_total` nor the established-stream total. A server-role tunnel that only accepts streams therefore reports `_count 0` and no quantiles. There is no `_sum`, since the sliding window cannot produce one.
 
@@ -619,7 +617,7 @@ Operational requirements:
 - `*-key.pem` files and `--dump-config` output contain private key material and must be protected accordingly.
 - By default the `identity` extension (`identity.claim`) is a self-declared routing key, not cryptographically bound to the presenting certificate. With a shared CA or `system_trust`, any peer holding a certificate accepted by that trust store can claim any identity string. Bind claims with `identity.verify` (below), or disable `system_trust` and list per-peer leaf certificates in `authcerts` instead of a shared CA. Every trusted issuer must enforce which `multiplexd:` identities it certifies when `identity.verify` is used; trusting more issuers also gives each of them authority to certify those identities.
 - `identity.verify` binds the claim to the certificate: a claimed identity must appear as a URI subjectAltName `multiplexd:<identity>` (percent-encoded, RFC 5280 §4.2.1.6) in the certificate the peer presented on that transport. This makes a shared CA safe against peer-to-peer impersonation, since the CA decides which identity each certificate may claim. Enforcement is local and per-direction: an enforcing node interoperates with a non-enforcing one, and each side independently decides whether to check the other. The check runs before any stream is admitted, and again on every resume, so a reconnecting transport cannot inherit a session's verified identity without proving it.
-- `identity.verify` does not deny an *unidentified* peer. A peer that claims nothing is still accepted if its certificate chains to `authcerts`, and reaches the root `connect` target; only identity-routed access is gated. Claiming the empty string is not the same as claiming nothing: it is an identity like any other, so it must be named by the certificate (`--identity ""`) to pass.
+- `identity.verify` does not deny an *unidentified* peer. A peer that claims nothing is still accepted if its certificate chains to a configured trust anchor, and reaches the root `connect` target; only identity-routed access is gated. Claiming the empty string is not the same as claiming nothing: it is an identity like any other, so it must be named by the certificate (`--identity ""`) to pass.
 - Rolling `identity.verify` out: upgrade binaries first, then reissue certificates, then enable the option. The `identity` config object rejects unknown keys, so a config containing `identity.verify` fails to load on an older binary; adding the URI subjectAltName is inert on every version, since nothing reads subjectAltNames unless the option is on.
 
 #### Certificate disclosure, and what PSK mode changes
@@ -650,25 +648,18 @@ claim to the key that made it.
 
 The `max_startups` option (`start:rate:full` format, where `rate` is a percentage from 0 to 100) rate-limits incoming session attempts: the first `start` are accepted freely; beyond that, each new attempt is rejected with probability `rate%` until `full` is reached.
 
-### Battery-Constrained Deployment (Mobile)
+### Power-Constrained Deployment
 
-On a phone or other battery-powered device the dominant cost is usually the radio, not the CPU. Every packet sent after an idle gap drives a cellular modem from idle to connected and holds it there through a multi-second tail, so the number of times the tunnel transmits matters far more than how much work each transmission takes.
+- Set `mux.idle_timeout` to close unused dialed sessions and stop their keepalive traffic. Short timeouts can increase connection setup work and latency when traffic resumes; `0` disables idle closure.
+- Set `mux.nodelay: false` to batch small writes, reducing frame processing and network activity at the cost of up to 40 ms of added delay.
+- Keep `mux.keepalive` as high as your network allows to reduce periodic wakeups and traffic. Leave `mux.tcp.keepalive: false` to avoid duplicate probes.
+- Leave `ENABLE_THREADS=OFF` unless you need parallel session processing across CPU cores. This avoids per-session threads and cross-thread dispatch, at the cost of CPU parallelism.
 
-An idle multiplexd holds no periodic timer of its own: the maintenance tick is armed only while a task has outstanding work, suspend detection rides loop iterations that already happen, and a tunnel's frame-cache trim stops once the cache is empty. What remains is whatever you configure below.
+### Memory-Constrained Deployment
 
-Configuration:
-
-- **`mux.idle_timeout`** (default `0`, disabled) is the largest single lever. With no streams open, a dialed session closes completely — no keepalive frames, no socket, no timers, and no reconnect backoff — and the next connection redials on demand. A value of `60`–`300` suits interactive use. The cost is that the first connection after an idle period waits for a TCP and TLS handshake before its first byte. The close is graceful, so a TLS server releases its side at once; a plaintext server cannot tell it from a dropped connection and keeps the session suspended for `mux.resume_timeout`.
-- **`mux.nodelay: false`** enables in-tunnel coalescing, batching small writes into fewer frames at up to 40 ms of added delay each. For interactive traffic this cuts the packet count substantially.
-- **`mux.keepalive`** should be as *high* as the path allows, not low. It exists to hold a NAT binding open, and each probe is one radio wakeup; carrier NAT typically tolerates `300`–`600`. Leave it at the default `7200` if nothing on the path requires less. The inactivity deadline is derived from it and is not separately configurable.
-- **`mux.tcp.keepalive`** should stay `false` (the default) — it would duplicate the mux keepalive at the kernel level.
-- **`tls.kernel_offload`** is harmless but generally inert on stock Android kernels, which do not register the `tls` upper-layer protocol; it is also OpenSSL-only.
-
-Build options:
-
-- Leave **`ENABLE_THREADS=OFF`** (the default). One session per device needs no per-session thread, and a single event loop avoids cross-thread dispatch and lets the scheduler park cores.
-- Do **not** set `FORCE_POSIX`. It disables the `TCP_USER_TIMEOUT` path, whose presence lets a session drop its userspace send-timeout watchdog entirely.
-- `MinSizeRel` with LTO (`./m.sh min`) produces the smallest resident binary.
+- Set positive `max_sessions` and `mux.max_streams` limits to bound session and per-session stream counts. Lower limits reduce concurrency; `0` means unlimited.
+- Set smaller explicit `mux.stream_window` and `mux.session_window` values to reduce receive buffering and unacknowledged send data. Values are bytes, with a minimum of 65536; `0` selects automatic sizing. Smaller windows can reduce throughput on high-latency links.
+- Set `mux.mem_pressure.hi` to a positive byte threshold to throttle new receive-window grants as per-session buffered data grows. `mux.mem_pressure.lo` starts throttling and defaults to half of `hi`. These thresholds do not impose a hard memory cap.
 
 ### API Server
 
@@ -676,19 +667,12 @@ Build options:
 
 ### Configuration Reload
 
-There are two ways to trigger a reload: send `SIGHUP` to the process, or issue a `PUT /config` request to the API server. Both are equivalent in effect, except that `PUT /config` cannot change `api_listen` (it answers `403 Forbidden`); only `SIGHUP` can. `PUT /config` accepts the new configuration as a JSON body instead of reading from the config file, which makes it scriptable without touching the filesystem.
+Send `SIGHUP` to reread the configuration file, or send new JSON to `PUT /config`. Changing `api_listen` requires `SIGHUP`; the API returns `403 Forbidden` for that change.
 
-On reload, existing sessions normally drain: each session stops accepting new inbound streams, completes its current streams gracefully, then outbound sessions reconnect with the updated configuration. Lowering `max_sessions` to a positive limit preserves retained sessions instead of newly draining them, including when the old limit was unlimited. Their capacity reservations remain held, and new reservations cannot succeed until usage falls below the new limit. Explicitly removed outbound tunnels still drain, and removed identity peers still close immediately. There is no timeout on the drain phase — a session with long-lived streams may remain open indefinitely. Settings that can be changed at runtime include:
-
-- `loglevel` — applied immediately.
-- Live mux behavior applied immediately to existing sessions: timeouts, keepalive, stream and session windows, `max_streams`, `max_halfopen`, `nodelay`, `mem_pressure` thresholds, and `lossymux.idle_timeout` / `lossymux.queue`.
-- `lossymux.enabled`: UDP sockets are bound or closed immediately; the extension itself is negotiated at each session's next handshake.
-- Admission controls: `max_sessions` and `max_startups`. `max_sessions` is a shared budget: outbound sessions count from creation, inbound sessions count before fresh establishment, and both keep their slot through suspension until destruction. Temporary inbound transports consume no slot and may resume an existing session at capacity, subject to `max_startups`. A zero session limit is unlimited; configured outbound sessions blocked by capacity are deferred and retried, with a warning at startup.
-- Listener bind addresses (`listen`, `mux_listen`, `api_listen`): the listener is stopped and restarted on the new address. `api_listen` changes only through `SIGHUP`; `PUT /config` refuses it.
-- Identity peers (`identity.listen`): only a peer whose listen address changed has its listener rebound; an unchanged peer's listener keeps its socket. Removing a peer does not drain its sessions: its listener and every session pooled for it are closed immediately, streams included.
-- Forward target (`connect`) and outbound addresses (`mux_connect`, `identity.mux_connect`): the next reconnect uses the new address.
-- TLS certificates, keys, trust roots, and TLS 1.3 cipher suites: applied to newly accepted sessions and future outbound reconnects.
-- `identity.verify`: read when a hello is processed, so it applies to newly accepted sessions and to the next handshake (resume or reconnect) of an existing one, never mid-session.
+- Existing sessions normally finish their current streams before outbound sessions reconnect with the new configuration. Draining has no deadline, so long-lived streams can delay reconnection indefinitely.
+- `loglevel`, mux timeouts, keepalive, and flow-control settings apply immediately. TLS credentials and outbound target changes take effect on new connections; `identity.verify` is checked at the next handshake.
+- Lowering `max_sessions` preserves current sessions and blocks new reservations until usage falls below the limit. Set `0` for unlimited sessions.
+- Removing an `identity.listen` peer closes its sessions and streams immediately.
 
 ## Credits
 
