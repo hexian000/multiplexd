@@ -24,6 +24,7 @@
 #include <openssl/evp.h>
 #include <openssl/obj_mac.h>
 #include <openssl/pem.h>
+#include <openssl/safestack.h>
 #include <openssl/types.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -185,7 +186,19 @@ static int reject_password_cb(char *buf, int size, int rwflag, void *u)
 	return -1;
 }
 
-static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
+static X509 *signing_certificate(const STACK_OF(X509_INFO) * chain)
+{
+	for (int i = 0; i < sk_X509_INFO_num(chain); i++) {
+		X509 *const cert = sk_X509_INFO_value(chain, i)->x509;
+		if (cert != NULL) {
+			return cert;
+		}
+	}
+	return NULL;
+}
+
+static bool read_keypair(
+	const char *name, STACK_OF(X509_INFO) * *out_chain, EVP_PKEY **out_key)
 {
 	char cert_file[256], key_file[256];
 	if (!format_pem_filename(
@@ -201,10 +214,15 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 		       strerror(err));
 		return false;
 	}
-	*out_cert = PEM_read_X509(fp, NULL, NULL, NULL);
+	*out_chain = PEM_X509_INFO_read(fp, NULL, reject_password_cb, NULL);
+	const bool read_ok = ferror(fp) == 0;
 	(void)fclose(fp);
-	if (*out_cert == NULL) {
-		LOG_SSLERROR("PEM_read_X509");
+	if (*out_chain == NULL || !read_ok ||
+	    signing_certificate(*out_chain) == NULL) {
+		LOGE_F("failed to read certificates from %s", cert_file);
+		LOG_SSLERROR("PEM_X509_INFO_read");
+		sk_X509_INFO_pop_free(*out_chain, X509_INFO_free);
+		*out_chain = NULL;
 		return false;
 	}
 
@@ -213,16 +231,16 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 		const int err = errno;
 		LOGE_F("failed to open %s: (%d) %s", key_file, err,
 		       strerror(err));
-		X509_free(*out_cert);
-		*out_cert = NULL;
+		sk_X509_INFO_pop_free(*out_chain, X509_INFO_free);
+		*out_chain = NULL;
 		return false;
 	}
 	*out_key = PEM_read_PrivateKey(fp, NULL, reject_password_cb, NULL);
 	(void)fclose(fp);
 	if (*out_key == NULL) {
 		LOG_SSLERROR("PEM_read_PrivateKey");
-		X509_free(*out_cert);
-		*out_cert = NULL;
+		sk_X509_INFO_pop_free(*out_chain, X509_INFO_free);
+		*out_chain = NULL;
 		return false;
 	}
 
@@ -233,21 +251,23 @@ static bool read_keypair(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 /* Read the --sign keypair @p name and check it can issue certificates: its key
  * must match its certificate, and the certificate must be a CA.  On failure
  * nothing is returned and nothing is left allocated. */
-static bool read_signer(const char *name, X509 **out_cert, EVP_PKEY **out_key)
+static bool read_signer(
+	const char *name, STACK_OF(X509_INFO) * *out_chain, EVP_PKEY **out_key)
 {
-	X509 *cert = NULL;
+	STACK_OF(X509_INFO) *chain = NULL;
 	EVP_PKEY *key = NULL;
-	if (!read_keypair(name, &cert, &key)) {
+	if (!read_keypair(name, &chain, &key)) {
 		LOGE_F("failed to read signing certificate: %s", name);
 		return false;
 	}
+	X509 *const cert = signing_certificate(chain);
 	if (X509_check_private_key(cert, key) != 1) {
 		LOGE_F("signing certificate and key do not match: %s", name);
 		/* Drain any error-queue entries this pushed, so they can't
 		 * bleed into a later, unrelated LOG_SSLERROR (gencerts() is a
 		 * reusable entry point invoked repeatedly in one process). */
 		LOG_SSLERROR("X509_check_private_key");
-		X509_free(cert);
+		sk_X509_INFO_pop_free(chain, X509_INFO_free);
 		EVP_PKEY_free(key);
 		return false;
 	}
@@ -261,11 +281,11 @@ static bool read_signer(const char *name, X509 **out_cert, EVP_PKEY **out_key)
 	if (X509_check_ca(cert) != 1) {
 		LOGE_F("signing certificate is not a CA certificate: %s", name);
 		LOG_SSLERROR("X509_check_ca");
-		X509_free(cert);
+		sk_X509_INFO_pop_free(chain, X509_INFO_free);
 		EVP_PKEY_free(key);
 		return false;
 	}
-	*out_cert = cert;
+	*out_chain = chain;
 	*out_key = key;
 	return true;
 }
@@ -286,25 +306,12 @@ static bool set_random_serial(X509 *restrict cert)
 		BN_free(bn);
 		return false;
 	}
-	ASN1_INTEGER *const serial = ASN1_INTEGER_new();
-	if (serial == NULL) {
-		LOG_SSLERROR("ASN1_INTEGER_new");
-		BN_free(bn);
-		return false;
-	}
-	if (BN_to_ASN1_INTEGER(bn, serial) == NULL) {
+	if (BN_to_ASN1_INTEGER(bn, X509_get_serialNumber(cert)) == NULL) {
 		LOG_SSLERROR("BN_to_ASN1_INTEGER");
-		ASN1_INTEGER_free(serial);
 		BN_free(bn);
 		return false;
 	}
 	BN_free(bn);
-	if (X509_set_serialNumber(cert, serial) == 0) {
-		LOG_SSLERROR("X509_set_serialNumber");
-		ASN1_INTEGER_free(serial);
-		return false;
-	}
-	ASN1_INTEGER_free(serial);
 	return true;
 }
 /* RFC 5280 A.1 ub-common-name: OpenSSL enforces this on NID_commonName. */
@@ -392,8 +399,8 @@ set_subject_name(X509 *restrict cert, const char *restrict server_name)
 	}
 	X509_NAME *const name = X509_NAME_new();
 	if (name == NULL) {
-		LOG_SSLERROR("X509_NAME_new");
 		OPENSSL_free(serial_hex);
+		LOG_SSLERROR("X509_NAME_new");
 		return false;
 	}
 	/* MBSTRING_ASC makes OpenSSL enforce ub_common_name (RFC 5280 A.1) on
@@ -418,16 +425,16 @@ set_subject_name(X509 *restrict cert, const char *restrict server_name)
 			(const unsigned char *)serial_hex, -1, -1, 0) != 0;
 	OPENSSL_free(serial_hex);
 	if (!ok) {
+		X509_NAME_free(name);
 		LOG_SSLERROR("X509_NAME_add_entry_by_NID");
-		X509_NAME_free(name);
 		return false;
 	}
-	if (X509_set_subject_name(cert, name) == 0) {
-		LOG_SSLERROR("X509_set_subject_name");
-		X509_NAME_free(name);
-		return false;
-	}
+	const int result = X509_set_subject_name(cert, name);
 	X509_NAME_free(name);
+	if (result == 0) {
+		LOG_SSLERROR("X509_set_subject_name");
+		return false;
+	}
 	return true;
 }
 
@@ -640,8 +647,9 @@ static bool create_certificate(
 	return true;
 }
 
-static bool
-write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
+static bool write_keypair(
+	const char *name, X509 *cert, EVP_PKEY *pkey,
+	const STACK_OF(X509_INFO) * parent_chain)
 {
 	char cert_file[256], key_file[256];
 	if (!format_pem_filename(
@@ -660,9 +668,14 @@ write_keypair(const char *name, X509 *cert, EVP_PKEY *pkey, X509 *parent)
 		discard_file(cert_file);
 		return false;
 	}
-	if (parent != NULL) {
-		/* Append the signing CA cert to form a complete chain */
-		if (PEM_write_X509(fp, parent) == 0) {
+	/* Preserve the supplied signer and issuer certificates in PEM order. */
+	for (int i = 0;
+	     parent_chain != NULL && i < sk_X509_INFO_num(parent_chain); i++) {
+		X509 *const issuer = sk_X509_INFO_value(parent_chain, i)->x509;
+		if (issuer == NULL) {
+			continue;
+		}
+		if (PEM_write_X509(fp, issuer) == 0) {
 			LOG_SSLERROR("PEM_write_X509");
 			(void)fclose(fp);
 			discard_file(cert_file);
@@ -748,8 +761,8 @@ static char *next_field(char **cursor)
 static bool generate_one(
 	const char *restrict name, const char *restrict server_name,
 	const char *restrict identity, X509 *const parent_cert,
-	EVP_PKEY *const sign_key, const char *restrict keytype,
-	const int keysize)
+	const STACK_OF(X509_INFO) * parent_chain, EVP_PKEY *const sign_key,
+	const char *restrict keytype, const int keysize)
 {
 	EVP_PKEY *const pkey = generate_key(keytype, keysize);
 	if (pkey == NULL) {
@@ -764,7 +777,7 @@ static bool generate_one(
 		EVP_PKEY_free(pkey);
 		return false;
 	}
-	const bool ok = write_keypair(name, cert, pkey, parent_cert);
+	const bool ok = write_keypair(name, cert, pkey, parent_chain);
 	if (!ok) {
 		LOGE_F("failed to write key pair for %s", name);
 	}
@@ -778,29 +791,30 @@ static bool generate_one(
 struct cert_job {
 	const char *name;
 	const char *identity;
-	struct cert_job *next;
 };
 
-static void free_jobs(struct cert_job *jobs)
-{
-	while (jobs != NULL) {
-		struct cert_job *const next = jobs->next;
-		free(jobs);
-		jobs = next;
-	}
-}
-
 /* Split the --gencerts list into jobs, in list order, pairing each name
- * positionally with its --identity entry and checking every identity, so that
- * nothing is generated for an invocation that would be refused anyway.
- * Tokenizes both lists in place. On success *out_jobs is the list (NULL when
- * every name was blank), which the caller frees with free_jobs(). */
+ * positionally with its --identity entry and checking every output path and
+ * identity, so that nothing is generated for an invocation that would be
+ * refused anyway.
+ * Tokenizes both lists in place. On success the caller owns *out_jobs, and
+ * *out_count is the number of planned jobs (zero when every name was blank). */
 static bool plan_jobs(
 	char *restrict names, char *restrict identities,
-	struct cert_job **restrict out_jobs)
+	struct cert_job **restrict out_jobs, size_t *restrict out_count)
 {
-	struct cert_job *jobs = NULL;
-	struct cert_job **tail = &jobs;
+	size_t capacity = 1;
+	for (const char *p = names; *p != '\0'; p++) {
+		if (*p == ',') {
+			capacity++;
+		}
+	}
+	struct cert_job *const jobs = calloc(capacity, sizeof(*jobs));
+	if (jobs == NULL) {
+		LOGOOM();
+		return false;
+	}
+	size_t count = 0;
 	char *id_cursor = identities;
 	char *saveptr = NULL;
 	for (char *name = strtok_r(names, ",", &saveptr); name != NULL;
@@ -817,6 +831,15 @@ static bool plan_jobs(
 			end--;
 		}
 
+		char cert_file[256], key_file[256];
+		if (!format_pem_filename(
+			    cert_file, sizeof(cert_file), name, "-cert.pem") ||
+		    !format_pem_filename(
+			    key_file, sizeof(key_file), name, "-key.pem")) {
+			free(jobs);
+			return false;
+		}
+
 		/* No --identity means no identity, never inferred from a file
 		 * name.  Consumed after the empty-name skip above, so blank
 		 * name fields do not shift the pairing. */
@@ -826,33 +849,28 @@ static bool plan_jobs(
 			if (identity == NULL) {
 				LOGE("--identity has fewer entries than"
 				     " --gencerts");
-				free_jobs(jobs);
+				free(jobs);
 				return false;
 			}
 			if (!check_identity(name, identity)) {
-				free_jobs(jobs);
+				free(jobs);
 				return false;
 			}
 		}
-		struct cert_job *const job = malloc(sizeof(*job));
-		if (job == NULL) {
-			LOGOOM();
-			free_jobs(jobs);
-			return false;
-		}
-		job->name = name;
-		job->identity = identity;
-		job->next = NULL;
-		*tail = job;
-		tail = &job->next;
+		assert(count < capacity);
+		jobs[count++] = (struct cert_job){
+			.name = name,
+			.identity = identity,
+		};
 	}
 
 	if (id_cursor != NULL) {
 		LOGE("--identity has more entries than --gencerts");
-		free_jobs(jobs);
+		free(jobs);
 		return false;
 	}
 	*out_jobs = jobs;
+	*out_count = count;
 	return true;
 }
 
@@ -885,43 +903,49 @@ bool gencerts(
 	}
 
 	struct cert_job *jobs = NULL;
-	bool success = plan_jobs(names_copy, identities_copy, &jobs);
+	size_t job_count = 0;
+	bool success =
+		plan_jobs(names_copy, identities_copy, &jobs, &job_count);
 	/* Every token was empty or blank (e.g. `--gencerts ""` from an unset
 	 * shell variable): nothing was written, so reporting success would tell a
 	 * provisioning script its certificates exist. */
-	if (success && jobs == NULL) {
+	if (success && job_count == 0) {
 		LOGE_F("no certificate name in list: \"%s\"", names);
 		success = false;
 	}
 
-	X509 *parent_cert = NULL;
+	STACK_OF(X509_INFO) *parent_chain = NULL;
 	EVP_PKEY *sign_key = NULL;
 	if (success && sign_cert != NULL &&
-	    !read_signer(sign_cert, &parent_cert, &sign_key)) {
+	    !read_signer(sign_cert, &parent_chain, &sign_key)) {
 		success = false;
 	}
 
-	/* Jobs before `pending` have been written. A failure part-way removes
+	X509 *const parent_cert =
+		parent_chain != NULL ? signing_certificate(parent_chain) : NULL;
+
+	/* Jobs before `completed` have been written. A failure part-way removes
 	 * them all, so a rerun is not refused by the survivors. */
-	const struct cert_job *pending = jobs;
-	for (; success && pending != NULL; pending = pending->next) {
+	size_t completed = 0;
+	for (; success && completed < job_count; completed++) {
+		const struct cert_job *const job = &jobs[completed];
 		if (!generate_one(
-			    pending->name, server_name_val, pending->identity,
-			    parent_cert, sign_key, keytype, keysize)) {
+			    job->name, server_name_val, job->identity,
+			    parent_cert, parent_chain, sign_key, keytype,
+			    keysize)) {
 			success = false;
 			break;
 		}
 	}
 	if (!success) {
-		for (const struct cert_job *job = jobs; job != pending;
-		     job = job->next) {
-			discard_keypair(job->name);
+		for (size_t i = 0; i < completed; i++) {
+			discard_keypair(jobs[i].name);
 		}
 	}
 
-	X509_free(parent_cert);
+	sk_X509_INFO_pop_free(parent_chain, X509_INFO_free);
 	EVP_PKEY_free(sign_key);
-	free_jobs(jobs);
+	free(jobs);
 	free(identities_copy);
 	free(names_copy);
 

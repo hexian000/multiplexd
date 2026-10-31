@@ -85,29 +85,6 @@ static bool genpsk_one(const char *restrict name)
 	return true;
 }
 
-/* A key file written by this call, so a later failure in the same list can
- * take it back: a stray key would make the corrected retry fail on O_EXCL. */
-struct generated_name {
-	const char *name;
-	struct generated_name *next;
-};
-
-static void
-release_generated_names(struct generated_name *names, const bool discard)
-{
-	while (names != NULL) {
-		struct generated_name *const next = names->next;
-		if (discard) {
-			char path[256];
-			if (format_psk_path(path, sizeof(path), names->name)) {
-				discard_file(path);
-			}
-		}
-		free(names);
-		names = next;
-	}
-}
-
 bool genpsk(const char *names)
 {
 	if (names == NULL) {
@@ -119,8 +96,21 @@ bool genpsk(const char *names)
 		LOGOOM();
 		return false;
 	}
+	size_t capacity = 1;
+	for (const char *p = names; *p != '\0'; p++) {
+		if (*p == ',') {
+			capacity++;
+		}
+	}
+	const char **const generated_names =
+		(const char **)calloc(capacity, sizeof(*generated_names));
+	if (generated_names == NULL) {
+		LOGOOM();
+		free(copy);
+		return false;
+	}
 	bool ok = true;
-	struct generated_name *generated_names = NULL;
+	size_t generated_count = 0;
 	char *saveptr = NULL;
 	for (char *name = strtok_r(copy, ",", &saveptr); name != NULL;
 	     name = strtok_r(NULL, ",", &saveptr)) {
@@ -134,22 +124,13 @@ bool genpsk(const char *names)
 		if (*name == '\0') {
 			continue;
 		}
-		struct generated_name *const node = malloc(sizeof(*node));
-		if (node == NULL) {
-			LOGOOM();
-			ok = false;
-			break;
-		}
 		if (!genpsk_one(name)) {
-			free(node);
 			ok = false;
 			break;
 		}
-		node->name = name;
-		node->next = generated_names;
-		generated_names = node;
+		generated_names[generated_count++] = name;
 	}
-	if (ok && generated_names == NULL) {
+	if (ok && generated_count == 0) {
 		/* Every token was blank: nothing was written, so reporting
 		 * success would tell a provisioning script its keys exist. */
 		LOGE("no key names given");
@@ -157,7 +138,17 @@ bool genpsk(const char *names)
 	}
 	/* All or nothing: a failure part-way through the list takes back the
 	 * keys this call already wrote, never a file that existed before it. */
-	release_generated_names(generated_names, !ok);
+	if (!ok) {
+		while (generated_count > 0) {
+			char path[256];
+			const char *const name =
+				generated_names[--generated_count];
+			if (format_psk_path(path, sizeof(path), name)) {
+				discard_file(path);
+			}
+		}
+	}
+	free((void *)generated_names);
 	free(copy);
 	return ok;
 }

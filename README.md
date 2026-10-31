@@ -7,7 +7,6 @@
 
 multiplexd is a TCP stream multiplexer that solves most of the problems of tunneling TCP over TCP. By relaying application streams over a single, flow-controlled transport, it sidesteps the "TCP meltdown" of naive tunnels — and adds 0-RTT stream open, fair bandwidth sharing, flow-control with BDP estimation, transparent session resumption, and TLS 1.3 mutual authentication against a private trust store.
 
-**Table of Contents**
 - [Features](#features)
   - [Protocol Efficiency](#protocol-efficiency)
   - [Reliability](#reliability)
@@ -21,6 +20,7 @@ multiplexd is a TCP stream multiplexer that solves most of the problems of tunne
   - [Generate Self-Signed Certificates](#generate-self-signed-certificates)
   - [Generate Self-Signed Certificate Chains](#generate-self-signed-certificate-chains)
   - [Certificate Options](#certificate-options)
+  - [Generating Pre-Shared Keys](#generating-pre-shared-keys)
 - [Configuration](#configuration)
   - [Server (server.json)](#server-serverjson)
   - [Client (client.json)](#client-clientjson)
@@ -48,6 +48,7 @@ multiplexd is a TCP stream multiplexer that solves most of the problems of tunne
   - [Developer Scripts](#developer-scripts)
 - [Deployment Notes](#deployment-notes)
   - [TLS Security Model](#tls-security-model)
+    - [Certificate disclosure, and what PSK mode changes](#certificate-disclosure-and-what-psk-mode-changes)
   - [Connection Backoff](#connection-backoff)
   - [Power-Constrained Deployment](#power-constrained-deployment)
   - [Memory-Constrained Deployment](#memory-constrained-deployment)
@@ -125,7 +126,7 @@ The wire format is a fixed 8-byte frame header followed by an optional payload; 
 | **Flow control**           | Per-stream byte window + session-wide unacked-frame cap; cap blocks payload only | Per-stream byte window + connection-level byte window (both byte-based)        | Per-channel byte window only                                               |
 | **Adaptive window tuning** | Per-direction 2-phase BDP estimator                                              | Monotonic BDP estimator                                                        | Fixed; manual tuning                                                       |
 | **Memory back-pressure**   | Linear throttle via `mem_pressure.lo` / `mem_pressure.hi`                        | None                                                                           | None                                                                       |
-| **Config reload**          | Updates live settings; normally drains existing sessions in-process               | None built-in                                                                  | Re-execs the master process; existing child processes drain naturally      |
+| **Config reload**          | Updates live settings; normally drains existing sessions in-process              | None built-in                                                                  | Re-execs the master process; existing child processes drain naturally      |
 | **Observability**          | Health check, plain-text stats, Prometheus metrics                               | channelz (internal introspection); OpenTelemetry / Prometheus via interceptors | Logging only                                                               |
 
 See [doc/spec.md](doc/spec.md) for the full wire protocol and state-machine specification.
@@ -169,16 +170,18 @@ multiplexd --gencerts client1,client2,client3 --sign ca
 multiplexd --gencerts client1,client2,client3 --sign ca --identity east-1,east-2,west-1
 ```
 
+When `--sign` uses an intermediate CA, put its certificate first in `<name>-cert.pem`, followed by its issuer certificates in chain order. Generated certificate files preserve this supplied chain after the new leaf; the root certificate may be omitted when peers already trust it.
+
 ### Certificate Options
 
-| Option       | Values              | Description                                                                                           |
-| ------------ | ------------------- | ----------------------------------------------------------------------------------------------------- |
-| `--gencerts` | name[,name...]      | Comma-separated list of certificate names to generate                                                 |
-| `--sni`      | hostname            | Server name for certificates (default: example.com)                                                   |
+| Option       | Values              | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--gencerts` | name[,name...]      | Comma-separated list of certificate names to generate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `--sni`      | hostname            | Server name for certificates (default: example.com)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `--identity` | name[,name...]      | Identity URI subjectAltName (`multiplexd:<identity>`) per certificate, paired positionally with `--gencerts`. Omitting the option generates certificates carrying no identity, which is the default; an empty entry is the empty identity, itself a valid one. An identity `identity.verify` could never match — over 255 octets, or holding a control character — is rejected before any key is generated; one over 63 octets is accepted with a warning, since multiplexd itself claims at most 63. Required by `identity.verify`. |
-| `--sign`     | name                | Sign generated certificates with the named signer (uses `<name>-cert.pem` and `<name>-key.pem`). The signer must be a CA certificate (basicConstraints `CA:TRUE`), such as one generated without `--sign`; signing with a leaf fails before anything is written. |
-| `--keytype`  | rsa, ecdsa, ed25519 | Key algorithm (default: rsa). `rsa` and `ecdsa` certificates load on either TLS backend; `ed25519` ones are usable only where OpenSSL is in use, since mbedTLS does not support Ed25519 in X.509 — a daemon built against it rejects the certificate at startup (`X509 - Requested OID is unknown`). |
-| `--keysize`  | bits                | Key size in bits: RSA 4096 (default, range 2048-16384); ECDSA 256 (default), 384 or 521, selecting NIST P-256/384/521. Not accepted with `--keytype ed25519`, whose key size is fixed: giving one makes certificate generation fail. |
+| `--sign`     | name                | Sign generated certificates with the named signer (uses `<name>-cert.pem` and `<name>-key.pem`). The signer must be a CA certificate (basicConstraints `CA:TRUE`), such as one generated without `--sign`; signing with a leaf fails before anything is written.                                                                                                                                                                                                                                                                     |
+| `--keytype`  | rsa, ecdsa, ed25519 | Key algorithm (default: rsa). `rsa` and `ecdsa` certificates load on either TLS backend; `ed25519` ones are usable only where OpenSSL is in use, since mbedTLS does not support Ed25519 in X.509 — a daemon built against it rejects the certificate at startup (`X509 - Requested OID is unknown`).                                                                                                                                                                                                                                 |
+| `--keysize`  | bits                | Key size in bits: RSA 4096 (default, range 2048-16384); ECDSA 256 (default), 384 or 521, selecting NIST P-256/384/521. Not accepted with `--keytype ed25519`, whose key size is fixed: giving one makes certificate generation fail.                                                                                                                                                                                                                                                                                                 |
 
 Generated files: `<name>-cert.pem` and `<name>-key.pem`.
 

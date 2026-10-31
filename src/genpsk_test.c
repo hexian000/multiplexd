@@ -31,6 +31,8 @@
 /* One key file: lowercase hex digits for the whole key, then a newline. */
 enum { PSK_FILE_LEN = TLS_PSK_MIN_LEN * 2 + 1 };
 
+#define GENPSK_TEST_TEMPLATE GENPSK_TEST_TMPDIR "/genpsk_test_XXXXXX"
+
 /* Remove a file tree recursively using only POSIX APIs; used for
  * temp-directory cleanup. */
 static void rm_tmpdir(const char *path)
@@ -62,7 +64,7 @@ static void rm_tmpdir(const char *path)
 /* Process-exit sweep for case failures that skip leave_tmpdir().
  * rm_tmpdir() no-ops for directories already removed by a passing case. */
 enum { PENDING_TMPDIRS_MAX = 64 };
-static char pending_tmpdirs[PENDING_TMPDIRS_MAX][64];
+static char pending_tmpdirs[PENDING_TMPDIRS_MAX][sizeof(GENPSK_TEST_TEMPLATE)];
 static int pending_tmpdirs_count = 0;
 
 static void sweep_pending_tmpdirs(void)
@@ -153,7 +155,7 @@ read_key_file(const char *restrict path, char *restrict buf, const size_t len)
 
 T_DECLARE_CASE(test_genpsk_writes_lowercase_hex_key)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -179,7 +181,7 @@ T_DECLARE_CASE(test_genpsk_writes_lowercase_hex_key)
 
 T_DECLARE_CASE(test_genpsk_multiple_names_get_distinct_keys)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -206,7 +208,7 @@ T_DECLARE_CASE(test_genpsk_multiple_names_get_distinct_keys)
  * on either side. */
 T_DECLARE_CASE(test_genpsk_skips_all_space_name_token)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -229,7 +231,7 @@ T_DECLARE_CASE(test_genpsk_skips_all_space_name_token)
  * provisioning script its keys exist. */
 T_DECLARE_CASE(test_genpsk_empty_name_list_fails)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -251,7 +253,7 @@ T_DECLARE_CASE(test_genpsk_empty_name_list_fails)
  * the old one, so the call fails and the key on disk is left untouched. */
 T_DECLARE_CASE(test_genpsk_refuses_overwrite_existing_key)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -274,7 +276,7 @@ T_DECLARE_CASE(test_genpsk_refuses_overwrite_existing_key)
 
 T_DECLARE_CASE(test_genpsk_file_permissions)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -300,7 +302,7 @@ T_DECLARE_CASE(test_genpsk_file_permissions)
  * shortened name instead, so no file may appear either. */
 T_DECLARE_CASE(test_genpsk_path_too_long_rejected)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -329,7 +331,7 @@ T_DECLARE_CASE(test_genpsk_path_too_long_rejected)
  * exceeding the limit kills the process instead of failing the call. */
 T_DECLARE_CASE(test_genpsk_write_failure_leaves_no_file)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -359,7 +361,7 @@ T_DECLARE_CASE(test_genpsk_write_failure_leaves_no_file)
  * this call's to remove, so it is left exactly as it was. */
 T_DECLARE_CASE(test_genpsk_mid_list_failure_discards_earlier_keys)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -424,12 +426,69 @@ genpsk_captured(struct log_capture *restrict cap, const char *restrict names)
 	return ok;
 }
 
+/* Derive the expected label from the exact lowercase hex written to disk. */
+static bool read_key_label(const char *path, char *label, size_t label_size)
+{
+	char hex[PSK_FILE_LEN + 1];
+	if (read_key_file(path, hex, sizeof(hex)) != PSK_FILE_LEN ||
+	    hex[PSK_FILE_LEN - 1] != '\n') {
+		return false;
+	}
+	unsigned char key[TLS_PSK_MIN_LEN];
+	static const char digits[] = "0123456789abcdef";
+	for (size_t i = 0; i < sizeof(key); i++) {
+		const char *const hi = strchr(digits, hex[i * 2]);
+		const char *const lo = strchr(digits, hex[i * 2 + 1]);
+		if (hi == NULL || hi == digits + 16 || lo == NULL ||
+		    lo == digits + 16) {
+			return false;
+		}
+		key[i] = (unsigned char)((hi - digits) * 16 + (lo - digits));
+	}
+	return tls_psk_label(key, sizeof(key), label, &label_size);
+}
+
+/* Each write record must name the identity label derived from that file's
+ * actual key, including when one call generates more than one file. */
+T_DECLARE_CASE(test_genpsk_logs_each_generated_key_label)
+{
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+
+	struct log_capture cap;
+	const bool ok = genpsk_captured(&cap, "alpha,beta");
+	const char *const paths[] = { "alpha.psk", "beta.psk" };
+	char labels[2][TLS_PSK_LABEL_MAX + 1];
+	bool decoded[2];
+	for (size_t i = 0; i < 2; i++) {
+		decoded[i] =
+			read_key_label(paths[i], labels[i], sizeof(labels[i]));
+	}
+	const bool tracked =
+		strcmp(pending_tmpdirs[pending_tmpdirs_count - 1], tmpl) == 0;
+	leave_tmpdir(origdir, tmpl);
+
+	T_EXPECT(ok);
+	T_EXPECT(tracked);
+	T_EXPECT(!cap.overflow);
+	for (size_t i = 0; i < 2; i++) {
+		T_EXPECT(decoded[i]);
+		char record[256];
+		const int len = snprintf(
+			record, sizeof(record), "write %s (identity label %s)",
+			paths[i], labels[i]);
+		T_EXPECT(len >= 0 && (size_t)len < sizeof(record));
+		T_EXPECT(strstr(cap.buf, record) != NULL);
+	}
+}
+
 /* A key genpsk_one() announced as written and a later name's failure then took
  * back must be reported as removed, after the notice that claimed it:
  * otherwise the log asserts a key file exists that does not. */
 T_DECLARE_CASE(test_genpsk_mid_list_failure_logs_removal)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -460,7 +519,7 @@ T_DECLARE_CASE(test_genpsk_mid_list_failure_logs_removal)
  * path too long for the buffer -- likewise leave nothing behind. */
 T_DECLARE_CASE(test_genpsk_failed_list_leaves_no_file)
 {
-	char tmpl[] = "/tmp/genpsk_test_XXXXXX";
+	char tmpl[] = GENPSK_TEST_TEMPLATE;
 	char origdir[PATH_MAX];
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 
@@ -496,6 +555,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_genpsk_path_too_long_rejected),
 	T_CASE(test_genpsk_write_failure_leaves_no_file),
 	T_CASE(test_genpsk_mid_list_failure_discards_earlier_keys),
+	T_CASE(test_genpsk_logs_each_generated_key_label),
 	T_CASE(test_genpsk_mid_list_failure_logs_removal),
 	T_CASE(test_genpsk_failed_list_leaves_no_file),
 	T_SUITE_END,

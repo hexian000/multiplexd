@@ -15,9 +15,11 @@
 
 #include <openssl/asn1.h>
 #include <openssl/bn.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/obj_mac.h>
 #include <openssl/pem.h>
+#include <openssl/safestack.h>
 #include <openssl/types.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
@@ -77,6 +79,90 @@ static void clear_scripted_clock(void *data)
 	scripted_clock = false;
 }
 #endif /* GENCERTS_TEST_WRAP_TIME */
+
+#ifdef GENCERTS_TEST_WRAP_PEM_WRITE
+static int fail_pem_write_after;
+
+int test_real_write_x509(FILE *fp, const X509 *cert) __asm__(
+	"__real_PEM_write_X509");
+int test_wrap_write_x509(FILE *fp, const X509 *cert) __asm__(
+	"__wrap_PEM_write_X509");
+int test_wrap_write_x509(FILE *fp, const X509 *cert)
+{
+	if (fail_pem_write_after > 0) {
+		fail_pem_write_after--;
+		if (fail_pem_write_after == 0) {
+			return 0;
+		}
+	}
+	return test_real_write_x509(fp, cert);
+}
+
+static void clear_pem_write_failure(void *data)
+{
+	(void)data;
+	fail_pem_write_after = 0;
+}
+#endif /* GENCERTS_TEST_WRAP_PEM_WRITE */
+
+#ifdef GENCERTS_TEST_WRAP_SUBJECT
+static struct {
+	bool allocation;
+	int entries;
+	bool assignment;
+	size_t hits;
+} subject_failure;
+
+X509_NAME *test_real_name_new(void) __asm__("__real_X509_NAME_new");
+X509_NAME *test_wrap_name_new(void) __asm__("__wrap_X509_NAME_new");
+X509_NAME *test_wrap_name_new(void)
+{
+	if (subject_failure.allocation) {
+		subject_failure.hits++;
+		return NULL;
+	}
+	return test_real_name_new();
+}
+
+int test_real_name_add(
+	X509_NAME *name, int nid, int type, const unsigned char *bytes, int len,
+	int loc, int set) __asm__("__real_X509_NAME_add_entry_by_NID");
+int test_wrap_name_add(
+	X509_NAME *name, int nid, int type, const unsigned char *bytes, int len,
+	int loc, int set) __asm__("__wrap_X509_NAME_add_entry_by_NID");
+int test_wrap_name_add(
+	X509_NAME *name, int nid, int type, const unsigned char *bytes, int len,
+	int loc, int set)
+{
+	if (subject_failure.entries > 0) {
+		subject_failure.entries--;
+		if (subject_failure.entries == 0) {
+			subject_failure.hits++;
+			return 0;
+		}
+	}
+	return test_real_name_add(name, nid, type, bytes, len, loc, set);
+}
+
+int test_real_subject_set(X509 *cert, const X509_NAME *name) __asm__(
+	"__real_X509_set_subject_name");
+int test_wrap_subject_set(X509 *cert, const X509_NAME *name) __asm__(
+	"__wrap_X509_set_subject_name");
+int test_wrap_subject_set(X509 *cert, const X509_NAME *name)
+{
+	if (subject_failure.assignment) {
+		subject_failure.hits++;
+		return 0;
+	}
+	return test_real_subject_set(cert, name);
+}
+
+static void clear_subject_failure(void *data)
+{
+	(void)data;
+	(void)memset(&subject_failure, 0, sizeof(subject_failure));
+}
+#endif /* GENCERTS_TEST_WRAP_SUBJECT */
 
 /* Remove a file tree recursively using only POSIX APIs; used for
  * temp-directory cleanup. */
@@ -152,6 +238,59 @@ static void cleanup_cert(void *data)
 	X509_free(data);
 }
 
+static void cleanup_key(void *data)
+{
+	EVP_PKEY_free(data);
+}
+
+/* Read a PEM certificate file (cwd-relative); caller frees with X509_free. */
+static X509 *read_cert_file(const char *restrict path)
+{
+	FILE *const fp = fopen(path, "r");
+	if (fp == NULL) {
+		return NULL;
+	}
+	X509 *const cert = PEM_read_X509(fp, NULL, NULL, NULL);
+	(void)fclose(fp);
+	return cert;
+}
+
+T_DECLARE_SUBCASE(
+	assert_generated_keypair, const char *name, const int key_type,
+	const int bits, const char *group)
+{
+	char path[128];
+	int len = snprintf(path, sizeof(path), "%s-key.pem", name);
+	T_CHECK(len > 0 && (size_t)len < sizeof(path));
+	FILE *const fp = fopen(path, "r");
+	T_CHECK(fp != NULL);
+	EVP_PKEY *const key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+	(void)fclose(fp);
+	retain_cleanup(_t_, cleanup_key, key);
+	T_CHECK(key != NULL);
+	len = snprintf(path, sizeof(path), "%s-cert.pem", name);
+	T_CHECK(len > 0 && (size_t)len < sizeof(path));
+	X509 *const cert = read_cert_file(path);
+	retain_cleanup(_t_, cleanup_cert, cert);
+	T_CHECK(cert != NULL);
+
+	T_EXPECT_EQ(EVP_PKEY_get_base_id(key), key_type);
+	if (bits != 0) {
+		T_EXPECT_EQ(EVP_PKEY_get_bits(key), bits);
+	}
+	if (group != NULL) {
+		char actual_group[80];
+		T_EXPECT_EQ(
+			EVP_PKEY_get_group_name(
+				key, actual_group, sizeof(actual_group), NULL),
+			1);
+		T_EXPECT_STREQ(actual_group, group);
+	}
+	T_EXPECT_EQ(X509_check_private_key(cert, key), 1);
+	release_cleanup(_t_, cleanup_cert, cert);
+	release_cleanup(_t_, cleanup_key, key);
+}
+
 /* Enter a fresh temp dir, filling origdir with the original cwd and tmpl
  * with the created path. */
 static bool
@@ -197,6 +336,9 @@ T_DECLARE_CASE(test_gencerts_ed25519)
 	if (ok) {
 		T_EXPECT_EQ(access("testcert-cert.pem", F_OK), 0);
 		T_EXPECT_EQ(access("testcert-key.pem", F_OK), 0);
+		T_CALL_SUBCASE(
+			assert_generated_keypair, "testcert", EVP_PKEY_ED25519,
+			0, NULL);
 	}
 
 	leave_tmpdir(origdir, tmpl);
@@ -215,6 +357,9 @@ T_DECLARE_CASE(test_gencerts_ecdsa)
 	if (ok) {
 		T_EXPECT_EQ(access("ec256-cert.pem", F_OK), 0);
 		T_EXPECT_EQ(access("ec256-key.pem", F_OK), 0);
+		T_CALL_SUBCASE(
+			assert_generated_keypair, "ec256", EVP_PKEY_EC, 256,
+			"prime256v1");
 	}
 
 	leave_tmpdir(origdir, tmpl);
@@ -234,6 +379,9 @@ T_DECLARE_CASE(test_gencerts_rsa)
 	if (ok) {
 		T_EXPECT_EQ(access("rsa2048-cert.pem", F_OK), 0);
 		T_EXPECT_EQ(access("rsa2048-key.pem", F_OK), 0);
+		T_CALL_SUBCASE(
+			assert_generated_keypair, "rsa2048", EVP_PKEY_RSA, 2048,
+			NULL);
 	}
 
 	leave_tmpdir(origdir, tmpl);
@@ -436,6 +584,9 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p384)
 	if (ok) {
 		T_EXPECT_EQ(access("p384-cert.pem", F_OK), 0);
 		T_EXPECT_EQ(access("p384-key.pem", F_OK), 0);
+		T_CALL_SUBCASE(
+			assert_generated_keypair, "p384", EVP_PKEY_EC, 384,
+			"secp384r1");
 	}
 
 	leave_tmpdir(origdir, tmpl);
@@ -454,6 +605,9 @@ T_DECLARE_CASE(test_gencerts_ecdsa_p521)
 	if (ok) {
 		T_EXPECT_EQ(access("p521-cert.pem", F_OK), 0);
 		T_EXPECT_EQ(access("p521-key.pem", F_OK), 0);
+		T_CALL_SUBCASE(
+			assert_generated_keypair, "p521", EVP_PKEY_EC, 521,
+			"secp521r1");
 	}
 
 	leave_tmpdir(origdir, tmpl);
@@ -573,6 +727,9 @@ T_DECLARE_CASE(test_gencerts_ecdsa_default_keysize)
 	if (ok) {
 		T_EXPECT_EQ(access("ecdef-cert.pem", F_OK), 0);
 		T_EXPECT_EQ(access("ecdef-key.pem", F_OK), 0);
+		T_CALL_SUBCASE(
+			assert_generated_keypair, "ecdef", EVP_PKEY_EC, 256,
+			"prime256v1");
 	}
 
 	leave_tmpdir(origdir, tmpl);
@@ -625,18 +782,6 @@ T_DECLARE_CASE(test_gencerts_file_permissions)
 	}
 
 	leave_tmpdir(origdir, tmpl);
-}
-
-/* Read a PEM certificate file (cwd-relative); caller frees with X509_free. */
-static X509 *read_cert_file(const char *restrict path)
-{
-	FILE *const fp = fopen(path, "r");
-	if (fp == NULL) {
-		return NULL;
-	}
-	X509 *const cert = PEM_read_X509(fp, NULL, NULL, NULL);
-	(void)fclose(fp);
-	return cert;
 }
 
 /* Copy the first commonName text of @p name into @p buf (NUL-terminated, up to
@@ -783,7 +928,8 @@ T_DECLARE_CASE(test_gencerts_identity_explicit_list)
 	T_CLEANUP(cleanup_tmpdir, NULL);
 
 	const bool ok = gencerts(
-		"blank,peer", "id.example", NULL, "ed25519", 0, ",east-1");
+		", blank, ,peer,, ", "id.example", NULL, "ed25519", 0,
+		",east-1");
 	T_EXPECT(ok);
 	if (ok) {
 		X509 *const blank = read_cert_file("blank-cert.pem");
@@ -910,11 +1056,17 @@ T_DECLARE_CASE(test_gencerts_validates_before_generating)
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 	T_CLEANUP(cleanup_tmpdir, NULL);
 
-	static const struct {
+	char long_names[2 + 247 + 1];
+	memcpy(long_names, "a,", 2);
+	memset(long_names + 2, 'x', 247);
+	long_names[sizeof(long_names) - 1] = '\0';
+	const struct {
 		const char *names;
 		const char *server_name;
 		const char *identities;
 	} cases[] = {
+		/* the later name fits the key path but not the certificate path */
+		{ long_names, "id.example", NULL },
 		/* one identity too many, noticed only after the last name */
 		{ "a,b,c", "id.example", "x,y,z,EXTRA" },
 		/* the server name is shared by every certificate */
@@ -1333,8 +1485,8 @@ T_DECLARE_CASE(test_gencerts_ca_key_usage)
 /* keytype == NULL is the documented "use the default" form (gencerts.h), so
  * main() can pass an omitted --keytype straight through: generate_key() must
  * take its "rsa" branch rather than reach strcmp(NULL). Asserts the key the
- * cert actually carries is RSA, not merely that a file appeared; 2048-bit to
- * keep the test fast. */
+ * cert actually carries is RSA with the default 4096-bit size, not merely
+ * that a file appeared. */
 T_DECLARE_CASE(test_gencerts_default_keytype)
 {
 	char tmpl[] = GENCERTS_TEST_TMPDIR "/gencerts_test_XXXXXX";
@@ -1342,27 +1494,11 @@ T_DECLARE_CASE(test_gencerts_default_keytype)
 	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
 	T_CLEANUP(cleanup_tmpdir, NULL);
 
-	const bool ok =
-		gencerts("rsadef", "rsa.example", NULL, NULL, 2048, NULL);
-	X509 *const cert = ok ? read_cert_file("rsadef-cert.pem") : NULL;
-	retain_cleanup(_t_, cleanup_cert, cert);
-
-	/* Capture before teardown so a failing assertion cannot leak the X509. */
-	const bool cert_ok = cert != NULL;
-	int key_type = EVP_PKEY_NONE;
-	if (cert_ok) {
-		EVP_PKEY *const pubkey = X509_get_pubkey(cert);
-		if (pubkey != NULL) {
-			key_type = EVP_PKEY_get_base_id(pubkey);
-			EVP_PKEY_free(pubkey);
-		}
-	}
-	release_cleanup(_t_, cleanup_cert, cert);
-	leave_tmpdir(origdir, tmpl);
-
+	const bool ok = gencerts("rsadef", "rsa.example", NULL, NULL, 0, NULL);
 	T_EXPECT(ok);
-	T_EXPECT(cert_ok);
-	T_EXPECT_EQ(key_type, EVP_PKEY_RSA);
+	T_CALL_SUBCASE(
+		assert_generated_keypair, "rsadef", EVP_PKEY_RSA, 4096, NULL);
+	leave_tmpdir(origdir, tmpl);
 }
 
 /* set_random_serial() must yield an RFC 5280 4.1.2.2 positive (nonzero)
@@ -1447,14 +1583,16 @@ static int ext_criticality(const X509 *restrict cert, const int nid)
 /* Verify @p target against a store trusting only @p anchor, the way a strict
  * TLS peer would: X509_V_FLAG_X509_STRICT and the SSL @p purpose. Returns the
  * X509_V_* result, X509_V_OK on success, or -1 when the check could not run. */
-static int verify_strict(X509 *anchor, X509 *target, const int purpose)
+static int verify_chain_strict(
+	X509 *anchor, X509 *target, STACK_OF(X509) * untrusted,
+	const int purpose)
 {
 	X509_STORE *const store = X509_STORE_new();
 	X509_STORE_CTX *const ctx = X509_STORE_CTX_new();
 	int result = -1;
 	if (store != NULL && ctx != NULL &&
 	    X509_STORE_add_cert(store, anchor) == 1 &&
-	    X509_STORE_CTX_init(ctx, store, target, NULL) == 1 &&
+	    X509_STORE_CTX_init(ctx, store, target, untrusted) == 1 &&
 	    X509_STORE_CTX_set_purpose(ctx, purpose) == 1) {
 		X509_STORE_CTX_set_flags(ctx, X509_V_FLAG_X509_STRICT);
 		(void)X509_verify_cert(ctx);
@@ -1463,6 +1601,277 @@ static int verify_strict(X509 *anchor, X509 *target, const int purpose)
 	X509_STORE_CTX_free(ctx);
 	X509_STORE_free(store);
 	return result;
+}
+
+static int verify_strict(X509 *anchor, X509 *target, const int purpose)
+{
+	return verify_chain_strict(anchor, target, NULL, purpose);
+}
+
+static size_t read_certificate_chain(
+	struct testing_ctx *_t_, const char *path, X509 **chain,
+	const size_t cap)
+{
+	FILE *const fp = fopen(path, "r");
+	T_CHECK(fp != NULL);
+	size_t count = 0;
+	while (count < cap) {
+		X509 *const cert = PEM_read_X509(fp, NULL, NULL, NULL);
+		if (cert == NULL) {
+			break;
+		}
+		retain_cleanup(_t_, cleanup_cert, cert);
+		chain[count++] = cert;
+	}
+	(void)fclose(fp);
+	ERR_clear_error();
+	return count;
+}
+
+/* Build two CA intermediates with the public generator's keys/extensions,
+ * then issue their certificates under the previous CA rather than themselves. */
+static void make_test_signer_chain(struct testing_ctx *_t_, X509 *certs[3])
+{
+	static const char *const names[3] = { "root", "intermediate",
+					      "signer" };
+	EVP_PKEY *keys[3];
+	for (size_t i = 0; i < 3; i++) {
+		T_CHECK(gencerts(names[i], names[i], NULL, "ecdsa", 256, NULL));
+		char path[64];
+		(void)snprintf(path, sizeof(path), "%s-cert.pem", names[i]);
+		certs[i] = read_cert_file(path);
+		retain_cleanup(_t_, cleanup_cert, certs[i]);
+		T_CHECK(certs[i] != NULL);
+		(void)snprintf(path, sizeof(path), "%s-key.pem", names[i]);
+		FILE *const fp = fopen(path, "r");
+		T_CHECK(fp != NULL);
+		keys[i] = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+		(void)fclose(fp);
+		retain_cleanup(_t_, cleanup_key, keys[i]);
+		T_CHECK(keys[i] != NULL);
+		if (i == 0) {
+			continue;
+		}
+		T_CHECK(X509_set_issuer_name(
+				certs[i],
+				X509_get_subject_name(certs[i - 1])) == 1);
+		X509V3_CTX ctx;
+		X509V3_set_ctx_nodb(&ctx);
+		X509V3_set_ctx(&ctx, certs[i - 1], certs[i], NULL, NULL, 0);
+		X509_EXTENSION *const aki = X509V3_EXT_conf_nid(
+			NULL, &ctx, NID_authority_key_identifier,
+			"keyid:always");
+		T_CHECK(aki != NULL);
+		const int added = X509_add_ext(certs[i], aki, -1);
+		X509_EXTENSION_free(aki);
+		T_CHECK(added == 1);
+		T_CHECK(X509_sign(certs[i], keys[i - 1], EVP_sha256()) > 0);
+	}
+}
+
+static void
+write_test_signer_chain(X509 *const certs[3], const bool include_root)
+{
+	FILE *const fp = fopen("signer-cert.pem", "w");
+	T_CHECK(fp != NULL);
+	for (int i = 2; i >= (include_root ? 0 : 1); i--) {
+		T_CHECK(PEM_write_X509(fp, certs[i]) == 1);
+	}
+	T_CHECK(fclose(fp) == 0);
+}
+
+T_DECLARE_CASE(test_gencerts_preserves_multiple_signer_intermediates)
+{
+	char tmpl[] = GENCERTS_TEST_TMPDIR "/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+	T_CLEANUP(cleanup_tmpdir, NULL);
+	X509 *certs[3];
+	make_test_signer_chain(_t_, certs);
+	static const char *const jobs[2] = { "leaf1,leaf2", "leaf3,leaf4" };
+	static const char *const leaves[2][2] = { { "leaf1", "leaf2" },
+						  { "leaf3", "leaf4" } };
+	for (int include_root = 0; include_root < 2; include_root++) {
+		write_test_signer_chain(certs, include_root != 0);
+		T_EXPECT(gencerts(
+			jobs[include_root], "leaf.example", "signer", "ecdsa",
+			256, NULL));
+		for (size_t leaf = 0; leaf < 2; leaf++) {
+			char path[64];
+			(void)snprintf(
+				path, sizeof(path), "%s-cert.pem",
+				leaves[include_root][leaf]);
+			X509 *chain[5] = { 0 };
+			const size_t count = read_certificate_chain(
+				_t_, path, chain, ARRAY_SIZE(chain));
+			T_EXPECT_EQ(count, (size_t)(include_root ? 4 : 3));
+			T_EXPECT(cert_cn_equals(chain[0], "leaf.example"));
+			T_EXPECT_EQ(X509_cmp(chain[1], certs[2]), 0);
+			T_EXPECT_EQ(X509_cmp(chain[2], certs[1]), 0);
+			if (include_root != 0) {
+				T_EXPECT_EQ(X509_cmp(chain[3], certs[0]), 0);
+			}
+			STACK_OF(X509) *const untrusted = sk_X509_new_null();
+			T_CHECK(untrusted != NULL);
+			for (size_t i = 1; i < count; i++) {
+				T_CHECK(sk_X509_push(untrusted, chain[i]) > 0);
+			}
+			const int server_rc = verify_chain_strict(
+				certs[0], chain[0], untrusted,
+				X509_PURPOSE_SSL_SERVER);
+			const int client_rc = verify_chain_strict(
+				certs[0], chain[0], untrusted,
+				X509_PURPOSE_SSL_CLIENT);
+			sk_X509_free(untrusted);
+			T_EXPECT_EQ(server_rc, X509_V_OK);
+			T_EXPECT_EQ(client_rc, X509_V_OK);
+			for (size_t i = 0; i < count; i++) {
+				release_cleanup(_t_, cleanup_cert, chain[i]);
+			}
+		}
+	}
+	leave_tmpdir(origdir, tmpl);
+}
+
+T_DECLARE_CASE(test_gencerts_chain_write_failure_rolls_back_all_jobs)
+{
+#ifdef GENCERTS_TEST_WRAP_PEM_WRITE
+	char tmpl[] = GENCERTS_TEST_TMPDIR "/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+	T_CLEANUP(cleanup_tmpdir, NULL);
+	T_CLEANUP(clear_pem_write_failure, NULL);
+	X509 *certs[3];
+	make_test_signer_chain(_t_, certs);
+	write_test_signer_chain(certs, false);
+	static const char *const files[] = { "a-cert.pem", "a-key.pem",
+					     "b-cert.pem", "b-key.pem" };
+	for (int failed_job = 0; failed_job < 2; failed_job++) {
+		/* Fail the additional intermediate after writing leaf and signer. */
+		fail_pem_write_after = 3 * (failed_job + 1);
+		T_EXPECT(!gencerts(
+			"a,b", "leaf.example", "signer", "ecdsa", 256, NULL));
+		T_EXPECT_EQ(fail_pem_write_after, 0);
+		for (size_t i = 0; i < ARRAY_SIZE(files); i++) {
+			T_EXPECT_EQ(access(files[i], F_OK), -1);
+		}
+		T_EXPECT(gencerts(
+			"a,b", "leaf.example", "signer", "ecdsa", 256, NULL));
+		for (size_t i = 0; i < ARRAY_SIZE(files); i++) {
+			T_EXPECT_EQ(unlink(files[i]), 0);
+		}
+	}
+	leave_tmpdir(origdir, tmpl);
+#else
+	T_SKIPNOW();
+#endif /* GENCERTS_TEST_WRAP_PEM_WRITE */
+}
+
+T_DECLARE_CASE(test_gencerts_rejects_malformed_trailing_certificate)
+{
+	char tmpl[] = GENCERTS_TEST_TMPDIR "/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+	T_CLEANUP(cleanup_tmpdir, NULL);
+	T_CHECK(gencerts("ca", "ca.example", NULL, "ecdsa", 256, NULL));
+	X509 *const ca = read_cert_file("ca-cert.pem");
+	retain_cleanup(_t_, cleanup_cert, ca);
+	T_CHECK(ca != NULL);
+	FILE *fp = fopen("ca-cert.pem", "a");
+	T_CHECK(fp != NULL);
+	T_CHECK(fputs("\n-----BEGIN CERTIFICATE-----\ninvalid!\n-----END CERTIFICATE-----\n",
+		      fp) >= 0);
+	T_CHECK(fclose(fp) == 0);
+	const bool rejected =
+		!gencerts("a,b", "leaf.example", "ca", "ecdsa", 256, NULL);
+	const bool absent = access("a-cert.pem", F_OK) != 0 &&
+			    access("a-key.pem", F_OK) != 0 &&
+			    access("b-cert.pem", F_OK) != 0 &&
+			    access("b-key.pem", F_OK) != 0;
+	const bool errors_drained = ERR_peek_error() == 0;
+	fp = fopen("ca-cert.pem", "w");
+	T_CHECK(fp != NULL);
+	T_CHECK(PEM_write_X509(fp, ca) == 1);
+	T_CHECK(fclose(fp) == 0);
+	const bool retry_ok =
+		gencerts("retry", "leaf.example", "ca", "ecdsa", 256, NULL);
+	leave_tmpdir(origdir, tmpl);
+	T_EXPECT(rejected);
+	T_EXPECT(absent);
+	T_EXPECT(errors_drained);
+	T_EXPECT(retry_ok);
+}
+
+T_DECLARE_CASE(test_gencerts_signer_bundle_requires_a_certificate)
+{
+	char tmpl[] = GENCERTS_TEST_TMPDIR "/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+	T_CLEANUP(cleanup_tmpdir, NULL);
+	T_CHECK(gencerts("ca", "ca.example", NULL, "ecdsa", 256, NULL));
+	FILE *fp = fopen("ca-key.pem", "r");
+	T_CHECK(fp != NULL);
+	EVP_PKEY *const key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+	(void)fclose(fp);
+	retain_cleanup(_t_, cleanup_key, key);
+	T_CHECK(key != NULL);
+	for (int with_key = 0; with_key < 2; with_key++) {
+		fp = fopen("ca-cert.pem", "w");
+		T_CHECK(fp != NULL);
+		if (with_key != 0) {
+			T_CHECK(PEM_write_PrivateKey(
+					fp, key, NULL, NULL, 0, NULL, NULL) ==
+				1);
+		}
+		T_CHECK(fclose(fp) == 0);
+		T_EXPECT(!gencerts(
+			"leaf", "leaf.example", "ca", "ecdsa", 256, NULL));
+		T_EXPECT_EQ(access("leaf-cert.pem", F_OK), -1);
+		T_EXPECT_EQ(access("leaf-key.pem", F_OK), -1);
+		T_EXPECT_EQ(ERR_peek_error(), 0ul);
+	}
+	leave_tmpdir(origdir, tmpl);
+}
+
+T_DECLARE_CASE(test_gencerts_signer_bundle_ignores_noncertificate_entries)
+{
+	char tmpl[] = GENCERTS_TEST_TMPDIR "/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+	T_CLEANUP(cleanup_tmpdir, NULL);
+	T_CHECK(gencerts("ca", "ca.example", NULL, "ecdsa", 256, NULL));
+	X509 *const ca = read_cert_file("ca-cert.pem");
+	retain_cleanup(_t_, cleanup_cert, ca);
+	T_CHECK(ca != NULL);
+	FILE *fp = fopen("ca-key.pem", "r");
+	T_CHECK(fp != NULL);
+	EVP_PKEY *const key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+	(void)fclose(fp);
+	retain_cleanup(_t_, cleanup_key, key);
+	T_CHECK(key != NULL);
+	fp = fopen("ca-cert.pem", "w");
+	T_CHECK(fp != NULL);
+	T_CHECK(PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL) == 1);
+	T_CHECK(PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL) == 1);
+	T_CHECK(PEM_write_X509(fp, ca) == 1);
+	T_CHECK(fclose(fp) == 0);
+	T_EXPECT(gencerts("leaf", "leaf.example", "ca", "ecdsa", 256, NULL));
+	X509 *chain[3] = { 0 };
+	const size_t count = read_certificate_chain(
+		_t_, "leaf-cert.pem", chain, ARRAY_SIZE(chain));
+	T_EXPECT_EQ(count, (size_t)2);
+	T_EXPECT_EQ(X509_cmp(chain[1], ca), 0);
+	/* The output must carry certificates only, never the input's private keys. */
+	fp = fopen("leaf-cert.pem", "r");
+	T_CHECK(fp != NULL);
+	char line[256];
+	bool has_key = false;
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		has_key = has_key || strstr(line, "PRIVATE KEY") != NULL;
+	}
+	(void)fclose(fp);
+	leave_tmpdir(origdir, tmpl);
+	T_EXPECT(!has_key);
 }
 
 /* RFC 5280 4.1.2.6: the DN MUST be unique for each subject entity one CA
@@ -1747,7 +2156,36 @@ T_DECLARE_CASE(test_gencerts_validity_with_separated_clock_reads)
 #endif /* GENCERTS_TEST_WRAP_TIME */
 }
 
+T_DECLARE_CASE(test_gencerts_subject_failure_leaves_no_files)
+{
+#ifdef GENCERTS_TEST_WRAP_SUBJECT
+	char tmpl[] = GENCERTS_TEST_TMPDIR "/gencerts_test_XXXXXX";
+	char origdir[PATH_MAX];
+	T_CHECK(enter_tmpdir(tmpl, origdir, sizeof(origdir)));
+	T_CLEANUP(cleanup_tmpdir, NULL);
+	T_CLEANUP(clear_subject_failure, NULL);
+	for (int failure = 0; failure < 4; failure++) {
+		clear_subject_failure(NULL);
+		subject_failure.allocation = failure == 0;
+		subject_failure.entries = failure == 1 ? 1 :
+					  failure == 2 ? 2 :
+							 0;
+		subject_failure.assignment = failure == 3;
+		T_EXPECT(!gencerts(
+			"subject", "subject.example", NULL, "ed25519", 0,
+			NULL));
+		T_EXPECT_EQ(subject_failure.hits, (size_t)1);
+		T_EXPECT_EQ(access("subject-cert.pem", F_OK), -1);
+		T_EXPECT_EQ(access("subject-key.pem", F_OK), -1);
+		T_EXPECT_EQ(ERR_peek_error(), 0ul);
+	}
+	clear_subject_failure(NULL);
+	leave_tmpdir(origdir, tmpl);
+#endif /* GENCERTS_TEST_WRAP_SUBJECT */
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_gencerts_subject_failure_leaves_no_files),
 	T_CASE(test_gencerts_validity_with_separated_clock_reads),
 	T_CASE(test_gencerts_ed25519),
 	T_CASE(test_gencerts_ecdsa),
@@ -1791,6 +2229,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_gencerts_signed_leaves_have_unique_subjects),
 	T_CASE(test_gencerts_non_ca_signer_rejected),
 	T_CASE(test_gencerts_signed_chain_verifies_strict),
+	T_CASE(test_gencerts_preserves_multiple_signer_intermediates),
+	T_CASE(test_gencerts_rejects_malformed_trailing_certificate),
+	T_CASE(test_gencerts_chain_write_failure_rolls_back_all_jobs),
+	T_CASE(test_gencerts_signer_bundle_requires_a_certificate),
+	T_CASE(test_gencerts_signer_bundle_ignores_noncertificate_entries),
 	T_CASE(test_gencerts_self_signed_verifies_as_anchor),
 	T_CASE(test_gencerts_ca_and_leaf_extensions),
 	T_SUITE_END,

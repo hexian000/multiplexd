@@ -296,8 +296,13 @@ add_src_test(gencerts_test
 target_compile_definitions(gencerts_test PRIVATE
     GENCERTS_TEST_TMPDIR="${CMAKE_BINARY_DIR}/tmp")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND WITH_OPENSSL)
-    target_link_options(gencerts_test PRIVATE "-Wl,--wrap=time" "-Wl,--wrap=X509_time_adj_ex")
-    target_compile_definitions(gencerts_test PRIVATE GENCERTS_TEST_WRAP_TIME=1)
+    target_link_options(gencerts_test PRIVATE
+        "-Wl,--wrap=time" "-Wl,--wrap=X509_time_adj_ex" "-Wl,--wrap=PEM_write_X509"
+        "-Wl,--wrap=X509_NAME_new" "-Wl,--wrap=X509_NAME_add_entry_by_NID"
+        "-Wl,--wrap=X509_set_subject_name")
+    target_compile_definitions(gencerts_test PRIVATE
+        GENCERTS_TEST_WRAP_TIME=1 GENCERTS_TEST_WRAP_PEM_WRITE=1
+        GENCERTS_TEST_WRAP_SUBJECT=1)
 endif()
 
 # Always registered; no-op when TLS disabled.
@@ -305,6 +310,8 @@ add_src_test(genpsk_test
     genpsk.c genpsk.h
     genpsk_test.c
 )
+target_compile_definitions(genpsk_test PRIVATE
+    GENPSK_TEST_TMPDIR="${CMAKE_BINARY_DIR}/tmp")
 
 # White-box: compiles tunnel.c into the TU so cases can call its static
 # functions and reach tunnel/session internals; every collaborator is linked
