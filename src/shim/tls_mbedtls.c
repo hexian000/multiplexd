@@ -460,17 +460,12 @@ struct alpn_collect {
 	size_t k;
 };
 
-/* alpn_field_fn: append a heap copy of each ALPN name to the array. */
+/* alpn_field_fn: retain a pointer into the array's inline token storage. */
 static bool alpn_collect_field(void *ctx, const char *name, const size_t len)
 {
 	(void)len;
 	struct alpn_collect *const a = ctx;
-	char *const s = strdup(name);
-	if (s == NULL) {
-		LOGOOM();
-		return false;
-	}
-	a->arr[a->k++] = s;
+	a->arr[a->k++] = (char *)name;
 	return true;
 }
 
@@ -487,26 +482,24 @@ static bool parse_alpn(const char *restrict list, char ***restrict out)
 	if (list == NULL || list[0] == '\0') {
 		return true;
 	}
-	/* alpn_tokenize parses the buffer in-place, so work on a mutable copy. */
-	size_t cap = 0;
-	char *const work = dup_for_tokens(list, ',', &cap);
-	if (work == NULL) {
-		LOGOOM();
-		return false;
+	/* Count every possible CSV separator. Quoted separators and CRLF may
+	 * overcount, but every emitted field plus the NULL sentinel fits. */
+	size_t cap = 2;
+	for (const char *p = list; *p != '\0'; p++) {
+		if (*p == ',' || *p == '\r' || *p == '\n') {
+			cap++;
+		}
 	}
-	char **const arr = (char **)calloc(cap, sizeof(*arr));
+	const size_t len = strlen(list);
+	char **const arr = (char **)malloc(cap * sizeof(*arr) + len + 1);
 	if (arr == NULL) {
 		LOGOOM();
-		free(work);
 		return false;
 	}
+	char *const work = (char *)(arr + cap);
+	memcpy(work, list, len + 1);
 	struct alpn_collect a = { .arr = arr, .k = 0 };
-	const bool ok = alpn_tokenize(work, list, alpn_collect_field, &a);
-	free(work);
-	if (!ok) {
-		for (size_t i = 0; i < a.k; i++) {
-			free(arr[i]);
-		}
+	if (!alpn_tokenize(work, list, alpn_collect_field, &a)) {
 		free((void *)arr);
 		return false;
 	}
@@ -554,12 +547,7 @@ static void tls_ctx_impl_free(struct tls_ctx_impl *restrict c)
 	mbedtls_x509_crt_free(&c->ca_chain);
 	free(c->ciphersuites);
 	free(c->sni);
-	if (c->alpn != NULL) {
-		for (char **p = c->alpn; *p != NULL; p++) {
-			free(*p);
-		}
-		free((void *)c->alpn);
-	}
+	free((void *)c->alpn);
 #ifdef MBEDTLS_LEGACY_RNG
 	mbedtls_ctr_drbg_free(&c->ctr_drbg);
 	mbedtls_entropy_free(&c->entropy);
@@ -719,7 +707,9 @@ static bool psk_restrict_ciphersuites(struct tls_ctx_impl *restrict c)
 	while (from[n] != 0) {
 		n++;
 	}
-	int *const ids = malloc(sizeof(int) * (n + 1));
+	int *const ids = c->ciphersuites != NULL ?
+				 c->ciphersuites :
+				 malloc(sizeof(*ids) * (n + 1));
 	if (ids == NULL) {
 		LOGOOM();
 		return false;
@@ -738,10 +728,11 @@ static bool psk_restrict_ciphersuites(struct tls_ctx_impl *restrict c)
 	if (k == 0) {
 		LOGE("tls.psk: no TLS 1.3 ciphersuite uses SHA-256, the hash "
 		     "every PSK is bound to");
-		free(ids);
+		if (ids != c->ciphersuites) {
+			free(ids);
+		}
 		return false;
 	}
-	free(c->ciphersuites);
 	c->ciphersuites = ids;
 	return true;
 }
@@ -1469,6 +1460,32 @@ bool tls_peer_cert_der(
  * than through mbedtls_x509_parse_subject_alt_name(), whose supported CHOICE
  * set differs across the mbedTLS versions this backend builds against. */
 #define X509_SAN_TAG_URI (MBEDTLS_ASN1_CONTEXT_SPECIFIC | 6)
+
+bool tls_peer_cert_uri_sans_foreach(
+	struct tls_connection *conn, tls_uri_san_fn fn, void *ctx)
+{
+	if (conn == NULL || fn == NULL) {
+		return false;
+	}
+	struct tls_conn_impl *const c = tls_conn_raw(conn);
+	const mbedtls_x509_crt *const cert = mbedtls_ssl_get_peer_cert(&c->ssl);
+	if (cert == NULL) {
+		return false;
+	}
+	for (const mbedtls_x509_sequence *san = &cert->subject_alt_names;
+	     san != NULL; san = san->next) {
+		if (san->buf.tag != X509_SAN_TAG_URI || san->buf.p == NULL) {
+			continue;
+		}
+		if (memchr(san->buf.p, '\0', san->buf.len) != NULL) {
+			LOGE("peer certificate: URI subjectAltName contains an"
+			     " embedded NUL");
+			return false;
+		}
+		fn(ctx, san->buf.p, san->buf.len);
+	}
+	return true;
+}
 
 bool tls_peer_cert_uri_sans(
 	struct tls_connection *conn, char ***out, size_t *count)

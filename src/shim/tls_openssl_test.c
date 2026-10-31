@@ -19,8 +19,37 @@
 
 #include "tls.h"
 
+/* Count only project-owned backend allocations, not TLS library internals. */
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+static size_t backend_allocations;
+static bool backend_fail_next;
+
+static void *backend_malloc(size_t size)
+{
+	backend_allocations++;
+	if (backend_fail_next) {
+		backend_fail_next = false;
+		return NULL;
+	}
+	return malloc(size);
+}
+
+static void *backend_calloc(size_t count, size_t size)
+{
+	backend_allocations++;
+	return calloc(count, size);
+}
+
+#define malloc(size) backend_malloc(size)
+#define calloc(count, size) backend_calloc((count), (size))
+
 /* Compile the backend into this TU to reach its static helpers. */
 #include "tls_openssl.c"
+#undef malloc
+#undef calloc
 
 #include "utils/slog.h"
 #include "utils/testing.h"
@@ -28,6 +57,8 @@
 #include <openssl/asn1.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/safestack.h>
 #include <openssl/ssl.h>
 #include <openssl/types.h>
 #include <openssl/x509.h>
@@ -74,6 +105,21 @@ static void cleanup_key(void *data)
 static void cleanup_cert(void *data)
 {
 	X509_free(data);
+}
+
+static void cleanup_ctx(void *data)
+{
+	tls_ctx_free(data);
+}
+
+static void cleanup_conn(void *data)
+{
+	tls_conn_free(data);
+}
+
+static void cleanup_ssl(void *data)
+{
+	SSL_free(data);
 }
 
 /* Generate a key pair; a NULL result is a test-setup failure, not a case
@@ -145,6 +191,63 @@ static X509 *make_cert(
 		return NULL;
 	}
 	return x;
+}
+
+static void cleanup_reload_ctx(void *data)
+{
+	tls_ctx_free(data);
+}
+
+static void cleanup_bio(void *data)
+{
+	(void)BIO_free(data);
+}
+
+T_DECLARE_CASE(test_reload_replaces_leaf_and_clears_chain)
+{
+	EVP_PKEY *const key = gen_ec("prime256v1");
+	T_CLEANUP(cleanup_key, key);
+	X509 *const leaf = make_cert(key, EVP_sha256(), "intermediate.test");
+	T_CLEANUP(cleanup_cert, leaf);
+	X509 *const intermediate = make_cert(key, EVP_sha256(), "root.test");
+	T_CLEANUP(cleanup_cert, intermediate);
+	X509 *const replacement = make_cert(key, EVP_sha256(), NULL);
+	T_CLEANUP(cleanup_cert, replacement);
+	T_CHECK(leaf != NULL && intermediate != NULL && replacement != NULL);
+	BIO *const chain_pem = BIO_new(BIO_s_mem());
+	T_CLEANUP(cleanup_bio, chain_pem);
+	BIO *const replacement_pem = BIO_new(BIO_s_mem());
+	T_CLEANUP(cleanup_bio, replacement_pem);
+	T_CHECK(chain_pem != NULL && replacement_pem != NULL);
+	T_CHECK(PEM_write_bio_X509(chain_pem, leaf) == 1);
+	T_CHECK(PEM_write_bio_X509(chain_pem, intermediate) == 1);
+	T_CHECK(BIO_write(chain_pem, "", 1) == 1);
+	T_CHECK(PEM_write_bio_X509(replacement_pem, replacement) == 1);
+	T_CHECK(BIO_write(replacement_pem, "", 1) == 1);
+	char *chain_data = NULL;
+	char *replacement_data = NULL;
+	T_CHECK(BIO_get_mem_data(chain_pem, &chain_data) > 0);
+	T_CHECK(BIO_get_mem_data(replacement_pem, &replacement_data) > 0);
+	struct tls_context *const ctx = tls_ctx_new(TLS_server_method());
+	T_CHECK(ctx != NULL);
+	T_CLEANUP(cleanup_reload_ctx, ctx);
+	SSL_CTX *const ssl_ctx = tls_ssl_ctx(ctx);
+	T_CHECK(tls_load_cert(ctx, chain_data));
+	STACK_OF(X509) *chain = NULL;
+	T_CHECK(SSL_CTX_get0_chain_certs(ssl_ctx, (void *)&chain) == 1);
+	T_CHECK(chain != NULL);
+	T_EXPECT_EQ(sk_X509_num(chain), 1);
+	T_EXPECT_EQ(X509_cmp(sk_X509_value(chain, 0), intermediate), 0);
+	T_EXPECT_EQ(X509_cmp(SSL_CTX_get0_certificate(ssl_ctx), leaf), 0);
+
+	T_CHECK(tls_load_cert(ctx, replacement_data));
+	T_CHECK(SSL_CTX_get0_chain_certs(ssl_ctx, (void *)&chain) == 1);
+	T_EXPECT(chain == NULL || sk_X509_num(chain) == 0);
+	T_EXPECT_EQ(
+		X509_cmp(SSL_CTX_get0_certificate(ssl_ctx), replacement), 0);
+	T_CHECK(tls_load_cert(ctx, replacement_data));
+	T_CHECK(SSL_CTX_get0_chain_certs(ssl_ctx, (void *)&chain) == 1);
+	T_EXPECT(chain == NULL || sk_X509_num(chain) == 0);
 }
 
 /* Invoke the strength callback with @p preverify_ok on @p cert at @p depth,
@@ -477,9 +580,12 @@ T_DECLARE_CASE(test_psk_find_session_cb_rejects_hostile_identity)
 	struct tls_context *const ctx = tls_ctx_server(&(struct tls_config){
 		.psk_lookup = psk_spy_lookup, .psk_lookup_ctx = &spy });
 	T_CHECK(ctx != NULL);
+	T_CLEANUP(cleanup_ctx, ctx);
 	SSL *const ssl = SSL_new(tls_ctx_raw(ctx)->ssl_ctx);
 	T_CHECK(ssl != NULL);
+	T_CLEANUP(cleanup_ssl, ssl);
 
+	T_EXPECT(!psk_conn_set_label(ssl, "unowned"));
 	const bool nul_mid_declined = psk_find_declines(ssl, "ab\0cd", 5);
 	const bool nul_last_declined =
 		psk_find_declines(ssl, k_nul_last, sizeof(k_nul_last) - 1);
@@ -489,8 +595,8 @@ T_DECLARE_CASE(test_psk_find_session_cb_rejects_hostile_identity)
 	const bool max_declined =
 		psk_find_declines(ssl, k_max, sizeof(k_max) - 1);
 
-	SSL_free(ssl);
-	tls_ctx_free(ctx);
+	release_cleanup(_t_, cleanup_ssl, ssl);
+	release_cleanup(_t_, cleanup_ctx, ctx);
 
 	T_EXPECT(nul_mid_declined);
 	T_EXPECT(nul_last_declined);
@@ -501,11 +607,100 @@ T_DECLARE_CASE(test_psk_find_session_cb_rejects_hostile_identity)
 	T_EXPECT_STREQ(spy.label, k_max);
 }
 
+T_DECLARE_CASE(test_alpn_uses_one_backend_allocation)
+{
+	struct tls_context *const ctx = tls_ctx_new(TLS_server_method());
+	T_CHECK(ctx != NULL);
+	T_CLEANUP(cleanup_ctx, ctx);
+	T_EXPECT(tls_ctx_set_alpn(tls_ctx_raw(ctx), true, NULL));
+	T_EXPECT(tls_ctx_set_alpn(tls_ctx_raw(ctx), true, ""));
+	T_EXPECT(tls_ctx_set_alpn(tls_ctx_raw(ctx), true, ",,"));
+	T_EXPECT(!tls_ctx_raw(ctx)->alpn_cb_registered);
+	char long_name[257];
+	memset(long_name, 'a', sizeof(long_name) - 1);
+	long_name[256] = '\0';
+	T_EXPECT(!tls_ctx_set_alpn(tls_ctx_raw(ctx), false, long_name));
+	long_name[255] = '\0';
+	T_EXPECT(tls_ctx_set_alpn(tls_ctx_raw(ctx), false, long_name));
+	backend_fail_next = true;
+	T_EXPECT(!tls_ctx_set_alpn(tls_ctx_raw(ctx), true, "h2"));
+	backend_allocations = 0;
+	const bool ok = tls_ctx_set_alpn(
+		tls_ctx_raw(ctx), true,
+		"h2,\"quoted,protocol\",\"a\"\"b\",,last");
+	const size_t allocations = backend_allocations;
+	T_EXPECT(ok);
+	T_EXPECT_EQ(allocations, (size_t)1);
+	const struct alpn_wire *const wire =
+		SSL_CTX_get_ex_data(tls_ssl_ctx(ctx), g_alpn_ex_idx);
+	static const unsigned char expected[] = "\x02"
+						"h2"
+						"\x0f"
+						"quoted,protocol"
+						"\x03"
+						"a\"b"
+						"\x04"
+						"last";
+	T_EXPECT(wire != NULL);
+	if (wire != NULL) {
+		T_EXPECT_EQ(wire->len, sizeof(expected) - 1);
+		T_EXPECT(
+			memcmp(wire->buf, expected, sizeof(expected) - 1) == 0);
+	}
+	release_cleanup(_t_, cleanup_ctx, ctx);
+}
+
+T_DECLARE_CASE(test_cert_connection_has_no_psk_label_owner)
+{
+	struct tls_context *const ctx = tls_ctx_new(TLS_client_method());
+	T_CHECK(ctx != NULL);
+	T_CLEANUP(cleanup_ctx, ctx);
+	struct tls_connection *const conn = tls_client(ctx, -1);
+	T_CHECK(conn != NULL);
+	T_CLEANUP(cleanup_conn, conn);
+	T_EXPECT(SSL_get_ex_data(tls_conn_ssl(conn), g_psk_ssl_ex_idx) == NULL);
+}
+
+T_DECLARE_CASE(test_psk_label_reuses_connection_storage)
+{
+	struct psk_lookup_spy spy = { 0 };
+	struct tls_context *const ctx = tls_ctx_server(&(struct tls_config){
+		.psk_lookup = psk_spy_lookup, .psk_lookup_ctx = &spy });
+	T_CHECK(ctx != NULL);
+	T_CLEANUP(cleanup_ctx, ctx);
+	struct tls_connection *const conn = tls_server(ctx, -1);
+	T_CHECK(conn != NULL);
+	T_CLEANUP(cleanup_conn, conn);
+	struct tls_conn_impl *const c = tls_conn_raw(conn);
+	T_EXPECT(SSL_get_ex_data(c->ssl, g_psk_ssl_ex_idx) == c);
+	backend_allocations = 0;
+	T_EXPECT(
+		psk_conn_set_label(c->ssl, "0123456789abcdef0123456789abcdef"));
+	T_EXPECT(SSL_get_ex_data(c->ssl, g_psk_ssl_ex_idx) == c);
+	T_EXPECT(psk_conn_set_label(c->ssl, ""));
+	T_EXPECT(SSL_get_ex_data(c->ssl, g_psk_ssl_ex_idx) == c);
+	T_EXPECT(psk_conn_set_label(c->ssl, "second"));
+	T_EXPECT(SSL_get_ex_data(c->ssl, g_psk_ssl_ex_idx) == c);
+	T_EXPECT(!psk_conn_set_label(
+		c->ssl, "0123456789abcdef0123456789abcdef0"));
+	T_EXPECT(SSL_get_ex_data(c->ssl, g_psk_ssl_ex_idx) == c);
+	T_EXPECT_EQ(backend_allocations, (size_t)0);
+	char label[TLS_PSK_LABEL_MAX + 1];
+	size_t len = sizeof(label);
+	T_EXPECT(!tls_peer_psk_label(conn, label, &len));
+	release_cleanup(_t_, cleanup_ctx, ctx);
+	release_cleanup(_t_, cleanup_conn, conn);
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_alpn_uses_one_backend_allocation),
+	T_CASE(test_psk_label_reuses_connection_storage),
+	T_CASE(test_cert_connection_has_no_psk_label_owner),
 	T_CASE(test_ec_curve_allowlist),
 	T_CASE(test_cert_digest_floor),
 	T_CASE(test_verify_cert_strength_cb),
 	T_CASE(test_load_cert_without_certificate_logs),
+	T_CASE(test_reload_replaces_leaf_and_clears_chain),
 	T_CASE(test_psk_clears_no_dhe_kex),
 	T_CASE(test_psk_find_session_cb_rejects_hostile_identity),
 	T_SUITE_END,

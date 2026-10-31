@@ -198,7 +198,9 @@ typedef bool (*alpn_field_fn)(void *ctx, const char *name, size_t len);
 /**
  * @brief Tokenize a comma-separated ALPN list (RFC 4180 CSV; a quoted name may
  * contain a comma), invoking fn for each non-empty validated name.
- * @param[inout] work Mutable copy of the list; unescaped in place.
+ * @param[inout] work Mutable copy of the list; unescaped in place. The
+ * callback may pack output over fields already scanned, including its current
+ * name, but must preserve unread input at and beyond the next field.
  * @param list Original list string, used only for log messages.
  * @param fn Per-name callback; a false return aborts and propagates.
  * @param ctx Opaque context passed through to fn.
@@ -206,8 +208,7 @@ typedef bool (*alpn_field_fn)(void *ctx, const char *name, size_t len);
  * true otherwise, including an empty or all-empty list.
  */
 bool alpn_tokenize(
-	char *restrict work, const char *restrict list, alpn_field_fn fn,
-	void *ctx);
+	char *work, const char *restrict list, alpn_field_fn fn, void *ctx);
 
 struct tls_connection;
 

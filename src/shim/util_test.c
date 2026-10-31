@@ -32,7 +32,21 @@
 static bool mock_bundle_stat;
 static int bundle_stat_error;
 static mode_t bundle_stat_mode;
-static size_t bundle_stat_hit;
+static const char *const expected_bundle_paths[] = {
+	"/etc/ssl/certs/ca-certificates.crt",
+	"/etc/pki/tls/certs/ca-bundle.crt",
+	"/etc/ssl/ca-bundle.pem",
+	"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+	"/etc/ssl/cert.pem",
+	"/usr/local/share/certs/ca-root-nss.crt",
+	"/usr/ssl/cert.pem",
+};
+enum {
+	BUNDLE_PATH_COUNT =
+		sizeof(expected_bundle_paths) / sizeof(expected_bundle_paths[0])
+};
+static bool bundle_stat_exists[BUNDLE_PATH_COUNT];
+static const char *bundle_stat_probes[BUNDLE_PATH_COUNT];
 static size_t bundle_stat_calls;
 
 int stat(const char *path, struct stat *st)
@@ -40,7 +54,15 @@ int stat(const char *path, struct stat *st)
 	if (!mock_bundle_stat) {
 		return fstatat(AT_FDCWD, path, st, 0);
 	}
-	if (bundle_stat_calls++ == bundle_stat_hit) {
+	if (bundle_stat_calls < BUNDLE_PATH_COUNT) {
+		bundle_stat_probes[bundle_stat_calls] = path;
+	}
+	bundle_stat_calls++;
+	for (size_t i = 0; i < BUNDLE_PATH_COUNT; i++) {
+		if (!bundle_stat_exists[i] ||
+		    strcmp(path, expected_bundle_paths[i]) != 0) {
+			continue;
+		}
 		if (bundle_stat_error == 0) {
 			memset(st, 0, sizeof(*st));
 			st->st_mode = bundle_stat_mode;
@@ -51,6 +73,14 @@ int stat(const char *path, struct stat *st)
 	}
 	errno = ENOENT;
 	return -1;
+}
+
+T_DECLARE_SUBCASE(expect_bundle_probes, size_t count)
+{
+	T_EXPECT_EQ(bundle_stat_calls, count);
+	for (size_t i = 0; i < count; i++) {
+		T_EXPECT_STREQ(bundle_stat_probes[i], expected_bundle_paths[i]);
+	}
 }
 
 static void restore_bundle_discovery(void *data)
@@ -74,31 +104,35 @@ T_DECLARE_CASE(test_tls_system_ca_discovery)
 	mock_bundle_stat = true;
 	bundle_stat_error = 0;
 	bundle_stat_mode = S_IFREG;
-	for (size_t i = 0; i < 7; i++) {
+	/* Every suffix exists, so the first available bundle must win even
+	 * when lower-priority bundles are also present. */
+	for (size_t i = 0; i < BUNDLE_PATH_COUNT; i++) {
+		for (size_t j = 0; j < BUNDLE_PATH_COUNT; j++) {
+			bundle_stat_exists[j] = j >= i;
+		}
 		bundle_stat_calls = 0;
-		bundle_stat_hit = i;
 		const char *const path = tls_system_ca_file();
 		T_CHECK(path != NULL);
-		T_EXPECT_EQ(bundle_stat_calls, i + 1);
-		T_EXPECT(path[0] == '/');
+		T_EXPECT_STREQ(path, expected_bundle_paths[i]);
+		T_CALL_SUBCASE(expect_bundle_probes, i + 1);
 	}
-	bundle_stat_hit = SIZE_MAX;
+	memset(bundle_stat_exists, 0, sizeof(bundle_stat_exists));
 	bundle_stat_calls = 0;
 	T_EXPECT(tls_system_ca_file() == NULL);
-	T_EXPECT_EQ(bundle_stat_calls, (size_t)7);
-	bundle_stat_hit = 0;
+	T_CALL_SUBCASE(expect_bundle_probes, BUNDLE_PATH_COUNT);
+	bundle_stat_exists[0] = true;
 	bundle_stat_mode = S_IFDIR;
 	bundle_stat_calls = 0;
 	T_EXPECT(tls_system_ca_file() == NULL);
-	T_EXPECT_EQ(bundle_stat_calls, (size_t)1);
+	T_CALL_SUBCASE(expect_bundle_probes, 1);
 	bundle_stat_error = EACCES;
 	bundle_stat_calls = 0;
 	T_EXPECT(tls_system_ca_file() == NULL);
-	T_EXPECT_EQ(bundle_stat_calls, (size_t)1);
+	T_CALL_SUBCASE(expect_bundle_probes, 1);
 	bundle_stat_error = ENOTDIR;
 	bundle_stat_calls = 0;
 	T_EXPECT(tls_system_ca_file() == NULL);
-	T_EXPECT_EQ(bundle_stat_calls, (size_t)7);
+	T_CALL_SUBCASE(expect_bundle_probes, BUNDLE_PATH_COUNT);
 	bundle_stat_calls = 0;
 	T_CHECK(setenv("SSL_CERT_FILE", "controlled-ca.pem", 1) == 0);
 	T_EXPECT_STREQ(tls_system_ca_file(), "controlled-ca.pem");

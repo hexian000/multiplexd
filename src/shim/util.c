@@ -316,7 +316,7 @@ const char *tls_system_ca_file(void)
 }
 
 bool alpn_tokenize(
-	char *restrict work, const char *restrict list, const alpn_field_fn fn,
+	char *work, const char *restrict list, const alpn_field_fn fn,
 	void *ctx)
 {
 	for (char *p = work; p != NULL;) {
@@ -372,40 +372,49 @@ bool alpn_tokenize(
  * that rejection is also what makes the strcmp() below sound.  csnippets does
  * deliberately decode "%%" to a literal '%' where a strict RFC 3986 decoder
  * errors (net/url.h); harmless here, since "%%" and "%25" decode alike. */
-static bool
-identity_uri_matches(const char *restrict uri, const char *restrict identity)
+static bool identity_uri_matches(
+	const unsigned char *restrict uri, const size_t uri_len,
+	const char *restrict identity)
 {
 	const size_t scheme_len = sizeof(IDENTITY_URI_SCHEME) - 1;
-	if (strncmp(uri, IDENTITY_URI_SCHEME, scheme_len) != 0) {
+	if (uri_len < scheme_len ||
+	    memcmp(uri, IDENTITY_URI_SCHEME, scheme_len) != 0) {
 		return false;
 	}
-	const char *const encoded = uri + scheme_len;
-	const size_t len = strlen(encoded);
+	const unsigned char *const encoded = uri + scheme_len;
+	const size_t len = uri_len - scheme_len;
 	if (len > IDENTITY_ENCODED_MAX) {
 		return false;
 	}
 	char buf[IDENTITY_ENCODED_MAX + 1];
-	memcpy(buf, encoded, len + 1);
+	memcpy(buf, encoded, len);
+	buf[len] = '\0';
 	if (!url_unescape_path(buf)) {
 		return false;
 	}
 	return strcmp(buf, identity) == 0;
 }
 
+struct identity_cert_match {
+	const char *identity;
+	bool matched;
+};
+
+static void identity_cert_uri(void *ctx, const unsigned char *uri, size_t len)
+{
+	struct identity_cert_match *const match = ctx;
+	if (!match->matched &&
+	    identity_uri_matches(uri, len, match->identity)) {
+		match->matched = true;
+	}
+}
+
 bool identity_matches_cert(
 	struct tls_connection *const conn, const char *const identity)
 {
-	char **names = NULL;
-	size_t count = 0;
-	if (!tls_peer_cert_uri_sans(conn, &names, &count)) {
-		return false;
-	}
-	bool matched = false;
-	for (size_t i = 0; i < count && !matched; i++) {
-		matched = identity_uri_matches(names[i], identity);
-	}
-	/* One allocation holds both the pointer array and the names. */
-	free((void *)names);
-	return matched;
+	struct identity_cert_match match = { .identity = identity };
+	return tls_peer_cert_uri_sans_foreach(
+		       conn, identity_cert_uri, &match) &&
+	       match.matched;
 }
 #endif /* WITH_TLS */

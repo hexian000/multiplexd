@@ -58,16 +58,56 @@ bio_fault_recv(const int fd, void *buf, const size_t len, const int flags)
 #define send(fd, buf, len, flags) bio_fault_send((fd), (buf), (len), (flags))
 #define recv(fd, buf, len, flags) bio_fault_recv((fd), (buf), (len), (flags))
 
+/* Count only project-owned backend allocations, not TLS library internals. */
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+static size_t backend_allocations;
+static bool backend_fail_next;
+
+static void *backend_malloc(size_t size)
+{
+	backend_allocations++;
+	if (backend_fail_next) {
+		backend_fail_next = false;
+		return NULL;
+	}
+	return malloc(size);
+}
+
+static void *backend_calloc(size_t count, size_t size)
+{
+	backend_allocations++;
+	return calloc(count, size);
+}
+
+static char *backend_strdup(const char *str)
+{
+	backend_allocations++;
+	return strdup(str);
+}
+
+#define malloc(size) backend_malloc(size)
+#define calloc(count, size) backend_calloc((count), (size))
+#define strdup(str) backend_strdup(str)
+
 /* Compile the backend into this TU to reach its static helpers. */
 #include "tls_mbedtls.c"
+#undef malloc
+#undef calloc
+#undef strdup
 
 #include "meta/arraysize.h"
 #include "os/socket.h"
 #include "tls.h"
 #include "utils/testing.h"
 
+#include <mbedtls/x509_crt.h>
+
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/ssl_ciphersuites.h>
 #include <psa/crypto.h>
 #include <psa/crypto_extra.h>
 #include <psa/crypto_values.h>
@@ -316,7 +356,6 @@ T_DECLARE_CASE(test_bio_eintr_is_retried)
 	fds[1] = -1;
 }
 
-#if !defined(MBEDTLS_LEGACY_RNG) || defined(MBEDTLS_PSA_CRYPTO_C)
 /* Self-signed P-256/SHA-256 pair, produced with the openssl CLI.  An EC key is
  * what a 3.6 build with MBEDTLS_USE_PSA_CRYPTO parses into PSA, so it fails to
  * load while PSA is still down. */
@@ -340,6 +379,32 @@ static const char *const test_p256_key_pem =
 	"s3MrOLqmfZPcENO6eoRmjotGSYVYYtASu14jf0vsVZyPgLEe9bT0Oiz6\n"
 	"-----END PRIVATE KEY-----\n";
 
+/* A leaf and its intermediate signed with the fixed P-256 key above. */
+static const char reload_chain_pem[] =
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIIBljCCATugAwIBAgIBDTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtyZWxvYWQt\n"
+	"aW50ZXJtZWRpYXRlLmV4YW1wbGUwIBcNMjYxMTA2MDkwNDA3WhgPMjEyNjEwMTMw\n"
+	"OTA0MDdaMB4xHDAaBgNVBAMME3JlbG9hZC1sZWFmLmV4YW1wbGUwWTATBgcqhkjO\n"
+	"PQIBBggqhkjOPQMBBwNCAAQj/hj/LTRiKoCSTiaW2fe7TA0l0seVs3MrOLqmfZPc\n"
+	"ENO6eoRmjotGSYVYYtASu14jf0vsVZyPgLEe9bT0Oiz6o2AwXjAMBgNVHRMBAf8E\n"
+	"AjAAMA4GA1UdDwEB/wQEAwIHgDAdBgNVHQ4EFgQUhOd74WO93nY4aa0uyImvWppb\n"
+	"VfAwHwYDVR0jBBgwFoAUhOd74WO93nY4aa0uyImvWppbVfAwCgYIKoZIzj0EAwID\n"
+	"SQAwRgIhAOvxRhhK6i3MhtM90xHE4gK6Z6tzwV0PCqKIZUF+XiwHAiEAkzQABIRh\n"
+	"uwgybbJCqzxYCjoS0Fldwp2e1N1Ewi/TEoo=\n"
+	"-----END CERTIFICATE-----\n"
+	"-----BEGIN CERTIFICATE-----\n"
+	"MIIBkTCCATagAwIBAgIBDDAKBggqhkjOPQQDAjAWMRQwEgYDVQQDDAtwc2EuZXhh\n"
+	"bXBsZTAgFw0yNjExMDYwOTA0MDdaGA8yMTI2MTAxMzA5MDQwN1owJjEkMCIGA1UE\n"
+	"AwwbcmVsb2FkLWludGVybWVkaWF0ZS5leGFtcGxlMFkwEwYHKoZIzj0CAQYIKoZI\n"
+	"zj0DAQcDQgAEI/4Y/y00YiqAkk4mltn3u0wNJdLHlbNzKzi6pn2T3BDTunqEZo6L\n"
+	"RkmFWGLQErteI39L7FWcj4CxHvW09Dos+qNjMGEwDwYDVR0TAQH/BAUwAwEB/zAO\n"
+	"BgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFITne+Fjvd52OGmtLsiJr1qaW1XwMB8G\n"
+	"A1UdIwQYMBaAFITne+Fjvd52OGmtLsiJr1qaW1XwMAoGCCqGSM49BAMCA0kAMEYC\n"
+	"IQCBntcJrkwuUAt06xfE8Rjg9rG35dMsgN9/RkwzJWftcAIhAKkUPaqG63jt8WJK\n"
+	"0L3tkOm6mMoLE1RxNhGe/ECmi9Xg\n"
+	"-----END CERTIFICATE-----\n";
+
+#if !defined(MBEDTLS_LEGACY_RNG) || defined(MBEDTLS_PSA_CRYPTO_C)
 /* psa_generate_random() answers PSA_ERROR_BAD_STATE until psa_crypto_init(). */
 static bool psa_is_initialized(void)
 {
@@ -364,6 +429,44 @@ T_DECLARE_CASE(test_ctx_init_initializes_psa)
 	T_LOG("mbedTLS built without PSA crypto");
 	T_SKIPNOW();
 #endif
+}
+
+static void cleanup_reload_cert(void *data)
+{
+	mbedtls_x509_crt_free(data);
+	free(data);
+}
+
+T_DECLARE_CASE(test_reload_replaces_leaf_and_clears_chain)
+{
+	struct tls_context *const ctx = tls_ctx_server(&(struct tls_config){
+		.cert = reload_chain_pem, .key = test_p256_key_pem });
+	T_CLEANUP(cleanup_ctx, ctx);
+	T_CHECK(ctx != NULL);
+	const struct tls_ctx_impl *const c = tls_ctx_raw(ctx);
+	T_CHECK(c->own_cert.next != NULL);
+	T_EXPECT(c->own_cert.next->next == NULL);
+	T_EXPECT(mbedtls_x509_crt_get_ca_istrue(c->own_cert.next) != 0);
+	mbedtls_x509_crt *const expected = calloc(1, sizeof(*expected));
+	T_CHECK(expected != NULL);
+	mbedtls_x509_crt_init(expected);
+	T_CLEANUP(cleanup_reload_cert, expected);
+	T_CHECK(mbedtls_x509_crt_parse(
+			expected, (const unsigned char *)test_p256_cert_pem,
+			strlen(test_p256_cert_pem) + 1) == 0);
+
+	T_CHECK(tls_load_cert(ctx, test_p256_cert_pem));
+	T_EXPECT(c->own_cert.next == NULL);
+	T_CHECK(c->own_cert.raw.len == expected->raw.len);
+	T_EXPECT(
+		memcmp(c->own_cert.raw.p, expected->raw.p, expected->raw.len) ==
+		0);
+	T_CHECK(tls_load_cert(ctx, test_p256_cert_pem));
+	T_EXPECT(c->own_cert.next == NULL);
+	T_CHECK(c->own_cert.raw.len == expected->raw.len);
+	T_EXPECT(
+		memcmp(c->own_cert.raw.p, expected->raw.p, expected->raw.len) ==
+		0);
 }
 
 /* tls_psk_label() is reached with no context (config load, key generator), and
@@ -483,7 +586,115 @@ T_DECLARE_CASE(test_psk_lookup_cb_rejects_hostile_identity)
 	T_EXPECT_STREQ(spy.label, k_max);
 }
 
+static void cleanup_cipher_list(void *data)
+{
+	struct tls_ctx_impl *const ctx = data;
+	free(ctx->ciphersuites);
+	ctx->ciphersuites = NULL;
+}
+
+T_DECLARE_CASE(test_alpn_tokens_share_one_allocation)
+{
+	char **names = NULL;
+	backend_fail_next = true;
+	T_EXPECT(!parse_alpn("h2", &names));
+	T_EXPECT(names == NULL);
+	backend_allocations = 0;
+	const bool ok =
+		parse_alpn("h2,\"quoted,protocol\",\"a\"\"b\",,last", &names);
+	const size_t allocations = backend_allocations;
+	T_CHECK(ok);
+	T_CHECK(names != NULL);
+	T_CLEANUP(free, (void *)names);
+	T_EXPECT_EQ(allocations, (size_t)1);
+	T_EXPECT_STREQ(names[0], "h2");
+	T_EXPECT_STREQ(names[1], "quoted,protocol");
+	T_EXPECT_STREQ(names[2], "a\"b");
+	T_EXPECT_STREQ(names[3], "last");
+	T_EXPECT(names[4] == NULL);
+	T_EXPECT((uintptr_t)names[0] > (uintptr_t)(names + 4));
+	T_EXPECT((uintptr_t)names[1] > (uintptr_t)names[0]);
+	T_EXPECT(parse_alpn(",,", &names));
+	T_EXPECT(names == NULL);
+	T_EXPECT(!parse_alpn("h2,\"broken", &names));
+	T_EXPECT(names == NULL);
+}
+
+T_DECLARE_CASE(test_alpn_record_separator_storage)
+{
+	static const char *const lists[] = {
+		"h2\nhttp/1.1",
+		"h2\rhttp/1.1",
+		"h2\r\nhttp/1.1",
+		",\nh2\r,\nhttp/1.1,\r\n",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(lists); i++) {
+		char **names = NULL;
+		T_CHECK(parse_alpn(lists[i], &names));
+		T_CHECK(names != NULL);
+		T_CLEANUP(free, (void *)names);
+		T_EXPECT_STREQ(names[0], "h2");
+		T_EXPECT_STREQ(names[1], "http/1.1");
+		T_EXPECT(names[2] == NULL);
+	}
+
+	char **names = NULL;
+	T_CHECK(parse_alpn("\"x,\r\ny\"\n\"a\"\"b\"\rz", &names));
+	T_CHECK(names != NULL);
+	T_CLEANUP(free, (void *)names);
+	T_EXPECT_STREQ(names[0], "x,\r\ny");
+	T_EXPECT_STREQ(names[1], "a\"b");
+	T_EXPECT_STREQ(names[2], "z");
+	T_EXPECT(names[3] == NULL);
+	T_EXPECT(parse_alpn(",\r\n,\n\r", &names));
+	T_EXPECT(names == NULL);
+	T_EXPECT(!parse_alpn("h2\n\"broken", &names));
+	T_EXPECT(names == NULL);
+	T_EXPECT(!parse_alpn("h2\r\"x\"y", &names));
+	T_EXPECT(names == NULL);
+}
+
+T_DECLARE_CASE(test_psk_ciphersuites_compact_owned_storage)
+{
+	int *const ids = malloc(4 * sizeof(*ids));
+	T_CHECK(ids != NULL);
+	ids[0] = MBEDTLS_TLS1_3_AES_256_GCM_SHA384;
+	ids[1] = MBEDTLS_TLS1_3_AES_128_GCM_SHA256;
+	ids[2] = MBEDTLS_TLS1_3_AES_128_GCM_SHA256;
+	ids[3] = 0;
+	static struct tls_ctx_impl ctx;
+	ctx = (struct tls_ctx_impl){ .ciphersuites = ids };
+	T_CLEANUP(cleanup_cipher_list, &ctx);
+	backend_allocations = 0;
+	const bool ok = psk_restrict_ciphersuites(&ctx);
+	T_EXPECT(ok);
+	T_EXPECT(ctx.ciphersuites == ids);
+	T_EXPECT_EQ(backend_allocations, (size_t)0);
+	T_EXPECT_EQ(ctx.ciphersuites[0], MBEDTLS_TLS1_3_AES_128_GCM_SHA256);
+	T_EXPECT_EQ(ctx.ciphersuites[1], MBEDTLS_TLS1_3_AES_128_GCM_SHA256);
+	T_EXPECT_EQ(ctx.ciphersuites[2], 0);
+	free(ctx.ciphersuites);
+	ctx.ciphersuites = NULL;
+	backend_fail_next = true;
+	T_EXPECT(!psk_restrict_ciphersuites(&ctx));
+	T_EXPECT(ctx.ciphersuites == NULL);
+	backend_allocations = 0;
+	T_EXPECT(psk_restrict_ciphersuites(&ctx));
+	T_EXPECT_EQ(backend_allocations, (size_t)1);
+	free(ctx.ciphersuites);
+	ctx.ciphersuites = malloc(2 * sizeof(*ids));
+	T_CHECK(ctx.ciphersuites != NULL);
+	ctx.ciphersuites[0] = MBEDTLS_TLS1_3_AES_256_GCM_SHA384;
+	ctx.ciphersuites[1] = 0;
+	backend_allocations = 0;
+	T_EXPECT(!psk_restrict_ciphersuites(&ctx));
+	T_EXPECT_EQ(backend_allocations, (size_t)0);
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_alpn_tokens_share_one_allocation),
+	T_CASE(test_alpn_record_separator_storage),
+	T_CASE(test_psk_ciphersuites_compact_owned_storage),
 	T_CASE(test_map_io_error_new_session_ticket_is_retriable),
 	T_CASE(test_map_io_error_classifies_known_codes),
 	T_CASE(test_bio_moves_bytes_and_empty_read_wants_read),
@@ -494,6 +705,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_bio_econnreset_is_conn_reset),
 	T_CASE(test_bio_eintr_is_retried),
 	T_CASE(test_ctx_init_initializes_psa),
+	T_CASE(test_reload_replaces_leaf_and_clears_chain),
 	T_CASE(test_psk_label_initializes_psa),
 	T_CASE(test_client_ctx_keeps_no_psk_copy),
 	T_CASE(test_psk_lookup_cb_rejects_hostile_identity),

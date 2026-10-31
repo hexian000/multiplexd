@@ -415,6 +415,18 @@ bool tls_peer_cert_uri_sans(
 	struct tls_connection *conn, char ***out, size_t *count);
 
 /**
+ * @brief Visit the peer certificate's URI SANs synchronously without copying
+ * their bytes. The spans are not NUL-terminated and live only in the callback.
+ * The callback must not call another TLS operation or retain the span.
+ * Visits every URI, including after a match; false means no peer certificate
+ * or an embedded NUL in any URI, and invalidates all callback results.
+ * Returns true for a certificate with no URI SANs. NULL conn or fn is false.
+ */
+typedef void (*tls_uri_san_fn)(void *ctx, const unsigned char *uri, size_t len);
+bool tls_peer_cert_uri_sans_foreach(
+	struct tls_connection *conn, tls_uri_san_fn fn, void *ctx);
+
+/**
  * @brief The PSK identity label this connection authenticated with.
  * @param conn Target connection.
  * @param[out] buf Receives the NUL-terminated label.

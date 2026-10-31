@@ -585,17 +585,7 @@ With TLS enabled, multiplexd uses TLS 1.3 with mutual certificate authentication
 
 `tls.system_trust` is an explicit opt-in, disabled by default. Enabling it adds the system PEM CA bundle to `authcerts`; `authcerts` may then be omitted, but `cert` and `key` are still mandatory. This authorizes certificates from a wider set of issuers, potentially including public Web PKI CAs, for **both inbound and outbound peers**. Certificate strength checks and mutual authentication still apply. Trust selection does not perform DNS hostname verification: `tls.sni` selects a server certificate but does not authenticate the tunnel's address. Keep a private trust store unless all issuers in the system bundle are suitable transport authenticators for this deployment.
 
-Both OpenSSL and mbedTLS load a PEM bundle using the same discovery order: if `SSL_CERT_FILE` is set, use exactly that file; otherwise use the first existing file in this list:
-
-1. `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu and derivatives)
-2. `/etc/pki/tls/certs/ca-bundle.crt` (Red Hat and derivatives)
-3. `/etc/ssl/ca-bundle.pem` (SUSE)
-4. `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`
-5. `/etc/ssl/cert.pem` (including systems with an OpenSSL-compatible bundle)
-6. `/usr/local/share/certs/ca-root-nss.crt` (FreeBSD)
-7. `/usr/ssl/cert.pem` (MSYS)
-
-No native Windows certificate database or macOS Keychain is read, and `SSL_CERT_DIR` is not used. On systems without one of these bundles, export the desired system roots to PEM and set `SSL_CERT_FILE`. An empty override, absent bundle, unreadable file, empty store, or certificate parse failure is a startup/reload error, even if `authcerts` is also present; verification is never disabled as a fallback. The bundle is loaded when contexts are created, so reload the configuration after changing it.
+With `system_trust` enabled, multiplexd loads a PEM CA bundle from `SSL_CERT_FILE` when set, or discovers one automatically. Failure to load the bundle is a startup/reload error, even if `authcerts` is also present. Reload the configuration after changing the bundle.
 
 For example, a certificate-mode configuration using only the system bundle contains:
 

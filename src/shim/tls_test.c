@@ -10,6 +10,7 @@
 
 #if WITH_TLS
 
+#include "codec/base64.h"
 #include "meta/arraysize.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
@@ -2276,6 +2277,28 @@ T_DECLARE_CASE(test_tls_alpn_negotiation)
 	rm_tmpdir(tmpl);
 }
 
+T_DECLARE_CASE(test_tls_alpn_record_separators)
+{
+	char *authcerts[] = { test_cert_pem };
+	static const char *const lists[] = {
+		"h2\nhttp/1.1",
+		"h2\rhttp/1.1",
+		"h2\r\nhttp/1.1",
+		",\nh2\r,\nhttp/1.1,\r\n",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(lists); i++) {
+		T_EXPECT(alpn_handshake(
+			test_cert_pem, test_key_pem, authcerts, lists[i],
+			"http/1.1"));
+		T_EXPECT(alpn_handshake(
+			test_cert_pem, test_key_pem, authcerts, "http/1.1",
+			lists[i]));
+		T_EXPECT(!alpn_handshake(
+			test_cert_pem, test_key_pem, authcerts, lists[i],
+			"other"));
+	}
+}
+
 /* Drive one handshake whose client side comes from tls_ctx_ref(), with the
  * source context released first: that is server.c's shape, where every dialed
  * tunnel holds a reference that outlives the reload which made it. */
@@ -2377,16 +2400,9 @@ T_DECLARE_CASE(test_tls_alpn_ctx_ref_setup_failures)
 		"\"unterminated"));
 }
 
-/* csv_scanfield's "need more data" check could not distinguish a
- * genuinely incomplete quoted field (ran off the end of the buffer
- * without ever finding a closing quote) from a complete one whose
- * closing quote simply happened to be the last byte -- both left the
- * scan cursor sitting on the same NUL. A quoted protocol name as the
- * *last* ALPN list entry hit exactly this: the client's sole entry here
- * is quoted with nothing following its closing quote, and the server's
- * list ends the same way. The only entry the two sides have in common
- * is that quoted name, so this can only succeed if both ends parse it,
- * not just tolerate a malformed list falling back to no-ALPN. */
+/* A quoted final entry must retain its comma as part of one protocol name.
+ * Disjoint controls distinguish that from omitting or splitting the entry;
+ * a handshake without any ALPN offer would otherwise succeed too. */
 T_DECLARE_CASE(test_tls_alpn_quoted_entry_at_list_end)
 {
 	char tmpl[] = TLS_TEST_TMPDIR "/tls_test_XXXXXX";
@@ -2401,6 +2417,14 @@ T_DECLARE_CASE(test_tls_alpn_quoted_entry_at_list_end)
 	char *authcerts[] = { cert_path };
 	T_EXPECT(alpn_handshake(
 		cert_path, key_path, authcerts, "h2,\"x,y\"", "\"x,y\""));
+	T_EXPECT(!alpn_handshake(
+		cert_path, key_path, authcerts, "h2", "\"x,y\""));
+	T_EXPECT(!alpn_handshake(
+		cert_path, key_path, authcerts, "\"x,y\"", "h2"));
+	T_EXPECT(!alpn_handshake(
+		cert_path, key_path, authcerts, "x,y", "\"x,y\""));
+	T_EXPECT(!alpn_handshake(
+		cert_path, key_path, authcerts, "\"x,y\"", "x,y"));
 
 	rm_tmpdir(tmpl);
 }
@@ -2522,28 +2546,137 @@ T_DECLARE_CASE(test_tls_alpn_survives_ctx_free_mid_handshake)
 }
 #endif /* WITH_OPENSSL */
 
+T_DECLARE_SUBCASE(
+	check_peer_cert_der, struct tls_connection *conn,
+	const char *expected_pem)
+{
+	/* Decode the fixed fixture independently of the TLS backend. Exact DER
+	 * equality pins the certificate, its encoding and the complete length. */
+	char pem[sizeof(test_leaf_cert_pem)];
+	_Static_assert(
+		sizeof(test_cert_pem) <= sizeof(pem),
+		"test certificate exceeds PEM scratch capacity");
+	_Static_assert(
+		sizeof(identity_cert_pem) <= sizeof(pem),
+		"identity certificate exceeds PEM scratch capacity");
+	const size_t pem_len = strlen(expected_pem);
+	T_CHECK(pem_len < sizeof(pem));
+	memcpy(pem, expected_pem, pem_len + 1);
+	char *body = strchr(pem, '\n');
+	T_CHECK(body != NULL);
+	body++;
+	const char *const end = strstr(body, "-----END CERTIFICATE-----");
+	T_CHECK(end != NULL);
+	size_t encoded_len = 0;
+	for (const char *p = body; p < end; p++) {
+		if (*p != '\n') {
+			body[encoded_len++] = *p;
+		}
+	}
+	size_t expected_len = encoded_len;
+	T_CHECK(base64_decode(
+		(unsigned char *)body, &expected_len,
+		(const unsigned char *)body, encoded_len));
+
+	unsigned char *der = NULL;
+	size_t der_len = 0;
+	const bool ok = tls_peer_cert_der(conn, &der, &der_len);
+	retain_cleanup(_t_, free, der);
+	T_EXPECT(ok);
+	T_EXPECT(der != NULL);
+	T_EXPECT_EQ(der_len, expected_len);
+	T_EXPECT(memcmp(der, body, expected_len) == 0);
+	release_cleanup(_t_, free, der);
+}
+
+T_DECLARE_SUBCASE(
+	check_reloaded_handshake, struct tls_context *srv_ctx,
+	struct tls_context *cli_ctx, const char *srv_pem, const char *cli_pem)
+{
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CLEANUP(cleanup_fd, (void *)(intptr_t)fds[0]);
+	T_CLEANUP(cleanup_fd, (void *)(intptr_t)fds[1]);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+	struct tls_connection *const srv = tls_server(srv_ctx, fds[0]);
+	retain_cleanup(_t_, cleanup_conn, srv);
+	struct tls_connection *const cli = tls_client(cli_ctx, fds[1]);
+	retain_cleanup(_t_, cleanup_conn, cli);
+	T_CHECK(srv != NULL);
+	T_CHECK(cli != NULL);
+	T_CHECK(drive_handshake(srv, cli, 20));
+	T_CALL_SUBCASE(check_peer_cert_der, cli, srv_pem);
+	T_CALL_SUBCASE(check_peer_cert_der, srv, cli_pem);
+	release_cleanup(_t_, cleanup_conn, cli);
+	release_cleanup(_t_, cleanup_conn, srv);
+	release_cleanup(_t_, cleanup_fd, (void *)(intptr_t)fds[0]);
+	release_cleanup(_t_, cleanup_fd, (void *)(intptr_t)fds[1]);
+}
+
+T_DECLARE_SUBCASE(check_credential_reload, bool server)
+{
+	char *authcerts[] = { test_cert_pem, test_ca_cert_pem,
+			      identity_cert_pem };
+	const struct tls_config original = { .cert = test_cert_pem,
+					     .key = test_key_pem,
+					     .authcerts = authcerts,
+					     .authcerts_count =
+						     ARRAY_SIZE(authcerts) };
+	const struct tls_config peer = { .cert = identity_cert_pem,
+					 .key = identity_key_pem,
+					 .authcerts = authcerts,
+					 .authcerts_count =
+						 ARRAY_SIZE(authcerts) };
+	struct tls_context *const srv =
+		tls_ctx_server(server ? &original : &peer);
+	retain_cleanup(_t_, cleanup_ctx, srv);
+	struct tls_context *const cli =
+		tls_ctx_client(server ? &peer : &original);
+	retain_cleanup(_t_, cleanup_ctx, cli);
+	T_CHECK(srv != NULL);
+	T_CHECK(cli != NULL);
+	T_CALL_SUBCASE(
+		check_reloaded_handshake, srv, cli,
+		server ? test_cert_pem : identity_cert_pem,
+		server ? identity_cert_pem : test_cert_pem);
+
+	/* Both RSA identities remain trusted, so only an exact peer-certificate
+	 * check distinguishes the replacement from a silently retained leaf.
+	 * Completing a new handshake also proves the replacement key is used. */
+	struct tls_context *const target = server ? srv : cli;
+	T_CHECK(tls_load_cert(target, test_leaf_cert_pem));
+	T_CHECK(tls_load_key(target, test_leaf_key_pem));
+	T_CALL_SUBCASE(
+		check_reloaded_handshake, srv, cli,
+		server ? test_leaf_cert_pem : identity_cert_pem,
+		server ? identity_cert_pem : test_leaf_cert_pem);
+}
+
+T_DECLARE_CASE(test_tls_server_credentials_replaced)
+{
+	T_CALL_SUBCASE(check_credential_reload, true);
+}
+
+T_DECLARE_CASE(test_tls_client_credentials_replaced)
+{
+	T_CALL_SUBCASE(check_credential_reload, false);
+}
+
 T_DECLARE_CASE(test_tls_peer_cert_der_after_handshake)
 {
-	char tmpl[] = TLS_TEST_TMPDIR "/tls_test_XXXXXX";
-	char cert_path[PATH_MAX + 2];
-	char key_path[PATH_MAX + 2];
-	char *const origdir = setup_cert_dir(
-		tmpl, cert_path, sizeof(cert_path), key_path, sizeof(key_path));
-	T_CLEANUP(cleanup_tmpdir, NULL);
-	T_CHECK(origdir != NULL);
-	free(origdir);
-
-	char *authcerts[] = { cert_path };
+	char *srv_authcerts[] = { identity_cert_pem };
+	char *cli_authcerts[] = { test_cert_pem };
 	struct tls_context *const srv_ctx =
-		tls_ctx_server(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
+		tls_ctx_server(&(struct tls_config){ .cert = test_cert_pem,
+						     .key = test_key_pem,
+						     .authcerts = srv_authcerts,
 						     .authcerts_count = 1 });
 	retain_cleanup(_t_, cleanup_ctx, srv_ctx);
 	struct tls_context *const cli_ctx =
-		tls_ctx_client(&(struct tls_config){ .cert = cert_path,
-						     .key = key_path,
-						     .authcerts = authcerts,
+		tls_ctx_client(&(struct tls_config){ .cert = identity_cert_pem,
+						     .key = identity_key_pem,
+						     .authcerts = cli_authcerts,
 						     .authcerts_count = 1 });
 	retain_cleanup(_t_, cleanup_ctx, cli_ctx);
 	T_CHECK(srv_ctx != NULL);
@@ -2564,31 +2697,10 @@ T_DECLARE_CASE(test_tls_peer_cert_der_after_handshake)
 	T_CHECK(cli_conn != NULL);
 	T_CHECK(drive_handshake(srv_conn, cli_conn, 20));
 
-	/* Both sides should be able to retrieve the peer's certificate. */
-	unsigned char *srv_der = NULL;
-	size_t srv_der_len = 0;
-	const bool srv_der_ok =
-		tls_peer_cert_der(srv_conn, &srv_der, &srv_der_len);
-	retain_cleanup(_t_, free, srv_der);
-	T_EXPECT(srv_der_ok);
-	T_EXPECT(srv_der != NULL);
-	T_EXPECT(srv_der_len > 0);
-
-	unsigned char *cli_der = NULL;
-	size_t cli_der_len = 0;
-	const bool cli_der_ok =
-		tls_peer_cert_der(cli_conn, &cli_der, &cli_der_len);
-	retain_cleanup(_t_, free, cli_der);
-	T_EXPECT(cli_der_ok);
-	T_EXPECT(cli_der != NULL);
-	T_EXPECT(cli_der_len > 0);
-
-	/* Same certificate on both sides (self-signed test cert). */
-	T_EXPECT(srv_der_len == cli_der_len);
-	T_EXPECT(memcmp(srv_der, cli_der, srv_der_len) == 0);
-
-	release_cleanup(_t_, free, srv_der);
-	release_cleanup(_t_, free, cli_der);
+	/* RSA server and EC client certificates must be reported at the opposite
+	 * endpoint, rather than returning each connection's local certificate. */
+	T_CALL_SUBCASE(check_peer_cert_der, srv_conn, identity_cert_pem);
+	T_CALL_SUBCASE(check_peer_cert_der, cli_conn, test_cert_pem);
 
 	T_EXPECT(drive_shutdown(cli_conn, srv_conn, 10));
 	release_cleanup(_t_, cleanup_conn, cli_conn);
@@ -2597,7 +2709,6 @@ T_DECLARE_CASE(test_tls_peer_cert_der_after_handshake)
 	release_cleanup(_t_, cleanup_ctx, srv_ctx);
 	release_cleanup(_t_, cleanup_fd, (void *)(intptr_t)fds[0]);
 	release_cleanup(_t_, cleanup_fd, (void *)(intptr_t)fds[1]);
-	rm_tmpdir(tmpl);
 }
 
 /* Handshake both ends using the identity fixture certificate, so each side sees
@@ -2827,6 +2938,124 @@ T_DECLARE_CASE(test_tls_psk_handshake)
 	T_EXPECT(ok);
 	T_EXPECT_STREQ(srv_label, PSK_ONES_LABEL);
 	T_EXPECT_STREQ(cli_label, PSK_ONES_LABEL);
+}
+
+/* A fd-backed write must preserve its pending record across WANT_WRITE.
+ * Every retry uses the original pointer and requested length, even though the
+ * previous call reported zero committed plaintext bytes. */
+T_DECLARE_CASE(test_tls_fd_send_backpressure_retry)
+{
+	struct tls_context *const srv_ctx = tls_ctx_server(
+		&(struct tls_config){ .psk_lookup = psk_test_lookup });
+	retain_cleanup(_t_, cleanup_ctx, srv_ctx);
+	struct tls_context *const cli_ctx = tls_ctx_client(&(struct tls_config){
+		.psk = psk_ones, .psk_len = sizeof(psk_ones) });
+	retain_cleanup(_t_, cleanup_ctx, cli_ctx);
+	T_EXPECT(srv_ctx != NULL && cli_ctx != NULL);
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CLEANUP(cleanup_fd, (void *)(intptr_t)fds[0]);
+	T_CLEANUP(cleanup_fd, (void *)(intptr_t)fds[1]);
+	T_CHECK(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+	T_CHECK(fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
+	struct tls_connection *const srv_conn = tls_server(srv_ctx, fds[0]);
+	retain_cleanup(_t_, cleanup_conn, srv_conn);
+	struct tls_connection *const cli_conn = tls_client(cli_ctx, fds[1]);
+	retain_cleanup(_t_, cleanup_conn, cli_conn);
+	T_EXPECT(srv_conn != NULL && cli_conn != NULL);
+	T_EXPECT(drive_handshake(srv_conn, cli_conn, 20));
+	/* Apply the small transport buffer after handshake so only application
+	 * writes are responsible for the observed backpressure. */
+	const int sndbuf = 4096;
+	T_CHECK(setsockopt(
+			fds[1], SOL_SOCKET, SO_SNDBUF, &sndbuf,
+			sizeof(sndbuf)) == 0);
+	enum { CHUNK = 4096, CAPACITY = 64 * CHUNK };
+	unsigned char *const payload = malloc(CAPACITY);
+	retain_cleanup(_t_, free, payload);
+	unsigned char *const received = malloc(CAPACITY);
+	retain_cleanup(_t_, free, received);
+	T_EXPECT(payload != NULL && received != NULL);
+	for (size_t i = 0; i < CAPACITY; i++) {
+		payload[i] = (unsigned char)((i * 37u + i / CHUNK) % 251u);
+	}
+	size_t committed = 0;
+	bool blocked = false;
+	while (committed + CHUNK <= CAPACITY) {
+		size_t len = CHUNK;
+		const enum tls_error err =
+			tls_send(cli_conn, payload + committed, &len);
+		if (err == TLS_ERROR_NONE) {
+			T_EXPECT(len > 0 && len <= CHUNK);
+			committed += len;
+		} else {
+			T_EXPECT_EQ(err, TLS_ERROR_WANT_WRITE);
+			T_EXPECT_EQ(len, (size_t)0);
+			blocked = true;
+			break;
+		}
+	}
+	T_EXPECT(blocked);
+	const unsigned char *const retry_buf = payload + committed;
+	const size_t retry_len = CHUNK;
+	const size_t expected = committed + retry_len;
+	size_t delivered = 0;
+	bool retried = false;
+	for (size_t round = 0;
+	     round < 1000 && (!retried || delivered < expected); round++) {
+		size_t len = CAPACITY - delivered;
+		const enum tls_error err =
+			tls_recv(srv_conn, received + delivered, &len);
+		if (err == TLS_ERROR_NONE) {
+			T_EXPECT(len > 0 && len <= CAPACITY - delivered);
+			delivered += len;
+		} else {
+			T_EXPECT(
+				err == TLS_ERROR_WANT_READ ||
+				err == TLS_ERROR_WANT_WRITE);
+			T_EXPECT_EQ(len, (size_t)0);
+		}
+		if (!retried) {
+			len = retry_len;
+			const enum tls_error retry_err =
+				tls_send(cli_conn, retry_buf, &len);
+			if (retry_err == TLS_ERROR_NONE) {
+				T_EXPECT_EQ(len, retry_len);
+				retried = true;
+			} else {
+				T_EXPECT(
+					retry_err == TLS_ERROR_WANT_READ ||
+					retry_err == TLS_ERROR_WANT_WRITE);
+				T_EXPECT_EQ(len, (size_t)0);
+			}
+		}
+	}
+	T_EXPECT(retried);
+	T_EXPECT_EQ(delivered, expected);
+	T_EXPECT(memcmp(received, payload, expected) == 0);
+	unsigned char extra = 0;
+	size_t len = 1;
+	T_EXPECT_EQ(tls_recv(srv_conn, &extra, &len), TLS_ERROR_WANT_READ);
+	T_EXPECT_EQ(len, (size_t)0);
+
+	/* A fresh write after the retry must not repeat or trail its payload. */
+	const unsigned char tail[] = "after-retry";
+	len = sizeof(tail);
+	T_EXPECT_EQ(tls_send(cli_conn, tail, &len), TLS_ERROR_NONE);
+	T_EXPECT_EQ(len, sizeof(tail));
+	len = sizeof(tail);
+	T_EXPECT_EQ(tls_recv(srv_conn, received, &len), TLS_ERROR_NONE);
+	T_EXPECT_EQ(len, sizeof(tail));
+	T_EXPECT(memcmp(received, tail, sizeof(tail)) == 0);
+
+	release_cleanup(_t_, free, received);
+	release_cleanup(_t_, free, payload);
+	release_cleanup(_t_, cleanup_conn, cli_conn);
+	release_cleanup(_t_, cleanup_conn, srv_conn);
+	release_cleanup(_t_, cleanup_ctx, cli_ctx);
+	release_cleanup(_t_, cleanup_ctx, srv_ctx);
+	release_cleanup(_t_, cleanup_fd, (void *)(intptr_t)fds[0]);
+	release_cleanup(_t_, cleanup_fd, (void *)(intptr_t)fds[1]);
 }
 
 /* A key the server does not know must not complete a handshake. */
@@ -3344,6 +3573,24 @@ T_DECLARE_CASE(test_tls_psk_lookup_ctx_released_on_failed_ctx)
 	T_EXPECT_EQ(suite_probe.releases, suite_probe.holds);
 }
 
+struct san_visit {
+	char **names;
+	size_t expected_count;
+	size_t count;
+	bool matches;
+};
+
+static void check_san_visit(void *ctx, const unsigned char *uri, size_t len)
+{
+	struct san_visit *const visit = ctx;
+	if (visit->count >= visit->expected_count ||
+	    strlen(visit->names[visit->count]) != len ||
+	    memcmp(visit->names[visit->count], uri, len) != 0) {
+		visit->matches = false;
+	}
+	visit->count++;
+}
+
 T_DECLARE_CASE(test_tls_peer_cert_uri_sans)
 {
 	char tmpl[] = TLS_TEST_TMPDIR "/tls_test_XXXXXX";
@@ -3375,6 +3622,18 @@ T_DECLARE_CASE(test_tls_peer_cert_uri_sans)
 		T_EXPECT(strcmp(names[1], "multiplexd:caf%C3%A9") == 0);
 		T_EXPECT(strcmp(names[2], "https://example.com/other") == 0);
 	}
+	struct san_visit visit = { .names = names,
+				   .expected_count = count,
+				   .matches = true };
+	if (count == 3) {
+		T_EXPECT(tls_peer_cert_uri_sans_foreach(
+			f.cli_conn, check_san_visit, &visit));
+		T_EXPECT_EQ(visit.count, count);
+		T_EXPECT(visit.matches);
+	}
+	T_EXPECT(
+		!tls_peer_cert_uri_sans_foreach(NULL, check_san_visit, &visit));
+	T_EXPECT(!tls_peer_cert_uri_sans_foreach(f.cli_conn, NULL, &visit));
 	/* One allocation backs both the pointer array and the names. */
 	release_cleanup(_t_, free, (void *)names);
 
@@ -3423,6 +3682,10 @@ T_DECLARE_CASE(test_tls_peer_cert_uri_sans_absent)
 	retain_cleanup(_t_, cleanup_conn, cli_conn);
 	T_CHECK(srv_conn != NULL);
 	T_CHECK(cli_conn != NULL);
+	struct san_visit before = { .matches = true };
+	T_EXPECT(!tls_peer_cert_uri_sans_foreach(
+		cli_conn, check_san_visit, &before));
+	T_EXPECT_EQ(before.count, (size_t)0);
 	T_CHECK(drive_handshake(srv_conn, cli_conn, 20));
 
 	/* A certificate with no URI subjectAltName is not an error: it reports
@@ -3436,6 +3699,10 @@ T_DECLARE_CASE(test_tls_peer_cert_uri_sans_absent)
 	T_EXPECT(names_ok);
 	T_EXPECT(names == NULL);
 	T_EXPECT(count == 0);
+	struct san_visit visit = { .matches = true };
+	T_EXPECT(tls_peer_cert_uri_sans_foreach(
+		cli_conn, check_san_visit, &visit));
+	T_EXPECT_EQ(visit.count, (size_t)0);
 	/* Nothing to match against, so no identity can be claimed. */
 	T_EXPECT(!identity_matches_cert(cli_conn, "client-a"));
 
@@ -4811,6 +5078,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tls_shutdown_syscall_on_broken_transport),
 	T_CASE(test_tls_recv_syscall_on_abrupt_peer_close),
 	T_CASE(test_tls_alpn_negotiation),
+	T_CASE(test_tls_alpn_record_separators),
 	T_CASE(test_tls_alpn_offered_through_ctx_ref),
 	T_CASE(test_tls_alpn_ctx_ref_setup_failures),
 	T_CASE(test_tls_alpn_quoted_entry_at_list_end),
@@ -4820,8 +5088,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_tls_alpn_survives_ctx_free_mid_handshake),
 #endif
 	T_CASE(test_tls_peer_cert_der_after_handshake),
+	T_CASE(test_tls_server_credentials_replaced),
+	T_CASE(test_tls_client_credentials_replaced),
 	T_CASE(test_tls_psk_label),
 	T_CASE(test_tls_psk_handshake),
+	T_CASE(test_tls_fd_send_backpressure_retry),
 	T_CASE(test_tls_psk_unknown_rejected),
 	T_CASE(test_tls_psk_client_rejects_cert_server),
 	T_CASE(test_tls_psk_lookup_rejects_invalid_lengths),

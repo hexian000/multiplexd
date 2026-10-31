@@ -113,6 +113,8 @@ struct tls_conn_impl {
 	/* Latched once tls_shutdown has handed our close_notify off: a repeat
 	 * SSL_shutdown() would go on to await the peer's, not re-send ours. */
 	bool close_notify_sent;
+	char psk_label[TLS_PSK_LABEL_MAX + 1];
+	bool psk_label_set;
 };
 
 static struct tls_conn_impl *tls_conn_raw(struct tls_connection *restrict conn)
@@ -152,6 +154,12 @@ static void tls_fire_recv(struct tls_conn_impl *restrict c, const int err)
 	}
 }
 
+/* Retained by SSL_CTX ex_data while handshakes can select from buf. */
+struct alpn_wire {
+	size_t len;
+	unsigned char buf[];
+};
+
 struct alpn_pack {
 	unsigned char *buf;
 	size_t w;
@@ -168,53 +176,39 @@ static bool alpn_pack_field(void *ctx, const char *name, const size_t len)
 		return false;
 	}
 	a->buf[a->w++] = (unsigned char)len;
-	memcpy(a->buf + a->w, name, len);
+	memmove(a->buf + a->w, name, len);
 	a->w += len;
 	return true;
 }
 
-/* Build an ALPN wire buffer (each protocol prefixed by a 1-byte length)
- * from a comma-separated list (RFC 4180 CSV; quoted commas allowed);
- * sets *out (heap, caller frees) and *outlen; *out=NULL for empty list. */
-static bool alpn_wire_from_list(
-	const char *restrict list, unsigned char **restrict out,
-	size_t *restrict outlen)
+/* Parse from buf+1 and pack from buf: unquoting only shrinks each field,
+ * and csv_scanfield obtains its next pointer before the callback writes. */
+static bool
+alpn_wire_from_list(const char *restrict list, struct alpn_wire **restrict out)
 {
 	*out = NULL;
-	*outlen = 0;
 	if (list == NULL || list[0] == '\0') {
 		return true;
 	}
 	const size_t list_len = strlen(list);
-	/* alpn_tokenize parses the buffer in-place, so work on a mutable copy. */
-	char *const work = malloc(list_len + 1);
-	if (work == NULL) {
+	struct alpn_wire *const wire = malloc(sizeof(*wire) + list_len + 2);
+	if (wire == NULL) {
 		LOGOOM();
 		return false;
 	}
+	char *const work = (char *)wire->buf + 1;
 	memcpy(work, list, list_len + 1);
-	/* Worst case is strlen(list)+1: every protocol contributes one length
-	 * byte in place of its separator (the first entry adds the extra +1)
-	 * and unescaping only ever shrinks a field. */
-	unsigned char *const buf = malloc(list_len + 1);
-	if (buf == NULL) {
-		LOGOOM();
-		free(work);
-		return false;
-	}
-	struct alpn_pack a = { .buf = buf, .w = 0, .list = list };
-	const bool ok = alpn_tokenize(work, list, alpn_pack_field, &a);
-	free(work);
-	if (!ok) {
-		free(buf);
+	struct alpn_pack a = { .buf = wire->buf, .w = 0, .list = list };
+	if (!alpn_tokenize(work, list, alpn_pack_field, &a)) {
+		free(wire);
 		return false;
 	}
 	if (a.w == 0) {
-		free(buf);
+		free(wire);
 		return true;
 	}
-	*out = buf;
-	*outlen = a.w;
+	wire->len = a.w;
+	*out = wire;
 	return true;
 }
 
@@ -276,16 +270,6 @@ bool tls_psk_label(
 	return true;
 }
 
-/* Owns the server ALPN wire buffer read by alpn_select_cb.  Hung off the
- * SSL_CTX via ex_data (below) so its lifetime is the refcounted SSL_CTX's, not
- * the tls_ctx_impl wrapper's: SSL_new up-refs only the SSL_CTX, and tls_ctx_free
- * frees the wrapper while accepted connections may still be mid-handshake, so
- * the callback must not reach into the wrapper. */
-struct alpn_wire {
-	unsigned char *buf;
-	size_t len;
-};
-
 /* CRYPTO_EX_free: fires when the last SSL drops its SSL_CTX ref and the
  * SSL_CTX is finally freed, after which no handshake can reference the buffer. */
 static void alpn_wire_ex_free(
@@ -297,11 +281,7 @@ static void alpn_wire_ex_free(
 	(void)idx;
 	(void)argl;
 	(void)argp;
-	struct alpn_wire *const w = ptr;
-	if (w != NULL) {
-		free(w->buf);
-		free(w);
-	}
+	free(ptr);
 }
 
 static CRYPTO_ONCE g_alpn_ex_idx_once = CRYPTO_ONCE_STATIC_INIT;
@@ -537,9 +517,8 @@ static bool tls_ctx_set_alpn(
 	struct tls_ctx_impl *restrict c, const bool is_server,
 	const char *restrict alpn)
 {
-	unsigned char *wire = NULL;
-	size_t wire_len = 0;
-	if (!alpn_wire_from_list(alpn, &wire, &wire_len)) {
+	struct alpn_wire *wire = NULL;
+	if (!alpn_wire_from_list(alpn, &wire)) {
 		return false;
 	}
 	if (wire == NULL) {
@@ -551,24 +530,12 @@ static bool tls_ctx_set_alpn(
 			free(wire);
 			return false;
 		}
-		struct alpn_wire *const w = malloc(sizeof(*w));
-		if (w == NULL) {
-			LOGOOM();
+		if (SSL_CTX_set_ex_data(c->ssl_ctx, g_alpn_ex_idx, wire) != 1) {
+			LOG_SSLERROR(ERROR, "SSL_CTX_set_ex_data");
 			free(wire);
 			return false;
 		}
-		/* Move the wire buffer into an SSL_CTX-lifetime object so
-		 * alpn_select_cb never reads the wrapper tls_ctx_free may free
-		 * out from under a still-live handshake. */
-		w->buf = wire;
-		w->len = wire_len;
-		if (SSL_CTX_set_ex_data(c->ssl_ctx, g_alpn_ex_idx, w) != 1) {
-			LOG_SSLERROR(ERROR, "SSL_CTX_set_ex_data");
-			free(w->buf);
-			free(w);
-			return false;
-		}
-		SSL_CTX_set_alpn_select_cb(c->ssl_ctx, alpn_select_cb, w);
+		SSL_CTX_set_alpn_select_cb(c->ssl_ctx, alpn_select_cb, wire);
 		c->alpn_cb_registered = true;
 		return true;
 	}
@@ -578,7 +545,7 @@ static bool tls_ctx_set_alpn(
 	 * lives in the refcounted SSL_CTX every tls_ctx_ref() sibling shares, so
 	 * nothing outlives this function. */
 	const int ret = SSL_CTX_set_alpn_protos(
-		c->ssl_ctx, wire, (unsigned int)wire_len);
+		c->ssl_ctx, wire->buf, (unsigned int)wire->len);
 	free(wire);
 	if (ret != 0) {
 		LOG_SSLERROR(ERROR, "SSL_CTX_set_alpn_protos");
@@ -946,27 +913,12 @@ static CRYPTO_ONCE g_psk_ex_idx_once = CRYPTO_ONCE_STATIC_INIT;
 static int g_psk_ctx_ex_idx = -1;
 static int g_psk_ssl_ex_idx = -1;
 
-/* CRYPTO_EX_free for the per-connection label: without it the string outlives
- * the SSL that owns it, which the sanitizer build reports as a leak. */
-static void psk_label_ex_free(
-	void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl,
-	void *argp)
-{
-	(void)parent;
-	(void)ad;
-	(void)idx;
-	(void)argl;
-	(void)argp;
-	OPENSSL_free(ptr);
-}
-
 static void psk_ex_idx_init(void)
 {
 	g_psk_ctx_ex_idx =
 		SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, psk_conf_ex_free);
-	/* The per-connection label is a plain heap string; freed with the SSL. */
-	g_psk_ssl_ex_idx =
-		SSL_get_ex_new_index(0, NULL, NULL, NULL, psk_label_ex_free);
+	/* Borrows the connection wrapper, which outlives SSL_free. */
+	g_psk_ssl_ex_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
 }
 
 static bool psk_ex_idx_ready(void)
@@ -994,16 +946,13 @@ static bool psk_conn_set_label(SSL *ssl, const char *label)
 	if (!psk_ex_idx_ready()) {
 		return false;
 	}
-	char *const dup = OPENSSL_strdup(label);
-	if (dup == NULL) {
-		LOGOOM();
+	struct tls_conn_impl *const c = SSL_get_ex_data(ssl, g_psk_ssl_ex_idx);
+	const size_t len = strlen(label);
+	if (c == NULL || len > TLS_PSK_LABEL_MAX) {
 		return false;
 	}
-	OPENSSL_free(SSL_get_ex_data(ssl, g_psk_ssl_ex_idx));
-	if (SSL_set_ex_data(ssl, g_psk_ssl_ex_idx, dup) != 1) {
-		OPENSSL_free(dup);
-		return false;
-	}
+	memcpy(c->psk_label, label, len + 1);
+	c->psk_label_set = true;
 	return true;
 }
 
@@ -1529,6 +1478,13 @@ static struct tls_connection *tls_conn_new(
 		SSL_free(ssl);
 		return NULL;
 	}
+	if (psk_conf_of(ssl) != NULL &&
+	    SSL_set_ex_data(ssl, g_psk_ssl_ex_idx, conn) != 1) {
+		LOG_SSLERROR(ERROR, "SSL_set_ex_data");
+		SSL_free(ssl);
+		free(conn);
+		return NULL;
+	}
 	conn->ssl = ssl;
 	conn->fd_backed = (fd >= 0);
 	return (struct tls_connection *)conn;
@@ -1837,6 +1793,44 @@ san_uri_octets(const GENERAL_NAME *restrict name, int *restrict len)
 	return data;
 }
 
+bool tls_peer_cert_uri_sans_foreach(
+	struct tls_connection *conn, tls_uri_san_fn fn, void *ctx)
+{
+	if (conn == NULL || fn == NULL) {
+		return false;
+	}
+	ERR_clear_error();
+	X509 *const cert = SSL_get1_peer_certificate(tls_conn_ssl(conn));
+	if (cert == NULL) {
+		return false;
+	}
+	GENERAL_NAMES *const names =
+		X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+	X509_free(cert);
+	if (names == NULL) {
+		return true;
+	}
+	bool ok = true;
+	const int num = sk_GENERAL_NAME_num(names);
+	for (int i = 0; i < num; i++) {
+		int len = 0;
+		const unsigned char *const data =
+			san_uri_octets(sk_GENERAL_NAME_value(names, i), &len);
+		if (data == NULL) {
+			continue;
+		}
+		if (memchr(data, '\0', (size_t)len) != NULL) {
+			LOGE("peer certificate: URI subjectAltName contains an"
+			     " embedded NUL");
+			ok = false;
+			break;
+		}
+		fn(ctx, data, (size_t)len);
+	}
+	GENERAL_NAMES_free(names);
+	return ok;
+}
+
 bool tls_peer_cert_uri_sans(
 	struct tls_connection *conn, char ***out, size_t *count)
 {
@@ -1935,15 +1929,16 @@ bool tls_peer_psk_label(
 	if (!SSL_is_init_finished(ssl) || SSL_session_reused(ssl) != 1) {
 		return false;
 	}
-	const char *const label = SSL_get_ex_data(ssl, g_psk_ssl_ex_idx);
-	if (label == NULL) {
+	const struct tls_conn_impl *const c =
+		SSL_get_ex_data(ssl, g_psk_ssl_ex_idx);
+	if (c == NULL || !c->psk_label_set) {
 		return false;
 	}
-	const size_t label_len = strlen(label);
+	const size_t label_len = strlen(c->psk_label);
 	if (label_len > TLS_PSK_LABEL_MAX) {
 		return false;
 	}
-	memcpy(buf, label, label_len + 1);
+	memcpy(buf, c->psk_label, label_len + 1);
 	*len = label_len;
 	return true;
 }
