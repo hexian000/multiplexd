@@ -162,15 +162,20 @@ _PRESENCE = False
 class _JsonNumber(float):
     """Retain legal number spelling for untyped defaults and raw fragments.
 
-    Schema-directed arithmetic still uses float semantics; supported C doubles
-    are range-checked separately. Instance data must not lose digits or turn
-    a large exponent into an Infinity token during default serialization.
+    Integer constraints use the retained text for exact arithmetic; supported C
+    doubles are range-checked separately. Instance data must not lose digits or
+    turn a large exponent into an Infinity token during default serialization.
     """
 
     def __new__(cls, text):
         number = super().__new__(cls, text)
         number.text = text
         return number
+
+
+def _exact_number(value):
+    """Recover a schema number before integer comparisons or conversion."""
+    return Decimal(value.text) if isinstance(value, _JsonNumber) else value
 
 
 def _default_spelling(value) -> str:
@@ -641,16 +646,20 @@ def _keyword_value_error(key: str, value) -> "str | None":
 
     A boolean is refused explicitly: bool is a Python subclass of int, so it
     would otherwise pass as the number 0 or 1 -- and be spelled ``True`` in the
-    emitted C.  A non-finite float is refused too: Python's json module accepts
-    NaN and Infinity (and an overflowing literal such as 1e400 decodes to
-    Infinity), but none of them is a JSON number.
+    emitted C.  Non-finite constants accepted by Python's json module are
+    refused too.  Retained JSON tokens are checked exactly: a finite literal
+    such as 1e400 remains legal even when its float value overflows.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         shown = "" if value is None else f" {json.dumps(value)}"
-        return f"must be a number, not the JSON {_json_type_name(value)}{shown}"
-    if isinstance(value, float) and not math.isfinite(value):
+        return (f"must be a number, not the JSON "
+                f"{_json_type_name(value)}{shown}")
+    exact = _exact_number(value)
+    finite = (exact.is_finite() if isinstance(exact, Decimal)
+              else not isinstance(exact, float) or math.isfinite(exact))
+    if not finite:
         return f"must be a finite number, not {value!r}"
-    if key in _COUNT_KEYWORDS and (value < 0 or value != math.floor(value)):
+    if key in _COUNT_KEYWORDS and (exact < 0 or exact != math.floor(exact)):
         return f"must be a non-negative integer, not {value!r}"
     return None
 
@@ -737,14 +746,12 @@ def _required_set(node: dict) -> set:
 
 
 def _is_dynamic_object(prop_schema: dict) -> bool:
-    """True when the schema node is an object with no fixed ``properties``
-    (missing, or an empty ``properties: {}``), meaning it carries no named
-    fields and its content is kept as a raw JSON fragment at runtime.
+    """True for an object with missing or empty fixed ``properties``.
 
-    An empty ``properties: {}`` must be treated as dynamic too: collect_scopes
-    only emits a struct scope when a property set is non-empty, so classifying
-    an empty-property object as a struct field would reference a ``struct`` type
-    that is never defined (and helper functions never generated)."""
+    _infer_c_type classifies supported objects of this shape as maps and
+    collect_scopes emits their scopes even without named fields. Unsupported
+    forms such as $ref and patternProperties retain raw JSON fragments.
+    """
     return (
         isinstance(prop_schema, dict)
         and prop_schema.get("type") == "object"
@@ -756,8 +763,8 @@ def _infer_c_type(prop_schema: dict) -> dict:
     """Return a descriptor dict for a single JSON Schema property.
 
     Keys:
-        kind        : 'string' | 'int' | 'uint' | 'double' | 'bool' |
-                      'object' | 'dynamic' | 'array_string' |
+        kind        : 'string' | 'int' | 'uint' | 'double' | 'bool' | 'null' |
+                      'object' | 'map' | 'dynamic' | 'array_string' |
                       'array_object' | 'array_primitive'
         c_type      : C type for the struct field: 'int' or 'intmax_t' (int
                       kind), 'unsigned' or 'uintmax_t' (uint kind)
@@ -775,8 +782,8 @@ def _infer_c_type(prop_schema: dict) -> dict:
     if t == "integer":
         # JSON Schema allows non-integral bounds on integer types; tighten
         # them to the nearest integer in the valid direction.
-        minimum = prop_schema.get("minimum")
-        maximum = prop_schema.get("maximum")
+        minimum = _exact_number(prop_schema.get("minimum"))
+        maximum = _exact_number(prop_schema.get("maximum"))
         if minimum is not None:
             minimum = math.ceil(minimum)
         if maximum is not None:
@@ -1583,7 +1590,7 @@ def _plan_identifiers(
     use_tables = opts.optimize == "size"
     root_scope = scopes[0][0]
     emit_lookup = opts.do_lookup or opts.do_unmarshal
-    emit_enum = opts.do_lookup or (opts.do_unmarshal and not use_tables)
+    emit_enum = opts.do_lookup
     plan.macro[guard] = "the header guard"
 
     for scope_name, keys, node in scopes:
@@ -1699,7 +1706,9 @@ def _const_matches_kind(v, kind: str) -> bool:
     if kind in ("int", "uint"):
         if isinstance(v, int):
             return True
-        return isinstance(v, float) and v.is_integer()
+        exact = _exact_number(v)
+        return (isinstance(v, float) and math.isfinite(v)
+                and exact == math.floor(exact))
     if kind == "double":
         return isinstance(v, (int, float))
     return False
@@ -1731,7 +1740,8 @@ def _unmatchable_reason(v, kind: str, c_type: str) -> "str | None":
                 f"{kind} field")
     if kind in ("int", "uint"):
         type_min, type_max = _C_TYPE_RANGE.get(c_type, (None, None))
-        if type_min is not None and not type_min <= int(v) <= type_max:
+        if (type_min is not None
+                and not type_min <= int(_exact_number(v)) <= type_max):
             return (f"lies outside the range of the {c_type} field "
                     f"([{type_min}, {type_max}])")
     return None
@@ -1764,6 +1774,8 @@ def _filter_const_values(
             "(an empty enum is unsatisfiable)")
     reasons = [_unmatchable_reason(v, kind, c_type) for v in values]
     kept = [v for v, why in zip(values, reasons) if why is None]
+    if kind in ("int", "uint"):
+        kept = [int(_exact_number(v)) for v in kept]
     if keyword == "const":
         if not kept:
             sys.exit(
@@ -1885,7 +1897,7 @@ def _c_num_literal(val: "int | float", kind: str, c_type: str) -> str:
     type.
     """
     if kind in ("int", "uint"):
-        n = int(val)
+        n = int(_exact_number(val))
         # An unknown c_type keeps the unbounded range _C_TYPE_RANGE's other
         # users give it, so the check never fires on a type it cannot judge.
         type_min, type_max = _C_TYPE_RANGE.get(
@@ -1979,7 +1991,7 @@ def _build_constraint_c(
         mn = array_schema.get("minItems")
         mx = array_schema.get("maxItems")
         if mn is not None:
-            mn = int(mn)
+            mn = int(_exact_number(mn))
             if mn > _UINT64_MAX:
                 array_bounds_impossible = True
             elif mn > 0:
@@ -1993,7 +2005,7 @@ def _build_constraint_c(
                 array_min_expr = (
                     f"(({mlit} <= SIZE_MAX) ? (size_t){mlit} : SIZE_MAX)")
         if mx is not None:
-            mx = int(mx)
+            mx = int(_exact_number(mx))
             if mx <= _UINT64_MAX:
                 mlit = _c_u64_literal(mx)
                 flags.append(
@@ -2015,7 +2027,7 @@ def _build_constraint_c(
         mn = value_schema.get("minLength")
         mx = value_schema.get("maxLength")
         if mn is not None:
-            mn = int(mn)
+            mn = int(_exact_number(mn))
             if mn > _UINT64_MAX:
                 string_bounds_impossible = True
             elif mn > 0:
@@ -2026,7 +2038,7 @@ def _build_constraint_c(
                     f".min_len = (({mlit} <= SIZE_MAX) ? "
                     f"(size_t){mlit} : SIZE_MAX)")
         if mx is not None:
-            mx = int(mx)
+            mx = int(_exact_number(mx))
             if mx <= _UINT64_MAX:
                 mlit = _c_u64_literal(mx)
                 flags.append(f"(JSON_C_MAX_LEN * ({mlit} <= SIZE_MAX))")
@@ -2074,13 +2086,13 @@ def _build_constraint_c(
         field_c_type = _infer_c_type(value_schema).get("c_type", wide)
 
         def lit(v):
-            return _c_num_literal(int(v), klit, wide)
+            return _c_num_literal(v, klit, wide)
 
-        minimum = value_schema.get("minimum")
-        maximum = value_schema.get("maximum")
-        excl_min = value_schema.get("exclusiveMinimum")
-        excl_max = value_schema.get("exclusiveMaximum")
-        mult_of = value_schema.get("multipleOf")
+        minimum = _exact_number(value_schema.get("minimum"))
+        maximum = _exact_number(value_schema.get("maximum"))
+        excl_min = _exact_number(value_schema.get("exclusiveMinimum"))
+        excl_max = _exact_number(value_schema.get("exclusiveMaximum"))
+        mult_of = _exact_number(value_schema.get("multipleOf"))
         const_v = value_schema.get("const", _MISSING)
         enum_vs = value_schema.get("enum")
         if minimum is not None:
@@ -2872,25 +2884,48 @@ def main():
     opts.inc_pfx = opts.include_prefix.rstrip(
         "/") + "/" if opts.include_prefix else ""
 
-    # Derive every output path up front and reject two distinct inputs that
+    # Check all output paths before writing: none may overwrite an input,
+    # including through a symlink or hard link. Also reject distinct inputs that
     # would write the same .gen.{h,c} pair (e.g. same-directory "a-b.json" and
     # "a_b.json" both sanitize to "a_b").  Writing them in sequence would let
     # the second silently clobber the first while the run still exits 0, so a
     # build could compile code for the wrong schema.  A single input listed
     # twice targets its own files and is allowed.
+    input_paths = {Path(arg).resolve() for arg in opts.schemas}
     out_owner: dict = {}
+    out_inodes: dict = {}
     for arg in opts.schemas:
         schema_path = Path(arg)
         out_stem = _out_stem(schema_path, opts)
         for suffix in (".gen.h", ".gen.c"):
             out_path = str(schema_path.parent / (out_stem + suffix))
-            prev = out_owner.get(out_path)
-            if prev is not None and prev != str(schema_path):
+            out_key = Path(out_path).resolve()
+            for input_path in input_paths:
+                if (out_key == input_path
+                        or (out_key.exists() and out_key.samefile(input_path))):
+                    sys.exit(
+                        f"error: output {out_path} overlaps input "
+                        f"{input_path}; "
+                        "choose a distinct --output-name")
+            owner = (schema_path.resolve(), suffix)
+            prev = out_owner.get(out_key)
+            if prev is not None and prev != owner:
                 sys.exit(
-                    f"error: {schema_path} and {prev} both generate "
+                    f"error: {schema_path} and {prev[0]} both generate "
                     f"{out_path}; rename one input, or generate them in "
                     "separate invocations with a distinct --output-name")
-            out_owner[out_path] = str(schema_path)
+            out_owner[out_key] = owner
+            # Resolving paths does not reveal hard links between outputs.
+            if out_key.exists():
+                info = out_key.stat()
+                inode = (info.st_dev, info.st_ino)
+                destination = (out_key, suffix)
+                prev_output = out_inodes.get(inode)
+                if prev_output is not None and prev_output != destination:
+                    sys.exit(
+                        f"error: output {out_path} overlaps output "
+                        f"{prev_output[0]}; choose distinct output files")
+                out_inodes[inode] = destination
 
     for arg in opts.schemas:
         try:
