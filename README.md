@@ -652,6 +652,7 @@ The `max_startups` option (`start:rate:full` format, where `rate` is a percentag
 
 - Set positive `max_sessions` and `mux.max_streams` limits to bound session and per-session stream counts. Lower limits reduce concurrency; `0` means unlimited.
 - Set smaller explicit `mux.stream_window` and `mux.session_window` values to reduce receive buffering and unacknowledged send data. Values are bytes, with a minimum of 65536; `0` selects automatic sizing. Smaller windows can reduce throughput on high-latency links.
+- Set `mux.unacked_memory_limit` to a positive retransmit-log allocation budget in bytes (default `67108864`, 64 MiB; no unlimited mode). It counts retained frame objects at full allocated capacity and the entire ring, including unused slots. It excludes allocator overhead, other send buffers and temporary replay copies. Exceeding the budget resets the whole session. Reload affects only new sessions; suspension and resumption keep the original budget. `mux.session_window` continues to govern payload-byte backpressure.
 - Set `mux.mem_pressure.hi` to a positive byte threshold to throttle new receive-window grants as per-session buffered data grows. `mux.mem_pressure.lo` starts throttling and defaults to half of `hi`. These thresholds do not impose a hard memory cap.
 
 ### API Server

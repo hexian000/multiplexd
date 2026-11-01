@@ -88,6 +88,10 @@ add_mux_test(mux_test
     mux_test.c
 )
 target_link_libraries(mux_test PRIVATE mux)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(mux_test PRIVATE "-Wl,--wrap=malloc,--wrap=close")
+    target_compile_definitions(mux_test PRIVATE MUX_TEST_WRAP_CONSTRUCTOR=1)
+endif()
 
 # White-box: compiles frame.c into the TU.  frame.c is a leaf module, so no
 # collaborators are mocked.

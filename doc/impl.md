@@ -167,8 +167,8 @@ threading rules live in §20.
 
 | Object  | Owns                                                                                                                                                                | Implicit Consequence                                                                                                                          |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Session | transport fd/TLS state, session sendbuf and oobbuf, fixed receive ring, unacked list, retransmit cursor, stream table, ready queue, timers, optional stats pointers | It is the only place where dispatch, sched, handshake, estimator, and wire meet; none of those submodules owns transport state independently. |
-| Stream  | send queue, receive ring sized by `recv_window`, flow-control counters, half-close/reset flags, local I/O mode, coalescing membership                               | A stream can be logically closed before it disappears from the table; tombstone retention keeps late traffic deterministic.                   |
+| Session | transport fd/TLS state, session sendbuf and oobbuf, receive buffer, unacked list, retransmit cursor, stream table, ready queue, timers, optional stats pointers | It is the only place where dispatch, sched, handshake, estimator, and wire meet; none of those submodules owns transport state independently. |
+| Stream  | send queue, lazily allocated receive buffer, flow-control counters, half-close/reset flags, local I/O mode, coalescing membership                               | A stream can be logically closed before it disappears from the table; tombstone retention keeps late traffic deterministic.                   |
 
 State enums are defined in `session.h` and `stream.h`; the diagrams below retain
 only the transitions whose runtime coupling is referenced elsewhere in this document.
@@ -502,9 +502,15 @@ sequenceDiagram
 
 | Design Constraint                                                                                                                                                                                                                                                         | Significance                                                                                                                    |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| The session receive ring is sized to the `mux.readahead` window (default 131072 bytes ≈ 8 full 16 KiB frames; `0` disables read-ahead, falling back to one local full frame `MUX_FRAME_HEADER_SIZE + max_payload`); it compacts when contiguous tail space runs out, grows on demand to assemble a single inbound frame larger than that, then shrinks back. Under `tls.socket_offload` the library owns the socket reads, so the window is just one frame and `mux.readahead > 0` instead drives `SSL_CTX_set_read_ahead`. | Receive-side work stays bounded for normal traffic without per-frame allocation, yet an oversized peer frame is still accepted; the read-ahead depth is tunable. |
+| The session receive buffer is sized to the `mux.readahead` window (default 131072 bytes ≈ 8 full 16 KiB frames; `0` disables read-ahead, falling back to one local full frame `MUX_FRAME_HEADER_SIZE + max_payload`); it compacts when contiguous tail space runs out, grows on demand to assemble a single inbound frame larger than that, then reclaims excess capacity while retaining one read window plus one maximum legal inbound frame. Under `tls.socket_offload` the library owns the socket reads, so the window is just one frame and `mux.readahead > 0` instead drives `SSL_CTX_set_read_ahead`. | Receive-side work stays bounded for normal traffic without per-frame allocation, yet an oversized peer frame is still accepted; the read-ahead depth is tunable. |
 | Unknown non-zero streams split into opening SYN, retired-stream traffic, and namespace violations.                                                                                                                                                                        | Valid late traffic gets one terminal RST; session-level violations still close the whole session.                               |
 | Socket mode normally spans `socket_cb` (EV_READ) then `local_cb` (EV_WRITE); the `stream_recv_copy` fast path collapses both into the first callback when the recvbuf is empty and the fd is writable.                                                                    | The extra loop turn only appears under local-fd backpressure, not on every frame.                                               |
+
+Stream receive storage stays unallocated until incoming payload needs buffering.
+A socket-mode stream that only writes incoming payload directly to its local fd
+needs no receive allocation. Empty-buffer checks treat `recvbuf == NULL` as zero
+readable bytes. Reaching `CLOSED` releases the receive allocation, including its
+buffer header.
 
 **Frame-size asymmetry.** `max_payload` (config `max_frame_size` minus the
 8-byte header; `max_frame_size` defaults to 16 KiB, so `max_payload`
@@ -735,6 +741,20 @@ PONG.  In auto mode the affected cap starts at `MUX_INITIAL_SEND_WINDOW /
 MUX_WINDOW_UNIT` frames; `send_stalled` gates on `unacked_bytes >=
 session_window × MUX_WINDOW_UNIT`, a byte-level cap that throttles payload
 scheduling rather than closing the session.
+
+The independent `mux.unacked_memory_limit` (default 67108864 bytes, 64 MiB)
+is a positive, configurable allocation budget with no unlimited mode. It is
+frozen in `unacked.memory_limit` at session creation, retained across suspension
+and resumption, and changed only for new sessions on reload. `unacked.memory_bytes`
+charges each physical retained frame once using `MUX_FRAME_OBJECT_SIZE(frame->cap)`
+and the ring object plus all allocated slots, including unused ones. Compaction
+and partial ACKs do not shrink these allocations; a full ACK releases the frame
+charge, while ring storage stays charged until destruction. Allocator overhead,
+other send buffers and temporary retransmit copies are excluded. Before each
+retention or ring growth, the proposed footprint is checked using subtraction
+and division to avoid overflow. Equality is allowed; exceeding the budget logs
+the reason and resets the whole session, including during suspension capture.
+No already-sent reliable frame is discarded while continuing the session.
 
 Each direction is fed from its own source: inbound PUSH payload accumulates
 into the rx sample via `estimator_add` (recv.c), and bytes that
@@ -1456,7 +1476,7 @@ The synchronous phase runs entirely on the server event loop, in the order below
 Before the synchronous phase completes, each live session is sent updated settings and its drain policy. The following happen on the session's own loop:
 
 - **Live settings applied immediately**: session timeouts, keepalive intervals, window sizes, `nodelay`, and memory pressure thresholds take effect for the existing session without a reconnect.
-- **Transport-shaping settings deferred**: `mux.max_frame_payload` and `mux.readahead` are fixed when the session is created, and `tls.socket_offload` is fixed per TLS connection (it describes how that connection was built), so a changed value applies only from the next session or connection, never to a live one.
+- **Transport-shaping settings deferred**: `mux.max_frame_payload`, `mux.readahead`, and `mux.unacked_memory_limit` are fixed when the session is created, and `tls.socket_offload` is fixed per TLS connection (it describes how that connection was built), so a changed value applies only from the next session or connection, never to a live one.
 - **Outbound address updated**: the target address for reconnects is updated so the next connection attempt uses the new destination.
 - **Drain policy**: normally, the session stops admitting new inbound streams and shuts down gracefully when its last active stream closes; an idle session shuts down immediately. If a positive `max_sessions` is lower than the old positive limit, or replaces an unlimited limit, retained sessions are not newly drained. Their reservations remain held, and new reservations cannot succeed until usage falls below the new limit. Explicitly removed outbound slots still drain; removed identity peers still close immediately as described in §21.1.
 - **Removed slots**: outbound sessions whose configuration slot was removed are prevented from reconnecting after they drain; one idle at that moment — closed, or suspended with no transport, which it could only regain by dialing — is ended at once, and one still live or mid-attempt is ended as soon as it suspends. The retirement is final: a slot re-added while its retired session still drains is not handed back to it, and the maintenance tick dials a fresh session once the retired one closes.

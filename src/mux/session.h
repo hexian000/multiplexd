@@ -274,25 +274,17 @@ struct mux_session_guard {
 	bool closed;
 };
 
-static inline void
-session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
-{
-	guard->session = ss;
-	guard->previous = ss->guards;
-	guard->closed = false;
-	ss->guards = guard;
-}
+/* Keep registration out of line so GCC does not mistake callback-invalidated
+ * guards for pointers that survive their stack frames. */
+void session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
+	__attribute__((noinline));
 
-/* Pass the same session as session_guard_begin so restoring the guard stack
- * explicitly updates the original object, even across opaque callbacks. */
-static inline bool
-session_guard_end(struct mux_session *ss, struct mux_session_guard *guard)
+static inline bool session_guard_end(struct mux_session_guard *guard)
 {
 	if (guard->session == NULL) {
 		return false;
 	}
-	ASSERT(guard->session == ss);
-	ss->guards = guard->previous;
+	guard->session->guards = guard->previous;
 	return !guard->closed;
 }
 

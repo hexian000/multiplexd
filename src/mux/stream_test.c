@@ -24,10 +24,20 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+void session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
+{
+	*guard = (struct mux_session_guard){
+		.session = ss,
+		.previous = ss->guards,
+	};
+	ss->guards = guard;
+}
 
 /* mock - collaborator mocks, frame pool, session/stream fixtures */
 
@@ -1061,6 +1071,7 @@ T_DECLARE_CASE(test_stream_flush_local_hard_error_leaves_timer_stopped)
 	s->socket.w_timeout.repeat = 5.0;
 	/* Buffer some recv data (with matching accounting for mux_stream_free). */
 	unsigned char payload[16] = { 0 };
+	T_CHECK(mux_bytebuf_reserve(&s->recvbuf, sizeof(payload), true));
 	memcpy(bytebuf_write_ptr(s->recvbuf), payload, sizeof(payload));
 	bytebuf_produce(s->recvbuf, sizeof(payload));
 	s->buffered_bytes = (uint_least32_t)sizeof(payload);
@@ -1758,6 +1769,7 @@ T_DECLARE_CASE(test_local_cb_survives_last_stream_freed_on_flush)
 	s->socket.connected = true;
 	s->state = STREAM_CLOSING;
 	unsigned char payload[8] = { 0 };
+	T_CHECK(mux_bytebuf_reserve(&s->recvbuf, sizeof(payload), true));
 	memcpy(bytebuf_write_ptr(s->recvbuf), payload, sizeof(payload));
 	bytebuf_produce(s->recvbuf, sizeof(payload));
 	s->buffered_bytes = (uint_least32_t)sizeof(payload);
@@ -1910,19 +1922,32 @@ T_DECLARE_CASE(test_stream_format_tag_formats_id_string)
 		T_FATAL("setup_fixture failed");
 		return;
 	}
-
 	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
-
-	char buf[256];
-	const int ret = mux_stream_format_tag(buf, sizeof(buf), s);
-	const bool nonempty = (buf[0] != '\0');
-
+	char local[] = "local";
+	char peer[] = "peer";
+	fx.ss.handshake.identity = local;
+	fx.ss.handshake.peer_identity = peer;
+	char tags[4][256];
+	int lengths[4];
+	for (size_t i = 0; i < 4; i++) {
+		fx.ss.accepted = i >= 2;
+		s->id = (uint_least16_t)(1u + i % 2u);
+		lengths[i] = mux_stream_format_tag(tags[i], sizeof(tags[i]), s);
+	}
 	mux_stream_free(s);
 	teardown_fixture(&fx);
 
-	T_EXPECT(ret > 0);
-	T_EXPECT(nonempty);
+	const char *const expected[] = {
+		"[1] local -> peer:",
+		"[2] local <- peer:",
+		"[1] local <- peer:",
+		"[2] local -> peer:",
+	};
+	for (size_t i = 0; i < 4; i++) {
+		T_EXPECT_STREQ(tags[i], expected[i]);
+		T_EXPECT_EQ(lengths[i], (int)strlen(expected[i]));
+	}
 }
 
 T_DECLARE_CASE(test_stream_mark_syn_sent_advances_state)
@@ -1983,23 +2008,39 @@ T_DECLARE_CASE(test_halfopen_release_before_free)
 		T_FATAL("setup_fixture failed");
 		return;
 	}
-	struct mux_stream *const s = make_stream(&fx, 1);
+	mux_gauge halfopen = 0;
+	fx.ss.cnt.stream.num_stream_halfopen = &halfopen;
+	struct mux_stream *const s = mux_stream_new(&fx.ss, 1, true);
 	T_CHECK(s != NULL);
-	s->halfopen_counted = true;
-	fx.ss.num_halfopen = 1;
-	const bool halfopen_set = s->halfopen_counted;
-	const bool num_positive = (fx.ss.num_halfopen > 0);
-	fx.ss.num_halfopen--;
-	s->halfopen_counted = false;
-	const size_t num_after = fx.ss.num_halfopen;
-	const bool halfopen_clear = !s->halfopen_counted;
+	mux_stream_mark_syn_sent(s);
+	const bool halfopen_before = s->halfopen_counted;
+	const size_t count_before = fx.ss.num_halfopen;
+	const size_t gauge_before =
+		COUNTER_LOAD(fx.ss.cnt.stream.num_stream_halfopen);
+
+	mux_stream_do_close(s);
+	const enum stream_state state_after = s->state;
+	const bool halfopen_after = s->halfopen_counted;
+	const size_t count_after = fx.ss.num_halfopen;
+	const size_t gauge_after =
+		COUNTER_LOAD(fx.ss.cnt.stream.num_stream_halfopen);
+	/* A repeated close and the final free must not release it again. */
+	mux_stream_do_close(s);
 	mux_stream_free(s);
+	const size_t count_after_free = fx.ss.num_halfopen;
+	const size_t gauge_after_free =
+		COUNTER_LOAD(fx.ss.cnt.stream.num_stream_halfopen);
 	teardown_fixture(&fx);
 
-	T_EXPECT(halfopen_set);
-	T_CHECK(num_positive);
-	T_EXPECT_EQ(num_after, (size_t)0);
-	T_EXPECT(halfopen_clear);
+	T_EXPECT(halfopen_before);
+	T_EXPECT_EQ(count_before, (size_t)1);
+	T_EXPECT_EQ(gauge_before, (size_t)1);
+	T_EXPECT_EQ(state_after, (enum stream_state)STREAM_CLOSED);
+	T_EXPECT(!halfopen_after);
+	T_EXPECT_EQ(count_after, (size_t)0);
+	T_EXPECT_EQ(gauge_after, (size_t)0);
+	T_EXPECT_EQ(count_after_free, (size_t)0);
+	T_EXPECT_EQ(gauge_after_free, (size_t)0);
 }
 
 /* mux_stream_format_tag endpoint rendering: identity strings, peer_identity,
@@ -2013,29 +2054,67 @@ T_DECLARE_CASE(test_stream_format_tag_endpoint_variants)
 	}
 	struct mux_stream *const s = make_stream(&fx, 1);
 	T_CHECK(s != NULL);
-	char buf[256];
-
-	char id_buf[] = "local-id";
-	char peer_ident[] = "peer-ident";
-
-	/* identity set -> "%s" branch for the local endpoint. */
-	fx.ss.handshake.identity = id_buf;
-	fx.ss.handshake.peer_identity = peer_ident; /* peer_identity branch */
-	const bool r1 = (mux_stream_format_tag(buf, sizeof(buf), s) > 0);
-
-	/* No identity and an unusable fd -> "[fd:%d]" local fallback. */
-	fx.ss.handshake.identity = NULL;
-	fx.ss.handshake.peer_identity = NULL;
+	const int local_fd = socket(AF_INET, SOCK_STREAM, 0);
+	T_CHECK(local_fd >= 0);
+	struct sockaddr_in local_addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	T_CHECK(bind(local_fd, (const struct sockaddr *)&local_addr,
+		     sizeof(local_addr)) == 0);
+	socklen_t addrlen = sizeof(local_addr);
+	T_CHECK(getsockname(
+			local_fd, (struct sockaddr *)&local_addr, &addrlen) ==
+		0);
 	const int saved_fd = fx.ss.w_socket.fd;
+	fx.ss.w_socket.fd = local_fd;
+	fx.ss.peer_addr.in = (struct sockaddr_in){
+		.sin_family = AF_INET,
+		.sin_port = htons(4321),
+		.sin_addr.s_addr = htonl(0xc0000209u),
+	};
+	char local[] = "local-id";
+	char peer[] = "peer-ident";
+	char tags[5][256];
+	int lengths[5];
+	/* Identities take precedence over both available addresses. */
+	fx.ss.handshake.identity = local;
+	fx.ss.handshake.peer_identity = peer;
+	lengths[0] = mux_stream_format_tag(tags[0], sizeof(tags[0]), s);
+	fx.ss.handshake.peer_identity = NULL;
+	lengths[1] = mux_stream_format_tag(tags[1], sizeof(tags[1]), s);
+	fx.ss.handshake.identity = NULL;
+	fx.ss.handshake.peer_identity = peer;
+	lengths[2] = mux_stream_format_tag(tags[2], sizeof(tags[2]), s);
+	fx.ss.handshake.peer_identity = NULL;
+	lengths[3] = mux_stream_format_tag(tags[3], sizeof(tags[3]), s);
 	fx.ss.w_socket.fd = -1;
-	const bool r2 = (mux_stream_format_tag(buf, sizeof(buf), s) > 0);
+	fx.ss.peer_addr.sa.sa_family = AF_UNSPEC;
+	lengths[4] = mux_stream_format_tag(tags[4], sizeof(tags[4]), s);
 	fx.ss.w_socket.fd = saved_fd;
-
+	(void)close(local_fd);
 	mux_stream_free(s);
 	teardown_fixture(&fx);
 
-	T_EXPECT(r1);
-	T_EXPECT(r2);
+	char local_tag[64], addresses_tag[128];
+	(void)snprintf(
+		local_tag, sizeof(local_tag), "[1] 127.0.0.1:%u -> peer-ident:",
+		(unsigned)ntohs(local_addr.sin_port));
+	(void)snprintf(
+		addresses_tag, sizeof(addresses_tag),
+		"[1] 127.0.0.1:%u -> 192.0.2.9:4321:",
+		(unsigned)ntohs(local_addr.sin_port));
+	const char *const expected[] = {
+		"[1] local-id -> peer-ident:",
+		"[1] local-id -> 192.0.2.9:4321:",
+		local_tag,
+		addresses_tag,
+		"[1] [fd:-1] -> [fd:-1]:",
+	};
+	for (size_t i = 0; i < 5; i++) {
+		T_EXPECT_STREQ(tags[i], expected[i]);
+		T_EXPECT_EQ(lengths[i], (int)strlen(expected[i]));
+	}
 }
 
 /* Regression: a peer's claimed identity is only NUL-excluded per doc/spec.md
@@ -2871,6 +2950,7 @@ T_DECLARE_CASE(test_local_read_retry_preserves_writes_and_cancels_on_close)
 	T_EXPECT(ev_is_active(&s->socket.w_read_retry));
 	/* Pending peer data still drains to the local application while its
 	 * own reads are held. Populate the same accounting as recv_copy. */
+	T_CHECK(mux_bytebuf_reserve(&s->recvbuf, 1, true));
 	*bytebuf_write_ptr(s->recvbuf) = 'y';
 	bytebuf_produce(s->recvbuf, 1);
 	s->buffered_bytes = 1;
@@ -3113,6 +3193,7 @@ T_DECLARE_CASE(test_stream_recv_copy_notify_readable_eager_flush)
 	/* Non-empty recvbuf so mux_stream_recv_copy skips the fast path and reaches
 	 * stream_notify_readable. */
 	unsigned char seed[4] = { 0xAA, 0xAA, 0xAA, 0xAA };
+	T_CHECK(mux_bytebuf_reserve(&s->recvbuf, sizeof(seed), true));
 	memcpy(bytebuf_write_ptr(s->recvbuf), seed, sizeof(seed));
 	bytebuf_produce(s->recvbuf, sizeof(seed));
 	s->buffered_bytes = (uint_least32_t)sizeof(seed);
@@ -3200,6 +3281,7 @@ T_DECLARE_CASE(test_stream_notify_readable_survives_last_stream_freed)
 	/* Pre-buffer recv data so mux_stream_recv_copy takes the slow path (the fast
 	 * path requires an empty recvbuf) and reaches stream_notify_readable. */
 	unsigned char seed[8] = { 0 };
+	T_CHECK(mux_bytebuf_reserve(&s->recvbuf, sizeof(seed), true));
 	memcpy(bytebuf_write_ptr(s->recvbuf), seed, sizeof(seed));
 	bytebuf_produce(s->recvbuf, sizeof(seed));
 	s->buffered_bytes = (uint_least32_t)sizeof(seed);
@@ -3404,7 +3486,36 @@ T_DECLARE_CASE(test_stream_clean_close_ends_local_socket_with_eof)
 	T_EXPECT_EQ(outcome, 0);
 }
 
+T_DECLARE_CASE(test_receive_storage_is_deferred_until_payload_is_buffered)
+{
+	struct stream_fixture fx;
+	T_CHECK(setup_fixture(&fx) == 0);
+	struct mux_stream *const s = make_stream(&fx, 1);
+	if (s == NULL) {
+		teardown_fixture(&fx);
+		T_FATAL("stream allocation failed");
+		return;
+	}
+	const bool initially_empty = s->recvbuf == NULL;
+	s->is_direct = true;
+	const unsigned char payload[] = "queued";
+	mux_stream_recv_copy(s, payload, sizeof(payload));
+	const bool buffered = s->recvbuf != NULL &&
+			      bytebuf_readable(s->recvbuf) == sizeof(payload) &&
+			      memcmp(bytebuf_read_ptr(s->recvbuf), payload,
+				     sizeof(payload)) == 0;
+	stream_release_buffers(s);
+	const bool released =
+		s->recvbuf == NULL && fx.ss.recv_buffered_bytes == 0;
+	mux_stream_free(s);
+	teardown_fixture(&fx);
+	T_EXPECT(initially_empty);
+	T_EXPECT(buffered);
+	T_EXPECT(released);
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_receive_storage_is_deferred_until_payload_is_buffered),
 	T_CASE(test_stream_grant_inc_uses_available_window),
 	T_CASE(test_stream_grant_inc_scales_under_pressure),
 	T_CASE(test_stream_dequeue_send_updates_queue_counters),

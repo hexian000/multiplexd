@@ -105,6 +105,7 @@ struct present_conf_mux {
 	bool has_session_window : 1;
 	bool has_stream_window : 1;
 	bool has_tcp : 1;
+	bool has_unacked_memory_limit : 1;
 	unsigned connect_timeout;
 	unsigned idle_timeout;
 	unsigned keepalive;
@@ -120,6 +121,7 @@ struct present_conf_mux {
 	unsigned session_window;
 	unsigned stream_window;
 	struct present_conf_mux_tcp tcp;
+	uintmax_t unacked_memory_limit;
 };
 
 struct present_conf_identity_listen_entry {

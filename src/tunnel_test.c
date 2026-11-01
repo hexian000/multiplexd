@@ -131,6 +131,7 @@ static const struct mux_session_config g_conf = {
 	.stream_window = 2,
 	.session_window = 2,
 	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
+	.unacked_memory_limit = 67108864,
 };
 
 static const struct conf_socket_opts g_mux_socket = { .backlog = 1 };

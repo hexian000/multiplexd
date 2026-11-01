@@ -35,6 +35,9 @@
 /* mock - collaborator spies; every routing-decision call is recorded
  * in struct spies; controllable return fields steer the decisions. */
 
+static struct mux_session *reset_release_session;
+static size_t shrink_target;
+
 static struct spies {
 	int send_ctrl_calls;
 	uint_fast16_t send_ctrl_id;
@@ -170,6 +173,11 @@ void mux_session_emit_ack(struct mux_session *restrict ss)
 	g.emit_ack_calls++;
 }
 
+void mux_session_refresh_send_timeout(struct mux_session *restrict ss)
+{
+	(void)ss;
+}
+
 void mux_notify_write(struct mux_session *restrict ss)
 {
 	(void)ss;
@@ -180,6 +188,16 @@ void mux_session_reset(struct mux_session *ss)
 {
 	g.reset_calls++;
 	ss->state = SESSION_CLOSED;
+	if (ss == reset_release_session) {
+		for (struct mux_session_guard *guard = ss->guards;
+		     guard != NULL; guard = guard->previous) {
+			guard->session = NULL;
+		}
+		bytebuf_free(ss->wire.recvbuf);
+		table_free(ss->sched.streams);
+		reset_release_session = NULL;
+		free(ss);
+	}
 }
 
 void mux_session_suspend(struct mux_session *ss)
@@ -464,7 +482,7 @@ void mux_bytebuf_shrink(struct bytebuf **restrict rbp, size_t target_cap)
 {
 	/* The fixture's recvbuf is never grown, so shrinking is a no-op here. */
 	(void)rbp;
-	(void)target_cap;
+	shrink_target = target_cap;
 }
 
 /* Integer-keyed stream table opts (matches sched.c's use of the stream id as a
@@ -494,6 +512,15 @@ const struct mux_session_config mux_session_config_default = {
 
 /* Pull in the unit under test after the stubs so its references bind here. */
 #include "recv.c"
+
+void session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
+{
+	*guard = (struct mux_session_guard){
+		.session = ss,
+		.previous = ss->guards,
+	};
+	ss->guards = guard;
+}
 
 /* Fixture: a session with a real receive ring and event loop; no transport. */
 
@@ -821,7 +848,7 @@ T_DECLARE_CASE(test_update_stream_window_grows_and_iterates)
 	T_EXPECT_EQ(stream_window_after, (uint_least32_t)5);
 	/* The below-target stream grew and asked for an ACK check; the
 	 * above-target stream was left as is. */
-	T_EXPECT(s_low_window > 0);
+	T_EXPECT_EQ(s_low_window, (uint_least32_t)(5u * MUX_WINDOW_UNIT));
 	T_EXPECT_EQ(s_high_window, (uint_least32_t)(100u * MUX_WINDOW_UNIT));
 	T_EXPECT_EQ(check_ack_after_grow, 1);
 	T_EXPECT_EQ(check_ack_after_noop, 0);
@@ -1574,6 +1601,62 @@ T_DECLARE_CASE(test_dispatch_no_stream_accept_rejects)
 	T_EXPECT_EQ(g.stream_close_calls, 1);
 }
 
+struct accept_cancellation {
+	struct mux_session *ss;
+	bool accepted;
+};
+
+static bool
+cancel_accept_cb(void *data, const struct mux_session *ss, struct mux_stream *s)
+{
+	(void)ss;
+	(void)s;
+	const struct accept_cancellation *const ctx = data;
+	table_free(ctx->ss->sched.streams);
+	ctx->ss->sched.streams = NULL;
+	ctx->ss->state = SESSION_CLOSING;
+	bytebuf_reset(ctx->ss->wire.recvbuf);
+	return ctx->accepted;
+}
+
+T_DECLARE_SUBCASE(accept_cancels_dispatch, const bool accepted)
+{
+	static struct recv_fixture fx;
+	T_CHECK(rf_setup(&fx) == 0);
+	T_CLEANUP(rf_cleanup, &fx);
+	struct accept_cancellation ctx = { .ss = &fx.ss, .accepted = accepted };
+	fx.ss.accepted = true;
+	fx.ss.userdata = &ctx;
+	fx.ss.callbacks.on_accept = cancel_accept_cb;
+	struct mux_stream newstream = make_stream(3, STREAM_SYN_RECEIVED);
+	g.stream_new_ret = &newstream;
+	const struct mux_header hdr = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_SYN | MUX_FLAG_PUSH,
+		.stream_id = 3,
+		.length = 4,
+	};
+	push_frame(&fx, &hdr);
+
+	dispatch_frame(&fx.ss);
+	const size_t readable = bytebuf_readable(fx.ss.wire.recvbuf);
+	rf_teardown(&fx);
+
+	T_EXPECT_EQ(fx.ss.state, SESSION_CLOSING);
+	T_EXPECT(fx.ss.guards == NULL);
+	T_EXPECT_EQ(readable, (size_t)0);
+	T_EXPECT_EQ(g.stream_new_calls, 1);
+	T_EXPECT_EQ(g.send_ctrl_calls, 0);
+	T_EXPECT_EQ(g.stream_close_calls, 0);
+	T_EXPECT_EQ(g.recv_copy_calls, 0);
+}
+
+T_DECLARE_CASE(test_dispatch_no_stream_accept_cancels_dispatch)
+{
+	T_CALL_SUBCASE(accept_cancels_dispatch, false);
+	T_CALL_SUBCASE(accept_cancels_dispatch, true);
+}
+
 /* Spec §4.3.1: the active opener's fast-open payload on the opening SYN MUST NOT
  * exceed the flat 16384-octet implicit initial credit. dispatch_no_stream
  * rejects an oversized fast-open by closing the connection -- before it commits
@@ -2259,11 +2342,12 @@ T_DECLARE_CASE(test_dispatch_ctrl_frame_reports_handler_reset)
 	push_frame(&fx, &probe);
 	push_frame(&fx, &ping);
 
-	const bool probe_ok = dispatch_ctrl_frame(
+	dispatch_ctrl_frame(
 		&fx.ss, &probe, MUX_FRAME_HEADER_SIZE + probe.length);
+	const bool probe_ok = fx.ss.state == SESSION_ESTABLISHED;
 	const int resets_after_probe = g.reset_calls;
-	const bool ping_ok = dispatch_ctrl_frame(
-		&fx.ss, &ping, MUX_FRAME_HEADER_SIZE + ping.length);
+	dispatch_ctrl_frame(&fx.ss, &ping, MUX_FRAME_HEADER_SIZE + ping.length);
+	const bool ping_ok = fx.ss.state == SESSION_ESTABLISHED;
 	const int state = fx.ss.state;
 
 	rf_teardown(&fx);
@@ -3323,6 +3407,8 @@ T_DECLARE_CASE(test_session_on_recv_dispatches_and_loops)
 	mux_session_on_recv(&fx.ss);
 
 	const size_t readable = bytebuf_readable(fx.ss.wire.recvbuf);
+	const size_t target = recv_window(&fx.ss) + MUX_MAX_FRAME_SIZE;
+	const size_t retained = shrink_target;
 	/* Free the fixture first so a failing assert can't leak it. */
 	rf_teardown(&fx);
 
@@ -3331,9 +3417,39 @@ T_DECLARE_CASE(test_session_on_recv_dispatches_and_loops)
 	T_EXPECT_EQ(readable, (size_t)0);
 	/* The batch epilogue drains freshly queued egress exactly once. */
 	T_EXPECT_EQ(g.flush_resp_calls, 1);
+	T_EXPECT_EQ(retained, target);
+}
+
+T_DECLARE_CASE(test_ctrl_ping_reset_survives_owner_release)
+{
+	struct recv_fixture fx;
+	T_CHECK(rf_setup(&fx) == 0);
+	fx.ss.max_payload = 64;
+	const struct mux_header ping = {
+		.version = MUX_PROTOCOL_VERSION,
+		.stream_id = STREAMID_CTRL,
+		.extra = MUX_CTRL_PING,
+		.length = 128,
+	};
+	push_frame(&fx, &ping);
+	struct mux_session *const ss = malloc(sizeof(*ss));
+	T_CHECK(ss != NULL);
+	*ss = fx.ss;
+	fx.ss.wire.recvbuf = NULL;
+	fx.ss.sched.streams = NULL;
+	reset_release_session = ss;
+	dispatch_frame(ss);
+	const bool released = reset_release_session == NULL;
+	if (!released) {
+		mux_session_reset(reset_release_session);
+	}
+	rf_teardown(&fx);
+	T_EXPECT(released);
+	T_EXPECT_EQ(g.reset_calls, 1);
 }
 
 static const struct testing_suite suite[] = {
+	T_CASE(test_ctrl_ping_reset_survives_owner_release),
 	T_CASE(test_validate_flags_syn_sent),
 	T_CASE(test_validate_flags_established),
 	T_CASE(test_validate_flags_closing_states),
@@ -3366,6 +3482,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_dispatch_no_stream_max_streams_refuses),
 	T_CASE(test_dispatch_no_stream_accept_null_refuses),
 	T_CASE(test_dispatch_no_stream_accept_rejects),
+	T_CASE(test_dispatch_no_stream_accept_cancels_dispatch),
 	T_CASE(test_dispatch_no_stream_accept_ok),
 	T_CASE(test_push_payload_feeds_estimator_in_auto_mode),
 	T_CASE(test_push_delivery_same_on_every_path),

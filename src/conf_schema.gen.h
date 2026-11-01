@@ -82,6 +82,7 @@ struct json_conf_mux {
 	unsigned session_window;
 	unsigned stream_window;
 	struct json_conf_mux_tcp tcp;
+	uintmax_t unacked_memory_limit;
 };
 
 struct json_conf_identity_listen_entry {

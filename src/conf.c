@@ -513,9 +513,15 @@ conf_check_no_tls(const struct json_conf *restrict obj, const bool has_psk)
 		(dst)->backlog = (int)(src).backlog;                             \
 	} while (0)
 
-static void
+static bool
 conf_load_mux(struct config *restrict cfg, const struct json_conf *restrict obj)
 {
+	if (obj->mux.unacked_memory_limit == 0 ||
+	    obj->mux.unacked_memory_limit > SIZE_MAX) {
+		LOGE("mux.unacked_memory_limit must be a positive size_t value");
+		return false;
+	}
+	cfg->mux.unacked_memory_limit = (size_t)obj->mux.unacked_memory_limit;
 	cfg->mux.nodelay = obj->mux.nodelay;
 	LOAD_SOCKET_OPTS(&cfg->mux_tcp, obj->mux.tcp);
 	cfg->mux.max_halfopen = (int)obj->mux.max_halfopen;
@@ -569,6 +575,7 @@ conf_load_mux(struct config *restrict cfg, const struct json_conf *restrict obj)
 	/* Schema-validated to [1, 86400] and [1, 65535], both fit int. */
 	cfg->mux.lossymux_idle_timeout = (int)obj->mux.lossymux.idle_timeout;
 	cfg->mux.lossymux_queue = (int)obj->mux.lossymux.queue;
+	return true;
 }
 
 static void
@@ -651,6 +658,7 @@ conf_merge(const struct json_conf *defaults, const struct present_conf *input)
 	COPY_FIELD(obj.mux, (*input).mux, resume_timeout);
 	COPY_FIELD(obj.mux, (*input).mux, send_timeout);
 	COPY_FIELD(obj.mux, (*input).mux, session_window);
+	COPY_FIELD(obj.mux, (*input).mux, unacked_memory_limit);
 	COPY_FIELD(obj.mux, (*input).mux, stream_window);
 	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, backlog);
 	COPY_FIELD(obj.mux.tcp, (*input).mux.tcp, keepalive);
@@ -724,7 +732,9 @@ static bool conf_load(
 		return false;
 	}
 #endif /* WITH_TLS */
-	conf_load_mux(cfg, obj);
+	if (!conf_load_mux(cfg, obj)) {
+		return false;
+	}
 	conf_load_tcp(cfg, obj);
 	if (!conf_load_identity(cfg, obj, &input->identity.listen)) {
 		return false;
@@ -1386,6 +1396,8 @@ char *conf_dump(
 			.resume_timeout = (unsigned)conf->mux.resume_timeout,
 			.has_session_window = true,
 			.session_window = (unsigned)session_window_bytes,
+			.has_unacked_memory_limit = true,
+			.unacked_memory_limit = (uintmax_t)conf->mux.unacked_memory_limit,
 			.has_stream_window = true,
 			.stream_window = (unsigned)stream_window_bytes,
 			.has_readahead = true,

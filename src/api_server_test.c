@@ -334,7 +334,10 @@ static int apifx_setup(struct apifx *restrict fx)
 	fx->conf = (struct config){
 		.mux_listen = NULL,
 		.mux = { .max_frame_payload =
-				 mux_session_config_default.max_frame_payload },
+				 mux_session_config_default.max_frame_payload,
+			 .unacked_memory_limit =
+				 mux_session_config_default
+					 .unacked_memory_limit },
 	};
 
 	fx->srv = (struct server){

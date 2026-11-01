@@ -72,6 +72,7 @@ static const json_lookup_conf_mux_entry_ json_lookup_conf_mux_keys_[] = {
 	{"resume_timeout", 14, 10},
 	{"session_window", 14, 12},
 	{"connect_timeout", 15, 0},
+	{"unacked_memory_limit", 20, 15},
 };
 static int json_lookup_conf_mux_cmp_(const void *key_, const void *entry_)
 {
@@ -86,7 +87,7 @@ json_lookup_conf_mux(const char *str, size_t len)
 {
 	const json_lookup_conf_mux_entry_ key_ = {str, len, 0};
 	const json_lookup_conf_mux_entry_ *e_ =
-		bsearch(&key_, json_lookup_conf_mux_keys_, 15, sizeof(*json_lookup_conf_mux_keys_), json_lookup_conf_mux_cmp_);
+		bsearch(&key_, json_lookup_conf_mux_keys_, 16, sizeof(*json_lookup_conf_mux_keys_), json_lookup_conf_mux_cmp_);
 	return e_ ? e_->idx : -1;
 }
 
@@ -323,6 +324,10 @@ static const struct json_constraint json_conf_mux_session_window_c = {
 	.flags = JSON_C_MAX,
 	.u = { .max = UINTMAX_C(1073725440) },
 };
+static const struct json_constraint json_conf_mux_unacked_memory_limit_c = {
+	.flags = JSON_C_MIN,
+	.u = { .min = UINTMAX_C(1) },
+};
 static const struct json_field json_conf_mux_fields[] = {
 	{ .name = "connect_timeout", .name_len = 15, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, connect_timeout), .constraint = &json_conf_mux_connect_timeout_c },
 	{ .name = "idle_timeout", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, idle_timeout), .constraint = &json_conf_mux_connect_timeout_c },
@@ -339,16 +344,17 @@ static const struct json_field json_conf_mux_fields[] = {
 	{ .name = "session_window", .name_len = 14, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, session_window), .constraint = &json_conf_mux_session_window_c },
 	{ .name = "stream_window", .name_len = 13, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, stream_window), .constraint = &json_conf_mux_session_window_c },
 	{ .name = "tcp", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct json_conf_mux, tcp), .child = &json_conf_mux_tcp_schema },
+	{ .name = "unacked_memory_limit", .name_len = 20, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct json_conf_mux, unacked_memory_limit), .constraint = &json_conf_mux_unacked_memory_limit_c },
 };
 static const struct json_schema json_conf_mux_schema = {
 	.obj_size = sizeof(struct json_conf_mux),
 	.fields = json_conf_mux_fields,
-	.n_fields = 15,
+	.n_fields = 16,
 	.lookup = json_lookup_conf_mux,
 	.has_default_storage = true,
 	.default_storage_offset = offsetof(struct json_conf_mux, json_defaults),
-	.default_json = "{\"connect_timeout\":15,\"idle_timeout\":0,\"keepalive\":7200,\"lossymux\":{\"enabled\":false,\"idle_timeout\":60,\"queue\":64},\"max_frame_size\":16384,\"max_halfopen\":256,\"max_streams\":0,\"mem_pressure\":{\"hi\":0,\"lo\":0},\"nodelay\":true,\"readahead\":131072,\"resume_timeout\":600,\"send_timeout\":15,\"session_window\":0,\"stream_window\":0,\"tcp\":{\"backlog\":16,\"keepalive\":false,\"nodelay\":true,\"notsent_lowat\":131072,\"rcvbuf\":0,\"reuseport\":false,\"sndbuf\":0}}",
-	.default_len = 430,
+	.default_json = "{\"connect_timeout\":15,\"idle_timeout\":0,\"keepalive\":7200,\"lossymux\":{\"enabled\":false,\"idle_timeout\":60,\"queue\":64},\"max_frame_size\":16384,\"max_halfopen\":256,\"max_streams\":0,\"mem_pressure\":{\"hi\":0,\"lo\":0},\"nodelay\":true,\"readahead\":131072,\"resume_timeout\":600,\"send_timeout\":15,\"session_window\":0,\"stream_window\":0,\"tcp\":{\"backlog\":16,\"keepalive\":false,\"nodelay\":true,\"notsent_lowat\":131072,\"rcvbuf\":0,\"reuseport\":false,\"sndbuf\":0},\"unacked_memory_limit\":67108864}",
+	.default_len = 462,
 };
 
 static const struct json_constraint json_conf_identity_listen_extra_c = {
@@ -424,8 +430,8 @@ static const struct json_schema json_conf_schema = {
 	.lookup = json_lookup_conf,
 	.has_default_storage = true,
 	.default_storage_offset = offsetof(struct json_conf, json_defaults),
-	.default_json = "{\"api_listen\":\"\",\"connect\":\"\",\"identity\":{\"claim\":\"\",\"listen\":{},\"mux_connect\":[],\"verify\":false},\"listen\":\"\",\"log\":\"\",\"loglevel\":4,\"max_sessions\":0,\"max_startups\":\"\",\"mux\":{\"connect_timeout\":15,\"idle_timeout\":0,\"keepalive\":7200,\"lossymux\":{\"enabled\":false,\"idle_timeout\":60,\"queue\":64},\"max_frame_size\":16384,\"max_halfopen\":256,\"max_streams\":0,\"mem_pressure\":{\"hi\":0,\"lo\":0},\"nodelay\":true,\"readahead\":131072,\"resume_timeout\":600,\"send_timeout\":15,\"session_window\":0,\"stream_window\":0,\"tcp\":{\"backlog\":16,\"keepalive\":false,\"nodelay\":true,\"notsent_lowat\":131072,\"rcvbuf\":0,\"reuseport\":false,\"sndbuf\":0}},\"mux_connect\":\"\",\"mux_listen\":\"\",\"tcp\":{\"backlog\":16,\"keepalive\":true,\"nodelay\":true,\"notsent_lowat\":0,\"rcvbuf\":0,\"reuseport\":false,\"sndbuf\":0},\"tls\":{\"alpn\":\"\",\"authcerts\":[],\"cert\":\"\",\"ciphersuites\":\"\",\"kernel_offload\":true,\"key\":\"\",\"psk\":{},\"sni\":\"example.com\",\"socket_offload\":false,\"system_trust\":false},\"type\":\"\"}",
-	.default_len = 923,
+	.default_json = "{\"api_listen\":\"\",\"connect\":\"\",\"identity\":{\"claim\":\"\",\"listen\":{},\"mux_connect\":[],\"verify\":false},\"listen\":\"\",\"log\":\"\",\"loglevel\":4,\"max_sessions\":0,\"max_startups\":\"\",\"mux\":{\"connect_timeout\":15,\"idle_timeout\":0,\"keepalive\":7200,\"lossymux\":{\"enabled\":false,\"idle_timeout\":60,\"queue\":64},\"max_frame_size\":16384,\"max_halfopen\":256,\"max_streams\":0,\"mem_pressure\":{\"hi\":0,\"lo\":0},\"nodelay\":true,\"readahead\":131072,\"resume_timeout\":600,\"send_timeout\":15,\"session_window\":0,\"stream_window\":0,\"tcp\":{\"backlog\":16,\"keepalive\":false,\"nodelay\":true,\"notsent_lowat\":131072,\"rcvbuf\":0,\"reuseport\":false,\"sndbuf\":0},\"unacked_memory_limit\":67108864},\"mux_connect\":\"\",\"mux_listen\":\"\",\"tcp\":{\"backlog\":16,\"keepalive\":true,\"nodelay\":true,\"notsent_lowat\":0,\"rcvbuf\":0,\"reuseport\":false,\"sndbuf\":0},\"tls\":{\"alpn\":\"\",\"authcerts\":[],\"cert\":\"\",\"ciphersuites\":\"\",\"kernel_offload\":true,\"key\":\"\",\"psk\":{},\"sni\":\"example.com\",\"socket_offload\":false,\"system_trust\":false},\"type\":\"\"}",
+	.default_len = 955,
 };
 
 void json_free_conf(struct json_conf *obj)

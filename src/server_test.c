@@ -816,6 +816,7 @@ static struct config *make_config(
 				.stream_window = 2,
 				.session_window = 256,
 				.max_frame_payload = mux_session_config_default.max_frame_payload,
+				.unacked_memory_limit = mux_session_config_default.unacked_memory_limit,
 				.lossymux_idle_timeout =
 					mux_session_config_default
 						.lossymux_idle_timeout,
@@ -1511,6 +1512,7 @@ T_DECLARE_CASE(test_server_offline_listeners_identity_branch)
 		.listen = NULL,
 		.mux = {
 			.idle_timeout = 0, /* selects the identity-listener branch */
+			.unacked_memory_limit = mux_session_config_default.unacked_memory_limit,
 			.timeout = 600,
 			.keepalive = 25,
 			.send_timeout = 15,
@@ -1592,7 +1594,10 @@ T_DECLARE_CASE(test_server_offline_listeners_idle_timeout_scoped_to_mux_connect)
 	struct config conf = {
 		.listen = "127.0.0.1:0",
 		.mux_connect = NULL,
-		.mux = { .idle_timeout = 60 },
+		.mux = { .idle_timeout = 60,
+			 .unacked_memory_limit =
+				 mux_session_config_default
+					 .unacked_memory_limit },
 	};
 	struct server srv = {
 		.conf = &conf,

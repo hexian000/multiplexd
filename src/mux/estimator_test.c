@@ -508,11 +508,10 @@ T_DECLARE_CASE(test_estimator_calculate_tiny_rtt_does_not_overflow_window)
 	mux_estimator_calculate(&ss, sent_ns);
 
 	const int_fast64_t bw_max = wndfilter_get(&ss.estimator.rx.bw_wnd);
-	T_EXPECT(bw_max <= INT_FAST64_MAX / WND_FEEDBACK_FLOOR_NS);
+	T_EXPECT_EQ(bw_max, INT_FAST64_MAX / WND_FEEDBACK_FLOOR_NS);
 
 	const size_t window = mux_estimator_rx_window_size(&ss.estimator);
-	T_EXPECT(window >= (size_t)WNDSIZE_MIN);
-	T_EXPECT(window <= (size_t)WNDSIZE_MAX);
+	T_EXPECT_EQ(window, (size_t)WNDSIZE_MAX);
 }
 
 /* Window-limited cycle: sample > 2/3 of effective_bdp → triples effective_bdp. */

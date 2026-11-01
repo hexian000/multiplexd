@@ -96,8 +96,11 @@ static size_t g_last_send_oob_len;
 static enum wire_shutdown_state g_wire_shutdown_result = WIRE_SHUTDOWN_DONE;
 static enum wire_eof_result g_wire_wait_eof_result = WIRE_EOF_CONFIRMED;
 static bool g_wire_tls_start_result = true;
+static bool g_fail_server_hello;
 static int g_adopt_tlsconn_calls;
 static bool g_last_adopt_offload;
+static size_t g_tlsconn_free_calls;
+static struct tls_connection *g_last_freed_tlsconn;
 static uint_least16_t g_alloc_stream_id_result = STREAMID_CTRL;
 static struct mux_stream *g_stream_new_result = NULL;
 static bool g_sched_add_stream_result = true;
@@ -239,9 +242,11 @@ size_t mux_estimator_rx_window_size(const struct estimator_ctx *restrict est)
 bool mux_handshake_enqueue_hello(
 	struct mux_session *ss, int msgid, bool include_resume_seq)
 {
-	(void)ss;
-	(void)msgid;
 	(void)include_resume_seq;
+	if (g_fail_server_hello && msgid == PROTO_MSG_SERVER_HELLO) {
+		mux_session_reset(ss);
+		return false;
+	}
 	return true;
 }
 
@@ -256,6 +261,18 @@ void mux_session_on_recv(struct mux_session *ss)
 }
 
 void mux_session_on_send(struct mux_session *ss)
+{
+	(void)ss;
+}
+
+void mux_notify_write(struct mux_session *restrict ss)
+{
+	if (ss->state == SESSION_ESTABLISHED) {
+		mux_session_notify(ss);
+	}
+}
+
+void mux_session_refresh_send_timeout(struct mux_session *restrict ss)
 {
 	(void)ss;
 }
@@ -296,9 +313,8 @@ void mux_stream_free(struct mux_stream *s)
 bool mux_unacked_resume_ack_recv(
 	struct mux_session *restrict ss, uint_least32_t peer_ack)
 {
-	(void)ss;
-	(void)peer_ack;
-	return true;
+	return !use_real_unacked ||
+	       real_mux_unacked_resume_ack_recv(ss, peer_ack);
 }
 
 static int g_unacked_track_sent_calls = 0;
@@ -331,7 +347,10 @@ void mux_wire_adopt_tlsconn(
 
 void mux_wire_tlsconn_free(struct tls_connection *restrict conn)
 {
-	(void)conn;
+	if (conn != NULL) {
+		g_tlsconn_free_calls++;
+		g_last_freed_tlsconn = conn;
+	}
 }
 
 enum wire_shutdown_state mux_wire_shutdown(struct mux_session *restrict ss)
@@ -522,6 +541,7 @@ static int setup_fixture(struct session_fixture *restrict fx)
 		.pool = make_pool(&fx->pool_ctx),
 		.max_payload = (uint_least32_t)mux_session_config_default.max_frame_payload,
 		.session_window = 8,
+		.unacked.memory_limit = mux_session_config_default.unacked_memory_limit,
 		.stream_window = 4,
 		.wire = {
 			.rx_open = true,
@@ -560,6 +580,9 @@ static int setup_fixture(struct session_fixture *restrict fx)
 		fx->loop = NULL;
 		return -1;
 	}
+	fx->ss.unacked.memory_bytes =
+		sizeof(struct mux_frame_ring) +
+		MUX_FRAME_RING_MIN * sizeof(struct mux_frame *);
 	return 0;
 }
 
@@ -628,6 +651,7 @@ static void cleanup_fixture(void *data)
 	g_wire_shutdown_result = WIRE_SHUTDOWN_DONE;
 	g_wire_wait_eof_result = WIRE_EOF_CONFIRMED;
 	g_wire_tls_start_result = true;
+	g_fail_server_hello = false;
 	g_alloc_stream_id_result = STREAMID_CTRL;
 	g_stream_new_result = NULL;
 	g_sched_add_stream_result = true;
@@ -801,9 +825,11 @@ T_DECLARE_CASE(test_session_set_config_preserves_suspended_resume_deadline)
 	ev_timer_init(
 		&fx.ss.w_connect_timeout, session_test_timer_cb, 0.0, 0.0);
 	fx.ss.w_connect_timeout.data = &fx.ss;
-	ev_timer_set(&fx.ss.w_connect_timeout, 30.0, 0.0);
+	ev_timer_set(&fx.ss.w_connect_timeout, 7.25, 0.0);
 	ev_timer_start(fx.ss.loop, &fx.ss.w_connect_timeout);
 
+	const double before =
+		ev_timer_remaining(fx.ss.loop, &fx.ss.w_connect_timeout);
 	const struct mux_session_config conf = {
 		.timeout = 30,
 		.keepalive = 15,
@@ -811,7 +837,12 @@ T_DECLARE_CASE(test_session_set_config_preserves_suspended_resume_deadline)
 		.connect_timeout = 10, /* differs from the resume deadline */
 		.resume_timeout = 30,
 	};
-	mux_session_set_config(&fx.ss, &conf);
+	for (size_t i = 0; i < 3; i++) {
+		mux_session_set_config(&fx.ss, &conf);
+		const double remaining = ev_timer_remaining(
+			fx.ss.loop, &fx.ss.w_connect_timeout);
+		T_EXPECT(fabs(remaining - before) < timer_tolerance);
+	}
 
 	/* Untouched: still a one-shot (repeat 0.0) and still active. */
 	T_EXPECT_EQ(fx.ss.w_connect_timeout.repeat, 0.0);
@@ -847,6 +878,7 @@ T_DECLARE_CASE(test_session_set_config_preserves_graceful_close_deadline)
 	enum { NCASES = 4 };
 	bool active[NCASES];
 	double repeat[NCASES];
+	double remaining[NCASES];
 	size_t k = 0;
 	for (size_t i = 0; i < 2; i++) {
 		for (size_t j = 0; j < 2; j++) {
@@ -857,7 +889,7 @@ T_DECLARE_CASE(test_session_set_config_preserves_graceful_close_deadline)
 				&fx.ss.w_connect_timeout, session_test_timer_cb,
 				0.0, 0.0);
 			fx.ss.w_connect_timeout.data = &fx.ss;
-			ev_timer_set(&fx.ss.w_connect_timeout, 30.0, 0.0);
+			ev_timer_set(&fx.ss.w_connect_timeout, 7.25, 0.0);
 			ev_timer_start(fx.ss.loop, &fx.ss.w_connect_timeout);
 
 			const struct mux_session_config conf = {
@@ -867,7 +899,15 @@ T_DECLARE_CASE(test_session_set_config_preserves_graceful_close_deadline)
 				.connect_timeout = timeouts[j],
 				.resume_timeout = 30,
 			};
-			mux_session_set_config(&fx.ss, &conf);
+			const double before = ev_timer_remaining(
+				fx.ss.loop, &fx.ss.w_connect_timeout);
+			for (size_t reload = 0; reload < 3; reload++) {
+				mux_session_set_config(&fx.ss, &conf);
+			}
+			remaining[k] =
+				ev_timer_remaining(
+					fx.ss.loop, &fx.ss.w_connect_timeout) -
+				before;
 
 			active[k] = ev_is_active(&fx.ss.w_connect_timeout);
 			repeat[k] = fx.ss.w_connect_timeout.repeat;
@@ -882,6 +922,7 @@ T_DECLARE_CASE(test_session_set_config_preserves_graceful_close_deadline)
 	for (size_t i = 0; i < NCASES; i++) {
 		T_EXPECT(active[i]);
 		T_EXPECT_EQ(repeat[i], 0.0);
+		T_EXPECT(fabs(remaining[i]) < timer_tolerance);
 	}
 }
 
@@ -1463,6 +1504,71 @@ T_DECLARE_CASE(test_capture_frame_list_skips_frames_once_session_closed)
 	T_EXPECT_EQ(g_unacked_track_sent_calls, 0);
 
 	teardown_fixture(&fx);
+}
+
+T_DECLARE_CASE(test_suspend_capture_memory_budget)
+{
+	for (int over = 0; over <= 1; over++) {
+		static struct session_fixture fx;
+		T_CHECK(setup_handshake_fixture(&fx) == 0);
+		T_CLEANUP(cleanup_fixture, &fx);
+		fx.ss.state = SESSION_ESTABLISHED;
+		use_real_unacked = true;
+		const size_t frame_bytes =
+			MUX_FRAME_OBJECT_SIZE(fx.ss.max_payload);
+		const size_t limit =
+			fx.ss.unacked.memory_bytes + 2 * frame_bytes;
+		fx.ss.unacked.memory_limit = limit;
+		/* One partially sent physical frame, then one OOB reliable control. */
+		for (int i = 0; i < 2 + over; i++) {
+			struct mux_frame *const frame =
+				mux_frame_get(&fx.ss.pool, fx.ss.max_payload);
+			T_CHECK(frame != NULL);
+			mux_write_header(
+				frame->data,
+				&(struct mux_header){
+					.version = MUX_PROTOCOL_VERSION,
+					.flags = MUX_FLAG_RST,
+					.stream_id = 33,
+				});
+			frame->len = MUX_FRAME_HEADER_SIZE;
+			frame->pos = i == 0 ? 1 : 0;
+			mux_frame_list_push(
+				i == 0 ? &fx.ss.wire.sendbuf :
+					 &fx.ss.wire.oobbuf,
+				frame);
+		}
+		mux_session_suspend(&fx.ss);
+		T_EXPECT_EQ(fx.ss.unacked.memory_limit, limit);
+		T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)0);
+		T_EXPECT_EQ(
+			fx.ss.state, over ? SESSION_CLOSED : SESSION_SUSPENDED);
+		if (!over) {
+			T_EXPECT_EQ(fx.ss.unacked.memory_bytes, limit);
+			T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)2);
+			T_EXPECT_EQ(fx.ss.unacked.retransmit_off, (size_t)0);
+			struct mux_session_config updated =
+				mux_session_config_default;
+			updated.unacked_memory_limit = limit + frame_bytes;
+			mux_session_set_config(&fx.ss, &updated);
+			T_EXPECT_EQ(fx.ss.unacked.memory_limit, limit);
+			struct mux_transport transport = { .fd = fx.fds[1] };
+			session_resume_attach(&fx.ss, &transport, 0);
+			T_CHECK(transport.fd == -1);
+			fx.fds[0] = fx.fds[1];
+			fx.fds[1] = -1;
+			T_EXPECT_EQ(fx.ss.state, SESSION_ESTABLISHED);
+			T_EXPECT_EQ(fx.ss.unacked.memory_limit, limit);
+			T_EXPECT_EQ(fx.ss.unacked.memory_bytes, limit);
+		} else {
+			T_EXPECT_EQ(fx.ss.unacked.memory_bytes, (size_t)0);
+			T_EXPECT(fx.ss.unacked.ring == NULL);
+			T_EXPECT_EQ(
+				fx.pool_ctx.alloc_calls,
+				fx.pool_ctx.free_calls);
+		}
+		teardown_fixture(&fx);
+	}
 }
 
 T_DECLARE_CASE(test_capture_ring_allocation_failure_stops_after_reset)
@@ -2205,6 +2311,236 @@ T_DECLARE_CASE(test_session_suspend_drops_queued_dgrams)
 	teardown_fixture(&fx);
 }
 
+struct resume_failure_probe {
+	struct mux_session *live;
+	bool release;
+	size_t failed;
+	size_t closed;
+};
+
+static void close_on_resume_failure(
+	void *data, struct mux_session *ss, const enum mux_event event,
+	const union mux_event_data edata)
+{
+	(void)edata;
+	struct resume_failure_probe *const probe = data;
+	if (event == MUX_EVENT_CONNECT_FAILED) {
+		probe->failed++;
+		if (probe->release) {
+			probe->live = NULL;
+			mux_session_close(ss);
+		}
+	} else if (event == MUX_EVENT_CLOSED) {
+		probe->closed++;
+	}
+}
+
+T_DECLARE_CASE(test_resume_hello_failure_survives_owner_release)
+{
+	for (int release = 0; release < 2; release++) {
+		struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+		T_CHECK(loop != NULL);
+		int fds[2];
+		T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+		struct frame_pool_ctx pool = { 0 };
+		struct resume_failure_probe probe = { .release = release != 0 };
+		const struct mux_callbacks callbacks = {
+			.on_event = close_on_resume_failure
+		};
+		const unsigned char id[MUX_SESSION_ID_LEN] = { 0 };
+		const struct mux_session_opts opts = {
+			.callbacks = &callbacks,
+			.userdata = &probe,
+			.conf = &mux_session_config_default,
+			.pool = make_pool(&pool),
+			.fd = -1,
+			.id = id,
+		};
+		struct mux_session *const ss = mux_session_new(loop, &opts);
+		T_CHECK(ss != NULL);
+		probe.live = ss;
+		ss->accepted = true;
+		ss->state = SESSION_SUSPENDED;
+		struct mux_transport transport = { .fd = fds[0] };
+		g_fail_server_hello = true;
+		mux_resume_attach(ss, &transport, 0);
+		g_fail_server_hello = false;
+		const bool consumed = transport.fd == -1;
+		if (probe.live != NULL) {
+			mux_session_close(probe.live);
+		}
+		(void)close(fds[1]);
+		ev_loop_destroy(loop);
+		T_EXPECT(consumed);
+		T_EXPECT_EQ(probe.failed, (size_t)1);
+		T_EXPECT_EQ(probe.closed, release ? (size_t)0 : (size_t)1);
+		T_EXPECT_EQ(pool.alloc_calls, pool.free_calls);
+	}
+}
+
+struct invalid_resume_probe {
+	struct ev_loop *loop;
+	struct mux_session *live;
+	struct frame_pool_ctx pool;
+	struct mux_transport transport;
+	int peer_fd;
+	bool release;
+	bool reset_before_closed;
+	bool transport_pending_at_closed;
+	size_t closed;
+	size_t connected;
+	size_t failed;
+#if WITH_TLS
+	unsigned char tls_token;
+#endif
+};
+
+static void cleanup_invalid_resume(void *data)
+{
+	struct invalid_resume_probe *const probe = data;
+	if (probe->live != NULL) {
+		mux_session_close(probe->live);
+		probe->live = NULL;
+	}
+	mux_transport_discard(&probe->transport);
+	if (probe->peer_fd != -1) {
+		(void)close(probe->peer_fd);
+		probe->peer_fd = -1;
+	}
+	if (probe->loop != NULL) {
+		ev_loop_destroy(probe->loop);
+		probe->loop = NULL;
+	}
+	use_real_unacked = false;
+}
+
+static void invalid_resume_event(
+	void *data, struct mux_session *ss, const enum mux_event event,
+	const union mux_event_data edata)
+{
+	(void)edata;
+	struct invalid_resume_probe *const probe = data;
+	if (event == MUX_EVENT_CLOSED) {
+		probe->closed++;
+		probe->reset_before_closed =
+			ss->state == SESSION_CLOSED && ss->w_socket.fd == -1 &&
+			!ev_is_active(&ss->w_socket) &&
+			ss->unacked.ring == NULL && ss->unacked.frames == 0;
+		int type = 0;
+		socklen_t len = sizeof(type);
+		probe->transport_pending_at_closed =
+			getsockopt(
+				probe->transport.fd, SOL_SOCKET, SO_TYPE, &type,
+				&len) == 0;
+		if (probe->release) {
+			probe->live = NULL;
+			mux_session_close(ss);
+		}
+	} else if (event == MUX_EVENT_CONNECT) {
+		probe->connected++;
+	} else if (event == MUX_EVENT_CONNECT_FAILED) {
+		probe->failed++;
+	}
+}
+
+static void setup_invalid_resume(struct invalid_resume_probe *probe)
+{
+	probe->loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(probe->loop != NULL);
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	probe->transport.fd = fds[0];
+	probe->peer_fd = fds[1];
+	probe->transport.peer_identity = strdup("incoming identity");
+	T_CHECK(probe->transport.peer_identity != NULL);
+#if WITH_TLS
+	probe->transport.tlsconn = (struct tls_connection *)&probe->tls_token;
+#endif
+	static const struct mux_callbacks callbacks = {
+		.on_event = invalid_resume_event
+	};
+	const unsigned char id[MUX_SESSION_ID_LEN] = { 0 };
+	const struct mux_session_opts opts = {
+		.callbacks = &callbacks,
+		.userdata = probe,
+		.conf = &mux_session_config_default,
+		.pool = make_pool(&probe->pool),
+		.fd = -1,
+		.id = id,
+	};
+	probe->live = mux_session_new(probe->loop, &opts);
+	T_CHECK(probe->live != NULL);
+	probe->live->accepted = true;
+	probe->live->state = SESSION_SUSPENDED;
+	probe->live->unacked.last_ack_recv = 4;
+	struct mux_frame *const frame = mux_frame_get(&probe->live->pool, 1);
+	T_CHECK(frame != NULL);
+	mux_write_header(
+		frame->data, &(struct mux_header){
+				     .version = MUX_PROTOCOL_VERSION,
+				     .stream_id = 1,
+				     .length = 1,
+			     });
+	frame->len = MUX_FRAME_HEADER_SIZE + 1;
+	real_mux_unacked_track_sent(probe->live, frame);
+}
+
+T_DECLARE_SUBCASE(
+	expect_invalid_resume_transport, struct invalid_resume_probe *probe)
+{
+	T_EXPECT_EQ(probe->transport.fd, -1);
+	T_EXPECT(probe->transport.peer_identity == NULL);
+#if WITH_TLS
+	T_EXPECT(probe->transport.tlsconn == NULL);
+	T_EXPECT_EQ(g_tlsconn_free_calls, (size_t)1);
+	T_EXPECT(
+		g_last_freed_tlsconn ==
+		(struct tls_connection *)&probe->tls_token);
+#endif
+	unsigned char byte;
+	T_EXPECT_EQ(recv(probe->peer_fd, &byte, 1, MSG_DONTWAIT), (ssize_t)0);
+	mux_transport_discard(&probe->transport);
+#if WITH_TLS
+	T_EXPECT_EQ(g_tlsconn_free_calls, (size_t)1);
+#endif
+}
+
+T_DECLARE_CASE(test_resume_invalid_ack_resets_before_owner_release)
+{
+	for (int release = 0; release < 2; release++) {
+		for (uint_least32_t ack = 3; ack <= 6; ack += 3) {
+			static struct invalid_resume_probe probe;
+			probe = (struct invalid_resume_probe){
+				.transport = { .fd = -1 },
+				.peer_fd = -1,
+				.release = release != 0,
+			};
+			T_CLEANUP(cleanup_invalid_resume, &probe);
+			setup_invalid_resume(&probe);
+			use_real_unacked = true;
+			g_adopt_tlsconn_calls = 0;
+			g_tlsconn_free_calls = 0;
+			g_last_freed_tlsconn = NULL;
+			g_unacked_track_sent_calls = 0;
+			mux_resume_attach(probe.live, &probe.transport, ack);
+			T_EXPECT_EQ(probe.closed, (size_t)1);
+			T_EXPECT_EQ(probe.connected, (size_t)0);
+			T_EXPECT_EQ(probe.failed, (size_t)0);
+			T_EXPECT(probe.reset_before_closed);
+			T_EXPECT(probe.transport_pending_at_closed);
+			T_EXPECT_EQ(g_adopt_tlsconn_calls, 0);
+			T_EXPECT_EQ(g_unacked_track_sent_calls, 0);
+			T_EXPECT_EQ(
+				probe.pool.alloc_calls, probe.pool.free_calls);
+			T_CALL_SUBCASE(expect_invalid_resume_transport, &probe);
+			ev_run(probe.loop, EVRUN_NOWAIT);
+			T_EXPECT_EQ(probe.closed, (size_t)1);
+			T_EXPECT_EQ(probe.connected, (size_t)0);
+			cleanup_invalid_resume(&probe);
+		}
+	}
+}
+
 /* session_resume_attach must clear wire.rx_eof the way the fresh-attach path
  * does: the FIN that suspended the session belongs to the transport that just
  * died, so carrying it across makes every later teardown of the resumed session
@@ -2706,6 +3042,11 @@ T_DECLARE_CASE(test_set_config_live_session_branches)
 	fx.ss.auto_session_window = true;
 	fx.ss.session_window = 1; /* below the initial floor */
 
+	ev_timer_again(fx.ss.loop, &fx.ss.w_timeout);
+	ev_timer_again(fx.ss.loop, &fx.ss.w_keepalive);
+	T_EXPECT(ev_is_active(&fx.ss.w_timeout));
+	T_EXPECT(ev_is_active(&fx.ss.w_keepalive));
+
 	/* Arm the timers whose "active -> ev_timer_again" arms we want to hit. */
 	ev_timer_set(&fx.ss.w_send_timeout, 0.0, 5.0);
 	ev_timer_again(fx.ss.loop, &fx.ss.w_send_timeout);
@@ -2722,13 +3063,58 @@ T_DECLARE_CASE(test_set_config_live_session_branches)
 	conf.keepalive = 0; /* established: stop w_keepalive */
 	conf.send_timeout =
 		5; /* AF_UNIX: TCP_USER_TIMEOUT fails, repeat kept */
-	conf.connect_timeout = 5;
+	conf.connect_timeout = 9;
 	conf.idle_timeout = 5;
 	mux_session_set_config(&fx.ss, &conf);
 
 	T_EXPECT(
 		fx.ss.session_window >=
 		MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT);
+
+	T_EXPECT(!ev_is_active(&fx.ss.w_timeout));
+	T_EXPECT(!ev_is_active(&fx.ss.w_keepalive));
+	T_EXPECT_EQ(fx.ss.w_timeout.repeat, 0.0);
+	T_EXPECT_EQ(fx.ss.w_keepalive.repeat, 0.0);
+	T_EXPECT(ev_is_active(&fx.ss.w_send_timeout));
+	T_EXPECT_EQ(fx.ss.w_send_timeout.repeat, 5.0);
+	T_EXPECT(
+		fabs(ev_timer_remaining(fx.loop, &fx.ss.w_send_timeout) - 5.0) <
+		timer_tolerance);
+	T_EXPECT(ev_is_active(&fx.ss.w_connect_timeout));
+	T_EXPECT_EQ(fx.ss.w_connect_timeout.repeat, 9.0);
+	T_EXPECT(
+		fabs(ev_timer_remaining(fx.loop, &fx.ss.w_connect_timeout) -
+		     9.0) < timer_tolerance);
+	T_EXPECT(ev_is_active(&fx.ss.w_idle_timeout));
+
+	conf.timeout = 17;
+	conf.keepalive = 3;
+	conf.send_timeout = 7;
+	conf.connect_timeout = 11;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(ev_is_active(&fx.ss.w_timeout));
+	T_EXPECT_EQ(fx.ss.w_timeout.repeat, 17.0);
+	T_EXPECT(
+		fabs(ev_timer_remaining(fx.loop, &fx.ss.w_timeout) - 17.0) <
+		timer_tolerance);
+	T_EXPECT(ev_is_active(&fx.ss.w_keepalive));
+	T_EXPECT(fx.ss.w_keepalive.repeat <= 3.0);
+	T_EXPECT(
+		fx.ss.w_keepalive.repeat >= 3.0 * (1.0 - MUX_KEEPALIVE_JITTER));
+	T_EXPECT(
+		fabs(ev_timer_remaining(fx.loop, &fx.ss.w_keepalive) -
+		     fx.ss.w_keepalive.repeat) < timer_tolerance);
+	T_EXPECT_EQ(fx.ss.w_send_timeout.repeat, 7.0);
+	T_EXPECT(
+		fabs(ev_timer_remaining(fx.loop, &fx.ss.w_send_timeout) - 7.0) <
+		timer_tolerance);
+	T_EXPECT_EQ(fx.ss.w_connect_timeout.repeat, 11.0);
+	T_EXPECT(
+		fabs(ev_timer_remaining(fx.loop, &fx.ss.w_connect_timeout) -
+		     11.0) < timer_tolerance);
+	conf.send_timeout = 0;
+	mux_session_set_config(&fx.ss, &conf);
+	T_EXPECT(!ev_is_active(&fx.ss.w_send_timeout));
 
 	ev_timer_stop(fx.ss.loop, &fx.ss.w_send_timeout);
 	ev_timer_stop(fx.ss.loop, &fx.ss.w_connect_timeout);
@@ -3099,6 +3485,9 @@ T_DECLARE_CASE(test_accepted_startup_reservation_lifecycle)
 }
 
 static const struct testing_suite suite[] = {
+	T_CASE(test_suspend_capture_memory_budget),
+	T_CASE(test_resume_invalid_ack_resets_before_owner_release),
+	T_CASE(test_resume_hello_failure_survives_owner_release),
 	T_CASE(test_accepted_startup_reservation_lifecycle),
 	T_CASE(test_capture_ring_allocation_failure_stops_after_reset),
 	T_CASE(test_session_handshake_done_rearms_coalesce_for_delay_list),

@@ -72,6 +72,7 @@ static const present_lookup_conf_mux_entry_ present_lookup_conf_mux_keys_[] = {
 	{"resume_timeout", 14, 10},
 	{"session_window", 14, 12},
 	{"connect_timeout", 15, 0},
+	{"unacked_memory_limit", 20, 15},
 };
 static int present_lookup_conf_mux_cmp_(const void *key_, const void *entry_)
 {
@@ -86,7 +87,7 @@ present_lookup_conf_mux(const char *str, size_t len)
 {
 	const present_lookup_conf_mux_entry_ key_ = {str, len, 0};
 	const present_lookup_conf_mux_entry_ *e_ =
-		bsearch(&key_, present_lookup_conf_mux_keys_, 15, sizeof(*present_lookup_conf_mux_keys_), present_lookup_conf_mux_cmp_);
+		bsearch(&key_, present_lookup_conf_mux_keys_, 16, sizeof(*present_lookup_conf_mux_keys_), present_lookup_conf_mux_cmp_);
 	return e_ ? e_->idx : -1;
 }
 
@@ -440,6 +441,7 @@ static bool present_conf_mux_get(const void *value, size_t field)
 	case 12: return obj->has_session_window;
 	case 13: return obj->has_stream_window;
 	case 14: return obj->has_tcp;
+	case 15: return obj->has_unacked_memory_limit;
 	default: return false;
 	}
 }
@@ -462,6 +464,7 @@ static void present_conf_mux_put(void *value, size_t field, bool present)
 	case 12: obj->has_session_window = present; break;
 	case 13: obj->has_stream_window = present; break;
 	case 14: obj->has_tcp = present; break;
+	case 15: obj->has_unacked_memory_limit = present; break;
 	default: break;
 	}
 }
@@ -485,6 +488,10 @@ static const struct json_constraint present_conf_mux_session_window_c = {
 	.flags = JSON_C_MAX,
 	.u = { .max = UINTMAX_C(1073725440) },
 };
+static const struct json_constraint present_conf_mux_unacked_memory_limit_c = {
+	.flags = JSON_C_MIN,
+	.u = { .min = UINTMAX_C(1) },
+};
 static const struct json_field present_conf_mux_fields[] = {
 	{ .name = "connect_timeout", .name_len = 15, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct present_conf_mux, connect_timeout), .constraint = &present_conf_mux_connect_timeout_c },
 	{ .name = "idle_timeout", .name_len = 12, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct present_conf_mux, idle_timeout), .constraint = &present_conf_mux_connect_timeout_c },
@@ -501,11 +508,12 @@ static const struct json_field present_conf_mux_fields[] = {
 	{ .name = "session_window", .name_len = 14, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct present_conf_mux, session_window), .constraint = &present_conf_mux_session_window_c },
 	{ .name = "stream_window", .name_len = 13, .kind = JSON_K_UINT, .req_bit = -1, .offset = offsetof(struct present_conf_mux, stream_window), .constraint = &present_conf_mux_session_window_c },
 	{ .name = "tcp", .name_len = 3, .kind = JSON_K_OBJECT, .req_bit = -1, .offset = offsetof(struct present_conf_mux, tcp), .child = &present_conf_mux_tcp_schema },
+	{ .name = "unacked_memory_limit", .name_len = 20, .kind = JSON_K_UMAX, .req_bit = -1, .offset = offsetof(struct present_conf_mux, unacked_memory_limit), .constraint = &present_conf_mux_unacked_memory_limit_c },
 };
 static const struct json_schema present_conf_mux_schema = {
 	.obj_size = sizeof(struct present_conf_mux),
 	.fields = present_conf_mux_fields,
-	.n_fields = 15,
+	.n_fields = 16,
 	.lookup = present_lookup_conf_mux,
 	.get_present = present_conf_mux_get,
 	.set_present = present_conf_mux_put,

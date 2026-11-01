@@ -133,7 +133,8 @@ struct mux_stream {
 	/* Send buffer (data waiting to be sent to mux) */
 	struct mux_frame_list send_queue;
 
-	/* Receive buffer (data waiting to be sent to local socket) */
+	/* Receive buffer (data waiting to be sent to local socket), NULL until
+	 * incoming payload needs buffering. */
 	struct bytebuf *recvbuf;
 
 	/* Flow control - sender side */

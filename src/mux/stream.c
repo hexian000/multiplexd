@@ -181,14 +181,15 @@ static void stream_release_buffers(struct mux_stream *restrict s)
 	COUNTER_SUB(ss->cnt.buffers.send_buffered_frames, s->send_queue.count);
 	mux_frame_list_clear(&s->send_queue, &ss->pool);
 	s->queued_send_bytes = 0;
-	ASSERT(ss->recv_buffered_bytes >= s->recvbuf->len);
-	ss->recv_buffered_bytes -= s->recvbuf->len;
-	COUNTER_SUB(ss->cnt.buffers.recv_buffered_bytes, s->recvbuf->len);
+	ASSERT(ss->recv_buffered_bytes >= bytebuf_readable(s->recvbuf));
+	ss->recv_buffered_bytes -= bytebuf_readable(s->recvbuf);
+	COUNTER_SUB(
+		ss->cnt.buffers.recv_buffered_bytes,
+		bytebuf_readable(s->recvbuf));
 	bytebuf_reset(s->recvbuf);
 	s->buffered_bytes = 0;
-	/* Release capacity grown for oversized frames; nothing writes to a
-	 * CLOSED stream's receive buffer, so no regrowth follows. */
-	mux_bytebuf_shrink(&s->recvbuf, 0);
+	bytebuf_free(s->recvbuf);
+	s->recvbuf = NULL;
 }
 
 /* Arm the local socket for an abortive close: with a zero linger, the
@@ -389,10 +390,11 @@ static void stream_rst_notify_direct(struct mux_stream *s)
  * completes the close. */
 static void stream_reset_unread(struct mux_stream *restrict s)
 {
-	ASSERT(s->session->recv_buffered_bytes >= s->recvbuf->len);
-	s->session->recv_buffered_bytes -= s->recvbuf->len;
+	ASSERT(s->session->recv_buffered_bytes >= bytebuf_readable(s->recvbuf));
+	s->session->recv_buffered_bytes -= bytebuf_readable(s->recvbuf);
 	COUNTER_SUB(
-		s->session->cnt.buffers.recv_buffered_bytes, s->recvbuf->len);
+		s->session->cnt.buffers.recv_buffered_bytes,
+		bytebuf_readable(s->recvbuf));
 	bytebuf_reset(s->recvbuf);
 	s->buffered_bytes = 0;
 	mux_session_discard_stream_frames(s->session, s->id);
@@ -475,7 +477,7 @@ static void stream_flush_local(struct mux_stream *s)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		const size_t nwrite = stream_local_write(s, data, len);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		if (nwrite == 0) {
@@ -624,7 +626,7 @@ static void stream_on_send(struct mux_stream *s)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		local_on_connected(s);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
@@ -660,7 +662,7 @@ static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		for (;;) {
 			session_guard_begin(ss, &guard);
 			const bool more = stream_on_recv(s);
-			if (!session_guard_end(ss, &guard)) {
+			if (!session_guard_end(&guard)) {
 				return;
 			}
 			if (session_streams_freed(ss) || !more ||
@@ -673,7 +675,7 @@ static void local_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	    s->state != STREAM_CLOSED) {
 		session_guard_begin(ss, &guard);
 		stream_on_send(s);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 	}
@@ -707,7 +709,7 @@ static void timeout_cb(struct ev_loop *loop, ev_timer *w, const int revents)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_stream_abort(s, MUX_STATUS_INTERNAL_ERROR);
-	if (!session_guard_end(ss, &guard)) {
+	if (!session_guard_end(&guard)) {
 		return;
 	}
 	mux_session_flush(ss);
@@ -757,11 +759,6 @@ struct mux_stream *mux_stream_new(
 	s->socket.w_timeout.data = s;
 	ev_timer_init(&s->socket.w_read_retry, read_retry_cb, 0.0, 0.0);
 	s->socket.w_read_retry.data = s;
-	s->recvbuf = bytebuf_new(ss->max_payload);
-	if (s->recvbuf == NULL) {
-		free(s);
-		return NULL;
-	}
 	if (active_open) {
 		COUNTER_ADD(ss->cnt.stream.num_stream_opened, 1);
 	} else {
@@ -798,10 +795,11 @@ void mux_stream_free(struct mux_stream *s)
 		s->session->cnt.buffers.send_buffered_frames,
 		s->send_queue.count);
 	mux_frame_list_clear(&s->send_queue, &s->session->pool);
-	ASSERT(s->session->recv_buffered_bytes >= s->recvbuf->len);
-	s->session->recv_buffered_bytes -= s->recvbuf->len;
+	ASSERT(s->session->recv_buffered_bytes >= bytebuf_readable(s->recvbuf));
+	s->session->recv_buffered_bytes -= bytebuf_readable(s->recvbuf);
 	COUNTER_SUB(
-		s->session->cnt.buffers.recv_buffered_bytes, s->recvbuf->len);
+		s->session->cnt.buffers.recv_buffered_bytes,
+		bytebuf_readable(s->recvbuf));
 	bytebuf_free(s->recvbuf);
 	if (!s->is_direct && s->socket.w_io.fd != -1) {
 		/* stream_mark_closed releases the fd of every stream that ends on its
@@ -1193,7 +1191,7 @@ static inline void stream_notify_readable(struct mux_stream *s)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		stream_flush_local(s);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		/* stream_flush_local can close the last active stream of a
@@ -1221,7 +1219,7 @@ static void stream_abort_notify_close(struct mux_stream *s)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		stream_rst_notify_direct(s);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
@@ -1280,10 +1278,10 @@ void mux_stream_recv_copy(
 	 * in uint_least32_t, freezing the credit loop for the session's life.
 	 * bytes_received and grant_sent both wrap, so compare via the module's
 	 * wrap-safe idiom rather than magnitude: the outstanding credit
-	 * (grant_sent - bytes_received) must cover this frame. payload_len is
-	 * frame-bounded (<= 16 KiB) so the subtraction never wraps in the
-	 * over-send direction; a plain-magnitude compare would instead abort a
-	 * conforming bulk stream every ~4 GiB, when grant_sent wraps first. */
+	 * (grant_sent - bytes_received) must cover this frame. A plain-magnitude
+	 * compare would instead abort a conforming bulk stream every ~4 GiB,
+	 * when grant_sent wraps first. Incoming payload is bounded by the
+	 * 16-bit wire Length (65535 octets), not our outbound frame limit. */
 	if (payload_len > (uint_fast32_t)(s->grant_sent - s->bytes_received)) {
 		STREAM_LOG_F(
 			WARNING, s,
@@ -1293,8 +1291,8 @@ void mux_stream_recv_copy(
 		mux_stream_abort(s, MUX_STATUS_FLOW_CONTROL_ERROR);
 		return;
 	}
-	/* Window updates are quantized to MUX_WINDOW_UNIT; up to one full payload
-	 * of over-window data is tolerated.  Hard cap: recv_window. */
+	/* Independently cap undrained payload at recv_window. Window increments
+	 * are quantized to MUX_WINDOW_UNIT, but this buffer limit is strict. */
 	if (s->buffered_bytes + payload_len > s->recv_window) {
 		STREAM_LOG_F(
 			WARNING, s,
@@ -1337,7 +1335,7 @@ void mux_stream_recv_copy(
 		session_guard_begin(ss, &guard);
 		const size_t nwrite =
 			stream_local_write(s, payload, payload_len);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		if (session_streams_freed(ss) || s->state == STREAM_CLOSED) {
@@ -1630,7 +1628,7 @@ void mux_stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		stream_rst_notify_direct(s);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		if (session_streams_freed(ss)) {
@@ -1644,10 +1642,11 @@ void mux_stream_recv_rst(struct mux_stream *s, const uint_fast16_t status)
 	/* Discard outbound frames and the inbound receive buffer (spec §4.3.4:
 	 * data buffered in the receive buffer MUST be discarded on RST). */
 	mux_session_discard_stream_frames(s->session, s->id);
-	ASSERT(s->session->recv_buffered_bytes >= s->recvbuf->len);
-	s->session->recv_buffered_bytes -= s->recvbuf->len;
+	ASSERT(s->session->recv_buffered_bytes >= bytebuf_readable(s->recvbuf));
+	s->session->recv_buffered_bytes -= bytebuf_readable(s->recvbuf);
 	COUNTER_SUB(
-		s->session->cnt.buffers.recv_buffered_bytes, s->recvbuf->len);
+		s->session->cnt.buffers.recv_buffered_bytes,
+		bytebuf_readable(s->recvbuf));
 	bytebuf_reset(s->recvbuf);
 	s->buffered_bytes = 0;
 	stream_mark_closed(s);

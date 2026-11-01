@@ -318,6 +318,7 @@ struct bytebuf {
 	unsigned char data[];
 };
 
+/* NULL represents an empty, unallocated buffer for reset/readable/reserve/shrink. */
 bool mux_bytebuf_reserve(
 	struct bytebuf **restrict rbp, size_t need, bool can_grow);
 
@@ -345,13 +346,15 @@ static inline void bytebuf_free(struct bytebuf *restrict rb)
 
 static inline void bytebuf_reset(struct bytebuf *restrict rb)
 {
-	rb->off = 0;
-	rb->len = 0;
+	if (rb != NULL) {
+		rb->off = 0;
+		rb->len = 0;
+	}
 }
 
 static inline size_t bytebuf_readable(const struct bytebuf *restrict rb)
 {
-	return rb->len;
+	return rb != NULL ? rb->len : 0;
 }
 
 static inline size_t bytebuf_write_space(const struct bytebuf *restrict rb)

@@ -52,6 +52,8 @@ static bool g_wire_send_ret;
 static size_t g_wire_send_nsend; /* bytes accepted; SIZE_MAX = all requested */
 static int g_wire_send_calls;
 static int g_track_sent_calls;
+static bool g_track_sent_releases_session;
+static bool g_track_sent_stalls;
 static int g_track_partial_calls;
 static int g_suspend_calls;
 static int g_reset_calls;
@@ -89,6 +91,8 @@ static void spies_reset(void)
 	g_wire_send_nsend = SIZE_MAX;
 	g_wire_send_calls = 0;
 	g_track_sent_calls = 0;
+	g_track_sent_releases_session = false;
+	g_track_sent_stalls = false;
 	g_track_partial_calls = 0;
 	g_suspend_calls = 0;
 	g_reset_calls = 0;
@@ -312,6 +316,25 @@ bool mux_wire_send(
 	return true;
 }
 
+unsigned char *
+mux_wire_sendbuf_extend(struct mux_session *restrict ss, const size_t len)
+{
+	if (!ss->wire.sendbuf_staging) {
+		return NULL;
+	}
+	struct mux_frame *const tail = ss->wire.sendbuf.tail;
+	size_t cap = MUX_FRAME_HEADER_SIZE + tail->cap;
+	if (cap > MUX_MAX_RECORD) {
+		cap = MUX_MAX_RECORD;
+	}
+	if (tail->len > cap || len > cap - tail->len) {
+		return NULL;
+	}
+	unsigned char *const span = tail->data + tail->len;
+	tail->len += len;
+	return span;
+}
+
 void mux_wire_sendbuf_push(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
@@ -467,7 +490,19 @@ void mux_unacked_track_sent(
 	/* The real implementation takes ownership; mirror that so the flush
 	 * tests, which fully send a frame, do not leak it. */
 	g_track_sent_calls++;
+	if (g_track_sent_stalls) {
+		ss->unacked.stalled = true;
+	}
 	mux_frame_put(&ss->pool, frame);
+	if (g_track_sent_releases_session) {
+		/* A failed reliability handoff resets, then LOST lets the owner
+		 * close the session and invalidate every outstanding guard. */
+		for (struct mux_session_guard *guard = ss->guards;
+		     guard != NULL; guard = guard->previous) {
+			guard->session = NULL;
+		}
+		free(ss);
+	}
 }
 
 /* Leaves the frame untouched: the prefix accounting itself is unacked.c's,
@@ -503,6 +538,15 @@ void mux_unacked_free_all(struct mux_session *restrict ss)
  * external references bind to the spies above.  mux_session_on_send / mux_session_flush /
  * session_flush_inline now live in send.c. */
 #include "send.c"
+
+void session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
+{
+	*guard = (struct mux_session_guard){
+		.session = ss,
+		.previous = ss->guards,
+	};
+	ss->guards = guard;
+}
 
 /* Fixture: a minimal session with a real loop and the mux socket watcher.
  * modify_io_events asserts a valid fd, so w_socket is bound to a live pipe end
@@ -1828,14 +1872,12 @@ T_DECLARE_CASE(test_update_send_timeout_rearms_while_pending)
 	T_EXPECT(active);
 }
 
-/* TCP_USER_TIMEOUT zeroes w_send_timeout.repeat, on the
- * (correct, for every other case) assumption that the kernel mechanism
+/* TCP_USER_TIMEOUT zeroes w_send_timeout.repeat because the kernel mechanism
  * covers "peer stopped acking data we already wrote to the socket". A resume
  * retransmit stalled by a frame-pool OOM never reached the socket at all --
  * retransmit_off stays set with sendbuf still empty -- so the kernel has
  * nothing to time out on either. update_send_timeout must still arm a real
- * interval for this one case, or #25's watchdog fix is unreachable dead code
- * on every build where TCP_USER_TIMEOUT actually works (i.e. Linux). */
+ * interval for this stall even when TCP_USER_TIMEOUT is available. */
 T_DECLARE_CASE(
 	test_update_send_timeout_arms_despite_kernel_timeout_for_oom_stall)
 {
@@ -1933,6 +1975,151 @@ T_DECLARE_CASE(test_update_send_timeout_restores_kernel_after_oom_stall_clears)
 
 	T_EXPECT(!active);
 	T_EXPECT(repeat == 0.0);
+}
+
+/* A writable socket and successful OOB sends cannot resolve a mux-window stall.
+ * Hold an earlier pending deadline explicitly, without advancing wall time. */
+T_DECLARE_SUBCASE(
+	window_stall_watchdog, const bool kernel_timeout, const bool active)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	struct mux_stream pending = { 0 };
+	fx.ss.conf.send_timeout = 5;
+	fx.ss.wire.kernel_send_timeout = kernel_timeout;
+	fx.ss.unacked.stalled = true;
+	if (active) {
+		fx.ss.sched.drr_active = &pending;
+	} else {
+		fx.ss.sched.sched_head = &pending;
+	}
+	ev_timer_init(
+		&fx.ss.w_send_timeout, si_noop_timer_cb, 0.0,
+		kernel_timeout ? 0.0 : 5.0);
+	const bool has_pending = send_has_pending_work(&fx.ss);
+	const bool sendable = send_has_sendable_work(&fx.ss);
+	update_send_timeout(&fx.ss, false);
+	const bool armed = ev_is_active(&fx.ss.w_send_timeout);
+	const ev_tstamp repeat = fx.ss.w_send_timeout.repeat;
+	/* If OOB progress incorrectly restarts the timer, its deadline becomes
+	 * now+5 rather than the retained now+1 set here. */
+	ev_timer_stop(fx.loop, &fx.ss.w_send_timeout);
+	ev_timer_set(&fx.ss.w_send_timeout, 1.0, 5.0);
+	ev_timer_start(fx.loop, &fx.ss.w_send_timeout);
+	const ev_tstamp deadline = fx.ss.w_send_timeout.at;
+	update_send_timeout(&fx.ss, true);
+	const bool kept = fx.ss.w_send_timeout.at == deadline;
+	/* An inactive watchdog must still restart even without transport progress. */
+	ev_timer_stop(fx.loop, &fx.ss.w_send_timeout);
+	update_send_timeout(&fx.ss, false);
+	const bool rearmed = ev_is_active(&fx.ss.w_send_timeout);
+
+	fx.ss.unacked.stalled = false;
+	update_send_timeout(&fx.ss, true);
+	const bool handed_back =
+		kernel_timeout ? !ev_is_active(&fx.ss.w_send_timeout) &&
+					 fx.ss.w_send_timeout.repeat == 0.0 :
+				 ev_is_active(&fx.ss.w_send_timeout);
+	fx.ss.sched.sched_head = NULL;
+	fx.ss.sched.drr_active = NULL;
+	update_send_timeout(&fx.ss, false);
+	const bool stopped = !ev_is_active(&fx.ss.w_send_timeout);
+	const bool idle_repeat =
+		!kernel_timeout || fx.ss.w_send_timeout.repeat == 0.0;
+	si_teardown(&fx);
+
+	T_EXPECT(has_pending);
+	T_EXPECT(!sendable);
+	T_EXPECT(armed);
+	T_EXPECT_EQ(repeat, 5.0);
+	T_EXPECT(kept);
+	T_EXPECT(rearmed);
+	T_EXPECT(handed_back);
+	T_EXPECT(stopped);
+	T_EXPECT(idle_repeat);
+}
+
+T_DECLARE_CASE(test_window_stall_watchdog_ignores_transport_progress)
+{
+	T_CALL_SUBCASE(window_stall_watchdog, false, false);
+	T_CALL_SUBCASE(window_stall_watchdog, false, true);
+	T_CALL_SUBCASE(window_stall_watchdog, true, false);
+	T_CALL_SUBCASE(window_stall_watchdog, true, true);
+}
+
+/* A successful payload flush that fills the window begins a fresh stall;
+ * its deadline must not inherit an earlier transport-backpressure deadline. */
+T_DECLARE_CASE(test_new_window_stall_renews_transport_deadline)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	struct mux_stream pending = { 0 };
+	fx.ss.sched.sched_head = &pending;
+	fx.ss.conf.send_timeout = 5;
+	ev_timer_init(&fx.ss.w_send_timeout, si_noop_timer_cb, 1.0, 5.0);
+	ev_timer_start(fx.loop, &fx.ss.w_send_timeout);
+	const ev_tstamp old_deadline = fx.ss.w_send_timeout.at;
+	(void)si_queue_sendbuf(_t_, &fx, 100);
+	g_track_sent_stalls = true;
+	mux_session_on_send(&fx.ss);
+	const bool stalled = fx.ss.unacked.stalled;
+	const bool renewed = ev_is_active(&fx.ss.w_send_timeout) &&
+			     fx.ss.w_send_timeout.at > old_deadline;
+	fx.ss.sched.sched_head = NULL;
+	ev_timer_stop(fx.loop, &fx.ss.w_send_timeout);
+	si_teardown(&fx);
+
+	T_EXPECT(stalled);
+	T_EXPECT(renewed);
+}
+
+/* Neither idle sessions, other lifecycle states nor an explicitly disabled
+ * send timeout may acquire a window-stall watchdog. */
+T_DECLARE_CASE(test_window_stall_watchdog_eligibility)
+{
+	struct si_fixture fx;
+	if (si_setup(&fx) != 0) {
+		T_FATAL("si_setup failed");
+		return;
+	}
+	spies_reset();
+	struct mux_stream pending = { 0 };
+	fx.ss.conf.send_timeout = 5;
+	fx.ss.wire.kernel_send_timeout = true;
+	fx.ss.unacked.stalled = true;
+	ev_timer_init(&fx.ss.w_send_timeout, si_noop_timer_cb, 0.0, 0.0);
+	update_send_timeout(&fx.ss, false);
+	const bool idle = !ev_is_active(&fx.ss.w_send_timeout);
+	fx.ss.sched.sched_head = &pending;
+	fx.ss.state = SESSION_HANDSHAKE;
+	update_send_timeout(&fx.ss, false);
+	const bool handshake = !ev_is_active(&fx.ss.w_send_timeout);
+	fx.ss.state = SESSION_ESTABLISHED;
+	fx.ss.conf.send_timeout = 0;
+	update_send_timeout(&fx.ss, true);
+	const bool disabled = !ev_is_active(&fx.ss.w_send_timeout);
+	fx.ss.conf.send_timeout = 5;
+	update_send_timeout(&fx.ss, false);
+	const bool armed = ev_is_active(&fx.ss.w_send_timeout);
+	fx.ss.sched.sched_head = NULL;
+	update_send_timeout(&fx.ss, false);
+	const bool drained = !ev_is_active(&fx.ss.w_send_timeout) &&
+			     fx.ss.w_send_timeout.repeat == 0.0;
+	si_teardown(&fx);
+
+	T_EXPECT(idle);
+	T_EXPECT(handshake);
+	T_EXPECT(disabled);
+	T_EXPECT(armed);
+	T_EXPECT(drained);
 }
 
 /* send_stage_next's priority ladder tries the resume
@@ -2944,7 +3131,63 @@ T_DECLARE_CASE(test_discard_stream_frames_keeps_blocked_tls_head)
 }
 #endif /* WITH_TLS */
 
+T_DECLARE_CASE(test_send_pump_stops_after_track_sent_releases_session)
+{
+	struct si_fixture fx;
+	T_CHECK(si_setup(&fx) == 0);
+	spies_reset();
+	struct mux_session *const ss = malloc(sizeof(*ss));
+	T_CHECK(ss != NULL);
+	*ss = fx.ss;
+	struct mux_frame *const frame = mux_frame_get(&ss->pool, 32);
+	T_CHECK(frame != NULL);
+	frame->pos = 0;
+	frame->len = MUX_FRAME_HEADER_SIZE;
+	mux_frame_list_push(&ss->wire.sendbuf, frame);
+	g_track_sent_releases_session = true;
+	mux_session_on_send(ss);
+	g_track_sent_releases_session = false;
+	si_teardown(&fx);
+	T_EXPECT_EQ(g_track_sent_calls, 1);
+	T_EXPECT_EQ(g_sched_next_data_calls, 0);
+	T_EXPECT_EQ(fx.pool_ctx.alloc_calls, fx.pool_ctx.free_calls);
+}
+
+T_DECLARE_CASE(test_send_ctrl_uses_staging_tail_without_pool_allocation)
+{
+	spies_reset();
+	struct si_fixture fx;
+	T_CHECK(si_setup(&fx) == 0);
+	struct mux_frame *const seed = mux_frame_get(&fx.ss.pool, 64);
+	if (seed == NULL) {
+		si_teardown(&fx);
+		T_FATAL("frame allocation failed");
+		return;
+	}
+	seed->len = MUX_FRAME_HEADER_SIZE;
+	mux_frame_list_push(&fx.ss.wire.sendbuf, seed);
+	fx.ss.wire.sendbuf_staging = true;
+	fx.pool_ctx.fail = true;
+	const bool ok =
+		mux_session_send_ctrl(&fx.ss, 5, MUX_FLAG_RST, UINT32_MAX);
+	struct mux_header header = { 0 };
+	if (ok) {
+		mux_read_header(seed->data + MUX_FRAME_HEADER_SIZE, &header);
+	}
+	const size_t len = seed->len;
+	const size_t count = fx.ss.wire.sendbuf.count;
+	si_teardown(&fx);
+	T_EXPECT(ok);
+	T_EXPECT_EQ(fx.pool_ctx.alloc_calls, (uint_least32_t)1);
+	T_EXPECT_EQ(len, (size_t)(2 * MUX_FRAME_HEADER_SIZE));
+	T_EXPECT_EQ(count, (size_t)1);
+	T_EXPECT_EQ(header.stream_id, (uint_least16_t)5);
+	T_EXPECT_EQ(header.extra, (uint_least16_t)UINT16_MAX);
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_send_ctrl_uses_staging_tail_without_pool_allocation),
+	T_CASE(test_send_pump_stops_after_track_sent_releases_session),
 	T_CASE(test_setup_frame_allocation_failure_reports_and_cleans_up),
 	T_CASE(test_send_cb_defers_lp_drain_before_established),
 	T_CASE(test_send_cb_drains_lp_when_established),
@@ -2981,6 +3224,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_flush_head_error_suspends),
 	T_CASE(test_flush_head_error_resets),
 	T_CASE(test_update_send_timeout_rearms_while_pending),
+	T_CASE(test_window_stall_watchdog_ignores_transport_progress),
+	T_CASE(test_window_stall_watchdog_eligibility),
+	T_CASE(test_new_window_stall_renews_transport_deadline),
 	T_CASE(test_update_send_timeout_arms_despite_kernel_timeout_for_oom_stall),
 	T_CASE(test_update_send_timeout_trusts_kernel_once_sendbuf_queued),
 	T_CASE(test_update_send_timeout_restores_kernel_after_oom_stall_clears),

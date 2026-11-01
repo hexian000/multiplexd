@@ -1112,7 +1112,7 @@ wire_test_fill_pattern(unsigned char *restrict buf, const size_t len)
  * plaintext is left decrypted inside the TLS library.  Returns the first
  * chunk's length (0 on failure). */
 static size_t wire_test_recv_first_chunk(
-	struct wire_test_tls_pair *restrict p, unsigned char *restrict rx)
+	struct wire_test_tls_pair *p, unsigned char *restrict rx)
 {
 	unsigned char msg[WIRE_TEST_DRAIN_MSG_LEN];
 	wire_test_fill_pattern(msg, sizeof(msg));
@@ -1187,7 +1187,7 @@ T_DECLARE_CASE(test_wire_recv_buffered_drains_plaintext_before_socket)
  * server so the drain path's next wire_cipher_push has something to send.
  * Returns false if the first chunk never arrived or nothing could be staged. */
 static bool wire_test_drain_with_residue(
-	struct wire_test_tls_pair *restrict p, unsigned char *restrict rx)
+	struct wire_test_tls_pair *p, unsigned char *restrict rx)
 {
 	static const size_t residue_len = 16;
 	if (wire_test_recv_first_chunk(p, rx) == 0) {
@@ -1304,8 +1304,8 @@ T_DECLARE_CASE(test_wire_recv_buffered_stale_readable_reads_socket)
  * elapse), appending plaintext to out[0..cap).  Returns false as soon as
  * mux_wire_recv does. */
 static bool wire_test_recv_until_closed(
-	struct mux_session *restrict ss, unsigned char *restrict out,
-	const size_t cap, size_t *restrict got, const int max_calls)
+	struct mux_session *ss, unsigned char *restrict out, const size_t cap,
+	size_t *restrict got, const int max_calls)
 {
 	*got = 0;
 	for (int i = 0; i < max_calls && ss->wire.rx_open; i++) {
@@ -1849,8 +1849,8 @@ T_DECLARE_CASE(test_wire_wait_eof_tls_offload_error_on_appdata)
  * copies arrive intact, driving any pending handshake on the way.  Returns
  * false on a wire error, a corrupted payload, or no delivery in the budget. */
 static bool wire_test_tls_exchange(
-	struct mux_session *restrict cli_ss,
-	struct mux_session *restrict srv_ss, const char *restrict msg)
+	struct mux_session *cli_ss, struct mux_session *srv_ss,
+	const char *restrict msg)
 {
 	const size_t len = strlen(msg);
 	unsigned char cli_rx[4096], srv_rx[4096];

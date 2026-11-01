@@ -26,6 +26,11 @@ struct mux_frame;
  * data, flushing to the transport.  Entry point from session.c:socket_cb. */
 void mux_session_on_send(struct mux_session *ss);
 
+/* Refresh the established-session send watchdog after mux ACK progress,
+ * window growth, or a config reload, including userspace deadlines for stalls
+ * TCP_USER_TIMEOUT cannot cover. */
+void mux_session_refresh_send_timeout(struct mux_session *restrict ss);
+
 /* Wake the write path (arm EV_WRITE) when there is egress to flush; no-op
  * unless SESSION_ESTABLISHED. */
 void mux_notify_write(struct mux_session *restrict ss);

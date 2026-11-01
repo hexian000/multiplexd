@@ -23,6 +23,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+void session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
+{
+	*guard = (struct mux_session_guard){
+		.session = ss,
+		.previous = ss->guards,
+	};
+	ss->guards = guard;
+}
+
 /* frame.c data global the header-inline framing helpers reference; defined here
  * since this white-box TU does not link frame.c. Keep max_frame_payload in step
  * with the real definition in frame.c (16384 - MUX_FRAME_HEADER_SIZE): it feeds
@@ -912,7 +921,8 @@ T_DECLARE_CASE(test_sched_drain_lp_syn_oom_aborts_unopened)
 {
 	static struct mux_session ss;
 	T_CALL_SUBCASE(make_case_session, &ss);
-	struct mux_stream stream = {
+	static struct mux_stream stream;
+	stream = (struct mux_stream){
 		.id = 11,
 		.state = STREAM_INIT,
 		.session = &ss,
@@ -937,7 +947,8 @@ T_DECLARE_CASE(test_sched_drain_lp_sends_syn_for_init_stream)
 {
 	static struct mux_session ss;
 	T_CALL_SUBCASE(make_case_session, &ss);
-	struct mux_stream stream = {
+	static struct mux_stream stream;
+	stream = (struct mux_stream){
 		.id = 11,
 		.state = STREAM_INIT,
 	};

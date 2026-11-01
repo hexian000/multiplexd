@@ -14,6 +14,7 @@
 
 #include "algo/hashtable.h"
 #include "meta/arraysize.h"
+#include "utils/slog.h"
 #include "utils/testing.h"
 
 #include <inttypes.h>
@@ -27,6 +28,15 @@
 
 /* Pull in the static symbols under test directly. */
 #include "handshake.c"
+
+void session_guard_begin(struct mux_session *ss, struct mux_session_guard *guard)
+{
+	*guard = (struct mux_session_guard){
+		.session = ss,
+		.previous = ss->guards,
+	};
+	ss->guards = guard;
+}
 
 /* mock - collaborator mocks, frame pool, session fixtures, helpers */
 
@@ -56,6 +66,7 @@ static int g_verify_calls;
 static bool g_verify_result;
 static bool g_verify_saw_null;
 static char g_verify_identity[256];
+static bool g_peer_identity_reused;
 
 static void handshake_mock_reset(void)
 {
@@ -73,6 +84,7 @@ static void handshake_mock_reset(void)
 	g_verify_result = true;
 	g_verify_saw_null = false;
 	g_verify_identity[0] = '\0';
+	g_peer_identity_reused = false;
 }
 
 static bool
@@ -158,10 +170,12 @@ void mux_unacked_free_all(struct mux_session *restrict ss)
 	COUNTER_SUB(ss->cnt.buffers.unacked_frames, ss->unacked.frames);
 	ss->unacked.frames = 0;
 	ss->unacked.bytes = 0;
+	ss->unacked.memory_bytes = 0;
 	ss->unacked.partial_offset = 0;
 	unacked_set_replay_off(&ss->unacked, SIZE_MAX);
 	ss->unacked.retransmit_copy = NULL;
 	ss->unacked.retransmit_copy_count = 0;
+	ss->unacked.retransmit_copy_sent = 0;
 	ss->unacked.stalled = false;
 }
 
@@ -175,6 +189,7 @@ void mux_sched_free_streams(struct mux_session *restrict ss)
 	ss->sched.lp_tail = NULL;
 	ss->sched.delay_head = NULL;
 	ss->sched.num_tombstones = 0;
+	ss->sched.num_closed = 0;
 	ss->sched.next_stream_id = 0;
 	if (ss->sched.streams != NULL) {
 		table_free(ss->sched.streams);
@@ -346,7 +361,7 @@ T_DECLARE_CASE(test_proto_hello_build_and_parse_max_identity)
 
 T_DECLARE_CASE(test_proto_hello_parse_rejects_missing_type)
 {
-	static const unsigned char json[] = "{\"msgid\":0}";
+	unsigned char json[] = "{\"msgid\":0}";
 	struct proto_hello parsed;
 
 	T_EXPECT(!proto_hello_parse(
@@ -359,7 +374,7 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_missing_type)
  * proto_parse_type validates obj.type.len, not strlen. */
 T_DECLARE_CASE(test_proto_hello_parse_rejects_type_embedded_nul)
 {
-	static const unsigned char json[] =
+	unsigned char json[] =
 		"{\"type\":\"application/x-multiplexd-proto; version=1\\u0000x\","
 		"\"msgid\":0}";
 	struct proto_hello parsed;
@@ -370,7 +385,7 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_type_embedded_nul)
 
 T_DECLARE_CASE(test_proto_hello_parse_rejects_bad_session_id)
 {
-	static const unsigned char json[] =
+	unsigned char json[] =
 		"{\"type\":\"application/x-multiplexd-proto; version=1\","
 		"\"msgid\":0,\"session_id\":\"bad\"}";
 	struct proto_hello parsed;
@@ -394,8 +409,8 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_oversized_identity)
 		identity);
 
 	T_EXPECT(!proto_hello_parse(
-		&k_parse_test_session, (const unsigned char *)json,
-		strlen(json), &parsed));
+		&k_parse_test_session, (unsigned char *)json, strlen(json),
+		&parsed));
 }
 
 /* An identity extension with an embedded NUL (a JSON u0000 escape) whose
@@ -405,7 +420,7 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_oversized_identity)
  * differential proto_parse_type/proto_parse_session_id reject. */
 T_DECLARE_CASE(test_proto_hello_parse_rejects_identity_embedded_nul)
 {
-	static const unsigned char json[] =
+	unsigned char json[] =
 		"{\"type\":\"application/x-multiplexd-proto; version=1\","
 		"\"msgid\":0,\"extensions\":{\"identity\":\"svc\\u0000x\"}}";
 	struct proto_hello parsed;
@@ -419,27 +434,26 @@ T_DECLARE_CASE(test_proto_hello_parse_rejects_identity_embedded_nul)
  * string decoder proto_hello_parse relies on, not silently accepted. */
 T_DECLARE_CASE(test_proto_hello_parse_rejects_invalid_utf8_identity)
 {
-	static const char json[] =
-		"{\"type\":\"application/x-multiplexd-proto; version=1\","
-		"\"msgid\":0,\"extensions\":{\"identity\":\"\xc2(\"}}";
+	char json[] = "{\"type\":\"application/x-multiplexd-proto; version=1\","
+		      "\"msgid\":0,\"extensions\":{\"identity\":\"\xc2(\"}}";
 	struct proto_hello parsed;
 
 	T_EXPECT(!proto_hello_parse(
-		&k_parse_test_session, (const unsigned char *)json,
-		sizeof(json) - 1, &parsed));
+		&k_parse_test_session, (unsigned char *)json, sizeof(json) - 1,
+		&parsed));
 }
 
 /* Well-formed multi-byte UTF-8 in the identity extension must still parse. */
 T_DECLARE_CASE(test_proto_hello_parse_accepts_well_formed_utf8_identity)
 {
-	static const char json[] =
+	char json[] =
 		"{\"type\":\"application/x-multiplexd-proto; version=1\","
 		"\"msgid\":0,\"extensions\":{\"identity\":\"\xc3\xa9\xe4\xb8\xad\"}}";
 	struct proto_hello parsed;
 
 	T_CHECK(proto_hello_parse(
-		&k_parse_test_session, (const unsigned char *)json,
-		sizeof(json) - 1, &parsed));
+		&k_parse_test_session, (unsigned char *)json, sizeof(json) - 1,
+		&parsed));
 	T_EXPECT(parsed.has_identity);
 	T_EXPECT_STREQ(parsed.identity, "\xc3\xa9\xe4\xb8\xad");
 }
@@ -711,6 +725,8 @@ T_DECLARE_SUBCASE(
 	ss.callbacks.on_verify_identity = verify_identity_cb;
 	ss.handshake.peer_identity = strdup(stale_identity);
 	T_CHECK(ss.handshake.peer_identity != NULL);
+	const uintptr_t previous_identity =
+		(uintptr_t)ss.handshake.peer_identity;
 	if (claim != NULL) {
 		(void)snprintf(
 			hello.identity, sizeof(hello.identity), "%s", claim);
@@ -729,6 +745,8 @@ T_DECLARE_SUBCASE(
 	bytebuf_produce(ss.wire.recvbuf, frame->len);
 
 	*ok_out = mux_handshake_process_hello(&ss, &hdr, frame->len);
+	g_peer_identity_reused =
+		(uintptr_t)ss.handshake.peer_identity == previous_identity;
 	(void)snprintf(
 		latched_out, latched_size, "%s",
 		ss.handshake.peer_identity != NULL ?
@@ -796,6 +814,50 @@ T_DECLARE_CASE(test_handshake_client_resume_reverifies_inherited_identity)
 	T_EXPECT_STREQ(latched, "alice");
 }
 
+T_DECLARE_CASE(test_handshake_reuses_unchanged_peer_identity_and_reverifies)
+{
+	static const struct {
+		const char *previous;
+		const char *claim;
+		bool resume;
+		bool reused;
+		bool accepted;
+	} cases[] = {
+		{ "alice", "alice", true, true, true },
+		{ "", "", true, true, true },
+		{ "alice", "alice", false, true, true },
+		{ "alice", "bob", true, false, true },
+		{ "alice", NULL, true, true, true },
+		{ "alice", NULL, false, false, true },
+		{ "alice", "bob", false, false, true },
+		{ "alice", "alice", true, true, false },
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		handshake_mock_reset();
+		g_verify_result = cases[i].accepted;
+		bool ok = false;
+		char latched[64];
+		T_CALL_SUBCASE(
+			run_client_verify_identity_hello, cases[i].previous,
+			cases[i].claim, cases[i].resume, &ok, latched,
+			sizeof(latched));
+		const char *const expected =
+			cases[i].claim != NULL ?
+				cases[i].claim :
+				(cases[i].resume ? cases[i].previous : NULL);
+		T_EXPECT_EQ(ok, cases[i].accepted);
+		T_EXPECT_EQ(g_peer_identity_reused, cases[i].reused);
+		T_EXPECT_EQ(g_verify_calls, 1);
+		T_EXPECT_EQ(g_verify_saw_null, expected == NULL);
+		T_EXPECT_STREQ(latched, expected != NULL ? expected : "");
+		if (expected != NULL) {
+			T_EXPECT_STREQ(g_verify_identity, expected);
+		}
+		T_EXPECT_EQ(g_reset_calls, cases[i].accepted ? 0 : 1);
+		T_EXPECT_EQ(g_handshake_done_calls, cases[i].accepted ? 1 : 0);
+	}
+}
+
 T_DECLARE_CASE(test_handshake_process_server_hello_assigns_peer_identity)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
@@ -860,12 +922,9 @@ T_DECLARE_CASE(test_handshake_process_server_hello_assigns_peer_identity)
 	T_EXPECT_STREQ(peer_identity, "srv-a");
 }
 
-/* The client's fresh-session fallback delegates the whole unacked teardown to
- * mux_unacked_free_all, so this pins the field set that contract owns: the
- * replay cursor routed through unacked_set_replay_off (which also zeroes
- * retransmitted_frames), retransmit_copy_count cleared, and the unacked_frames
- * gauge paid back. A double that skipped any of them would let a case here
- * pass against behavior production does not have. */
+/* Fresh-session fallback discards the old reliability and stream-table state,
+ * but preserves the session's fixed retransmit allocation budget. Pin both
+ * teardown doubles to those production contracts with nonzero old state. */
 T_DECLARE_CASE(test_handshake_client_fresh_clears_unacked_replay_state)
 {
 	struct frame_pool_ctx pool_ctx = { 0 };
@@ -883,11 +942,16 @@ T_DECLARE_CASE(test_handshake_client_fresh_clears_unacked_replay_state)
 	/* Server answers with an id of its own: not a confirmed resume, so the
 	 * client falls back to a fresh session. */
 	memset(hello.session_id, 0x44, sizeof(hello.session_id));
+	ss.handshake.has_session_id = true;
 	ss.cnt.buffers.unacked_frames = &unacked_gauge;
 	ss.unacked.frames = 7;
+	ss.unacked.memory_bytes = 4096;
+	ss.unacked.memory_limit = 65536;
 	ss.unacked.retransmit_off = 0;
 	ss.unacked.retransmitted_frames = 3;
 	ss.unacked.retransmit_copy_count = 5;
+	ss.unacked.retransmit_copy_sent = 2;
+	ss.sched.num_closed = 2;
 	T_CHECK(build_hello_frame(frame, &hdr, &hello));
 	bytebuf_free(ss.wire.recvbuf);
 	ss.wire.recvbuf = bytebuf_new(frame->len);
@@ -897,9 +961,13 @@ T_DECLARE_CASE(test_handshake_client_fresh_clears_unacked_replay_state)
 
 	const bool ok = mux_handshake_process_hello(&ss, &hdr, frame->len);
 	const size_t frames = ss.unacked.frames;
+	const size_t memory_bytes = ss.unacked.memory_bytes;
+	const size_t memory_limit = ss.unacked.memory_limit;
+	const size_t num_closed = ss.sched.num_closed;
 	const size_t replay_off = ss.unacked.retransmit_off;
 	const size_t retransmitted = ss.unacked.retransmitted_frames;
 	const size_t copy_count = ss.unacked.retransmit_copy_count;
+	const size_t copy_sent = ss.unacked.retransmit_copy_sent;
 	const size_t gauge =
 		(size_t)COUNTER_LOAD(ss.cnt.buffers.unacked_frames);
 
@@ -912,10 +980,63 @@ T_DECLARE_CASE(test_handshake_client_fresh_clears_unacked_replay_state)
 
 	T_EXPECT(ok);
 	T_EXPECT_EQ(frames, (size_t)0);
+	T_EXPECT_EQ(memory_bytes, (size_t)0);
+	T_EXPECT_EQ(memory_limit, (size_t)65536);
+	T_EXPECT_EQ(num_closed, (size_t)0);
 	T_EXPECT_EQ(replay_off, SIZE_MAX);
 	T_EXPECT_EQ(retransmitted, (size_t)0);
 	T_EXPECT_EQ(copy_count, (size_t)0);
+	T_EXPECT_EQ(copy_sent, (size_t)0);
 	T_EXPECT_EQ(gauge, (size_t)0);
+}
+
+T_DECLARE_CASE(test_handshake_process_hello_control_fields)
+{
+	const struct mux_header controls[] = {
+		{ 0 },
+		{ .flags = 1 },
+		{ .stream_id = 1 },
+		{ .extra = 1 },
+	};
+	for (size_t role = 0; role < 2; role++) {
+		const bool accepted = role != 0;
+		for (size_t i = 0; i < ARRAY_SIZE(controls); i++) {
+			struct frame_pool_ctx pool_ctx = { 0 };
+			struct mux_session ss;
+			TEST_FRAME(frame);
+			struct mux_header hdr;
+			const struct proto_hello hello = {
+				.msgid = accepted ? PROTO_MSG_CLIENT_HELLO :
+						    PROTO_MSG_SERVER_HELLO,
+				.has_session_id = true,
+			};
+			handshake_mock_reset();
+			setup_session(&ss, &pool_ctx, accepted);
+			T_CHECK(build_hello_frame(frame, &hdr, &hello));
+			hdr.flags = controls[i].flags;
+			hdr.stream_id = controls[i].stream_id;
+			hdr.extra = controls[i].extra;
+			mux_write_header(frame->data, &hdr);
+			ss.wire.recvbuf = bytebuf_new(frame->len);
+			T_CHECK(ss.wire.recvbuf != NULL);
+			memcpy(bytebuf_write_ptr(ss.wire.recvbuf), frame->data,
+			       frame->len);
+			bytebuf_produce(ss.wire.recvbuf, frame->len);
+
+			const bool ok = mux_handshake_process_hello(
+				&ss, &hdr, frame->len);
+			teardown_session(&ss);
+
+			const bool valid = i == 0;
+			T_EXPECT_EQ(ok, valid);
+			T_EXPECT_EQ(
+				ss.state,
+				valid ? SESSION_ESTABLISHED : SESSION_CLOSED);
+			T_EXPECT_EQ(g_reset_calls, valid ? 0 : 1);
+			T_EXPECT_EQ(g_handshake_done_calls, valid ? 1 : 0);
+			T_EXPECT_EQ(pool_ctx.alloc_calls, pool_ctx.free_calls);
+		}
+	}
 }
 
 T_DECLARE_CASE(test_handshake_process_resume_hello_calls_on_resume_match)
@@ -1331,9 +1452,8 @@ T_DECLARE_CASE(test_handshake_process_invalid_version_resets_session)
 	struct mux_session ss;
 	TEST_FRAME(frame);
 	struct mux_header hdr;
-	static const char json[] =
-		"{\"type\":\"application/x-multiplexd-proto; version=9\","
-		"\"msgid\":1}";
+	char json[] = "{\"type\":\"application/x-multiplexd-proto; version=9\","
+		      "\"msgid\":1}";
 
 	handshake_mock_reset();
 	setup_session(&ss, &pool_ctx, false);
@@ -1392,8 +1512,7 @@ T_DECLARE_CASE(test_worst_case_hello_fits_minimum_frame)
  * forms parsed as a plain 1 and established. */
 T_DECLARE_CASE(test_proto_parse_type_requires_canonical_version)
 {
-	static const char k_good[] =
-		"application/x-multiplexd-proto; version=1";
+	char k_good[] = "application/x-multiplexd-proto; version=1";
 	static const char *const k_bad[] = {
 		"application/x-multiplexd-proto; version=01",
 		"application/x-multiplexd-proto; version=001",
@@ -1408,17 +1527,102 @@ T_DECLARE_CASE(test_proto_parse_type_requires_canonical_version)
 
 	for (size_t i = 0; i < ARRAY_SIZE(k_bad); i++) {
 		version = 0;
+		char type[128];
+		(void)snprintf(type, sizeof(type), "%s", k_bad[i]);
 		T_EXPECT(!proto_parse_type(
-			&k_parse_test_session, k_bad[i], strlen(k_bad[i]),
-			&version));
+			&k_parse_test_session, type, strlen(type), &version));
 	}
+}
+
+struct handshake_log_capture {
+	char text[1024];
+	size_t len;
+	bool unsafe;
+};
+
+static void
+capture_handshake_log(void *data, const unsigned char *buf, size_t len)
+{
+	struct handshake_log_capture *const capture = data;
+	for (size_t i = 0; i < len; i++) {
+		if ((buf[i] < 0x20 && !(buf[i] == '\n' && i + 1 == len)) ||
+		    buf[i] == 0x7F ||
+		    (buf[i] == 0xC2 && i + 1 < len && buf[i + 1] >= 0x80 &&
+		     buf[i + 1] <= 0x9F)) {
+			capture->unsafe = true;
+		}
+	}
+	const size_t available = sizeof(capture->text) - capture->len - 1;
+	const size_t n = len < available ? len : available;
+	memcpy(capture->text + capture->len, buf, n);
+	capture->len += n;
+	capture->text[capture->len] = '\0';
+}
+
+T_DECLARE_CASE(test_proto_hello_diagnostics_escape_text)
+{
+	static const struct {
+		const char *type;
+		const char *expected;
+	} cases[] = {
+		{ "bad\\nFORGED\\r\\u001b\\u007f\\u009b",
+		  "unsupported protocol: \"bad\\nFORGED\\r\\x1b\\x7f\\xc2\\x9b\"" },
+		{ "application/x-multiplexd-proto; broken\\n\\u001b",
+		  "malformed protocol type parameter:" },
+		{ "application/x-multiplexd-proto; version=\\\"\\tFORGED\\\"",
+		  "invalid protocol version: \\tFORGED" },
+		{ "application/x-multiplexd-proto; version=\\\"1\\u009bFORGED\\\"",
+		  "invalid protocol version: 1\\xc2\\x9bFORGED" },
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		char json[512];
+		const int n = snprintf(
+			json, sizeof(json), "{\"type\":\"%s\",\"msgid\":1}",
+			cases[i].type);
+		T_CHECK(n > 0 && (size_t)n < sizeof(json));
+		struct handshake_log_capture capture = { 0 };
+		const int saved_level = slog_level_;
+		slog_setlevel(LOG_LEVEL_ERROR);
+		slog_setoutput(
+			SLOG_OUTPUT_WRITER, capture_handshake_log,
+			(void *)&capture);
+		struct proto_hello parsed;
+		const bool ok = proto_hello_parse(
+			&k_parse_test_session, (unsigned char *)json, (size_t)n,
+			&parsed);
+		slog_setoutput(SLOG_OUTPUT_DISCARD);
+		slog_setlevel(saved_level);
+		T_LOGF("case %zu: %s", i, capture.text);
+		T_EXPECT(!ok);
+		T_EXPECT(strstr(capture.text, cases[i].expected) != NULL);
+		T_EXPECT(!capture.unsafe);
+	}
+	/* A peer-sized type still emits a bounded preview, even when most bytes
+	 * are ordinary printable data. */
+	char type[2048];
+	memset(type, 'a', sizeof(type) - 1);
+	type[sizeof(type) - 1] = '\0';
+	struct handshake_log_capture capture = { 0 };
+	const int saved_level = slog_level_;
+	slog_setlevel(LOG_LEVEL_ERROR);
+	slog_setoutput(
+		SLOG_OUTPUT_WRITER, capture_handshake_log, (void *)&capture);
+	int version = 0;
+	const bool ok = proto_parse_type(
+		&k_parse_test_session, type, strlen(type), &version);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+	slog_setlevel(saved_level);
+	T_EXPECT(!ok);
+	T_EXPECT(capture.len < 400);
+	T_EXPECT(strstr(capture.text, "unsupported protocol:") != NULL);
+	T_EXPECT(!capture.unsafe);
 }
 
 /* proto_hello_parse rejects a frame whose declared length exceeds the protocol
  * payload cap before touching the buffer. */
 T_DECLARE_CASE(test_proto_hello_parse_rejects_oversized_json)
 {
-	static const unsigned char json[] = "{}";
+	unsigned char json[] = "{}";
 	struct proto_hello parsed;
 	T_EXPECT(!proto_hello_parse(
 		&k_parse_test_session, json, (size_t)MUX_MAX_PAYLOAD_SIZE + 1,
@@ -1731,19 +1935,24 @@ static size_t gen_hello_build(unsigned char *restrict buf, const size_t cap)
 }
 
 static void print_fuzz_context(
-	const size_t iter, const uint64_t seed, const unsigned char *input,
-	const size_t len)
+	struct testing_ctx *_t_, const size_t iter, const uint64_t seed,
+	const unsigned char *input, const size_t len)
 {
-	(void)fprintf(
-		stderr,
-		"FUZZ FAILURE: iter=%zu seed=0x%016" PRIx64 " len=%zu\n", iter,
-		seed, len);
-	(void)fprintf(stderr, "  input:");
-	for (size_t i = 0; i < len; i++) {
-		(void)fprintf(stderr, " %02x", input[i]);
+	T_LOGF("FUZZ FAILURE: iter=%zu seed=0x%016" PRIx64 " len=%zu", iter,
+	       seed, len);
+	for (size_t offset = 0; offset < len;) {
+		char hex[32 * 3 + 1];
+		size_t n = len - offset;
+		if (n > 32) {
+			n = 32;
+		}
+		for (size_t i = 0; i < n; i++) {
+			(void)snprintf(
+				&hex[3 * i], 4, " %02x", input[offset + i]);
+		}
+		T_LOGF("  input[%zu]:%s", offset, hex);
+		offset += n;
 	}
-	(void)fprintf(stderr, "\n");
-	(void)fflush(stderr);
 }
 
 T_DECLARE_CASE(test_handshake_fuzz)
@@ -1782,13 +1991,16 @@ T_DECLARE_CASE(test_handshake_fuzz)
 				json_buf[i] = (unsigned char)prng_u32();
 			}
 
+			/* Preserve the wire bytes for failure diagnostics. */
+			memcpy(frame_buf, json_buf, len);
 			struct proto_hello out;
 			const bool ok = proto_hello_parse(
-				&k_parse_test_session, json_buf, len, &out);
+				&k_parse_test_session, frame_buf, len, &out);
 
 			/* Invariant 1: successful parse implies valid version. */
 			if (ok && out.version <= 0) {
-				print_fuzz_context(iter, seed, json_buf, len);
+				print_fuzz_context(
+					_t_, iter, seed, json_buf, len);
 				T_FATAL("invariant 1 violated: "
 					"proto_hello_parse true but "
 					"version <= 0");
@@ -1809,12 +2021,15 @@ T_DECLARE_CASE(test_handshake_fuzz)
 					json_buf, sizeof(json_buf));
 			}
 
+			/* Preserve the wire bytes for failure diagnostics. */
+			memcpy(frame_buf, json_buf, len);
 			struct proto_hello out;
 			const bool ok = proto_hello_parse(
-				&k_parse_test_session, json_buf, len, &out);
+				&k_parse_test_session, frame_buf, len, &out);
 
 			if (ok && out.version <= 0) {
-				print_fuzz_context(iter, seed, json_buf, len);
+				print_fuzz_context(
+					_t_, iter, seed, json_buf, len);
 				T_FATAL("invariant 1 violated: "
 					"proto_hello_parse true but "
 					"version <= 0");
@@ -1934,7 +2149,7 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			/* Invariant 2: state must be a valid session_state. */
 			if ((unsigned)ss.state > (unsigned)SESSION_CLOSED) {
 				print_fuzz_context(
-					iter, seed, frame_buf, frame_size);
+					_t_, iter, seed, frame_buf, frame_size);
 				T_FATAL("invariant 2 violated: "
 					"session state out of range");
 			}
@@ -1942,7 +2157,7 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			/* Invariant 3: mux_session_reset -> SESSION_CLOSED. */
 			if (g_reset_calls > 0 && ss.state != SESSION_CLOSED) {
 				print_fuzz_context(
-					iter, seed, frame_buf, frame_size);
+					_t_, iter, seed, frame_buf, frame_size);
 				T_FATAL("invariant 3 violated: "
 					"mux_session_reset called but "
 					"state != SESSION_CLOSED");
@@ -1952,7 +2167,7 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			 * mux_session_handshake_done call. */
 			if (ret && g_handshake_done_calls != 1) {
 				print_fuzz_context(
-					iter, seed, frame_buf, frame_size);
+					_t_, iter, seed, frame_buf, frame_size);
 				T_FATAL("invariant 4 violated: "
 					"mux_handshake_process_hello returned true "
 					"but mux_session_handshake_done not called "
@@ -1963,7 +2178,7 @@ T_DECLARE_CASE(test_handshake_fuzz)
 			 * mutually exclusive within a single call. */
 			if (g_handshake_done_calls > 0 && g_reset_calls > 0) {
 				print_fuzz_context(
-					iter, seed, frame_buf, frame_size);
+					_t_, iter, seed, frame_buf, frame_size);
 				T_FATAL("invariant 5 violated: "
 					"mux_session_handshake_done and "
 					"mux_session_reset both called");
@@ -1972,7 +2187,43 @@ T_DECLARE_CASE(test_handshake_fuzz)
 	}
 }
 
+T_DECLARE_CASE(test_hello_parses_in_place_without_touching_following_frame)
+{
+	unsigned char input[] =
+		"{\"type\":\"application/x-multiplexd-proto; version=1\",\"msgid\":0,"
+		"\"extensions\":{\"identity\":\"svc\\u002da\"}}NEXT";
+	const size_t len = sizeof(input) - 1 - 4;
+	unsigned char original[sizeof(input)];
+	memcpy(original, input, sizeof(input));
+	struct proto_hello parsed = { 0 };
+	T_CHECK(proto_hello_parse(&k_parse_test_session, input, len, &parsed));
+	T_EXPECT_STREQ(parsed.identity, "svc-a");
+	T_EXPECT(memcmp(input, original, len) != 0);
+	T_EXPECT(memcmp(input + len, "NEXT", 4) == 0);
+}
+
+T_DECLARE_CASE(test_client_first_hello_reuses_empty_stream_table)
+{
+	handshake_mock_reset();
+	struct frame_pool_ctx pool = { 0 };
+	struct mux_session ss;
+	setup_session(&ss, &pool, false);
+	ss.sched.streams = table_new(&mux_stream_table_opts);
+	T_CHECK(ss.sched.streams != NULL);
+	struct hashtable *const original = ss.sched.streams;
+	const struct proto_hello peer = { .has_session_id = true };
+	const bool ok = handshake_client_fresh(&ss, &peer);
+	const bool same = ss.sched.streams == original;
+	teardown_session(&ss);
+	T_EXPECT(ok);
+	T_EXPECT(same);
+	T_EXPECT_EQ(g_sched_free_calls, 0);
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_hello_parses_in_place_without_touching_following_frame),
+	T_CASE(test_client_first_hello_reuses_empty_stream_table),
+	T_CASE(test_handshake_reuses_unchanged_peer_identity_and_reverifies),
 	T_CASE(test_proto_hello_build_and_parse_roundtrip),
 	T_CASE(test_proto_hello_build_and_parse_max_identity),
 	T_CASE(test_proto_hello_parse_rejects_missing_type),
@@ -1987,6 +2238,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_handshake_enqueue_hello_bounds_claim_at_max_claim_len),
 	T_CASE(test_handshake_process_server_hello_assigns_peer_identity),
 	T_CASE(test_handshake_client_fresh_clears_unacked_replay_state),
+	T_CASE(test_handshake_process_hello_control_fields),
 	T_CASE(test_handshake_verify_identity_rejects),
 	T_CASE(test_handshake_verify_identity_accepts),
 	T_CASE(test_handshake_verify_identity_null_when_unclaimed),
@@ -2005,6 +2257,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_handshake_process_invalid_version_resets_session),
 	T_CASE(test_worst_case_hello_fits_minimum_frame),
 	T_CASE(test_proto_parse_type_requires_canonical_version),
+	T_CASE(test_proto_hello_diagnostics_escape_text),
 	T_CASE(test_proto_hello_parse_rejects_oversized_json),
 	T_CASE(test_handshake_process_hello_outside_handshake_resets),
 	T_CASE(test_handshake_fuzz),

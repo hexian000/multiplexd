@@ -406,7 +406,7 @@ void mux_sched_drain_lp(struct mux_session *ss)
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			mux_sched_check_no_active_streams(ss);
-			if (!session_guard_end(ss, &guard) ||
+			if (!session_guard_end(&guard) ||
 			    ss->state != SESSION_ESTABLISHED) {
 				return;
 			}
@@ -625,7 +625,7 @@ bool mux_sched_next_data(struct mux_session *ss)
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			mux_session_send_push(ss, s, frame);
-			if (!session_guard_end(ss, &guard) ||
+			if (!session_guard_end(&guard) ||
 			    ss->state != SESSION_ESTABLISHED) {
 				/* A piggybacked FIN may free s during a drain;
 				 * leaving ESTABLISHED is the signal used in recv.c too. */
@@ -647,7 +647,7 @@ bool mux_sched_next_data(struct mux_session *ss)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		sched_send_ctrl_flags(ss, s);
-		if (!session_guard_end(ss, &guard) ||
+		if (!session_guard_end(&guard) ||
 		    ss->state != SESSION_ESTABLISHED) {
 			return false;
 		}
@@ -669,7 +669,7 @@ void mux_sched_flush_ctrl(struct mux_session *ss)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		sched_send_ctrl_flags(ss, ss->sched.drr_active);
-		if (!session_guard_end(ss, &guard) ||
+		if (!session_guard_end(&guard) ||
 		    ss->state != SESSION_ESTABLISHED) {
 			return;
 		}
@@ -682,7 +682,7 @@ void mux_sched_flush_ctrl(struct mux_session *ss)
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			sched_send_ctrl_flags(ss, s);
-			if (!session_guard_end(ss, &guard) ||
+			if (!session_guard_end(&guard) ||
 			    ss->state != SESSION_ESTABLISHED) {
 				return;
 			}

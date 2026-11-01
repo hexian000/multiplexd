@@ -204,6 +204,12 @@ struct mux_session_config {
 	/* Maximum unacknowledged byte cap for the whole session (stored in frames;
 	 * the effective stall gate is session_window × MUX_WINDOW_UNIT bytes). */
 	int session_window;
+	/* Positive retained retransmit-log allocation budget in bytes (default
+	 * 64 MiB): frame objects at full capacity plus ring storage. Excludes
+	 * allocator overhead, other send buffers and temporary replay copies.
+	 * Exceeding it resets the session. Fixed at creation, including resume;
+	 * mux_set_config changes apply only to new sessions. */
+	size_t unacked_memory_limit;
 	/* Per-stream receive window size (stored in frames; config value in bytes). */
 	int stream_window;
 

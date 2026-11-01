@@ -384,26 +384,35 @@ void mux_wire_discard_buffers(struct mux_session *restrict ss)
 #endif
 }
 
+unsigned char *
+mux_wire_sendbuf_extend(struct mux_session *restrict ss, const size_t len)
+{
+	if (len > MUX_MAX_RECORD || !ss->wire.sendbuf_staging) {
+		return NULL;
+	}
+	struct mux_frame *const tail = ss->wire.sendbuf.tail;
+	ASSERT(tail->pos == 0);
+	size_t record_cap = MUX_FRAME_HEADER_SIZE + tail->cap;
+	if (record_cap > MUX_MAX_RECORD) {
+		record_cap = MUX_MAX_RECORD;
+	}
+	if (tail->len > record_cap || len > record_cap - tail->len) {
+		return NULL;
+	}
+	unsigned char *const span = tail->data + tail->len;
+	tail->len += len;
+	return span;
+}
+
 void mux_wire_sendbuf_push(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame)
 {
 	ASSERT(frame->len > 0);
-	/* Pack onto the open tail to fill the current TLS record (MUX_MAX_RECORD,
-	 * bounded by tail's physical buffer); a frame fitting neither falls
-	 * through to the zero-copy by-reference path below. */
-	if (frame->len <= MUX_MAX_RECORD && ss->wire.sendbuf_staging) {
-		struct mux_frame *const tail = ss->wire.sendbuf.tail;
-		ASSERT(tail->pos == 0);
-		size_t record_cap = MUX_FRAME_HEADER_SIZE + tail->cap;
-		if (record_cap > MUX_MAX_RECORD) {
-			record_cap = MUX_MAX_RECORD;
-		}
-		if (tail->len + frame->len <= record_cap) {
-			memcpy(tail->data + tail->len, frame->data, frame->len);
-			tail->len += frame->len;
-			mux_frame_put(&ss->pool, frame);
-			return;
-		}
+	unsigned char *const span = mux_wire_sendbuf_extend(ss, frame->len);
+	if (span != NULL) {
+		memcpy(span, frame->data, frame->len);
+		mux_frame_put(&ss->pool, frame);
+		return;
 	}
 
 	/* Otherwise append by reference (zero-copy) as the new open tail. */

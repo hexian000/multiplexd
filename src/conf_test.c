@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -2407,6 +2408,72 @@ T_DECLARE_CASE(test_conf_dump_identity_listen_exact_grow_boundary)
 	release_cleanup(_t_, cleanup_conf, orig);
 }
 
+T_DECLARE_CASE(test_conf_unacked_memory_limit)
+{
+	struct config *conf =
+		parse_tmpconf("{\"mux_connect\":\"127.0.0.1:9000\"}");
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(conf->mux.unacked_memory_limit, (size_t)67108864);
+	release_cleanup(_t_, cleanup_conf, conf);
+
+	char overflow[sizeof(uintmax_t) * CHAR_BIT + 2];
+	(void)snprintf(
+		overflow, sizeof(overflow), "%" PRIuMAX "0", UINTMAX_MAX);
+	const char *invalid[] = { "0", "-1", "1.5", "\"64MiB\"", overflow };
+	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+		char json[160];
+		(void)snprintf(
+			json, sizeof(json),
+			"{\"mux_connect\":\"127.0.0.1:9000\","
+			"\"mux\":{\"unacked_memory_limit\":%s}}",
+			invalid[i]);
+		conf = parse_tmpconf(json);
+		retain_cleanup(_t_, cleanup_conf, conf);
+		T_EXPECT(conf == NULL);
+		release_cleanup(_t_, cleanup_conf, conf);
+	}
+
+	const size_t valid[] = { 1, 1048576, SIZE_MAX };
+	for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+		char json[160];
+		(void)snprintf(
+			json, sizeof(json),
+			"{\"mux_connect\":\"127.0.0.1:9000\","
+			"\"mux\":{\"unacked_memory_limit\":%zu}}",
+			valid[i]);
+		conf = parse_tmpconf(json);
+		retain_cleanup(_t_, cleanup_conf, conf);
+		T_CHECK(conf != NULL);
+		T_EXPECT_EQ(conf->mux.unacked_memory_limit, valid[i]);
+		char path[] = CONF_TEST_TMPDIR "/conf_unacked_dump_XXXXXX";
+		const int fd = mkstemp(path);
+		retain_path(_t_, path);
+		T_CHECK(fd >= 0);
+		(void)close(fd);
+		T_CHECK(write_conf_file(conf, path));
+		struct config *const parsed = conf_parsefile(path);
+		retain_cleanup(_t_, cleanup_conf, parsed);
+		release_path(_t_, path);
+		T_CHECK(parsed != NULL);
+		T_EXPECT_EQ(parsed->mux.unacked_memory_limit, valid[i]);
+		release_cleanup(_t_, cleanup_conf, parsed);
+		release_cleanup(_t_, cleanup_conf, conf);
+	}
+#if SIZE_MAX < UINTMAX_MAX
+	char json[160];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"mux_connect\":\"127.0.0.1:9000\","
+		"\"mux\":{\"unacked_memory_limit\":%" PRIuMAX "}}",
+		(uintmax_t)SIZE_MAX + 1);
+	conf = parse_tmpconf(json);
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_EXPECT(conf == NULL);
+	release_cleanup(_t_, cleanup_conf, conf);
+#endif
+}
+
 T_DECLARE_CASE(test_conf_dump_readahead_roundtrip)
 {
 	const char *json =
@@ -2485,6 +2552,7 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_invalid_type)
 }
 
 static const struct testing_suite suite[] = {
+	T_CASE(test_conf_unacked_memory_limit),
 	T_CASE(test_conf_stdin_fixtures_with_closed_descriptor_zero),
 	T_CASE(test_conf_new_default_fields),
 	T_CASE(test_conf_map_diagnostics_escape_keys),

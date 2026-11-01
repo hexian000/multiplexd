@@ -66,6 +66,7 @@ const char *mux_status_str(const uint_fast16_t status)
 const struct mux_session_config mux_session_config_default = {
 	.max_frame_payload = 16384 - MUX_FRAME_HEADER_SIZE,
 	.readahead = 128 * 1024,
+	.unacked_memory_limit = 67108864,
 	.lossymux_idle_timeout = 60,
 	.lossymux_queue = 64,
 };
@@ -74,6 +75,16 @@ bool mux_bytebuf_reserve(
 	struct bytebuf **restrict rbp, const size_t need, const bool can_grow)
 {
 	struct bytebuf *const rb = *rbp;
+	if (rb == NULL) {
+		if (need == 0) {
+			return true;
+		}
+		if (!can_grow || need > SIZE_MAX - sizeof(struct bytebuf)) {
+			return false;
+		}
+		*rbp = bytebuf_new(need);
+		return *rbp != NULL;
+	}
 	if (need == 0 || bytebuf_write_space(rb) >= need) {
 		return true;
 	}
@@ -114,6 +125,9 @@ bool mux_bytebuf_reserve(
 void mux_bytebuf_shrink(struct bytebuf **restrict rbp, const size_t target_cap)
 {
 	struct bytebuf *const rb = *rbp;
+	if (rb == NULL) {
+		return;
+	}
 	/* Keep whichever is larger: the requested floor or the live bytes. */
 	const size_t want = rb->len > target_cap ? rb->len : target_cap;
 	if (rb->cap <= want) {

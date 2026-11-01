@@ -2,21 +2,54 @@
  * This code is licensed under MIT license (see LICENSE for details) */
 
 /* frame_test.c - white-box tests for frame.c.
- * Dependencies: frame.c #included (leaf module, no collaborators to mock).
+ * Dependencies: frame.c #included; realloc has a one-shot failure seam.
  * Benches (bench section) are opt-in: run with TESTING_BENCH set in the env. */
 
 #include "frame.h"
 
+static void *frame_test_realloc(void *ptr, size_t size);
+static struct bytebuf *frame_test_bytebuf_new(size_t cap);
+#define bytebuf_new frame_test_bytebuf_new
+#define realloc frame_test_realloc
 #include "frame.c"
+#undef realloc
+#undef bytebuf_new
 #include "mux.h"
 
 #include "meta/arraysize.h"
 #include "utils/testing.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+static bool g_fail_next_realloc;
+static bool g_fail_next_bytebuf;
+static size_t g_realloc_calls;
+static size_t g_last_realloc_size;
+
+static void *frame_test_realloc(void *ptr, const size_t size)
+{
+	g_realloc_calls++;
+	g_last_realloc_size = size;
+	if (g_fail_next_realloc) {
+		g_fail_next_realloc = false;
+		errno = ENOMEM;
+		return NULL;
+	}
+	return realloc(ptr, size);
+}
+
+static struct bytebuf *frame_test_bytebuf_new(const size_t cap)
+{
+	if (g_fail_next_bytebuf) {
+		g_fail_next_bytebuf = false;
+		return NULL;
+	}
+	return bytebuf_new(cap);
+}
 
 /* mock - the test frame allocator */
 
@@ -108,6 +141,42 @@ T_DECLARE_CASE(test_frame_put_calls_allocator_free)
 	correct = (ctx.last_freed_address == frame_address) && correct;
 
 	T_EXPECT(correct);
+}
+
+T_DECLARE_CASE(test_header_write_matches_wire_vector)
+{
+	const struct mux_header header = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_SYN | MUX_FLAG_ACK | MUX_FLAG_PUSH,
+		.length = 0x1234,
+		.stream_id = 0x5678,
+		.extra = 0x9ABC,
+	};
+	const unsigned char expected[] = {
+		0x01, 0x1A, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+	};
+	unsigned char buf[8] = { 0 };
+
+	mux_write_header(buf, &header);
+
+	T_EXPECT_EQ(MUX_FRAME_HEADER_SIZE, sizeof(expected));
+	T_EXPECT(memcmp(buf, expected, sizeof(expected)) == 0);
+}
+
+T_DECLARE_CASE(test_header_read_matches_wire_vector)
+{
+	const unsigned char wire[] = {
+		0x01, 0x1A, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+	};
+	struct mux_header header = { 0 };
+
+	mux_read_header(wire, &header);
+
+	T_EXPECT_EQ(header.version, 0x01);
+	T_EXPECT_EQ(header.flags, 0x1A);
+	T_EXPECT_EQ(header.length, 0x1234);
+	T_EXPECT_EQ(header.stream_id, 0x5678);
+	T_EXPECT_EQ(header.extra, 0x9ABC);
 }
 
 T_DECLARE_CASE(test_header_roundtrip_preserves_all_fields)
@@ -617,9 +686,11 @@ T_DECLARE_CASE(test_bytebuf_reserve_noop_when_space_available)
 T_DECLARE_CASE(test_bytebuf_reserve_compaction_recovers_space)
 {
 	bool correct = true;
+	const unsigned char bytes[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 	struct bytebuf *rb = bytebuf_new(10);
 	T_CHECK(rb != NULL);
-	bytebuf_produce(rb, 8);
+	memcpy(bytebuf_write_ptr(rb), bytes, sizeof(bytes));
+	bytebuf_produce(rb, sizeof(bytes));
 	bytebuf_consume(
 		rb, 5); /* off=5, len=3: partial consume, no off reset */
 	T_CHECK(rb->off == 5 && rb->len == 3);
@@ -630,6 +701,7 @@ T_DECLARE_CASE(test_bytebuf_reserve_compaction_recovers_space)
 	correct = (rb->len == (size_t)3) && correct;
 	correct = (rb->cap == (size_t)10) &&
 		  correct; /* compaction alone; no realloc */
+	correct = (memcmp(bytebuf_read_ptr(rb), bytes + 5, 3) == 0) && correct;
 
 	bytebuf_free(rb);
 
@@ -716,6 +788,42 @@ T_DECLARE_CASE(test_bytebuf_reserve_len_plus_need_overflow_rejects)
 	T_EXPECT(correct);
 }
 
+T_DECLARE_CASE(test_bytebuf_reserve_realloc_failure_preserves_ownership)
+{
+	bool correct = true;
+	unsigned char bytes[24];
+	for (size_t i = 0; i < sizeof(bytes); i++) {
+		bytes[i] = (unsigned char)i;
+	}
+	struct bytebuf *rb = bytebuf_new(32);
+	T_CHECK(rb != NULL);
+	memcpy(bytebuf_write_ptr(rb), bytes, sizeof(bytes));
+	bytebuf_produce(rb, sizeof(bytes));
+	bytebuf_consume(rb, 7);
+	struct bytebuf *const original = rb;
+	g_realloc_calls = 0;
+	g_fail_next_realloc = true;
+
+	correct = (!mux_bytebuf_reserve(&rb, 32, true)) && correct;
+	correct = (g_realloc_calls == 1 && !g_fail_next_realloc) && correct;
+	correct = (g_last_realloc_size == sizeof(*rb) + 64) && correct;
+	correct = (rb == original) && correct;
+	correct = (rb->cap == 32 && rb->off == 0 && rb->len == 17) && correct;
+	correct = (memcmp(bytebuf_read_ptr(rb), bytes + 7, 17) == 0) && correct;
+
+	/* The failed reserve still leaves writable storage and a usable reader. */
+	memcpy(bytebuf_write_ptr(rb), "xyz", 3);
+	bytebuf_produce(rb, 3);
+	correct = (mux_bytebuf_reserve(&rb, 32, true)) && correct;
+	correct = (g_realloc_calls == 2) && correct;
+	correct = (rb->cap == 64 && rb->off == 0 && rb->len == 20) && correct;
+	correct = (memcmp(bytebuf_read_ptr(rb), bytes + 7, 17) == 0) && correct;
+	correct = (memcmp(bytebuf_read_ptr(rb) + 17, "xyz", 3) == 0) && correct;
+	bytebuf_free(rb);
+
+	T_EXPECT(correct);
+}
+
 /* Consuming one frame from the front of a receive buffer must leave the next
  * frame's bytes readable and intact. */
 T_DECLARE_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes)
@@ -777,10 +885,14 @@ T_DECLARE_CASE(test_bytebuf_consume_advances_offset_without_copy)
 T_DECLARE_CASE(test_bytebuf_shrink_reclaims_capacity)
 {
 	bool correct = true;
+	unsigned char bytes[100];
+	for (size_t i = 0; i < sizeof(bytes); i++) {
+		bytes[i] = (unsigned char)i;
+	}
 	struct bytebuf *rb = bytebuf_new(4096);
 	T_CHECK(rb != NULL);
-	memset(bytebuf_write_ptr(rb), 'X', 100);
-	bytebuf_produce(rb, 100);
+	memcpy(bytebuf_write_ptr(rb), bytes, sizeof(bytes));
+	bytebuf_produce(rb, sizeof(bytes));
 	bytebuf_consume(rb, 10); /* off=10, len=90: forces compaction */
 	correct = (rb->cap == (size_t)4096) && correct;
 
@@ -789,12 +901,8 @@ T_DECLARE_CASE(test_bytebuf_shrink_reclaims_capacity)
 	correct = (rb->cap == (size_t)256) && correct;
 	correct = (rb->off == (size_t)0) && correct;
 	correct = (bytebuf_readable(rb) == (size_t)90) && correct;
-	const unsigned char *const p = bytebuf_read_ptr(rb);
-	bool intact = true;
-	for (size_t i = 0; i < 90; i++) {
-		intact = intact && (p[i] == 'X');
-	}
-	correct = (intact) && correct;
+	correct =
+		(memcmp(bytebuf_read_ptr(rb), bytes + 10, 90) == 0) && correct;
 	bytebuf_free(rb);
 
 	T_EXPECT(correct);
@@ -814,6 +922,46 @@ T_DECLARE_CASE(test_bytebuf_shrink_keeps_live_bytes)
 
 	correct = (rb->cap == (size_t)500) && correct;
 	correct = (bytebuf_readable(rb) == (size_t)500) && correct;
+	bytebuf_free(rb);
+
+	T_EXPECT(correct);
+}
+
+T_DECLARE_CASE(test_bytebuf_shrink_realloc_failure_preserves_ownership)
+{
+	bool correct = true;
+	unsigned char bytes[64];
+	for (size_t i = 0; i < sizeof(bytes); i++) {
+		bytes[i] = (unsigned char)i;
+	}
+	struct bytebuf *rb = bytebuf_new(128);
+	T_CHECK(rb != NULL);
+	memcpy(bytebuf_write_ptr(rb), bytes, sizeof(bytes));
+	bytebuf_produce(rb, sizeof(bytes));
+	bytebuf_consume(rb, 19);
+	struct bytebuf *const original = rb;
+	g_realloc_calls = 0;
+	g_fail_next_realloc = true;
+
+	mux_bytebuf_shrink(&rb, 32);
+	correct = (g_realloc_calls == 1 && !g_fail_next_realloc) && correct;
+	correct = (g_last_realloc_size == sizeof(*rb) + 45) && correct;
+	correct = (rb == original) && correct;
+	correct = (rb->cap == 128 && rb->off == 0 && rb->len == 45) && correct;
+	correct =
+		(memcmp(bytebuf_read_ptr(rb), bytes + 19, 45) == 0) && correct;
+
+	/* Use the retained allocation, then retry with another partial consume. */
+	bytebuf_consume(rb, 5);
+	memcpy(bytebuf_write_ptr(rb), "xyz", 3);
+	bytebuf_produce(rb, 3);
+	mux_bytebuf_shrink(&rb, 16);
+	correct = (g_realloc_calls == 2) && correct;
+	correct = (g_last_realloc_size == sizeof(*rb) + 43) && correct;
+	correct = (rb->cap == 43 && rb->off == 0 && rb->len == 43) && correct;
+	correct =
+		(memcmp(bytebuf_read_ptr(rb), bytes + 24, 40) == 0) && correct;
+	correct = (memcmp(bytebuf_read_ptr(rb) + 40, "xyz", 3) == 0) && correct;
 	bytebuf_free(rb);
 
 	T_EXPECT(correct);
@@ -922,9 +1070,34 @@ T_DECLARE_CASE(test_mux_status_str_names_known_codes_distinctly)
 	T_EXPECT_STREQ(mux_status_str((uint_fast16_t)0xFFFF), "UNKNOWN");
 }
 
+T_DECLARE_CASE(test_bytebuf_null_storage_lifecycle)
+{
+	struct bytebuf *rb = NULL;
+	T_EXPECT_EQ(bytebuf_readable(rb), (size_t)0);
+	bytebuf_reset(rb);
+	mux_bytebuf_shrink(&rb, 0);
+	T_EXPECT(mux_bytebuf_reserve(&rb, 0, false));
+	T_EXPECT(rb == NULL);
+	T_EXPECT(!mux_bytebuf_reserve(&rb, 1, false));
+	T_EXPECT(!mux_bytebuf_reserve(&rb, SIZE_MAX, true));
+	g_fail_next_bytebuf = true;
+	T_EXPECT(!mux_bytebuf_reserve(&rb, 16, true));
+	T_EXPECT(rb == NULL);
+	T_CHECK(mux_bytebuf_reserve(&rb, 16, true));
+	memcpy(bytebuf_write_ptr(rb), "payload", 8);
+	bytebuf_produce(rb, 8);
+	const bool good = bytebuf_readable(rb) == 8 &&
+			  memcmp(bytebuf_read_ptr(rb), "payload", 8) == 0;
+	bytebuf_free(rb);
+	T_EXPECT(good);
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_bytebuf_null_storage_lifecycle),
 	T_CASE(test_frame_get_resets_runtime_fields),
 	T_CASE(test_frame_put_calls_allocator_free),
+	T_CASE(test_header_write_matches_wire_vector),
+	T_CASE(test_header_read_matches_wire_vector),
 	T_CASE(test_header_roundtrip_preserves_all_fields),
 	T_CASE(test_header_roundtrip_with_flag_combinations),
 	T_CASE(test_frame_list_push_pop_fifo),
@@ -944,10 +1117,12 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_bytebuf_reserve_doubling_growth_loop),
 	T_CASE(test_bytebuf_reserve_overflow_clamp_rejects),
 	T_CASE(test_bytebuf_reserve_len_plus_need_overflow_rejects),
+	T_CASE(test_bytebuf_reserve_realloc_failure_preserves_ownership),
 	T_CASE(test_bytebuf_consume_frame_preserves_remaining_bytes),
 	T_CASE(test_bytebuf_consume_advances_offset_without_copy),
 	T_CASE(test_bytebuf_shrink_reclaims_capacity),
 	T_CASE(test_bytebuf_shrink_keeps_live_bytes),
+	T_CASE(test_bytebuf_shrink_realloc_failure_preserves_ownership),
 	T_CASE(test_bytebuf_shrink_noop_when_small),
 	T_CASE(test_mux_status_str_names_known_codes_distinctly),
 	/* Opt-in micro-benchmarks: each runs ~1s, so they are skipped by the

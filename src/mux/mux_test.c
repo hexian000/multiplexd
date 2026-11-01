@@ -29,6 +29,7 @@
 #include "codec/base64.h"
 #include "io/file.h"
 #include "math/rand.h"
+#include "os/socket.h"
 #include "utils/slog.h"
 #include "utils/testing.h"
 
@@ -49,8 +50,50 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <unistd.h>
+
+#ifdef MUX_TEST_WRAP_CONSTRUCTOR
+static bool fail_fixture_constructor;
+static bool fail_constructor_malloc;
+static int constructor_fd = -1;
+static unsigned int constructor_fd_closes;
+
+void *test_real_malloc(size_t size) __asm__("__real_malloc");
+void *test_wrap_malloc(size_t size) __asm__("__wrap_malloc");
+int test_real_close(int fd) __asm__("__real_close");
+int test_wrap_close(int fd) __asm__("__wrap_close");
+
+void *test_wrap_malloc(size_t size)
+{
+	if (fail_constructor_malloc) {
+		fail_constructor_malloc = false;
+		return NULL;
+	}
+	return test_real_malloc(size);
+}
+
+int test_wrap_close(int fd)
+{
+	if (fd == constructor_fd) {
+		constructor_fd_closes++;
+	}
+	return test_real_close(fd);
+}
+#endif /* MUX_TEST_WRAP_CONSTRUCTOR */
+
+static struct mux_session *
+fixture_session_new(struct ev_loop *loop, const struct mux_session_opts *opts)
+{
+#ifdef MUX_TEST_WRAP_CONSTRUCTOR
+	if (fail_fixture_constructor) {
+		fail_fixture_constructor = false;
+		constructor_fd = opts->fd;
+		constructor_fd_closes = 0;
+		fail_constructor_malloc = true;
+	}
+#endif
+	return mux_new(loop, opts);
+}
 
 /* Constants */
 
@@ -1035,6 +1078,8 @@ static void pending_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 		.session_window = 256,
 		.max_frame_payload =
 			mux_session_config_default.max_frame_payload,
+		.unacked_memory_limit =
+			mux_session_config_default.unacked_memory_limit,
 		.nodelay = fx->nodelay,
 #if WITH_TLS
 		.tls_socket_offload = fx->tls_socket_offload,
@@ -1106,6 +1151,8 @@ static struct mux_session_config make_cli_conf(const bool nodelay)
 		.session_window = 256,
 		.max_frame_payload =
 			mux_session_config_default.max_frame_payload,
+		.unacked_memory_limit =
+			mux_session_config_default.unacked_memory_limit,
 	};
 }
 
@@ -1293,7 +1340,8 @@ static int fixture_setup(struct mux_test_fixture *restrict fx)
 	return fixture_setup_transport(fx, FIXTURE_PLAIN);
 }
 
-static void fixture_teardown(struct mux_test_fixture *restrict fx)
+/* mux_close synchronously calls on_event_cb through its stored fixture alias. */
+static void fixture_teardown(struct mux_test_fixture *fx)
 {
 	/* If the accept watcher never fired, clean it up here. */
 	if (fx->pending_accept != NULL) {
@@ -1524,6 +1572,7 @@ T_DECLARE_CASE(test_establish)
 		&fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_established, &fx);
 	const bool srv_established = fx.srv_established;
 	const bool cli_established = fx.cli_established;
+	const bool cli_lost_before_teardown = fx.cli_lost;
 	/* ESTABLISHED payload, per side: setup latency is measured against a
 	 * monotonic clock, so an established peer reports a strictly positive
 	 * ns; peer_identity is what the other side claimed in its hello. */
@@ -1549,6 +1598,13 @@ T_DECLARE_CASE(test_establish)
 	T_EXPECT(ret == 0);
 	T_EXPECT(srv_established);
 	T_EXPECT(cli_established);
+	/* No loop iteration runs during teardown: LOST must be synchronous and
+	 * must identify the client before teardown clears its pointer. */
+	T_EXPECT(!cli_lost_before_teardown);
+	T_EXPECT(fx.cli_lost);
+	T_EXPECT(fx.cli == NULL);
+	T_EXPECT(fx.srv == NULL);
+	T_EXPECT(fx.loop == NULL);
 	T_EXPECT(srv_cap.fired);
 	T_EXPECT(cli_cap.fired);
 	T_EXPECT(srv_cap.ns > 0);
@@ -1577,24 +1633,17 @@ T_DECLARE_CASE(test_send_recv_small)
 		return;
 	}
 
-	unsigned char *payload = malloc(PAYLOAD_SMALL);
-	if (payload == NULL) {
-		fixture_teardown(&fx);
-		T_FATAL("malloc failed");
-		return;
-	}
+	unsigned char payload[PAYLOAD_SMALL];
 	fill_payload(payload, PAYLOAD_SMALL, 0x42);
 
 	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
-		free(payload);
 		fixture_teardown(&fx);
 		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		free(payload);
 		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
 		return;
@@ -1619,7 +1668,6 @@ T_DECLARE_CASE(test_send_recv_small)
 	 * SYN-to-SYN|ACK latency once, and it is strictly positive. */
 	const int_least64_t stream_ns = fx.ev_stream_established_ns;
 
-	free(payload);
 	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
 
@@ -2253,25 +2301,18 @@ T_DECLARE_CASE(test_server_open_send_recv)
 		return;
 	}
 
-	unsigned char *payload = malloc(PAYLOAD_SMALL);
-	if (payload == NULL) {
-		fixture_teardown(&fx);
-		T_FATAL("malloc failed");
-		return;
-	}
+	unsigned char payload[PAYLOAD_SMALL];
 	fill_payload(payload, PAYLOAD_SMALL, 0x55);
 
 	/* Server actively opens a stream toward the client. */
 	struct mux_stream *s = mux_stream_open(fx.srv);
 	if (s == NULL) {
-		free(payload);
 		fixture_teardown(&fx);
 		T_FATAL("mux_stream_open(srv) returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		free(payload);
 		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
 		return;
@@ -2297,7 +2338,6 @@ T_DECLARE_CASE(test_server_open_send_recv)
 		recv_len == PAYLOAD_SMALL &&
 		memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0;
 
-	free(payload);
 	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
 
@@ -2328,12 +2368,7 @@ T_DECLARE_CASE(test_client_open_server_sends_first)
 		return;
 	}
 
-	unsigned char *payload = malloc(PAYLOAD_SMALL);
-	if (payload == NULL) {
-		fixture_teardown(&fx);
-		T_FATAL("malloc failed");
-		return;
-	}
+	unsigned char payload[PAYLOAD_SMALL];
 	fill_payload(payload, PAYLOAD_SMALL, 0xC3);
 
 	/* Server will send payload + FIN when a stream is accepted. */
@@ -2344,14 +2379,12 @@ T_DECLARE_CASE(test_client_open_server_sends_first)
 	/* Client opens a stream; it does not send any data – it only receives. */
 	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
-		free(payload);
 		fixture_teardown(&fx);
 		T_FATAL("mux_stream_open(cli) returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		free(payload);
 		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
 		return;
@@ -2374,7 +2407,6 @@ T_DECLARE_CASE(test_client_open_server_sends_first)
 		recv_len == PAYLOAD_SMALL &&
 		memcmp(ts->recv_buf, payload, PAYLOAD_SMALL) == 0;
 
-	free(payload);
 	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
 
@@ -2482,21 +2514,10 @@ T_DECLARE_CASE(test_simultaneous_close)
 		return;
 	}
 
-	unsigned char *cli_payload = malloc(PAYLOAD_SMALL);
-	if (cli_payload == NULL) {
-		fixture_teardown(&fx);
-		T_FATAL("malloc failed");
-		return;
-	}
+	unsigned char cli_payload[PAYLOAD_SMALL];
 	fill_payload(cli_payload, PAYLOAD_SMALL, 0x77);
 
-	unsigned char *srv_payload = malloc(PAYLOAD_SMALL);
-	if (srv_payload == NULL) {
-		free(cli_payload);
-		fixture_teardown(&fx);
-		T_FATAL("malloc failed");
-		return;
-	}
+	unsigned char srv_payload[PAYLOAD_SMALL];
 	fill_payload(srv_payload, PAYLOAD_SMALL, 0x88);
 
 	/* Server sends srv_payload + FIN when the stream is accepted. */
@@ -2507,16 +2528,12 @@ T_DECLARE_CASE(test_simultaneous_close)
 	/* Client opens a stream and sends cli_payload + FIN. */
 	struct mux_stream *s = mux_stream_open(fx.cli);
 	if (s == NULL) {
-		free(cli_payload);
-		free(srv_payload);
 		fixture_teardown(&fx);
 		T_FATAL("mux_stream_open returned NULL");
 		return;
 	}
 	struct test_stream *ts = test_stream_new(&fx, s);
 	if (ts == NULL) {
-		free(cli_payload);
-		free(srv_payload);
 		fixture_teardown(&fx);
 		T_FATAL("test_stream_new failed");
 		return;
@@ -2532,8 +2549,6 @@ T_DECLARE_CASE(test_simultaneous_close)
 	if (wait_until(
 		    &fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_accepted_count,
 		    &acc_ctx) != 0) {
-		free(cli_payload);
-		free(srv_payload);
 		fixture_teardown(&fx);
 		T_FATAL("server did not accept stream");
 		return;
@@ -2559,8 +2574,6 @@ T_DECLARE_CASE(test_simultaneous_close)
 		memcmp(srv_ts->recv_buf, cli_payload, PAYLOAD_SMALL) == 0;
 	const size_t cli_halfopen = fx.cli->num_halfopen;
 
-	free(cli_payload);
-	free(srv_payload);
 	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
 
@@ -3760,8 +3773,7 @@ T_DECLARE_CASE(test_shutdown_graceful)
  * an ECONNRESET is recorded, not acted on, as when the close is handed to a
  * worker queue), and wait for its SYN|ACK. Returns NULL after tearing the
  * fixture down when the stream cannot be opened or does not establish. */
-static struct test_stream *
-open_held_direct_stream(struct mux_test_fixture *restrict fx)
+static struct test_stream *open_held_direct_stream(struct mux_test_fixture *fx)
 {
 	struct mux_stream *const s = mux_stream_open(fx->cli);
 	if (s == NULL) {
@@ -4364,6 +4376,10 @@ static void cancel_on_connect(
 	}
 }
 
+static bool fail_connect_cancellation_expectation;
+static int cancellation_probe_fd;
+static unsigned int cancellation_probe_cleanups;
+
 static void
 check_connect_cancellation(struct testing_ctx *_t_, const bool release_on_close)
 {
@@ -4396,23 +4412,58 @@ check_connect_cancellation(struct testing_ctx *_t_, const bool release_on_close)
 
 		mux_attach_fd(ctx.ss, fds[0]);
 
-		T_EXPECT(ctx.observed_connect);
-		T_EXPECT_EQ(ctx.connects, 1u);
-		T_EXPECT_EQ(ctx.failures, 1u);
-		T_EXPECT_EQ(ctx.closes, 1u);
-		T_EXPECT((ctx.ss == NULL) == release_on_close);
+		const bool observed_connect =
+			ctx.observed_connect &&
+			!fail_connect_cancellation_expectation;
+		const unsigned int connects = ctx.connects;
+		const unsigned int failures = ctx.failures;
+		const unsigned int closes = ctx.closes;
+		const bool released = (ctx.ss == NULL) == release_on_close;
+		bool stopped = true;
 		if (ctx.ss != NULL) {
-			T_EXPECT_EQ(mux_fd(ctx.ss), -1);
-			T_EXPECT_EQ(mux_state(ctx.ss), MUX_STATE_CLOSED);
-			T_EXPECT(!ev_is_active(&ctx.ss->w_socket));
-			T_EXPECT(!ev_is_active(&ctx.ss->w_connect_timeout));
+			stopped = mux_fd(ctx.ss) == -1 &&
+				  mux_state(ctx.ss) == MUX_STATE_CLOSED &&
+				  !ev_is_active(&ctx.ss->w_socket) &&
+				  !ev_is_active(&ctx.ss->w_connect_timeout);
 			mux_close(ctx.ss);
 		}
 		unsigned char byte;
-		T_EXPECT_EQ(recv(fds[1], &byte, 1, MSG_DONTWAIT), (ssize_t)0);
+		const ssize_t received = recv(fds[1], &byte, 1, MSG_DONTWAIT);
 		(void)close(fds[1]);
 		ev_loop_destroy(loop);
+		cancellation_probe_fd = fds[1];
+		cancellation_probe_cleanups++;
+
+		T_EXPECT(observed_connect);
+		T_EXPECT_EQ(connects, 1u);
+		T_EXPECT_EQ(failures, 1u);
+		T_EXPECT_EQ(closes, 1u);
+		T_EXPECT(released);
+		T_EXPECT(stopped);
+		T_EXPECT_EQ(received, (ssize_t)0);
 	}
+}
+
+T_DECLARE_CASE(connect_cancellation_failed_expectation)
+{
+	check_connect_cancellation(_t_, false);
+}
+
+T_DECLARE_CASE(test_connect_cancellation_failure_releases_resources)
+{
+	T_DECLARE_CTX(probe);
+	probe.out = _t_->out;
+	T_LOG("the following inner failure is intentional");
+	cancellation_probe_cleanups = 0;
+	fail_connect_cancellation_expectation = true;
+	T_RUN_CASE(probe, connect_cancellation_failed_expectation);
+	fail_connect_cancellation_expectation = false;
+	errno = 0;
+	const bool closed =
+		fcntl(cancellation_probe_fd, F_GETFD) == -1 && errno == EBADF;
+	T_EXPECT_EQ(probe.failed, 1);
+	T_EXPECT_EQ(cancellation_probe_cleanups, 1u);
+	T_EXPECT(closed);
 }
 
 T_DECLARE_CASE(test_connect_callback_cancels_attach)
@@ -4472,9 +4523,9 @@ static const struct mux_callbacks g_raw_callbacks = {
 
 /* raw_fixture_setup with the server session's lossymux offer (spec §5.2.3.3)
  * chosen by @p lossymux. */
-static int raw_fixture_setup_ex(
+static int raw_fixture_setup_budget(
 	struct raw_fixture *fx, const struct mux_callbacks *restrict cbs,
-	void *userdata, const bool lossymux)
+	void *userdata, const bool lossymux, const size_t memory_limit)
 {
 	*fx = (struct raw_fixture){ .raw_fd = -1 };
 
@@ -4521,6 +4572,7 @@ static int raw_fixture_setup_ex(
 		.session_window = 256,
 		.max_frame_payload =
 			mux_session_config_default.max_frame_payload,
+		.unacked_memory_limit = memory_limit,
 		.lossymux = lossymux,
 		.lossymux_idle_timeout =
 			mux_session_config_default.lossymux_idle_timeout,
@@ -4537,9 +4589,8 @@ static int raw_fixture_setup_ex(
 		.fd = fds[0],
 		.id = raw_sid,
 	};
-	fx->srv = mux_new(fx->loop, &raw_opts);
+	fx->srv = fixture_session_new(fx->loop, &raw_opts);
 	if (fx->srv == NULL) {
-		(void)close(fds[0]);
 		(void)close(fx->raw_fd);
 		fx->raw_fd = -1;
 		ev_loop_destroy(fx->loop);
@@ -4548,6 +4599,15 @@ static int raw_fixture_setup_ex(
 	}
 	mux_start(fx->srv);
 	return 0;
+}
+
+static int raw_fixture_setup_ex(
+	struct raw_fixture *fx, const struct mux_callbacks *restrict cbs,
+	void *userdata, const bool lossymux)
+{
+	return raw_fixture_setup_budget(
+		fx, cbs, userdata, lossymux,
+		mux_session_config_default.unacked_memory_limit);
 }
 
 static int raw_fixture_setup(
@@ -4670,16 +4730,17 @@ static bool raw_read_frame_header(const int fd, struct mux_header *restrict hdr)
 
 static bool raw_discard_payload(const int fd, const uint_least16_t length)
 {
-	if (length == 0) {
-		return true;
+	unsigned char buf[4096];
+	size_t remaining = length;
+	while (remaining > 0) {
+		const size_t chunk =
+			remaining < sizeof(buf) ? remaining : sizeof(buf);
+		if (!raw_read_all(fd, buf, chunk)) {
+			return false;
+		}
+		remaining -= chunk;
 	}
-	unsigned char *discard_buf = malloc(length);
-	if (discard_buf == NULL) {
-		return false;
-	}
-	const bool ok = raw_read_all(fd, discard_buf, length);
-	free(discard_buf);
-	return ok;
+	return true;
 }
 
 /* Returns 1 when raw_fd has incoming data, -1 on EOF/error, 0 otherwise. */
@@ -4739,18 +4800,7 @@ static bool raw_do_hello_ex(struct raw_fixture *fx, const bool lossymux)
 	if (!raw_read_frame_header(fx->raw_fd, &srv_hdr)) {
 		return false;
 	}
-	if (srv_hdr.length > 0) {
-		unsigned char *body = malloc(srv_hdr.length);
-		if (body == NULL) {
-			return false;
-		}
-		const bool ok = raw_read_all(fx->raw_fd, body, srv_hdr.length);
-		free(body);
-		if (!ok) {
-			return false;
-		}
-	}
-	return true;
+	return raw_discard_payload(fx->raw_fd, srv_hdr.length);
 }
 
 static bool raw_do_hello(struct raw_fixture *fx)
@@ -4819,6 +4869,101 @@ T_DECLARE_CASE(test_interop_i1_non_syn_unknown_stream)
 	 * stayed open. */
 	T_EXPECT(!srv_closed);
 	T_EXPECT(connected_ns > 0);
+}
+
+/* A raw peer keeps reading RST replies but never acknowledges them at mux
+ * level. Reusing one unknown stream bypasses stream admission limits. */
+T_DECLARE_CASE(test_raw_control_memory_limit_and_reload)
+{
+	struct raw_fixture fx;
+	const size_t frame_bytes = MUX_FRAME_OBJECT_SIZE(
+		mux_session_config_default.max_frame_payload);
+	const size_t ring_bytes =
+		sizeof(struct mux_frame_ring) +
+		MUX_FRAME_RING_MIN * sizeof(struct mux_frame *);
+	const size_t limit = ring_bytes + 2 * frame_bytes;
+	if (raw_fixture_setup_budget(
+		    &fx, &g_raw_callbacks, &fx, false, limit) != 0) {
+		T_FATAL("raw_fixture_setup_budget failed");
+		return;
+	}
+	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
+		T_FATAL("hello exchange failed");
+		return;
+	}
+	struct mux_session_config updated = *mux_conf(fx.srv);
+	updated.unacked_memory_limit = limit + frame_bytes;
+	mux_set_config(fx.srv, &updated);
+	bool retained_ok = fx.srv->unacked.memory_limit == limit;
+	bool replies_ok = true;
+	bool sent = true;
+	for (size_t i = 0; i < 3; i++) {
+		const struct mux_header hdr = {
+			.version = MUX_PROTOCOL_VERSION,
+			.flags = MUX_FLAG_PUSH,
+			.stream_id = 1,
+			.length = 1,
+		};
+		if (!raw_send_frame(fx.raw_fd, &hdr) ||
+		    !raw_write_all(fx.raw_fd, (const unsigned char *)"x", 1)) {
+			sent = false;
+			break;
+		}
+		for (int turn = 0; turn < 16 && !fx.srv_closed; turn++) {
+			ev_run(fx.loop, EVRUN_NOWAIT);
+		}
+		if (i < 2) {
+			if (fx.srv == NULL) {
+				retained_ok = false;
+				break;
+			}
+			retained_ok =
+				retained_ok && fx.srv->unacked.bytes == 0 &&
+				fx.srv->unacked.frames == i + 1 &&
+				fx.srv->unacked.memory_bytes ==
+					ring_bytes + (i + 1) * frame_bytes &&
+				table_size(fx.srv->sched.streams) == 0;
+			bool got_rst = false;
+			int raw_fd = fx.raw_fd;
+			while (raw_pred_data_available(&raw_fd) > 0) {
+				struct mux_header reply;
+				if (!raw_read_frame_header(raw_fd, &reply) ||
+				    !raw_discard_payload(raw_fd, reply.length)) {
+					replies_ok = false;
+					break;
+				}
+				got_rst = got_rst ||
+					  (reply.stream_id == 1 &&
+					   (reply.flags & MUX_FLAG_RST) != 0);
+			}
+			replies_ok = replies_ok && got_rst;
+		}
+	}
+	const bool closed = fx.srv_closed;
+	raw_fixture_teardown(&fx);
+	T_EXPECT(sent);
+	T_EXPECT(closed);
+	T_EXPECT(retained_ok);
+	T_EXPECT(replies_ok);
+	/* The same reloaded value takes effect when constructing a new session. */
+	if (raw_fixture_setup_budget(
+		    &fx, &g_raw_callbacks, &fx, false,
+		    updated.unacked_memory_limit) != 0) {
+		T_FATAL("new session setup failed");
+		return;
+	}
+	const bool new_limit =
+		fx.srv->unacked.memory_limit == updated.unacked_memory_limit;
+	raw_fixture_teardown(&fx);
+	T_EXPECT(new_limit);
+	const int zero_result =
+		raw_fixture_setup_budget(&fx, &g_raw_callbacks, &fx, false, 0);
+	const bool released =
+		fx.srv == NULL && fx.loop == NULL && fx.raw_fd == -1;
+	raw_fixture_teardown(&fx);
+	T_EXPECT_EQ(zero_result, -1);
+	T_EXPECT(released);
 }
 
 /* Stream-aware raw fixture: extends raw_fixture with an on_accept callback
@@ -6492,6 +6637,115 @@ T_DECLARE_CASE(test_drain_lost_callback_closes_session)
 	T_CALL_SUBCASE(shutdown_reentry, SHUTDOWN_REENTRY_DRAIN, true);
 }
 
+struct accept_cancellation_ctx {
+	struct raw_fixture *fx;
+	mux_stream_io io;
+	bool accepted;
+	bool graceful;
+	bool release;
+	unsigned int accepts;
+	unsigned int lost;
+	unsigned int closed;
+};
+
+static void accept_cancellation_event(
+	void *data, struct mux_session *ss, const enum mux_event event,
+	const union mux_event_data edata)
+{
+	(void)edata;
+	struct accept_cancellation_ctx *const ctx = data;
+	if (event == MUX_EVENT_LOST) {
+		ctx->lost++;
+		if (!ctx->graceful) {
+			mux_shutdown(ss);
+		}
+	} else if (event == MUX_EVENT_CLOSED) {
+		ctx->closed++;
+		if (ctx->release) {
+			ctx->fx->srv = NULL;
+			mux_close(ss);
+		}
+	}
+}
+
+static bool cancel_stream_acceptance(
+	void *data, const struct mux_session *ss, struct mux_stream *stream)
+{
+	(void)ss;
+	struct accept_cancellation_ctx *const ctx = data;
+	ctx->accepts++;
+	if (ctx->accepted) {
+		mux_stream_io_init(
+			&ctx->io, raw_stream_io_noop_cb, stream, EV_READ);
+		T_CHECK(mux_stream_io_start(ctx->fx->loop, &ctx->io));
+	}
+	mux_shutdown(ctx->fx->srv);
+	return ctx->accepted;
+}
+
+T_DECLARE_SUBCASE(
+	stream_acceptance_cancellation, const bool accepted,
+	const bool graceful, const bool release)
+{
+	struct raw_fixture fx;
+	T_CHECK(raw_fixture_setup(&fx, &g_raw_callbacks, &fx) == 0);
+	if (!raw_do_hello(&fx)) {
+		raw_fixture_teardown(&fx);
+		T_FATAL("raw handshake failed");
+	}
+	struct accept_cancellation_ctx ctx = {
+		.fx = &fx,
+		.accepted = accepted,
+		.graceful = graceful,
+		.release = release,
+	};
+	fx.srv->userdata = &ctx;
+	mux_set_callbacks(
+		fx.srv, &(struct mux_callbacks){
+				.on_accept = cancel_stream_acceptance,
+				.on_event = accept_cancellation_event,
+			});
+	const struct mux_header syn = {
+		.version = MUX_PROTOCOL_VERSION,
+		.flags = MUX_FLAG_SYN | MUX_FLAG_PUSH,
+		.stream_id = 1,
+		.length = 4,
+	};
+	if (!raw_send_frame_payload(fx.raw_fd, &syn, "data")) {
+		mux_set_callbacks(fx.srv, &(struct mux_callbacks){ 0 });
+		raw_fixture_teardown(&fx);
+		T_FATAL("could not send opening stream frame");
+	}
+	mux_session_on_recv(fx.srv);
+	const bool released = fx.srv == NULL;
+	const enum mux_state state =
+		released ? MUX_STATE_CLOSED : mux_state(fx.srv);
+	const bool discarded =
+		released || (fx.srv->sched.streams == NULL &&
+			     bytebuf_readable(fx.srv->wire.recvbuf) == 0);
+	if (!released) {
+		mux_set_callbacks(fx.srv, &(struct mux_callbacks){ 0 });
+	}
+	raw_fixture_teardown(&fx);
+	T_EXPECT(ctx.io.stream == NULL);
+	T_EXPECT_EQ(ctx.accepts, 1u);
+	T_EXPECT_EQ(ctx.lost, 1u);
+	T_EXPECT_EQ(ctx.closed, graceful ? 0u : 1u);
+	T_EXPECT(released == release);
+	T_EXPECT_EQ(state, graceful ? MUX_STATE_CLOSING : MUX_STATE_CLOSED);
+	T_EXPECT(discarded);
+}
+
+T_DECLARE_CASE(test_stream_acceptance_cancellation)
+{
+	T_CALL_SUBCASE(stream_acceptance_cancellation, false, true, false);
+	T_CALL_SUBCASE(stream_acceptance_cancellation, true, true, false);
+	T_CALL_SUBCASE(stream_acceptance_cancellation, false, false, false);
+	T_CALL_SUBCASE(stream_acceptance_cancellation, true, false, false);
+	T_CALL_SUBCASE(stream_acceptance_cancellation, false, false, true);
+	T_CALL_SUBCASE(stream_acceptance_cancellation, true, false, true);
+}
+
 struct identity_cancellation_ctx {
 	struct raw_fixture *fx;
 	bool accepted;
@@ -6656,6 +6910,7 @@ T_DECLARE_SUBCASE(
 	    trigger == STREAM_DRAIN_WRITE_ERROR ||
 	    trigger == STREAM_DRAIN_EAGER_WRITE_ERROR) {
 		stream->state = STREAM_CLOSING;
+		T_CHECK(mux_bytebuf_reserve(&stream->recvbuf, 1, true));
 		*bytebuf_write_ptr(stream->recvbuf) = 'x';
 		bytebuf_produce(stream->recvbuf, 1);
 		stream->buffered_bytes = 1;
@@ -6693,6 +6948,7 @@ T_DECLARE_SUBCASE(
 			stream->state = STREAM_CLOSING;
 		} else if (trigger == STREAM_DRAIN_DIRECT_ABORT) {
 			stream->grant_sent = 0;
+			T_CHECK(mux_bytebuf_reserve(&stream->recvbuf, 1, true));
 			*bytebuf_write_ptr(stream->recvbuf) = 'x';
 			bytebuf_produce(stream->recvbuf, 1);
 			stream->buffered_bytes = 1;
@@ -6756,34 +7012,24 @@ static void test_session_set_write_only(struct mux_session *restrict ss)
 	ev_io_start(ss->loop, &ss->w_socket);
 }
 
-static bool test_pump_unacked_no_wait(
+static bool test_retain_unacked(
 	struct mux_test_fixture *restrict fx, const bool require_srv)
 {
-	test_session_set_write_only(fx->cli);
-	test_session_set_write_only(fx->srv);
-
-	/* Pump non-blocking until the client (and, when require_srv, the server)
-	 * has buffered unacked frames. Each caller asserts only the side it
-	 * genuinely populated: test_resume_retransmit opens a client and a server
-	 * stream and needs both buffered, but test_resume_stream_unacked_retransmit
-	 * opens only a client stream -- coupling it to srv->unacked.frames > 0 would
-	 * spuriously fail whenever the echo server has already flushed and had its
-	 * frames ACKed before both sides go write-only. The iteration bound only
-	 * guards against a hang (a handful of EV_WRITE-only runs suffices). The
-	 * postcondition is returned rather than asserted here: the caller captures
-	 * it and asserts only after fixture_teardown, so a never-satisfied
-	 * precondition fails the one case instead of aborting the binary and
-	 * leaking the fixture. */
-	bool ready = false;
-	for (int i = 0; i < 32 && !ready; i++) {
-		ev_run(fx->loop, EVRUN_NOWAIT);
-		ready = fx->cli->unacked.frames > 0 &&
-			(!require_srv || fx->srv->unacked.frames > 0);
+	/* The callers queue known payload with reads disabled. Drive only the
+	 * write callbacks, so ACK reception cannot retire it before suspension.
+	 * No event-loop turn or timer eligibility is needed for this setup. */
+	const size_t cli_bytes = fx->cli->unacked.bytes;
+	const size_t srv_bytes = fx->srv->unacked.bytes;
+	ev_invoke(fx->loop, &fx->cli->w_socket, EV_WRITE);
+	if (fx->cli == NULL || fx->srv == NULL) {
+		return false;
 	}
-
-	mux_session_notify(fx->cli);
-	mux_session_notify(fx->srv);
-	return ready;
+	ev_invoke(fx->loop, &fx->srv->w_socket, EV_WRITE);
+	if (fx->cli == NULL || fx->srv == NULL) {
+		return false;
+	}
+	return fx->cli->unacked.bytes > cli_bytes &&
+	       (!require_srv || fx->srv->unacked.bytes > srv_bytes);
 }
 
 /* transport break with no active streams.
@@ -6817,8 +7063,10 @@ T_DECLARE_CASE(test_resume_idle)
 	const bool srv_suspended = fx.srv_suspended;
 	const bool cli_resumed = fx.cli_resumed;
 	const bool srv_resumed = fx.srv_resumed;
-	const enum mux_state cli_state = mux_state(fx.cli);
-	const enum mux_state srv_state = mux_state(fx.srv);
+	const enum mux_state cli_state =
+		fx.cli != NULL ? mux_state(fx.cli) : MUX_STATE_CLOSED;
+	const enum mux_state srv_state =
+		fx.srv != NULL ? mux_state(fx.srv) : MUX_STATE_CLOSED;
 	/* Leaving ESTABLISHED on the break emits LOST; the RESUMED payload
 	 * carries the reconnect setup latency (strictly positive) and, on the
 	 * server, the identity the resume hello claimed -- parsed by the
@@ -6851,6 +7099,26 @@ static int pred_both_closed(void *ptr)
 {
 	const struct mux_test_fixture *restrict fx = ptr;
 	return (fx->cli_closed && fx->srv_closed) ? 1 : 0;
+}
+
+/* Both sides must finish all data and acknowledgement work before a clean
+ * transport close can be expected. Empty transmit queues alone do not account
+ * for frames already on the socket or deferred coalescing ticks. */
+static int pred_sessions_quiet(void *ptr)
+{
+	const struct mux_test_fixture *const fx = ptr;
+	const struct mux_session *const sessions[] = { fx->cli, fx->srv };
+	for (size_t i = 0; i < 2; i++) {
+		const struct mux_session *const ss = sessions[i];
+		if (ss == NULL || ss->state != SESSION_ESTABLISHED) {
+			return -1;
+		}
+		if (ss->unacked.frames != 0 || ss->unacked.unreported != 0 ||
+		    ss->sched.delay_head != NULL || ss->wire.tx_pending) {
+			return 0;
+		}
+	}
+	return 1;
 }
 
 /* Open a client stream, echo @p len bytes of @p payload through the server's
@@ -6936,6 +7204,15 @@ T_DECLARE_SUBCASE(tls_session_lifecycle, const enum fixture_transport transport)
 		resume_ret == 0 &&
 		fixture_echo_roundtrip(&fx, payload, PAYLOAD_SMALL);
 
+	/* Put the server acknowledgement on the wire without a client read turn,
+	 * reproducing a coalescing tick racing the end of the echo. */
+	if (fx.srv->unacked.unreported > 0) {
+		mux_session_emit_ack(fx.srv);
+		mux_session_on_send(fx.srv);
+	}
+	const int quiet_ret = wait_until(
+		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_sessions_quiet, &fx);
+
 	/* close_notify is a deliberate close, not a lost transport: the server
 	 * answers with its own instead of suspending, and each side reports the
 	 * other's close_notify as a clean CLOSED. */
@@ -6958,6 +7235,7 @@ T_DECLARE_SUBCASE(tls_session_lifecycle, const enum fixture_transport transport)
 	T_EXPECT(srv_tls_resumed);
 	T_EXPECT(cli_tls_resumed);
 	T_EXPECT(resumed_echo_ok);
+	T_EXPECT(quiet_ret == 0);
 	T_EXPECT(close_ret == 0);
 	T_EXPECT(srv_closed.closed.clean);
 	T_EXPECT(cli_closed.closed.clean);
@@ -7035,8 +7313,9 @@ T_DECLARE_CASE(test_resume_preserves_drain)
 	const int ret =
 		wait_until(&fx, RESUME_TIMEOUT_MS / 1000.0, pred_resumed, &fx);
 	const bool srv_resumed = fx.srv_resumed;
-	const bool draining_after = fx.srv->draining;
-	const enum mux_state srv_state = mux_state(fx.srv);
+	const bool draining_after = fx.srv != NULL && fx.srv->draining;
+	const enum mux_state srv_state =
+		fx.srv != NULL ? mux_state(fx.srv) : MUX_STATE_CLOSED;
 
 	/* Teardown first so a failing assert can't leak the fixture. */
 	fixture_teardown(&fx);
@@ -7099,7 +7378,8 @@ T_DECLARE_CASE(test_resume_preserves_client_drain)
 		T_FATAL("client session closed instead of resuming");
 		return;
 	}
-	const enum mux_state cli_state = mux_state(fx.cli);
+	const enum mux_state cli_state =
+		fx.cli != NULL ? mux_state(fx.cli) : MUX_STATE_CLOSED;
 	const bool draining_after = fx.cli->draining;
 	/* Still draining after the resume: a new stream is refused. */
 	const bool open_refused = mux_stream_open(fx.cli) == NULL;
@@ -7119,6 +7399,26 @@ T_DECLARE_CASE(test_resume_preserves_client_drain)
 /* transport break with a stream in flight.
  * Frames unacknowledged at suspension must be retransmitted after resume
  * and the echo must complete with exactly the original payload. */
+
+static void
+log_resume_sessions(struct testing_ctx *_t_, const struct mux_test_fixture *fx)
+{
+	const struct mux_session *const sessions[2] = { fx->cli, fx->srv };
+	const char *const names[2] = { "client", "server" };
+	for (size_t i = 0; i < 2; i++) {
+		const struct mux_session *const ss = sessions[i];
+		if (ss == NULL) {
+			T_LOGF("%s session released", names[i]);
+			continue;
+		}
+		T_LOGF("%s(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
+		       " unreported=%" PRIuLEAST32 " tx_pending=%d retrans=%d)",
+		       names[i], ss->state, ss->unacked.frames,
+		       ss->unacked.recv_seq, ss->unacked.unreported,
+		       ss->wire.tx_pending,
+		       ss->unacked.retransmit_off != SIZE_MAX);
+	}
+}
 
 T_DECLARE_CASE(test_resume_retransmit)
 {
@@ -7209,6 +7509,10 @@ T_DECLARE_CASE(test_resume_retransmit)
 		}
 	}
 
+	/* Retain the following sends before any peer ACK can be read. */
+	test_session_set_write_only(fx.cli);
+	test_session_set_write_only(fx.srv);
+
 	/* Pre-break load injection (no waits): queue data from both endpoints.
 	 * Stop naturally when flow control returns zero progress. */
 	for (;;) {
@@ -7244,9 +7548,16 @@ T_DECLARE_CASE(test_resume_retransmit)
 	mux_stream_io_start(fx.loop, &cli_ts->w_io);
 	mux_stream_io_start(fx.loop, &srv_ts->w_io);
 	/* Both a client and a server stream are open, so both sides must buffer. */
-	const bool unacked_pre = test_pump_unacked_no_wait(&fx, true);
-	T_LOGF("pre-suspend unacked: cli=%zu srv=%zu", fx.cli->unacked.frames,
-	       fx.srv->unacked.frames);
+	const bool unacked_pre = test_retain_unacked(&fx, true);
+	if (!unacked_pre) {
+		free(cli_payload);
+		free(srv_payload);
+		fixture_teardown(&fx);
+		T_FATAL("sessions did not retain unacked frames");
+	}
+	T_LOGF("pre-suspend unacked: cli=%zu srv=%zu",
+	       (fx.cli != NULL ? fx.cli->unacked.frames : 0),
+	       (fx.srv != NULL ? fx.srv->unacked.frames : 0));
 
 	/* Freeze both endpoints directly into SUSPENDED with non-empty unacked
 	 * lists. This avoids timing windows while still forcing resume to replay
@@ -7254,31 +7565,27 @@ T_DECLARE_CASE(test_resume_retransmit)
 	mux_session_suspend(fx.cli);
 	mux_session_suspend(fx.srv);
 	const bool cli_retrans_armed =
-		fx.cli->unacked.retransmit_off != SIZE_MAX;
+		(fx.cli != NULL && fx.cli->unacked.retransmit_off != SIZE_MAX);
 	const bool srv_retrans_armed =
-		fx.srv->unacked.retransmit_off != SIZE_MAX;
+		(fx.srv != NULL && fx.srv->unacked.retransmit_off != SIZE_MAX);
 	T_LOGF("retransmit armed: cli=%d srv=%d",
-	       fx.cli->unacked.retransmit_off != SIZE_MAX,
-	       fx.srv->unacked.retransmit_off != SIZE_MAX);
+	       (fx.cli != NULL && fx.cli->unacked.retransmit_off != SIZE_MAX),
+	       (fx.srv != NULL && fx.srv->unacked.retransmit_off != SIZE_MAX));
 
 	/* Wait for both sessions to resume. */
 	const int resume_ret =
 		wait_until(&fx, RESUME_TIMEOUT_MS / 1000.0, pred_resumed, &fx);
 	if (resume_ret != 0) {
-		T_LOGF("resume wait failed:"
-		       " cli(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-		       " unreported=%" PRIuLEAST32 " tx_pending=%d retrans=%d)"
-		       " srv(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-		       " unreported=%" PRIuLEAST32 " tx_pending=%d retrans=%d)",
-		       fx.cli->state, fx.cli->unacked.frames,
-		       fx.cli->unacked.recv_seq, fx.cli->unacked.unreported,
-		       fx.cli->wire.tx_pending,
-		       fx.cli->unacked.retransmit_off != SIZE_MAX,
-		       fx.srv->state, fx.srv->unacked.frames,
-		       fx.srv->unacked.recv_seq, fx.srv->unacked.unreported,
-		       fx.srv->wire.tx_pending,
-		       fx.srv->unacked.retransmit_off != SIZE_MAX);
+		T_LOG("resume wait failed");
+		log_resume_sessions(_t_, &fx);
 	}
+	if (resume_ret != 0 || fx.cli == NULL || fx.srv == NULL) {
+		free(cli_payload);
+		free(srv_payload);
+		fixture_teardown(&fx);
+		T_FATAL("sessions did not resume");
+	}
+
 	const bool cli_suspended = fx.cli_suspended;
 	const bool srv_suspended = fx.srv_suspended;
 	const bool cli_resumed = fx.cli_resumed;
@@ -7296,29 +7603,21 @@ T_DECLARE_CASE(test_resume_retransmit)
 			&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received,
 			&cli_ctx);
 		if (cli_echo_ret != 0) {
-			T_LOGF("client echo after resume failed:"
-			       " cli(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-			       " unreported=%" PRIuLEAST32
-			       " tx_pending=%d retrans=%d"
-			       " recv=%zu/%zu err=%d eof=%d)"
-			       " srv(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-			       " unreported=%" PRIuLEAST32
-			       " tx_pending=%d retrans=%d"
-			       " recv=%zu/%zu err=%d eof=%d)",
-			       fx.cli->state, fx.cli->unacked.frames,
-			       fx.cli->unacked.recv_seq,
-			       fx.cli->unacked.unreported,
-			       fx.cli->wire.tx_pending,
-			       fx.cli->unacked.retransmit_off != SIZE_MAX,
+			T_LOG("client echo after resume failed");
+			log_resume_sessions(_t_, &fx);
+			T_LOGF("echo cli(recv=%zu/%zu err=%d eof=%d)"
+			       " srv(recv=%zu/%zu err=%d eof=%d)",
 			       cli_ts->recv_len, cli_sent, cli_ts->got_error,
-			       cli_ts->got_eof, fx.srv->state,
-			       fx.srv->unacked.frames, fx.srv->unacked.recv_seq,
-			       fx.srv->unacked.unreported,
-			       fx.srv->wire.tx_pending,
-			       fx.srv->unacked.retransmit_off != SIZE_MAX,
-			       srv_ts->recv_len, srv_sent, srv_ts->got_error,
-			       srv_ts->got_eof);
+			       cli_ts->got_eof, srv_ts->recv_len, srv_sent,
+			       srv_ts->got_error, srv_ts->got_eof);
 		}
+		if (cli_echo_ret != 0) {
+			free(cli_payload);
+			free(srv_payload);
+			fixture_teardown(&fx);
+			T_FATAL("cli echo after resume failed");
+		}
+
 		cli_echo_ok = cli_echo_ret == 0;
 	}
 	bool srv_echo_ok;
@@ -7332,29 +7631,21 @@ T_DECLARE_CASE(test_resume_retransmit)
 			&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_received,
 			&srv_ctx);
 		if (srv_echo_ret != 0) {
-			T_LOGF("server echo after resume failed:"
-			       " cli(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-			       " unreported=%" PRIuLEAST32
-			       " tx_pending=%d retrans=%d"
-			       " recv=%zu/%zu err=%d eof=%d)"
-			       " srv(state=%d unacked=%zu recv_seq=%" PRIuLEAST32
-			       " unreported=%" PRIuLEAST32
-			       " tx_pending=%d retrans=%d"
-			       " recv=%zu/%zu err=%d eof=%d)",
-			       fx.cli->state, fx.cli->unacked.frames,
-			       fx.cli->unacked.recv_seq,
-			       fx.cli->unacked.unreported,
-			       fx.cli->wire.tx_pending,
-			       fx.cli->unacked.retransmit_off != SIZE_MAX,
+			T_LOG("server echo after resume failed");
+			log_resume_sessions(_t_, &fx);
+			T_LOGF("echo cli(recv=%zu/%zu err=%d eof=%d)"
+			       " srv(recv=%zu/%zu err=%d eof=%d)",
 			       cli_ts->recv_len, cli_sent, cli_ts->got_error,
-			       cli_ts->got_eof, fx.srv->state,
-			       fx.srv->unacked.frames, fx.srv->unacked.recv_seq,
-			       fx.srv->unacked.unreported,
-			       fx.srv->wire.tx_pending,
-			       fx.srv->unacked.retransmit_off != SIZE_MAX,
-			       srv_ts->recv_len, srv_sent, srv_ts->got_error,
-			       srv_ts->got_eof);
+			       cli_ts->got_eof, srv_ts->recv_len, srv_sent,
+			       srv_ts->got_error, srv_ts->got_eof);
 		}
+		if (srv_echo_ret != 0) {
+			free(cli_payload);
+			free(srv_payload);
+			fixture_teardown(&fx);
+			T_FATAL("srv echo after resume failed");
+		}
+
 		srv_echo_ok = srv_echo_ret == 0;
 	}
 	const bool cli_no_error = !cli_ts->got_error;
@@ -7486,8 +7777,10 @@ T_DECLARE_CASE(test_resume_stream_transparent)
 	const bool srv_suspended = fx.srv_suspended;
 	const bool cli_resumed = fx.cli_resumed;
 	const bool srv_resumed = fx.srv_resumed;
-	const enum mux_state cli_state = mux_state(fx.cli);
-	const enum mux_state srv_state = mux_state(fx.srv);
+	const enum mux_state cli_state =
+		fx.cli != NULL ? mux_state(fx.cli) : MUX_STATE_CLOSED;
+	const enum mux_state srv_state =
+		fx.srv != NULL ? mux_state(fx.srv) : MUX_STATE_CLOSED;
 	const size_t recv_len = ts->recv_len;
 	const bool payload_matches =
 		recv_len == PAYLOAD_LARGE &&
@@ -7562,7 +7855,7 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 	}
 	fx.cli_streams[fx.n_cli_streams++] = ts;
 	ts->send_data = payload;
-	ts->send_len = PAYLOAD_LARGE;
+	ts->send_len = PAYLOAD_LARGE / 4;
 	mux_stream_io_start(fx.loop, &ts->w_io);
 
 	/* Let the transfer get underway so the stream straddles the break. */
@@ -7583,10 +7876,21 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 	 * check must not longjmp past fixture_teardown and leak the fixture. */
 	const bool not_error_underway = !ts->got_error;
 
-	/* Force a non-empty unacked ring: stop processing ACKs and pump the send
-	 * side so sent frames stay pending replay. Only a client stream is open, so
-	 * require only the client side (the echo server may already be fully ACKed). */
-	const bool cli_unacked_pre = test_pump_unacked_no_wait(&fx, false);
+	/* Queue a fresh chunk only after ACK reception stops. The initial
+	 * prefix may already be completely sent and acknowledged. */
+	test_session_set_write_only(fx.cli);
+	test_session_set_write_only(fx.srv);
+	ts->send_len = PAYLOAD_LARGE;
+	const size_t send_off_before = ts->send_off;
+	(void)test_stream_flush_send(ts);
+	const bool fresh_payload_queued = ts->send_off > send_off_before;
+	const bool cli_unacked_pre =
+		fresh_payload_queued && test_retain_unacked(&fx, false);
+	if (!cli_unacked_pre) {
+		free(payload);
+		fixture_teardown(&fx);
+		T_FATAL("client did not retain unacked frames");
+	}
 
 	/* Freeze straight into SUSPENDED with the ring populated; resume must
 	 * replay the preserved frames over the fresh transport. */
@@ -7597,6 +7901,12 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 
 	const int resume_ret =
 		wait_until(&fx, RESUME_TIMEOUT_MS / 1000.0, pred_resumed, &fx);
+	if (resume_ret != 0 || fx.cli == NULL || fx.srv == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
+		T_FATAL("sessions did not resume");
+	}
+
 	const bool cli_suspended = fx.cli_suspended;
 	const bool srv_suspended = fx.srv_suspended;
 	const bool cli_resumed = fx.cli_resumed;
@@ -7624,6 +7934,7 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 	fixture_teardown(&fx);
 
 	T_EXPECT(not_error_underway);
+	T_EXPECT(fresh_payload_queued);
 	T_EXPECT(cli_unacked_pre);
 	T_EXPECT(cli_retrans_armed);
 	T_EXPECT(resume_ret == 0);
@@ -7643,6 +7954,8 @@ T_DECLARE_CASE(test_resume_stream_unacked_retransmit)
 /* test_resume_handshake_transport_lost: transport failure during a client
  * resume handshake must re-suspend (not reset/close) so the session can
  * resume on the next attempt. */
+
+static bool release_resume_test_client;
 
 T_DECLARE_CASE(test_resume_handshake_transport_lost)
 {
@@ -7692,22 +8005,31 @@ T_DECLARE_CASE(test_resume_handshake_transport_lost)
 		sp[1]); /* close peer end; writes to sp[0] get EPIPE / reads get EOF */
 
 	mux_attach_fd(fx.cli, sp[0]);
+	if (release_resume_test_client && fx.cli != NULL) {
+		on_event_cb(
+			&fx, fx.cli, MUX_EVENT_CLOSED,
+			(union mux_event_data){ 0 });
+	}
 
 	/* Run the event loop until the client detects the error and re-suspends.
 	 * With the fix, this reaches SESSION_SUSPENDED.
 	 * Without the fix, it reaches SESSION_CLOSED (and the test fails). */
-	for (int i = 0; i < 32 && fx.cli->state != SESSION_SUSPENDED; i++) {
+	for (int i = 0;
+	     i < 32 && fx.cli != NULL && fx.cli->state != SESSION_SUSPENDED;
+	     i++) {
 		ev_run(fx.loop, EVRUN_NOWAIT);
 	}
 
 	/* On failure, tear down before asserting so the fixture cannot leak; the
 	 * subsequent real-resume steps assume a re-suspended client, so bail here
 	 * rather than driving them against a closed session. */
-	const bool cli_resuspended = fx.cli->state == SESSION_SUSPENDED;
+	const bool cli_resuspended =
+		fx.cli != NULL && fx.cli->state == SESSION_SUSPENDED;
 	if (!cli_resuspended) {
 		T_LOGF("client state after dead-end handshake: %d"
 		       " (expected SESSION_SUSPENDED=%d)",
-		       fx.cli->state, (int)SESSION_SUSPENDED);
+		       fx.cli != NULL ? (int)fx.cli->state : -1,
+		       (int)SESSION_SUSPENDED);
 		fixture_teardown(&fx);
 		T_EXPECT(cli_resuspended);
 		return;
@@ -7748,6 +8070,18 @@ T_DECLARE_CASE(test_resume_handshake_transport_lost)
 	T_EXPECT(srv_resumed);
 	/* The dead-end attempt ended before ESTABLISHED. */
 	T_EXPECT(cli_connect_failed);
+}
+
+T_DECLARE_CASE(test_resume_failure_reports_released_client)
+{
+	T_DECLARE_CTX(probe);
+	probe.out = _t_->out;
+	T_LOG("the following inner failure is intentional");
+	release_resume_test_client = true;
+	T_RUN_CASE(probe, test_resume_handshake_transport_lost);
+	release_resume_test_client = false;
+	T_EXPECT_EQ(probe.failed, 1);
+	T_EXPECT_EQ(probe.passed, 0);
 }
 
 /* Satisfied once the client and the declined transient have both completed
@@ -7875,7 +8209,8 @@ T_DECLARE_CASE(test_resume_declined_after_reattach)
 	const bool identity_restored = peer_identity != NULL &&
 				       strcmp(peer_identity, cli_identity) == 0;
 	const enum mux_state declined_state = mux_state(fx.declined);
-	const enum mux_state cli_state = mux_state(fx.cli);
+	const enum mux_state cli_state =
+		fx.cli != NULL ? mux_state(fx.cli) : MUX_STATE_CLOSED;
 	const bool cli_adopted_fresh_id =
 		memcmp(mux_session_id(fx.cli), mux_session_id(fx.declined),
 		       MUX_SESSION_ID_LEN) == 0;
@@ -8022,7 +8357,7 @@ T_DECLARE_CASE(test_nodelay_reverse_large)
 
 struct bdp_ctx {
 	struct test_stream *ts;
-	const struct mux_session *ss;
+	const struct mux_test_fixture *fx;
 	size_t expected_len;
 };
 
@@ -8035,19 +8370,23 @@ static void bdp_enable_auto_windows(struct mux_session *restrict ss)
 }
 
 struct bdp_control_ctx {
-	const struct mux_session *ss;
+	const struct mux_test_fixture *fx;
 	uint_least64_t before_bytes_recv;
 };
 
 static int pred_control_only_no_bdp(void *ptr)
 {
 	const struct bdp_control_ctx *restrict ctx = ptr;
-	if (ctx->ss->bytes_recv <= ctx->before_bytes_recv) {
+	const struct mux_session *const ss = ctx->fx->cli;
+	if (ss == NULL) {
+		return -1;
+	}
+	if (ss->bytes_recv <= ctx->before_bytes_recv) {
 		return 0;
 	}
-	if (wndfilter_get(&ctx->ss->estimator.rx.bw_wnd) > 0 ||
-	    wndfilter_get(&ctx->ss->estimator.tx.bw_wnd) > 0 ||
-	    ctx->ss->estimator.ping_in_flight) {
+	if (wndfilter_get(&ss->estimator.rx.bw_wnd) > 0 ||
+	    wndfilter_get(&ss->estimator.tx.bw_wnd) > 0 ||
+	    ss->estimator.ping_in_flight) {
 		return -1;
 	}
 	return 1;
@@ -8056,18 +8395,36 @@ static int pred_control_only_no_bdp(void *ptr)
 static int pred_echo_and_bdp_cycle(void *ptr)
 {
 	const struct bdp_ctx *restrict ctx = ptr;
-	if (ctx->ts->got_error) {
+	const struct mux_session *const ss = ctx->fx->cli;
+	if (ss == NULL || ctx->ts->got_error) {
 		return -1;
 	}
 	/* All echoed bytes received AND at least one full PING/PONG cycle. */
 	if (ctx->ts->recv_len < ctx->expected_len) {
 		return 0;
 	}
-	if (wndfilter_get(&ctx->ss->estimator.rtt_wnd) == 0 ||
-	    ctx->ss->estimator.ping_in_flight) {
+	if (wndfilter_get(&ss->estimator.rtt_wnd) == 0 ||
+	    ss->estimator.ping_in_flight) {
 		return 0;
 	}
 	return 1;
+}
+
+T_DECLARE_CASE(test_bdp_predicates_reject_released_session)
+{
+	struct mux_test_fixture fx;
+	if (fixture_setup(&fx) != 0) {
+		T_FATAL("fixture_setup failed");
+	}
+	struct test_stream ts = { 0 };
+	struct bdp_control_ctx control = { .fx = &fx };
+	struct bdp_ctx echo = { .fx = &fx, .ts = &ts };
+	on_event_cb(&fx, fx.cli, MUX_EVENT_CLOSED, (union mux_event_data){ 0 });
+	const int control_ret = pred_control_only_no_bdp(&control);
+	const int echo_ret = pred_echo_and_bdp_cycle(&echo);
+	fixture_teardown(&fx);
+	T_EXPECT_EQ(control_ret, -1);
+	T_EXPECT_EQ(echo_ret, -1);
 }
 
 /* when both windows are automatic, a PONG-driven BDP update from inbound
@@ -8363,6 +8720,12 @@ T_DECLARE_CASE(test_bdp_manual_window_mode_no_estimator_effect)
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_eof, &ctx);
+	if (ret != 0 || fx.cli == NULL || fx.srv == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
+		T_FATAL("session closed or estimator/echo wait failed");
+	}
+
 	const size_t recv_len = ts->recv_len;
 	const bool payload_matches =
 		recv_len == PAYLOAD_LARGE &&
@@ -8531,7 +8894,7 @@ T_DECLARE_CASE(test_bdp_control_only_no_cycle)
 	bdp_enable_auto_windows(fx.cli);
 
 	struct bdp_control_ctx ctx = {
-		.ss = fx.cli,
+		.fx = &fx,
 		.before_bytes_recv = fx.cli->bytes_recv,
 	};
 	const bool ctrl_sent =
@@ -8540,6 +8903,11 @@ T_DECLARE_CASE(test_bdp_control_only_no_cycle)
 	const int ret = wait_until(
 		&fx, ESTABLISH_TIMEOUT_MS / 1000.0, pred_control_only_no_bdp,
 		&ctx);
+	if (ret != 0 || fx.cli == NULL || fx.srv == NULL) {
+		fixture_teardown(&fx);
+		T_FATAL("session closed or estimator/echo wait failed");
+	}
+
 	const bool rx_bw_zero =
 		wndfilter_get(&fx.cli->estimator.rx.bw_wnd) == 0;
 	const bool tx_bw_zero =
@@ -8654,11 +9022,17 @@ T_DECLARE_CASE(test_bdp_ping_sent)
 	 * cycle with no queued or in-flight estimator PING left behind. */
 	struct bdp_ctx bdp = {
 		.ts = ts,
-		.ss = fx.cli,
+		.fx = &fx,
 		.expected_len = PAYLOAD_SMALL,
 	};
 	const int ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
+	if (ret != 0 || fx.cli == NULL || fx.srv == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
+		T_FATAL("session closed or estimator/echo wait failed");
+	}
+
 	const bool rtt_positive = wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0;
 	const bool no_ping_in_flight = !fx.cli->estimator.ping_in_flight;
 	const size_t recv_len = ts->recv_len;
@@ -8733,11 +9107,17 @@ T_DECLARE_CASE(test_bdp_stop_halves_stream_window)
 
 	struct bdp_ctx bdp = {
 		.ts = ts,
-		.ss = fx.cli,
+		.fx = &fx,
 		.expected_len = PAYLOAD_SMALL,
 	};
 	const int cycle_ret = wait_until(
 		&fx, ECHO_TIMEOUT_MS / 1000.0, pred_echo_and_bdp_cycle, &bdp);
+	if (cycle_ret != 0 || fx.cli == NULL || fx.srv == NULL) {
+		free(payload);
+		fixture_teardown(&fx);
+		T_FATAL("session closed or estimator/echo wait failed");
+	}
+
 	const bool rtt_positive_after_cycle =
 		wndfilter_get(&fx.cli->estimator.rtt_wnd) > 0;
 
@@ -9407,6 +9787,7 @@ static int xs_setup(struct xs_fixture *restrict fx)
 		 * replay in progress", not the zero-init compound literal would
 		 * otherwise leave here. */
 		.unacked = {
+			.memory_limit = mux_session_config_default.unacked_memory_limit,
 			.retransmit_off = SIZE_MAX,
 		},
 	};
@@ -9443,6 +9824,9 @@ static int xs_setup(struct xs_fixture *restrict fx)
 		fx->loop = NULL;
 		return -1;
 	}
+	fx->ss.unacked.memory_bytes =
+		sizeof(struct mux_frame_ring) +
+		MUX_FRAME_RING_MIN * sizeof(struct mux_frame *);
 	return 0;
 }
 
@@ -9473,6 +9857,45 @@ static void xs_teardown(struct xs_fixture *restrict fx)
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 	}
+}
+
+T_DECLARE_CASE(test_receive_retains_window_beside_maximum_partial_frame)
+{
+	struct xs_fixture fx;
+	T_CHECK(xs_setup(&fx) == 0);
+	if (socket_set_nonblock(fx.fds[0]) != 0) {
+		xs_teardown(&fx);
+		T_FATAL("socket_set_nonblock failed");
+		return;
+	}
+	fx.ss.readahead = (size_t)mux_session_config_default.readahead;
+	ev_timer_init(&fx.ss.w_timeout, xs_timer_cb, 0.0, 0.0);
+	const size_t partial = MUX_MAX_FRAME_SIZE - 2;
+	unsigned char *const data = bytebuf_write_ptr(fx.ss.wire.recvbuf);
+	memset(data, 0, partial);
+	const struct mux_header header = {
+		.version = MUX_PROTOCOL_VERSION,
+		.length = MUX_MAX_PAYLOAD_SIZE,
+		.stream_id = STREAMID_CTRL,
+		.extra = 3,
+	};
+	mux_write_header(data, &header);
+	bytebuf_produce(fx.ss.wire.recvbuf, partial);
+	size_t sent = 1;
+	const int err = socket_send(fx.fds[1], "x", &sent);
+	if (err == 0 && sent == 1) {
+		mux_session_on_recv(&fx.ss);
+	}
+	const bool established = fx.ss.state == SESSION_ESTABLISHED;
+	const size_t readable = bytebuf_readable(fx.ss.wire.recvbuf);
+	const size_t capacity = fx.ss.wire.recvbuf->cap;
+	const size_t window = fx.ss.readahead;
+	xs_teardown(&fx);
+	T_EXPECT_EQ(err, 0);
+	T_EXPECT_EQ(sent, (size_t)1);
+	T_EXPECT(established);
+	T_EXPECT_EQ(readable, partial + 1);
+	T_EXPECT(capacity >= window + readable);
 }
 
 static struct mux_frame *xs_make_frame(
@@ -9515,6 +9938,7 @@ T_DECLARE_SUBCASE(replay_oom_waits_for_retry_timer, const bool kernel_timeout)
 	T_CHECK(frame != NULL);
 	frame->unacked_count = 1;
 	T_CHECK(mux_frame_ring_push(&fx.ss.unacked.ring, frame));
+	fx.ss.unacked.memory_bytes += MUX_FRAME_OBJECT_SIZE(frame->cap);
 	fx.ss.unacked.frames = 1;
 	fx.ss.unacked.retransmit_off = 0;
 	fx.ss.conf.send_timeout = 60;
@@ -9595,7 +10019,9 @@ T_DECLARE_CASE(test_replay_oom_waits_for_retry_timer)
 
 /* A session-window stall keeps its watchdog and receive watcher, but writable
  * sockets cannot advance queued payloads until a peer ACK opens the window. */
-T_DECLARE_SUBCASE(window_stall_settles_write_watcher, const bool active)
+T_DECLARE_SUBCASE(
+	window_stall_settles_write_watcher, const bool active,
+	const bool kernel_timeout, const bool grow_window)
 {
 	struct xs_fixture fx;
 	if (xs_setup(&fx) != 0) {
@@ -9605,7 +10031,10 @@ T_DECLARE_SUBCASE(window_stall_settles_write_watcher, const bool active)
 	fx.ss.conf.nodelay = true;
 	fx.ss.conf.send_timeout = 60;
 	fx.ss.session_window = 1;
-	ev_timer_init(&fx.ss.w_send_timeout, xs_timer_cb, 0.0, 60.0);
+	fx.ss.wire.kernel_send_timeout = kernel_timeout;
+	ev_timer_init(
+		&fx.ss.w_send_timeout, xs_timer_cb, 0.0,
+		kernel_timeout ? 0.0 : 60.0);
 	struct mux_stream *const stream = mux_stream_new(&fx.ss, 1, true);
 	if (stream == NULL || !mux_sched_add_stream(&fx.ss, stream)) {
 		if (stream != NULL) {
@@ -9633,8 +10062,24 @@ T_DECLARE_SUBCASE(window_stall_settles_write_watcher, const bool active)
 		T_FATAL("ring setup failed");
 		return;
 	}
-	fx.ss.unacked.frames = 1;
-	fx.ss.unacked.bytes = sizeof(retained);
+	struct mux_frame *const second = xs_make_frame(
+		&fx.ss.pool, 1, MUX_FLAG_PUSH, 0, retained, sizeof(retained));
+	if (second == NULL) {
+		xs_teardown(&fx);
+		T_FATAL("second frame setup failed");
+		return;
+	}
+	second->unacked_count = 1;
+	if (!mux_frame_ring_push(&fx.ss.unacked.ring, second)) {
+		mux_frame_put(&fx.ss.pool, second);
+		xs_teardown(&fx);
+		T_FATAL("second ring entry failed");
+		return;
+	}
+	fx.ss.unacked.frames = 2;
+	fx.ss.unacked.memory_bytes += MUX_FRAME_OBJECT_SIZE(frame->cap) +
+				      MUX_FRAME_OBJECT_SIZE(second->cap);
+	fx.ss.unacked.bytes = 2 * sizeof(retained);
 	fx.ss.unacked.stalled = true;
 	static const unsigned char payload[] = "window-blocked payload";
 	size_t len = sizeof(payload);
@@ -9673,7 +10118,20 @@ T_DECLARE_SUBCASE(window_stall_settles_write_watcher, const bool active)
 	const ssize_t control_bytes =
 		recv(fx.fds[1], received, sizeof(received), MSG_DONTWAIT);
 
-	const struct mux_header ack = {
+	/* A keepalive writes bytes while stream payload is still window-blocked.
+	 * Its success must leave the earlier send deadline unchanged. */
+	ev_timer_stop(fx.loop, &fx.ss.w_send_timeout);
+	ev_timer_set(&fx.ss.w_send_timeout, 30.0, 60.0);
+	ev_timer_start(fx.loop, &fx.ss.w_send_timeout);
+	const ev_tstamp deadline = fx.ss.w_send_timeout.at;
+	const bool keepalive =
+		mux_session_send_oob(&fx.ss, MUX_CTRL_PROBE, NULL, 0);
+	mux_session_on_send(&fx.ss);
+	const ssize_t keepalive_bytes =
+		recv(fx.fds[1], received, sizeof(received), MSG_DONTWAIT);
+	const bool deadline_kept = fx.ss.w_send_timeout.at == deadline;
+
+	struct mux_header ack = {
 		.version = MUX_PROTOCOL_VERSION,
 		.flags = MUX_FLAG_ACK,
 		.stream_id = STREAMID_CTRL,
@@ -9682,6 +10140,25 @@ T_DECLARE_SUBCASE(window_stall_settles_write_watcher, const bool active)
 	mux_write_header(bytebuf_write_ptr(fx.ss.wire.recvbuf), &ack);
 	bytebuf_produce(fx.ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE);
 	mux_session_dispatch_pending(&fx.ss);
+	const bool partial_progress = fx.ss.unacked.stalled &&
+				      ev_is_active(&fx.ss.w_send_timeout) &&
+				      fx.ss.w_send_timeout.at > deadline;
+	const ev_tstamp partial_deadline = fx.ss.w_send_timeout.at;
+	if (grow_window) {
+		mux_session_update_session_window(
+			&fx.ss, (size_t)2 * MUX_WINDOW_UNIT);
+	} else {
+		ack.extra = 2;
+		mux_write_header(bytebuf_write_ptr(fx.ss.wire.recvbuf), &ack);
+		bytebuf_produce(fx.ss.wire.recvbuf, MUX_FRAME_HEADER_SIZE);
+		mux_session_dispatch_pending(&fx.ss);
+	}
+	const bool ack_refreshed =
+		kernel_timeout ?
+			!ev_is_active(&fx.ss.w_send_timeout) &&
+				fx.ss.w_send_timeout.repeat == 0.0 :
+			ev_is_active(&fx.ss.w_send_timeout) &&
+				fx.ss.w_send_timeout.at >= partial_deadline;
 	const bool woke = !fx.ss.unacked.stalled && fx.ss.wire.tx_pending &&
 			  (fx.ss.w_socket.events & EV_WRITE) != 0;
 	mux_session_on_send(&fx.ss);
@@ -9708,6 +10185,11 @@ T_DECLARE_SUBCASE(window_stall_settles_write_watcher, const bool active)
 	T_EXPECT(watchdog);
 	T_EXPECT(drained);
 	T_EXPECT(control_bytes > 0);
+	T_EXPECT(keepalive);
+	T_EXPECT(keepalive_bytes > 0);
+	T_EXPECT(deadline_kept);
+	T_EXPECT(partial_progress);
+	T_EXPECT(ack_refreshed);
 	T_EXPECT(woke);
 	T_EXPECT(delivered);
 	T_EXPECT(idle);
@@ -9716,8 +10198,186 @@ T_DECLARE_SUBCASE(window_stall_settles_write_watcher, const bool active)
 
 T_DECLARE_CASE(test_window_stall_settles_write_watcher_until_ack)
 {
-	T_CALL_SUBCASE(window_stall_settles_write_watcher, false);
-	T_CALL_SUBCASE(window_stall_settles_write_watcher, true);
+	T_CALL_SUBCASE(window_stall_settles_write_watcher, false, false, false);
+	T_CALL_SUBCASE(window_stall_settles_write_watcher, true, false, false);
+	T_CALL_SUBCASE(window_stall_settles_write_watcher, false, true, false);
+	T_CALL_SUBCASE(window_stall_settles_write_watcher, true, true, false);
+	T_CALL_SUBCASE(window_stall_settles_write_watcher, false, false, true);
+	T_CALL_SUBCASE(window_stall_settles_write_watcher, true, true, true);
+}
+
+static void cleanup_reload_stall(void *data)
+{
+	struct xs_fixture *const fx = data;
+	if (fx->loop != NULL) {
+		mux_sched_free_streams(&fx->ss);
+		mux_sched_free_orphans(&fx->ss);
+		xs_teardown(fx);
+	}
+}
+
+T_DECLARE_SUBCASE(
+	reload_stalled_window, const int old_window,
+	const size_t retained_units, const int new_window,
+	const bool expect_wake)
+{
+	static struct xs_fixture fx;
+	T_CHECK(xs_setup(&fx) == 0);
+	T_CLEANUP(cleanup_reload_stall, &fx);
+	struct mux_session_config conf = fx.ss.conf;
+	conf.nodelay = true;
+	conf.stream_window = 4;
+	conf.session_window = old_window;
+	conf.send_timeout = 60;
+	ev_timer_init(&fx.ss.w_timeout, xs_timer_cb, 0.0, 0.0);
+	ev_timer_init(&fx.ss.w_keepalive, xs_timer_cb, 0.0, 0.0);
+	ev_timer_init(&fx.ss.w_connect_timeout, xs_timer_cb, 0.0, 0.0);
+	ev_timer_init(&fx.ss.w_send_timeout, xs_timer_cb, 0.0, 60.0);
+	mux_set_config(&fx.ss, &conf);
+	struct mux_stream *const stream = mux_stream_new(&fx.ss, 1, true);
+	T_CHECK(stream != NULL);
+	if (!mux_sched_add_stream(&fx.ss, stream)) {
+		mux_stream_free(stream);
+		T_FATAL("stream setup failed");
+	}
+	stream->state = STREAM_ESTABLISHED;
+	stream->is_direct = true;
+	stream->send_window = 1024;
+	static const unsigned char retained[MUX_WINDOW_UNIT] = { 0 };
+	for (size_t i = 0; i < retained_units; i++) {
+		struct mux_frame *const frame = xs_make_frame(
+			&fx.ss.pool, 1, MUX_FLAG_PUSH, 0, retained,
+			sizeof(retained));
+		T_CHECK(frame != NULL);
+		frame->unacked_count = 1;
+		if (!mux_frame_ring_push(&fx.ss.unacked.ring, frame)) {
+			mux_frame_put(&fx.ss.pool, frame);
+			T_FATAL("ring setup failed");
+		}
+		fx.ss.unacked.memory_bytes += MUX_FRAME_OBJECT_SIZE(frame->cap);
+	}
+	fx.ss.unacked.frames = retained_units;
+	fx.ss.unacked.bytes = retained_units * sizeof(retained);
+	fx.ss.unacked.stalled = true;
+	static const unsigned char payload[] = "reload resumes queued payload";
+	size_t len = sizeof(payload);
+	T_CHECK(mux_stream_send(stream, payload, &len) == 0);
+	T_CHECK(len == sizeof(payload));
+	mux_session_on_send(&fx.ss);
+	mux_session_update_watcher(&fx.ss);
+	T_CHECK(!fx.ss.wire.tx_pending);
+	T_CHECK((fx.ss.w_socket.events & EV_WRITE) == 0);
+	T_CHECK(ev_is_active(&fx.ss.w_send_timeout));
+
+	conf.session_window = new_window;
+	mux_set_config(&fx.ss, &conf);
+	T_EXPECT_EQ(
+		fx.ss.session_window,
+		new_window > 0 ? (uint_least32_t)new_window :
+				 MUX_INITIAL_SEND_WINDOW / MUX_WINDOW_UNIT);
+	T_EXPECT_EQ(fx.ss.unacked.stalled, !expect_wake);
+	T_EXPECT_EQ(fx.ss.wire.tx_pending, expect_wake);
+	T_EXPECT_EQ((fx.ss.w_socket.events & EV_WRITE) != 0, expect_wake);
+	mux_session_on_send(&fx.ss);
+	unsigned char received[MUX_FRAME_HEADER_SIZE + sizeof(payload)];
+	const ssize_t nrecv =
+		recv(fx.fds[1], received, sizeof(received), MSG_DONTWAIT);
+	if (expect_wake) {
+		T_EXPECT_EQ(nrecv, (ssize_t)sizeof(received));
+		T_EXPECT(
+			memcmp(received + MUX_FRAME_HEADER_SIZE, payload,
+			       sizeof(payload)) == 0);
+		T_EXPECT_EQ(stream->queued_send_bytes, (size_t)0);
+		T_EXPECT(!ev_is_active(&fx.ss.w_send_timeout));
+	} else {
+		T_EXPECT(
+			nrecv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+		T_EXPECT_EQ(stream->queued_send_bytes, sizeof(payload));
+		T_EXPECT(ev_is_active(&fx.ss.w_send_timeout));
+	}
+	mux_stream_close(stream);
+	cleanup_reload_stall(&fx);
+	T_EXPECT_EQ(fx.pool_ctx.alloc_calls, fx.pool_ctx.free_calls);
+}
+
+T_DECLARE_CASE(test_window_reload_resumes_stalled_payload)
+{
+	T_CALL_SUBCASE(reload_stalled_window, 1, 1, 2, true);
+	T_CALL_SUBCASE(reload_stalled_window, 1, 1, 0, true);
+	T_CALL_SUBCASE(reload_stalled_window, 1, 2, 2, false);
+	T_CALL_SUBCASE(reload_stalled_window, 1, 3, 2, false);
+	T_CALL_SUBCASE(reload_stalled_window, 2, 2, 2, false);
+	T_CALL_SUBCASE(reload_stalled_window, 2, 2, 1, false);
+}
+
+T_DECLARE_CASE(test_window_stall_watchdog_survives_reload)
+{
+	struct xs_fixture fx;
+	if (xs_setup(&fx) != 0) {
+		T_FATAL("xs_setup failed");
+		return;
+	}
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		xs_teardown(&fx);
+		T_FATAL("TCP socket failed");
+		return;
+	}
+	(void)close(fx.fds[0]);
+	fx.fds[0] = fd;
+	ev_io_set(&fx.ss.w_socket, fd, EV_READ);
+	struct mux_stream *const stream = mux_stream_new(&fx.ss, 1, true);
+	if (stream == NULL || !mux_sched_add_stream(&fx.ss, stream)) {
+		if (stream != NULL) {
+			mux_stream_free(stream);
+		}
+		xs_teardown(&fx);
+		T_FATAL("stream setup failed");
+		return;
+	}
+	stream->state = STREAM_ESTABLISHED;
+	stream->is_direct = true;
+	stream->send_window = 1024;
+	fx.ss.unacked.stalled = true;
+	fx.ss.conf.nodelay = true;
+	static const unsigned char payload[] = "reload-blocked payload";
+	size_t len = sizeof(payload);
+	const bool queued = mux_stream_send(stream, payload, &len) == 0 &&
+			    len == sizeof(payload);
+	struct mux_session_config conf = fx.ss.conf;
+	conf.stream_window = 4;
+	conf.session_window = 1;
+	conf.send_timeout = 60;
+	ev_timer_init(&fx.ss.w_send_timeout, xs_timer_cb, 0.0, 60.0);
+	ev_timer_again(fx.loop, &fx.ss.w_send_timeout);
+	mux_set_config(&fx.ss, &conf);
+	const bool kernel = fx.ss.wire.kernel_send_timeout;
+	const bool armed = ev_is_active(&fx.ss.w_send_timeout) &&
+			   fx.ss.w_send_timeout.repeat == 60.0;
+	conf.send_timeout = 0;
+	mux_set_config(&fx.ss, &conf);
+	const bool disabled = !ev_is_active(&fx.ss.w_send_timeout);
+	conf.send_timeout = 30;
+	mux_set_config(&fx.ss, &conf);
+	const bool reenabled = ev_is_active(&fx.ss.w_send_timeout) &&
+			       fx.ss.w_send_timeout.repeat == 30.0;
+	mux_stream_close(stream);
+	ev_timer_stop(fx.loop, &fx.ss.w_send_timeout);
+	ev_timer_stop(fx.loop, &fx.ss.w_timeout);
+	ev_timer_stop(fx.loop, &fx.ss.w_keepalive);
+	ev_io_stop(fx.loop, &fx.ss.w_socket);
+	xs_teardown(&fx);
+
+	T_EXPECT(queued);
+#if WITH_TCP_USER_TIMEOUT
+	T_EXPECT(kernel);
+#else
+	T_EXPECT(!kernel);
+#endif
+	T_EXPECT(armed);
+	T_EXPECT(disabled);
+	T_EXPECT(reenabled);
+	T_EXPECT_EQ(fx.pool_ctx.alloc_calls, fx.pool_ctx.free_calls);
 }
 
 /* The caller owns exactly the unsent suffix after either allocation outcome. */
@@ -9843,6 +10503,7 @@ T_DECLARE_CASE(test_session_ack_trim_leaves_estimator_alone)
 	T_CHECK(frame != NULL);
 	frame->unacked_count = 1;
 	T_CHECK(mux_frame_ring_push(&fx.ss.unacked.ring, frame));
+	fx.ss.unacked.memory_bytes += MUX_FRAME_OBJECT_SIZE(frame->cap);
 	fx.ss.unacked.frames = 1;
 	fx.ss.unacked.bytes = sizeof(payload);
 	fx.ss.unacked.last_ack_recv = 0;
@@ -10612,11 +11273,15 @@ static int bench_fixture_setup(struct mux_test_fixture *restrict fx)
 		.conn = srv_conn,
 #endif
 	};
-	fx->srv = mux_new(fx->loop, &srv_opts);
+	fx->srv = fixture_session_new(fx->loop, &srv_opts);
+	/* The constructor consumes both resources on success and failure. */
+	fds[0] = -1;
+#if WITH_TLS
+	srv_conn = NULL;
+#endif
 	if (fx->srv == NULL) {
 		goto fail;
 	}
-	fds[0] = -1; /* owned by fx->srv (which now also owns srv_conn) */
 	mux_start(fx->srv);
 
 	/* Client: outbound session (fd=-1) with the peer end attached, which
@@ -10649,8 +11314,7 @@ fail:
 		(void)close(fds[1]);
 	}
 #if WITH_TLS
-	/* srv_conn is owned by fx->srv once it exists; otherwise free it here. */
-	if (fx->srv == NULL && srv_conn != NULL) {
+	if (srv_conn != NULL) {
 		tls_conn_free(srv_conn);
 	}
 #endif
@@ -10662,6 +11326,39 @@ fail:
 	ev_loop_destroy(fx->loop);
 	fx->loop = NULL;
 	return -1;
+}
+
+T_DECLARE_CASE(test_fixture_constructor_failure_consumes_transport)
+{
+#ifdef MUX_TEST_WRAP_CONSTRUCTOR
+	struct raw_fixture raw;
+	fail_fixture_constructor = true;
+	const int raw_ret = raw_fixture_setup_ex(
+		&raw, &(struct mux_callbacks){ 0 }, NULL, false);
+	const unsigned int raw_closes = constructor_fd_closes;
+	const bool raw_released =
+		raw.srv == NULL && raw.loop == NULL && raw.raw_fd == -1;
+	constructor_fd = -1;
+
+	struct mux_test_fixture bench;
+	fail_fixture_constructor = true;
+	const int bench_ret = bench_fixture_setup(&bench);
+	const unsigned int bench_closes = constructor_fd_closes;
+	const bool bench_released = bench.srv == NULL && bench.loop == NULL;
+	constructor_fd = -1;
+
+	const int retry_ret = bench_fixture_setup(&bench);
+	fixture_teardown(&bench);
+	T_EXPECT_EQ(raw_ret, -1);
+	T_EXPECT_EQ(raw_closes, 1u);
+	T_EXPECT(raw_released);
+	T_EXPECT_EQ(bench_ret, -1);
+	T_EXPECT_EQ(bench_closes, 1u);
+	T_EXPECT(bench_released);
+	T_EXPECT_EQ(retry_ret, 0);
+#else
+	T_SKIP("constructor allocation injection requires linker wrapping");
+#endif /* MUX_TEST_WRAP_CONSTRUCTOR */
 }
 
 #if WITH_TLS
@@ -11244,6 +11941,7 @@ T_DECLARE_CASE(test_mux_set_callbacks_replaces_callback_table)
 }
 
 static const struct testing_suite suite[] = {
+	T_CASE(test_receive_retains_window_beside_maximum_partial_frame),
 	T_CASE(test_establish),
 	T_CASE(test_send_recv_small),
 	T_CASE(test_idle_scheduler_stops_while_sendbuf_blocked),
@@ -11289,8 +11987,10 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_peer_close_lost_callback_closes_session),
 	T_CASE(test_drain_lost_callback_closes_session),
 	T_CASE(test_identity_verification_cancellation),
+	T_CASE(test_stream_acceptance_cancellation),
 	T_CASE(test_stream_drain_callback_cancellation),
 	T_CASE(test_interop_i1_non_syn_unknown_stream),
+	T_CASE(test_raw_control_memory_limit_and_reload),
 	T_CASE(test_interop_i2_close_wait_push),
 	T_CASE(test_interop_i3_ack_fin_credit),
 	T_CASE(test_interop_i4_stream_id_parity),
@@ -11322,6 +12022,10 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_resume_stream_transparent),
 	T_CASE(test_resume_stream_unacked_retransmit),
 	T_CASE(test_resume_handshake_transport_lost),
+	T_CASE(test_resume_failure_reports_released_client),
+	T_CASE(test_connect_cancellation_failure_releases_resources),
+	T_CASE(test_bdp_predicates_reject_released_session),
+	T_CASE(test_fixture_constructor_failure_consumes_transport),
 	T_CASE(test_resume_declined_after_reattach),
 	T_CASE(test_resume_declined_keeps_held_direct_stream),
 	T_CASE(test_tls_session_memory_transport),
@@ -11357,6 +12061,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_mux_set_callbacks_replaces_callback_table),
 	T_CASE(test_replay_oom_waits_for_retry_timer),
 	T_CASE(test_window_stall_settles_write_watcher_until_ack),
+	T_CASE(test_window_reload_resumes_stalled_payload),
+	T_CASE(test_window_stall_watchdog_survives_reload),
 	T_CASE(test_direct_send_first_allocation_failure),
 	T_CASE(test_direct_send_partial_allocation_failure),
 	T_CASE(test_session_ack_trim_leaves_estimator_alone),

@@ -99,8 +99,10 @@ flush_sendbuf_head(struct mux_session *ss, bool *restrict made_progress)
 	if (frame == was_staging_tail) {
 		ss->wire.sendbuf_staging = false;
 	}
+	struct mux_session_guard guard;
+	session_guard_begin(ss, &guard);
 	mux_unacked_track_sent(ss, frame);
-	return false;
+	return !session_guard_end(&guard);
 }
 
 /* True while the sendbuf head must be flushed before producing more: a
@@ -277,7 +279,7 @@ static enum send_stage send_stage_next(
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			mux_sched_flush_ctrl(ss);
-			if (!session_guard_end(ss, &guard) ||
+			if (!session_guard_end(&guard) ||
 			    ss->state != SESSION_ESTABLISHED) {
 				return SEND_STAGE_BLOCKED;
 			}
@@ -291,14 +293,13 @@ static enum send_stage send_stage_next(
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	const bool produced = mux_sched_next_data(ss);
-	if (!session_guard_end(ss, &guard) ||
-	    ss->state != SESSION_ESTABLISHED) {
+	if (!session_guard_end(&guard) || ss->state != SESSION_ESTABLISHED) {
 		return SEND_STAGE_BLOCKED;
 	}
 	if (!produced) {
 		session_guard_begin(ss, &guard);
 		mux_sched_flush_ctrl(ss);
-		if (!session_guard_end(ss, &guard) ||
+		if (!session_guard_end(&guard) ||
 		    ss->state != SESSION_ESTABLISHED) {
 			return SEND_STAGE_BLOCKED;
 		}
@@ -377,26 +378,29 @@ update_send_timeout(struct mux_session *restrict ss, const bool progress)
 	}
 	if (!send_has_pending_work(ss)) {
 		ev_timer_stop(ss->loop, &ss->w_send_timeout);
+		if (ss->wire.kernel_send_timeout) {
+			ev_timer_set(&ss->w_send_timeout, 0.0, 0.0);
+		}
 		return;
 	}
-	/* When the kernel's TCP_USER_TIMEOUT is installed it covers "peer stopped
-	 * acking data we already wrote to the socket", so this timer stays off
-	 * (repeat == 0.0). The exception is a resume retransmit stalled on a
-	 * frame-pool OOM: it never reached the socket, so the kernel has nothing
-	 * to time out on -- raise a real userspace watchdog interval for that one
-	 * case, then restore repeat == 0.0 (handing the watchdog back to the
-	 * kernel) once the stall clears, so a redundant userspace watchdog does
-	 * not persist for the rest of the connection. */
+	/* TCP_USER_TIMEOUT covers transport ACKs, not work waiting before the
+	 * socket on replay allocation or the mux session window. Use a userspace
+	 * deadline for those stalls and restore kernel-only coverage afterward. */
 	const bool oom_stalled = ss->unacked.retransmit_off != SIZE_MAX &&
 				 ss->wire.sendbuf.head == NULL;
+	const bool window_stalled =
+		ss->unacked.stalled &&
+		(ss->sched.sched_head != NULL || ss->sched.drr_active != NULL);
+	/* OOB/keepalive traffic is transport progress, not mux-window progress. */
+	const bool renew = progress && !window_stalled;
 	if (ss->wire.kernel_send_timeout) {
-		if (oom_stalled) {
+		if (oom_stalled || window_stalled) {
 			if (ss->w_send_timeout.repeat == 0.0) {
 				ev_timer_set(
 					&ss->w_send_timeout, 0.0,
 					(double)ss->conf.send_timeout);
 				ev_timer_again(ss->loop, &ss->w_send_timeout);
-			} else if (!ev_is_active(&ss->w_send_timeout) || progress) {
+			} else if (!ev_is_active(&ss->w_send_timeout) || renew) {
 				ev_timer_again(ss->loop, &ss->w_send_timeout);
 			}
 		} else if (ss->w_send_timeout.repeat != 0.0) {
@@ -406,8 +410,16 @@ update_send_timeout(struct mux_session *restrict ss, const bool progress)
 		return;
 	}
 	/* No kernel timeout: the userspace watchdog always covers egress. */
-	if (!ev_is_active(&ss->w_send_timeout) || progress) {
+	if (!ev_is_active(&ss->w_send_timeout) || renew) {
 		ev_timer_again(ss->loop, &ss->w_send_timeout);
+	}
+}
+
+void mux_session_refresh_send_timeout(struct mux_session *restrict ss)
+{
+	if (ss->state == SESSION_ESTABLISHED) {
+		ev_timer_stop(ss->loop, &ss->w_send_timeout);
+		update_send_timeout(ss, false);
 	}
 }
 
@@ -442,7 +454,7 @@ static bool send_handle_rx_closed(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_set_state(ss, SESSION_CLOSING);
-	if (!session_guard_end(ss, &guard) || ss->state != SESSION_CLOSING) {
+	if (!session_guard_end(&guard) || ss->state != SESSION_CLOSING) {
 		return true;
 	}
 	ss->wire.tx_pending = true;
@@ -451,6 +463,7 @@ static bool send_handle_rx_closed(struct mux_session *ss)
 
 void mux_session_on_send(struct mux_session *ss)
 {
+	const bool was_window_stalled = ss->unacked.stalled;
 	ss->wire.tx_pending = false;
 	if (send_handle_rx_closed(ss)) {
 		return;
@@ -465,7 +478,7 @@ void mux_session_on_send(struct mux_session *ss)
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		mux_sched_drain_lp(ss);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 	}
@@ -474,7 +487,7 @@ void mux_session_on_send(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	send_pump(ss, &made_progress);
-	if (!session_guard_end(ss, &guard)) {
+	if (!session_guard_end(&guard)) {
 		return;
 	}
 	if (ss->state == SESSION_SUSPENDED || ss->state == SESSION_CLOSED) {
@@ -523,6 +536,11 @@ void mux_session_on_send(struct mux_session *ss)
 	/* Resume the lifecycle drain (INIT SYN / CLOSED cleanup) now the sendbuf
 	 * may have cleared; mux_sched_schedule no-ops while it is still occupied. */
 	mux_sched_schedule(ss);
+	/* Payload progress may fill the window this pass. Start its new stall
+	 * deadline here rather than retaining an older transport deadline. */
+	if (made_progress && !was_window_stalled) {
+		ev_timer_stop(ss->loop, &ss->w_send_timeout);
+	}
 	update_send_timeout(ss, made_progress);
 	/* dispatch_frame's post-hello early return (recv.c)
 	 * defers already-buffered frames behind tx_pending. If tx_pending has
@@ -641,14 +659,21 @@ bool mux_session_send_ctrl(
 	struct mux_session *restrict ss, const uint_fast16_t stream_id,
 	const uint_fast8_t flags, const uint_fast32_t extra)
 {
-	struct mux_frame *const frame =
-		mux_frame_get(&ss->pool, ss->max_payload);
-	if (frame == NULL) {
-		LOGOOM();
-		return false;
+	const bool defer = stream_id != STREAMID_CTRL &&
+			   ss->unacked.retransmit_off != SIZE_MAX;
+	unsigned char *data =
+		defer ? NULL :
+			mux_wire_sendbuf_extend(ss, MUX_FRAME_HEADER_SIZE);
+	struct mux_frame *frame = NULL;
+	if (data == NULL) {
+		frame = mux_frame_get(&ss->pool, ss->max_payload);
+		if (frame == NULL) {
+			LOGOOM();
+			return false;
+		}
+		frame->len = MUX_FRAME_HEADER_SIZE;
+		data = frame->data;
 	}
-	frame->pos = 0;
-	frame->len = MUX_FRAME_HEADER_SIZE;
 
 	const uint_fast32_t clamped = MIN(extra, (uint_fast32_t)UINT16_MAX);
 	const struct mux_header hdr = {
@@ -659,11 +684,10 @@ bool mux_session_send_ctrl(
 		.extra = (uint_least16_t)clamped,
 	};
 
-	mux_write_header(frame->data, &hdr);
+	mux_write_header(data, &hdr);
 
 	if (LOGLEVEL(VERYVERBOSE)) {
-		mux_session_log_frame_header(
-			ss, "frame out", frame->data, &hdr);
+		mux_session_log_frame_header(ss, "frame out", data, &hdr);
 	}
 	/* mux_unacked_track_sent ring-tracks every non-STREAMID_CTRL frame it sees
 	 * flushed, so wire order must match ring order or a peer's cumulative
@@ -673,10 +697,9 @@ bool mux_session_send_ctrl(
 	 * send_stage_next's step 1 like every other producer already does;
 	 * mux_session_suspend() migrates a still-pending one into the resume log
 	 * instead of dropping it if a second suspend intervenes. */
-	if (stream_id != STREAMID_CTRL &&
-	    ss->unacked.retransmit_off != SIZE_MAX) {
+	if (defer) {
 		mux_frame_list_push(&ss->wire.oobbuf, frame);
-	} else {
+	} else if (frame != NULL) {
 		mux_wire_sendbuf_push(ss, frame);
 	}
 	/* Counted only once the RST is actually enqueued, matching every other
@@ -943,7 +966,7 @@ static void session_flush_inline(struct mux_session *ss)
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_on_send(ss);
-	if (!session_guard_end(ss, &guard)) {
+	if (!session_guard_end(&guard)) {
 		return;
 	}
 	if (ss->state == SESSION_CLOSED) {

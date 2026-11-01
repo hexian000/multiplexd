@@ -235,6 +235,12 @@
                     "maximum": 1073725440,
                     "default": 0
                 },
+                "unacked_memory_limit": {
+                    "description": "Positive per-session retransmit-log allocation budget in bytes, default 67108864 (64 MiB). Includes retained frame objects at full capacity and all ring storage; excludes allocator overhead, other send buffers and temporary replay copies. Overflow resets the whole session. Fixed at session creation, preserved through suspension/resumption; reload applies only to new sessions. session_window remains payload-byte backpressure. No unlimited mode.",
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 67108864
+                },
                 "stream_window": {
                     "description": "Per-stream receive buffer size in bytes advertised to the peer. Rounded down to a multiple of 16384 (16 KiB), with a floor of 65536: any smaller nonzero value becomes 65536. 0 = automatic.",
                     "type": "integer",

@@ -42,11 +42,9 @@ struct wire_ctx {
 	/* true when dgrambuf has the next turn over scheduled stream data; set
 	 * after each data frame so datagrams and data alternate. */
 	bool dgram_turn : 1;
-	/* true when the kernel's TCP_USER_TIMEOUT is installed on the socket, so
-	 * it -- not w_send_timeout -- covers "peer stopped acking". Persistent per
-	 * connection; distinguishes "kernel handles the watchdog" from the timer's
-	 * repeat, which update_send_timeout temporarily raises for an OOM stall the
-	 * kernel cannot see and must be able to restore afterward. */
+	/* true when TCP_USER_TIMEOUT covers transport ACK progress. The send
+	 * watchdog may still use a userspace deadline for replay-allocation or
+	 * mux-window stalls, then restore kernel-only coverage when they clear. */
 	bool kernel_send_timeout : 1;
 	/* errno that ended the transport, or 0 when none was observed (a clean
 	 * close, a timeout, or a failure the layer cannot attribute).  Set when
@@ -114,6 +112,11 @@ bool mux_wire_has_pending(const struct mux_session *restrict ss);
 
 /* Free all pending send buffers and reset the receive ring. */
 void mux_wire_discard_buffers(struct mux_session *restrict ss);
+
+/* Extend an eligible staging tail by len bytes and return the new span, or
+ * NULL when a separate frame is needed. */
+unsigned char *
+mux_wire_sendbuf_extend(struct mux_session *restrict ss, size_t len);
 
 /* Append @p frame to the sendbuf queue.  A frame that still fits the open tail
  * within one TLS record (MUX_MAX_RECORD) is memcpy-packed onto it (and freed);

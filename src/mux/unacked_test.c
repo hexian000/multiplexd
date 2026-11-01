@@ -107,6 +107,8 @@ static void uf_setup(struct unacked_fixture *restrict fx)
 	};
 	fx->ss.max_payload = MUX_MAX_PAYLOAD_SIZE;
 	fx->ss.session_window = 4;
+	fx->ss.unacked.memory_limit =
+		mux_session_config_default.unacked_memory_limit;
 	fx->ss.unacked.retransmit_off = SIZE_MAX;
 	fx->ss.cnt.buffers.unacked_frames = &fx->unacked_frames;
 }
@@ -172,6 +174,167 @@ static struct mux_frame *make_data_frame(
 }
 
 /* regression - targeted cases for one ring/counter behavior each */
+
+T_DECLARE_CASE(test_unacked_control_memory_boundary)
+{
+	static struct unacked_fixture fx;
+	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
+	const size_t ring_bytes =
+		sizeof(struct mux_frame_ring) +
+		MUX_FRAME_RING_MIN * sizeof(struct mux_frame *);
+	const size_t frame_bytes = MUX_FRAME_OBJECT_SIZE(fx.ss.max_payload);
+	fx.ss.unacked.memory_limit = ring_bytes + 2 * frame_bytes;
+	g_reset_calls = 0;
+	for (size_t i = 0; i < 3; i++) {
+		struct mux_frame *const frame = make_data_frame(&fx, 0);
+		T_CHECK(frame != NULL);
+		mux_write_header(
+			frame->data, &(struct mux_header){
+					     .version = MUX_PROTOCOL_VERSION,
+					     .flags = MUX_FLAG_RST,
+					     .stream_id = 1,
+				     });
+		mux_unacked_track_sent(&fx.ss, frame);
+		T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)0);
+		if (i < 2) {
+			T_EXPECT_EQ(g_reset_calls, 0);
+			T_EXPECT_EQ(
+				fx.ss.unacked.memory_bytes,
+				ring_bytes + (i + 1) * frame_bytes);
+		}
+	}
+	T_EXPECT_EQ(g_reset_calls, 1);
+	T_EXPECT_EQ(fx.ss.unacked.memory_bytes, (size_t)0);
+	T_EXPECT(fx.ss.unacked.ring == NULL);
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)0);
+	T_EXPECT_EQ(COUNTER_LOAD(fx.ss.cnt.buffers.unacked_frames), 0);
+	T_EXPECT(uf_teardown(&fx));
+}
+
+T_DECLARE_CASE(test_unacked_small_budget_and_size_overflow)
+{
+	const size_t limits[] = { 1, MUX_FRAME_OBJECT_SIZE(0),
+				  MUX_FRAME_OBJECT_SIZE(MUX_MAX_PAYLOAD_SIZE) };
+	for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+		static struct unacked_fixture fx;
+		uf_setup(&fx);
+		T_CLEANUP(uf_cleanup, &fx);
+		fx.ss.unacked.memory_limit = limits[i];
+		struct mux_frame *const frame = make_data_frame(&fx, 0);
+		T_CHECK(frame != NULL);
+		g_reset_calls = 0;
+		mux_unacked_track_sent(&fx.ss, frame);
+		T_EXPECT_EQ(g_reset_calls, 1);
+		T_EXPECT_EQ(fx.ss.unacked.memory_bytes, (size_t)0);
+		T_EXPECT(fx.ss.unacked.ring == NULL);
+		T_EXPECT(uf_teardown(&fx));
+	}
+	/* A forged capacity must not wrap the requested object size to zero. */
+	static struct unacked_fixture fx;
+	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
+	fx.ss.unacked.memory_limit = SIZE_MAX;
+	struct mux_frame *const frame = make_data_frame(&fx, 0);
+	T_CHECK(frame != NULL);
+	frame->cap = SIZE_MAX;
+	g_reset_calls = 0;
+	mux_unacked_track_sent(&fx.ss, frame);
+	T_EXPECT_EQ(g_reset_calls, 1);
+	T_EXPECT(uf_teardown(&fx));
+}
+
+T_DECLARE_CASE(test_unacked_ring_growth_budget)
+{
+	for (size_t shortfall = 0; shortfall <= 1; shortfall++) {
+		static struct unacked_fixture fx;
+		uf_setup(&fx);
+		T_CLEANUP(uf_cleanup, &fx);
+		fx.ss.max_payload = MUX_MIN_FRAME_PAYLOAD;
+		const size_t frame_bytes =
+			MUX_FRAME_OBJECT_SIZE(fx.ss.max_payload);
+		const size_t grown_ring = sizeof(struct mux_frame_ring) +
+					  (size_t)2 * MUX_FRAME_RING_MIN *
+						  sizeof(struct mux_frame *);
+		fx.ss.unacked.memory_limit =
+			grown_ring + (MUX_FRAME_RING_MIN + 1) * frame_bytes -
+			shortfall;
+		g_reset_calls = 0;
+		for (size_t i = 0; i <= MUX_FRAME_RING_MIN; i++) {
+			struct mux_frame *const frame = make_data_frame(&fx, 0);
+			T_CHECK(frame != NULL);
+			mux_unacked_track_sent(&fx.ss, frame);
+		}
+		T_EXPECT_EQ(g_reset_calls, (int)shortfall);
+		if (shortfall == 0) {
+			T_CHECK(fx.ss.unacked.ring != NULL);
+			T_EXPECT_EQ(
+				fx.ss.unacked.ring->capacity,
+				(size_t)2 * MUX_FRAME_RING_MIN);
+			T_EXPECT_EQ(
+				fx.ss.unacked.memory_bytes,
+				fx.ss.unacked.memory_limit);
+		} else {
+			T_EXPECT_EQ(fx.ss.unacked.memory_bytes, (size_t)0);
+			T_EXPECT(fx.ss.unacked.ring == NULL);
+		}
+		T_EXPECT(uf_teardown(&fx));
+	}
+}
+
+T_DECLARE_CASE(test_unacked_partial_ack_keeps_allocation_charge)
+{
+	static struct unacked_fixture fx;
+	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
+	const size_t ring_bytes =
+		sizeof(struct mux_frame_ring) +
+		MUX_FRAME_RING_MIN * sizeof(struct mux_frame *);
+	const size_t frame_bytes = MUX_FRAME_OBJECT_SIZE(fx.ss.max_payload);
+	const uint_least16_t lengths[] = { 1, 2, 0 };
+	struct mux_frame *const frame =
+		make_frame(&fx, MUX_PROTOCOL_VERSION, 1, lengths, 3);
+	T_CHECK(frame != NULL);
+	fx.ss.unacked.memory_limit = ring_bytes + frame_bytes;
+	mux_unacked_track_sent(&fx.ss, frame);
+	T_EXPECT_EQ(fx.ss.unacked.memory_bytes, ring_bytes + frame_bytes);
+	T_EXPECT_EQ(fx.ss.unacked.frames, (size_t)3);
+	T_EXPECT(mux_unacked_ack_trim(&fx.ss, 1).ok);
+	T_EXPECT_EQ(fx.ss.unacked.memory_bytes, ring_bytes + frame_bytes);
+	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)2);
+	T_EXPECT(mux_unacked_ack_trim(&fx.ss, 2).ok);
+	T_EXPECT_EQ(fx.ss.unacked.memory_bytes, ring_bytes);
+	T_EXPECT_EQ(fx.ss.unacked.bytes, (size_t)0);
+	/* Released frame charge can be reused without growing the empty ring. */
+	struct mux_frame *const next = make_data_frame(&fx, 0);
+	T_CHECK(next != NULL);
+	mux_unacked_track_sent(&fx.ss, next);
+	T_EXPECT_EQ(fx.ss.unacked.memory_bytes, ring_bytes + frame_bytes);
+	T_EXPECT(uf_teardown(&fx));
+	T_EXPECT_EQ(fx.ss.unacked.memory_bytes, (size_t)0);
+}
+
+T_DECLARE_CASE(test_unacked_partial_flush_budget)
+{
+	static struct unacked_fixture fx;
+	uf_setup(&fx);
+	T_CLEANUP(uf_cleanup, &fx);
+	const size_t ring_bytes =
+		sizeof(struct mux_frame_ring) +
+		MUX_FRAME_RING_MIN * sizeof(struct mux_frame *);
+	const size_t frame_bytes = MUX_FRAME_OBJECT_SIZE(fx.ss.max_payload);
+	fx.ss.unacked.memory_limit = ring_bytes + frame_bytes - 1;
+	const uint_least16_t lengths[] = { 0, 1 };
+	fx.owned[0] = make_frame(&fx, MUX_PROTOCOL_VERSION, 1, lengths, 2);
+	T_CHECK(fx.owned[0] != NULL);
+	fx.owned[0]->pos = MUX_FRAME_HEADER_SIZE;
+	g_reset_calls = 0;
+	mux_unacked_track_partial(&fx.ss, fx.owned[0]);
+	T_EXPECT_EQ(g_reset_calls, 1);
+	T_EXPECT_EQ(fx.ss.unacked.memory_bytes, (size_t)0);
+	T_EXPECT(fx.ss.unacked.ring == NULL);
+	T_EXPECT(uf_teardown(&fx));
+}
 
 T_DECLARE_CASE(test_track_sent_ring_allocation_failure_resets)
 {
@@ -995,6 +1158,8 @@ T_DECLARE_CASE(test_replay_counter_consistency_stress)
 	uf_setup(&fx);
 	T_CLEANUP(uf_cleanup, &fx);
 
+	/* Keep the stress ring below its explicit budget with realistic capacity. */
+	fx.ss.max_payload = MUX_MIN_FRAME_PAYLOAD;
 	enum { N = 1500 };
 	size_t pushed = 0;
 	for (size_t i = 0; i < N; i++) {
@@ -1344,13 +1509,23 @@ static void replay_pool_free(void *data, struct mux_frame *frame)
 	}
 }
 
-/* Replay-accounting cost (issue #45): fill a ring, then run a full resume replay
- * -- retire every entry and ACK it back in small batches.  Retire folds one
- * entry's logical count into the running counter in O(1) and each ACK reconciles
- * only the popped prefix, so a whole replay is O(total frames) instead of the
- * O(n^2) the per-ACK rescan cost.  In shipped (NDEBUG) builds mux_unacked_ack_recv's
- * bound is a single field read; the O(n) cross-check verifier is compiled out,
- * so build Release to read the production replay cost from this bench. */
+/* Retire copies through the same accounting path as the send side. */
+static void replay_bench_prefix(struct unacked_fixture *fx, const size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		const struct mux_frame *const orig = mux_frame_ring_peek(
+			fx->ss.unacked.ring, fx->ss.unacked.retransmit_off);
+		struct mux_frame *const copy = make_data_frame(fx, 8);
+		fx->ss.unacked.retransmit_copy = copy;
+		fx->ss.unacked.retransmit_copy_count = orig->unacked_count;
+		mux_unacked_track_sent(&fx->ss, copy);
+	}
+}
+
+/* Retire a long prefix before ACKing it in batches of four. The unreplayed
+ * suffix keeps the replay bound active while the prefix drains, exposing the
+ * former per-ACK prefix rescan's quadratic cost. Release builds omit the debug
+ * cross-check rescan, so use Release to measure production accounting cost. */
 T_DECLARE_BENCH(bench_unacked_replay_accounting)
 {
 	g_replay_top = 0;
@@ -1373,29 +1548,22 @@ T_DECLARE_BENCH(bench_unacked_replay_accounting)
 			mux_unacked_track_sent(&fx.ss, make_data_frame(&fx, 8));
 		}
 		unacked_set_replay_off(&fx.ss.unacked, 0);
-		while (fx.ss.unacked.retransmit_off != SIZE_MAX &&
-		       fx.ss.unacked.ring != NULL &&
-		       fx.ss.unacked.ring->count > 0) {
-			if (fx.ss.unacked.retransmit_off <
-			    fx.ss.unacked.ring->count) {
-				const struct mux_frame *const orig =
-					mux_frame_ring_peek(
-						fx.ss.unacked.ring,
-						fx.ss.unacked.retransmit_off);
-				struct mux_frame *const copy =
-					make_data_frame(&fx, 8);
-				fx.ss.unacked.retransmit_copy = copy;
-				fx.ss.unacked.retransmit_copy_count =
-					orig->unacked_count;
-				mux_unacked_track_sent(&fx.ss, copy);
-			}
-			const size_t avail = fx.ss.unacked.retransmitted_frames;
-			if (avail > 0) {
-				const size_t batch = avail < 4 ? avail : 4;
-				(void)mux_unacked_ack_recv(
-					&fx.ss, (uint_fast32_t)batch);
-			}
+		replay_bench_prefix(&fx, REPLAY_RING - 4);
+		T_CHECK(fx.ss.unacked.ring->count == REPLAY_RING);
+		T_CHECK(fx.ss.unacked.retransmit_off == REPLAY_RING - 4);
+		T_CHECK(fx.ss.unacked.retransmitted_frames == REPLAY_RING - 4);
+		for (size_t remaining = REPLAY_RING - 4; remaining > 0;
+		     remaining -= 4) {
+			T_CHECK(fx.ss.unacked.retransmit_off == remaining);
+			T_CHECK(fx.ss.unacked.ring->count == remaining + 4);
+			T_CHECK(mux_unacked_ack_recv(&fx.ss, 4).ok);
 		}
+		/* Complete the suffix only after measuring ACKs of the long prefix. */
+		replay_bench_prefix(&fx, 4);
+		T_CHECK(mux_unacked_ack_recv(&fx.ss, 4).ok);
+		T_CHECK(fx.ss.unacked.frames == 0);
+		T_CHECK(fx.ss.unacked.ring->count == 0);
+		T_CHECK(fx.ss.unacked.retransmit_off == SIZE_MAX);
 	}
 	mux_unacked_free_all(&fx.ss);
 	for (size_t i = 0; i < g_replay_top; i++) {
@@ -1404,6 +1572,11 @@ T_DECLARE_BENCH(bench_unacked_replay_accounting)
 }
 
 static const struct testing_suite suite[] = {
+	T_CASE(test_unacked_control_memory_boundary),
+	T_CASE(test_unacked_small_budget_and_size_overflow),
+	T_CASE(test_unacked_ring_growth_budget),
+	T_CASE(test_unacked_partial_ack_keeps_allocation_charge),
+	T_CASE(test_unacked_partial_flush_budget),
 	T_CASE(test_track_sent_ring_allocation_failure_resets),
 	T_CASE(test_track_sent_drops_hello),
 	T_CASE(test_track_sent_drops_single_ctrl),

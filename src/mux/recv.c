@@ -145,7 +145,7 @@ static bool deliver_push_payload(
 	mux_stream_recv_copy(
 		s, bytebuf_read_ptr(ss->wire.recvbuf) + MUX_FRAME_HEADER_SIZE,
 		hdr->length);
-	if (!session_guard_end(ss, &guard)) {
+	if (!session_guard_end(&guard)) {
 		return false;
 	}
 	if (session_streams_freed(ss)) {
@@ -167,22 +167,16 @@ static void process_syn_payload(
 	if ((hdr->flags & MUX_FLAG_PUSH) && hdr->length > 0 &&
 	    (s->state == STREAM_ESTABLISHED ||
 	     s->state == STREAM_SYN_RECEIVED)) {
-		/* Bound the fast-open payload by the credit this side has granted the
-		 * peer, so bytes_received can never overtake grant_sent: nothing
-		 * downstream enforces it, as mux_stream_recv_copy only guards recv_window,
-		 * which floors at four frames (65536). Without this, a payload above
-		 * the grant is copied in, and stream_grantable_bytes then evaluates
-		 * (grant_sent - bytes_received) in wrapping uint_least32_t arithmetic
-		 * (~4.29e9), so mux_stream_grant_inc returns 0 forever and the stream's
-		 * credit loop never reopens.
+		/* Bound the initial fast-open payload by our grant. On the SYN|ACK
+		 * path this is the implicit 16384 octets plus our SYN's Extra
+		 * (spec §4.3.1). Delivery through mux_stream_recv_copy also enforces
+		 * remaining cumulative credit (grant_sent - bytes_received) and the
+		 * separate recv_window limit.
 		 *
-		 * grant_sent is the exact bound on the SYN|ACK path (spec §4.3.1's
-		 * implicit 16384 plus our own SYN's Extra), which is the path this
-		 * check now guards. On the SYN path §4.3.1's flat 16384 cap is enforced
-		 * upstream in dispatch_no_stream -- before on_accept attaches the stream
-		 * and raises grant_sent past 16384 -- so every fast-open reaching here
-		 * on that path is already within the flat cap and this remains only a
-		 * redundant backstop there. */
+		 * An opening SYN has a flat 16384-octet cap, enforced upstream in
+		 * dispatch_no_stream before on_accept can raise grant_sent. This
+		 * live-grant check is a backstop there, not a replacement for that
+		 * pre-accept cap. */
 		if (hdr->length > s->grant_sent) {
 			MUX_LOG_F(
 				WARNING, ss,
@@ -193,7 +187,7 @@ static void process_syn_payload(
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			mux_stream_abort(s, MUX_STATUS_FLOW_CONTROL_ERROR);
-			if (!session_guard_end(ss, &guard)) {
+			if (!session_guard_end(&guard)) {
 				return;
 			}
 			/* mux_stream_abort can free the last active stream of a
@@ -337,7 +331,7 @@ static void dispatch_by_stream(
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		mux_stream_recv_window(s, hdr->extra);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		/* mux_stream_recv_window() may mux_stream_abort on a spec §6.6 excessive-
@@ -376,7 +370,7 @@ static void dispatch_by_stream(
 		struct mux_session_guard guard;
 		session_guard_begin(ss, &guard);
 		mux_stream_recv_window(s, hdr->extra);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		/* Defense-in-depth, mirroring the ACK-only guard above: a SYN|ACK
@@ -398,7 +392,7 @@ static void dispatch_by_stream(
 		}
 		session_guard_begin(ss, &guard);
 		stream_report_established(ss, s);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		/* The lifecycle callback may shut down the session, freeing or
@@ -597,7 +591,16 @@ static void dispatch_no_stream(
 			return;
 		}
 
-		if (!ss->callbacks.on_accept(ss->userdata, ss, s)) {
+		struct mux_session_guard guard;
+		session_guard_begin(ss, &guard);
+		const bool accepted =
+			ss->callbacks.on_accept(ss->userdata, ss, s);
+		/* Acceptance can shut down or release the session and its new stream. */
+		if (!session_guard_end(&guard) ||
+		    ss->state != SESSION_ESTABLISHED) {
+			return;
+		}
+		if (!accepted) {
 			MUX_LOG_F(
 				DEBUG, ss,
 				"stream %" PRIuFAST16
@@ -635,8 +638,8 @@ static void dispatch_no_stream(
 		return;
 	}
 
-	/* IDs are never reused, so a non-SYN frame for an unknown stream is
-	 * likely late data past the tombstone period: RST it, keep the session. */
+	/* No stream-table entry matches this non-SYN frame; it may be late data
+	 * past the tombstone period. RST it and keep the session. */
 	MUX_LOG_F(
 		DEBUG, ss,
 		"non-SYN frame for unknown stream %" PRIuFAST16 ", sending RST",
@@ -679,11 +682,9 @@ static void dispatch_dgram_frame(
 	}
 }
 
-/* Handle a control-stream frame.  Returns false once the session has left
- * SESSION_ESTABLISHED -- reset here or by a handler it calls (e.g.
- * mux_session_recv_ping on an oversized PING) -- and frame dispatch must
- * stop. */
-static bool dispatch_ctrl_frame(
+/* Control handlers can reset the session and let its owner release it. The
+ * caller guards dispatch and checks the state before reading another frame. */
+static void dispatch_ctrl_frame(
 	struct mux_session *ss, const struct mux_header *restrict hdr,
 	const size_t frame_size)
 {
@@ -695,7 +696,7 @@ static bool dispatch_ctrl_frame(
 				" length=%" PRIuLEAST16 ", closing connection",
 				(uint_least8_t)hdr->flags, hdr->length);
 			mux_session_reset(ss);
-			return false;
+			return;
 		}
 		MUX_LOG_F(
 			DEBUG, ss,
@@ -707,13 +708,16 @@ static bool dispatch_ctrl_frame(
 		if (!r.ok) {
 			/* Peer acked more frames than were sent. */
 			mux_session_reset(ss);
-			return false;
+			return;
 		}
 		/* unacked stays free of the estimator and send pipeline:
 		 * drive both here from the result. */
 		if ((ss->auto_stream_window || ss->auto_session_window) &&
 		    r.trimmed_bytes > 0) {
 			mux_estimator_add_acked(ss, r.trimmed_bytes);
+		}
+		if (r.trimmed_bytes > 0 || r.unstalled) {
+			mux_session_refresh_send_timeout(ss);
 		}
 		if (r.unstalled) {
 			mux_notify_write(ss);
@@ -738,7 +742,6 @@ static bool dispatch_ctrl_frame(
 		dispatch_dgram_frame(ss, hdr);
 		bytebuf_consume(ss->wire.recvbuf, frame_size);
 	}
-	return ss->state == SESSION_ESTABLISHED;
 }
 
 static void dispatch_frame(struct mux_session *ss)
@@ -767,7 +770,7 @@ static void dispatch_frame(struct mux_session *ss)
 			struct mux_session_guard guard;
 			session_guard_begin(ss, &guard);
 			mux_handshake_process_hello(ss, &hdr, frame_size);
-			if (!session_guard_end(ss, &guard)) {
+			if (!session_guard_end(&guard)) {
 				return;
 			}
 			if (ss->state == SESSION_CLOSED) {
@@ -816,7 +819,11 @@ static void dispatch_frame(struct mux_session *ss)
 		}
 
 		if (hdr.stream_id == STREAMID_CTRL) {
-			if (!dispatch_ctrl_frame(ss, &hdr, frame_size)) {
+			struct mux_session_guard guard;
+			session_guard_begin(ss, &guard);
+			dispatch_ctrl_frame(ss, &hdr, frame_size);
+			if (!session_guard_end(&guard) ||
+			    ss->state != SESSION_ESTABLISHED) {
 				return;
 			}
 			continue;
@@ -855,7 +862,7 @@ static void dispatch_frame(struct mux_session *ss)
 		} else {
 			dispatch_no_stream(ss, &hdr);
 		}
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return;
 		}
 		if (ss->state != SESSION_ESTABLISHED) {
@@ -954,15 +961,13 @@ void mux_session_on_recv(struct mux_session *ss)
 			}
 		}
 	}
-	if (!session_guard_end(ss, &guard)) {
+	if (!session_guard_end(&guard)) {
 		return;
 	}
 	/* Reclaim capacity grown for oversized frames; floor is one read-ahead
 	 * window plus one partial frame to avoid regrowth churn. */
 	mux_bytebuf_shrink(
-		&ss->wire.recvbuf,
-		recv_window(ss) +
-			((size_t)MUX_FRAME_HEADER_SIZE + ss->max_payload));
+		&ss->wire.recvbuf, recv_window(ss) + MUX_MAX_FRAME_SIZE);
 	/* Flush responses (PONG, ACKs, credit) immediately rather than waiting
 	 * for EV_WRITE; prompt PONG avoids inflating the peer's RTT sample. */
 	mux_session_flush_resp(ss);
@@ -1135,6 +1140,7 @@ void mux_session_update_session_window(
 			ss->unacked.bytes,
 			(size_t)ss->session_window * MUX_WINDOW_UNIT);
 		ss->unacked.stalled = false;
+		mux_session_refresh_send_timeout(ss);
 		mux_notify_write(ss);
 	}
 }

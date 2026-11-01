@@ -22,6 +22,47 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Compute the extra retained allocation before allocating/growing the ring.
+ * Subtraction against the remaining budget also bounds every addition and
+ * multiplication used by mux_frame_ring_push. */
+static bool unacked_memory_charge(
+	const struct unacked_ctx *restrict ctx,
+	const struct mux_frame *restrict frame, size_t *restrict charge)
+{
+	const size_t overhead = MUX_FRAME_OBJECT_SIZE(0);
+	if (ctx->memory_bytes > ctx->memory_limit) {
+		return false;
+	}
+	size_t remaining = ctx->memory_limit - ctx->memory_bytes;
+	if (overhead > remaining || frame->cap > remaining - overhead) {
+		return false;
+	}
+	*charge = overhead + frame->cap;
+	remaining -= *charge;
+	const struct mux_frame_ring *const ring = ctx->ring;
+	size_t slots = 0;
+	if (ring == NULL) {
+		if (sizeof(*ring) > remaining) {
+			return false;
+		}
+		*charge += sizeof(*ring);
+		remaining -= sizeof(*ring);
+		slots = MUX_FRAME_RING_MIN;
+	} else if (ring->count == ring->capacity) {
+		/* Growth doubles capacity; only the new slots add retained bytes. */
+		if (ring->capacity > (SIZE_MAX - sizeof(*ring)) /
+					     sizeof(struct mux_frame *) / 2) {
+			return false;
+		}
+		slots = ring->capacity;
+	}
+	if (slots > remaining / sizeof(struct mux_frame *)) {
+		return false;
+	}
+	*charge += slots * sizeof(struct mux_frame *);
+	return true;
+}
+
 static bool ring_push(
 	struct mux_session *restrict ss, struct mux_frame *restrict frame,
 	const size_t count)
@@ -38,15 +79,27 @@ static bool ring_push(
 	return true;
 }
 
-/* Add one ring entry worth @p count logical seqnums.  Hitting the session cap
- * only stalls new data dequeues; ACK/oob paths still run. The frame is
- * already flushed to the peer by this point, so an OOM here means the resume
+/* Add one ring entry worth @p count logical seqnums. The payload window
+ * stalls only new data dequeues; the allocation budget bounds all entries.
+ * The frame is already flushed to the peer by this point, so an OOM here
+ * means the resume
  * log can no longer reconstruct what the peer received -- an unrecoverable
  * desync, not a transient failure to retry. */
 static void unacked_push(
 	struct mux_session *ss, struct mux_frame *restrict frame,
 	const size_t count)
 {
+	size_t charge;
+	if (!unacked_memory_charge(&ss->unacked, frame, &charge)) {
+		mux_frame_put(&ss->pool, frame);
+		MUX_LOG_F(
+			ERROR, ss,
+			"unacked memory limit exceeded: retained=%zu limit=%zu;"
+			" resetting session",
+			ss->unacked.memory_bytes, ss->unacked.memory_limit);
+		mux_session_reset(ss);
+		return;
+	}
 	if (!ring_push(ss, frame, count)) {
 		mux_frame_put(&ss->pool, frame);
 		MUX_LOG(ERROR, ss,
@@ -55,6 +108,7 @@ static void unacked_push(
 		mux_session_reset(ss);
 		return;
 	}
+	ss->unacked.memory_bytes += charge;
 	if (!ss->unacked.stalled &&
 	    ss->unacked.bytes >= (size_t)ss->session_window * MUX_WINDOW_UNIT) {
 		MUX_LOG_F(
@@ -340,6 +394,8 @@ mux_unacked_ack_trim(struct mux_session *restrict ss, const uint_fast32_t count)
 				trimmed_retransmitted += f->unacked_count;
 			}
 			remaining -= f->unacked_count;
+			ss->unacked.memory_bytes -=
+				MUX_FRAME_OBJECT_SIZE(f->cap);
 			(void)mux_frame_ring_pop(ss->unacked.ring);
 			mux_frame_put(&ss->pool, f);
 			popped++;
@@ -497,6 +553,7 @@ void mux_unacked_free_all(struct mux_session *restrict ss)
 	COUNTER_SUB(ss->cnt.buffers.unacked_frames, ss->unacked.frames);
 	ss->unacked.frames = 0;
 	ss->unacked.bytes = 0;
+	ss->unacked.memory_bytes = 0;
 	ss->unacked.partial_offset = 0;
 	unacked_set_replay_off(&ss->unacked, SIZE_MAX);
 	/* The replay copy belonged to the ring just freed (or to the send buffer

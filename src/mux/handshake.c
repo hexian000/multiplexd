@@ -109,7 +109,7 @@ static bool proto_hello_build(
 }
 
 static bool proto_parse_type(
-	const struct mux_session *restrict ss, const char *type,
+	const struct mux_session *restrict ss, char *type,
 	const size_t type_len, int *const version_out)
 {
 	if (type_len > MUX_MAX_PAYLOAD_SIZE) {
@@ -125,61 +125,48 @@ static bool proto_parse_type(
 		MUX_LOG(ERROR, ss, "protocol type contains an embedded NUL");
 		return false;
 	}
-	const size_t len = type_len;
-	/* mime_check_media tokenizes the buffer in place; copy onto the heap
-	 * rather than a peer-sized stack VLA (the ASSERT bound compiles out under
-	 * NDEBUG, leaving the stack at the mercy of the peer's type length). */
-	char *const buf = malloc(len + 1);
-	if (buf == NULL) {
-		LOGOOM();
-		return false;
-	}
-	memcpy(buf, type, len + 1);
-
-	bool ok = false;
+	char escaped[257];
+	escape_identity(escaped, sizeof(escaped), type, ESCAPE_PLAIN);
 	const char *version = NULL;
-	switch (mime_check_media(buf, "x-multiplexd-proto", &version)) {
+	switch (mime_check_media(type, "x-multiplexd-proto", &version)) {
 	case MIME_CHECK_OK:
 		break;
 	case MIME_CHECK_BAD_TYPE:
-		/* type is attacker-controlled (only known NUL-free, up to ~64 KiB
-		 * and can carry decoded ESC/LF); bound the logged length so a peer
-		 * cannot push kilobytes of arbitrary bytes into an ERROR line. */
-		MUX_LOG_F(ERROR, ss, "unsupported protocol: \"%.64s\"", type);
-		goto done;
+		/* Bound and escape peer-controlled text before logging it. */
+		MUX_LOG_F(ERROR, ss, "unsupported protocol: \"%s\"", escaped);
+		return false;
 	case MIME_CHECK_MALFORMED:
 		MUX_LOG_F(
-			ERROR, ss,
-			"malformed protocol type parameter: \"%.64s\"", type);
-		goto done;
+			ERROR, ss, "malformed protocol type parameter: \"%s\"",
+			escaped);
+		return false;
 	}
 	if (version == NULL) {
 		MUX_LOG(ERROR, ss, "protocol version not specified");
-		goto done;
+		return false;
 	}
 	/* strtoumax admits leading whitespace, a '+' sign and leading zeros, and
 	 * all of those are RFC 2045 token characters, so "01", "+1" and a quoted
 	 * " 1" would each parse as 1. Spec §5.2.2 admits only the canonical
 	 * decimal, and a strict peer closes on the rest. */
 	if (version[0] < '1' || version[0] > '9') {
-		MUX_LOG_F(
-			ERROR, ss, "invalid protocol version: %.64s", version);
-		goto done;
+		escape_identity(
+			escaped, sizeof(escaped), version, ESCAPE_PLAIN);
+		MUX_LOG_F(ERROR, ss, "invalid protocol version: %s", escaped);
+		return false;
 	}
 	errno = 0;
 	char *end = NULL;
 	const uintmax_t parsed = strtoumax(version, &end, 10);
 	if (errno != 0 || end == version || *end != '\0' || parsed == 0 ||
 	    parsed > (uintmax_t)UINT8_MAX) {
-		MUX_LOG_F(
-			ERROR, ss, "invalid protocol version: %.64s", version);
-		goto done;
+		escape_identity(
+			escaped, sizeof(escaped), version, ESCAPE_PLAIN);
+		MUX_LOG_F(ERROR, ss, "invalid protocol version: %s", escaped);
+		return false;
 	}
 	*version_out = (int)parsed;
-	ok = true;
-done:
-	free(buf);
-	return ok;
+	return true;
 }
 
 /* Decode a Base64-encoded session_id string into a binary buffer.
@@ -203,29 +190,18 @@ static bool proto_parse_session_id(
 }
 
 static bool proto_hello_parse(
-	const struct mux_session *restrict ss, const unsigned char *const json,
+	const struct mux_session *restrict ss, unsigned char *const json,
 	const size_t json_len, struct proto_hello *const out)
 {
-	/* A hello may legally be up to MUX_MAX_PAYLOAD_SIZE (the JSON tolerates
-	 * unknown keys and extensions).  Copy into a heap buffer rather than a
-	 * stack VLA to keep the large hello off the handshake thread's stack. */
 	if (json_len > MUX_MAX_PAYLOAD_SIZE) {
 		MUX_LOG(ERROR, ss, "failed to parse protocol hello: too large");
 		return false;
 	}
-	char *const json_buf = malloc(json_len + 1);
-	if (json_buf == NULL) {
-		LOGOOM();
-		return false;
-	}
-	memcpy(json_buf, json, json_len);
-	json_buf[json_len] = '\0';
-
-	/* obj's string fields (type/session_id/identity) point into json_buf, so it
-	 * must outlive every use below; freed together at the single cleanup exit. */
+	/* Decoded strings borrow the writable frame until retained fields have
+	 * been copied into out, before any callback or receive-buffer consume. */
 	struct json_proto obj = { 0 };
 	bool ok = false;
-	if (!json_unmarshal_proto(&obj, json_buf, json_len)) {
+	if (!json_unmarshal_proto(&obj, (char *)json, json_len)) {
 		MUX_LOG(ERROR, ss, "malformed protocol hello");
 		goto done;
 	}
@@ -279,7 +255,6 @@ static bool proto_hello_parse(
 	ok = true;
 done:
 	json_free_proto(&obj);
-	free(json_buf);
 	return ok;
 }
 
@@ -425,12 +400,14 @@ static bool handshake_client_fresh(
 				table_size(ss->sched.streams) :
 				0);
 	}
-	mux_sched_free_streams(ss);
-	ss->sched.streams = table_new(&mux_stream_table_opts);
-	if (ss->sched.streams == NULL) {
-		LOGOOM();
-		mux_session_reset(ss);
-		return false;
+	if (ss->handshake.has_session_id) {
+		mux_sched_free_streams(ss);
+		ss->sched.streams = table_new(&mux_stream_table_opts);
+		if (ss->sched.streams == NULL) {
+			LOGOOM();
+			mux_session_reset(ss);
+			return false;
+		}
 	}
 	mux_unacked_free_all(ss);
 	ss->unacked.recv_seq = 0;
@@ -510,7 +487,7 @@ bool mux_handshake_process_hello(
 		mux_session_reset(ss);
 		return false;
 	}
-	const unsigned char *const p = bytebuf_read_ptr(ss->wire.recvbuf);
+	unsigned char *const p = ss->wire.recvbuf->data + ss->wire.recvbuf->off;
 	LOG_BIN_F(
 		VERYVERBOSE, p, frame_size, 0,
 		"[fd:%d] hello recv:", ss->w_socket.fd);
@@ -555,14 +532,18 @@ bool mux_handshake_process_hello(
 	ss->handshake.peer_rejects_inbound_streams = peer_hello.reject_inbound;
 	ss->handshake.peer_lossymux = peer_hello.lossymux;
 	if (peer_hello.has_identity) {
-		char *const dup = strdup(peer_hello.identity);
-		if (dup == NULL) {
-			LOGOOM();
-			mux_session_reset(ss);
-			return false;
+		if (ss->handshake.peer_identity == NULL ||
+		    strcmp(ss->handshake.peer_identity, peer_hello.identity) !=
+			    0) {
+			char *const dup = strdup(peer_hello.identity);
+			if (dup == NULL) {
+				LOGOOM();
+				mux_session_reset(ss);
+				return false;
+			}
+			free(ss->handshake.peer_identity);
+			ss->handshake.peer_identity = dup;
 		}
-		free(ss->handshake.peer_identity);
-		ss->handshake.peer_identity = dup;
 	} else if (!ss->accepted && !hello_confirms_resume(ss, &peer_hello)) {
 		/* A dialed session is reused across reconnects, so it still holds
 		 * the identity an earlier server claimed.  Only a confirmed resume
@@ -588,7 +569,7 @@ bool mux_handshake_process_hello(
 		session_guard_begin(ss, &guard);
 		const bool accepted = ss->callbacks.on_verify_identity(
 			ss->userdata, ss, ss->handshake.peer_identity);
-		if (!session_guard_end(ss, &guard)) {
+		if (!session_guard_end(&guard)) {
 			return false;
 		}
 		if (ss->state != SESSION_HANDSHAKE) {
@@ -610,7 +591,7 @@ bool mux_handshake_process_hello(
 	struct mux_session_guard guard;
 	session_guard_begin(ss, &guard);
 	mux_session_handshake_done(ss);
-	if (!session_guard_end(ss, &guard)) {
+	if (!session_guard_end(&guard)) {
 		return false;
 	}
 	if (ss->state != SESSION_ESTABLISHED) {

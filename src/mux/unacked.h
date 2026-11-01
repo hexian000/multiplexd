@@ -29,6 +29,11 @@ struct unacked_ctx {
 	/* Payload bytes in the ring; drives the stall gate (byte-based so small
 	 * frames cannot fill the window). */
 	size_t bytes;
+	/* Requested bytes of retained frame allocations and the entire ring.
+	 * Partial ACKs retain their physical allocation and its full charge. */
+	size_t memory_bytes;
+	/* Positive allocation budget frozen when the session is created. */
+	size_t memory_limit;
 	/* Byte offset into the ring head entry while it is partially trimmed
 	 * across mux_unacked_ack_trim calls; 0 once the head is fully popped. */
 	uint_least32_t partial_offset;
