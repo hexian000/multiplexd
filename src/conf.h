@@ -137,6 +137,16 @@ struct config *conf_parse(char *json, size_t len);
 /* Parse, validate, and normalize a JSON config file; NULL on failure. */
 struct config *conf_parsefile(const char *path);
 
+/* Serialize config into caller storage. Return the required byte count,
+ * excluding NUL, or -1 on failure or output exceeding CONF_MAXSIZE. A NULL
+ * out queries length. bufsz includes space for NUL; output is complete only
+ * when the returned count is less than bufsz. Failed or incomplete output
+ * is cleared (securely when TLS is enabled), up to CONF_MAXSIZE + 1 bytes.
+ * indent is the per-level indent string, or NULL for compact output. */
+int conf_dump_into(
+	const struct config *restrict conf, char *restrict out, size_t bufsz,
+	const char *restrict indent);
+
 /* Serialize config to a heap JSON string (caller frees); @p lenp optionally
  * receives the length excluding NUL. @p indent is the per-level indent string
  * for pretty output, or NULL for compact. NULL on failure. */

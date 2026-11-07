@@ -265,6 +265,11 @@ add_src_test(conf_test
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/tmp")
 target_compile_definitions(conf_test PRIVATE
     CONF_TEST_TMPDIR="${CMAKE_BINARY_DIR}/tmp")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_property(TARGET conf_test PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
+    target_link_options(conf_test PRIVATE "-Wl,--wrap=malloc,--wrap=calloc,--wrap=free")
+    target_compile_definitions(conf_test PRIVATE CONF_TEST_WRAP_ALLOC=1)
+endif()
 
 # --run takes a POSIX ERE: the anchors must keep the first name from also
 # selecting its *_listen sibling, and the alternation must select both names.
@@ -353,6 +358,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(server_test PRIVATE SERVER_TEST_WRAP_SYMBOLS=1)
 endif()
 
+# White-box lifetime observations; the suite still drives real socket requests.
+# api_server_test.c includes api_server.c with a test-local free observer.
 add_src_test(api_server_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     conf_presence.gen.c conf_presence.gen.h
@@ -361,7 +368,7 @@ add_src_test(api_server_test
     server.c server.h
     tunnel.c tunnel.h
     udp.c udp.h
-    api_server.c api_server.h
+    api_server.h
     api_server_test.c
 )
 target_link_libraries(api_server_test PRIVATE mux)

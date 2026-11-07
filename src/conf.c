@@ -96,7 +96,9 @@ static bool conf_parse_max_startups(
 	if (!parse_startups_field(&nptr, ':', &start) ||
 	    !parse_startups_field(&nptr, ':', &rate) ||
 	    !parse_startups_field(&nptr, '\0', &full)) {
-		LOGE_F("invalid max_startups format: \"%s\"", s);
+		char escaped[257];
+		escape_identity(escaped, sizeof(escaped), s, ESCAPE_PLAIN);
+		LOGE_F("invalid max_startups format: \"%s\"", escaped);
 		return false;
 	}
 
@@ -182,8 +184,11 @@ static bool psk_map_cb(
 	for (size_t i = 0; i < conf->tls_psk_count; i++) {
 		const struct psk_entry *const restrict e = &conf->tls_psk[i];
 		if (e->id_len == key_len && memcmp(e->id, key, key_len) == 0) {
-			LOGE_F("tls.psk: duplicate entry for identity \"%.64s\"",
-			       e->id);
+			char escaped[257];
+			escape_identity(
+				escaped, sizeof(escaped), e->id, ESCAPE_PLAIN);
+			LOGE_F("tls.psk: duplicate entry for identity \"%s\"",
+			       escaped);
 			return false;
 		}
 	}
@@ -255,18 +260,20 @@ static void psk_trim(char *restrict s)
  * bits. Keys must come from --genpsk. */
 static bool conf_check_psk_key(const struct psk_entry *restrict e)
 {
+	char escaped[257];
+	escape_identity(escaped, sizeof(escaped), e->id, ESCAPE_PLAIN);
 	const size_t hex_len = strlen(e->hex);
 	if (hex_len % 2u != 0 || hex_len / 2u < TLS_PSK_MIN_LEN ||
 	    hex_len / 2u > TLS_PSK_MAX_LEN) {
 		LOGE_F("tls.psk.%s: expected %u to %u octets of hex, got %zu"
 		       " characters",
-		       e->id, (unsigned)TLS_PSK_MIN_LEN,
+		       escaped, (unsigned)TLS_PSK_MIN_LEN,
 		       (unsigned)TLS_PSK_MAX_LEN, hex_len);
 		return false;
 	}
 	for (size_t j = 0; j < hex_len; j++) {
 		if (!isxdigit((unsigned char)e->hex[j])) {
-			LOGE_F("tls.psk.%s: not a hex string", e->id);
+			LOGE_F("tls.psk.%s: not a hex string", escaped);
 			return false;
 		}
 	}
@@ -282,9 +289,12 @@ static bool conf_check_psk(struct config *restrict conf)
 	for (size_t i = 0; i < conf->tls_psk_count; i++) {
 		struct psk_entry *const restrict e = &conf->tls_psk[i];
 		if (e->id_len > MUX_MAX_CLAIM_LEN) {
-			LOGE_F("tls.psk key \"%.64s\" (%zu octets) exceeds the"
+			char escaped[257];
+			escape_identity(
+				escaped, sizeof(escaped), e->id, ESCAPE_PLAIN);
+			LOGE_F("tls.psk key \"%s\" (%zu octets) exceeds the"
 			       " %u-octet peer identity limit",
-			       e->id, e->id_len, (unsigned)MUX_MAX_CLAIM_LEN);
+			       escaped, e->id_len, (unsigned)MUX_MAX_CLAIM_LEN);
 			return false;
 		}
 		if (e->hex[0] == '@') {
@@ -300,9 +310,13 @@ static bool conf_check_psk(struct config *restrict conf)
 	 * discover it by watching handshakes fail. */
 	if (conf->tls_psk_count > 1 && (conf->mux_connect != NULL ||
 					conf->identity.mux_connect_count > 0)) {
+		char escaped[257];
+		escape_identity(
+			escaped, sizeof(escaped), conf->tls_psk[0].id,
+			ESCAPE_PLAIN);
 		LOGW_F("tls.psk has %zu entries but only one can be offered when"
-		       " dialing; using \"%.64s\"",
-		       conf->tls_psk_count, conf->tls_psk[0].id);
+		       " dialing; using \"%s\"",
+		       conf->tls_psk_count, escaped);
 	}
 	return true;
 }
@@ -793,44 +807,41 @@ static void conf_normalize(struct config *restrict conf)
  * application/x-multiplexd-config carrying a matching "version" parameter, in
  * any order and tolerant of case and whitespace -- none of which a literal
  * string comparison (as the schema's old "const" constraint did) would accept.
- * mime_check_media tokenizes its input in place, so validate a private copy and
- * keep conf->type intact for logging. */
-static bool conf_check_type(const struct config *restrict conf)
+ * Tokenize the decoded input, keeping the persistent conf->type for logging. */
+static bool conf_check_type(const struct config *restrict conf, char *buf)
 {
 	if (conf->type == NULL) {
 		return true;
 	}
-	char *const buf = strdup(conf->type);
-	if (buf == NULL) {
-		LOGOOM();
-		return false;
-	}
-	bool ok = false;
+	char escaped[257];
 	const char *version = NULL;
 	switch (mime_check_media(buf, "x-multiplexd-config", &version)) {
 	case MIME_CHECK_OK:
 		break;
 	case MIME_CHECK_BAD_TYPE:
-		LOGE_F("unsupported config type: \"%s\"", conf->type);
-		goto done;
+		escape_identity(
+			escaped, sizeof(escaped), conf->type, ESCAPE_PLAIN);
+		LOGE_F("unsupported config type: \"%s\"", escaped);
+		return false;
 	case MIME_CHECK_MALFORMED:
-		LOGE_F("malformed config type: \"%s\"", conf->type);
-		goto done;
+		escape_identity(
+			escaped, sizeof(escaped), conf->type, ESCAPE_PLAIN);
+		LOGE_F("malformed config type: \"%s\"", escaped);
+		return false;
 	}
 	if (version == NULL || strcmp(version, CONF_VERSION) != 0) {
-		LOGE_F("unsupported config version: \"%s\"",
-		       version != NULL ? version : "(missing)");
-		goto done;
+		escape_identity(
+			escaped, sizeof(escaped),
+			version != NULL ? version : "(missing)", ESCAPE_PLAIN);
+		LOGE_F("unsupported config version: \"%s\"", escaped);
+		return false;
 	}
-	ok = true;
-done:
-	free(buf);
-	return ok;
+	return true;
 }
 
-static bool conf_check(struct config *restrict conf)
+static bool conf_check(struct config *restrict conf, char *type)
 {
-	if (!conf_check_type(conf)) {
+	if (!conf_check_type(conf, type)) {
 		return false;
 	}
 
@@ -947,12 +958,9 @@ static bool conf_check(struct config *restrict conf)
 	/* identity.claim's MUX_MAX_CLAIM_LEN limit is already enforced by the
 	 * generated schema unmarshal (conf_schema.json maxLength, applied to the
 	 * decoded length before conf_check runs), and STRNDUP_FIELD rejects an
-	 * embedded NUL, so no re-check is needed here -- unlike identity.listen
-	 * below, whose map values bypass every generated per-field check. */
-	/* identity.listen values are a dynamic map, invisible to the schema's
-	 * generated per-field checks (see conf_schema.json); reject an
-	 * oversized one here instead, since the schema already enforces the
-	 * analogous length limit for claim above. */
+	 * embedded NUL, so no re-check is needed here. The identity.listen map
+	 * keys below have no generated length check. */
+	/* Validate identity.listen keys and the shared address limit. */
 	for (size_t i = 0; i < conf->identity.peers_count; i++) {
 		const struct identity_peer *restrict p =
 			&conf->identity.peers[i];
@@ -963,23 +971,27 @@ static bool conf_check(struct config *restrict conf)
 		 * silently dead. The map keys bypass the schema's generated
 		 * per-field checks, so reject an oversized one here. */
 		if (p->id_len > MUX_MAX_CLAIM_LEN) {
-			LOGE_F("identity.listen key \"%.64s\" (%zu octets) exceeds"
+			char escaped[257];
+			escape_identity(
+				escaped, sizeof(escaped), p->id, ESCAPE_PLAIN);
+			LOGE_F("identity.listen key \"%s\" (%zu octets) exceeds"
 			       " the %u-octet peer identity limit",
-			       p->id, p->id_len, (unsigned)MUX_MAX_CLAIM_LEN);
+			       escaped, p->id_len, (unsigned)MUX_MAX_CLAIM_LEN);
 			return false;
 		}
 		if (p->listen == NULL) {
 			continue;
 		}
-		/* identity.listen is a dynamic map value that bypasses the
-		 * generated per-field maxLength checks, so enforce the shared
-		 * address limit (shim/util.h ADDR_MAX_STRLEN, mirrored by
-		 * conf_schema.json's maxLength) here instead. */
+		/* Match the codec's maxLength for identity.listen values to
+		 * the shared address limit in shim/util.h. */
 		const size_t listen_len = strlen(p->listen);
 		if (listen_len > ADDR_MAX_STRLEN) {
+			char escaped[257];
+			escape_identity(
+				escaped, sizeof(escaped), p->id, ESCAPE_PLAIN);
 			LOGE_F("identity.listen.%s (%zu octets) exceeds the"
 			       " %zu-octet address limit",
-			       p->id, listen_len, (size_t)ADDR_MAX_STRLEN);
+			       escaped, listen_len, (size_t)ADDR_MAX_STRLEN);
 			return false;
 		}
 	}
@@ -1130,16 +1142,13 @@ struct config *conf_parse(char *json, const size_t len)
 		conf_free(conf);
 		return NULL;
 	}
-	const bool ok = conf_load(conf, &defaults, &input);
+	const bool loaded = conf_load(conf, &defaults, &input);
+	const bool ok = loaded && conf_check(conf, input.type.str);
 	json_free_conf(&defaults);
 	present_free_conf(&input);
 	if (!ok) {
-		LOGE("failed to process configuration");
-		conf_free(conf);
-		return NULL;
-	}
-	if (!conf_check(conf)) {
-		LOGE("configuration validation failed");
+		LOGE(loaded ? "configuration validation failed" :
+			      "failed to process configuration");
 		conf_free(conf);
 		return NULL;
 	}
@@ -1241,21 +1250,20 @@ static bool build_json_string_arr(
 	return true;
 }
 
-char *conf_dump(
-	const struct config *restrict conf, size_t *restrict lenp,
+int conf_dump_into(
+	const struct config *restrict conf, char *restrict out, size_t bufsz,
 	const char *restrict indent)
 {
-	/* Heap temporaries feed the `raw` literal below; they are released
-	 * once at the cleanup label so a future addition need only be freed there.
-	 * out is freed on the failure branch (NULL'd once handed to result). */
+	/* Heap temporaries feed the `raw` literal below and are released once
+	 * at the cleanup label. */
 	struct present_conf_identity_listen listen_map = { 0 };
 	struct json_string *id_mc_arr = NULL;
 #if WITH_TLS
 	struct json_string *authcerts_arr = NULL;
 	struct present_conf_tls_psk psk_map = { 0 };
 #endif
-	char *out = NULL;
-	char *result = NULL;
+	int result = -1;
+	bufsz = out != NULL ? MIN(bufsz, (size_t)CONF_MAXSIZE + 1) : 0;
 
 	if (!build_listen_map(conf, &listen_map)) {
 		goto cleanup;
@@ -1457,27 +1465,13 @@ char *conf_dump(
 		},
 	};
 
-	/* The dump is bounded by the same CONF_MAXSIZE limit applied when
-	 * reading, so a single allocation avoids a measuring pass. */
-	out = malloc(CONF_MAXSIZE + 1);
-	if (out == NULL) {
-		LOGOOM();
-		goto cleanup;
-	}
-	const int json_sz =
-		present_marshal_conf(out, CONF_MAXSIZE + 1, &raw, indent);
+	const int json_sz = present_marshal_conf(out, bufsz, &raw, indent);
 	if (json_sz <= 0 || json_sz > CONF_MAXSIZE) {
 		LOGE_F("config dump failed or exceeds maximum size of %d bytes",
 		       CONF_MAXSIZE);
 		goto cleanup;
 	}
-	out[json_sz] = '\0';
-	if (lenp != NULL) {
-		*lenp = (size_t)json_sz;
-	}
-	/* Success: hand out to the caller, then null it so cleanup leaves it. */
-	result = out;
-	out = NULL;
+	result = json_sz;
 
 cleanup:
 	free(listen_map.entries);
@@ -1486,8 +1480,38 @@ cleanup:
 	free(authcerts_arr);
 	free(psk_map.entries);
 #endif
-	free(out);
+	if (result < 0 || (size_t)result >= bufsz) {
+#if WITH_TLS
+		/* Failed or incomplete output can contain plaintext credentials. */
+		tls_secure_erase(out, bufsz);
+#endif
+		if (out != NULL && bufsz > 0) {
+			out[0] = '\0';
+		}
+	}
 	return result;
+}
+
+char *conf_dump(
+	const struct config *restrict conf, size_t *restrict lenp,
+	const char *restrict indent)
+{
+	/* The dump is bounded by the same CONF_MAXSIZE limit applied when
+	 * reading, so a single allocation avoids a measuring pass. */
+	char *const out = malloc(CONF_MAXSIZE + 1);
+	if (out == NULL) {
+		LOGOOM();
+		return NULL;
+	}
+	const int len = conf_dump_into(conf, out, CONF_MAXSIZE + 1, indent);
+	if (len < 0) {
+		free(out);
+		return NULL;
+	}
+	if (lenp != NULL) {
+		*lenp = (size_t)len;
+	}
+	return out;
 }
 
 #if WITH_TLS

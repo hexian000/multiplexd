@@ -1,7 +1,7 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* api_server_test.c - black-box tests for the REST API server (real stack
+/* api_server_test.c - socket-driven tests for the REST API server (real stack
  * linked); each test drives a socketpair via api_serve(); covers healthy,
  * stats, metrics, 404/405/413, keep-alive, and Connection: close. */
 
@@ -41,6 +41,72 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Include the API implementation to observe request storage at destruction and
+ * reuse, and to fire its real timeout callback without waiting 30 seconds. */
+static void api_test_free(void *ptr);
+static void *api_test_malloc(size_t size);
+static void *api_test_realloc(void *ptr, size_t size);
+#define free api_test_free
+#define malloc api_test_malloc
+#define realloc api_test_realloc
+#include "api_server.c"
+#include "utils/buffer.h"
+#undef realloc
+#undef malloc
+#undef free
+
+static bool g_count_api_alloc;
+static bool g_fail_api_realloc;
+static size_t g_api_malloc_calls, g_api_realloc_calls;
+
+static void *api_test_malloc(size_t size)
+{
+	if (g_count_api_alloc) {
+		g_api_malloc_calls++;
+	}
+	return malloc(size);
+}
+
+static void *api_test_realloc(void *ptr, size_t size)
+{
+	if (g_count_api_alloc) {
+		g_api_realloc_calls++;
+	}
+	return g_fail_api_realloc ? NULL : realloc(ptr, size);
+}
+
+static void reset_api_alloc(void *data)
+{
+	(void)data;
+	g_count_api_alloc = false;
+	g_fail_api_realloc = false;
+	g_api_malloc_calls = g_api_realloc_calls = 0;
+}
+
+static struct api_ctx *g_watched_api_ctx;
+static bool g_api_freed;
+static bool g_api_erased;
+
+static bool request_storage_erased(const struct api_ctx *ctx)
+{
+	for (size_t i = 0; i < ctx->rbuf.len; i++) {
+		if (ctx->rbuf.data[i] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void api_test_free(void *ptr)
+{
+	if (ptr != NULL && ptr == g_watched_api_ctx) {
+		g_api_erased = request_storage_erased(ptr);
+		g_api_freed = true;
+		g_watched_api_ctx = NULL;
+	}
+	free(ptr);
+}
+
 /* Test seam for the Date header's failure paths.  api_server.c formats the
  * header with contrib's http_date(), which calls time() then gmtime_r(), and
  * neither an unrepresentable clock nor a year outside IMF-fixdate's 4DIGIT
@@ -72,29 +138,39 @@ time_t time(time_t *tloc)
 #if API_TEST_WRAP_HTTP
 /* Delegate to the real parsers while measuring how often the receive loop
  * submits incomplete prefixes. Linker wrapping preserves their implementation
- * in the separately compiled API source and the shared csnippets library. */
+ * in the shared csnippets library. */
 static struct {
 	size_t request_calls, request_bytes;
 	size_t header_calls, header_bytes;
 } g_http_work;
 
-char *__real_http_parse(char *restrict buf, struct http_message *restrict msg);
-char *__real_http_parsehdr(
-	char *restrict buf, char **restrict key, char **restrict value);
+char *test_real_http_parse(
+	char *restrict buf,
+	struct http_message *restrict msg) __asm__("__real_http_parse");
+char *test_real_http_parsehdr(
+	char *restrict buf, char **restrict key,
+	char **restrict value) __asm__("__real_http_parsehdr");
+char *test_wrap_http_parse(
+	char *restrict buf,
+	struct http_message *restrict msg) __asm__("__wrap_http_parse");
+char *test_wrap_http_parsehdr(
+	char *restrict buf, char **restrict key,
+	char **restrict value) __asm__("__wrap_http_parsehdr");
 
-char *__wrap_http_parse(char *restrict buf, struct http_message *restrict msg)
+char *
+test_wrap_http_parse(char *restrict buf, struct http_message *restrict msg)
 {
 	g_http_work.request_calls++;
 	g_http_work.request_bytes += strlen(buf);
-	return __real_http_parse(buf, msg);
+	return test_real_http_parse(buf, msg);
 }
 
-char *__wrap_http_parsehdr(
+char *test_wrap_http_parsehdr(
 	char *restrict buf, char **restrict key, char **restrict value)
 {
 	g_http_work.header_calls++;
 	g_http_work.header_bytes += strlen(buf);
-	return __real_http_parsehdr(buf, key, value);
+	return test_real_http_parsehdr(buf, key, value);
 }
 #endif /* API_TEST_WRAP_HTTP */
 
@@ -700,6 +776,7 @@ do_send(struct apifx *restrict fx, const int fd, const void *restrict data,
 
 struct resp_wait_ctx {
 	int fd;
+	int read_error;
 	char buf[RESP_BUF_SIZE];
 	size_t nread;
 };
@@ -712,6 +789,7 @@ static int resp_wait_predicate(void *ptr)
 {
 	struct resp_wait_ctx *const restrict ctx = ptr;
 	bool eof = false;
+	ctx->read_error = 0;
 
 	if (ctx->nread < sizeof(ctx->buf) - 1u) {
 		const ssize_t n =
@@ -724,6 +802,7 @@ static int resp_wait_predicate(void *ptr)
 			    err == ENOMEM) {
 				return 0;
 			}
+			ctx->read_error = err;
 			return -1;
 		}
 		eof = n == 0;
@@ -796,12 +875,16 @@ static int eof_wait_predicate(void *ptr)
 	return n == 0 ? 1 : 0;
 }
 
-/* 413 path: server closes, which may surface as a reset discarding the
- * queued response. Treat any non-pending result as success so both
- * a 413 and a peer reset are acceptable. */
+/* A reset may discard the queued 413. Other transport failures and invalid
+ * framing must still fail the oversized-request regression. */
 static int oversized_wait_predicate(void *ptr)
 {
-	return resp_wait_predicate(ptr) != 0 ? 1 : 0;
+	struct resp_wait_ctx *const ctx = ptr;
+	const int result = resp_wait_predicate(ctx);
+	if (result < 0) {
+		return ctx->read_error == ECONNRESET ? 1 : -1;
+	}
+	return result > 0 && parse_status(ctx->buf) != 413 ? -1 : result;
 }
 
 /* Response inspection helpers */
@@ -814,12 +897,49 @@ static int parse_status(const char *restrict buf)
 	if (strncmp(buf, pfx, pfx_len) != 0) {
 		return -1;
 	}
-	char *end;
-	const long code = strtol(buf + pfx_len, &end, 10);
-	if (end == buf + pfx_len || code < 100 || code > 999) {
+	const char *const status = buf + pfx_len;
+	int code = 0;
+	for (size_t i = 0; i < 3; i++) {
+		if (status[i] < '0' || status[i] > '9') {
+			return -1;
+		}
+		code = code * 10 + status[i] - '0';
+	}
+	if (status[3] != ' ' || code < 100) {
 		return -1;
 	}
-	return (int)code;
+	return code;
+}
+
+T_DECLARE_CASE(test_status_parser_requires_three_digit_token)
+{
+	static const struct {
+		const char *response;
+		int status;
+	} cases[] = {
+		{ "HTTP/1.1 100 Continue\r\n\r\n", 100 },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 200 },
+		{ "HTTP/1.1 204 \r\n\r\n", 204 },
+		{ "HTTP/1.1 999 Unrecognized\r\n\r\n", 999 },
+		{ "", -1 },
+		{ "HTTP/1.1 ", -1 },
+		{ "HTTP/1.1 2", -1 },
+		{ "HTTP/1.1 20", -1 },
+		{ "HTTP/1.1 200", -1 },
+		{ "HTTP/1.1 200garbage\r\n\r\n", -1 },
+		{ "HTTP/1.1 +200 OK\r\n\r\n", -1 },
+		{ "HTTP/1.1 -200 OK\r\n\r\n", -1 },
+		{ "HTTP/1.1 0200 OK\r\n\r\n", -1 },
+		{ "HTTP/1.1  200 OK\r\n\r\n", -1 },
+		{ "HTTP/1.1 200\tOK\r\n\r\n", -1 },
+		{ "HTTP/1.1 20x OK\r\n\r\n", -1 },
+		{ "HTTP/1.1 099 Invalid\r\n\r\n", -1 },
+		{ "HTTP/1.0 200 OK\r\n\r\n", -1 },
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		T_LOGF("status control %zu", i);
+		T_EXPECT_EQ(parse_status(cases[i].response), cases[i].status);
+	}
 }
 
 /* Returns true when needle appears anywhere in the NUL-terminated response;
@@ -827,6 +947,44 @@ static int parse_status(const char *restrict buf)
 static bool resp_contains(const char *restrict buf, const char *restrict needle)
 {
 	return strstr(buf, needle) != NULL;
+}
+
+static bool metric_sample_contains(const char *response, const char *sample)
+{
+	const size_t len = strlen(sample);
+	const char *match = response;
+	while ((match = strstr(match, sample)) != NULL) {
+		if ((match == response || match[-1] == '\n') &&
+		    (match[len] == '\n' || match[len] == '\0')) {
+			return true;
+		}
+		match++;
+	}
+	return false;
+}
+
+T_DECLARE_CASE(test_metric_value_boundary_rejects_prefixes)
+{
+	static const char response[] =
+		"multiplexd_rst_sent_total 110\n"
+		"multiplexd_session_window_bytes{identity=\"peer\"} 327680\n"
+		"multiplexd_session_rtt_seconds{identity=\"peer\"} 0.029\n";
+	T_EXPECT(!metric_sample_contains(
+		response, "multiplexd_rst_sent_total 11"));
+	T_EXPECT(!metric_sample_contains(
+		response,
+		"multiplexd_session_window_bytes{identity=\"peer\"} 32768"));
+	T_EXPECT(!metric_sample_contains(
+		response,
+		"multiplexd_session_rtt_seconds{identity=\"peer\"} 0.02"));
+	T_EXPECT(metric_sample_contains(
+		response, "multiplexd_rst_sent_total 110"));
+	T_EXPECT(!metric_sample_contains(
+		"other_multiplexd_rst_sent_total 11\n",
+		"multiplexd_rst_sent_total 11"));
+	T_EXPECT(metric_sample_contains(
+		"multiplexd_rst_sent_total 110\nmultiplexd_rst_sent_total 11\n",
+		"multiplexd_rst_sent_total 11"));
 }
 
 /* The Date header's day/month names must always be the RFC
@@ -898,6 +1056,12 @@ T_DECLARE_CASE(test_response_reader_requires_complete_framing)
 		{ "HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n", 1,
 		  1 },
 		{ "bad status\r\n\r\n", -1, -1 },
+		{ "HTTP/1.1 200garbage\r\nContent-Length: 0\r\n\r\n", -1, -1 },
+		{ "HTTP/1.1 +200 OK\r\nContent-Length: 0\r\n\r\n", -1, -1 },
+		{ "HTTP/1.1 0200 OK\r\nContent-Length: 0\r\n\r\n", -1, -1 },
+		{ "HTTP/1.1 200\tOK\r\nContent-Length: 0\r\n\r\n", -1, -1 },
+		{ "HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n", -1, -1 },
+		{ "HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n", 1, 1 },
 		{ "HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999\r\n\r\n",
 		  -1, -1 },
 	};
@@ -925,6 +1089,58 @@ T_DECLARE_CASE(test_response_reader_requires_complete_framing)
 	memcpy(full.buf, header, sizeof(header) - 1u);
 	full.buf[full.nread] = '\0';
 	T_EXPECT_EQ(resp_wait_predicate(&full), -1);
+}
+
+T_DECLARE_CASE(test_oversized_reader_requires_413_or_reset)
+{
+	static const struct {
+		const char *response;
+		int first, eof;
+	} cases[] = {
+		{ "", 0, -1 },
+		{ "garbage\r\n\r\n", -1, -1 },
+		{ "HTTP/1.1 413 Too Large\r\nContent-Len", 0, -1 },
+		{ "HTTP/1.1 413 Too Large\r\nContent-Length: 3\r\n\r\na", 0,
+		  -1 },
+		{ "HTTP/1.1 413 Too Large\r\nContent-Length: bad\r\n\r\n", -1,
+		  -1 },
+		{ "HTTP/1.1 413 Too Large\r\nContent-Length: 0\r\n\r\n", 1, 1 },
+		{ "HTTP/1.1 413 Too Large\r\nConnection: close\r\n\r\nbody", 0,
+		  1 },
+		{ "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", -1, -1 },
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		int fds[2];
+		T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+		T_CHECK(socket_set_nonblock(fds[0]) == 0);
+		const size_t len = strlen(cases[i].response);
+		T_CHECK(write(fds[1], cases[i].response, len) == (ssize_t)len);
+		struct resp_wait_ctx ctx = { .fd = fds[0] };
+		const int first = oversized_wait_predicate(&ctx);
+		T_CHECK(shutdown(fds[1], SHUT_WR) == 0);
+		const int eof = oversized_wait_predicate(&ctx);
+		(void)close(fds[0]);
+		(void)close(fds[1]);
+		T_LOGF("oversized response control %zu", i);
+		T_EXPECT_EQ(first, cases[i].first);
+		T_EXPECT_EQ(eof, cases[i].eof);
+		T_EXPECT_EQ(ctx.read_error, 0);
+	}
+	struct resp_wait_ctx invalid = { .fd = -1 };
+	T_EXPECT_EQ(oversized_wait_predicate(&invalid), -1);
+	T_EXPECT_EQ(invalid.read_error, EBADF);
+
+	/* Closing with unread input produces the real reset allowed above. */
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	T_CHECK(socket_set_nonblock(fds[0]) == 0);
+	T_CHECK(write(fds[0], "unread", 6) == 6);
+	(void)close(fds[1]);
+	struct resp_wait_ctx reset = { .fd = fds[0] };
+	const int result = oversized_wait_predicate(&reset);
+	(void)close(fds[0]);
+	T_EXPECT_EQ(result, 1);
+	T_EXPECT_EQ(reset.read_error, ECONNRESET);
 }
 
 T_DECLARE_CASE(test_date_validator_rejects_malformed_fields)
@@ -1550,7 +1766,7 @@ T_DECLARE_CASE(test_request_too_large)
 	 * (status is captured above; rctx.buf is a stack buffer, safe afterward). */
 	free(big_req);
 	apifx_teardown(&fx);
-	if (status > 0) {
+	if (rctx.read_error != ECONNRESET) {
 		T_EXPECT_EQ(status, 413);
 	}
 	return;
@@ -1908,34 +2124,30 @@ T_DECLARE_CASE(test_healthy_all_online)
 	}
 	T_CLEANUP(apifx_cleanup, &fx);
 
-	fx.srv.identities = table_new(&(struct table_opts){
-		.hash = TABLE_OPTS_STR.hash,
-		.eq = TABLE_OPTS_STR.eq,
-		.flags = TABLE_FAST,
-	});
-	T_CHECK(fx.srv.identities != NULL);
-	struct identity_listener *const sl = calloc(1, sizeof(*sl));
-	T_CHECK(sl != NULL);
-	sl->peer_identity = "peer-up";
+	static struct identity_peer peer = {
+		.id = "peer-up",
+		.listen = "127.0.0.1:1",
+	};
+	fx.conf.identity.peers = &peer;
+	fx.conf.identity.peers_count = 1;
 	struct tunnel *const t = make_established_tunnel(&fx, 1);
 	T_CHECK(t != NULL);
-	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
-	T_CHECK(sl->tunnels != NULL);
-	sl->tunnels[0] = t;
-	sl->num_tunnels = 1;
-	{
-		void *slot = sl;
-		fx.srv.identities =
-			table_set(fx.srv.identities, sl->peer_identity, &slot);
-		T_CHECK(slot == NULL);
-	}
+	T_CHECK(pool_tunnel(&fx, t, peer.id));
 
-	struct resp_wait_ctx rctx;
-	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_HEALTHY_GET);
-	/* Teardown before asserting so a failing T_EXPECT can't skip it. */
+	struct resp_wait_ctx online, offline;
+	T_CALL_SUBCASE(assert_exchange, &fx, &online, REQ_HEALTHY_GET);
+	struct mux_session *const ss = tunnel_session(t);
+	ss->state = SESSION_CONNECT;
+	PUB_STORE(ss->_pub_state, SESSION_CONNECT);
+	T_CALL_SUBCASE(assert_exchange, &fx, &offline, REQ_HEALTHY_GET);
 	apifx_teardown(&fx);
-	T_EXPECT_EQ(parse_status(rctx.buf), 200);
-	T_EXPECT(resp_contains(rctx.buf, "Content-Length: 0"));
+	T_EXPECT_EQ(parse_status(online.buf), 200);
+	T_EXPECT(resp_contains(online.buf, "Content-Length: 0\r\n"));
+	const char *const body = strstr(online.buf, "\r\n\r\n");
+	T_EXPECT(body != NULL);
+	T_EXPECT_EQ(body[4], '\0');
+	T_EXPECT_EQ(parse_status(offline.buf), 503);
+	T_EXPECT(resp_contains(offline.buf, "offline: peer-up"));
 }
 
 T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
@@ -2096,7 +2308,7 @@ T_DECLARE_CASE(test_metrics_floats_use_c_numeric_locale)
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_rtt_seconds{identity=\"peer-loc\",tunnel=\"1\"} 0.02"));
+		"multiplexd_session_rtt_seconds{identity=\"peer-loc\",tunnel=\"1\"} 0.02\n"));
 }
 
 T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
@@ -2143,10 +2355,10 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	 * tunnel_new(); 1 for the first tunnel created in a fresh fixture. */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_window_bytes{identity=\"peer-win\",tunnel=\"1\",direction=\"rx\"} 32768"));
+		"multiplexd_session_window_bytes{identity=\"peer-win\",tunnel=\"1\",direction=\"rx\"} 32768\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_window_bytes{identity=\"peer-win\",tunnel=\"1\",direction=\"tx\"} 65536"));
+		"multiplexd_session_window_bytes{identity=\"peer-win\",tunnel=\"1\",direction=\"tx\"} 65536\n"));
 	/* The window rises and falls, so the series is a gauge, not a counter --
 	 * a counter-typed gauge breaks rate()/increase() and reset detection. */
 	T_EXPECT(resp_contains(
@@ -2217,24 +2429,24 @@ T_DECLARE_CASE(test_metrics_session_counter_type_matches_samples)
 		rctx.buf, "# TYPE multiplexd_session_datagrams_total counter"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_datagrams_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"rx\"} 0"));
+		"multiplexd_session_datagrams_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"rx\"} 0\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_datagram_bytes_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} 0"));
+		"multiplexd_session_datagram_bytes_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} 0\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_datagrams_dropped_total{identity=\"peer-cnt\",tunnel=\"1\"} 0"));
+		"multiplexd_session_datagrams_dropped_total{identity=\"peer-cnt\",tunnel=\"1\"} 0\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_udp_flows{identity=\"peer-cnt\",tunnel=\"1\"} 0"));
+		"multiplexd_session_udp_flows{identity=\"peer-cnt\",tunnel=\"1\"} 0\n"));
 	T_EXPECT(resp_contains(
-		rctx.buf, "multiplexd_datagrams_total{direction=\"rx\"} 0"));
+		rctx.buf, "multiplexd_datagrams_total{direction=\"rx\"} 0\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_datagram_bytes_total{direction=\"tx\"} 0"));
+		"multiplexd_datagram_bytes_total{direction=\"tx\"} 0\n"));
 	T_EXPECT(resp_contains(
-		rctx.buf, "multiplexd_datagrams_dropped_total 0"));
-	T_EXPECT(resp_contains(rctx.buf, "multiplexd_udp_flows 0"));
+		rctx.buf, "multiplexd_datagrams_dropped_total 0\n"));
+	T_EXPECT(metric_sample_contains(rctx.buf, "multiplexd_udp_flows 0"));
 }
 
 /* A peer identity containing structural characters must be escaped in the
@@ -2497,19 +2709,20 @@ T_DECLARE_CASE(test_metrics_buffer_gauges_are_labeled)
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_send_buffered_frames{identity=\"peer-buf\",tunnel=\"1\"} 5"));
+		"multiplexd_session_send_buffered_frames{identity=\"peer-buf\",tunnel=\"1\"} 5\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_recv_buffered_bytes{identity=\"peer-buf\",tunnel=\"1\"} 4096"));
+		"multiplexd_session_recv_buffered_bytes{identity=\"peer-buf\",tunnel=\"1\"} 4096\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_unacked_frames{identity=\"peer-buf\",tunnel=\"1\"} 3"));
+		"multiplexd_session_unacked_frames{identity=\"peer-buf\",tunnel=\"1\"} 3\n"));
 	/* The tunnel is the only one alive, so each total equals its sample. */
 	T_EXPECT(resp_contains(
 		rctx.buf, "\nmultiplexd_send_buffered_frames 5\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf, "\nmultiplexd_recv_buffered_bytes 4096\n"));
-	T_EXPECT(resp_contains(rctx.buf, "\nmultiplexd_unacked_frames 3\n"));
+	T_EXPECT(metric_sample_contains(
+		rctx.buf, "multiplexd_unacked_frames 3"));
 }
 
 /* Stream lifecycle counters are per-tunnel data that used to be emitted only in
@@ -2539,32 +2752,32 @@ T_DECLARE_CASE(test_metrics_stream_lifecycle_counters_are_labeled)
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_open_total{identity=\"peer-life\",tunnel=\"1\"} 23"));
+		"multiplexd_session_stream_open_total{identity=\"peer-life\",tunnel=\"1\"} 23\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_accept_total{identity=\"peer-life\",tunnel=\"1\"} 29"));
+		"multiplexd_session_stream_accept_total{identity=\"peer-life\",tunnel=\"1\"} 29\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_fastopen_total{identity=\"peer-life\",tunnel=\"1\"} 31"));
+		"multiplexd_session_stream_fastopen_total{identity=\"peer-life\",tunnel=\"1\"} 31\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_succeeded_total{identity=\"peer-life\",tunnel=\"1\"} 37"));
+		"multiplexd_session_stream_succeeded_total{identity=\"peer-life\",tunnel=\"1\"} 37\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_failed_total{identity=\"peer-life\",tunnel=\"1\"} 41"));
+		"multiplexd_session_stream_failed_total{identity=\"peer-life\",tunnel=\"1\"} 41\n"));
 	/* The summary's sample count is per-tunnel too, and no unlabeled form of
 	 * it survives.  Its value is the latency ring's observation count, which
 	 * no stream here ever fed -- not the 43 established streams above, which
 	 * include passive opens the ring never observes. */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-life\",tunnel=\"1\"} 0"));
+		"multiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-life\",tunnel=\"1\"} 0\n"));
 	T_EXPECT(!resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-life\",tunnel=\"1\"} 43"));
+		"multiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-life\",tunnel=\"1\"} 43\n"));
 	T_EXPECT(!resp_contains(
 		rctx.buf,
-		"\nmultiplexd_session_stream_establish_latency_seconds_count 43"));
+		"\nmultiplexd_session_stream_establish_latency_seconds_count 43\n"));
 	/* The process-wide summary counts the same observations, so it must not
 	 * follow num_stream_established either. */
 	T_EXPECT(resp_contains(
@@ -2578,6 +2791,91 @@ T_DECLARE_CASE(test_metrics_stream_lifecycle_counters_are_labeled)
 		rctx.buf, "\nmultiplexd_stream_succeeded_total 37\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf, "\nmultiplexd_stream_failed_total 41\n"));
+}
+
+/* Feed the tunnel's real event callback, leaving snapshot collection and HTTP
+ * formatting on their production paths. Two distinct sample populations make
+ * an identity/tunnel label mix-up observable. */
+T_DECLARE_CASE(test_latency_exports_nonzero_observations)
+{
+	static struct apifx fx;
+	if (apifx_setup(&fx) != 0) {
+		T_FATAL("apifx_setup failed");
+	}
+	T_CLEANUP(apifx_cleanup, &fx);
+
+	struct tunnel *const t1 = make_established_tunnel(&fx, 0);
+	T_CHECK(t1 != NULL);
+	T_CHECK(pool_tunnel(&fx, t1, "peer-fast"));
+	struct tunnel *const t2 = make_established_tunnel(&fx, 0);
+	T_CHECK(t2 != NULL);
+	T_CHECK(pool_tunnel(&fx, t2, "peer-slow"));
+
+	struct resp_wait_ctx empty_stats, empty_metrics, stats, metrics;
+	T_CALL_SUBCASE(assert_exchange, &fx, &empty_stats, REQ_STATS_GET);
+	T_CALL_SUBCASE(assert_exchange, &fx, &empty_metrics, REQ_METRICS_GET);
+	struct mux_session *const ss1 = tunnel_session(t1);
+	struct mux_session *const ss2 = tunnel_session(t2);
+	/* Unsorted samples: 1..100ms and 301..500ms, respectively. */
+	for (int i = 0; i < 100; i++) {
+		ss1->callbacks.on_event(
+			ss1->userdata, ss1, MUX_EVENT_STREAM_ESTABLISHED,
+			(union mux_event_data){ .stream_established.ns =
+							(100 - i) *
+							INT64_C(1000000) });
+	}
+	for (int i = 0; i < 200; i++) {
+		ss2->callbacks.on_event(
+			ss2->userdata, ss2, MUX_EVENT_STREAM_ESTABLISHED,
+			(union mux_event_data){ .stream_established.ns =
+							(500 - i) *
+							INT64_C(1000000) });
+	}
+	T_CALL_SUBCASE(assert_exchange, &fx, &stats, REQ_STATS_GET);
+	T_CALL_SUBCASE(assert_exchange, &fx, &metrics, REQ_METRICS_GET);
+	apifx_teardown(&fx);
+
+	T_EXPECT_EQ(parse_status(empty_stats.buf), 200);
+	T_EXPECT(resp_contains(
+		empty_stats.buf, "Stream Latency      : (never)\n"));
+	T_EXPECT_EQ(parse_status(empty_metrics.buf), 200);
+	T_EXPECT(!resp_contains(
+		empty_metrics.buf,
+		"\nmultiplexd_stream_establish_latency_seconds{"));
+	T_EXPECT(!resp_contains(
+		empty_metrics.buf,
+		"\nmultiplexd_session_stream_establish_latency_seconds{"));
+	static const char *const empty_counts[] = {
+		"\nmultiplexd_stream_establish_latency_seconds_count 0\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-fast\",tunnel=\"1\"} 0\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-slow\",tunnel=\"2\"} 0\n",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(empty_counts); i++) {
+		T_EXPECT(resp_contains(empty_metrics.buf, empty_counts[i]));
+	}
+
+	T_EXPECT_EQ(parse_status(stats.buf), 200);
+	T_EXPECT(resp_contains(
+		stats.buf,
+		"Stream Latency      : P50=351.0ms P90=471.0ms P99=498.0ms MAX=500.0ms\n"));
+	T_EXPECT_EQ(parse_status(metrics.buf), 200);
+	static const char *const samples[] = {
+		"\nmultiplexd_stream_establish_latency_seconds{quantile=\"0.5\"} 0.351\n",
+		"\nmultiplexd_stream_establish_latency_seconds{quantile=\"0.9\"} 0.471\n",
+		"\nmultiplexd_stream_establish_latency_seconds{quantile=\"0.99\"} 0.498\n",
+		"\nmultiplexd_stream_establish_latency_seconds_count 300\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds{identity=\"peer-fast\",tunnel=\"1\",quantile=\"0.5\"} 0.051\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds{identity=\"peer-fast\",tunnel=\"1\",quantile=\"0.9\"} 0.091\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds{identity=\"peer-fast\",tunnel=\"1\",quantile=\"0.99\"} 0.1\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-fast\",tunnel=\"1\"} 100\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds{identity=\"peer-slow\",tunnel=\"2\",quantile=\"0.5\"} 0.401\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds{identity=\"peer-slow\",tunnel=\"2\",quantile=\"0.9\"} 0.481\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds{identity=\"peer-slow\",tunnel=\"2\",quantile=\"0.99\"} 0.499\n",
+		"\nmultiplexd_session_stream_establish_latency_seconds_count{identity=\"peer-slow\",tunnel=\"2\"} 200\n",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(samples); i++) {
+		T_EXPECT(resp_contains(metrics.buf, samples[i]));
+	}
 }
 
 /* Only the dial path bumps num_reconnects, so a server-role tunnel's reconnect
@@ -2614,6 +2912,39 @@ T_DECLARE_CASE(test_metrics_reconnects_series_skips_accepted_tunnel)
 		rctx.buf, "multiplexd_session_streams{identity=\"peer-acc\""));
 }
 
+T_DECLARE_CASE(test_metrics_anonymous_labels_need_no_storage)
+{
+	struct server_stats *const stats =
+		calloc(1, sizeof(*stats) + 3 * sizeof(stats->tunnels[0]));
+	T_CHECK(stats != NULL);
+	T_CLEANUP(free, stats);
+	T_CLEANUP(reset_api_alloc, NULL);
+	struct vbuffer *out = VBUF_NEW(16);
+	T_CHECK(out != NULL);
+	for (size_t count = 0; count <= 3; count += 3) {
+		stats->num_tunnels = count;
+		struct tunnel_labels labels;
+		g_count_api_alloc = true;
+		const bool built = tunnel_labels_build(&labels, stats);
+		g_count_api_alloc = false;
+		const size_t allocations =
+			g_api_malloc_calls + g_api_realloc_calls;
+		const bool empty = labels.buf == NULL && labels.offset == NULL;
+		if (built) {
+			out = append_tunnel_metrics(out, stats, &labels);
+		}
+		tunnel_labels_free(&labels);
+		const size_t len = VBUF_LEN(out);
+		if (!built || !empty || allocations != 0 || len != 0) {
+			VBUF_FREE(out);
+			T_FATALF(
+				"anonymous labels: built=%d empty=%d allocations=%zu len=%zu",
+				built, empty, allocations, len);
+		}
+	}
+	VBUF_FREE(out);
+}
+
 /* A tunnel with no identity pool is anonymous: it gets no labeled series, but
  * its counters must still reach the process-wide totals. */
 T_DECLARE_CASE(test_metrics_anonymous_tunnel_counted_in_totals_only)
@@ -2643,7 +2974,7 @@ T_DECLARE_CASE(test_metrics_anonymous_tunnel_counted_in_totals_only)
 	/* Only the identified tunnel is labeled; the anonymous one has index 1. */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_open_total{identity=\"peer-named\",tunnel=\"2\"} 4"));
+		"multiplexd_session_stream_open_total{identity=\"peer-named\",tunnel=\"2\"} 4\n"));
 	T_EXPECT(!resp_contains(
 		rctx.buf,
 		"multiplexd_session_stream_open_total{identity=\"\""));
@@ -2651,8 +2982,8 @@ T_DECLARE_CASE(test_metrics_anonymous_tunnel_counted_in_totals_only)
 	 * label set -- neither the plain form nor the rx/tx one. */
 	T_EXPECT(!resp_contains(rctx.buf, "tunnel=\"1\""));
 	/* The total covers both. */
-	T_EXPECT(
-		resp_contains(rctx.buf, "\nmultiplexd_stream_open_total 10\n"));
+	T_EXPECT(metric_sample_contains(
+		rctx.buf, "multiplexd_stream_open_total 10"));
 }
 
 /* Regression: an identity.mux_connect dial-out is wired into an identity pool
@@ -2683,8 +3014,10 @@ T_DECLARE_CASE(test_metrics_staged_identity_tunnel_counted_in_totals)
 	T_CALL_SUBCASE(assert_exchange, &fx, &rctx, REQ_METRICS_GET);
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
-	T_EXPECT(resp_contains(rctx.buf, "\nmultiplexd_stream_open_total 9\n"));
-	T_EXPECT(resp_contains(rctx.buf, "\nmultiplexd_rst_sent_total 3\n"));
+	T_EXPECT(metric_sample_contains(
+		rctx.buf, "multiplexd_stream_open_total 9"));
+	T_EXPECT(metric_sample_contains(
+		rctx.buf, "multiplexd_rst_sent_total 3"));
 	/* Unpooled, so it stays anonymous: totals only, no labeled series. */
 	T_EXPECT(!resp_contains(rctx.buf, "tunnel=\"1\""));
 }
@@ -2881,20 +3214,24 @@ T_DECLARE_CASE(test_metrics_reports_non_zero_mux_counters)
 	 * is a stack buffer, safe to read afterward). */
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(parse_status(rctx.buf), 200);
-	T_EXPECT(resp_contains(rctx.buf, "multiplexd_reconnects_total 7"));
-	T_EXPECT(resp_contains(rctx.buf, "multiplexd_rst_sent_total 11"));
-	T_EXPECT(resp_contains(rctx.buf, "multiplexd_rst_recv_total 17"));
-	T_EXPECT(resp_contains(rctx.buf, "multiplexd_stream_errors_total 19"));
+	T_EXPECT(metric_sample_contains(
+		rctx.buf, "multiplexd_reconnects_total 7"));
+	T_EXPECT(metric_sample_contains(
+		rctx.buf, "multiplexd_rst_sent_total 11"));
+	T_EXPECT(metric_sample_contains(
+		rctx.buf, "multiplexd_rst_recv_total 17"));
+	T_EXPECT(metric_sample_contains(
+		rctx.buf, "multiplexd_stream_errors_total 19"));
 	/* The same values are attributed to the tunnel that produced them. */
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_rst_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"rx\"} 17"));
+		"multiplexd_session_rst_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"rx\"} 17\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_rst_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} 11"));
+		"multiplexd_session_rst_total{identity=\"peer-cnt\",tunnel=\"1\",direction=\"tx\"} 11\n"));
 	T_EXPECT(resp_contains(
 		rctx.buf,
-		"multiplexd_session_stream_errors_total{identity=\"peer-cnt\",tunnel=\"1\"} 19"));
+		"multiplexd_session_stream_errors_total{identity=\"peer-cnt\",tunnel=\"1\"} 19\n"));
 }
 
 T_DECLARE_CASE(test_not_found_keepalive_followed_by_success)
@@ -3186,6 +3523,93 @@ T_DECLARE_CASE(test_config_get_returns_json)
 	T_EXPECT(resp_contains(rctx.buf, "application/json"));
 	T_EXPECT(resp_contains(
 		rctx.buf, "application/x-multiplexd-config; version=1"));
+}
+
+T_DECLARE_CASE(test_config_get_reuses_response_capacity)
+{
+	static struct apifx fx;
+	T_CHECK(apifx_setup(&fx) == 0);
+	T_CLEANUP(apifx_cleanup, &fx);
+	T_CLEANUP(reset_api_alloc, NULL);
+	static char claim[8193];
+	memset(claim, 'x', sizeof(claim) - 1);
+	claim[sizeof(claim) - 1] = '\0';
+	struct api_ctx *const ctx = fx.srv.api_conns;
+	const size_t initial_capacity = ctx->cbuf->cap;
+	size_t grown_capacity = 0;
+	for (size_t i = 0; i < 3; i++) {
+		fx.conf.identity.claim = i == 1 ? claim : NULL;
+		size_t len = 0;
+		char *const expected = conf_dump(&fx.conf, &len, NULL);
+		T_CHECK(expected != NULL);
+		T_CLEANUP(free, expected);
+		struct vbuffer *const previous = ctx->cbuf;
+		reset_api_alloc(NULL);
+		g_count_api_alloc = true;
+		struct resp_wait_ctx response;
+		const int result = do_exchange(&fx, &response, REQ_CONFIG_GET);
+		g_count_api_alloc = false;
+		T_CHECK(result == 0);
+		T_EXPECT_EQ(parse_status(response.buf), 200);
+		const char *const body = strstr(response.buf, "\r\n\r\n");
+		T_CHECK(body != NULL);
+		T_EXPECT_STREQ(body + 4, expected);
+		T_EXPECT(ctx->cbuf->cap > len);
+		if (i == 1) {
+			T_EXPECT(ctx->cbuf->cap > initial_capacity);
+			grown_capacity = ctx->cbuf->cap;
+		} else {
+			T_EXPECT(ctx->cbuf == previous);
+			T_EXPECT_EQ(g_api_realloc_calls, (size_t)0);
+		}
+	}
+	T_EXPECT_EQ(ctx->cbuf->cap, grown_capacity);
+}
+
+T_DECLARE_CASE(test_config_get_reserve_failure_recovers)
+{
+	static struct apifx fx;
+	T_CHECK(apifx_setup(&fx) == 0);
+	T_CLEANUP(apifx_cleanup, &fx);
+	T_CLEANUP(reset_api_alloc, NULL);
+	static char claim[8193];
+	memset(claim, 'x', sizeof(claim) - 1);
+	claim[sizeof(claim) - 1] = '\0';
+	fx.conf.identity.claim = claim;
+	struct api_ctx *const ctx = fx.srv.api_conns;
+	const size_t capacity = ctx->cbuf->cap;
+	g_fail_api_realloc = true;
+	struct resp_wait_ctx failed;
+	const int result = do_exchange(&fx, &failed, REQ_CONFIG_GET);
+	g_fail_api_realloc = false;
+	T_CHECK(result == 0);
+	T_EXPECT_EQ(parse_status(failed.buf), 500);
+	T_EXPECT(resp_contains(failed.buf, "Content-Length: 0\r\n"));
+	T_EXPECT_EQ(ctx->cbuf->cap, capacity);
+	T_EXPECT_EQ(ctx->cbuf->len, (size_t)0);
+	struct resp_wait_ctx recovered;
+	T_CALL_SUBCASE(assert_exchange, &fx, &recovered, REQ_CONFIG_GET);
+	T_EXPECT_EQ(parse_status(recovered.buf), 200);
+	T_EXPECT(resp_contains(recovered.buf, claim));
+}
+
+T_DECLARE_CASE(test_config_get_oversize_dump_recovers)
+{
+	static struct apifx fx;
+	T_CHECK(apifx_setup(&fx) == 0);
+	T_CLEANUP(apifx_cleanup, &fx);
+	static char claim[CONF_MAXSIZE + 1];
+	memset(claim, 'x', sizeof(claim) - 1);
+	claim[sizeof(claim) - 1] = '\0';
+	fx.conf.identity.claim = claim;
+	struct resp_wait_ctx failed;
+	T_CALL_SUBCASE(assert_exchange, &fx, &failed, REQ_CONFIG_GET);
+	T_EXPECT_EQ(parse_status(failed.buf), 500);
+	T_EXPECT(resp_contains(failed.buf, "Content-Length: 0\r\n"));
+	fx.conf.identity.claim = NULL;
+	struct resp_wait_ctx recovered;
+	T_CALL_SUBCASE(assert_exchange, &fx, &recovered, REQ_CONFIG_GET);
+	T_EXPECT_EQ(parse_status(recovered.buf), 200);
 }
 
 T_DECLARE_CASE(test_config_put_malformed_body)
@@ -4066,6 +4490,81 @@ static int request_consumed_predicate(void *ptr)
 	return n == 0 ? -1 : 0;
 }
 
+#if WITH_TLS
+static void reset_api_observer(void *unused)
+{
+	(void)unused;
+	g_watched_api_ctx = NULL;
+}
+
+T_DECLARE_SUBCASE(assert_request_erased, const int exit_path)
+{
+	static struct apifx fx;
+	T_CHECK(apifx_setup(&fx) == 0);
+	T_CLEANUP(apifx_cleanup, &fx);
+	T_CLEANUP(reset_api_observer, NULL);
+	g_watched_api_ctx = fx.srv.api_conns;
+	g_api_freed = false;
+	g_api_erased = false;
+	/* Invalid config and framing rejection exercise exits which never parse
+	 * credentials, despite receiving them in the same read as the headers. */
+	static const char partial[] =
+		"PUT /config HTTP/1.1\r\nHost: localhost\r\n"
+		"Content-Length: 128\r\n\r\n{\"tls\":{\"key\":\"private-marker";
+	static const char rejected[] =
+		"PUT /config HTTP/1.1\r\nHost: localhost\r\n"
+		"Transfer-Encoding: chunked\r\n\r\nprivate-marker";
+	static const char complete[] =
+		"PUT /config HTTP/1.1\r\nHost: localhost\r\n"
+		"Content-Length: 14\r\n\r\nprivate-marker";
+	const char *request = exit_path == 3 ?
+				      rejected :
+				      (exit_path == 4 ? complete : partial);
+	T_CHECK(do_send(&fx, fx.cli_fd, request, strlen(request)) == 0);
+	struct request_consumed_ctx consumed = { .srv = &fx.srv,
+						 .fd = fx.srv_fd };
+	T_CHECK(wait_until(&fx, 2.0, request_consumed_predicate, &consumed) ==
+		0);
+	struct api_ctx *const ctx = fx.srv.api_conns;
+	T_CHECK(ctx != NULL);
+	if (exit_path <= 2) {
+		T_EXPECT(strstr(ctx->next, "private-marker") != NULL);
+		if (exit_path == 0) {
+			T_CHECK(shutdown(fx.cli_fd, SHUT_WR) == 0);
+			ev_invoke(fx.loop, &ctx->w_recv, EV_READ);
+		} else if (exit_path == 1) {
+			ev_invoke(fx.loop, &ctx->w_timeout, EV_TIMER);
+		} else {
+			api_server_stop(&fx.srv, fx.loop);
+		}
+	} else {
+		/* Rejection closes; a complete invalid config resets keepalive. */
+		const size_t received = ctx->rbuf.len;
+		T_CHECK(received > 0);
+		ev_invoke(fx.loop, &ctx->w_send, EV_WRITE);
+		if (exit_path == 4) {
+			T_EXPECT(fx.srv.api_conns == ctx);
+			T_EXPECT_EQ(ctx->rbuf.len, 0);
+			for (size_t i = 0; i < received; i++) {
+				T_EXPECT_EQ(ctx->rbuf.data[i], 0);
+			}
+			api_server_stop(&fx.srv, fx.loop);
+		}
+	}
+	T_EXPECT(g_api_freed);
+	T_EXPECT(g_api_erased);
+	T_EXPECT(fx.srv.api_conns == NULL);
+	apifx_teardown(&fx);
+}
+
+T_DECLARE_CASE(test_config_request_storage_erased)
+{
+	for (int exit_path = 0; exit_path < 5; exit_path++) {
+		T_CALL_SUBCASE(assert_request_erased, exit_path);
+	}
+}
+#endif /* WITH_TLS */
+
 T_DECLARE_SUBCASE(
 	assert_fragmented_exchange, struct apifx *restrict fx,
 	struct resp_wait_ctx *restrict rctx, const char *restrict request)
@@ -4456,6 +4955,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_stats_get_nobanner),
 	T_CASE(test_stats_post_text),
 	T_CASE(test_metrics_get),
+	T_CASE(test_metric_value_boundary_rejects_prefixes),
 	T_CASE(test_not_found),
 	T_CASE(test_method_not_allowed),
 	T_CASE(test_request_too_large),
@@ -4464,7 +4964,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_connection_close_multi_token),
 	T_CASE(test_connection_close_long_token_list),
 	T_CASE(test_connection_close_repeated_header),
+	T_CASE(test_status_parser_requires_three_digit_token),
 	T_CASE(test_response_reader_requires_complete_framing),
+	T_CASE(test_oversized_reader_requires_413_or_reset),
 	T_CASE(test_date_validator_rejects_malformed_fields),
 	T_CASE(test_stats_get_includes_identity_rows),
 	T_CASE(test_healthy_offline),
@@ -4480,7 +4982,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_stats_post_tracks_rate_deltas),
 	T_CASE(test_metrics_buffer_gauges_are_labeled),
 	T_CASE(test_metrics_stream_lifecycle_counters_are_labeled),
+	T_CASE(test_latency_exports_nonzero_observations),
 	T_CASE(test_metrics_reconnects_series_skips_accepted_tunnel),
+	T_CASE(test_metrics_anonymous_labels_need_no_storage),
 	T_CASE(test_metrics_anonymous_tunnel_counted_in_totals_only),
 	T_CASE(test_metrics_staged_identity_tunnel_counted_in_totals),
 	T_CASE(test_metrics_validation_rejects_duplicates_and_missing_metadata),
@@ -4496,6 +5000,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_content_length_plus_sign_rejected),
 	T_CASE(test_malformed_url_path_rejected),
 	T_CASE(test_config_get_returns_json),
+	T_CASE(test_config_get_reuses_response_capacity),
+	T_CASE(test_config_get_reserve_failure_recovers),
+	T_CASE(test_config_get_oversize_dump_recovers),
 	T_CASE(test_config_put_malformed_body),
 	T_CASE(test_stats_malformed_query_rejected),
 	T_CASE(test_config_put_no_content_length),
@@ -4504,6 +5011,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_config_put_success),
 	T_CASE(test_config_put_cannot_change_api_listen),
 #if WITH_TLS
+	T_CASE(test_config_request_storage_erased),
 	T_CASE(test_config_put_bad_inline_psk_rejected),
 #endif
 	T_CASE(test_method_not_allowed_carries_allow),

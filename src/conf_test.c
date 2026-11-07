@@ -25,6 +25,100 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef CONF_TEST_WRAP_ALLOC
+/* conf.c is linked separately, so intercept only this executable's allocation
+ * calls. Arm around conf_dump alone; parsing and test-framework allocations
+ * must not consume a failure or distort the cleanup counts. */
+static struct {
+	bool armed;
+	size_t fail_at;
+	size_t calls;
+	size_t allocated;
+	size_t freed;
+} dump_alloc;
+
+static struct config *rejection_probe_conf;
+static size_t rejection_probe_frees;
+#if WITH_TLS
+static struct {
+	bool armed;
+	void *ptr;
+	size_t frees;
+	bool zeroed;
+} dump_erase_probe;
+#endif
+
+void *test_real_malloc(size_t size) __asm__("__real_malloc");
+void *test_real_calloc(size_t count, size_t size) __asm__("__real_calloc");
+void test_real_free(void *ptr) __asm__("__real_free");
+void *test_wrap_malloc(size_t size) __asm__("__wrap_malloc");
+void *test_wrap_calloc(size_t count, size_t size) __asm__("__wrap_calloc");
+void test_wrap_free(void *ptr) __asm__("__wrap_free");
+
+static bool dump_alloc_should_fail(void)
+{
+	return dump_alloc.armed && ++dump_alloc.calls == dump_alloc.fail_at;
+}
+
+static void *dump_alloc_record(void *ptr)
+{
+	if (dump_alloc.armed && ptr != NULL) {
+		dump_alloc.allocated++;
+	}
+	return ptr;
+}
+
+void *test_wrap_malloc(size_t size)
+{
+	if (dump_alloc_should_fail()) {
+		return NULL;
+	}
+	void *const ptr = test_real_malloc(size);
+#if WITH_TLS
+	if (dump_erase_probe.armed && size == CONF_MAXSIZE + 1 && ptr != NULL) {
+		dump_erase_probe.ptr = ptr;
+		/* Include untouched capacity in the release-boundary observation. */
+		memset(ptr, 0xA5, size);
+	}
+#endif
+	return dump_alloc_record(ptr);
+}
+
+void *test_wrap_calloc(size_t count, size_t size)
+{
+	if (dump_alloc_should_fail()) {
+		return NULL;
+	}
+	return dump_alloc_record(test_real_calloc(count, size));
+}
+
+void test_wrap_free(void *ptr)
+{
+#if WITH_TLS
+	if (ptr != NULL && ptr == dump_erase_probe.ptr) {
+		const unsigned char *const bytes = ptr;
+		dump_erase_probe.zeroed = true;
+		for (size_t i = 0; i < CONF_MAXSIZE + 1; i++) {
+			if (bytes[i] != 0) {
+				dump_erase_probe.zeroed = false;
+				break;
+			}
+		}
+		dump_erase_probe.ptr = NULL;
+		dump_erase_probe.frees++;
+	}
+#endif /* WITH_TLS */
+	if (ptr != NULL && ptr == rejection_probe_conf) {
+		rejection_probe_conf = NULL;
+		rejection_probe_frees++;
+	}
+	if (dump_alloc.armed && ptr != NULL) {
+		dump_alloc.freed++;
+	}
+	test_real_free(ptr);
+}
+#endif /* CONF_TEST_WRAP_ALLOC */
+
 static void
 retain_cleanup(struct testing_ctx *_t_, void (*cleanup)(void *), void *data)
 {
@@ -148,11 +242,20 @@ find_peer(const struct config *restrict conf, const char *restrict id)
 struct conf_log_capture {
 	char text[1024];
 	size_t len;
+	bool unsafe;
 };
 
 static void capture_conf_log(void *ud, const unsigned char *buf, size_t len)
 {
 	struct conf_log_capture *const capture = ud;
+	for (size_t i = 0; i < len; i++) {
+		if ((buf[i] < 0x20 && !(buf[i] == '\n' && i + 1 == len)) ||
+		    buf[i] == 0x7F ||
+		    (buf[i] == 0xC2 && i + 1 < len && buf[i + 1] >= 0x80 &&
+		     buf[i + 1] <= 0x9F)) {
+			capture->unsafe = true;
+		}
+	}
 	const size_t available = sizeof(capture->text) - capture->len - 1;
 	const size_t n = len < available ? len : available;
 	memcpy(capture->text + capture->len, buf, n);
@@ -213,6 +316,87 @@ T_DECLARE_CASE(test_conf_map_diagnostics_escape_keys)
 			release_cleanup(_t_, cleanup_conf, conf);
 		}
 	}
+}
+
+T_DECLARE_CASE(test_conf_validation_diagnostics_escape_text)
+{
+	static const struct {
+		const char *fields;
+		const char *expected;
+		bool accepted;
+	} cases[] = {
+#if WITH_TLS
+		{ "\"tls\":{\"psk\":{\"peer\\nFORGED\\r\\u001b\\u007f\\u009b\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"second\":\"1111111111111111111111111111111111111111111111111111111111111111\"}}",
+		  "using \"peer\\nFORGED\\r\\x1b\\x7f\\xc2\\x9b\"", true },
+		{ "\"tls\":{\"psk\":{\"peer\\nFORGED\\u001b\":\"00\",\"peer\\nFORGED\\u001b\":\"00\"}}",
+		  "duplicate entry for identity \"peer\\nFORGED\\x1b\"",
+		  false },
+		{ "\"tls\":{\"psk\":{\"peer\\nFORGED\\u001b\":\"00\"}}",
+		  "tls.psk.peer\\nFORGED\\x1b: expected", false },
+		{ "\"tls\":{\"psk\":{\"peer\\nFORGED\\u001b\":\"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg\"}}",
+		  "tls.psk.peer\\nFORGED\\x1b: not a hex string", false },
+		{ "\"tls\":{\"psk\":{\"peer\\nFORGED\\u001babcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnop\":\"@key\"}}",
+		  "tls.psk key \"peer\\nFORGED\\x1b", false },
+#endif /* WITH_TLS */
+		{ "\"type\":\"bad\\nFORGED\\r\\u001b\\u007f\\u009b\"",
+		  "unsupported config type: \"bad\\nFORGED\\r\\x1b\\x7f\\xc2\\x9b\"",
+		  false },
+		{ "\"type\":\"application/x-multiplexd-config; broken\\n\\u001b\"",
+		  "malformed config type:", false },
+		{ "\"type\":\"application/x-multiplexd-config; version=\\\"\\u009bFORGED\\\"\"",
+		  "unsupported config version: \"\\xc2\\x9bFORGED\"", false },
+		{ "\"max_startups\":\"bad\\nFORGED\\r\\u001b\"",
+		  "invalid max_startups format: \"bad\\nFORGED\\r\\x1b\"",
+		  false },
+		{ "\"identity\":{\"claim\":\"local\",\"listen\":{\"peer\\nFORGED\\u001babcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnop\":\"127.0.0.1:9001\"}}",
+		  "identity.listen key \"peer\\nFORGED\\x1b", false },
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		char json[1024];
+		(void)snprintf(
+			json, sizeof(json),
+			"{\"mux_connect\":\"127.0.0.1:9000\",%s}",
+			cases[i].fields);
+		struct conf_log_capture capture = { 0 };
+		const int saved_level = slog_level_;
+		slog_setlevel(LOG_LEVEL_WARNING);
+		slog_setoutput(
+			SLOG_OUTPUT_WRITER, capture_conf_log, (void *)&capture);
+		struct config *const conf = parse_tmpconf(json);
+		slog_setoutput(SLOG_OUTPUT_DISCARD);
+		slog_setlevel(saved_level);
+		retain_cleanup(_t_, cleanup_conf, conf);
+		T_LOGF("case %zu: %s", i, capture.text);
+		T_EXPECT((conf != NULL) == cases[i].accepted);
+		T_EXPECT(strstr(capture.text, cases[i].expected) != NULL);
+		T_EXPECT(!capture.unsafe);
+		release_cleanup(_t_, cleanup_conf, conf);
+	}
+
+	/* The schema rejects an oversized listen value before conf_check can
+	 * emit its fallback address-limit diagnostic. Its rejection stays inert. */
+	char address[2048];
+	memset(address, 'a', sizeof(address) - 1);
+	address[sizeof(address) - 1] = '\0';
+	char json[2304];
+	(void)snprintf(
+		json, sizeof(json),
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"local\",\"listen\":{\"peer\\nFORGED\\u001b\":\"%s\"}}}",
+		address);
+	struct conf_log_capture capture = { 0 };
+	const int saved_level = slog_level_;
+	slog_setlevel(LOG_LEVEL_WARNING);
+	slog_setoutput(SLOG_OUTPUT_WRITER, capture_conf_log, (void *)&capture);
+	struct config *const conf = parse_tmpconf(json);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+	slog_setlevel(saved_level);
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_EXPECT(conf == NULL);
+	T_EXPECT(
+		strstr(capture.text, "failed to process configuration") !=
+		NULL);
+	T_EXPECT(!capture.unsafe);
+	release_cleanup(_t_, cleanup_conf, conf);
 }
 
 T_DECLARE_CASE(test_conf_new_default_fields)
@@ -864,9 +1048,8 @@ T_DECLARE_CASE(test_conf_parsefile_identity_listen_many_peers)
 
 T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_listen_value)
 {
-	/* identity.listen values bypass the schema's generated checks;
-	 * conf_check's own length check must reject an oversized one
-	 * instead of resolve_bindaddr failing much later in server.c. */
+	/* The codec rejects an oversized identity.listen value before it
+	 * reaches address resolution in server.c. */
 	char addr[263];
 	memset(addr, 'a', sizeof(addr) - 1);
 	addr[sizeof(addr) - 1] = '\0';
@@ -945,11 +1128,33 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_oversized_identity_mux_connect)
 	T_EXPECT(conf == NULL);
 }
 
+/* Both empty and populated maps are otherwise valid with a transport. */
+T_DECLARE_CASE(test_conf_parsefile_identity_listen_valid_map_control)
+{
+	const char *const json[] = {
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"mynode\",\"listen\":{}}}",
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"mynode\",\"listen\":{\"peer1\":\"127.0.0.1:9002\"}}}",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(json); i++) {
+		struct config *const conf = parse_tmpconf(json[i]);
+		retain_cleanup(_t_, cleanup_conf, conf);
+		T_CHECK(conf != NULL);
+		T_EXPECT_EQ(conf->identity.peers_count, i);
+		if (i != 0) {
+			T_CHECK(find_peer(conf, "peer1") != NULL);
+			T_EXPECT_STREQ(
+				find_peer(conf, "peer1")->listen,
+				"127.0.0.1:9002");
+		}
+		release_cleanup(_t_, cleanup_conf, conf);
+	}
+}
+
 /* The generated typed map rejects values that are not objects. */
 T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_non_object)
 {
 	const char *json =
-		"{\"identity\":{\"claim\":\"mynode\",\"listen\":\"not-an-object\"}}";
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"mynode\",\"listen\":\"not-an-object\"}}";
 	struct config *const conf = parse_tmpconf(json);
 	retain_cleanup(_t_, cleanup_conf, conf);
 	T_EXPECT(conf == NULL);
@@ -959,7 +1164,7 @@ T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_non_object)
 T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_malformed_json)
 {
 	const char *json =
-		"{\"identity\":{\"claim\":\"mynode\",\"listen\":{\"peer1\"}}}";
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"mynode\",\"listen\":{\"peer1\"}}}";
 	struct config *const conf = parse_tmpconf(json);
 	retain_cleanup(_t_, cleanup_conf, conf);
 	T_EXPECT(conf == NULL);
@@ -970,7 +1175,7 @@ T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_malformed_json)
 T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_bracket_mismatch)
 {
 	const char *json =
-		"{\"identity\":{\"claim\":\"mynode\",\"listen\":{\"-old\":[{], \"ok\":\"1.2.3.4:1\"}}}}";
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"mynode\",\"listen\":{\"-old\":[{], \"ok\":\"1.2.3.4:1\"}}}}";
 	struct config *const conf = parse_tmpconf(json);
 	retain_cleanup(_t_, cleanup_conf, conf);
 	T_EXPECT(conf == NULL);
@@ -995,7 +1200,7 @@ T_DECLARE_CASE(test_conf_parsefile_identity_listen_skips_comment_key)
 T_DECLARE_CASE(test_conf_parsefile_identity_listen_rejects_non_string_value)
 {
 	const char *json =
-		"{\"identity\":{\"claim\":\"mynode\",\"listen\":{\"peer1\":123}}}";
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"mynode\",\"listen\":{\"peer1\":123}}}";
 	struct config *const conf = parse_tmpconf(json);
 	retain_cleanup(_t_, cleanup_conf, conf);
 	T_EXPECT(conf == NULL);
@@ -1308,6 +1513,14 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_partial_tls_config)
 	T_EXPECT(conf == NULL);
 }
 
+/* Retain an unexpectedly accepted configuration before the fatal expectation
+ * transfers control back to the runner. */
+T_DECLARE_SUBCASE(assert_conf_rejected, struct config *conf)
+{
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_EXPECT(conf == NULL);
+}
+
 /* Builds "{"mux_listen":..., "tls": <tls_json>}" and expects rejection. */
 T_DECLARE_SUBCASE(assert_partial_tls_rejected, const char *restrict tls_json)
 {
@@ -1315,8 +1528,7 @@ T_DECLARE_SUBCASE(assert_partial_tls_rejected, const char *restrict tls_json)
 	(void)snprintf(
 		json, sizeof(json),
 		"{\"mux_listen\":\"127.0.0.1:9000\",\"tls\":%s}", tls_json);
-	struct config *const conf = parse_tmpconf(json);
-	T_EXPECT(conf == NULL);
+	T_CALL_SUBCASE(assert_conf_rejected, parse_tmpconf(json));
 }
 
 T_DECLARE_CASE(test_conf_system_trust_roundtrip)
@@ -1752,6 +1964,35 @@ static void psk_hex_fill(char *restrict hex, const size_t octets, const char c)
 	hex[octets * 2u] = '\0';
 }
 
+#ifdef CONF_TEST_WRAP_ALLOC
+static void reset_rejection_probe(void *data)
+{
+	(void)data;
+	conf_free(rejection_probe_conf);
+	rejection_probe_conf = NULL;
+	rejection_probe_frees = 0;
+}
+
+T_DECLARE_CASE(conf_rejection_with_accepted_result)
+{
+	T_CALL_SUBCASE(assert_conf_rejected, rejection_probe_conf);
+}
+
+T_DECLARE_CASE(test_conf_rejection_cleanup_on_failed_expectation)
+{
+	T_CLEANUP(reset_rejection_probe, NULL);
+	rejection_probe_conf = parse_tmpconf(
+		"{\"mux_listen\":\"127.0.0.1:9000\","
+		"\"tls\":{\"psk\":{\"peer\":" PSK_HEX "}}}");
+	T_CHECK(rejection_probe_conf != NULL);
+	T_DECLARE_CTX(inner);
+	T_RUN_CASE(inner, conf_rejection_with_accepted_result);
+	T_EXPECT_EQ(inner.failed, 1);
+	T_EXPECT_EQ(rejection_probe_frees, (size_t)1);
+	T_EXPECT(rejection_probe_conf == NULL);
+}
+#endif /* CONF_TEST_WRAP_ALLOC */
+
 /* An inline key is fully visible to conf_parse, so a malformed one must fail
  * the parse itself -- which is what makes PUT /config answer 400 rather than
  * accept the body and fail the reload later. */
@@ -1763,23 +2004,23 @@ T_DECLARE_CASE(test_conf_psk_rejects_bad_key)
 	/* Below TLS_PSK_MIN_LEN. */
 	psk_hex_fill(hex, TLS_PSK_MIN_LEN - 1u, '0');
 	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
-	T_EXPECT(parse_tmpconf(json) == NULL);
+	T_CALL_SUBCASE(assert_conf_rejected, parse_tmpconf(json));
 
 	/* Above TLS_PSK_MAX_LEN. */
 	psk_hex_fill(hex, TLS_PSK_MAX_LEN + 1u, '0');
 	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
-	T_EXPECT(parse_tmpconf(json) == NULL);
+	T_CALL_SUBCASE(assert_conf_rejected, parse_tmpconf(json));
 
 	/* Odd number of hex digits: half an octet. */
 	psk_hex_fill(hex, TLS_PSK_MIN_LEN + 1u, '0');
 	hex[strlen(hex) - 1u] = '\0';
 	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
-	T_EXPECT(parse_tmpconf(json) == NULL);
+	T_CALL_SUBCASE(assert_conf_rejected, parse_tmpconf(json));
 
 	/* Right length, wrong alphabet. */
 	psk_hex_fill(hex, TLS_PSK_MIN_LEN, 'z');
 	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), "peer", hex);
-	T_EXPECT(parse_tmpconf(json) == NULL);
+	T_CALL_SUBCASE(assert_conf_rejected, parse_tmpconf(json));
 }
 
 /* Both length bounds are inclusive. */
@@ -1927,33 +2168,36 @@ T_DECLARE_CASE(test_conf_psk_identity_length_bound)
 	memset(id, 'i', MUX_MAX_CLAIM_LEN + 1u);
 	id[MUX_MAX_CLAIM_LEN + 1u] = '\0';
 	T_CALL_SUBCASE(psk_conf_json, json, sizeof(json), id, hex);
-	T_EXPECT(parse_tmpconf(json) == NULL);
+	T_CALL_SUBCASE(assert_conf_rejected, parse_tmpconf(json));
 }
 
 /* Typed PSK maps reject non-objects, malformed JSON and non-string values;
  * the map filter skips disabled entries before value-type validation. */
 T_DECLARE_CASE(test_conf_psk_rejects_non_object)
 {
-	T_EXPECT(
+	T_CALL_SUBCASE(
+		assert_conf_rejected,
 		parse_tmpconf(
 			"{\"mux_listen\":\"127.0.0.1:9000\","
-			"\"tls\":{\"psk\":\"not-an-object\"}}") == NULL);
+			"\"tls\":{\"psk\":\"not-an-object\"}}"));
 }
 
 T_DECLARE_CASE(test_conf_psk_rejects_malformed_json)
 {
-	T_EXPECT(
+	T_CALL_SUBCASE(
+		assert_conf_rejected,
 		parse_tmpconf(
 			"{\"mux_listen\":\"127.0.0.1:9000\","
-			"\"tls\":{\"psk\":{\"peer\"}}}") == NULL);
+			"\"tls\":{\"psk\":{\"peer\"}}}"));
 }
 
 T_DECLARE_CASE(test_conf_psk_rejects_non_string_value)
 {
-	T_EXPECT(
+	T_CALL_SUBCASE(
+		assert_conf_rejected,
 		parse_tmpconf(
 			"{\"mux_listen\":\"127.0.0.1:9000\","
-			"\"tls\":{\"psk\":{\"peer\":123}}}") == NULL);
+			"\"tls\":{\"psk\":{\"peer\":123}}}"));
 }
 
 T_DECLARE_CASE(test_conf_psk_skips_comment_key)
@@ -2341,9 +2585,7 @@ T_DECLARE_CASE(test_conf_dump_identity_fields)
 	release_cleanup(_t_, cleanup_conf, orig);
 }
 
-/* Regression test: conf_dump must fail (return NULL) rather than silently
- * dropping identity.listen when its entry-array allocation fails -- this
- * pins the success path so a wrong-polarity failure signal never resurfaces. */
+/* A successful dump preserves the configured identity listener. */
 T_DECLARE_CASE(test_conf_dump_identity_listen_roundtrip)
 {
 	const char *json =
@@ -2371,6 +2613,195 @@ T_DECLARE_CASE(test_conf_dump_identity_listen_roundtrip)
 	release_cleanup(_t_, cleanup_conf, reparsed);
 	release_cleanup(_t_, cleanup_conf, orig);
 }
+
+T_DECLARE_CASE(test_conf_dump_into_capacity_and_length)
+{
+	struct config *const conf = conf_new_default();
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_CHECK(conf != NULL);
+	conf->identity.claim = strdup("node-\"\\\n");
+	T_CHECK(conf->identity.claim != NULL);
+	const char *const indents[] = { NULL, "  " };
+	for (size_t i = 0; i < ARRAY_SIZE(indents); i++) {
+		size_t len = 0;
+		char *const expected = conf_dump(conf, &len, indents[i]);
+		T_CHECK(expected != NULL);
+		retain_cleanup(_t_, free, expected);
+		T_EXPECT_EQ(
+			conf_dump_into(conf, NULL, 0, indents[i]), (int)len);
+		unsigned char *const out = malloc(len + 3);
+		T_CHECK(out != NULL);
+		retain_cleanup(_t_, free, out);
+		const size_t capacities[] = { 0, 1, len, len + 1, len + 2 };
+		for (size_t j = 0; j < ARRAY_SIZE(capacities); j++) {
+			const size_t cap = capacities[j];
+			memset(out, 0xA5, len + 3);
+			T_EXPECT_EQ(
+				conf_dump_into(
+					conf, (char *)out, cap, indents[i]),
+				(int)len);
+			T_EXPECT_EQ(out[cap], (unsigned char)0xA5);
+			if (cap > len) {
+				T_EXPECT_STREQ((char *)out, expected);
+			} else if (cap > 0) {
+				T_EXPECT_EQ(out[0], (unsigned char)0);
+#if WITH_TLS
+				for (size_t k = 0; k < cap; k++) {
+					T_EXPECT_EQ(out[k], (unsigned char)0);
+				}
+#endif
+			}
+		}
+		release_cleanup(_t_, free, out);
+		release_cleanup(_t_, free, expected);
+	}
+}
+
+T_DECLARE_CASE(test_conf_dump_into_output_limit_clears_capacity)
+{
+	struct config *const conf = conf_new_default();
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_CHECK(conf != NULL);
+	conf->identity.claim = calloc(CONF_MAXSIZE + 1, 1);
+	T_CHECK(conf->identity.claim != NULL);
+#if WITH_TLS
+	conf->tls_key = strdup("private-key-marker");
+	T_CHECK(conf->tls_key != NULL);
+#endif
+	const int overhead = conf_dump_into(conf, NULL, 0, NULL);
+	T_CHECK(overhead > 0 && overhead < CONF_MAXSIZE);
+	const size_t claim_len = CONF_MAXSIZE - (size_t)overhead;
+	memset(conf->identity.claim, 'x', claim_len);
+	unsigned char *const out = malloc(CONF_MAXSIZE + 2);
+	T_CHECK(out != NULL);
+	retain_cleanup(_t_, free, out);
+	memset(out, 0xA5, CONF_MAXSIZE + 2);
+	T_EXPECT_EQ(
+		conf_dump_into(conf, (char *)out, CONF_MAXSIZE + 2, NULL),
+		CONF_MAXSIZE);
+	T_EXPECT_EQ(out[CONF_MAXSIZE], (unsigned char)0);
+	T_EXPECT_EQ(out[CONF_MAXSIZE + 1], (unsigned char)0xA5);
+	conf->identity.claim[claim_len] = 'x';
+	memset(out, 0xA5, CONF_MAXSIZE + 2);
+	T_EXPECT_EQ(
+		conf_dump_into(conf, (char *)out, CONF_MAXSIZE + 2, NULL), -1);
+	T_EXPECT_EQ(out[0], (unsigned char)0);
+	T_EXPECT_EQ(out[CONF_MAXSIZE + 1], (unsigned char)0xA5);
+#if WITH_TLS
+	for (size_t i = 0; i < CONF_MAXSIZE + 1; i++) {
+		T_EXPECT_EQ(out[i], (unsigned char)0);
+	}
+#endif
+}
+
+#ifdef CONF_TEST_WRAP_ALLOC
+T_DECLARE_SUBCASE(conf_dump_alloc_failures, const char *json, size_t allocations)
+{
+	struct config *const conf = parse_tmpconf(json);
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_CHECK(conf != NULL);
+	size_t baseline_len = 0;
+	char *const baseline = conf_dump(conf, &baseline_len, NULL);
+	retain_cleanup(_t_, free, baseline);
+	T_CHECK(baseline != NULL);
+	for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+		dump_alloc.armed = true;
+		dump_alloc.fail_at = fail_at;
+		dump_alloc.calls = dump_alloc.allocated = dump_alloc.freed = 0;
+		size_t len = SIZE_MAX;
+		char *const failed = conf_dump(conf, &len, NULL);
+		const bool rejected = failed == NULL;
+		const size_t calls = dump_alloc.calls;
+		const size_t allocated = dump_alloc.allocated;
+		const size_t freed = dump_alloc.freed;
+		free(failed);
+		dump_alloc.armed = false;
+		T_EXPECT(rejected);
+		T_EXPECT_EQ(len, SIZE_MAX);
+		T_EXPECT_EQ(calls, fail_at);
+		T_EXPECT_EQ(allocated, fail_at - 1);
+		T_EXPECT_EQ(freed, allocated);
+
+		/* Recover using the same configuration: no field may have been lost. */
+		dump_alloc.armed = true;
+		dump_alloc.fail_at = 0;
+		dump_alloc.calls = dump_alloc.allocated = dump_alloc.freed = 0;
+		char *const recovered = conf_dump(conf, &len, NULL);
+		const bool intact =
+			recovered != NULL && strcmp(recovered, baseline) == 0;
+		free(recovered);
+		const size_t recovery_calls = dump_alloc.calls;
+		const size_t recovery_allocated = dump_alloc.allocated;
+		const size_t recovery_freed = dump_alloc.freed;
+		dump_alloc.armed = false;
+		T_EXPECT(intact);
+		T_EXPECT_EQ(len, baseline_len);
+		T_EXPECT_EQ(recovery_calls, allocations);
+		T_EXPECT_EQ(recovery_allocated, allocations);
+		T_EXPECT_EQ(recovery_freed, allocations);
+	}
+	release_cleanup(_t_, free, baseline);
+	release_cleanup(_t_, cleanup_conf, conf);
+}
+
+T_DECLARE_CASE(test_conf_dump_alloc_failure_cleanup)
+{
+	/* Listener map, identity connect array, optional trust array, output. */
+	const char *const json =
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"node\","
+		"\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer\":\"127.0.0.1:9002\"}}"
+#if WITH_TLS
+		",\"tls\":{\"cert\":\"cert.pem\",\"key\":\"key.pem\",\"authcerts\":[\"ca.pem\"]}"
+#endif
+		"}";
+#if WITH_TLS
+	const size_t allocations = 4;
+#else
+	const size_t allocations = 3;
+#endif
+	T_CALL_SUBCASE(conf_dump_alloc_failures, json, allocations);
+}
+
+#if WITH_TLS
+T_DECLARE_CASE(test_conf_dump_failure_erases_output_capacity)
+{
+	struct config *const conf = conf_new_default();
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_CHECK(conf != NULL);
+	conf->tls_key = strdup("private-key-marker-for-failed-dump");
+	conf->identity.claim = malloc(CONF_MAXSIZE + 1);
+	T_CHECK(conf->tls_key != NULL && conf->identity.claim != NULL);
+	memset(conf->identity.claim, 'x', CONF_MAXSIZE);
+	conf->identity.claim[CONF_MAXSIZE] = '\0';
+
+	dump_erase_probe.armed = true;
+	dump_erase_probe.frees = 0;
+	dump_erase_probe.zeroed = false;
+	size_t len = SIZE_MAX;
+	char *const out = conf_dump(conf, &len, NULL);
+	dump_erase_probe.armed = false;
+	const size_t frees = dump_erase_probe.frees;
+	const bool zeroed = dump_erase_probe.zeroed;
+	const bool rejected = out == NULL;
+	free(out);
+	T_EXPECT(rejected);
+	T_EXPECT_EQ(len, SIZE_MAX);
+	T_EXPECT_EQ(frees, (size_t)1);
+	T_EXPECT(zeroed);
+}
+
+T_DECLARE_CASE(test_conf_dump_psk_alloc_failure_cleanup)
+{
+	/* Listener map, PSK map, identity connect array, output. */
+	T_CALL_SUBCASE(
+		conf_dump_alloc_failures,
+		"{\"mux_listen\":\"127.0.0.1:9000\",\"identity\":{\"claim\":\"node\","
+		"\"mux_connect\":[\"127.0.0.1:9001\"],\"listen\":{\"peer\":\"127.0.0.1:9002\"}},"
+		"\"tls\":{\"psk\":{\"peer\":" PSK_HEX "}}}",
+		(size_t)4);
+}
+#endif /* WITH_TLS */
+#endif /* CONF_TEST_WRAP_ALLOC */
 
 T_DECLARE_CASE(test_conf_dump_identity_listen_exact_grow_boundary)
 {
@@ -2523,6 +2954,7 @@ T_DECLARE_CASE(test_conf_parsefile_accepts_type_variants)
 		struct config *const conf = parse_tmpconf(json);
 		retain_cleanup(_t_, cleanup_conf, conf);
 		T_EXPECT(conf != NULL);
+		T_EXPECT_STREQ(conf->type, good[i]);
 		release_cleanup(_t_, cleanup_conf, conf);
 	}
 }
@@ -2551,11 +2983,34 @@ T_DECLARE_CASE(test_conf_parsefile_rejects_invalid_type)
 	}
 }
 
+T_DECLARE_CASE(test_type_validation_preserves_long_owned_type)
+{
+	char json[8192];
+	const char prefix[] =
+		"{\"type\":\"application/x-multiplexd-config; version=1; extra=";
+	memcpy(json, prefix, sizeof(prefix) - 1);
+	memset(json + sizeof(prefix) - 1, 'x', 4096);
+	const char suffix[] = "\",\"mux_connect\":\"127.0.0.1:9000\"}";
+	memcpy(json + sizeof(prefix) - 1 + 4096, suffix, sizeof(suffix));
+	const size_t len = sizeof(prefix) - 1 + 4096 + sizeof(suffix) - 1;
+	struct config *const conf = conf_parse(json, len);
+	retain_cleanup(_t_, cleanup_conf, conf);
+	T_CHECK(conf != NULL);
+	T_EXPECT_EQ(
+		strlen(conf->type),
+		strlen("application/x-multiplexd-config; version=1; extra=") +
+			4096);
+	T_EXPECT(strstr(conf->type, "; version=1; extra=") != NULL);
+	release_cleanup(_t_, cleanup_conf, conf);
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_type_validation_preserves_long_owned_type),
 	T_CASE(test_conf_unacked_memory_limit),
 	T_CASE(test_conf_stdin_fixtures_with_closed_descriptor_zero),
 	T_CASE(test_conf_new_default_fields),
 	T_CASE(test_conf_map_diagnostics_escape_keys),
+	T_CASE(test_conf_validation_diagnostics_escape_text),
 	T_CASE(test_conf_new_default_matches_empty_parse),
 	T_CASE(test_conf_presence_preserves_empty_strings_and_nested_defaults),
 	T_CASE(test_conf_lossymux_defaults),
@@ -2568,6 +3023,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_parsefile_minimal_client),
 	T_CASE(test_conf_parsefile_minimal_server),
 	T_CASE(test_conf_dump_roundtrip),
+	T_CASE(test_conf_dump_into_capacity_and_length),
+	T_CASE(test_conf_dump_into_output_limit_clears_capacity),
 	T_CASE(test_conf_parsefile_mux_max_frame_size_roundtrip),
 	T_CASE(test_conf_identity_connect_count),
 	T_CASE(test_conf_loglevel_parsed),
@@ -2587,6 +3044,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_parsefile_accepts_max_length_identity_listen_key),
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_listen_key),
 	T_CASE(test_conf_parsefile_rejects_oversized_identity_mux_connect),
+	T_CASE(test_conf_parsefile_identity_listen_valid_map_control),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_non_object),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_malformed_json),
 	T_CASE(test_conf_parsefile_identity_listen_rejects_bracket_mismatch),
@@ -2632,6 +3090,9 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_psk_rejects_identity_verify),
 	T_CASE(test_conf_psk_rejects_duplicate_identity),
 	T_CASE(test_conf_psk_rejects_bad_key),
+#ifdef CONF_TEST_WRAP_ALLOC
+	T_CASE(test_conf_rejection_cleanup_on_failed_expectation),
+#endif
 	T_CASE(test_conf_psk_accepts_key_length_bounds),
 	T_CASE(test_conf_psk_trim_erases_vacated_tail),
 	T_CASE(test_conf_psk_at_path_trims_trailing_newline),
@@ -2662,6 +3123,13 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_conf_no_tls_rejects_credentials),
 #endif /* !WITH_TLS */
 	T_CASE(test_conf_dump_identity_listen_roundtrip),
+#ifdef CONF_TEST_WRAP_ALLOC
+	T_CASE(test_conf_dump_alloc_failure_cleanup),
+#if WITH_TLS
+	T_CASE(test_conf_dump_failure_erases_output_capacity),
+	T_CASE(test_conf_dump_psk_alloc_failure_cleanup),
+#endif
+#endif /* CONF_TEST_WRAP_ALLOC */
 	T_CASE(test_conf_dump_identity_listen_exact_grow_boundary),
 	T_CASE(test_conf_parsefile_accepts_maxsize),
 	T_CASE(test_conf_parsefile_rejects_oversized_file),

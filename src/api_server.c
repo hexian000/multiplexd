@@ -33,6 +33,7 @@
 #include <ev.h>
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <locale.h>
@@ -114,12 +115,19 @@ static void api_ctx_free(struct ev_loop *loop, struct api_ctx *restrict ctx)
 		socket_close(ctx->fd);
 	}
 	VBUF_FREE(ctx->cbuf);
+#if WITH_TLS
+	tls_secure_erase(ctx->rbuf.data, ctx->rbuf.len);
+#endif
 	free(ctx);
 }
 
 /* Resets the context to receive the next request on a kept-alive connection. */
 static void api_ctx_reset(struct ev_loop *loop, struct api_ctx *restrict ctx)
 {
+	/* Even incomplete or rejected requests can contain inline credentials. */
+#if WITH_TLS
+	tls_secure_erase(ctx->rbuf.data, ctx->rbuf.len);
+#endif
 	BUF_RESET(ctx->rbuf);
 	ctx->rbuf.data[0] = '\0';
 	ctx->next = (char *)ctx->rbuf.data;
@@ -825,7 +833,7 @@ static struct vbuffer *append_dgram_metrics(
 struct tunnel_labels {
 	/* label sets packed back to back, each NUL-terminated */
 	struct vbuffer *buf;
-	/* per-tunnel offset into buf, or NO_LABEL; NULL when num_tunnels == 0 */
+	/* per-tunnel offset into buf, or NO_LABEL; NULL when no tunnel is labeled */
 	size_t *offset;
 };
 
@@ -844,7 +852,14 @@ static bool tunnel_labels_build(
 {
 	labels->buf = NULL;
 	labels->offset = NULL;
-	if (stats->num_tunnels == 0) {
+	bool has_labels = false;
+	for (size_t i = 0; i < stats->num_tunnels; i++) {
+		if (stats->tunnels[i].peer_identity != NULL) {
+			has_labels = true;
+			break;
+		}
+	}
+	if (!has_labels) {
 		return true;
 	}
 	size_t *const restrict offset =
@@ -1107,6 +1122,9 @@ static struct vbuffer *append_tunnel_metrics(
 	const struct server_stats *restrict stats,
 	const struct tunnel_labels *restrict labels)
 {
+	if (labels->offset == NULL) {
+		return cbuf;
+	}
 	cbuf = append_session_link_metrics(cbuf, stats, labels);
 	cbuf = append_session_stream_metrics(cbuf, stats, labels);
 	cbuf = append_session_latency_metrics(cbuf, stats, labels);
@@ -1184,19 +1202,26 @@ static void handle_metrics(struct api_ctx *restrict ctx)
 /* Handles GET /config — serializes the active configuration as JSON. */
 static void handle_config_get(struct api_ctx *restrict ctx)
 {
-	size_t len;
-	char *const restrict json = conf_dump(ctx->s->conf, &len, NULL);
-	if (json == NULL) {
-		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
-		return;
-	}
 	VBUF_RESET(ctx->cbuf);
-	VBUF_APPEND(ctx->cbuf, (const unsigned char *)json, len);
-	free(json);
-	if (VBUF_HAS_OOM(ctx->cbuf)) {
+	int len = conf_dump_into(
+		ctx->s->conf, (char *)ctx->cbuf->data, ctx->cbuf->cap, NULL);
+	if (len > 0 && (size_t)len >= ctx->cbuf->cap) {
+		VBUF_RESERVE(ctx->cbuf, (size_t)len);
+		if ((size_t)len >= ctx->cbuf->cap) {
+			LOGOOM();
+			respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
+			return;
+		}
+		len = conf_dump_into(
+			ctx->s->conf, (char *)ctx->cbuf->data, ctx->cbuf->cap,
+			NULL);
+	}
+	if (len < 0) {
 		respond_status(ctx, HTTP_INTERNAL_SERVER_ERROR);
 		return;
 	}
+	assert((size_t)len < ctx->cbuf->cap);
+	ctx->cbuf->len = (size_t)len;
 	respond_ok(ctx, "application/json; charset=utf-8", ctx->cbuf->len);
 }
 
