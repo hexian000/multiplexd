@@ -1,13 +1,19 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* main_test.c - white-box tests for parse_args/print_usage in main.c;
- * main() renamed to avoid conflict; the daemon body is compiled but never
- * run; tests inspect only the static args state. */
+/* main_test.c - white-box CLI tests and deterministic startup/reload tests;
+ * main() is renamed so the test runner owns the executable entry point. */
+
+#include "conf.h"
+#include "server.h"
 
 #include "utils/slog.h"
 #include "utils/testing.h"
 
+#include <ev.h>
+
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -15,16 +21,135 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* Rename the daemon entry point so the test owns main().  main.c's body is
- * never executed here -- it is compiled only so parse_args/print_usage and the
- * static `args` state become reachable in this TU. */
+#if WITH_TLS
+#define DUMP_KEY_MARKER                                                        \
+	"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+static struct dump_output_probe {
+	bool armed;
+	bool fail_write;
+	char *ptr;
+	size_t len;
+	bool contained_key;
+	bool released;
+	bool zeroed;
+} dump_output_probe;
+
+static char *
+probe_conf_dump(const struct config *conf, size_t *len, const char *indent);
+static void probe_dump_free(void *ptr);
+static size_t
+probe_dump_fwrite(const void *ptr, size_t size, size_t count, FILE *stream);
+#define conf_dump probe_conf_dump
+#define free probe_dump_free
+#define fwrite probe_dump_fwrite
+#endif /* WITH_TLS */
+
+/* Intercept the main TU's startup boundary while keeping the real server
+ * implementation linked. The reload probe changes cwd where daemonize would,
+ * replaces a symlink after startup, and invokes the real SIGHUP watcher. */
+static bool start_reload_probe(struct server *server);
+#define server_start start_reload_probe
 #define main mux_daemon_main
 #include "main.c"
 #undef main
+#undef server_start
+#if WITH_TLS
+#undef conf_dump
+#undef free
+#undef fwrite
+
+static char *
+probe_conf_dump(const struct config *conf, size_t *len, const char *indent)
+{
+	char *const out = conf_dump(conf, len, indent);
+	if (dump_output_probe.armed && out != NULL) {
+		dump_output_probe.ptr = out;
+		dump_output_probe.len = *len;
+		dump_output_probe.contained_key =
+			strstr(out, DUMP_KEY_MARKER) != NULL;
+	}
+	return out;
+}
+
+static void probe_dump_free(void *ptr)
+{
+	if (ptr != NULL && ptr == dump_output_probe.ptr) {
+		const unsigned char *const bytes = ptr;
+		dump_output_probe.zeroed = true;
+		for (size_t i = 0; i < dump_output_probe.len; i++) {
+			if (bytes[i] != 0) {
+				dump_output_probe.zeroed = false;
+				break;
+			}
+		}
+		dump_output_probe.released = true;
+		dump_output_probe.ptr = NULL;
+	}
+	free(ptr);
+}
+
+static size_t
+probe_dump_fwrite(const void *ptr, size_t size, size_t count, FILE *stream)
+{
+	if (dump_output_probe.armed && dump_output_probe.fail_write) {
+		errno = EIO;
+		return 0;
+	}
+	return fwrite(ptr, size, count, stream);
+}
+#endif /* WITH_TLS */
+
+struct reload_probe {
+	const char *active;
+	const char *replacement;
+	const char *other;
+	const char *expected_path;
+	struct ev_loop *loop;
+	ev_timer stop;
+	bool started;
+	bool cwd_changed;
+	bool replaced;
+	bool path_preserved;
+	size_t max_sessions;
+};
+static struct reload_probe reload_probe;
+
+static void stop_reload_probe(struct ev_loop *loop, ev_timer *w, int revents)
+{
+	(void)w;
+	(void)revents;
+	ev_break(loop, EVBREAK_ALL);
+}
+
+static bool start_reload_probe(struct server *server)
+{
+	if (reload_probe.active == NULL) {
+		return server_start(server);
+	}
+	reload_probe.loop = server->loop;
+	reload_probe.cwd_changed = chdir(reload_probe.other) == 0;
+	reload_probe.started = server_start(server);
+	if (!reload_probe.started) {
+		return false;
+	}
+	reload_probe.path_preserved =
+		strcmp(server->conf_path, reload_probe.expected_path) == 0;
+	reload_probe.replaced =
+		rename(reload_probe.replacement, reload_probe.active) == 0;
+	if (reload_probe.replaced) {
+		ev_invoke(server->loop, &server->w_sighup, EV_SIGNAL);
+		reload_probe.max_sessions = server->conf->max_sessions;
+	}
+	ev_timer_init(&reload_probe.stop, stop_reload_probe, 0., 0.);
+	ev_timer_start(server->loop, &reload_probe.stop);
+	return true;
+}
 
 /* mock - argv builder and args reset helper */
 
@@ -431,7 +556,219 @@ T_DECLARE_CASE(test_write_dump_accepts_a_complete_write)
 	T_EXPECT(written);
 }
 
+#if WITH_TLS
+struct dump_output_fixture {
+	int fd;
+	int saved_stdout;
+	char path[sizeof(MAIN_TEST_TMPDIR) + sizeof("/main_dump_XXXXXX")];
+};
+
+static void restore_dump_stdout(struct dump_output_fixture *fx)
+{
+	dump_output_probe.armed = false;
+	if (fx->saved_stdout >= 0) {
+		(void)fflush(stdout);
+		T_CHECK(dup2(fx->saved_stdout, STDOUT_FILENO) >= 0);
+		(void)close(fx->saved_stdout);
+		fx->saved_stdout = -1;
+		clearerr(stdout);
+	}
+}
+
+static void cleanup_dump_output(void *data)
+{
+	struct dump_output_fixture *const fx = data;
+	restore_dump_stdout(fx);
+	if (fx->fd >= 0) {
+		(void)close(fx->fd);
+		(void)unlink(fx->path);
+	}
+	dump_output_probe = (struct dump_output_probe){ 0 };
+	free(fx);
+}
+
+T_DECLARE_SUBCASE(check_dump_output_erased, const bool fail_write)
+{
+	struct dump_output_fixture *const fx = calloc(1, sizeof(*fx));
+	T_CHECK(fx != NULL);
+	fx->fd = fx->saved_stdout = -1;
+	T_CLEANUP(cleanup_dump_output, fx);
+	(void)snprintf(
+		fx->path, sizeof(fx->path), "%s/main_dump_XXXXXX",
+		MAIN_TEST_TMPDIR);
+	fx->fd = mkstemp(fx->path);
+	T_CHECK(fx->fd >= 0);
+	static const char json[] =
+		"{\"mux_listen\":\"127.0.0.1:0\",\"identity\":{\"claim\":\"node\"},"
+		"\"tls\":{\"psk\":{\"peer\":\"" DUMP_KEY_MARKER "\"}}}";
+	T_CHECK(write(fx->fd, json, sizeof(json) - 1) ==
+		(ssize_t)(sizeof(json) - 1));
+	T_CHECK(fflush(stdout) == 0);
+	fx->saved_stdout = dup(STDOUT_FILENO);
+	T_CHECK(fx->saved_stdout >= 0);
+	T_CHECK(dup2(fx->fd, STDOUT_FILENO) >= 0);
+	dump_output_probe.armed = true;
+	dump_output_probe.fail_write = fail_write;
+	reset_args();
+	char *argv[] = { "multiplexd", "--dump-config", "-c", fx->path, NULL };
+	const int result = mux_daemon_main(4, argv);
+	restore_dump_stdout(fx);
+	T_EXPECT_EQ(result, fail_write ? EXIT_FAILURE : EXIT_SUCCESS);
+	T_EXPECT(dump_output_probe.contained_key);
+	T_EXPECT(dump_output_probe.released);
+	T_EXPECT(dump_output_probe.zeroed);
+}
+
+T_DECLARE_CASE(test_dump_config_erases_successful_output)
+{
+	T_CALL_SUBCASE(check_dump_output_erased, false);
+}
+
+T_DECLARE_CASE(test_dump_config_erases_output_after_write_failure)
+{
+	T_CALL_SUBCASE(check_dump_output_erased, true);
+}
+#endif /* WITH_TLS */
+
+struct reload_fixture {
+	int cwd_fd;
+	char dir[sizeof(MAIN_TEST_TMPDIR) + sizeof("/main_reload_XXXXXX")];
+};
+
+static void cleanup_reload_fixture(void *data)
+{
+	struct reload_fixture *const fx = data;
+	if (fx->cwd_fd >= 0) {
+		T_CHECK(fchdir(fx->cwd_fd) == 0);
+		(void)close(fx->cwd_fd);
+	}
+	if (reload_probe.loop != NULL) {
+		ev_loop_destroy(reload_probe.loop);
+	}
+	reload_probe = (struct reload_probe){ 0 };
+	if (fx->dir[0] == '\0') {
+		free(fx);
+		return;
+	}
+	const char *const files[] = {
+		"active",  "replacement",    "v1.json",
+		"v2.json", "v1/config.json", "v2/config.json",
+	};
+	char path[PATH_MAX];
+	for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+		(void)snprintf(path, sizeof(path), "%s/%s", fx->dir, files[i]);
+		(void)unlink(path);
+	}
+	const char *const dirs[] = { "v1", "v2", "other" };
+	for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		(void)snprintf(path, sizeof(path), "%s/%s", fx->dir, dirs[i]);
+		(void)rmdir(path);
+	}
+	(void)rmdir(fx->dir);
+	free(fx);
+}
+
+static bool write_reload_config(const char *path, const size_t max_sessions)
+{
+	FILE *const file = fopen(path, "w");
+	if (file == NULL) {
+		return false;
+	}
+	const bool written =
+		fprintf(file,
+			"{\"mux_listen\":\"127.0.0.1:0\",\"log\":\"discard\","
+			"\"max_sessions\":%zu}",
+			max_sessions) > 0;
+	return fclose(file) == 0 && written;
+}
+
+T_DECLARE_SUBCASE(
+	check_config_symlink_reload, const bool absolute, const bool parent)
+{
+	struct reload_fixture *const fx = calloc(1, sizeof(*fx));
+	T_CHECK(fx != NULL);
+	fx->cwd_fd = -1;
+	T_CLEANUP(cleanup_reload_fixture, fx);
+	fx->cwd_fd = open(".", O_RDONLY);
+	T_CHECK(fx->cwd_fd >= 0);
+	(void)snprintf(
+		fx->dir, sizeof(fx->dir), "%s/main_reload_XXXXXX",
+		MAIN_TEST_TMPDIR);
+	T_CHECK(mkdtemp(fx->dir) != NULL);
+	char active[PATH_MAX];
+	char replacement[PATH_MAX];
+	char other[PATH_MAX];
+	char expected_path[PATH_MAX];
+	(void)snprintf(active, sizeof(active), "%s/active", fx->dir);
+	(void)snprintf(
+		replacement, sizeof(replacement), "%s/replacement", fx->dir);
+	(void)snprintf(other, sizeof(other), "%s/other", fx->dir);
+	T_CHECK(mkdir(other, 0700) == 0);
+	for (unsigned int version = 1; version <= 2; version++) {
+		char path[PATH_MAX];
+		if (parent) {
+			(void)snprintf(
+				path, sizeof(path), "%s/v%u", fx->dir, version);
+			T_CHECK(mkdir(path, 0700) == 0);
+		}
+		(void)snprintf(
+			path, sizeof(path), "%s/v%u%s", fx->dir, version,
+			parent ? "/config.json" : ".json");
+		T_CHECK(write_reload_config(path, version == 1 ? 7 : 11));
+	}
+	T_CHECK(symlink(parent ? "v1" : "v1.json", active) == 0);
+	T_CHECK(symlink(parent ? "v2" : "v2.json", replacement) == 0);
+	T_CHECK(chdir(fx->dir) == 0);
+	/* CMake's directory can retain a build-path alias; relative config paths
+	 * are prefixed with the physical working directory at startup. */
+	char cwd[PATH_MAX];
+	T_CHECK(getcwd(cwd, sizeof(cwd)) != NULL);
+	const int path_len = snprintf(
+		expected_path, sizeof(expected_path), "%s/active%s",
+		absolute ? fx->dir : cwd, parent ? "/config.json" : "");
+	T_CHECK(path_len > 0 && (size_t)path_len < sizeof(expected_path));
+	reload_probe = (struct reload_probe){
+		.active = active,
+		.replacement = replacement,
+		.other = other,
+		.expected_path = expected_path,
+	};
+	reset_args();
+	char relative_file[] = "active";
+	char relative_parent[] = "active/config.json";
+	char *argv[] = { "multiplexd", "-c",
+			 absolute ? expected_path :
+			 parent	  ? relative_parent :
+				    relative_file,
+			 NULL };
+	const int result = mux_daemon_main(3, argv);
+	T_EXPECT_EQ(result, EXIT_SUCCESS);
+	T_EXPECT(reload_probe.started);
+	T_EXPECT(reload_probe.cwd_changed);
+	T_EXPECT(reload_probe.replaced);
+	T_EXPECT_EQ(reload_probe.max_sessions, (size_t)11);
+	T_EXPECT(reload_probe.path_preserved);
+}
+
+T_DECLARE_CASE(test_config_reload_replaced_relative_symlink)
+{
+	T_CALL_SUBCASE(check_config_symlink_reload, false, false);
+}
+
+T_DECLARE_CASE(test_config_reload_replaced_absolute_symlink)
+{
+	T_CALL_SUBCASE(check_config_symlink_reload, true, false);
+}
+
+T_DECLARE_CASE(test_config_reload_replaced_parent_symlink)
+{
+	T_CALL_SUBCASE(check_config_symlink_reload, false, true);
+}
+
 static const struct testing_suite suite[] = {
+	T_CASE(test_config_reload_replaced_relative_symlink),
+	T_CASE(test_config_reload_replaced_absolute_symlink),
+	T_CASE(test_config_reload_replaced_parent_symlink),
 	T_CASE(test_parse_args_config_short_and_long),
 	T_CASE(test_parse_args_loglevel_parses_number),
 	T_CASE(test_parse_args_loglevel_accepts_documented_bounds),
@@ -456,6 +793,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_parse_args_rejects_gencerts_options_without_gencerts),
 #endif
 #if WITH_TLS
+	T_CASE(test_dump_config_erases_successful_output),
+	T_CASE(test_dump_config_erases_output_after_write_failure),
 	T_CASE(test_parse_args_genpsk),
 	T_CASE(test_parse_args_rejects_combined_oneshot_options),
 #endif

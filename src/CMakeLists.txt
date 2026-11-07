@@ -380,8 +380,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 # White-box: compiles main.c into the TU (its main() renamed away) to reach the
-# static CLI parser; the daemon body's collaborators are linked real so it
-# resolves, but only parse_args/print_usage are exercised.
+# static CLI parser and startup/reload boundary; the daemon collaborators
+# are linked real.
 add_src_test(main_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
     conf_presence.gen.c conf_presence.gen.h
@@ -395,3 +395,5 @@ add_src_test(main_test
     main_test.c
 )
 target_link_libraries(main_test PRIVATE mux)
+target_compile_definitions(main_test PRIVATE
+    MAIN_TEST_TMPDIR="${CMAKE_BINARY_DIR}/tmp")

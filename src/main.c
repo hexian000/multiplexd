@@ -478,6 +478,25 @@ write_dump(FILE *restrict f, const char *restrict json, const size_t len)
 	       fflush(f) == 0;
 }
 
+/* Prefix a relative pathname without resolving any of its symlink components. */
+static char *absolute_conf_path(
+	const char *restrict path, char *restrict out, const size_t size)
+{
+	char *const cwd = getcwd(out, size);
+	if (cwd == NULL) {
+		return NULL;
+	}
+	const size_t cwd_len = strcmp(cwd, "/") == 0 ? 0 : strlen(cwd);
+	const size_t path_len = strlen(path);
+	if (size - cwd_len < 2 || path_len > size - cwd_len - 2) {
+		errno = ENAMETOOLONG;
+		return NULL;
+	}
+	cwd[cwd_len] = '/';
+	memcpy(cwd + cwd_len + 1, path, path_len + 1);
+	return cwd;
+}
+
 int main(int argc, char **argv)
 {
 	init();
@@ -568,6 +587,9 @@ int main(int argc, char **argv)
 		/* Snapshot before the frees below: both may clobber errno, and the
 		 * diagnostic must report the failing write's. */
 		const int err = errno;
+#if WITH_TLS
+		tls_secure_erase(dump_json, dump_len);
+#endif
 		free(dump_json);
 		conf_free(conf);
 		if (!written) {
@@ -629,17 +651,19 @@ int main(int argc, char **argv)
 	/* Carry an explicit --loglevel into the server so SIGHUP reloads honor it
 	 * too (server_apply_config), instead of reverting to the config's level. */
 	server->loglevel_override = args.loglevel;
-	/* Resolve to an absolute path before the possible daemonize() chdir("/")
-	 * below, so a later reload can still find a relative -c path; fall
-	 * back to the original string if realpath() fails. */
+	/* Retain symlinks in the configured pathname so replacing one changes the
+	 * next reload. Only relative paths need a prefix before daemonize's chdir. */
 	static char conf_path_abs[PATH_MAX];
 	server->conf_path = args.conf_path;
-	if (args.conf_path != NULL && strcmp(args.conf_path, "-") != 0) {
-		if (realpath(args.conf_path, conf_path_abs) != NULL) {
+	if (args.conf_path != NULL && args.conf_path[0] != '/' &&
+	    strcmp(args.conf_path, "-") != 0) {
+		if (absolute_conf_path(
+			    args.conf_path, conf_path_abs,
+			    sizeof(conf_path_abs)) != NULL) {
 			server->conf_path = conf_path_abs;
 		} else {
 			const int err = errno;
-			LOGW_F("realpath(\"%s\"): (%d) %s; a later SIGHUP reload"
+			LOGW_F("absolute config path for \"%s\": (%d) %s; a later SIGHUP reload"
 			       " after daemonize()'s chdir(\"/\") may look in the"
 			       " wrong directory",
 			       args.conf_path, err, strerror(err));
