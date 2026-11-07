@@ -24,6 +24,7 @@
 struct sockaddr;
 struct tunnel;
 struct udp_dgram;
+struct udp_dgram_view;
 
 /* Server-level counter pointers for the mux session counters block.  Session
  * lifecycle only: every other counter in the block is per-tunnel and the tunnel
@@ -120,11 +121,13 @@ struct tunnel_opts {
 	 * that owns it, or NULL when the label is unknown.  NULL in certificate
 	 * mode.  Set instead of verify_identity, never alongside it: a PSK binder
 	 * proves possession of the key its label names, so the binding is
-	 * intrinsic rather than opt-in.  Borrowed rather than held, tunnel_new()
-	 * having adopted it before it returns: the owner must keep psk_ctx alive
-	 * until tunnel_psk_ctx() stops reporting it, or the tunnel is closed. */
+	 * intrinsic rather than opt-in. psk_ctx carries one owning reference,
+	 * adopted on success and left to the caller on tunnel_new() failure. The
+	 * tunnel releases it on replacement or destruction via psk_ctx_release;
+	 * NULL is allowed when the resolver needs no ownership callback. */
 	const char *(*psk_identity_of)(void *ctx, const char *label);
 	void *psk_ctx;
+	void (*psk_ctx_release)(void *ctx);
 #if WITH_TLS
 	/* Adopted on success and freed by tunnel_close(); left to the caller
 	 * only when tunnel_new() fails, since it may be a shared, ref-counted
@@ -328,6 +331,13 @@ void tunnel_open_stream(struct tunnel *t, int fd);
 void tunnel_send_dgram(
 	struct tunnel *t, struct udp_dgram *d, size_t queue_limit);
 
+#if !WITH_THREADS
+/* Relay a local UDP datagram synchronously on the shared server/tunnel loop.
+ * The view and its socket/address/payload remain borrowed for this call. */
+void tunnel_send_dgram_borrowed(
+	struct tunnel *t, const struct udp_dgram_view *d);
+#endif
+
 /* Options for a single-pass reload dispatch, applied atomically in the tunnel
  * thread: address updates precede the drain config. */
 struct tunnel_reload_opts {
@@ -366,14 +376,9 @@ struct tunnel_reload_opts {
 	 * effect on the session's next handshake (resume or reconnect) rather
 	 * than mid-session. */
 	bool verify_identity;
-	/* New PSK resolver.  Must be refreshed together with the config.  The
-	 * tunnel only adopts it once the dispatched reload runs, so the caller
-	 * keeps the table it replaces alive until tunnel_psk_ctx() stops
-	 * reporting it -- a dropped dispatch leaves the tunnel on the old one
-	 * indefinitely.  psk_ctx carries one hold of the caller's, transferred
-	 * with the dispatch and given back through psk_ctx_release (NULL when the
-	 * context needs no hold) once the dispatch runs or is dropped: between the
-	 * two the resolver is named by nothing the owner can see. */
+	/* New PSK resolver with one owning reference. The dispatch transfers it
+	 * into the tunnel when applied, releasing the previous resolver; a failed
+	 * dispatch releases it instead. NULL callback needs no release. */
 	const char *(*psk_identity_of)(void *ctx, const char *label);
 	void *psk_ctx;
 	void (*psk_ctx_release)(void *ctx);
@@ -397,10 +402,13 @@ bool tunnel_set_psk(
 	struct tunnel *t, const char *(*psk_identity_of)(void *, const char *),
 	void *psk_ctx, void (*psk_ctx_release)(void *ctx));
 
-/* The PSK resolver context the tunnel is currently using, readable from any
- * thread.  An owner of the tables compares it against the current one to tell
- * whether a dispatched reload has been adopted yet; the value it returns must
- * be kept alive until the tunnel reports a different one or is closed. */
+/* The adopted resolver's identity, readable from any thread for update
+ * progress checks. This observation does not acquire a reference and must not
+ * be dereferenced; each tunnel keeps its own resolver alive. */
 const void *tunnel_psk_ctx(const struct tunnel *t);
+
+/* True once every queued resolver update has run and the adopted resolver
+ * matches ctx. Intended for the owner thread that dispatches updates. */
+bool tunnel_psk_is_current(const struct tunnel *t, const void *ctx);
 
 #endif /* TUNNEL_H */

@@ -180,18 +180,30 @@ static const struct table_opts SESSION_TABLE_OPTS = {
 	.flags = 0,
 };
 
-/* Iterate over all tunnel objects owned by a server.  Zero-initialize before
- * the first call; returns NULL when done. */
-struct tunnel_iter {
-	/* 0 = mux_tunnel, 1 = identities, 2 = identity_tunnels, 3 = accepted */
-	size_t phase;
-	/* opaque cursor for table_next (identities in phase 1, accepted in phase 3) */
-	size_t sub;
-	/* index within cur_sl->tunnels[] (phase 1) or identity_tunnels[] (phase 2) */
-	size_t sub2;
-	/* identity listener being drained (phase 1); NULL = fetch next via table_next */
-	struct identity_listener *cur_sl;
-};
+static bool server_register_tunnel(struct server *s, struct tunnel *t)
+{
+	struct server_tunnel *const owned = malloc(sizeof(*owned));
+	if (owned == NULL) {
+		LOGOOM();
+		return false;
+	}
+	*owned = (struct server_tunnel){ .t = t };
+	void *elem = owned;
+	s->live_tunnels = table_set(s->live_tunnels, t, &elem);
+	if (elem != NULL) {
+		LOGOOM();
+		free(owned);
+		return false;
+	}
+	return true;
+}
+
+static void server_unregister_tunnel(struct server *s, struct tunnel *t)
+{
+	void *elem = NULL;
+	s->live_tunnels = table_del(s->live_tunnels, t, &elem);
+	free(elem);
+}
 
 /* True if t is already in sl's pool. Callers must check this before
  * identity_listener_add: on_established may fire more than once for the
@@ -272,6 +284,13 @@ static void identity_pools_remove_except(
 		}
 		(void)identity_listener_remove(elem, t);
 	}
+	void *owned = NULL;
+	if (table_find(srv->live_tunnels, t, &owned)) {
+		struct server_tunnel *const entry = owned;
+		if (entry->pool != keep) {
+			entry->pool = NULL;
+		}
+	}
 }
 
 /* Drop every lossymux route to t, a tunnel about to be freed. */
@@ -335,8 +354,8 @@ identity_listener_pick(struct identity_listener *restrict sl)
 static void server_close_and_fold(struct server *srv, struct tunnel *restrict t)
 {
 	/* Before the close: its dispatcher flush can reenter a sweep that must
-	 * already see t as gone. A no-op outside a sweep (sweep_live NULL). */
-	srv->sweep_live = table_del(srv->sweep_live, t, NULL);
+	 * already see t as gone in the authoritative registry. */
+	server_unregister_tunnel(srv, t);
 	server_udp_forget(srv, t);
 	struct tunnel_final_counters fin;
 	tunnel_close_final(t, &fin);
@@ -397,119 +416,12 @@ server_accepted_set(struct server *restrict s, struct tunnel *restrict t)
 	return elem;
 }
 
-static struct tunnel *tunnel_iter_next(
-	const struct server *restrict s, struct tunnel_iter *restrict it)
-{
-	if (it->phase == 0) {
-		it->phase = 1;
-		if (s->mux_tunnel != NULL) {
-			return s->mux_tunnel;
-		}
-	}
-	if (it->phase == 1) {
-		for (;;) {
-			if (it->cur_sl != NULL) {
-				if (it->sub2 < it->cur_sl->num_tunnels) {
-					return it->cur_sl->tunnels[it->sub2++];
-				}
-				it->cur_sl = NULL;
-				it->sub2 = 0;
-			}
-			void *elem = NULL;
-			if (!table_next(s->identities, &it->sub, NULL, &elem)) {
-				break;
-			}
-			it->cur_sl = elem;
-		}
-		it->phase = 2;
-		/* it->sub2 == 0 after the loop above */
-	}
-	if (it->phase == 2) {
-		while (it->sub2 < s->num_identity_tunnels) {
-			struct tunnel *t = s->identity_tunnels[it->sub2++];
-			if (t != NULL) {
-				return t;
-			}
-		}
-		it->phase = 3;
-		it->sub = 0;
-	}
-	/* phase 3: accepted_tunnels */
-	void *elem = NULL;
-	if (table_next(s->accepted_tunnels, &it->sub, NULL, &elem)) {
-		return elem;
-	}
-	return NULL;
-}
-
-/* True if @p t is still registered in any of the server's tunnel tables.
- * Compares pointers only and never dereferences t: the caller uses this exactly
- * when t may already have been freed by a reentrant handle_closed. O(n) in the
- * live tunnel count, so a sweep uses it only when its sweep_live set could not
- * be allocated. */
+/* Compare only the pointer: a previous close may have flushed a queued
+ * callback that already destroyed a later snapshot entry. */
 static bool server_tunnel_is_registered(
 	const struct server *restrict srv, const struct tunnel *restrict t)
 {
-	struct tunnel_iter it = { 0 };
-	for (const struct tunnel *cur = tunnel_iter_next(srv, &it); cur != NULL;
-	     cur = tunnel_iter_next(srv, &it)) {
-		if (cur == t) {
-			return true;
-		}
-	}
-	return false;
-}
-
-/* Start a force-close sweep over the n distinct tunnels in ts[]: publish them
- * as srv->sweep_live, from which server_close_and_fold() deletes each tunnel it
- * frees. On OOM sweep_live stays NULL and server_sweep_is_live() falls back to
- * the registry walk. */
-static void server_sweep_begin(
-	struct server *restrict srv, struct tunnel *const *restrict ts,
-	const size_t n)
-{
-	ASSERT(srv->sweep_live == NULL);
-	if (n == 0) {
-		return;
-	}
-	struct hashtable *set = table_new(&TABLE_OPTS_PTR);
-	if (set == NULL) {
-		LOGOOM();
-		return;
-	}
-	set = table_reserve(set, n);
-	for (size_t i = 0; i < n; i++) {
-		/* ts[] is distinct, so a non-NULL elem back is an OOM. */
-		void *elem = ts[i];
-		set = table_set(set, ts[i], &elem);
-		if (elem != NULL) {
-			LOGOOM();
-			table_free(set);
-			return;
-		}
-	}
-	srv->sweep_live = set;
-}
-
-/* End the sweep server_sweep_begin() started. */
-static void server_sweep_end(struct server *restrict srv)
-{
-	table_free(srv->sweep_live);
-	srv->sweep_live = NULL;
-}
-
-/* True if the running sweep has not seen @p t freed. Compares pointers only and
- * never dereferences t, which may already be freed. Without a sweep_live set
- * (OOM) it asks server_tunnel_is_registered() instead -- the same answer at O(n)
- * per call: every live sweep entry is also registered in some table, and
- * handle_closed unregisters a tunnel from all of them before freeing it. */
-static bool server_sweep_is_live(
-	const struct server *restrict srv, const struct tunnel *restrict t)
-{
-	if (srv->sweep_live != NULL) {
-		return table_find(srv->sweep_live, t, NULL);
-	}
-	return server_tunnel_is_registered(srv, t);
+	return table_find(srv->live_tunnels, t, NULL);
 }
 
 /* Stop sl's listener and close every tunnel in its pool, then free it.
@@ -517,7 +429,7 @@ static bool server_sweep_is_live(
  * a peer the new config removed, whose pooled sessions are closed at once
  * rather than drained, and a listener created for a reload that is then
  * rejected (its pool is still empty). Once s->identities no longer holds sl,
- * it is unreachable via tunnel_iter/handle_closed pool removal, so its
+ * it is unreachable via handle_closed pool removal, so its
  * listener and tunnels must be torn down explicitly here instead of
  * leaking as a "ghost" that keeps serving into a pool nothing can find
  * anymore. A pooled tunnel can also be live in srv->accepted_tunnels or be
@@ -534,7 +446,6 @@ static void identity_listener_discard(
 	sl->udp = NULL;
 	/* A pool holds each tunnel once (identity_listener_add is guarded by
 	 * identity_listener_contains), so tunnels[] is a valid sweep set. */
-	server_sweep_begin(srv, sl->tunnels, sl->num_tunnels);
 	for (size_t j = 0; j < sl->num_tunnels; j++) {
 		struct tunnel *const t = sl->tunnels[j];
 		/* Closing an earlier member flushes the shared dispatcher
@@ -544,8 +455,8 @@ static void identity_listener_discard(
 		 * sl is already out of srv->identities, so
 		 * identity_pools_remove_except never reaches it -- leaving a
 		 * dangling entry here. Re-validate by pointer before touching t:
-		 * the fold that freed it also dropped it from sweep_live. */
-		if (!server_sweep_is_live(srv, t)) {
+		 * the fold that freed it also dropped it from the owner registry. */
+		if (!server_tunnel_is_registered(srv, t)) {
 			continue;
 		}
 		if (tunnel_is_accepted(t)) {
@@ -561,81 +472,28 @@ static void identity_listener_discard(
 		}
 		server_close_and_fold(srv, t);
 	}
-	server_sweep_end(srv);
 	free((void *)sl->tunnels);
 	free(sl);
 }
 
-/* Upper bound on the distinct tunnels server_snapshot_tunnels() can yield, for
- * sizing its output buffer: the one dialed mux_tunnel (the +1), every
- * identity_listener's whole tunnels[] pool (round-robin, more than one tunnel
- * per peer -- so the sum of num_tunnels, not table_size(identities)), every
- * identity_tunnels[] slot, and every accepted session. Counting every phase
- * at its full size (the +1 and each slot even when NULL) makes this at least
- * the raw yield count of tunnel_iter_next(), duplicates included, so every
- * snapshot call site must size its buffer from this one function, never from
- * a copy of the sum. The count is a size_t sized from the live tables; the
- * live tunnel count is unbounded in principle (max_sessions defaults to
- * unlimited and accepts values above any fixed cap), so this imposes no
- * arbitrary ceiling of its own. */
 static size_t server_snapshot_cap(const struct server *restrict s)
 {
-	size_t identity_pool_tunnels = 0;
-	size_t cursor = 0;
-	void *elem;
-	while (table_next(s->identities, &cursor, NULL, &elem)) {
-		const struct identity_listener *const restrict sl = elem;
-		identity_pool_tunnels += sl->num_tunnels;
-	}
-	return (s->accepted_tunnels != NULL ? table_size(s->accepted_tunnels) :
-					      0) +
-	       1 + identity_pool_tunnels + s->num_identity_tunnels;
+	return table_size(s->live_tunnels);
 }
 
-/* Total order on tunnel pointers for the snapshot dedup. Compares the
- * converted uintptr_t values -- relational operators on pointers into distinct
- * objects are not well defined, but the integer conversions are. */
-static int cmp_tunnel_ptr(const void *a, const void *b)
-{
-	const uintptr_t va = (uintptr_t)*(struct tunnel *const *)a;
-	const uintptr_t vb = (uintptr_t)*(struct tunnel *const *)b;
-	return (va > vb) - (va < vb);
-}
-
-/* Snapshot every distinct tunnel (accepted + identity-pooled), deduped since
- * tunnel_iter yields a pooled tunnel a second time via its identity_tunnels
- * slot or accepted_tunnels. cap must be at least the caller's precomputed upper
- * bound -- which is at least the raw yield count (it sums every phase's full
- * size), so the with-duplicates sequence collected below always fits.
- *
- * Collect the raw sequence, then sort-and-dedup by pointer: O(n log n) on the
- * server loop, and robust to any yield multiplicity without depending on which
- * phases can overlap. */
-static size_t server_snapshot_tunnels(
-	struct server *restrict s, struct tunnel **restrict out,
-	const size_t cap)
+/* Snapshot the authoritative registry before callbacks can remove entries. */
+static size_t
+server_snapshot_tunnels(struct server *restrict s, struct tunnel **restrict out)
 {
 	size_t count = 0;
-	struct tunnel_iter it = { 0 };
-	struct tunnel *t;
-	while ((t = tunnel_iter_next(s, &it)) != NULL) {
-		ASSERT(count < cap);
-		if (count >= cap) {
-			/* Cannot happen: cap is derived from the same live tables
-			 * just before the snapshot. Guard anyway against a future
-			 * sizing mistake becoming a buffer overflow. */
-			break;
-		}
-		out[count++] = t;
+	size_t cursor = 0;
+	void *elem;
+	while (table_next(s->live_tunnels, &cursor, NULL, &elem)) {
+		const struct server_tunnel *const owned = elem;
+		ASSERT(count < table_size(s->live_tunnels));
+		out[count++] = owned->t;
 	}
-	qsort((void *)out, count, sizeof(struct tunnel *), cmp_tunnel_ptr);
-	size_t distinct = 0;
-	for (size_t i = 0; i < count; i++) {
-		if (i == 0 || out[i] != out[i - 1]) {
-			out[distinct++] = out[i];
-		}
-	}
-	return distinct;
+	return count;
 }
 
 /* Log session establishment/close with peer address formatting. The identity is
@@ -765,7 +623,13 @@ static void server_update_identity_pool(
 	if (!identity_listener_contains(sl, t)) {
 		/* OOM leaves it reachable through its slot or accepted registry;
 		 * a later establishment or resumption retries the pool add. */
-		(void)identity_listener_add(sl, t);
+		if (!identity_listener_add(sl, t)) {
+			return;
+		}
+	}
+	void *owned = NULL;
+	if (table_find(srv->live_tunnels, t, &owned)) {
+		((struct server_tunnel *)owned)->pool = sl;
 	}
 }
 
@@ -826,28 +690,6 @@ server_remove_and_close_tunnel(struct server *srv, struct tunnel *restrict t)
 	server_close_and_fold(srv, t);
 }
 
-/* True if any session is still draining: an identity listener pool with a live
- * tunnel, or an identity.mux_connect dial-out occupying an identity_tunnels[]
- * staging slot (non-NULL for a live dial-out's whole lifetime, handshaking or
- * established). The graceful-shutdown "can we exit now?" checks combine this
- * with their own accepted_tunnels/mux_tunnel guards. */
-static bool server_has_live_peer(const struct server *restrict s)
-{
-	size_t cursor = 0;
-	void *elem;
-	while (table_next(s->identities, &cursor, NULL, &elem)) {
-		if (((const struct identity_listener *)elem)->num_tunnels > 0) {
-			return true;
-		}
-	}
-	for (size_t i = 0; i < s->num_identity_tunnels; i++) {
-		if (s->identity_tunnels[i] != NULL) {
-			return true;
-		}
-	}
-	return false;
-}
-
 /* Arm the maintenance tick.  Every site that leaves deferred work behind calls
  * this; the tick itself stops once a pass finds nothing left, so between them
  * an idle server holds no timer at all.  A no-op while shutting down, where the
@@ -875,8 +717,7 @@ static void handle_closed(
 	server_remove_and_close_tunnel(srv, t);
 
 	/* During graceful shutdown, exit when no accepted or dialed sessions remain. */
-	if (srv->shutting_down && table_size(srv->accepted_tunnels) == 0 &&
-	    srv->mux_tunnel == NULL && !server_has_live_peer(srv)) {
+	if (srv->shutting_down && table_size(srv->live_tunnels) == 0) {
 		ev_timer_stop(srv->loop, &srv->w_maintenance);
 		ev_break(srv->loop, EVBREAK_ALL);
 		return;
@@ -1067,11 +908,13 @@ static void *udp_local_pick(void *ctx)
 	return server_pick_local(ctx);
 }
 
+#if WITH_THREADS
 static void udp_local_deliver(void *ctx, void *target, struct udp_dgram *d)
 {
 	const struct server *const restrict srv = ctx;
 	tunnel_send_dgram(target, d, (size_t)srv->conf->mux.lossymux_queue);
 }
+#endif
 
 /* lossymux routing for an identity.listen address, over that peer's pool. */
 static void *udp_identity_pick(void *ctx)
@@ -1079,12 +922,21 @@ static void *udp_identity_pick(void *ctx)
 	return identity_listener_pick(ctx);
 }
 
+#if WITH_THREADS
 static void udp_identity_deliver(void *ctx, void *target, struct udp_dgram *d)
 {
 	const struct identity_listener *const restrict sl = ctx;
 	tunnel_send_dgram(
 		target, d, (size_t)sl->listener.srv->conf->mux.lossymux_queue);
 }
+#else
+static void
+udp_deliver_borrowed(void *ctx, void *target, const struct udp_dgram_view *d)
+{
+	(void)ctx;
+	tunnel_send_dgram_borrowed(target, d);
+}
+#endif /* WITH_THREADS */
 
 /* Bring the lossymux UDP socket in *slot in line with its TCP listener: bound
  * to the very address tcp holds (so a port-0 listen shares its port) while
@@ -1132,7 +984,11 @@ static bool server_sync_udp_listeners(struct server *restrict s)
 {
 	const struct udp_listener_cb local_cb = {
 		.pick = udp_local_pick,
+#if WITH_THREADS
 		.deliver = udp_local_deliver,
+#else
+		.deliver_borrowed = udp_deliver_borrowed,
+#endif
 		.ctx = s,
 	};
 	bool ok = server_sync_udp_listener(
@@ -1143,7 +999,11 @@ static bool server_sync_udp_listeners(struct server *restrict s)
 		struct identity_listener *const restrict sl = elem;
 		const struct udp_listener_cb cb = {
 			.pick = udp_identity_pick,
+#if WITH_THREADS
 			.deliver = udp_identity_deliver,
+#else
+			.deliver_borrowed = udp_deliver_borrowed,
+#endif
 			.ctx = sl,
 		};
 		ok = server_sync_udp_listener(
@@ -1220,9 +1080,14 @@ server_new_session_id(const struct server *restrict s, unsigned char *sid)
 
 static bool server_register_session(struct server *s, struct tunnel *t)
 {
+	if (!server_register_tunnel(s, t)) {
+		tunnel_close(t);
+		return false;
+	}
 	void *const elem = server_accepted_set(s, t);
 	if (elem == t) {
 		LOGOOM();
+		server_unregister_tunnel(s, t);
 		tunnel_close(t);
 		return false;
 	}
@@ -1233,6 +1098,11 @@ static bool server_register_session(struct server *s, struct tunnel *t)
 #if WITH_TLS
 /* tunnel_opts.psk_identity_of adapter: the table is opaque there, so the
  * typed accessor is reached through a void * context. */
+static void server_psk_release_cb(void *ctx)
+{
+	server_psk_table_release(ctx);
+}
+
 static const char *server_psk_identity_cb(void *ctx, const char *label)
 {
 	return server_psk_identity_of(ctx, label);
@@ -1322,13 +1192,20 @@ static void mux_serve(
 		.psk_identity_of =
 			srv->psk != NULL ? server_psk_identity_cb : NULL,
 		.psk_ctx = srv->psk,
+		.psk_ctx_release = server_psk_release_cb,
 		.tlsctx = NULL,
 		.conn = conn,
 #endif
 	};
 
+#if WITH_TLS
+	server_psk_table_hold(srv->psk);
+#endif
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	if (t == NULL) {
+#if WITH_TLS
+		server_psk_table_release(srv->psk);
+#endif
 		/* tunnel_new() owns fd and conn on every path, including failure
 		 * (see its doc comment); closing/freeing them here too would
 		 * double-close fd (a live descriptor number could already have been
@@ -1348,6 +1225,7 @@ static void mux_serve(
 		 * releases the mux session, closing fd) rather than leave a dead
 		 * tunnel in accepted_tunnels, and do not count it as served. */
 		server_accepted_del(srv, t);
+		server_unregister_tunnel(srv, t);
 		tunnel_close(t);
 		LOGE_F("[fd:%d] failed to start accepted mux connection", fd);
 		return;
@@ -1402,11 +1280,6 @@ static bool server_psk_lookup(
 static void server_psk_hold_cb(void *ctx)
 {
 	server_psk_table_hold(ctx);
-}
-
-static void server_psk_release_cb(void *ctx)
-{
-	server_psk_table_release(ctx);
 }
 
 /* Build fresh server and client TLS contexts from conf; shared by startup and
@@ -1529,13 +1402,13 @@ static void tunnel_set_reload_connect(
 	}
 }
 
-/* Snapshot the live tunnels (deduped) and invoke fn(t, ctx) for each. Owns the
+/* Snapshot the live tunnels and invoke fn(t, ctx) for each. Owns the
  * server_snapshot_cap/malloc/server_snapshot_tunnels/free scaffolding, so the
  * cap-to-count sizing invariant lives in one place. On allocation failure it
  * logs and skips the pass, returning false; a caller that needs an OOM
  * fallback (server_stop) keeps its own scaffolding.
  * Returns whether every live tunnel was visited -- a caller that draws a
- * conclusion from the absence of a match (the PSK reload barrier) must not
+ * conclusion from the absence of a match must not
  * mistake a skipped pass for an empty one. */
 static bool server_for_each_tunnel(
 	struct server *s, void (*fn)(struct tunnel *t, void *ctx), void *ctx)
@@ -1543,48 +1416,35 @@ static bool server_for_each_tunnel(
 	/* Heap-allocated (not a VLA): the live tunnel count is unbounded in
 	 * principle. */
 	const size_t n = server_snapshot_cap(s);
+	if (n == 0) {
+		return true;
+	}
 	struct tunnel **const snapshot =
 		(struct tunnel **)malloc(n * sizeof(struct tunnel *));
 	if (snapshot == NULL) {
 		LOGOOM();
 		return false;
 	}
-	const size_t count = server_snapshot_tunnels(s, snapshot, n);
+	const size_t count = server_snapshot_tunnels(s, snapshot);
 	for (size_t i = 0; i < count; i++) {
-		fn(snapshot[i], ctx);
+		if (server_tunnel_is_registered(s, snapshot[i])) {
+			fn(snapshot[i], ctx);
+		}
 	}
 	free((void *)snapshot);
 	return true;
 }
 
 #if WITH_TLS
-/* Context for psk_barrier_cb over server_for_each_tunnel. */
-struct psk_barrier_ctx {
-	struct server *s;
-	/* Live tunnels not yet resolving through s->psk. */
-	size_t stale;
-};
-
-static void psk_barrier_cb(struct tunnel *t, void *ctx)
+/* Retry resolver updates independently of key reclamation. Comparing an
+ * adopted pointer only reports progress; no old table is dereferenced here. */
+static void psk_update_cb(struct tunnel *t, void *ctx)
 {
-	struct psk_barrier_ctx *const restrict c = ctx;
-	struct server *const restrict s = c->s;
-	const void *const cur = tunnel_psk_ctx(t);
-	if (cur == s->psk) {
+	struct server *const s = ctx;
+	if (tunnel_psk_is_current(t, s->psk)) {
 		return;
 	}
-	c->stale++;
-	/* Whichever retired table it is still on has to outlive this sweep. */
-	for (struct psk_table *p = s->retired_psk; p != NULL;
-	     p = p->retired_next) {
-		if (p == cur) {
-			p->retired_in_use = true;
-			break;
-		}
-	}
-	/* Nothing else will move this tunnel forward: the reload it was sent
-	 * never reached its queue (full, or its argument could not be
-	 * allocated), so re-offer the resolver alone until one lands. */
+	s->psk_updates_pending = true;
 	server_psk_table_hold(s->psk);
 	if (!tunnel_set_psk(
 		    t, s->psk != NULL ? server_psk_identity_cb : NULL, s->psk,
@@ -1593,70 +1453,16 @@ static void psk_barrier_cb(struct tunnel *t, void *ctx)
 	}
 }
 
-/* Acquire, pairing with the release in server_psk_table_release(). */
-static bool psk_table_held(const struct psk_table *restrict t)
+static bool server_psk_retry_updates(struct server *s)
 {
-#if WITH_THREADS
-	return atomic_load_explicit(&t->holds, memory_order_acquire) > 0;
-#else
-	return t->holds > 0;
-#endif
-}
-
-/* Free every retired table nothing names any more, and re-dispatch the current
- * resolver to the tunnels that still name an older one.  Runs on the
- * maintenance tick and costs nothing while the retired list is empty, which is
- * every moment outside the window a reload opens. */
-static void server_psk_release_retired(struct server *restrict s)
-{
-	if (s->retired_psk == NULL) {
-		return;
+	if (!s->psk_updates_pending) {
+		return false;
 	}
-	/* Holds first, tunnels second, and never the other way round: a tunnel
-	 * gives back the hold on a repoint only after publishing the resolver it
-	 * carried, so a table this pass finds unheld is one the next loop is
-	 * guaranteed to see reported if the tunnel is on it. */
-	for (struct psk_table *p = s->retired_psk; p != NULL;
-	     p = p->retired_next) {
-		p->retired_in_use = psk_table_held(p);
+	s->psk_updates_pending = false;
+	if (!server_for_each_tunnel(s, psk_update_cb, s)) {
+		s->psk_updates_pending = true;
 	}
-	struct psk_barrier_ctx ctx = { .s = s, .stale = 0 };
-	if (!server_for_each_tunnel(s, psk_barrier_cb, &ctx)) {
-		/* No tunnel was visited, so no table may be assumed unused. */
-		return;
-	}
-	if (ctx.stale > 0) {
-		LOGD_F("psk reload barrier: %zu tunnel(s) not yet repointed",
-		       ctx.stale);
-	}
-	struct psk_table **link = &s->retired_psk;
-	while (*link != NULL) {
-		struct psk_table *const p = *link;
-		if (p->retired_in_use) {
-			link = &p->retired_next;
-			continue;
-		}
-		*link = p->retired_next;
-		p->retired_next = NULL;
-		server_psk_table_free(p);
-	}
-}
-
-/* Hand a table replaced by a reload to the barrier rather than freeing it: the
- * reload only *dispatches* the new one to each tunnel, and every tunnel keeps
- * resolving labels through this table on its own thread until that dispatch
- * runs -- or forever, if it was dropped. */
-static void
-server_retire_psk(struct server *restrict s, struct psk_table *restrict old)
-{
-	if (old == NULL) {
-		return;
-	}
-	old->retired_next = s->retired_psk;
-	s->retired_psk = old;
-	/* The barrier can only be re-polled, not waited on, so retiring a table
-	 * is what puts maintenance back on the clock until the list drains. */
-	server_maintenance_kick(s);
+	return s->psk_updates_pending;
 }
 #endif /* WITH_TLS */
 
@@ -1688,9 +1494,7 @@ static void drain_tunnel_cb(struct tunnel *t, void *ctx)
 		.forward_addr = d->new_conf->connect,
 		.verify_identity = d->new_conf->identity.verify,
 #if WITH_TLS
-		/* Refreshed with the config: the table this replaces is retired
-		 * at the end of server_apply_config, and released once no tunnel
-		 * reports it any more. */
+		/* The dispatch transfers this reference into the adopted resolver. */
 		.psk_identity_of =
 			d->new_psk != NULL ? server_psk_identity_cb : NULL,
 		.psk_ctx = d->new_psk,
@@ -1698,10 +1502,7 @@ static void drain_tunnel_cb(struct tunnel *t, void *ctx)
 #endif
 	};
 #if WITH_TLS
-	/* Held for the dispatch, which gives it back when it runs or is dropped:
-	 * until then this table is named by nothing else -- the tunnel still
-	 * reports the previous one, and a reload after this one would retire this
-	 * table while the dispatch is still in the ring. */
+	/* Owned by the dispatch until adopted, or released on dispatch failure. */
 	server_psk_table_hold(d->new_psk);
 	/* Per-dialed-tunnel TLS handle (ownership transferred to tunnel_reload);
 	 * on OOM the tunnel keeps its current context. */
@@ -1742,7 +1543,7 @@ static void server_drain_tunnels(
 	const size_t old_ni = s->num_identity_tunnels;
 	const size_t new_ni = new_conf->identity.mux_connect_count;
 
-	/* Snapshot and dedupe first (inside server_for_each_tunnel) so each live
+	/* Snapshot first (inside server_for_each_tunnel) so each live
 	 * tunnel is reloaded exactly once; on OOM it skips this reload pass rather
 	 * than failing the whole reload, leaving live sessions on their old
 	 * settings. */
@@ -2313,9 +2114,8 @@ static bool server_reload_identities(
 	/* Publish the rebuilt table BEFORE discarding the removed peers.
 	 * identity_listener_discard() closes each removed peer's tunnels, and a
 	 * close can synchronously flush the shared dispatcher and run another
-	 * tunnel's queued handle_closed(), reaching identity_pools_remove_except()
-	 * or (when discard's sweep_live set could not be allocated)
-	 * server_tunnel_is_registered() -- both traverse s->identities. Freeing
+	 * tunnel's queued handle_closed(), reaching identity_pools_remove_except(),
+	 * which traverses s->identities. Freeing
 	 * a listener while it is still reachable through s->identities would leave
 	 * those reentrant traversals (and a concurrent session-thread lookup)
 	 * dereferencing freed memory. Swapping first keeps every traversal on the
@@ -2411,15 +2211,25 @@ server_new_client_tunnel(struct server *restrict s, const char *connect_addr)
 		.psk_identity_of =
 			s->psk != NULL ? server_psk_identity_cb : NULL,
 		.psk_ctx = s->psk,
+		.psk_ctx_release = server_psk_release_cb,
 		.tlsctx = tlsctx,
 		.conn = NULL,
 #endif
 	};
 	errno = 0;
+#if WITH_TLS
+	server_psk_table_hold(s->psk);
+#endif
 	struct tunnel *const t = tunnel_new(&ctx, &opts);
 	const int create_error = errno;
+	if (t != NULL && !server_register_tunnel(s, t)) {
+		tunnel_close(t);
+		errno = ENOMEM;
+		return NULL;
+	}
 #if WITH_TLS
 	if (t == NULL) {
+		server_psk_table_release(s->psk);
 		/* tunnel_new failed before adopting the handle; release it here. */
 		tls_ctx_free(tlsctx);
 	}
@@ -2452,6 +2262,7 @@ server_ensure_mux_tunnel(struct server *s, const struct config *restrict conf)
 		/* Thread never started; clear the slot so maintenance can
 		 * recreate it (this early-returns while mux_tunnel != NULL). */
 		s->mux_tunnel = NULL;
+		server_unregister_tunnel(s, t);
 		tunnel_close(t);
 		server_maintenance_kick(s);
 	}
@@ -2478,6 +2289,7 @@ static void server_start_identity_tunnel(
 		 * maintenance pass can recreate it (a NULL slot reads as
 		 * "closed"). */
 		s->identity_tunnels[i] = NULL;
+		server_unregister_tunnel(s, t);
 		tunnel_close(t);
 		server_maintenance_kick(s);
 	}
@@ -2649,11 +2461,11 @@ bool server_apply_config(struct server *s, struct config *new_conf)
 	if (old_client_tlsctx != NULL) {
 		tls_ctx_free(old_client_tlsctx);
 	}
-	/* Not freed here: server_drain_tunnels above only *dispatched* the new
-	 * table to each tunnel, and every one of them keeps resolving labels
-	 * through this one -- on its own thread -- until that dispatch runs.
-	 * The barrier releases it once no tunnel reports it any more. */
-	server_retire_psk(s, old_psk);
+	server_psk_table_release(old_psk);
+	/* A dropped reload keeps its old owned resolver; retry until every live
+	 * tunnel has adopted this config's table, including a transition to NULL. */
+	s->psk_updates_pending = true;
+	server_maintenance_kick(s);
 #endif /* WITH_TLS */
 
 	/* An explicit --loglevel (loglevel_override >= 0) wins over the config's
@@ -2784,11 +2596,7 @@ static bool maintenance_pass(struct server *srv)
 {
 	bool more = false;
 #if WITH_TLS
-	/* Release the PSK tables a reload retired, once no tunnel is resolving
-	 * through them, and re-offer the current one to any tunnel whose reload
-	 * dispatch was dropped. */
-	server_psk_release_retired(srv);
-	more = srv->retired_psk != NULL;
+	more = server_psk_retry_updates(srv);
 #endif
 
 	/* Re-dial any configured identity slot left empty. A slot goes NULL only
@@ -2888,10 +2696,7 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, const int revents)
 		 * still guarantees every session gets closed. */
 		(void)server_for_each_tunnel(s, shutdown_cb, NULL);
 
-		if (s->mux_tunnel == NULL &&
-		    (s->accepted_tunnels == NULL ||
-		     table_size(s->accepted_tunnels) == 0) &&
-		    !server_has_live_peer(s)) {
+		if (table_size(s->live_tunnels) == 0) {
 			ev_break(loop, EVBREAK_ALL);
 			break;
 		}
@@ -2946,6 +2751,13 @@ struct server *server_new(struct ev_loop *loop, struct config *conf)
 		return NULL;
 	}
 #endif
+
+	srv->live_tunnels = table_new(&TABLE_OPTS_PTR);
+	if (srv->live_tunnels == NULL) {
+		LOGOOM();
+		server_free(srv);
+		return NULL;
+	}
 
 	srv->accepted_tunnels = table_new(&SESSION_TABLE_OPTS);
 	if (srv->accepted_tunnels == NULL) {
@@ -3071,6 +2883,7 @@ static bool server_start_mux_tunnel(struct server *s)
 	s->mux_tunnel = t;
 	if (!tunnel_start(t)) {
 		s->mux_tunnel = NULL;
+		server_unregister_tunnel(s, t);
 		tunnel_close(t);
 		return false;
 	}
@@ -3159,6 +2972,7 @@ static bool server_start_identity_tunnels(struct server *s)
 			return false;
 		}
 		if (!tunnel_start(t)) {
+			server_unregister_tunnel(s, t);
 			tunnel_close(t);
 			return false;
 		}
@@ -3221,29 +3035,17 @@ bool server_start(struct server *s)
 	return true;
 }
 
-/* Force-close every tunnel in snapshot[0..count), used by server_stop()'s
- * shutdown-deadline sweep. Mirrors handle_closed(): remove each tunnel
- * under the exclusive lock before tearing it down, so a concurrent resume
- * lookup can never dispatch to a tunnel being concurrently freed. */
+/* A close can drain callbacks that destroy another snapshot entry. Check
+ * owner membership before dereferencing each pointer. Listeners are stopped,
+ * so remove the cross-thread session-ID index here and bulk-clear the other
+ * routing indexes afterwards, avoiding a full pool scan for every tunnel. */
 static void server_force_close_snapshot(
 	struct server *srv, struct tunnel *const *restrict snapshot,
 	const size_t count)
 {
-	server_sweep_begin(srv, snapshot, count);
 	for (size_t i = 0; i < count; i++) {
 		struct tunnel *const t = snapshot[i];
-		/* Closing an earlier entry flushes the shared dispatcher
-		 * (tunnel_close_final's epilogue drains the whole queue), which
-		 * can run a still-live tunnel's queued MUX_EVENT_CLOSED through
-		 * handle_closed -- freeing a tunnel still ahead in snapshot[].
-		 * relay_disconnected only suppresses events of the tunnel being
-		 * closed, so re-validate by pointer before touching t, giving
-		 * this fast path the same rescan semantics that make
-		 * server_force_close_one_by_one immune. Every fold drops its
-		 * tunnel from sweep_live, so a reentrantly-freed tunnel is absent
-		 * from it; the snapshot is deduped, so an entry this sweep
-		 * already closed is never revisited. */
-		if (!server_sweep_is_live(srv, t)) {
+		if (!server_tunnel_is_registered(srv, t)) {
 			continue;
 		}
 		if (tunnel_is_accepted(t)) {
@@ -3251,29 +3053,23 @@ static void server_force_close_snapshot(
 		}
 		server_close_and_fold(srv, t);
 	}
-	server_sweep_end(srv);
 }
 
-/* OOM fallback for the force-close sweep below: process one tunnel at a
- * time via a fresh tunnel_iter_next scan instead of snapshotting all of
- * them into a buffer, so it needs no allocation at all (the heap snapshot
- * just failed). server_remove_and_close_tunnel() removes t from every pool it
- * could be found in -- the same full scope handle_closed uses, unlike
- * server_force_close_snapshot above which only removes from accepted_tunnels
- * because its caller bulk-clears the other pools right after the sweep -- so a
- * fresh scan on the next iteration can never find t again. tunnel_close()
- * joins t's thread and is not safe to call twice on the same tunnel, so this
- * exhaustive removal is what makes repeated fresh scans safe without tracking
- * which tunnels were already seen. */
+/* OOM fallback: close one registry entry at a time, restarting after each
+ * close because draining callbacks can mutate the remaining entries. */
 static void server_force_close_one_by_one(struct server *srv)
 {
 	for (;;) {
-		struct tunnel_iter it = { 0 };
-		struct tunnel *const t = tunnel_iter_next(srv, &it);
-		if (t == NULL) {
+		size_t cursor = 0;
+		void *elem;
+		if (!table_next(srv->live_tunnels, &cursor, NULL, &elem)) {
 			break;
 		}
-		server_remove_and_close_tunnel(srv, t);
+		struct tunnel *const t = ((struct server_tunnel *)elem)->t;
+		if (tunnel_is_accepted(t)) {
+			server_accepted_del(srv, t);
+		}
+		server_close_and_fold(srv, t);
 	}
 }
 
@@ -3316,16 +3112,14 @@ void server_stop(struct server *srv)
 	dispatcher_tick(srv->disp);
 #endif
 
-	/* Force-close any sessions that did not finish their shutdown handshake
-	 * within the deadline.  tunnel_iter yields a pool-registered tunnel more
-	 * than once; dedupe so each is closed (and freed) exactly once. */
-	{
-		const size_t n = server_snapshot_cap(srv);
+	/* Force-close every remaining owner entry, once each. */
+	const size_t n = server_snapshot_cap(srv);
+	if (n > 0) {
 		struct tunnel **const heap_snapshot =
 			(struct tunnel **)malloc(n * sizeof(struct tunnel *));
 		if (heap_snapshot != NULL) {
 			const size_t count =
-				server_snapshot_tunnels(srv, heap_snapshot, n);
+				server_snapshot_tunnels(srv, heap_snapshot);
 			server_force_close_snapshot(srv, heap_snapshot, count);
 			free((void *)heap_snapshot);
 		} else {
@@ -3379,20 +3173,10 @@ void server_free(struct server *srv)
 	if (srv->client_tlsctx != NULL) {
 		tls_ctx_free(srv->client_tlsctx);
 	}
-	/* After the contexts: their PSK lookup callback reads this table, and
-	 * destroying the last of them is what gives back the hold on it. */
-	server_psk_table_free(srv->psk);
-	/* Every tunnel has been closed by now, so whatever the barrier was still
-	 * holding for them has no reader left -- including a repoint the tunnel
-	 * never ran, whose hold went with it. */
-	while (srv->retired_psk != NULL) {
-		struct psk_table *const p = srv->retired_psk;
-		srv->retired_psk = p->retired_next;
-		p->retired_next = NULL;
-		server_psk_table_free(p);
-	}
+	server_psk_table_release(srv->psk);
 #endif /* WITH_TLS */
 	table_free(srv->accepted_tunnels);
+	table_free(srv->live_tunnels);
 #if WITH_THREADS
 	smtx_destroy(&srv->accepted_mu);
 #endif
@@ -3427,43 +3211,6 @@ static int cmp_intfast64(const void *a, const void *b)
 		return 1;
 	}
 	return 0;
-}
-
-/* Context for accepted tunnels absent from the sorted pointer snapshot of
- * the mux tunnel and actual identity-pool members. Peer metadata can change on
- * a session thread before the server receives its membership update. */
-struct unmatched_accepted_ctx {
-	struct tunnel *const *pooled;
-	size_t num_pooled;
-	struct server_stats *out;
-	size_t val; /* next out->tunnels[] write index */
-	size_t cap; /* out->tunnels[] capacity */
-};
-
-static bool collect_unmatched_accepted(
-	const struct hashtable *table, const void *key, void *element,
-	void *data)
-{
-	(void)table;
-	(void)key;
-	struct unmatched_accepted_ctx *const ctx = data;
-	struct tunnel *const t = element;
-	if (bsearch((const void *)&t, (const void *)ctx->pooled,
-		    ctx->num_pooled, sizeof(struct tunnel *),
-		    cmp_tunnel_ptr) != NULL) {
-		return true;
-	}
-	ASSERT(ctx->val < ctx->cap);
-	if (ctx->val >= ctx->cap) {
-		/* cap counts every accepted tunnel; guard against future sizing
-		 * mistakes becoming a buffer overflow. */
-		return true;
-	}
-	struct tunnel_stats *ts = &ctx->out->tunnels[ctx->val++];
-	ts->peer_identity = NULL;
-	ts->num_tunnels = 1;
-	tunnel_stats(t, ts);
-	return true;
 }
 
 struct latency_percentiles {
@@ -3566,15 +3313,6 @@ server_stats(const struct server *restrict s, const bool want_tunnel_latency)
 		LOGOOM();
 		return NULL;
 	}
-	/* Keep actual membership independent of the asynchronously published peer
-	 * claim. Sorting once also avoids scanning a whole pool for every tunnel. */
-	struct tunnel **const pooled =
-		(struct tunnel **)malloc(n * sizeof(*pooled));
-	if (pooled == NULL) {
-		LOGOOM();
-		free(out);
-		return NULL;
-	}
 
 	const struct server_counters *const restrict c = &s->counters;
 	out->num_accepted = c->num_accepted;
@@ -3638,77 +3376,19 @@ server_stats(const struct server *restrict s, const bool want_tunnel_latency)
 	out->byt_dgram_sent = c->closed.byt_dgram_sent;
 	out->byt_dgram_recv = c->closed.byt_dgram_recv;
 
-	/* Populate dialed tunnels first; stream aggregation reads their snapshots. */
 	size_t idx = 0;
-	if (s->mux_tunnel != NULL) {
-		struct tunnel_stats *ts = &out->tunnels[idx];
-		ts->peer_identity = NULL;
-		ts->num_tunnels = 1;
-		tunnel_stats(s->mux_tunnel, ts);
-		pooled[idx++] = s->mux_tunnel;
-	}
-	{
-		size_t cursor = 0;
-		void *elem;
-		while (table_next(s->identities, &cursor, NULL, &elem)) {
-			const struct identity_listener *const restrict sl =
-				elem;
-			for (size_t j = 0; j < sl->num_tunnels; j++) {
-				/* mux_tunnel can also match a configured
-				 * identity.listen key and be pooled; it is
-				 * already emitted above as the standalone
-				 * mux_tunnel entry, so skip it here to avoid
-				 * double-counting its streams/traffic/latency. */
-				if (sl->tunnels[j] == s->mux_tunnel) {
-					continue;
-				}
-				struct tunnel_stats *ts = &out->tunnels[idx];
-				ts->peer_identity = sl->peer_identity;
-				ts->num_tunnels = sl->num_tunnels;
-				tunnel_stats(sl->tunnels[j], ts);
-				pooled[idx++] = sl->tunnels[j];
-			}
-		}
-	}
-	const size_t num_pooled = idx;
-	qsort((void *)pooled, num_pooled, sizeof(*pooled), cmp_tunnel_ptr);
-	/* Append identity dial-outs still reachable only through their staging
-	 * slot: one that has not been pooled -- not yet established, or announcing
-	 * an identity no identity.listen entry names -- is invisible to every pass
-	 * above, and its reconnect attempts are exactly what the totals must show. */
-	for (size_t j = 0; j < s->num_identity_tunnels; j++) {
-		struct tunnel *const t = s->identity_tunnels[j];
-		if (t == NULL ||
-		    bsearch((const void *)&t, (const void *)pooled, num_pooled,
-			    sizeof(struct tunnel *), cmp_tunnel_ptr) != NULL) {
-			continue;
-		}
-		ASSERT(idx < n);
-		if (idx >= n) {
-			break;
-		}
-		struct tunnel_stats *ts = &out->tunnels[idx];
-		ts->peer_identity = NULL;
-		ts->num_tunnels = 1;
-		tunnel_stats(t, ts);
-		idx++;
-	}
-	/* Append accepted tunnels not wired into any identity pool. */
-	if (s->accepted_tunnels != NULL) {
-		struct unmatched_accepted_ctx unmatched_ctx = {
-			.pooled = pooled,
-			.num_pooled = num_pooled,
-			.out = out,
-			.val = idx,
-			.cap = n
-		};
-		table_iterate(
-			s->accepted_tunnels, collect_unmatched_accepted,
-			&unmatched_ctx);
-		idx = unmatched_ctx.val;
+	size_t cursor = 0;
+	void *elem;
+	while (table_next(s->live_tunnels, &cursor, NULL, &elem)) {
+		const struct server_tunnel *const owned = elem;
+		struct tunnel_stats *const ts = &out->tunnels[idx++];
+		const struct identity_listener *const pool =
+			owned->t == s->mux_tunnel ? NULL : owned->pool;
+		ts->peer_identity = pool != NULL ? pool->peer_identity : NULL;
+		ts->num_tunnels = pool != NULL ? pool->num_tunnels : 1;
+		tunnel_stats(owned->t, ts);
 	}
 	out->num_tunnels = idx;
-	free((void *)pooled);
 
 	/* Aggregate stream and traffic counters over every snapshotted tunnel.
 	 * Every accepted tunnel is already in out->tunnels[] (as a pool member or
@@ -3885,9 +3565,9 @@ struct psk_table *server_psk_table_new(const struct config *restrict conf)
 		return NULL;
 	}
 #if WITH_THREADS
-	atomic_init(&t->holds, (size_t)0);
+	atomic_init(&t->holds, (size_t)1);
 #else
-	t->holds = 0;
+	t->holds = 1;
 #endif
 	t->count = conf->tls_psk_count;
 	for (size_t i = 0; i < t->count; i++) {
@@ -3905,8 +3585,11 @@ struct psk_table *server_psk_table_new(const struct config *restrict conf)
 		}
 		size_t label_len = sizeof(e->label);
 		if (!tls_psk_label(e->key, e->key_len, e->label, &label_len)) {
+			char esc[IDENTITY_ESCAPED_MAX];
+			escape_identity(
+				esc, sizeof(esc), src->id, ESCAPE_PLAIN);
 			LOGE_F("tls.psk.%s: failed to derive the identity label",
-			       src->id);
+			       esc);
 			server_psk_table_free(t);
 			return NULL;
 		}
@@ -3917,13 +3600,7 @@ struct psk_table *server_psk_table_new(const struct config *restrict conf)
 
 void server_psk_table_free(struct psk_table *restrict t)
 {
-	if (t == NULL) {
-		return;
-	}
-	for (size_t i = 0; i < t->count; i++) {
-		tls_secure_erase(t->entries[i].key, sizeof(t->entries[i].key));
-	}
-	free(t);
+	server_psk_table_release(t);
 }
 
 void server_psk_table_hold(struct psk_table *restrict t)
@@ -3932,8 +3609,7 @@ void server_psk_table_hold(struct psk_table *restrict t)
 		return;
 	}
 #if WITH_THREADS
-	/* Relaxed: every hold is taken on the server thread, the same one that
-	 * reads them. */
+	/* A caller must already own a reference while taking another. */
 	(void)atomic_fetch_add_explicit(
 		&t->holds, (size_t)1, memory_order_relaxed);
 #else
@@ -3947,15 +3623,21 @@ void server_psk_table_release(struct psk_table *restrict t)
 		return;
 	}
 #if WITH_THREADS
-	/* Release, paired with the sweep's acquire load: whatever the holder did
-	 * before giving the hold back -- a tunnel publishing the resolver it just
-	 * adopted, a TLS context finishing its last handshake -- is visible to the
-	 * sweep that sees the count reach zero. */
-	(void)atomic_fetch_sub_explicit(
-		&t->holds, (size_t)1, memory_order_release);
+	/* The final release acquires every preceding holder's accesses before
+	 * erasing shared keys; no thread may retain a borrowed table past it. */
+	const size_t previous = atomic_fetch_sub_explicit(
+		&t->holds, (size_t)1, memory_order_acq_rel);
 #else
-	t->holds--;
-#endif /* WITH_THREADS */
+	const size_t previous = t->holds--;
+#endif
+	ASSERT(previous > 0);
+	if (previous != 1) {
+		return;
+	}
+	for (size_t i = 0; i < t->count; i++) {
+		tls_secure_erase(t->entries[i].key, sizeof(t->entries[i].key));
+	}
+	free(t);
 }
 
 const char *server_psk_identity_of(

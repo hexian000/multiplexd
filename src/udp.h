@@ -35,6 +35,16 @@ struct udp_socket *udp_socket_ref(struct udp_socket *sock);
 /* Drop one reference; the last one closes the descriptor. */
 void udp_socket_unref(struct udp_socket *sock);
 
+/* A synchronous datagram view. The caller keeps the socket, sender address
+ * and payload alive until the receiving call returns. Retaining the socket
+ * requires its own reference; retained address/payload bytes must be copied. */
+struct udp_dgram_view {
+	struct udp_socket *sock;
+	const union sockaddr_max *from;
+	const unsigned char *data;
+	size_t len;
+};
+
 /* One datagram read by a udp_listener, on its way to a tunnel's flows. */
 struct udp_dgram {
 	/* Intrusive FIFO link for an owner carrying it across threads. */
@@ -59,6 +69,10 @@ struct udp_listener_cb {
 	/* Hand d to target, a value pick() returned; always consumes d. */
 	void (*deliver)(void *ctx, void *target, struct udp_dgram *d);
 	void *ctx;
+	/* When set, used instead of deliver without allocating an envelope or
+	 * copying the payload. Must finish using the borrowed view before return. */
+	void (*deliver_borrowed)(
+		void *ctx, void *target, const struct udp_dgram_view *d);
 };
 
 struct udp_listener;
@@ -116,6 +130,11 @@ void udp_flows_reset(struct udp_flows *f);
 
 /* Relay a datagram a local client sent to a udp_listener; consumes d. */
 void udp_flows_input(struct udp_flows *f, struct udp_dgram *d);
+
+/* Relay a local datagram synchronously, retaining only a flow's own socket
+ * reference and sender address when it opens. The view remains caller-owned. */
+void udp_flows_input_borrowed(
+	struct udp_flows *f, const struct udp_dgram_view *d);
 
 /**
  * @brief Relay a DATAGRAM the peer sent on @p flow.

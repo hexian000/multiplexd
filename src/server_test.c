@@ -18,6 +18,7 @@
 #include "tunnel.h"
 
 #include "algo/hashtable.h"
+#include "meta/arraysize.h"
 #include "os/socket.h"
 #include "sync/shared_mutex.h"
 #include "sync/task.h"
@@ -53,6 +54,25 @@
 static atomic_uintptr_t fail_realloc_ptr;
 static const struct server *fail_stats_server;
 static bool fail_peer_strdup;
+#if WITH_TLS
+static bool fail_psk_label;
+bool test_real_tls_psk_label(
+	const unsigned char *psk, size_t psk_len, char *buf,
+	size_t *len) __asm__("__real_tls_psk_label");
+bool test_wrap_tls_psk_label(
+	const unsigned char *psk, size_t psk_len, char *buf,
+	size_t *len) __asm__("__wrap_tls_psk_label");
+
+bool test_wrap_tls_psk_label(
+	const unsigned char *psk, size_t psk_len, char *buf, size_t *len)
+{
+	if (fail_psk_label) {
+		fail_psk_label = false;
+		return false;
+	}
+	return test_real_tls_psk_label(psk, psk_len, buf, len);
+}
+#endif /* WITH_TLS */
 static struct {
 	const struct tunnel *tunnel;
 	struct tunnel_stats stats;
@@ -150,6 +170,7 @@ enum mock_mode {
 	MOCK_ECHO = 0,
 	MOCK_ECHO_HALF_CLOSE = 1,
 	MOCK_ECHO_HALF_CLOSE_ON_EOF = 2,
+	MOCK_ECHO_SMALL_BUFFERS = 3,
 };
 
 struct mock_server {
@@ -186,6 +207,10 @@ struct test_fixture {
 	int mux_port_a;
 	int tcp_port_a;
 	int tcp_port_b;
+
+	struct mux_session *owned_peer;
+	int client_fds[4];
+	size_t num_client_fds;
 
 	struct mock_server backend_a;
 	struct mock_server backend_b;
@@ -390,15 +415,18 @@ static int expect_echo(
 	const char *const restrict msg, const size_t msg_len,
 	const double timeout_sec)
 {
-	char *buf = malloc(msg_len);
-	if (buf == NULL) {
-		return -1;
-	}
+	struct testing_ctx *const _t_ = &(struct testing_ctx){ .out = stderr };
+	char buf[4096];
+	size_t mismatch = msg_len;
+	unsigned char mismatch_byte = 0;
 	size_t off = 0;
 	const ev_tstamp deadline = mono_now() + timeout_sec;
 
 	while (off < msg_len) {
-		const ssize_t n = read(fd, buf + off, msg_len - off);
+		const size_t remaining = msg_len - off;
+		const ssize_t n =
+			read(fd, buf,
+			     remaining < sizeof(buf) ? remaining : sizeof(buf));
 		if (n < 0) {
 			const int err = errno;
 			if (err == EINTR) {
@@ -413,45 +441,38 @@ static int expect_echo(
 				if (remaining <= 0.0 ||
 				    (wait_fd_events(fx, fd, EV_READ, remaining) &
 				     EV_READ) == 0) {
-					(void)fprintf(
-						stderr,
-						"DBGFAIL: timeout/EAGAIN off=%zu/%zu remaining=%.3f\n",
-						off, msg_len, remaining);
-					free(buf);
+					T_LOGF("echo timeout/EAGAIN off=%zu/%zu remaining=%.3f",
+					       off, msg_len, remaining);
 					return -1;
 				}
 				continue;
 			}
-			(void)fprintf(
-				stderr, "DBGFAIL: read err=%d off=%zu/%zu\n",
-				err, off, msg_len);
-			free(buf);
+			T_LOGF("echo read err=%d off=%zu/%zu", err, off,
+			       msg_len);
 			return -1;
 		}
 		if (n == 0) {
-			(void)fprintf(
-				stderr, "DBGFAIL: EOF off=%zu/%zu\n", off,
-				msg_len);
-			free(buf);
+			T_LOGF("echo EOF off=%zu/%zu", off, msg_len);
 			return -1;
+		}
+		if (mismatch == msg_len &&
+		    memcmp(buf, msg + off, (size_t)n) != 0) {
+			size_t mm = 0;
+			while (mm < (size_t)n && buf[mm] == msg[off + mm]) {
+				mm++;
+			}
+			mismatch = off + mm;
+			mismatch_byte = (unsigned char)buf[mm];
 		}
 		off += (size_t)n;
 	}
-
-	const int ret = memcmp(buf, msg, msg_len) == 0 ? 0 : -1;
-	if (ret != 0) {
-		size_t mm = 0;
-		while (mm < msg_len && buf[mm] == msg[mm]) {
-			mm++;
-		}
-		(void)fprintf(
-			stderr,
-			"DBGFAIL: mismatch at byte %zu/%zu got=0x%02x want=0x%02x\n",
-			mm, msg_len, (unsigned char)buf[mm],
-			(unsigned char)msg[mm]);
+	if (mismatch != msg_len) {
+		T_LOGF("echo mismatch at byte %zu/%zu got=0x%02x want=0x%02x",
+		       mismatch, msg_len, mismatch_byte,
+		       (unsigned char)msg[mismatch]);
+		return -1;
 	}
-	free(buf);
-	return ret;
+	return 0;
 }
 
 static int send_and_expect_echo(
@@ -459,10 +480,63 @@ static int send_and_expect_echo(
 	const char *const restrict msg, const size_t msg_len,
 	const double timeout_sec)
 {
-	if (write_full(fx, fd, msg, msg_len) != 0) {
-		return -1;
+	struct testing_ctx *const _t_ = &(struct testing_ctx){ .out = stderr };
+	const ev_tstamp deadline = mono_now() + timeout_sec;
+	size_t sent = 0;
+	size_t received = 0;
+	while (received < msg_len) {
+		char buf[4096];
+		const size_t remaining = msg_len - received;
+		const ssize_t nread =
+			read(fd, buf,
+			     remaining < sizeof(buf) ? remaining : sizeof(buf));
+		if (nread > 0) {
+			if (memcmp(buf, msg + received, (size_t)nread) != 0) {
+				T_LOGF("echo mismatch after %zu/%zu bytes",
+				       received, msg_len);
+				return -1;
+			}
+			received += (size_t)nread;
+		} else if (
+			nread == 0 || (errno != EINTR && errno != EAGAIN &&
+				       errno != EWOULDBLOCK &&
+				       errno != ENOBUFS && errno != ENOMEM)) {
+			T_LOGF("echo read failed after %zu/%zu bytes: %d",
+			       received, msg_len, nread == 0 ? 0 : errno);
+			return -1;
+		}
+
+		if (sent < msg_len) {
+			const ssize_t nwritten = send(
+				fd, msg + sent, msg_len - sent, MSG_NOSIGNAL);
+			if (nwritten > 0) {
+				sent += (size_t)nwritten;
+			} else if (
+				nwritten == 0 ||
+				(errno != EINTR && errno != EAGAIN &&
+				 errno != EWOULDBLOCK && errno != ENOBUFS &&
+				 errno != ENOMEM)) {
+				T_LOGF("echo send failed after %zu/%zu bytes: %d",
+				       sent, msg_len,
+				       nwritten == 0 ? 0 : errno);
+				return -1;
+			}
+		}
+		if (received == msg_len) {
+			return 0;
+		}
+		const ev_tstamp wait = deadline - mono_now();
+		/* Drain replies while sending: a peer may stop reading when its
+		 * echo output is full, irrespective of our remaining input. */
+		const int events = EV_READ | (sent < msg_len ? EV_WRITE : 0);
+		if (wait <= 0.0 ||
+		    (wait_fd_events(fx, fd, events, wait) & events) == 0) {
+			T_LOGF("echo timeout sent=%zu received=%zu/%zu", sent,
+			       received, msg_len);
+			return -1;
+		}
 	}
-	return expect_echo(fx, fd, msg, msg_len, timeout_sec);
+	return 0;
 }
 
 static int wait_for_peer_eof(
@@ -498,7 +572,7 @@ static int wait_for_peer_eof(
 	}
 }
 
-static int bind_listen_localhost(void)
+static int bind_listen_localhost_port(const int port)
 {
 	const int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -515,13 +589,38 @@ static int bind_listen_localhost(void)
 	memset(&sa, 0, sizeof(sa));
 	sa.sin_family = AF_INET;
 	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	sa.sin_port = 0;
+	sa.sin_port = htons((uint16_t)port);
 	if (bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0) {
 		socket_close(fd);
 		return -1;
 	}
 	if (listen(fd, 8) != 0) {
 		socket_close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int bind_listen_localhost(void)
+{
+	return bind_listen_localhost_port(0);
+}
+
+static int bind_udp_localhost(const int port)
+{
+	const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (fd < 0) {
+		return -1;
+	}
+	const struct sockaddr_in sa = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+		.sin_port = htons((uint16_t)port),
+	};
+	if (bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		const int error = errno;
+		socket_close(fd);
+		errno = error;
 		return -1;
 	}
 	return fd;
@@ -536,6 +635,34 @@ static int listener_fd_port(const int fd)
 		return -1;
 	}
 	return (int)ntohs(sa.sin_port);
+}
+
+/* Keep both sockets reserved; a TCP bind alone says nothing about UDP. The
+ * optional first candidate lets the collision case use an occupied UDP port. */
+static int bind_listen_tcp_udp(const int first_port, int *udp_fd)
+{
+	*udp_fd = -1;
+	for (unsigned int attempt = 0; attempt < 128; attempt++) {
+		const int fd = bind_listen_localhost_port(
+			attempt == 0 ? first_port : 0);
+		if (fd < 0) {
+			return -1;
+		}
+		const int port = listener_fd_port(fd);
+		const int udp = port > 0 ? bind_udp_localhost(port) : -1;
+		if (udp >= 0) {
+			*udp_fd = udp;
+			return fd;
+		}
+		const int error = errno;
+		socket_close(fd);
+		if (port <= 0 || error != EADDRINUSE) {
+			errno = error;
+			return -1;
+		}
+	}
+	errno = EADDRINUSE;
+	return -1;
 }
 
 static void mock_conn_free(struct mock_conn *restrict conn)
@@ -720,9 +847,9 @@ mock_server_accept_cb(struct ev_loop *loop, ev_io *w, const int revents)
 	}
 }
 
-static int mock_server_start(
+static int mock_server_start_on_fd(
 	struct mock_server *restrict mock, struct ev_loop *restrict loop,
-	const enum mock_mode mode)
+	const enum mock_mode mode, const int fd)
 {
 	*mock = (struct mock_server){
 		.loop = loop,
@@ -733,7 +860,7 @@ static int mock_server_start(
 		.conns = NULL,
 	};
 
-	mock->listen_fd = bind_listen_localhost();
+	mock->listen_fd = fd;
 	if (mock->listen_fd < 0) {
 		return -1;
 	}
@@ -757,6 +884,14 @@ static int mock_server_start(
 	ev_io_start(loop, &mock->w_accept);
 	mock->running = true;
 	return 0;
+}
+
+static int mock_server_start(
+	struct mock_server *restrict mock, struct ev_loop *restrict loop,
+	const enum mock_mode mode)
+{
+	return mock_server_start_on_fd(
+		mock, loop, mode, bind_listen_localhost());
 }
 
 /* Gate on `running`, not a listen_fd sentinel: every construction site would
@@ -903,20 +1038,18 @@ static void log_stream_wait_stats(
 	struct test_fixture *restrict fx, const char *restrict wait_name,
 	const size_t expected)
 {
+	struct testing_ctx *const _t_ = &(struct testing_ctx){ .out = stderr };
 	const struct wait_stats sa = wait_stats_snapshot(fx->srv_a);
 	const struct wait_stats sb = wait_stats_snapshot(fx->srv_b);
-	(void)fprintf(
-		stderr,
-		"    %s:%d %s timed out: expected=%zu"
-		" srv_a(streams=%zu halfopen_streams=%zu established_sessions=%zu"
-		" halfopen_sessions=%zu)"
-		" srv_b(streams=%zu halfopen_streams=%zu established_sessions=%zu"
-		" halfopen_sessions=%zu)\n",
-		__FILE__, __LINE__, wait_name, expected, sa.num_streams,
-		sa.num_halfopen_streams, sa.num_established_sessions,
-		sa.num_halfopen_sessions, sb.num_streams,
-		sb.num_halfopen_streams, sb.num_established_sessions,
-		sb.num_halfopen_sessions);
+	T_LOGF("%s timed out: expected=%zu"
+	       " srv_a(streams=%zu halfopen_streams=%zu established_sessions=%zu"
+	       " halfopen_sessions=%zu)"
+	       " srv_b(streams=%zu halfopen_streams=%zu established_sessions=%zu"
+	       " halfopen_sessions=%zu)",
+	       wait_name, expected, sa.num_streams, sa.num_halfopen_streams,
+	       sa.num_established_sessions, sa.num_halfopen_sessions,
+	       sb.num_streams, sb.num_halfopen_streams,
+	       sb.num_established_sessions, sb.num_halfopen_sessions);
 }
 
 static int streams_ready_wait_predicate(void *ptr)
@@ -1074,17 +1207,8 @@ static void udp_echo_cb(struct ev_loop *loop, ev_io *w, const int revents)
 /* Bind a UDP echo on 127.0.0.1:port, watched by w on loop. */
 static int udp_echo_start(ev_io *w, struct ev_loop *loop, const int port)
 {
-	const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	const int fd = bind_udp_localhost(port);
 	if (fd < 0) {
-		return -1;
-	}
-	struct sockaddr_in sa = {
-		.sin_family = AF_INET,
-		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-		.sin_port = htons((uint16_t)port),
-	};
-	if (bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) != 0) {
-		(void)close(fd);
 		return -1;
 	}
 	ev_io_init(w, udp_echo_cb, fd, EV_READ);
@@ -1100,6 +1224,52 @@ static void udp_echo_stop(ev_io *w, struct ev_loop *loop)
 	ev_io_stop(loop, w);
 	(void)close(w->fd);
 	ev_io_set(w, -1, EV_READ);
+}
+
+static int fixture_backend_start(
+	struct mock_server *mock, struct ev_loop *loop,
+	const enum mock_mode mode, ev_io *udp_echo, const bool lossymux)
+{
+	if (!lossymux) {
+		return mock_server_start(mock, loop, mode);
+	}
+	int udp_fd;
+	const int tcp_fd = bind_listen_tcp_udp(0, &udp_fd);
+	if (tcp_fd < 0) {
+		return -1;
+	}
+	if (mock_server_start_on_fd(mock, loop, mode, tcp_fd) != 0) {
+		socket_close(udp_fd);
+		return -1;
+	}
+	ev_io_init(udp_echo, udp_echo_cb, udp_fd, EV_READ);
+	ev_io_start(loop, udp_echo);
+	return 0;
+}
+
+static bool fixture_server_start(struct server *srv, struct config *conf)
+{
+	if (!conf->mux.lossymux) {
+		return server_start(srv);
+	}
+	int udp_fd;
+	const int tcp_fd = bind_listen_tcp_udp(0, &udp_fd);
+	if (tcp_fd < 0) {
+		return false;
+	}
+	char addr[64];
+	(void)snprintf(
+		addr, sizeof(addr), "127.0.0.1:%d", listener_fd_port(tcp_fd));
+	char *const listen = strdup(addr);
+	if (listen != NULL) {
+		free((void *)conf->listen);
+		conf->listen = listen;
+	}
+	/* The server opens its own sockets synchronously, so release the checked
+	 * pair immediately before handing this address to its listener. */
+	socket_close(udp_fd);
+	socket_close(tcp_fd);
+	return listen != NULL && server_start(srv);
 }
 
 static int fixture_setup_ex(
@@ -1128,23 +1298,16 @@ static int fixture_setup_ex(
 	}
 
 	g_setup_stage = "mock_server_a_start";
-	if (mock_server_start(&fx->backend_a, fx->loop, mode) != 0) {
+	if (fixture_backend_start(
+		    &fx->backend_a, fx->loop, mode, &fx->udp_echo_a,
+		    lossymux) != 0) {
 		return -1;
 	}
 	g_setup_stage = "mock_server_b_start";
-	if (mock_server_start(&fx->backend_b, fx->loop, mode) != 0) {
+	if (fixture_backend_start(
+		    &fx->backend_b, fx->loop, mode, &fx->udp_echo_b,
+		    lossymux) != 0) {
 		return -1;
-	}
-	if (lossymux) {
-		g_setup_stage = "udp_echo_start";
-		if (udp_echo_start(
-			    &fx->udp_echo_a, fx->loop, fx->backend_a.port) !=
-			    0 ||
-		    udp_echo_start(
-			    &fx->udp_echo_b, fx->loop, fx->backend_b.port) !=
-			    0) {
-			return -1;
-		}
 	}
 
 	char connect_a[64];
@@ -1157,13 +1320,17 @@ static int fixture_setup_ex(
 		return -1;
 	}
 	fx->conf_a->mux.lossymux = lossymux;
+	if (mode == MOCK_ECHO_SMALL_BUFFERS) {
+		fx->conf_a->tcp.tcp_sndbuf = 4096;
+		fx->conf_a->tcp.tcp_rcvbuf = 4096;
+	}
 	g_setup_stage = "server_a_create";
 	fx->srv_a = server_new(fx->loop, fx->conf_a);
 	if (fx->srv_a == NULL) {
 		return -1;
 	}
 	g_setup_stage = "server_a_start";
-	if (!server_start(fx->srv_a)) {
+	if (!fixture_server_start(fx->srv_a, fx->conf_a)) {
 		return -1;
 	}
 	g_setup_stage = "server_a_mux_port";
@@ -1187,13 +1354,17 @@ static int fixture_setup_ex(
 		return -1;
 	}
 	fx->conf_b->mux.lossymux = lossymux;
+	if (mode == MOCK_ECHO_SMALL_BUFFERS) {
+		fx->conf_b->tcp.tcp_sndbuf = 4096;
+		fx->conf_b->tcp.tcp_rcvbuf = 4096;
+	}
 	g_setup_stage = "server_b_create";
 	fx->srv_b = server_new(fx->loop, fx->conf_b);
 	if (fx->srv_b == NULL) {
 		return -1;
 	}
 	g_setup_stage = "server_b_start";
-	if (!server_start(fx->srv_b)) {
+	if (!fixture_server_start(fx->srv_b, fx->conf_b)) {
 		return -1;
 	}
 
@@ -1273,6 +1444,15 @@ static void fixture_teardown(struct test_fixture *restrict fx)
 		return;
 	}
 
+	if (fx->owned_peer != NULL) {
+		mux_close(fx->owned_peer);
+		fx->owned_peer = NULL;
+	}
+	while (fx->num_client_fds > 0) {
+		fx->num_client_fds--;
+		(void)close(fx->client_fds[fx->num_client_fds]);
+	}
+
 	if (fx->srv_b != NULL) {
 		server_stop(fx->srv_b);
 		server_free(fx->srv_b);
@@ -1344,6 +1524,31 @@ T_DECLARE_CASE(test_udp_echo_stop_closes_only_active_socket)
 	ev_loop_destroy(loop);
 	T_EXPECT_EQ(started, 0);
 	T_EXPECT(closed);
+}
+
+T_DECLARE_CASE(test_shared_port_skips_udp_only_collision)
+{
+	int occupied;
+	const int reservation = bind_listen_tcp_udp(0, &occupied);
+	T_CHECK(reservation >= 0);
+	socket_close(reservation);
+	const int occupied_port = listener_fd_port(occupied);
+	int udp_fd;
+	const int tcp_fd = bind_listen_tcp_udp(occupied_port, &udp_fd);
+	const int selected_port = tcp_fd >= 0 ? listener_fd_port(tcp_fd) : -1;
+	const int selected_udp_port =
+		udp_fd >= 0 ? listener_fd_port(udp_fd) : -1;
+	if (tcp_fd >= 0) {
+		socket_close(tcp_fd);
+	}
+	if (udp_fd >= 0) {
+		socket_close(udp_fd);
+	}
+	socket_close(occupied);
+	T_EXPECT(occupied_port > 0);
+	T_EXPECT(selected_port > 0);
+	T_EXPECT(selected_port != occupied_port);
+	T_EXPECT_EQ(selected_udp_port, selected_port);
 }
 
 /* Keep a teardown-then-fail pair atomic: every T_FATAL after the fixture has
@@ -1437,6 +1642,7 @@ static struct tunnel *ol_make_established_tunnel(struct server *restrict srv)
 
 /* Unstarted tunnels give deterministic published states without worker races. */
 struct offline_fixture {
+	struct server_tunnel owned[2];
 	struct config *conf;
 	struct server srv;
 	struct tunnel *accepted;
@@ -1451,6 +1657,7 @@ static void offline_fixture_free(struct offline_fixture *fx)
 		tunnel_close(fx->accepted);
 	}
 	table_free(fx->srv.accepted_tunnels);
+	table_free(fx->srv.live_tunnels);
 	if (fx->srv.loop != NULL) {
 		ev_loop_destroy(fx->srv.loop);
 	}
@@ -1483,7 +1690,24 @@ static bool offline_fixture_init(struct offline_fixture *fx)
 		return false;
 	}
 	fx->srv.accepted_tunnels = table;
-	return slot == NULL;
+	if (slot != NULL) {
+		return false;
+	}
+	fx->srv.live_tunnels = table_new(&TABLE_OPTS_PTR);
+	if (fx->srv.live_tunnels == NULL) {
+		return false;
+	}
+	fx->owned[0].t = fx->srv.mux_tunnel;
+	fx->owned[1].t = fx->accepted;
+	for (size_t i = 0; i < ARRAY_SIZE(fx->owned); i++) {
+		slot = &fx->owned[i];
+		fx->srv.live_tunnels =
+			table_set(fx->srv.live_tunnels, fx->owned[i].t, &slot);
+		if (slot != NULL) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /* Records identities reported offline by server_offline_listeners. */
@@ -2064,47 +2288,77 @@ T_DECLARE_CASE(test_server_force_close_folds_tunnel_counters)
 	T_EXPECT(live_buffered >= folded_buffered);
 }
 
-/* Regression: the live tunnel count is unbounded (max_sessions defaults to
- * unlimited and accepts values above any fixed cap), so server_snapshot_cap()
- * must size the force-close snapshot from the real count rather than assert an
- * arbitrary 65536 ceiling. Grow identity_tunnels[] with NULL slots so the cap
- * exceeds that bound (tunnel_iter_next skips NULL slots, so the snapshot still
- * yields only the real tunnels); pre-fix, server_stop()'s snapshot aborted the
- * debug build here. */
-T_DECLARE_CASE(test_server_snapshot_cap_allows_many_tunnels)
+/* Routing slots are non-owning indexes: withdrawing one must not make its
+ * still-live tunnel disappear from generic traversal or statistics. */
+T_DECLARE_CASE(test_server_owned_tunnel_survives_routing_slot_removal)
 {
 	struct test_fixture fx;
 	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
-		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
 		FIXTURE_FATAL(&fx, "fixture_setup failed");
 	}
-
-	/* Push num_identity_tunnels past the old assertion's 65536 bound with
-	 * NULL slots; server_stop() frees this array, taking ownership. */
-	const size_t pad = 65537;
-	const size_t old_n = fx.srv_b->num_identity_tunnels;
-	const size_t new_n = old_n + pad;
-	struct tunnel **const grown = (struct tunnel **)realloc(
-		(void *)fx.srv_b->identity_tunnels,
-		new_n * sizeof(struct tunnel *));
-	if (grown == NULL) {
-		FIXTURE_FATAL(&fx, "realloc identity_tunnels failed");
-	}
-	for (size_t i = old_n; i < new_n; i++) {
-		grown[i] = NULL;
-	}
-	fx.srv_b->identity_tunnels = grown;
-	fx.srv_b->num_identity_tunnels = new_n;
-
-	/* Pre-fix this aborts inside server_snapshot_cap (ASSERT n <= 65536);
-	 * with the fix the snapshot is sized from the real count and returns. */
-	server_stop(fx.srv_b);
-	server_free(fx.srv_b);
-	fx.srv_b = NULL;
-
+	struct tunnel *const t = fx.srv_b->mux_tunnel;
+	fx.srv_b->mux_tunnel = NULL;
+	struct server_stats *const stats = server_stats(fx.srv_b, false);
+	const size_t count = stats != NULL ? stats->num_tunnels : 0;
+	const bool found = stats != NULL && stats->num_tunnels == 1 &&
+			   stats->tunnels[0].tunnel_index == tunnel_index(t);
+	free(stats);
+	fx.srv_b->mux_tunnel = t;
 	fixture_teardown(&fx);
-	/* Reaching here (no abort) with a cap past the old bound is the check. */
-	T_EXPECT(new_n > 65536);
+	T_EXPECT_EQ(count, (size_t)1);
+	T_EXPECT(found);
+}
+
+/* Exercise the authoritative registry above the former fixed ceiling without
+ * starting thousands of workers. Synthetic owner slots refer to the two valid,
+ * unstarted tunnels; stats must allocate and collect every slot. */
+T_DECLARE_CASE(test_server_snapshot_cap_allows_many_tunnels)
+{
+	struct offline_fixture fx;
+	if (!offline_fixture_init(&fx)) {
+		offline_fixture_free(&fx);
+		T_FATAL("offline fixture failed");
+	}
+	const size_t pad = 65537;
+	struct server_tunnel *const owned = calloc(pad, sizeof(*owned));
+	if (owned == NULL) {
+		offline_fixture_free(&fx);
+		T_FATAL("owner slots allocation failed");
+	}
+	size_t added = 0;
+	for (; added < pad; added++) {
+		owned[added].t =
+			added % 2 == 0 ? fx.accepted : fx.srv.mux_tunnel;
+		void *slot = &owned[added];
+		fx.srv.live_tunnels =
+			table_set(fx.srv.live_tunnels, &owned[added], &slot);
+		if (slot != NULL) {
+			break;
+		}
+	}
+	const size_t registry_count = table_size(fx.srv.live_tunnels);
+	struct server_stats *const stats = server_stats(&fx.srv, false);
+	const size_t count = stats != NULL ? stats->num_tunnels : 0;
+	size_t accepted = 0;
+	size_t dialed = 0;
+	for (size_t i = 0; i < count; i++) {
+		accepted += stats->tunnels[i].tunnel_index ==
+			    tunnel_index(fx.accepted);
+		dialed += stats->tunnels[i].tunnel_index ==
+			  tunnel_index(fx.srv.mux_tunnel);
+	}
+	free(stats);
+	for (size_t i = 0; i < added; i++) {
+		fx.srv.live_tunnels =
+			table_del(fx.srv.live_tunnels, &owned[i], NULL);
+	}
+	free(owned);
+	offline_fixture_free(&fx);
+	T_EXPECT_EQ(added, pad);
+	T_EXPECT_EQ(registry_count, pad + 2);
+	T_EXPECT_EQ(count, registry_count);
+	T_EXPECT_EQ(accepted, (pad + 1) / 2 + 1);
+	T_EXPECT_EQ(dialed, pad / 2 + 1);
 }
 
 T_DECLARE_CASE(test_half_close_b_to_a)
@@ -2200,6 +2454,40 @@ cleanup:
 		(void)close(cl);
 	}
 	fixture_teardown(&fx);
+}
+
+T_DECLARE_CASE(test_echo_with_small_socket_buffers)
+{
+	struct test_fixture fx;
+	int fd = -1;
+	int echo_rc = -1;
+	char *payload = NULL;
+	if (fixture_setup(&fx, MOCK_ECHO_SMALL_BUFFERS) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fd = connect_local(&fx, fx.tcp_port_a);
+	if (fd < 0 || socket_set_buffer(fd, 4096, 4096) != 0 ||
+	    wait_for_streams_ready(&fx, 1) != 0) {
+		T_FAIL();
+		goto cleanup;
+	}
+	payload = malloc(PAYLOAD_LARGE);
+	if (payload == NULL) {
+		T_FAIL();
+		goto cleanup;
+	}
+	fill_payload(payload, PAYLOAD_LARGE, 17);
+	echo_rc = send_and_expect_echo(
+		&fx, fd, payload, PAYLOAD_LARGE,
+		(double)ECHO_WAIT_TIMEOUT_MS / 1000.0);
+cleanup:
+	free(payload);
+	if (fd >= 0) {
+		socket_close(fd);
+	}
+	fixture_teardown(&fx);
+	T_EXPECT_EQ(echo_rc, 0);
 }
 
 T_DECLARE_CASE(test_multi_stream_churn_and_workload)
@@ -2821,7 +3109,7 @@ T_DECLARE_CASE(test_server_config_reload)
 	/* Write the config to a tempfile.  The test config carries
 	 * type="...version=2" which conf_parsefile rejects; temporarily clear
 	 * it so conf_dumpfile emits the canonical CONF_TYPE ("version=1"). */
-	char tmp_path[] = "/tmp/server_reload_XXXXXX";
+	char tmp_path[] = SERVER_TEST_TMPDIR "/server_reload_XXXXXX";
 	const int tmp_fd = mkstemp(tmp_path);
 	if (tmp_fd < 0) {
 		FIXTURE_FATAL(&fx, "mkstemp failed");
@@ -4780,37 +5068,24 @@ T_DECLARE_CASE(test_server_reload_tls_to_plaintext_reconnects_retained_tunnel)
 	T_EXPECT_EQ(reconnected, 0);
 }
 
-/* Predicate: the tunnel resolves through the current table and the barrier has
- * let go of everything the reload retired. */
-static int psk_retired_released_predicate(void *ptr)
+/* Predicate: resolver adoption and the maintenance retry pass have settled. */
+static int psk_updates_finished_predicate(void *ptr)
 {
 	const struct psk_retire_wait_ctx *const restrict ctx = ptr;
 	return tunnel_psk_ctx(ctx->t) == ctx->srv->psk &&
-			       ctx->srv->retired_psk == NULL ?
+			       !ctx->srv->psk_updates_pending ?
 		       1 :
 		       0;
 }
 
-/* Regression: server_apply_config() freed the outgoing PSK table as soon as it
- * had *queued* a reload to every tunnel.  A tunnel only stops resolving labels
- * through that table when the queued task runs on its own thread -- or never,
- * when the queue was full or the reload argument could not be allocated -- so
- * the free raced, and could permanently outlive, the readers.
- *
- * Reading the outgoing table after the reload is exactly what
- * tunnel_on_verify_identity() does for a hello arriving in that window, so
- * against the pre-fix server.c this lands on the freed block and the sanitizer
- * build reports a heap-use-after-free.  The tail of the case then holds the
- * fix to the other half of its bargain: the retirement is a barrier, not a
- * retention leak, and the maintenance tick must release the table once the
- * tunnel reports the new one. */
-T_DECLARE_CASE(test_server_reload_retires_psk_table_for_live_tunnels)
+/* A caller with its own table reference may keep resolving old labels across
+ * reload. Maintenance settles resolver updates independently of that lifetime. */
+T_DECLARE_CASE(test_server_reload_preserves_owned_psk_table)
 {
 	struct test_fixture fx = { 0 };
 	fx.loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(fx.loop != NULL);
-	/* mux_connect gives server_start() a dialed tunnel that borrows the
-	 * table; it never has to reach a peer to be a reader of it. */
+	/* A dialed tunnel owns its resolver even without reaching a peer. */
 	struct config *const conf =
 		make_psk_config("127.0.0.1:0", "127.0.0.1:1", RELOAD_PSK_HEX_A);
 	T_CHECK(conf != NULL);
@@ -4822,6 +5097,7 @@ T_DECLARE_CASE(test_server_reload_retires_psk_table_for_live_tunnels)
 	T_CHECK(t != NULL);
 	struct psk_table *const old_psk = srv->psk;
 	T_CHECK(old_psk != NULL);
+	server_psk_table_hold(old_psk);
 	/* Copied out before the reload: after it, reading the table is the very
 	 * thing under test and must not be needed to set the test up. */
 	char label[sizeof(old_psk->entries[0].label)];
@@ -4834,27 +5110,16 @@ T_DECLARE_CASE(test_server_reload_retires_psk_table_for_live_tunnels)
 	T_CHECK(applied);
 	T_CHECK(srv->psk != old_psk);
 
-	/* The defect, read back at the surface a tunnel meets it on.  Reduced to
-	 * a verdict here rather than carried to the assertions below: the result
-	 * points *into* the table, which the barrier is expected to release
-	 * before this case ends. */
+	/* Read while the explicit reference is still held. */
 	const char *const owner = server_psk_identity_of(old_psk, label);
 	const bool owner_ok =
 		owner != NULL && strcmp(owner, RELOAD_PSK_ID) == 0;
-	/* Whichever table the tunnel reports -- the reload is asynchronous, so
-	 * either is legal -- resolving through it must not touch freed memory.
-	 * NULL is a legal answer once it holds the new table, whose label
-	 * differs; what matters is that the lookup stayed in bounds. */
-	const void *const held = tunnel_psk_ctx(t);
-	const bool held_live = (held == old_psk || held == srv->psk);
-	const char *const held_owner = server_psk_identity_of(held, label);
-	const bool held_owner_ok =
-		held_owner == NULL || strcmp(held_owner, RELOAD_PSK_ID) == 0;
 
 	struct psk_retire_wait_ctx wait_ctx = { .srv = srv, .t = t };
 	const int released_rc =
-		wait_until(&fx, 5.0, psk_retired_released_predicate, &wait_ctx);
+		wait_until(&fx, 5.0, psk_updates_finished_predicate, &wait_ctx);
 
+	server_psk_table_release(old_psk);
 	server_stop(srv);
 	struct config *const final_conf = srv->conf;
 	server_free(srv);
@@ -4862,8 +5127,6 @@ T_DECLARE_CASE(test_server_reload_retires_psk_table_for_live_tunnels)
 	ev_loop_destroy(fx.loop);
 
 	T_EXPECT(owner_ok);
-	T_EXPECT(held_live);
-	T_EXPECT(held_owner_ok);
 	T_EXPECT_EQ(released_rc, 0);
 }
 
@@ -4879,35 +5142,21 @@ struct psk_tick_wait_ctx {
 	uint_least64_t before;
 };
 
-/* Predicate: a maintenance tick has run since @c before was sampled, so the
- * retired-table sweep it carries has had its turn. */
+/* Predicate: a maintenance retry pass has run since the sampled count. */
 static int psk_maintenance_ticked_predicate(void *ptr)
 {
 	const struct psk_tick_wait_ctx *const restrict ctx = ptr;
 	return ctx->srv->maintenance_passes != ctx->before ? 1 : 0;
 }
 
-/* Regression: the barrier decided a retired table had no reader left from what
- * the live tunnels report, which covers only the pointer a tunnel has already
- * adopted.  A server TLS context registered with that table as its PSK lookup
- * context is a reader too, and the reload freeing the context handle does not
- * end it: SSL_new() (and the mbedTLS backend's per-connection reference) keeps
- * the parsed context alive, so a connection accepted before the reload can
- * still reach the lookup afterwards.  The sweep swept right past that holder.
- *
- * tls_ctx_ref() stands in for such a connection here -- it takes the same
- * reference on the parsed context that an accepted one does -- and the table is
- * then read at the surface the lookup meets it on, which lands on the freed
- * block against the pre-fix server.c.  The tail holds the fix to the other half
- * of its bargain: dropping the last reference must let the next tick go through
- * with the release. */
-T_DECLARE_CASE(test_server_psk_retirement_waits_for_live_tls_context)
+/* A TLS connection retains the parsed context and its resolver reference even
+ * after reload drops the server's context handle and every tunnel repoints. */
+T_DECLARE_CASE(test_server_psk_table_outlives_live_tls_context)
 {
 	struct test_fixture fx = { 0 };
 	fx.loop = ev_loop_new(EVFLAG_AUTO);
 	T_CHECK(fx.loop != NULL);
-	/* mux_listen builds the server-role context that registers the table;
-	 * mux_connect gives the barrier a live tunnel to ask about. */
+	/* Build both the server lookup context and a live resolver user. */
 	struct config *const conf =
 		make_psk_config("127.0.0.1:0", "127.0.0.1:1", RELOAD_PSK_HEX_A);
 	T_CHECK(conf != NULL);
@@ -4936,9 +5185,7 @@ T_DECLARE_CASE(test_server_psk_retirement_waits_for_live_tls_context)
 	T_CHECK(applied);
 	T_CHECK(srv->psk != old_psk);
 
-	/* The barrier's own criterion, satisfied: every live tunnel reports the
-	 * new table.  The sweep that follows is the one that used to free the
-	 * table accepted_ctx still resolves through. */
+	/* Let every tunnel adopt the new resolver and maintenance settle. */
 	struct psk_retire_wait_ctx wait_ctx = { .srv = srv, .t = t };
 	const int repointed_rc =
 		wait_until(&fx, 5.0, psk_repointed_predicate, &wait_ctx);
@@ -4951,7 +5198,7 @@ T_DECLARE_CASE(test_server_psk_retirement_waits_for_live_tls_context)
 
 	/* Reduced to verdicts here, as in the case above: the reads point into a
 	 * table the fix must have kept, and it is released before the case ends. */
-	const bool still_retired = srv->retired_psk == old_psk;
+	const bool still_owned = old_psk->holds > 0;
 	const char *const owner = server_psk_identity_of(old_psk, label);
 	const bool owner_ok =
 		owner != NULL && strcmp(owner, RELOAD_PSK_ID) == 0;
@@ -4959,7 +5206,7 @@ T_DECLARE_CASE(test_server_psk_retirement_waits_for_live_tls_context)
 	/* The connection ends; nothing names the table any more. */
 	tls_ctx_free(accepted_ctx);
 	const int released_rc =
-		wait_until(&fx, 5.0, psk_retired_released_predicate, &wait_ctx);
+		wait_until(&fx, 5.0, psk_updates_finished_predicate, &wait_ctx);
 
 	server_stop(srv);
 	struct config *const final_conf = srv->conf;
@@ -4970,9 +5217,8 @@ T_DECLARE_CASE(test_server_psk_retirement_waits_for_live_tls_context)
 	T_EXPECT(applied);
 	T_EXPECT_EQ(repointed_rc, 0);
 	T_EXPECT_EQ(ticked_rc, 0);
-	/* The sweep ran with the tunnel already repointed and must still have
-	 * kept the table: the context is a reader it cannot see. */
-	T_EXPECT(still_retired);
+	/* The independent TLS context reference still owns the table. */
+	T_EXPECT(still_owned);
 	T_EXPECT(owner_ok);
 	/* ...and kept it no longer than that. */
 	T_EXPECT_EQ(released_rc, 0);
@@ -5937,11 +6183,9 @@ T_DECLARE_CASE(test_server_capacity_reload_and_unmatched_resume)
 		FIXTURE_FATAL(&fx, "fixture_setup failed");
 	}
 	struct mux_session *existing = capacity_peer_new(&fx);
+	fx.owned_peer = existing;
 	const int existing_fd = connect_local(&fx, fx.mux_port_a);
 	if (existing == NULL || existing_fd < 0) {
-		if (existing != NULL) {
-			mux_close(existing);
-		}
 		if (existing_fd >= 0) {
 			socket_close(existing_fd);
 		}
@@ -5951,7 +6195,6 @@ T_DECLARE_CASE(test_server_capacity_reload_and_unmatched_resume)
 	struct capacity_peer_wait initial = { &existing, 1 };
 	if (wait_until(&fx, 2.0, capacity_peers_settled, &initial) != 0 ||
 	    mux_state(existing) != MUX_STATE_ESTABLISHED) {
-		mux_close(existing);
 		FIXTURE_FATAL(&fx, "second peer handshake failed");
 	}
 	struct config *conf = make_config("127.0.0.1:0", NULL, NULL, NULL);
@@ -6019,7 +6262,6 @@ T_DECLARE_CASE(test_server_capacity_reload_and_unmatched_resume)
 		wait_until(&fx, 2.0, capacity_peers_settled, &wait) == 0;
 	const bool established = mux_state(peer) == MUX_STATE_ESTABLISHED;
 
-	mux_close(existing);
 	mux_close(peer);
 	fixture_teardown(&fx);
 	T_EXPECT_EQ(lowered_usage, (size_t)2);
@@ -6035,6 +6277,49 @@ static int capacity_removed_outbound_closed(void *data)
 {
 	const struct server *const srv = data;
 	return srv->mux_tunnel == NULL;
+}
+
+static struct test_fixture cleanup_probe_fixture;
+static int cleanup_probe_peer_fd;
+static int cleanup_probe_client_fd;
+
+T_DECLARE_CASE(fixture_fatal_after_acquiring_resources)
+{
+	struct test_fixture *const fx = &cleanup_probe_fixture;
+	if (fixture_setup(fx, MOCK_ECHO) != 0) {
+		FIXTURE_FATAL(fx, "fixture_setup failed");
+	}
+	fx->owned_peer = capacity_peer_new(fx);
+	T_CHECK(fx->owned_peer != NULL);
+	int fds[2];
+	T_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	mux_attach_fd(fx->owned_peer, fds[0]);
+	fx->client_fds[fx->num_client_fds++] = fds[1];
+	cleanup_probe_peer_fd = fds[0];
+	cleanup_probe_client_fd = fds[1];
+	FIXTURE_FATAL(
+		fx, "intentional failure after acquiring peer and client");
+}
+
+T_DECLARE_CASE(test_fixture_fatal_releases_owned_resources)
+{
+	T_DECLARE_CTX(probe);
+	probe.out = _t_->out;
+	T_LOG("the following inner failure is intentional");
+	T_RUN_CASE(probe, fixture_fatal_after_acquiring_resources);
+	errno = 0;
+	const bool peer_closed =
+		fcntl(cleanup_probe_peer_fd, F_GETFD) == -1 && errno == EBADF;
+	errno = 0;
+	const bool client_closed =
+		fcntl(cleanup_probe_client_fd, F_GETFD) == -1 && errno == EBADF;
+	const bool released = cleanup_probe_fixture.loop == NULL &&
+			      cleanup_probe_fixture.owned_peer == NULL &&
+			      cleanup_probe_fixture.num_client_fds == 0;
+	T_EXPECT_EQ(probe.failed, 1);
+	T_EXPECT(peer_closed);
+	T_EXPECT(client_closed);
+	T_EXPECT(released);
 }
 
 /* Capacity reduction preserves retained sessions, but removing a configured
@@ -6257,7 +6542,13 @@ T_DECLARE_CASE(test_server_stream_percentiles_exact_wrapped_merge)
 	bool plain_zero = false;
 	if (sampled && stats->num_tunnels == 2 && plain->num_tunnels == 2) {
 		result = *stats;
-		memcpy(tunnels, stats->tunnels, sizeof(tunnels));
+		for (size_t i = 0; i < stats->num_tunnels; i++) {
+			const size_t which =
+				stats->tunnels[i].stream_establish_count == 5 ?
+					0 :
+					1;
+			tunnels[which] = stats->tunnels[i];
+		}
 		plain_zero = plain->tunnels[0].stream_establish_p50 == 0 &&
 			     plain->tunnels[1].stream_establish_p50 == 0;
 	}
@@ -6323,16 +6614,17 @@ static void count_tunnel_percentiles(
 T_DECLARE_CASE(test_server_stream_establish_percentiles)
 {
 	struct test_fixture fx;
-	int cls[4] = { -1, -1, -1, -1 };
 	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
 		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
 		FIXTURE_FATAL(&fx, "fixture_setup failed");
 	}
 	for (size_t i = 0; i < 4; i++) {
 		if (connect_and_wait_echo(
-			    &fx, fx.tcp_port_b, "estab", &cls[i]) != 0) {
+			    &fx, fx.tcp_port_b, "estab", &fx.client_fds[i]) !=
+		    0) {
 			FIXTURE_FATAL(&fx, "connect_and_wait_echo failed");
 		}
+		fx.num_client_fds++;
 	}
 	/* Wait until srv_b has published at least one establish sample. */
 	struct establish_count_ctx ctx = { .srv = fx.srv_b };
@@ -6363,11 +6655,6 @@ T_DECLARE_CASE(test_server_stream_establish_percentiles)
 		count_tunnel_percentiles(st_plain, &ignored, &unasked_derived);
 		free(st_plain);
 	}
-	for (size_t i = 0; i < 4; i++) {
-		if (cls[i] >= 0) {
-			(void)close(cls[i]);
-		}
-	}
 	fixture_teardown(&fx);
 
 	T_EXPECT_EQ(waited, 0);
@@ -6392,7 +6679,6 @@ T_DECLARE_CASE(test_server_stream_establish_percentiles)
 T_DECLARE_CASE(test_server_stream_establish_percentiles_accepted_side)
 {
 	struct test_fixture fx;
-	int cls[4] = { -1, -1, -1, -1 };
 	if (fixture_setup(&fx, MOCK_ECHO) != 0) {
 		T_LOGF("fixture_setup failed at stage: %s", g_setup_stage);
 		FIXTURE_FATAL(&fx, "fixture_setup failed");
@@ -6401,10 +6687,11 @@ T_DECLARE_CASE(test_server_stream_establish_percentiles_accepted_side)
 	 * tunnel. */
 	for (size_t i = 0; i < 4; i++) {
 		if (connect_and_wait_echo(
-			    &fx, fx.tcp_port_a, "estab-accepted", &cls[i]) !=
-		    0) {
+			    &fx, fx.tcp_port_a, "estab-accepted",
+			    &fx.client_fds[i]) != 0) {
 			FIXTURE_FATAL(&fx, "connect_and_wait_echo failed");
 		}
+		fx.num_client_fds++;
 	}
 	struct establish_count_ctx ctx = { .srv = fx.srv_a };
 	const int waited = wait_until(
@@ -6418,11 +6705,6 @@ T_DECLARE_CASE(test_server_stream_establish_percentiles_accepted_side)
 		count = st->stream_establish_count;
 		count_tunnel_percentiles(st, &sampled, &derived);
 		free(st);
-	}
-	for (size_t i = 0; i < 4; i++) {
-		if (cls[i] >= 0) {
-			(void)close(cls[i]);
-		}
 	}
 	fixture_teardown(&fx);
 
@@ -7243,11 +7525,20 @@ T_DECLARE_CASE(test_server_new_arms_async_before_start)
 	T_EXPECT(armed);
 }
 
+/* Observe the CLOSED wakeup without draining the server's task ring. */
+static void
+stop_wait_async_cb(struct ev_loop *loop, ev_async *w, const int revents)
+{
+	(void)revents;
+	*(bool *)w->data = true;
+	ev_break(loop, EVBREAK_ALL);
+}
+
 /* A CLOSED event still queued when server_stop() runs is handled there, by its
  * dispatcher flush -- and must not re-arm the maintenance tick on the server
  * being torn down.  Queue one deterministically: shut down a dial-out resting
  * in reconnect backoff, whose tunnel then relays its CLOSED, and wait for the
- * relay's wakeup without running the loop. */
+ * relay's wakeup without invoking the server's async callback. */
 T_DECLARE_CASE(test_server_stop_leaves_maintenance_disarmed)
 {
 	struct test_fixture fx = { .loop = ev_loop_new(EVFLAG_AUTO) };
@@ -7274,14 +7565,25 @@ T_DECLARE_CASE(test_server_stop_leaves_maintenance_disarmed)
 	/* Consume any wakeup already pending, so the next one is the CLOSED. */
 	ev_run(fx.loop, EVRUN_NOWAIT);
 
+	bool timed_out = false;
+	ev_timer timeout;
+	ev_timer_init(
+		&timeout, shutdown_safety_break_cb,
+		(double)SETUP_WAIT_TIMEOUT_MS / 1000.0, 0.0);
+	timeout.data = &timed_out;
+	ev_timer_start(fx.loop, &timeout);
+	void (*const saved_cb)(struct ev_loop *, ev_async *, int) =
+		ev_cb(&srv->w_async);
+	void *const saved_data = srv->w_async.data;
+	bool woke = false;
+	ev_set_cb(&srv->w_async, stop_wait_async_cb);
+	srv->w_async.data = &woke;
 	tunnel_shutdown(srv->mux_tunnel);
-	const ev_tstamp deadline =
-		mono_now() + (double)SETUP_WAIT_TIMEOUT_MS / 1000.0;
-	while (!(queued = ev_async_pending(&srv->w_async)) &&
-	       mono_now() < deadline) {
-		const struct timespec ts = { .tv_nsec = 1000000 };
-		(void)nanosleep(&ts, NULL);
-	}
+	ev_run(fx.loop, 0);
+	queued = woke && !timed_out;
+	ev_set_cb(&srv->w_async, saved_cb);
+	srv->w_async.data = saved_data;
+	ev_timer_stop(fx.loop, &timeout);
 
 	server_stop(srv);
 	armed_after_stop = ev_is_active(&srv->w_maintenance);
@@ -8022,6 +8324,47 @@ log_capture_write(void *ud, const unsigned char *buf, const size_t len)
 	cap->buf[cap->len] = '\0';
 }
 
+T_DECLARE_CASE(test_server_psk_label_failure_escapes_identity)
+{
+#if WITH_TLS && defined(SERVER_TEST_WRAP_SYMBOLS)
+	char owner[] = "alice\r\n\x1b[31m\"\\";
+	char hex[] = RELOAD_PSK_HEX_A;
+	struct psk_entry entry = {
+		.id = owner,
+		.id_len = sizeof(owner) - 1,
+		.hex = hex,
+	};
+	const struct config conf = {
+		.tls_psk = &entry,
+		.tls_psk_count = 1,
+	};
+	struct log_capture cap = { 0 };
+	slog_setoutput(SLOG_OUTPUT_WRITER, log_capture_write, &cap);
+	slog_setlevel(LOG_LEVEL_ERROR);
+	fail_psk_label = true;
+	struct psk_table *const table = server_psk_table_new(&conf);
+	const bool failed = table == NULL;
+	const bool injected = !fail_psk_label;
+	fail_psk_label = false;
+	slog_setlevel(LOG_LEVEL_SILENCE);
+	slog_setoutput(SLOG_OUTPUT_DISCARD);
+	server_psk_table_free(table);
+	T_EXPECT(injected);
+	T_EXPECT(failed);
+	T_EXPECT(!cap.overflow);
+	T_EXPECT(
+		strstr(cap.buf,
+		       "tls.psk.alice\\r\\n\\x1b[31m\\\"\\\\: failed to derive the identity label") !=
+		NULL);
+	T_EXPECT(strchr(cap.buf, '\r') == NULL);
+	T_EXPECT(strchr(cap.buf, '\x1b') == NULL);
+	const char *const newline = strchr(cap.buf, '\n');
+	T_EXPECT(newline != NULL && newline[1] == '\0');
+#else
+	T_SKIPNOW();
+#endif
+}
+
 static int capacity_outbound_retried(void *data)
 {
 	const struct server *const srv = data;
@@ -8300,6 +8643,7 @@ T_DECLARE_CASE(test_server_tls_readahead_only_under_socket_offload)
 static const struct testing_suite suite[] = {
 	T_CASE(test_fixture_teardown_preserves_unowned_descriptor_zero),
 	T_CASE(test_udp_echo_stop_closes_only_active_socket),
+	T_CASE(test_shared_port_skips_udp_only_collision),
 	T_CASE(test_server_apply_config_honors_cli_loglevel_override),
 	T_CASE(test_server_offline_listeners_idle_timeout_scoped_to_mux_connect),
 	T_CASE(test_server_offline_listeners_identity_branch),
@@ -8320,9 +8664,11 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_server_lossymux_udp_empty_roundtrip),
 	T_CASE(test_server_lossymux_disabled_binds_no_udp),
 	T_CASE(test_server_force_close_folds_tunnel_counters),
+	T_CASE(test_server_owned_tunnel_survives_routing_slot_removal),
 	T_CASE(test_server_snapshot_cap_allows_many_tunnels),
 	T_CASE(test_half_close_b_to_a),
 	T_CASE(test_half_close_a_to_b),
+	T_CASE(test_echo_with_small_socket_buffers),
 	T_CASE(test_multi_stream_churn_and_workload),
 	T_CASE(test_backend_close_after_echo),
 	T_CASE(test_client_abort_mid_payload),
@@ -8348,8 +8694,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_server_reload_keeps_established_identity_mux_connect_tunnel),
 #if WITH_TLS
 	T_CASE(test_server_reload_tls_to_plaintext_reconnects_retained_tunnel),
-	T_CASE(test_server_reload_retires_psk_table_for_live_tunnels),
-	T_CASE(test_server_psk_retirement_waits_for_live_tls_context),
+	T_CASE(test_server_reload_preserves_owned_psk_table),
+	T_CASE(test_server_psk_table_outlives_live_tls_context),
 #endif
 	T_CASE(test_server_maintenance_redials_emptied_identity_slot),
 #ifdef SERVER_TEST_WRAP_SYMBOLS
@@ -8361,6 +8707,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_server_capacity_simultaneous_inbound),
 	T_CASE(test_server_capacity_defers_outbound_and_retries),
 	T_CASE(test_server_capacity_reload_and_unmatched_resume),
+	T_CASE(test_fixture_fatal_releases_owned_resources),
 	T_CASE(test_server_capacity_reduction_drains_removed_outbound),
 	T_CASE(test_server_startup_limit_zero_start_throttles_first_connection),
 	T_CASE(test_server_startup_limit_full_rejects_at_exact_limit),
@@ -8387,6 +8734,7 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_server_accepted_fallback_skips_non_established_tunnel),
 	T_CASE(test_server_stop_frees_inflight_api_connection),
 	T_CASE(test_server_escapes_peer_identity_in_output),
+	T_CASE(test_server_psk_label_failure_escapes_identity),
 #if WITH_TLS
 	T_CASE(test_server_tls_readahead_only_under_socket_offload),
 #endif

@@ -186,8 +186,8 @@ struct udp_listener {
 	unsigned char buf[UDP_RECV_BUFSIZE];
 };
 
-/* Sweep often enough that an idle entry outlives its timeout by at most half
- * of it again, and never more than once a second. */
+/* Sweep every half-timeout, with a one-second minimum interval. Expiry can
+ * lag by one sweep interval, up to a full timeout for a one-second timeout. */
 static double sweep_interval(const double idle_timeout)
 {
 	return idle_timeout > 2.0 ? idle_timeout / 2.0 : 1.0;
@@ -291,12 +291,25 @@ static void listener_route(
 	} else {
 		r = listener_add_route(l, client);
 	}
-	struct udp_dgram *const restrict d =
-		r != NULL ? malloc(sizeof(*d) + len) : NULL;
+	if (r == NULL) {
+		(*l->num_dropped)++;
+		return;
+	}
+	if (l->cb.deliver_borrowed != NULL) {
+		const struct udp_dgram_view view = {
+			.sock = l->sock,
+			.from = client,
+			.data = l->buf,
+			.len = len,
+		};
+		r->last_seen = ev_now(l->loop);
+		/* Last use of r: delivery may forget every route to its target. */
+		l->cb.deliver_borrowed(l->cb.ctx, r->target, &view);
+		return;
+	}
+	struct udp_dgram *const restrict d = malloc(sizeof(*d) + len);
 	if (d == NULL) {
-		if (r != NULL) {
-			LOGOOM();
-		}
+		LOGOOM();
 		(*l->num_dropped)++;
 		return;
 	}
@@ -609,7 +622,7 @@ static uint_least16_t flows_alloc_id(struct udp_flows *restrict f)
 
 /* Open an active flow for a client first seen on d's socket. */
 static struct udp_flow *flow_open_active(
-	struct udp_flows *restrict f, const struct udp_dgram *restrict d,
+	struct udp_flows *restrict f, const struct udp_dgram_view *restrict d,
 	const unsigned char *restrict key)
 {
 	const uint_least16_t id = flows_alloc_id(f);
@@ -631,7 +644,7 @@ static struct udp_flow *flow_open_active(
 	}
 	*flow = (struct udp_flow){
 		.id = id,
-		.client = d->from,
+		.client = *d->from,
 		.owner = f,
 	};
 	(void)memcpy(flow->key_data, key, sizeof(flow->key_data));
@@ -655,7 +668,7 @@ static struct udp_flow *flow_open_active(
 	}
 	if (LOGLEVEL(DEBUG)) {
 		char addr_str[64];
-		(void)sa_format(addr_str, sizeof(addr_str), &d->from.sa);
+		(void)sa_format(addr_str, sizeof(addr_str), &d->from->sa);
 		LOGD_F("udp: flow %" PRIuLEAST16 " opened for %s", id,
 		       addr_str);
 	}
@@ -664,13 +677,25 @@ static struct udp_flow *flow_open_active(
 
 void udp_flows_input(struct udp_flows *f, struct udp_dgram *d)
 {
+	const struct udp_dgram_view view = {
+		.sock = d->sock,
+		.from = &d->from,
+		.data = d->data,
+		.len = d->len,
+	};
+	udp_flows_input_borrowed(f, &view);
+	udp_dgram_free(d);
+}
+
+void udp_flows_input_borrowed(
+	struct udp_flows *f, const struct udp_dgram_view *d)
+{
 	if (!mux_dgram_ready(f->ss)) {
 		flows_drop(f);
-		udp_dgram_free(d);
 		return;
 	}
 	unsigned char key[UDP_FLOW_KEY_SIZE];
-	flow_key(key, d->sock, &d->from);
+	flow_key(key, d->sock, d->from);
 	const struct hashkey hkey = { .len = sizeof(key), .data = key };
 	void *elem = NULL;
 	struct udp_flow *flow = NULL;
@@ -681,13 +706,11 @@ void udp_flows_input(struct udp_flows *f, struct udp_dgram *d)
 	}
 	if (flow == NULL) {
 		flows_drop(f);
-		udp_dgram_free(d);
 		return;
 	}
 	flow->last_seen = ev_now(f->loop);
 	/* mux_dgram_send counts its own drops. */
 	(void)mux_dgram_send(f->ss, flow->id, d->data, d->len);
-	udp_dgram_free(d);
 }
 
 static void passive_read_cb(struct ev_loop *loop, ev_io *w, const int revents)

@@ -195,20 +195,17 @@ struct tunnel {
 	/* PSK mode: resolves an authenticated label to its peer identity; NULL
 	 * in certificate mode.  Same lifetime rules as verify_identity. */
 	const char *(*psk_identity_of)(void *ctx, const char *label);
-	/* Context handed to psk_identity_of, borrowed from the server.  Written
-	 * on this tunnel's thread only, but published (see TPSK_STORE) so the
-	 * server thread can tell which table this tunnel still resolves through
-	 * and hold that table alive for exactly as long. */
+	/* Owned by this tunnel; pointer publication only reports update progress. */
 #if WITH_THREADS
 	_Atomic(void *) psk_ctx;
+	atomic_size_t psk_updates;
 #else
 	void *psk_ctx;
+	size_t psk_updates;
 #endif
+	void (*psk_ctx_release)(void *ctx);
 	/* Server-wide monotonic index, never reused. */
 	uint_least64_t tunnel_index;
-	/* Owned copies of session metadata strings. */
-	char *identity;
-	char *peer_identity;
 	/* Session log tag: "my <= peer" or "my => peer". */
 	char tag[TUNNEL_TAG_SIZE];
 	/* Socket options cached at creation; updated on reload. */
@@ -356,11 +353,8 @@ struct tunnel {
 #define TPUB_ADD(field, v) ((void)((field) += (v)))
 #endif /* WITH_THREADS */
 
-/* TPSK_STORE/TPSK_LOAD: publish and observe t->psk_ctx.  Ordered rather than
- * relaxed, unlike the TPUB_* fields, because the observer acts on the value by
- * freeing the table it names: the release store puts this thread's lookups
- * *through* the old table before it, and the acquire load puts the server's
- * free() after it, so a free can never overtake a lookup already in flight. */
+/* Publish resolver adoption for retry checks. Reclamation uses owning
+ * references and never depends on the observed pointer. */
 #if WITH_THREADS
 #define TPSK_STORE(field, v)                                                   \
 	atomic_store_explicit(&(field), (v), memory_order_release)
@@ -394,16 +388,17 @@ static void tunnel_pub_unlock(const struct tunnel *restrict t)
 /* Publish the coherent diagnostic snapshot (tag, peer_identity, transport fd and
  * peer address) under pub_mtx so the server thread can read it race-free.  Runs
  * on the session thread. */
-static void tunnel_publish_pub(struct tunnel *restrict t)
+static void tunnel_publish_pub(
+	struct tunnel *restrict t, const char *restrict peer_identity)
 {
 	const int fd = mux_fd(t->ss);
 	const struct sockaddr *const peer_addr = mux_peer_addr(t->ss);
 	tunnel_pub_lock(t);
 	(void)memcpy(t->pub.tag, t->tag, sizeof(t->pub.tag));
-	if (t->peer_identity != NULL) {
+	if (peer_identity != NULL) {
 		(void)snprintf(
 			t->pub.peer_identity, sizeof(t->pub.peer_identity),
-			"%s", t->peer_identity);
+			"%s", peer_identity);
 		t->pub.has_peer_identity = true;
 	} else {
 		t->pub.peer_identity[0] = '\0';
@@ -977,13 +972,9 @@ static void handle_connected(
 {
 	t->reconnect_count = 0;
 
-	free(t->peer_identity);
 	/* The peer's claimed identity, from its hello. */
 	const char *const peer_identity = edata.connected.peer_identity;
-	t->peer_identity = peer_identity != NULL ? strdup(peer_identity) : NULL;
-	if (peer_identity != NULL && t->peer_identity == NULL) {
-		LOGOOM();
-	}
+	const char *const identity = ss->handshake.identity;
 
 	/* Rebuild the diagnostic tag for the transport just established.  A dialed
 	 * tunnel is reused across reconnects, so its tag is rebuilt every time:
@@ -995,8 +986,8 @@ static void handle_connected(
 		/* server.c server_on_established wires identities[].tunnels[];
 		 * here we just update the tag. */
 		char my[64];
-		if (t->identity != NULL) {
-			tunnel_set_tag_part(my, sizeof(my), t->identity);
+		if (identity != NULL) {
+			tunnel_set_tag_part(my, sizeof(my), identity);
 		} else {
 			union sockaddr_max addr;
 			if (socket_get_addr(mux_fd(ss), &addr) == 0) {
@@ -1015,17 +1006,17 @@ static void handle_connected(
 		 * provides thread-safe identity table lookup. */
 		const bool matched = t->relay.parent.verify_peer(
 			t->relay.parent.user, peer_identity);
-		/* t->identity is conf->identity.claim frozen at creation and may
+		/* The session's identity is frozen at creation and may
 		 * be NULL (accepted before any identity was configured, then a
 		 * reload added one); guard it like the dialed branch does --
 		 * passing NULL to "%s" is UB. */
 		const char *const my =
-			(matched && t->identity != NULL) ? t->identity : "?";
+			(matched && identity != NULL) ? identity : "?";
 		tunnel_set_tag(
 			t->tag, sizeof(t->tag), my, " <= ", peer_identity);
 	}
 	/* Publish tag + peer_identity for server-thread diagnostic readers. */
-	tunnel_publish_pub(t);
+	tunnel_publish_pub(t, peer_identity);
 }
 
 /* Returns false when the event should not be relayed to the server: the
@@ -1082,14 +1073,17 @@ static bool tunnel_attach_stream(struct tunnel *restrict t, const int fd)
 	return true;
 }
 
-/* Queue fd behind the redial in flight.  Returns false on OOM (logged), leaving
- * fd with the caller. */
-static bool tunnel_park(struct tunnel *restrict t, const int fd)
+/* Queue fd behind the redial in flight, reusing node when supplied. Returns
+ * false on OOM (logged), leaving fd and node with the caller. */
+static bool
+tunnel_park(struct tunnel *restrict t, const int fd, struct pending_open *node)
 {
-	struct pending_open *const restrict node = malloc(sizeof(*node));
 	if (node == NULL) {
-		LOGOOM();
-		return false;
+		node = malloc(sizeof(*node));
+		if (node == NULL) {
+			LOGOOM();
+			return false;
+		}
 	}
 	node->fd = fd;
 	node->next = NULL;
@@ -1235,12 +1229,16 @@ static void tunnel_demand_redial(struct tunnel *t)
 	}
 }
 
-/* Open one accepted local connection as a new stream.  Runs on this tunnel's
- * own thread (or inline without threads); the caller guarantees t->ss is live. */
-static void tunnel_open_fd(struct tunnel *t, const int fd)
+/* Open one accepted local connection as a new stream. Runs on this tunnel's
+ * own thread (or inline without threads); the caller guarantees t->ss is live.
+ * Returns true when node was transferred into the parked queue; otherwise the
+ * caller still owns node and fd was attached or closed. NULL node allocates
+ * only if the connection must be parked. */
+static bool
+tunnel_open_fd(struct tunnel *t, const int fd, struct pending_open *node)
 {
 	if (tunnel_attach_stream(t, fd)) {
-		return;
+		return false;
 	}
 	/* Demand-triggered reconnect (tunnel_demand_redial), then hold fd until
 	 * the redial ends -- the connection that triggers it is the first one it
@@ -1254,29 +1252,40 @@ static void tunnel_open_fd(struct tunnel *t, const int fd)
 		if (((mux_state(t->ss) == MUX_STATE_CONNECT &&
 		      mux_fd(t->ss) >= 0) ||
 		     t->redial_on_closed) &&
-		    tunnel_park(t, fd)) {
+		    tunnel_park(t, fd, node)) {
 			TUNNEL_LOG_F(
 				DEBUG, t, "[fd:%d] waiting for redial", fd);
-			return;
+			return true;
 		}
 	}
 	TUNNEL_LOG_F(DEBUG, t, "[fd:%d] session not ready, closing", fd);
 	socket_close(fd);
+	return false;
 }
 
-/* Relay one local UDP datagram over the session.  Runs on this tunnel's own
- * thread (or inline without threads); consumes d. */
-static void tunnel_dgram_input(struct tunnel *t, struct udp_dgram *d)
+/* Relay one local UDP datagram synchronously on the tunnel's own loop. */
+static void tunnel_dgram_input(struct tunnel *t, const struct udp_dgram_view *d)
 {
 	if (t->ss == NULL) {
 		TPUB_ADD(t->dgram_cnt.pkt_dgram_dropped, 1);
-		udp_dgram_free(d);
 		return;
 	}
 	if (!mux_dgram_ready(t->ss)) {
 		tunnel_demand_redial(t);
 	}
-	udp_flows_input(t->flows, d);
+	udp_flows_input_borrowed(t->flows, d);
+}
+
+static void tunnel_dgram_owned_input(struct tunnel *t, struct udp_dgram *d)
+{
+	const struct udp_dgram_view view = {
+		.sock = d->sock,
+		.from = &d->from,
+		.data = d->data,
+		.len = d->len,
+	};
+	tunnel_dgram_input(t, &view);
+	udp_dgram_free(d);
 }
 
 #if WITH_THREADS
@@ -1291,7 +1300,7 @@ static void tunnel_drain_pending_dgrams(struct tunnel *t)
 	THRD_ASSERT(mtx_unlock(&t->open_mu));
 	while (d != NULL) {
 		struct udp_dgram *const next = d->next;
-		tunnel_dgram_input(t, d);
+		tunnel_dgram_owned_input(t, d);
 		d = next;
 	}
 }
@@ -1307,12 +1316,15 @@ static void tunnel_drain_pending_opens(struct tunnel *t)
 	THRD_ASSERT(mtx_unlock(&t->open_mu));
 	while (node != NULL) {
 		struct pending_open *const restrict next = node->next;
+		bool parked = false;
 		if (t->ss != NULL) {
-			tunnel_open_fd(t, node->fd);
+			parked = tunnel_open_fd(t, node->fd, node);
 		} else {
 			socket_close(node->fd);
 		}
-		free(node);
+		if (!parked) {
+			free(node);
+		}
 		node = next;
 	}
 }
@@ -1483,14 +1495,18 @@ static bool tunnel_on_verify_identity(
 			t->psk_identity_of(TPSK_LOAD(t->psk_ctx), label);
 		if (owner == NULL || strcmp(owner, identity) != 0) {
 			char esc[IDENTITY_ESCAPED_MAX];
+			char owner_esc[IDENTITY_ESCAPED_MAX];
 			escape_identity(
 				esc, sizeof(esc), identity, ESCAPE_PLAIN);
+			escape_identity(
+				owner_esc, sizeof(owner_esc),
+				owner != NULL ? owner : "(unknown)",
+				ESCAPE_PLAIN);
 			TUNNEL_LOG_F(
 				ERROR, t,
 				"[fd:%d] peer claims identity \"%s\" but"
 				" authenticated with the key of \"%s\"",
-				mux_fd(ss), esc,
-				owner != NULL ? owner : "(unknown)");
+				mux_fd(ss), esc, owner_esc);
 			return false;
 		}
 		return true;
@@ -1706,7 +1722,6 @@ static void tunnel_new_cleanup(
 #endif
 	free(t->forward_addr);
 	free(t->connect_addr);
-	free(t->identity);
 	tunnel_release_session(t);
 	free(t);
 	if (owns_fd_conn) {
@@ -1747,6 +1762,9 @@ struct tunnel *tunnel_new(
 #endif
 		return NULL;
 	}
+#if WITH_THREADS
+	atomic_init(&t->psk_updates, (size_t)0);
+#endif
 	t->relay.parent = *parent;
 	t->relay.cb = *cb;
 	t->callback_data = data;
@@ -1761,11 +1779,8 @@ struct tunnel *tunnel_new(
 	TPUB_STORE(t->last_changed, clock_monotonic_ns());
 	t->reconnect_count = 0;
 	t->shutting_down = false;
-	t->identity = identity != NULL ? strdup(identity) : NULL;
-	t->peer_identity = NULL;
 	if ((forward_addr != NULL && t->forward_addr == NULL) ||
-	    (connect_addr != NULL && t->connect_addr == NULL) ||
-	    (identity != NULL && t->identity == NULL)) {
+	    (connect_addr != NULL && t->connect_addr == NULL)) {
 		LOGOOM();
 		tunnel_new_cleanup(t, NULL, true, opts);
 		return NULL;
@@ -1784,6 +1799,7 @@ struct tunnel *tunnel_new(
 	t->verify_identity = opts->verify_identity;
 	t->psk_identity_of = opts->psk_identity_of;
 	TPSK_STORE(t->psk_ctx, opts->psk_ctx);
+	t->psk_ctx_release = opts->psk_ctx_release;
 	t->cb = (struct mux_callbacks){
 		.on_accept = tunnel_on_accept,
 		.on_event = tunnel_on_event,
@@ -1993,7 +2009,7 @@ struct tunnel *tunnel_new(
 	ss->admit_session = tunnel_admit_session;
 	/* Publish the creation-time snapshot for the server thread's diagnostic
 	 * readers (its log records' tag and fd) before the thread runs. */
-	tunnel_publish_pub(t);
+	tunnel_publish_pub(t, NULL);
 	return t;
 }
 
@@ -2244,8 +2260,6 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 	}
 	free(t->forward_addr);
 	free(t->connect_addr);
-	free(t->identity);
-	free(t->peer_identity);
 #if WITH_TLS
 	/* Safe after mux_close above: the session no longer borrows it. */
 	tls_ctx_free(t->tlsctx);
@@ -2257,6 +2271,9 @@ void tunnel_close_final(struct tunnel *t, struct tunnel_final_counters *out)
 	/* After mux_close: any frames released during teardown are now back in
 	 * the cache, so it is safe to drop. */
 	mcache_free(t->frame_cache);
+	if (t->psk_ctx_release != NULL) {
+		t->psk_ctx_release(TPSK_LOAD(t->psk_ctx));
+	}
 	tunnel_release_session(t);
 	free(t);
 }
@@ -2504,7 +2521,7 @@ void tunnel_open_stream(struct tunnel *t, const int fd)
 	THRD_ASSERT(mtx_unlock(&t->open_mu));
 	ev_async_send(t->loop, &t->w_async);
 #else /* WITH_THREADS */
-	tunnel_open_fd(t, fd);
+	(void)tunnel_open_fd(t, fd, NULL);
 #endif /* WITH_THREADS */
 }
 
@@ -2534,9 +2551,16 @@ void tunnel_send_dgram(
 	ev_async_send(t->loop, &t->w_async);
 #else /* WITH_THREADS */
 	(void)queue_limit;
-	tunnel_dgram_input(t, d);
+	tunnel_dgram_owned_input(t, d);
 #endif /* WITH_THREADS */
 }
+
+#if !WITH_THREADS
+void tunnel_send_dgram_borrowed(struct tunnel *t, const struct udp_dgram_view *d)
+{
+	tunnel_dgram_input(t, d);
+}
+#endif
 
 struct reload_arg {
 	struct tunnel *t;
@@ -2574,9 +2598,42 @@ static void release_psk_ctx(void *restrict ctx, void (*release)(void *ctx))
 	release(ctx);
 }
 
-static void reload_task(void *p)
+static void tunnel_psk_update_begin(struct tunnel *t)
 {
-	struct reload_arg *const restrict arg = p;
+#if WITH_THREADS
+	(void)atomic_fetch_add_explicit(
+		&t->psk_updates, (size_t)1, memory_order_relaxed);
+#else
+	t->psk_updates++;
+#endif
+}
+
+static void tunnel_psk_update_done(struct tunnel *t)
+{
+#if WITH_THREADS
+	(void)atomic_fetch_sub_explicit(
+		&t->psk_updates, (size_t)1, memory_order_release);
+#else
+	t->psk_updates--;
+#endif
+}
+
+/* Transfer a queued reference into the tunnel before releasing its old one. */
+static void tunnel_adopt_psk(
+	struct tunnel *t, const char *(*identity_of)(void *, const char *),
+	void *ctx, void (*release)(void *))
+{
+	void *const old = TPSK_LOAD(t->psk_ctx);
+	void (*const old_release)(void *) = t->psk_ctx_release;
+	t->psk_identity_of = identity_of;
+	t->psk_ctx_release = release;
+	TPSK_STORE(t->psk_ctx, ctx);
+	release_psk_ctx(old, old_release);
+	tunnel_psk_update_done(t);
+}
+
+static void reload_apply(const struct reload_arg *arg)
+{
 	struct tunnel *const t = arg->t;
 	if (arg->update_connect_addr) {
 		free(t->connect_addr);
@@ -2604,13 +2661,8 @@ static void reload_task(void *p)
 	/* Read at the next hello, so this takes effect on the session's next
 	 * handshake rather than mid-session. */
 	t->verify_identity = arg->verify_identity;
-	t->psk_identity_of = arg->psk_identity_of;
-	/* Publishes to the server that this tunnel is off the previous table. */
-	TPSK_STORE(t->psk_ctx, arg->psk_ctx);
-	/* Only now, with the tunnel reporting the resolver itself: the owner reads
-	 * the holds before it asks the tunnels, so one or the other covers the
-	 * resolver at every instant. */
-	release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
+	tunnel_adopt_psk(
+		t, arg->psk_identity_of, arg->psk_ctx, arg->psk_ctx_release);
 #if WITH_TLS
 	/* Adopt the new per-tunnel TLS context (ownership transferred via the
 	 * reload).  mux_set_tlsctx() below repoints the wire to it, after which the
@@ -2633,7 +2685,6 @@ static void reload_task(void *p)
 	}
 	t->mux_socket = arg->mux_socket;
 	t->local_socket = arg->local_socket;
-	free(arg);
 	if (!retired) {
 		return;
 	}
@@ -2641,8 +2692,17 @@ static void reload_task(void *p)
 	tunnel_end_idle(t);
 }
 
+#if WITH_THREADS
+static void reload_task(void *p)
+{
+	reload_apply(p);
+	free(p);
+}
+#endif
+
 void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 {
+#if WITH_THREADS
 	struct reload_arg *const restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
@@ -2653,6 +2713,10 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 #endif
 		return;
 	}
+#else
+	struct reload_arg local;
+	struct reload_arg *const arg = &local;
+#endif /* WITH_THREADS */
 	*arg = (struct reload_arg){
 		.t = t,
 		.ss = t->ss,
@@ -2676,40 +2740,42 @@ void tunnel_reload(struct tunnel *t, const struct tunnel_reload_opts *opts)
 		arg->connect_addr = strdup(opts->connect_addr);
 		if (arg->connect_addr == NULL) {
 			LOGOOM();
-			release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
-			free(arg);
-#if WITH_TLS
-			tls_ctx_free(opts->tlsctx);
-#endif
-			return;
+			goto fail;
 		}
 	}
 	if (opts->update_forward_addr && opts->forward_addr != NULL) {
 		arg->forward_addr = strdup(opts->forward_addr);
 		if (arg->forward_addr == NULL) {
 			LOGOOM();
-			release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
-			free(arg->connect_addr);
-			free(arg);
-#if WITH_TLS
-			tls_ctx_free(opts->tlsctx);
-#endif
-			return;
+			goto fail;
 		}
 	}
+	tunnel_psk_update_begin(t);
+#if WITH_THREADS
 	if (!tunnel_post(t, (struct task){ reload_task, arg })) {
+		tunnel_psk_update_done(t);
 		TUNNEL_LOG_PUB(
 			ERROR, t, "failed to dispatch reload (queue full)");
-		release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
-		free(arg->connect_addr);
-		free(arg->forward_addr);
-#if WITH_TLS
-		tls_ctx_free(arg->tlsctx);
-#endif
-		free(arg);
+		goto fail;
 	}
+#else
+	reload_apply(arg);
+#endif /* WITH_THREADS */
+	return;
+
+fail:
+	release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
+	free(arg->connect_addr);
+	free(arg->forward_addr);
+#if WITH_TLS
+	tls_ctx_free(arg->tlsctx);
+#endif
+#if WITH_THREADS
+	free(arg);
+#endif
 }
 
+#if WITH_THREADS
 struct set_psk_arg {
 	struct tunnel *t;
 	const char *(*psk_identity_of)(void *ctx, const char *label);
@@ -2722,17 +2788,17 @@ static void set_psk_task(void *p)
 {
 	struct set_psk_arg *const restrict arg = p;
 	struct tunnel *const restrict t = arg->t;
-	t->psk_identity_of = arg->psk_identity_of;
-	TPSK_STORE(t->psk_ctx, arg->psk_ctx);
-	/* Ordered as in reload_task: publish first, then give the hold back. */
-	release_psk_ctx(arg->psk_ctx, arg->psk_ctx_release);
+	tunnel_adopt_psk(
+		t, arg->psk_identity_of, arg->psk_ctx, arg->psk_ctx_release);
 	free(arg);
 }
+#endif /* WITH_THREADS */
 
 bool tunnel_set_psk(
 	struct tunnel *t, const char *(*psk_identity_of)(void *, const char *),
 	void *psk_ctx, void (*psk_ctx_release)(void *ctx))
 {
+#if WITH_THREADS
 	struct set_psk_arg *const restrict arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
 		LOGOOM();
@@ -2745,15 +2811,29 @@ bool tunnel_set_psk(
 		.psk_ctx = psk_ctx,
 		.psk_ctx_release = psk_ctx_release,
 	};
+	tunnel_psk_update_begin(t);
 	if (!tunnel_post(t, (struct task){ set_psk_task, arg })) {
+		tunnel_psk_update_done(t);
 		release_psk_ctx(psk_ctx, psk_ctx_release);
 		free(arg);
 		return false;
 	}
+#else
+	tunnel_psk_update_begin(t);
+	tunnel_adopt_psk(t, psk_identity_of, psk_ctx, psk_ctx_release);
+#endif /* WITH_THREADS */
 	return true;
 }
 
 const void *tunnel_psk_ctx(const struct tunnel *t)
 {
 	return TPSK_LOAD(t->psk_ctx);
+}
+
+bool tunnel_psk_is_current(const struct tunnel *t, const void *ctx)
+{
+	/* Read pending work before the adopted pointer: the last completion
+	 * publishes its pointer before releasing this count. A queued intermediate
+	 * update can move a tunnel away even when its current pointer matches. */
+	return TPSK_LOAD(t->psk_updates) == 0 && TPSK_LOAD(t->psk_ctx) == ctx;
 }

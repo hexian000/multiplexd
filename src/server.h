@@ -224,13 +224,21 @@ struct identity_listener {
 	struct udp_listener *udp;
 	/* Peer identity expected in hellos — not owned. */
 	const char *peer_identity;
-	/* Active tunnels for this identity; owned, all non-NULL. */
+	/* Non-owning routing pool for this identity; all entries non-NULL. */
 	struct tunnel **tunnels;
 	size_t num_tunnels;
 	/* Allocated capacity of tunnels[]; always a power of two. */
 	size_t cap_tunnels;
 	/* Round-robin dispatch cursor into tunnels[]. */
 	size_t rr_next;
+};
+
+/* Each tunnel has one owner entry; routing indexes borrow its pointer.
+ * pool records actual server-thread membership, independent of the peer's
+ * asynchronously published identity claim. */
+struct server_tunnel {
+	struct tunnel *t;
+	struct identity_listener *pool;
 };
 
 struct server {
@@ -249,11 +257,8 @@ struct server {
 	/* Decoded tls.psk table; NULL in certificate mode.  Backs the TLS
 	 * lookup callback and the tunnel layer's label -> identity mapping. */
 	struct psk_table *psk;
-	/* Tables replaced by earlier reloads, linked through retired_next.  A
-	 * reload only dispatches the new table to each tunnel, so the previous
-	 * one stays allocated here until the maintenance tick observes that no
-	 * live tunnel resolves through it any more. */
-	struct psk_table *retired_psk;
+	/* A reload left resolver updates to retry on the maintenance tick. */
+	bool psk_updates_pending;
 	/* TLS context for initiated mux connections (client role). */
 	struct tls_context *client_tlsctx;
 #endif /* WITH_TLS */
@@ -271,26 +276,21 @@ struct server {
 	 * Each value is a heap-allocated struct identity_listener *. */
 	struct hashtable *identities;
 
-	/* accepted_tunnels maps accepted session_id to tunnel pointer */
+	/* Owning registry, keyed by tunnel pointer; server-thread only. */
+	struct hashtable *live_tunnels;
+	/* Non-owning accepted session-id lookup index. */
 	struct hashtable *accepted_tunnels;
 	/* Round-robin cursor into accepted_tunnels for tcp_serve()'s no-identity,
 	 * no-mux_tunnel fallback; an opaque table_next() cursor, not an index
 	 * (mirrors identity_listener.rr_next's role for the identity case). */
 	size_t accepted_rr_cursor;
-	/* Single dialed session for the top-level mux_connect entry, or NULL. */
+	/* Non-owning slot for the top-level mux_connect session, or NULL. */
 	struct tunnel *mux_tunnel;
-	/* identity_tunnels contains the dialed tunnels ptr */
+	/* Non-owning configured dial-out slots. */
 	struct tunnel **identity_tunnels;
 	size_t num_identity_tunnels;
 	/* monotonically-increasing index */
 	uint_least64_t next_tunnel_index;
-	/* Pointer-keyed set of the tunnels the running force-close sweep
-	 * (server_stop's snapshot, or a discarded identity pool) has not seen
-	 * freed yet; NULL outside a sweep, or when building it ran out of
-	 * memory. server_close_and_fold() deletes each tunnel before freeing
-	 * it, so a sweep entry freed by a reentrant handle_closed is missing
-	 * here -- an O(1) check in place of a walk over every registry. */
-	struct hashtable *sweep_live;
 
 	int_least64_t started;
 
@@ -298,7 +298,7 @@ struct server {
 	ev_signal w_sigint;
 	ev_signal w_sigterm;
 	/* Maintenance timer: armed only while a task has outstanding work --
-	 * releasing the PSK tables a reload retired, re-dialing drained identity
+	 * retrying PSK resolver updates, re-dialing drained identity
 	 * slots -- and stopped again by the first pass that finds none. While
 	 * shutting_down it is instead the one-shot force-exit deadline. */
 	ev_timer w_maintenance;
@@ -430,30 +430,15 @@ struct psk_table_entry {
 	size_t key_len;
 };
 
-/* Built once at startup and owned by the server; outlives the TLS contexts,
- * whose lookup callback reads it during every handshake.  A config reload
- * retires the table it replaces rather than freeing it: tunnels resolve labels
- * through it on their own threads, and a reload only dispatches the new
- * pointer to them, so the table must stay readable until every tunnel is
- * observed to have moved off it. */
+/* Immutable decoded keys, shared by owning references in the server, TLS
+ * contexts, queued updates and adopted tunnel resolvers. The final release
+ * erases the key material and frees the table on whichever thread drops it. */
 struct psk_table {
-	/* Intrusive link through the server's retired list; NULL while the table
-	 * is the current one. */
-	struct psk_table *retired_next;
-	/* Holders naming this table that asking the tunnels cannot reveal: a
-	 * repoint the tunnel has been sent but not yet run, and every TLS context
-	 * registered with it as the PSK lookup context.  Taken on the server
-	 * thread, dropped by whichever thread finishes with the holder; a drop
-	 * never frees, so no holder can pull a table out from under the sweep. */
 #if WITH_THREADS
 	atomic_size_t holds;
 #else
 	size_t holds;
 #endif
-	/* Scratch mark for the retired-list sweep, set while a hold is out or a
-	 * live tunnel is still resolving through this table; meaningless between
-	 * sweeps. */
-	bool retired_in_use;
 	size_t count;
 	struct psk_table_entry entries[];
 };
@@ -461,16 +446,13 @@ struct psk_table {
 /* Decode conf->tls_psk and derive each label; NULL when none are configured
  * or on failure (which is logged). */
 struct psk_table *server_psk_table_new(const struct config *restrict conf);
+/* Release the creator's reference; equivalent to server_psk_table_release. */
 void server_psk_table_free(struct psk_table *restrict t);
 
-/* Mark @p t as named by a holder the retirement sweep cannot see: a repoint
- * dispatched to a tunnel, or a TLS context built over it.  Server thread only,
- * and before the holder becomes reachable from any other one; NULL is a no-op. */
+/* Take an owning reference while already holding one; NULL is a no-op. */
 void server_psk_table_hold(struct psk_table *restrict t);
 
-/* Give back a hold, from any thread.  Never frees: a retired table is released
- * by the server's own sweep, so a table only outlives its last holder by a
- * maintenance tick, never the reverse. */
+/* Give back an owning reference from any thread; the last one frees it. */
 void server_psk_table_release(struct psk_table *restrict t);
 
 /* The peer identity owning @p label, or NULL when no entry matches.  The

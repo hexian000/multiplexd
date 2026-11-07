@@ -10,6 +10,7 @@
 #include "udp.h"
 
 #include "mux/mux.h"
+#include "shim/util.h"
 
 #include "algo/hashtable.h"
 #include "os/socket.h"
@@ -17,6 +18,8 @@
 
 #include <ev.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -103,23 +106,173 @@ static struct {
 	size_t refs;
 } table_failure;
 
+static struct {
+	bool watch;
+	int fd;
+	void *flow;
+	size_t allocations;
+	size_t frees;
+	bool connected_at_failure;
+	bool read_active_at_free;
+} passive_allocation;
+
+static struct {
+	int fd;
+	int error;
+	size_t hits;
+} send_failure;
+
+static bool watch_udp_allocations;
+static size_t udp_malloc_calls;
+
+struct recv_step {
+	int error;
+	int flags;
+	const char *data;
+};
+
+static struct {
+	bool active;
+	int fd;
+	const struct recv_step *steps;
+	size_t count;
+	size_t next;
+	size_t overruns;
+	union sockaddr_max from;
+} recv_script;
+
+static void *test_malloc(size_t size);
+static void test_free(void *ptr);
+static int test_connect(int fd, const struct sockaddr *addr, socklen_t len);
+static ssize_t test_send(int fd, const void *buf, size_t len, int flags);
+static ssize_t test_recvmsg(int fd, struct msghdr *msg, int flags);
+static ssize_t test_sendto(
+	int fd, const void *buf, size_t len, int flags,
+	const struct sockaddr *addr, socklen_t addrlen);
+
 static struct hashtable *test_table_new(const struct table_opts *opts);
 static struct hashtable *
 test_table_set(struct hashtable *table, const void *key, void **element);
 
 /* Pull in the unit under test after the fakes so its references bind here. */
+#define malloc test_malloc
+#define free test_free
+#define connect test_connect
+#define send test_send
+#define sendto test_sendto
+#define recvmsg test_recvmsg
 #define table_new test_table_new
 #define table_set test_table_set
 #include "udp.c"
+#undef recvmsg
 #undef table_new
 #undef table_set
+#undef connect
+#undef sendto
+#undef send
+#undef free
+#undef malloc
+
+static void *test_malloc(const size_t size)
+{
+	if (watch_udp_allocations) {
+		udp_malloc_calls++;
+	}
+	void *const ptr = malloc(size);
+	if (passive_allocation.watch && size == sizeof(struct udp_flow)) {
+		passive_allocation.flow = ptr;
+		passive_allocation.allocations++;
+	}
+	return ptr;
+}
+
+static void test_free(void *ptr)
+{
+	if (passive_allocation.watch && ptr != NULL &&
+	    ptr == passive_allocation.flow) {
+		const struct udp_flow *const flow = passive_allocation.flow;
+		passive_allocation.read_active_at_free =
+			ev_is_active(&flow->w_read);
+		passive_allocation.flow = NULL;
+		passive_allocation.frees++;
+	}
+	free(ptr);
+}
+
+static int
+test_connect(const int fd, const struct sockaddr *addr, const socklen_t len)
+{
+	const int result = connect(fd, addr, len);
+	if (passive_allocation.watch && result == 0) {
+		passive_allocation.fd = fd;
+	}
+	return result;
+}
+
+static bool fail_send(const int fd)
+{
+	if (send_failure.error == 0 || send_failure.fd != fd) {
+		return false;
+	}
+	errno = send_failure.error;
+	send_failure.hits++;
+	return true;
+}
+
+static ssize_t
+test_send(const int fd, const void *buf, const size_t len, const int flags)
+{
+	return fail_send(fd) ? -1 : send(fd, buf, len, flags);
+}
+
+static ssize_t test_sendto(
+	const int fd, const void *buf, const size_t len, const int flags,
+	const struct sockaddr *addr, const socklen_t addrlen)
+{
+	return fail_send(fd) ? -1 : sendto(fd, buf, len, flags, addr, addrlen);
+}
+
+static ssize_t test_recvmsg(const int fd, struct msghdr *msg, const int flags)
+{
+	if (!recv_script.active || fd != recv_script.fd) {
+		return recvmsg(fd, msg, flags);
+	}
+	if (recv_script.next == recv_script.count) {
+		recv_script.overruns++;
+		errno = EIO;
+		return -1;
+	}
+	const struct recv_step *const step =
+		&recv_script.steps[recv_script.next++];
+	if (step->error != 0) {
+		errno = step->error;
+		return -1;
+	}
+	const size_t len = strlen(step->data);
+	(void)memcpy(msg->msg_iov[0].iov_base, step->data, len);
+	msg->msg_flags = step->flags;
+	if (msg->msg_name != NULL) {
+		(void)memcpy(
+			msg->msg_name, &recv_script.from,
+			sizeof(struct sockaddr_in));
+		msg->msg_namelen = sizeof(struct sockaddr_in);
+	}
+	return (ssize_t)len;
+}
 
 static void record_table_failure(void)
 {
 	table_failure.point = TABLE_FAIL_NONE;
 	table_failure.hits++;
 	table_failure.clients = table_size(table_failure.flows->by_client);
-	table_failure.refs = (size_t)table_failure.sock->refs;
+	table_failure.refs = table_failure.sock != NULL ?
+				     (size_t)table_failure.sock->refs :
+				     0;
+	if (passive_allocation.watch && passive_allocation.fd >= 0) {
+		union sockaddr_max peer;
+		passive_allocation.connected_at_failure =
+			socket_get_peer(passive_allocation.fd, &peer) == 0;
+	}
 }
 
 static struct hashtable *test_table_new(const struct table_opts *opts)
@@ -157,6 +310,8 @@ struct udp_fixture {
 	/* Tunnels the listener picked, counting how often pick() ran. */
 	int picks;
 	bool refuse_pick;
+	size_t borrowed_calls;
+	size_t invalid_views;
 };
 
 static void *fx_pick(void *ctx)
@@ -170,6 +325,17 @@ static void fx_deliver(void *ctx, void *target, struct udp_dgram *d)
 {
 	(void)ctx;
 	udp_flows_input(target, d);
+}
+
+static void
+fx_deliver_borrowed(void *ctx, void *target, const struct udp_dgram_view *d)
+{
+	struct udp_fixture *const fx = ctx;
+	fx->borrowed_calls++;
+	if (d->sock != fx->listener->sock || d->data != fx->listener->buf) {
+		fx->invalid_views++;
+	}
+	udp_flows_input_borrowed(target, d);
 }
 
 static const union sockaddr_max *loopback_any_port(void)
@@ -402,6 +568,8 @@ static void udp_client_fixture_free(void *data)
 {
 	struct udp_client_fixture *const ef = data;
 	table_failure.point = TABLE_FAIL_NONE;
+	passive_allocation.watch = false;
+	send_failure.error = 0;
 	if (ef->client >= 0) {
 		(void)close(ef->client);
 	}
@@ -584,6 +752,295 @@ T_DECLARE_CASE(test_flows_active_id_insertion_rollback)
 	check_active_insert_rollback(_t_, TABLE_FAIL_ID_SET);
 }
 
+static void check_passive_insert_rollback(
+	struct testing_ctx *_t_, const enum table_failure_point point)
+{
+	struct udp_client_fixture *const cf = calloc(1, sizeof(*cf));
+	T_CHECK(cf != NULL);
+	cf->client = -1;
+	T_CLEANUP(udp_client_fixture_free, cf);
+	struct udp_fixture *const fx = &cf->fx;
+	T_EXPECT_EQ(udp_fixture_setup(fx, false), 0);
+	cf->client = client_socket();
+	T_EXPECT(cf->client >= 0);
+	union sockaddr_max target;
+	T_EXPECT_EQ(socket_get_addr(cf->client, &target), 0);
+	char forward[64];
+	(void)sa_format(forward, sizeof(forward), &target.sa);
+	table_failure.point = point;
+	table_failure.flows = fx->flows;
+	table_failure.sock = NULL;
+	table_failure.hits = 0;
+	passive_allocation.watch = true;
+	passive_allocation.fd = -1;
+	passive_allocation.flow = NULL;
+	passive_allocation.allocations = 0;
+	passive_allocation.frees = 0;
+	passive_allocation.connected_at_failure = false;
+	passive_allocation.read_active_at_free = false;
+	static const unsigned char failed[] = "failed";
+	udp_flows_recv(fx->flows, 2, failed, sizeof(failed) - 1, forward);
+	passive_allocation.watch = false;
+	const bool closed = passive_allocation.fd >= 0 &&
+			    fcntl(passive_allocation.fd, F_GETFD) == -1 &&
+			    errno == EBADF;
+	const size_t freed = passive_allocation.frees;
+	/* Keep failure diagnostics clean even if the rollback under test leaks. */
+	if (table_failure.hits == 1) {
+		if (!closed && passive_allocation.fd >= 0) {
+			(void)close(passive_allocation.fd);
+		}
+		free(passive_allocation.flow);
+		passive_allocation.flow = NULL;
+	}
+	T_EXPECT_EQ(table_failure.hits, (size_t)1);
+	T_EXPECT(passive_allocation.connected_at_failure);
+	T_EXPECT_EQ(passive_allocation.allocations, (size_t)1);
+	T_EXPECT_EQ(freed, (size_t)1);
+	T_EXPECT(!passive_allocation.read_active_at_free);
+	T_EXPECT(closed);
+	T_EXPECT_EQ(table_size(fx->flows->by_id), (size_t)0);
+	T_EXPECT_EQ(fx->flows->by_id == NULL, point == TABLE_FAIL_ID_NEW);
+	T_EXPECT(fx->flows->by_client == NULL);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)0);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)0);
+	T_EXPECT(!ev_is_active(&fx->flows->w_sweep));
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)1);
+	T_EXPECT_EQ(fx->listener_dropped, (uint_least64_t)0);
+	T_EXPECT_EQ(fx->ss.num_closed, (size_t)1);
+	T_EXPECT_EQ(fx->ss.closed[0], (uint_least16_t)2);
+	T_EXPECT_EQ(fx->ss.num_sent, (size_t)0);
+
+	static const unsigned char retry[] = "retry";
+	udp_flows_recv(fx->flows, 2, retry, sizeof(retry) - 1, forward);
+	char got[32] = { 0 };
+	union sockaddr_max from;
+	socklen_t from_len = sizeof(from);
+	const ssize_t received = recvfrom(
+		cf->client, got, sizeof(got) - 1, 0, &from.sa, &from_len);
+	T_EXPECT_EQ(received, (ssize_t)(sizeof(retry) - 1));
+	T_EXPECT_STREQ(got, "retry");
+	T_EXPECT_EQ(
+		sendto(cf->client, "answer", 6, 0, &from.sa, from_len),
+		(ssize_t)6);
+	T_EXPECT(run_until_sent(fx, 1));
+	T_EXPECT(sent_is(&fx->ss.sent[0], 2, "answer"));
+	void *entry = NULL;
+	T_EXPECT(table_find(fx->flows->by_id, flow_id_key(2), &entry));
+	struct udp_flow *const flow = entry;
+	T_EXPECT(flow->sock == NULL);
+	T_EXPECT(ev_is_active(&flow->w_read));
+	T_EXPECT(ev_is_active(&fx->flows->w_sweep));
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)1);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)1);
+	T_EXPECT_EQ(fx->ss.num_closed, (size_t)1);
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)1);
+	udp_flows_reset(fx->flows);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)0);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)0);
+	T_EXPECT(!ev_is_active(&fx->flows->w_sweep));
+}
+
+T_DECLARE_CASE(test_flows_passive_id_creation_rollback)
+{
+	check_passive_insert_rollback(_t_, TABLE_FAIL_ID_NEW);
+}
+
+T_DECLARE_CASE(test_flows_passive_id_insertion_rollback)
+{
+	check_passive_insert_rollback(_t_, TABLE_FAIL_ID_SET);
+}
+
+static void check_local_send_failure(
+	struct testing_ctx *_t_, const bool active, const int error)
+{
+	struct udp_client_fixture *const cf = calloc(1, sizeof(*cf));
+	T_CHECK(cf != NULL);
+	cf->client = -1;
+	T_CLEANUP(udp_client_fixture_free, cf);
+	struct udp_fixture *const fx = &cf->fx;
+	T_EXPECT_EQ(udp_fixture_setup(fx, false), 0);
+	cf->client = client_socket();
+	T_EXPECT(cf->client >= 0);
+	const uint_least16_t id = active ? 1 : 2;
+	if (active) {
+		T_EXPECT(send_to(cf->client, &fx->listener_addr, "open"));
+		T_EXPECT(run_until_sent(fx, 1));
+		T_EXPECT(sent_is(&fx->ss.sent[0], id, "open"));
+	} else {
+		union sockaddr_max target;
+		T_EXPECT_EQ(socket_get_addr(cf->client, &target), 0);
+		char forward[64];
+		(void)sa_format(forward, sizeof(forward), &target.sa);
+		static const unsigned char open[] = "open";
+		udp_flows_recv(fx->flows, id, open, sizeof(open) - 1, forward);
+		char got[32];
+		T_EXPECT(recv_str(cf->client, got, sizeof(got)));
+		T_EXPECT_STREQ(got, "open");
+	}
+	void *entry = NULL;
+	T_EXPECT(table_find(fx->flows->by_id, flow_id_key(id), &entry));
+	struct udp_flow *const flow = entry;
+	T_EXPECT_EQ(flow->sock != NULL, active);
+	const int fd = active ? flow->sock->fd : flow->w_read.fd;
+	const size_t refs = (size_t)fx->listener->sock->refs;
+	T_EXPECT_EQ(refs, active ? (size_t)2 : (size_t)1);
+	const size_t sent = fx->ss.num_sent;
+
+	send_failure.fd = fd;
+	send_failure.error = error;
+	send_failure.hits = 0;
+	static const unsigned char failed[] = "failed";
+	udp_flows_recv(fx->flows, id, failed, sizeof(failed) - 1, NULL);
+	send_failure.error = 0;
+	T_EXPECT_EQ(send_failure.hits, (size_t)1);
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)1);
+	T_EXPECT_EQ(fx->listener_dropped, (uint_least64_t)0);
+	T_EXPECT_EQ(fx->ss.num_closed, (size_t)0);
+	T_EXPECT_EQ(fx->ss.num_sent, sent);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)1);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)1);
+	T_EXPECT(table_find(fx->flows->by_id, flow_id_key(id), &entry));
+	T_EXPECT(entry == flow);
+	T_EXPECT_EQ(
+		table_size(fx->flows->by_client),
+		active ? (size_t)1 : (size_t)0);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs);
+	T_EXPECT(fcntl(fd, F_GETFD) >= 0);
+	if (active) {
+		T_EXPECT(flow->sock == fx->listener->sock);
+	} else {
+		T_EXPECT(ev_is_active(&flow->w_read));
+		T_EXPECT_EQ(flow->w_read.fd, fd);
+		union sockaddr_max peer;
+		T_EXPECT_EQ(socket_get_peer(fd, &peer), 0);
+	}
+	T_EXPECT(ev_is_active(&fx->flows->w_sweep));
+	char got[32];
+	T_EXPECT_EQ(
+		recv(cf->client, got, sizeof(got), MSG_DONTWAIT), (ssize_t)-1);
+	T_EXPECT(sock_would_block(errno));
+
+	static const unsigned char retry[] = "retry";
+	udp_flows_recv(fx->flows, id, retry, sizeof(retry) - 1, NULL);
+	T_EXPECT(recv_str(cf->client, got, sizeof(got)));
+	T_EXPECT_STREQ(got, "retry");
+	T_EXPECT(table_find(fx->flows->by_id, flow_id_key(id), &entry));
+	T_EXPECT(entry == flow);
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)1);
+	T_EXPECT_EQ(fx->ss.num_closed, (size_t)0);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)1);
+	T_EXPECT_EQ((size_t)fx->num_flows, (size_t)1);
+	T_EXPECT_EQ((size_t)fx->listener->sock->refs, refs);
+}
+
+T_DECLARE_CASE(test_flows_active_send_would_block)
+{
+	check_local_send_failure(_t_, true, EAGAIN);
+}
+
+T_DECLARE_CASE(test_flows_active_send_permanent_error)
+{
+	check_local_send_failure(_t_, true, EACCES);
+}
+
+T_DECLARE_CASE(test_flows_passive_send_would_block)
+{
+	check_local_send_failure(_t_, false, EAGAIN);
+}
+
+T_DECLARE_CASE(test_flows_passive_send_permanent_error)
+{
+	check_local_send_failure(_t_, false, EACCES);
+}
+
+static void check_receive_results(struct testing_ctx *_t_, const bool passive)
+{
+	struct udp_client_fixture *const cf = calloc(1, sizeof(*cf));
+	T_CHECK(cf != NULL);
+	cf->client = -1;
+	T_CLEANUP(udp_client_fixture_free, cf);
+	struct udp_fixture *const fx = &cf->fx;
+	T_EXPECT_EQ(udp_fixture_setup(fx, false), 0);
+	cf->client = client_socket();
+	T_EXPECT(cf->client >= 0);
+	union sockaddr_max client = { 0 };
+	T_EXPECT_EQ(socket_get_addr(cf->client, &client), 0);
+	ev_io *watcher = &fx->listener->w_read;
+	const uint_least16_t id = passive ? 2 : 1;
+	if (passive) {
+		char forward[64];
+		(void)sa_format(forward, sizeof(forward), &client.sa);
+		static const unsigned char open[] = "open";
+		udp_flows_recv(fx->flows, id, open, sizeof(open) - 1, forward);
+		char got[32];
+		T_EXPECT(recv_str(cf->client, got, sizeof(got)));
+		T_EXPECT_STREQ(got, "open");
+		void *entry = NULL;
+		T_EXPECT(table_find(fx->flows->by_id, flow_id_key(id), &entry));
+		struct udp_flow *const flow = entry;
+		watcher = &flow->w_read;
+	}
+	void (*const read_cb)(struct ev_loop *, ev_io *, int) =
+		passive ? passive_read_cb : listener_read_cb;
+	static const struct recv_step steps[] = {
+		{ .error = EINTR },
+		{ .error = ECONNREFUSED },
+		{ .data = "after errors" },
+		{ .error = EAGAIN },
+		{ .data = "after block" },
+		{ .flags = MSG_TRUNC, .data = "partial" },
+		{ .error = EWOULDBLOCK },
+		{ .data = "after trunc" },
+		{ .error = EAGAIN },
+	};
+	recv_script.active = true;
+	recv_script.fd = watcher->fd;
+	recv_script.steps = steps;
+	recv_script.count = sizeof(steps) / sizeof(steps[0]);
+	recv_script.next = 0;
+	recv_script.overruns = 0;
+	recv_script.from = client;
+	read_cb(fx->loop, watcher, EV_READ);
+	recv_script.active = false;
+	T_EXPECT_EQ(recv_script.next, (size_t)4);
+	T_EXPECT_EQ(fx->ss.num_sent, (size_t)1);
+	T_EXPECT(sent_is(&fx->ss.sent[0], id, "after errors"));
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)0);
+	T_EXPECT_EQ(fx->listener_dropped, (uint_least64_t)0);
+
+	recv_script.active = true;
+	read_cb(fx->loop, watcher, EV_READ);
+	recv_script.active = false;
+	T_EXPECT_EQ(recv_script.next, (size_t)7);
+	T_EXPECT_EQ(fx->ss.num_sent, (size_t)2);
+	T_EXPECT(sent_is(&fx->ss.sent[1], id, "after block"));
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)passive);
+	T_EXPECT_EQ(fx->listener_dropped, (uint_least64_t)!passive);
+
+	recv_script.active = true;
+	read_cb(fx->loop, watcher, EV_READ);
+	recv_script.active = false;
+	T_EXPECT_EQ(recv_script.next, recv_script.count);
+	T_EXPECT_EQ(recv_script.overruns, (size_t)0);
+	T_EXPECT_EQ(fx->ss.num_sent, (size_t)3);
+	T_EXPECT(sent_is(&fx->ss.sent[2], id, "after trunc"));
+	T_EXPECT_EQ((uint_least64_t)fx->dropped, (uint_least64_t)passive);
+	T_EXPECT_EQ(fx->listener_dropped, (uint_least64_t)!passive);
+	T_EXPECT_EQ(udp_flows_count(fx->flows), (size_t)1);
+	T_EXPECT_EQ(fx->ss.num_closed, (size_t)0);
+}
+
+T_DECLARE_CASE(test_listener_receive_recovery_and_truncation)
+{
+	check_receive_results(_t_, false);
+}
+
+T_DECLARE_CASE(test_passive_receive_recovery_and_truncation)
+{
+	check_receive_results(_t_, true);
+}
+
 /* A local client's datagrams become a flow of the local parity, stickily: the
  * same client keeps its flow (and its route), a second client gets the next
  * id, and the peer's replies on a flow go back to that flow's client through
@@ -635,6 +1092,76 @@ T_DECLARE_CASE(test_flows_active_roundtrip)
 	T_EXPECT_EQ(picks, 2);
 	T_EXPECT_EQ(flows, (size_t)2);
 	T_EXPECT_EQ(gauge, (size_t)2);
+}
+
+/* A synchronous view borrows listener storage, while an active flow takes its
+ * own socket reference and remains usable after the listener is closed. */
+T_DECLARE_CASE(test_listener_borrowed_delivery_storage_and_socket_lifetime)
+{
+	struct udp_fixture fx;
+	if (udp_fixture_setup(&fx, false) != 0) {
+		udp_fixture_teardown(&fx);
+		T_FATAL("udp_fixture_setup failed");
+		return;
+	}
+	fx.listener->cb.deliver_borrowed = fx_deliver_borrowed;
+	const int client = client_socket();
+	T_CHECK(client >= 0);
+	const bool warm = send_to(client, &fx.listener_addr, "warm") &&
+			  run_until_sent(&fx, 1);
+	udp_malloc_calls = 0;
+	watch_udp_allocations = true;
+	const bool borrowed = send_to(client, &fx.listener_addr, "borrowed") &&
+			      run_until_sent(&fx, 2) &&
+			      send_to(client, &fx.listener_addr, "") &&
+			      run_until_sent(&fx, 3);
+	watch_udp_allocations = false;
+	const size_t borrowed_allocations = udp_malloc_calls;
+	const bool copied_into_mux = borrowed &&
+				     sent_is(&fx.ss.sent[1], 1, "borrowed") &&
+				     sent_is(&fx.ss.sent[2], 1, "");
+	/* The retained owned path supplies a comparison with the same warmed flow. */
+	fx.listener->cb.deliver_borrowed = NULL;
+	udp_malloc_calls = 0;
+	watch_udp_allocations = true;
+	const bool owned = send_to(client, &fx.listener_addr, "owned") &&
+			   run_until_sent(&fx, 4);
+	watch_udp_allocations = false;
+	const size_t owned_allocations = udp_malloc_calls;
+	fx.listener->cb.deliver_borrowed = fx_deliver_borrowed;
+	fx.ss.ready = false;
+	union sockaddr_max from = { 0 };
+	T_CHECK(socket_get_addr(client, &from) == 0);
+	memcpy(fx.listener->buf, "drop", sizeof("drop"));
+	udp_malloc_calls = 0;
+	watch_udp_allocations = true;
+	listener_route(fx.listener, &from, sizeof("drop") - 1);
+	watch_udp_allocations = false;
+	const size_t dropped_allocations = udp_malloc_calls;
+	const size_t dropped = (size_t)fx.dropped;
+	const size_t borrowed_calls = fx.borrowed_calls;
+	const size_t invalid_views = fx.invalid_views;
+	const size_t refs = (size_t)fx.listener->sock->refs;
+	fx.ss.ready = true;
+	udp_listener_free(fx.listener);
+	fx.listener = NULL;
+	static const unsigned char reply[] = "after listener close";
+	udp_flows_recv(fx.flows, 1, reply, sizeof(reply) - 1, NULL);
+	char received[64] = { 0 };
+	const bool replied = recv_str(client, received, sizeof(received));
+	(void)close(client);
+	udp_fixture_teardown(&fx);
+
+	T_EXPECT(warm && borrowed && owned && copied_into_mux);
+	T_EXPECT_EQ(borrowed_allocations, (size_t)0);
+	T_EXPECT_EQ(owned_allocations, (size_t)1);
+	T_EXPECT_EQ(dropped_allocations, (size_t)0);
+	T_EXPECT_EQ(dropped, (size_t)1);
+	T_EXPECT_EQ(borrowed_calls, (size_t)4);
+	T_EXPECT_EQ(invalid_views, (size_t)0);
+	T_EXPECT_EQ(refs, (size_t)2);
+	T_EXPECT(replied);
+	T_EXPECT_STREQ(received, (const char *)reply);
 }
 
 /* A DATAGRAM on a flow the peer opened is relayed to the forward target from a
@@ -1159,11 +1686,20 @@ T_DECLARE_CASE(test_flows_reset_is_silent)
 }
 
 static const struct testing_suite suite[] = {
+	T_CASE(test_listener_borrowed_delivery_storage_and_socket_lifetime),
 	T_CASE(test_flows_alloc_id_parity_and_wrap),
 	T_CASE(test_flows_odd_id_exhaustion_and_recovery),
 	T_CASE(test_flows_even_id_exhaustion_and_recovery),
 	T_CASE(test_flows_active_id_creation_rollback),
 	T_CASE(test_flows_active_id_insertion_rollback),
+	T_CASE(test_flows_passive_id_creation_rollback),
+	T_CASE(test_flows_passive_id_insertion_rollback),
+	T_CASE(test_flows_active_send_would_block),
+	T_CASE(test_flows_active_send_permanent_error),
+	T_CASE(test_flows_passive_send_would_block),
+	T_CASE(test_flows_passive_send_permanent_error),
+	T_CASE(test_listener_receive_recovery_and_truncation),
+	T_CASE(test_passive_receive_recovery_and_truncation),
 	T_CASE(test_flows_active_roundtrip),
 	T_CASE(test_flows_passive_roundtrip),
 	T_CASE(test_flows_active_empty_roundtrip),

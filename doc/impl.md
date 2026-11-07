@@ -350,7 +350,7 @@ sequenceDiagram
 | Stream (direct mode) | `direct.w_io`           | synthesized `EV_READ` / `EV_WRITE`                                                         | user-visible readiness is derived from stream state rather than kernel fd readiness                                                                                                  |
 | Server               | `w_sighup`              | config reload trigger                                                                      | fires `server_reload()` synchronously on the server loop                                                                                                                             |
 | Server               | `w_sigint`, `w_sigterm` | graceful shutdown trigger                                                                  | sets `shutting_down` (which also refuses any further reload), stops listeners, dispatches `tunnel_shutdown()` to every tunnel and re-arms `w_maintenance` as the one-shot force-exit deadline                                   |
-| Server               | `w_maintenance`         | deferred maintenance, then the shutdown deadline                                           | armed by `server_maintenance_kick()` only while work is outstanding (retired PSK tables, an emptied identity or `mux_connect` slot) and stopped by the first pass finding none; once `shutting_down` it is instead a one-shot 2 s force-exit deadline |
+| Server               | `w_maintenance`         | deferred maintenance, then the shutdown deadline                                           | armed by `server_maintenance_kick()` only while work is outstanding (pending PSK resolver updates, an emptied identity or `mux_connect` slot) and stopped by the first pass finding none; once `shutting_down` it is instead a one-shot 2 s force-exit deadline |
 | Server               | `w_suspend`             | resume-from-suspend detection                                                              | `ev_check`, `ev_unref`'d so it never holds the loop open; at most once a second compares how far `CLOCK_BOOTTIME` (or the wall clock) advanced against `CLOCK_MONOTONIC` and calls `tunnel_drop_transport()` on every tunnel when they disagree by ≥ 15 s |
 | Server               | `w_async` (threads)     | cross-thread event relay                                                                   | drains the server-side dispatcher queue after tunnel-to-server async relay                                                                                                           |
 | Tunnel               | `w_maintenance`         | frame-cache trim                                                                           | armed by `tunnel_frame_free()` when a frame re-enters the cache, releases one cached frame per 10 s tick, and stops itself once the cache is empty                                   |
@@ -1235,10 +1235,19 @@ readable by any scanner that completes a key exchange — does not arise.
 | Callback plumbing | OpenSSL hangs credentials off the `SSL_CTX` via ex_data, as ALPN does, because `SSL_new` up-refs the `SSL_CTX` and not the wrapper. mbedTLS takes an opaque pointer but passes the `ssl` object, so the wrapper is recovered by cast, guarded by a `static_assert` that it is the first member. |
 | Negotiated label | OpenSSL exposes no getter, so both backends record it as the handshake selects it; `tls_peer_psk_label()` reads that. |
 | Identity binding | Implicit, unlike `identity.verify`: the binder already proves possession, so `tunnel_on_verify_identity()` only has to confirm the claim matches the peer owning that label. The resolver reaches the tunnel as a callback, since `server.h` includes `tunnel.h`. |
-| Reload | The decoded table is rebuilt from the new config and the one it replaces is retired, not freed: tunnels resolve labels through it on their own threads and are only handed the new resolver by a dispatch (`tunnel_reload`, or `tunnel_set_psk` when that one was dropped). Retiring a table arms the maintenance tick, which frees it once no live tunnel reports it and no hold is out — a dispatch still queued on a tunnel's ring holds one, as does every TLS context registered with the table, whose parsed context a live connection keeps alive past `tls_ctx_free()`. The tick keeps retrying while the retired list is non-empty, since a hold can only be re-polled, and stops once it drains. |
+| Reload | The decoded table is rebuilt from the new config. The server, each TLS context, each queued resolver update and each adopted tunnel resolver own references to it. An update transfers its queued reference into the tunnel and releases the previous resolver; the tunnel releases its final resolver on destruction. The last release erases and frees the table, independently of maintenance. Reload arms maintenance to retry resolver updates after allocation or queue failure; a tunnel is caught up only when its adopted pointer matches and no intermediate update remains queued. Live TLS connections can keep an older parsed context and its table reference after `tls_ctx_free()`. |
 | Storage | `struct config` keeps keys hex-encoded so the `strlen`-based erase in `conf_erase_credentials()` stays valid; decoded copies live in `struct psk_table` and are erased with it. `conf_free()` runs the same erase, so a config released on a failed start or reload does not return its keys to the heap intact, and the raw config buffer (the file, or a `PUT /config` body), which `conf_parse()` decodes in place, is erased as well. Format is validated where the key is first visible: an inline key in `conf_check()`, so a malformed one fails the parse (`PUT /config` answers 400); an `@path` key in `conf_inline_pem()`, after the file is loaded, since `conf_check()` sees only the reference. |
 
 ## 20. Tunnel Layer Threading Model
+
+`server.live_tunnels` is the owning registry of all live tunnels. Session-ID
+lookups, identity pools and configured dial-out slots are non-owning routing
+indexes. Each owner entry records actual pool membership for statistics, so a
+published peer claim cannot change grouping before its relay runs. Generic
+traversal snapshots the registry once, and rechecks membership before invoking
+a callback because an earlier callback may drain tasks that destroy another
+tunnel. Shutdown uses the same registry for liveness and exactly-once teardown.
+
 
 This section keeps only the ownership split and the crossings between the
 server loop and tunnel loops. The mux core itself stays single-threaded per
@@ -1469,7 +1478,7 @@ The synchronous phase runs entirely on the server event loop, in the order below
 | Listener commit  | Each prepared replacement is armed in place of its old socket, which is closed; a listener whose address was removed from the config is only stopped.                           |
 | Session creation | Missing outbound sessions are started for any newly configured or previously closed slots.                                                                                      |
 | UDP sync         | The lossymux UDP sockets follow the settled TCP listener addresses (§23.4). A failed UDP bind is logged but does not fail the reload.                                           |
-| Cleanup          | Old TLS contexts and config are freed, the old PSK table is retired rather than freed (§19.2), and the log level is updated unless `--loglevel` overrides it.                   |
+| Cleanup          | Old TLS contexts and config are freed, the server releases its reference to the old PSK table (§19.2), and the log level is updated unless `--loglevel` overrides it.                   |
 
 ### 21.2 Drain Behavior
 

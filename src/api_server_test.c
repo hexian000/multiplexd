@@ -243,6 +243,20 @@ make_tunnel(struct apifx *restrict fx, const size_t num_streams, const int fd)
 			return NULL;
 		}
 	}
+	struct server_tunnel *const owned = calloc(1, sizeof(*owned));
+	if (owned == NULL) {
+		tunnel_close(t);
+		return NULL;
+	}
+	owned->t = t;
+	void *owner_slot = owned;
+	fx->srv.live_tunnels = table_set(fx->srv.live_tunnels, t, &owner_slot);
+	if (owner_slot != NULL) {
+		free(owned);
+		tunnel_close(t);
+		return NULL;
+	}
+
 	return t;
 }
 
@@ -264,6 +278,15 @@ static struct tunnel *make_accepted_tunnel(struct apifx *restrict fx)
 	(void)close(fds[1]);
 	/* tunnel_new fully owns fds[0] from here, including on failure. */
 	return make_tunnel(fx, 0, fds[0]);
+}
+
+static void set_fixture_pool(
+	struct apifx *fx, struct tunnel *t, struct identity_listener *pool)
+{
+	void *elem = NULL;
+	if (table_find(fx->srv.live_tunnels, t, &elem)) {
+		((struct server_tunnel *)elem)->pool = pool;
+	}
 }
 
 /* Register t in an identity pool keyed by peer_identity, creating the identities
@@ -316,6 +339,7 @@ static bool pool_tunnel(
 		sl->cap_tunnels = new_cap;
 	}
 	sl->tunnels[sl->num_tunnels++] = t;
+	set_fixture_pool(fx, t, sl);
 	return true;
 }
 
@@ -347,8 +371,17 @@ static int apifx_setup(struct apifx *restrict fx)
 		.accepted_tunnels = NULL,
 	};
 
+	fx->srv.live_tunnels = table_new(&TABLE_OPTS_PTR);
+	if (fx->srv.live_tunnels == NULL) {
+		ev_loop_destroy(fx->loop);
+		fx->loop = NULL;
+		return -1;
+	}
+
 	int fds[2];
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+		table_free(fx->srv.live_tunnels);
+		fx->srv.live_tunnels = NULL;
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 		return -1;
@@ -358,6 +391,8 @@ static int apifx_setup(struct apifx *restrict fx)
 	    socket_set_nonblock(fds[1]) != 0) {
 		(void)close(fds[0]);
 		(void)close(fds[1]);
+		table_free(fx->srv.live_tunnels);
+		fx->srv.live_tunnels = NULL;
 		ev_loop_destroy(fx->loop);
 		fx->loop = NULL;
 		return -1;
@@ -403,46 +438,29 @@ static void apifx_teardown(struct apifx *restrict fx)
 	{
 		size_t cursor = 0;
 		void *elem;
+		while (table_next(fx->srv.live_tunnels, &cursor, NULL, &elem)) {
+			struct server_tunnel *const owned = elem;
+			tunnel_close(owned->t);
+			free(owned);
+		}
+		table_free(fx->srv.live_tunnels);
+		fx->srv.live_tunnels = NULL;
+	}
+	{
+		size_t cursor = 0;
+		void *elem;
 		while (table_next(fx->srv.identities, &cursor, NULL, &elem)) {
 			struct identity_listener *const sl = elem;
-			for (size_t j = 0; j < sl->num_tunnels; j++) {
-				struct tunnel *const t = sl->tunnels[j];
-				/* A pooled tunnel may also occupy the mux_tunnel
-				 * or a staging slot; clear both so the sweeps
-				 * below cannot close it a second time. */
-				if (fx->srv.mux_tunnel == t) {
-					fx->srv.mux_tunnel = NULL;
-				}
-				for (size_t k = 0;
-				     k < fx->srv.num_identity_tunnels; k++) {
-					if (fx->srv.identity_tunnels[k] == t) {
-						fx->srv.identity_tunnels[k] =
-							NULL;
-					}
-				}
-				tunnel_close(t);
-			}
 			free((void *)sl->tunnels);
-			sl->tunnels = NULL;
-			sl->num_tunnels = 0;
 			free(sl);
 		}
 		table_free(fx->srv.identities);
 		fx->srv.identities = NULL;
 	}
-	for (size_t i = 0; i < fx->srv.num_identity_tunnels; i++) {
-		if (fx->srv.identity_tunnels[i] != NULL) {
-			tunnel_close(fx->srv.identity_tunnels[i]);
-			fx->srv.identity_tunnels[i] = NULL;
-		}
-	}
 	free((void *)fx->srv.identity_tunnels);
 	fx->srv.identity_tunnels = NULL;
 	fx->srv.num_identity_tunnels = 0;
-	if (fx->srv.mux_tunnel != NULL) {
-		tunnel_close(fx->srv.mux_tunnel);
-		fx->srv.mux_tunnel = NULL;
-	}
+	fx->srv.mux_tunnel = NULL;
 	if (fx->cli_fd >= 0) {
 		(void)close(fx->cli_fd);
 		fx->cli_fd = -1;
@@ -1705,6 +1723,7 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	sl0->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl0->tunnels != NULL);
 	sl0->tunnels[0] = t0;
+	set_fixture_pool(&fx, t0, sl0);
 	sl0->num_tunnels = 1;
 	{
 		void *slot = sl0;
@@ -1720,6 +1739,7 @@ T_DECLARE_CASE(test_stats_get_includes_identity_rows)
 	sl1->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl1->tunnels != NULL);
 	sl1->tunnels[0] = t1;
+	set_fixture_pool(&fx, t1, sl1);
 	sl1->num_tunnels = 1;
 	{
 		void *slot = sl1;
@@ -1772,6 +1792,7 @@ T_DECLARE_CASE(test_healthy_offline)
 	sl_down->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_down->tunnels != NULL);
 	sl_down->tunnels[0] = t_down;
+	set_fixture_pool(&fx, t_down, sl_down);
 	sl_down->num_tunnels = 1;
 	{
 		void *slot = sl_down;
@@ -1790,6 +1811,7 @@ T_DECLARE_CASE(test_healthy_offline)
 	sl_up->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_up->tunnels != NULL);
 	sl_up->tunnels[0] = t_up;
+	set_fixture_pool(&fx, t_up, sl_up);
 	sl_up->num_tunnels = 1;
 	{
 		void *slot = sl_up;
@@ -1850,6 +1872,7 @@ T_DECLARE_CASE(test_healthy_escapes_control_chars_in_identity)
 	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
 	sl->tunnels[0] = t;
+	set_fixture_pool(&fx, t, sl);
 	sl->num_tunnels = 1;
 	{
 		void *slot = sl;
@@ -1941,6 +1964,7 @@ T_DECLARE_CASE(test_stats_identity_shows_window_when_rtt_known)
 	sl_rtt->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_rtt->tunnels != NULL);
 	sl_rtt->tunnels[0] = t1;
+	set_fixture_pool(&fx, t1, sl_rtt);
 	sl_rtt->num_tunnels = 1;
 	{
 		void *slot = sl_rtt;
@@ -1980,8 +2004,7 @@ T_DECLARE_CASE(test_server_stats_dedups_mux_tunnel_in_identity_pool)
 	T_CHECK(fx.srv.identities != NULL);
 	struct tunnel *const t = make_established_tunnel(&fx, 3);
 	T_CHECK(t != NULL);
-	/* Same tunnel is both the top-level mux_tunnel and an identity-pool
-	 * member (teardown frees it once, via the pool). */
+	/* Same tunnel is in two routing views and owned by one registry entry. */
 	fx.srv.mux_tunnel = t;
 	struct identity_listener *const sl = calloc(1, sizeof(*sl));
 	T_CHECK(sl != NULL);
@@ -1989,6 +2012,7 @@ T_DECLARE_CASE(test_server_stats_dedups_mux_tunnel_in_identity_pool)
 	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
 	sl->tunnels[0] = t;
+	set_fixture_pool(&fx, t, sl);
 	sl->num_tunnels = 1;
 	{
 		void *slot = sl;
@@ -2000,7 +2024,7 @@ T_DECLARE_CASE(test_server_stats_dedups_mux_tunnel_in_identity_pool)
 	struct server_stats *const snap = server_stats(&fx.srv, true);
 	const size_t num_tunnels = snap != NULL ? snap->num_tunnels : 0;
 	free(snap);
-	fx.srv.mux_tunnel = NULL; /* freed via the pool by teardown */
+	fx.srv.mux_tunnel = NULL; /* still owned by the registry */
 	apifx_teardown(&fx);
 	T_EXPECT_EQ(num_tunnels, (size_t)1);
 }
@@ -2036,6 +2060,7 @@ T_DECLARE_CASE(test_metrics_floats_use_c_numeric_locale)
 	sl_rtt->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_rtt->tunnels != NULL);
 	sl_rtt->tunnels[0] = t1;
+	set_fixture_pool(&fx, t1, sl_rtt);
 	sl_rtt->num_tunnels = 1;
 	{
 		void *slot = sl_rtt;
@@ -2099,6 +2124,7 @@ T_DECLARE_CASE(test_metrics_reports_identity_window_bytes)
 	sl_win->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl_win->tunnels != NULL);
 	sl_win->tunnels[0] = t1;
+	set_fixture_pool(&fx, t1, sl_win);
 	sl_win->num_tunnels = 1;
 	{
 		void *slot = sl_win;
@@ -2153,6 +2179,7 @@ T_DECLARE_CASE(test_metrics_session_counter_type_matches_samples)
 	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
 	sl->tunnels[0] = t1;
+	set_fixture_pool(&fx, t1, sl);
 	sl->num_tunnels = 1;
 	{
 		void *slot = sl;
@@ -2243,6 +2270,7 @@ T_DECLARE_CASE(test_metrics_escapes_special_chars_in_identity)
 	sl->tunnels = (struct tunnel **)malloc(sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
 	sl->tunnels[0] = t;
+	set_fixture_pool(&fx, t, sl);
 	sl->num_tunnels = 1;
 	{
 		void *slot = sl;
@@ -2323,7 +2351,9 @@ T_DECLARE_CASE(test_metrics_unique_tunnel_label_for_repeated_peer_identity)
 	sl->tunnels = (struct tunnel **)malloc(2 * sizeof(struct tunnel *));
 	T_CHECK(sl->tunnels != NULL);
 	sl->tunnels[0] = t1;
+	set_fixture_pool(&fx, t1, sl);
 	sl->tunnels[1] = t2;
+	set_fixture_pool(&fx, t2, sl);
 	sl->num_tunnels = 2;
 	{
 		void *slot = sl;

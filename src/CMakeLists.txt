@@ -327,6 +327,11 @@ add_src_test(tunnel_test
     tunnel_test.c
 )
 target_link_libraries(tunnel_test PRIVATE mux)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_property(TARGET tunnel_test PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
+    target_link_options(tunnel_test PRIVATE "-Wl,--wrap=table_new")
+    target_compile_definitions(tunnel_test PRIVATE TUNNEL_TEST_WRAP_TABLE_NEW=1)
+endif()
 
 add_src_test(server_test
     conf.c conf.h conf_schema.gen.c conf_schema.gen.h
@@ -340,9 +345,11 @@ add_src_test(server_test
     server_test.c
 )
 target_link_libraries(server_test PRIVATE mux)
+target_compile_definitions(server_test PRIVATE
+    SERVER_TEST_TMPDIR="${CMAKE_BINARY_DIR}/tmp")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_property(TARGET server_test PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
-    target_link_options(server_test PRIVATE "-Wl,--wrap=realloc,--wrap=server_stats,--wrap=tunnel_stats,--wrap=strdup")
+    target_link_options(server_test PRIVATE "-Wl,--wrap=realloc,--wrap=server_stats,--wrap=tunnel_stats,--wrap=strdup,--wrap=tls_psk_label")
     target_compile_definitions(server_test PRIVATE SERVER_TEST_WRAP_SYMBOLS=1)
 endif()
 
