@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 import json
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -154,11 +155,15 @@ class MainTests(unittest.TestCase):
         self.assertIn("reused existing benchmark log", report)
         self.assertIn("| TLS | unknown |", report)
 
-    def benchmark_collaborators(self, stack, processes, benchmark):
+    def benchmark_collaborators(self, stack, processes, benchmark, *, port_lines=None):
         stack.enter_context(mock.patch.object(
             gprof.shutil, "which", side_effect=lambda name: "/tools/" + name))
-        stack.enter_context(mock.patch.object(
-            gprof, "check_port_available", return_value=True))
+        if port_lines is None:
+            stack.enter_context(mock.patch.object(
+                gprof, "check_port_available", return_value=True))
+        else:
+            stack.enter_context(mock.patch.object(
+                gprof, "_ss_listen_lines", side_effect=lambda: list(port_lines)))
         stack.enter_context(mock.patch.object(gprof.time, "sleep"))
         spawn = stack.enter_context(mock.patch.object(
             gprof.subprocess, "Popen", side_effect=processes))
@@ -170,6 +175,39 @@ class MainTests(unittest.TestCase):
         terminate = stack.enter_context(mock.patch.object(
             gprof, "terminate_process"))
         return spawn, run, command, terminate
+
+    def test_collision_cleanup_respects_executable_ownership(self):
+        for owned in (False, True):
+            with self.subTest(owned=owned):
+                rows = [PortOwnershipTests.row("[::]:8443", 42001)]
+                processes = [mock.Mock(pid=100 + i) for i in range(3)]
+                for proc in processes:
+                    proc.poll.return_value = None
+                with ExitStack() as stack:
+                    spawn, run, command, _ = self.benchmark_collaborators(
+                        stack, processes, lambda *a, **k: "traffic", port_lines=rows)
+                    stack.enter_context(mock.patch.object(
+                        gprof, "_proc_exe", return_value=str(
+                            self.binary if owned else self.runtime / "unrelated")))
+                    killed = stack.enter_context(mock.patch.object(
+                        gprof.os, "kill", side_effect=lambda *args: rows.clear()))
+                    args = self.args + [
+                        "--skip-configure", "--skip-build", "--keep-profile-data"]
+                    if owned:
+                        self.assertEqual(gprof.main(args), 0)
+                    else:
+                        with self.assertRaisesRegex(SystemExit, "ports still in use"):
+                            gprof.main(args)
+                if owned:
+                    killed.assert_called_once_with(42001, signal.SIGTERM)
+                    self.assertEqual(spawn.call_count, 3)
+                    run.assert_called_once()
+                    command.assert_called_once()
+                else:
+                    killed.assert_not_called()
+                    spawn.assert_not_called()
+                    run.assert_not_called()
+                    command.assert_not_called()
 
     def test_benchmark_refuses_service_exits_before_teardown(self):
         names = ("iperf3 server", "multiplexd server", "multiplexd client")
@@ -221,6 +259,38 @@ class MainTests(unittest.TestCase):
         self.assertNotIn("unknown", report)
         self.assertIn("successful traffic", report)
 
+    def test_cleanup_failure_still_stops_every_child_and_closes_logs(self):
+        for primary in (None, RuntimeError("benchmark failed")):
+            for cleanup_error in (subprocess.TimeoutExpired("client", 2),
+                                  OSError("cannot signal client")):
+                with self.subTest(primary=primary, cleanup=cleanup_error):
+                    processes = [mock.Mock(pid=100 + i) for i in range(3)]
+                    for proc in processes:
+                        proc.poll.return_value = None
+                    self.output.write_text("previous report\n")
+                    expected = primary if primary is not None else cleanup_error
+                    with ExitStack() as stack:
+                        spawn, run, command, terminate = self.benchmark_collaborators(
+                            stack, processes, lambda *args, **kwargs: "traffic")
+                        if primary is not None:
+                            run.side_effect = primary
+                        terminate.side_effect = [cleanup_error, None, None]
+                        logged = stack.enter_context(mock.patch.object(gprof, "log"))
+                        with self.assertRaises(type(expected)) as caught:
+                            gprof.main(self.args + [
+                                "--skip-configure", "--skip-build", "--keep-profile-data"])
+                    handles = [call.kwargs["stdout"] for call in spawn.call_args_list]
+                    for handle in handles:
+                        self.addCleanup(handle.close)
+                    self.assertIs(caught.exception, expected)
+                    self.assertEqual([call.args[0] for call in terminate.call_args_list],
+                                     list(reversed(processes)))
+                    self.assertTrue(all(handle.closed for handle in handles))
+                    self.assertTrue(any("cleanup failed for multiplexd client" in call.args[0]
+                                        for call in logged.call_args_list))
+                    command.assert_not_called()
+                    self.assertEqual(self.output.read_text(), "previous report\n")
+
     def test_each_enabled_cmake_stage_requires_cmake(self):
         for skipped in ("--skip-configure", "--skip-build"):
             with self.subTest(skipped=skipped):
@@ -248,6 +318,144 @@ class MainTests(unittest.TestCase):
             self.profile.unlink()
             with self.assertRaisesRegex(SystemExit, "no gprof data files found"):
                 gprof.main(self.args + self.skip_all)
+
+
+class PortOwnershipTests(unittest.TestCase):
+    @staticmethod
+    def row(local, pid, peer="*:0"):
+        return 'LISTEN 0 128 %s %s users:(("service",pid=%d,fd=3))' % (
+            local, peer, pid)
+
+    def test_local_port_parsing_handles_wildcards_and_ignores_peer(self):
+        for local in ("*:8443", "0.0.0.0:8443", "[::]:8443", "127.0.0.1:8443"):
+            with self.subTest(local=local):
+                row = self.row(local, 42001, "127.0.0.1:9081")
+                self.assertEqual(gprof._line_listen_port(row), 8443)
+                with mock.patch.object(gprof, "_ss_listen_lines", return_value=[row]):
+                    self.assertFalse(gprof.check_port_available(8443))
+                    self.assertTrue(gprof.check_port_available(9081))
+                    self.assertEqual(gprof._parse_listening_pids(8443), [42001])
+                    self.assertEqual(gprof._parse_listening_pids(9081), [])
+        for row in ("", "State Recv-Q Send-Q Local Address:Port Peer Address:Port",
+                    "LISTEN 0 128 *:https *:0", "LISTEN 0 128 malformed *:0"):
+            with self.subTest(row=row):
+                self.assertIsNone(gprof._line_listen_port(row))
+
+    def test_only_owned_listeners_are_signalled_once(self):
+        binary = (gprof.ROOT / "build/multiplexd").resolve()
+        iperf = (gprof.ROOT / "build/iperf3").resolve()
+        rows = [self.row("*:8443", 42001), self.row("[::]:8443", 42001),
+                self.row("*:9081", 42001), self.row("0.0.0.0:5201", 42002),
+                self.row("*:8443", 42003), self.row("*:8443", 42004),
+                self.row("*:8443", 42005), self.row("*:9999", 42006)]
+        exes = {42001: str(binary), 42002: str(iperf),
+                42003: str(gprof.ROOT / "build/unrelated"), 42004: None}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(gprof, "_ss_listen_lines", return_value=rows))
+            stack.enter_context(mock.patch.object(gprof.os, "getpid", return_value=42005))
+            exe = stack.enter_context(mock.patch.object(gprof, "_proc_exe", side_effect=exes.get))
+            kill = stack.enter_context(mock.patch.object(gprof.os, "kill"))
+            stack.enter_context(mock.patch.object(gprof.time, "sleep"))
+            self.assertEqual(gprof.kill_leftover_on_ports(
+                [(8443, "mux"), (9081, "api"), (5201, "iperf")], [binary, iperf]), 2)
+        self.assertEqual(kill.call_args_list, [mock.call(42001, signal.SIGTERM),
+                                              mock.call(42002, signal.SIGTERM)])
+        self.assertNotIn(mock.call(42005), exe.call_args_list)
+        self.assertNotIn(mock.call(42006), exe.call_args_list)
+
+
+class BenchmarkProcessTests(unittest.TestCase):
+    def setUp(self):
+        scratch = Path("build/tmp")
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=scratch)
+        self.addCleanup(self.temp.cleanup)
+        self.runtime = Path(self.temp.name)
+        self.budget = gprof.ProcessShutdownBudget(0.1, 0.1)
+
+    def run_client(self, proc):
+        with mock.patch.object(gprof.subprocess, "Popen", return_value=proc) as spawn:
+            try:
+                return gprof.run_benchmark(
+                    [["iperf3", "-c", "127.0.0.1"]], cwd=self.runtime,
+                    stdout_log_path=self.runtime / "stdout.log",
+                    stderr_log_path=self.runtime / "stderr.log",
+                    timeout_seconds=1, shutdown_budget=self.budget)
+            finally:
+                if spawn.called:
+                    self.assertTrue(spawn.call_args.kwargs["stdout"].closed)
+                    self.assertTrue(spawn.call_args.kwargs["stderr"].closed)
+
+    @staticmethod
+    def process(outcomes):
+        proc = mock.Mock(pid=42001, returncode=None)
+        proc.poll.side_effect = lambda: proc.returncode
+        results = iter(outcomes)
+
+        def wait(**kwargs):
+            outcome = next(results)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            proc.returncode = outcome
+            return outcome
+
+        proc.wait.side_effect = wait
+        return proc
+
+    def test_cancellation_and_wait_errors_reap_client_and_close_logs(self):
+        for error in (KeyboardInterrupt(), RuntimeError("wait failed")):
+            with self.subTest(error=type(error).__name__):
+                proc = self.process([error, -signal.SIGINT])
+                with self.assertRaises(type(error)) as caught:
+                    self.run_client(proc)
+                self.assertIs(caught.exception, error)
+                proc.send_signal.assert_called_once_with(signal.SIGINT)
+                self.assertIsNotNone(proc.returncode)
+                self.assertEqual(proc.wait.call_count, 2)
+
+    def test_timeout_escalates_to_kill_and_preserves_timeout_diagnostic(self):
+        timeout = subprocess.TimeoutExpired("iperf3", 1)
+        proc = self.process([timeout, timeout, timeout, -signal.SIGKILL])
+        with self.assertRaisesRegex(SystemExit, "timed out after 1.0 seconds"):
+            self.run_client(proc)
+        proc.send_signal.assert_called_once_with(signal.SIGINT)
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+        self.assertEqual(proc.returncode, -signal.SIGKILL)
+        self.assertEqual(proc.wait.call_count, 4)
+
+    def test_cleanup_errors_still_force_reap_and_preserve_cancellation(self):
+        for stage in ("send_signal", "terminate", "wait", "kill"):
+            with self.subTest(stage=stage):
+                primary = KeyboardInterrupt()
+                failure = OSError("graceful cleanup failed")
+                timeout = subprocess.TimeoutExpired("iperf3", 1)
+                outcomes = [primary]
+                if stage == "terminate":
+                    outcomes.append(timeout)
+                elif stage == "kill":
+                    outcomes.extend([timeout, timeout])
+                elif stage == "wait":
+                    outcomes.append(failure)
+                outcomes.append(-signal.SIGKILL)
+                proc = self.process(outcomes)
+                if stage != "wait":
+                    getattr(proc, stage).side_effect = failure
+                with mock.patch.object(gprof, "log") as logged:
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        self.run_client(proc)
+                self.assertIs(caught.exception, primary)
+                proc.kill.assert_called_once_with()
+                self.assertEqual(proc.returncode, -signal.SIGKILL)
+                self.assertTrue(any("cleanup failed for benchmark client" in call.args[0]
+                                    for call in logged.call_args_list))
+
+    def test_successful_client_is_not_signalled(self):
+        proc = self.process([0])
+        self.assertIn("$ iperf3", self.run_client(proc))
+        proc.send_signal.assert_not_called()
+        proc.terminate.assert_not_called()
+        proc.kill.assert_not_called()
 
 
 class CredentialTests(unittest.TestCase):

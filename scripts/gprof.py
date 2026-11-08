@@ -14,9 +14,10 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence, TextIO
 
 from smoke_test import BUILTIN_CERT_PEM, BUILTIN_KEY_PEM
 
@@ -169,6 +170,21 @@ def kill_leftover_on_ports(
     return len(killed_pids)
 
 
+def _log_lines(stream: TextIO) -> Iterator[str]:
+    """Stream splitlines-compatible lines, retaining only an incomplete line."""
+    parts: List[str] = []
+    # TextIO normalizes CR and CRLF; splitlines also recognizes these separators.
+    endings = "\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+    for chunk in iter(lambda: stream.read(65536), ""):
+        for line in chunk.splitlines(keepends=True):
+            parts.append(line)
+            if line[-1] in endings:
+                yield "".join(parts)
+                parts.clear()
+    if parts:
+        yield "".join(parts)
+
+
 def verify_process_running(
         proc: subprocess.Popen[str],
         name: str,
@@ -185,9 +201,10 @@ def verify_process_running(
     tail_text = ""
     if log_path is not None and log_path.exists():
         try:
-            text = log_path.read_text(encoding="utf-8", errors="replace")
-            lines = [l.rstrip() for l in text.splitlines() if l.strip()]
-            tail_text = "\n".join(lines[-20:])
+            with log_path.open(encoding="utf-8", errors="replace") as stream:
+                lines = deque((line.rstrip() for line in _log_lines(stream)
+                               if line.strip()), maxlen=20)
+            tail_text = "\n".join(lines)
         except Exception:
             pass
     raise SystemExit(
@@ -399,16 +416,49 @@ def terminate_process(
     if proc.poll() is not None:
         return
     log("stopping %s [pid:%d]" % (name, proc.pid))
-    proc.send_signal(signal.SIGINT)
     try:
-        proc.wait(timeout=shutdown_budget.sigint_wait_seconds)
-    except subprocess.TimeoutExpired:
-        proc.terminate()
+        proc.send_signal(signal.SIGINT)
         try:
-            proc.wait(timeout=shutdown_budget.terminate_wait_seconds)
+            proc.wait(timeout=shutdown_budget.sigint_wait_seconds)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=max(2.0, shutdown_budget.terminate_wait_seconds))
+            proc.terminate()
+            try:
+                proc.wait(timeout=shutdown_budget.terminate_wait_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            finally:
+                proc.wait(timeout=max(
+                    2.0, shutdown_budget.terminate_wait_seconds))
+
+
+def cleanup_services(
+        services: Sequence[tuple[Optional[subprocess.Popen[str]], str]],
+        handles: Sequence[Optional[TextIO]],
+        *,
+        shutdown_budget: ProcessShutdownBudget,
+        preserve_error: bool,
+) -> None:
+    errors: List[tuple[str, Exception]] = []
+    for proc, name in services:
+        if proc is not None:
+            try:
+                terminate_process(proc, name, shutdown_budget=shutdown_budget)
+            except Exception as error:
+                errors.append((name, error))
+    for handle in handles:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception as error:
+                errors.append(("log handle", error))
+    for name, error in errors:
+        log("cleanup failed for %s: %s" % (name, error))
+    if errors and not preserve_error:
+        raise errors[0][1]
 
 
 def ensure_certificates(binary_path: Path, runtime_dir: Path) -> None:
@@ -514,23 +564,15 @@ def run_benchmark(
             try:
                 proc.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
-                proc.send_signal(signal.SIGINT)
-                try:
-                    proc.wait(timeout=shutdown_budget.sigint_wait_seconds)
-                except subprocess.TimeoutExpired:
-                    proc.terminate()
-                    try:
-                        proc.wait(
-                            timeout=shutdown_budget.terminate_wait_seconds)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=max(
-                            2.0, shutdown_budget.terminate_wait_seconds))
-                stdout_handle.flush()
-                stderr_handle.flush()
                 raise SystemExit(
                     "benchmark command timed out after %.1f seconds: %s"
                     % (timeout_seconds, quote_command(command))
+                )
+            finally:
+                cleanup_services(
+                    ((proc, "benchmark client"),), (),
+                    shutdown_budget=shutdown_budget,
+                    preserve_error=sys.exc_info()[0] is not None,
                 )
             stdout_handle.flush()
             stderr_handle.flush()
@@ -932,6 +974,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     client_log = None
     iperf_server_log = None
 
+    work_finished = False
     try:
         if not args.skip_benchmark:
             server_config_path, client_config_path = prepare_runtime_assets(
@@ -1059,28 +1102,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for proc, name, log_path in services:
                 verify_process_running(
                     proc, name, log_path=log_path, wait_seconds=0.0)
+        work_finished = True
     finally:
-        if client_proc is not None:
-            terminate_process(
-                client_proc,
-                "multiplexd client",
-                shutdown_budget=shutdown_budget,
-            )
-        if server_proc is not None:
-            terminate_process(
-                server_proc,
-                "multiplexd server",
-                shutdown_budget=shutdown_budget,
-            )
-        if iperf_server_proc is not None:
-            terminate_process(
-                iperf_server_proc,
-                "iperf3 server",
-                shutdown_budget=shutdown_budget,
-            )
-        for handle in (iperf_server_log, client_log, server_log):
-            if handle is not None:
-                handle.close()
+        cleanup_services(
+            ((client_proc, "multiplexd client"),
+             (server_proc, "multiplexd server"),
+             (iperf_server_proc, "iperf3 server")),
+            (iperf_server_log, client_log, server_log),
+            shutdown_budget=shutdown_budget,
+            preserve_error=not work_finished,
+        )
 
     profile_files = collect_profile_files(profile_build_dir)
     if not profile_files:
