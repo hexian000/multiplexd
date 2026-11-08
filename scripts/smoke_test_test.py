@@ -30,12 +30,18 @@ class _FakeDaemons:
 
     start_ok = True
     started: List[str] = []
+    created: List["_FakeDaemons"] = []
 
     def __init__(self, binary: Path, log_dir: Path, *, tag: str,
                  **_kwargs: object) -> None:
         self.tag = tag
+        self.server_cfg = _kwargs.get("server_cfg")
+        self.client_cfg = _kwargs.get("client_cfg")
+        self.extra_clients = _kwargs.get("extra_clients", [])
+        _FakeDaemons.created.append(self)
         self.server: Optional[object] = None
         self.client: Optional[object] = None
+        self.premature_exits: List[str] = []
 
     def start(self) -> bool:
         _FakeDaemons.started.append(self.tag)
@@ -93,6 +99,7 @@ class _Base(unittest.TestCase):
     def setUp(self) -> None:
         _FakeDaemons.start_ok = True
         _FakeDaemons.started = []
+        _FakeDaemons.created = []
         scratch = smoke_test.ROOT / "build" / "tmp"
         scratch.mkdir(parents=True, exist_ok=True)
         self.temp_dir = tempfile.TemporaryDirectory(dir=scratch)
@@ -120,6 +127,8 @@ class _Base(unittest.TestCase):
                        smoke_test.run_parallel_topology,
                        smoke_test.run_identity_verify_topology,
                        smoke_test.run_udp_topology,
+                       smoke_test.run_multi_peer_topology,
+                       smoke_test.run_udp_negotiation_topology,
                        smoke_test.run_resumption_topology):
             runner(binary, self.log_dir, suite, rng, self.sizes,
                    window=None, loglevel=0)
@@ -341,6 +350,278 @@ class UdpIsolationTests(_Base):
                 self.assertIn(want, detail)
 
 
+class PluginTopologyTests(_Base):
+    def run_plugin(self, name: str) -> smoke_test.Suite:
+        suite = smoke_test.Suite(only={name})
+        with ExitStack() as stack:
+            for helper in ("scen_identity_routes", "scen_udp_multiflow",
+                           "scen_udp_tcp_coexistence", "scen_udp_unnegotiated",
+                           "scen_integrity"):
+                stack.enter_context(mock.patch.object(
+                    smoke_test, helper, return_value=(True, "verified")))
+            self.run_all_topologies(suite)
+        return suite
+
+    def test_udp_topologies_reserve_ports_for_both_protocols(self) -> None:
+        for scenario, expected in (
+                ("udp_multiflow", (12, (0, 1, 5, 6, 10, 11))),
+                ("udp_multi_peer", (11, tuple(range(4, 11)))),
+                ("identity_multi_peer", (11, ())),
+                ("udp_negotiation", (7, (0, 1, 5, 6)))):
+            with self.subTest(scenario=scenario), mock.patch.object(
+                    smoke_test, "free_ports", wraps=smoke_test.free_ports) as reserve:
+                self.run_plugin(scenario)
+                self.assertTrue(reserve.called)
+                for call in reserve.call_args_list:
+                    self.assertEqual(call.args, (expected[0],))
+                    self.assertEqual(tuple(call.kwargs.get("udp", ())), expected[1])
+
+    def test_each_plugin_scenario_starts_only_its_topology(self) -> None:
+        for name, tags in (
+                ("identity_multi_peer", ["multi-peer"]),
+                ("udp_multi_peer", ["multi-peer"]),
+                ("udp_negotiation", ["udp-only-server", "udp-only-client"]),
+                ("udp_multiflow", ["udp"]),
+                ("udp_tcp_coexistence", ["udp"])):
+            with self.subTest(name=name):
+                _FakeDaemons.started = []
+                suite = self.run_plugin(name)
+                self.assertEqual(_FakeDaemons.started, tags)
+                self.assertEqual([(r.name, r.status) for r in suite.results],
+                                 [(name, "PASS")])
+
+    def test_start_failure_reports_only_the_selected_scenario(self) -> None:
+        _FakeDaemons.start_ok = False
+        for name in ("identity_multi_peer", "udp_multi_peer", "udp_negotiation",
+                     "udp_multiflow", "udp_tcp_coexistence"):
+            with self.subTest(name=name):
+                suite = self.run_plugin(name)
+                self.assertEqual(len(suite.results), 1)
+                self.assertTrue(suite.results[0].gating_failure)
+                self.assertIn(name, suite.results[0].name + suite.results[0].detail)
+
+    def test_multi_peer_configs_keep_distinct_routes(self) -> None:
+        for scenario in ("identity_multi_peer", "udp_multi_peer"):
+            with self.subTest(scenario=scenario):
+                self.run_plugin(scenario)
+                pair = _FakeDaemons.created[-1]
+                hub = pair.server_cfg
+                a = pair.client_cfg
+                b, _api = pair.extra_clients[0]
+                self.assertEqual(set(hub["identity"]["listen"]),
+                                 {"spoke-a", "spoke-b"})
+                self.assertEqual(a["identity"]["claim"], "spoke-a")
+                self.assertEqual(b["identity"]["claim"], "spoke-b")
+                for cfg in (a, b):
+                    self.assertEqual(set(cfg["identity"]["listen"]), {"hub"})
+                    self.assertEqual(cfg["identity"]["mux_connect"],
+                                     [hub["mux_listen"]])
+                for cfg in (hub, a, b):
+                    self.assertEqual("lossymux" in cfg["mux"],
+                                     scenario == "udp_multi_peer")
+                    self.assertFalse(cfg["identity"].get("verify", False))
+
+    def test_negotiation_exercises_both_unilateral_offers(self) -> None:
+        self.run_plugin("udp_negotiation")
+        for pair in _FakeDaemons.created:
+            self.assertEqual("lossymux" in pair.server_cfg["mux"],
+                             pair.tag == "udp-only-server")
+            self.assertEqual("lossymux" in pair.client_cfg["mux"],
+                             pair.tag == "udp-only-client")
+
+    def test_new_scenarios_gate_on_abnormal_exit(self) -> None:
+        for name in ("identity_multi_peer", "udp_multi_peer", "udp_negotiation",
+                     "udp_multiflow", "udp_tcp_coexistence"):
+            with self.subTest(name=name), mock.patch.object(
+                    _FakeDaemons, "shutdown", return_value=(1, 0)):
+                suite = self.run_plugin(name)
+                self.assertTrue(any(r.gating_failure for r in suite.results))
+
+    def test_all_clients_spawn_before_health_checks(self) -> None:
+        pair = _REAL_DAEMONS(
+            self.log_dir, self.log_dir, server_cfg={}, client_cfg={},
+            server_api=1, client_api=2, tag="multi",
+            extra_clients=[({}, 3)])
+        procs = [mock.Mock() for _ in range(3)]
+        with mock.patch.object(pair, "_spawn", side_effect=procs) as spawn:
+            def healthy(api: int, _label: str, *, proc: object) -> bool:
+                self.assertEqual(spawn.call_count, 3)
+                self.assertIs(proc, procs[api - 1])
+                return api != 3
+
+            with mock.patch.object(smoke_test, "wait_healthy", healthy):
+                self.assertFalse(pair.start())
+        self.assertEqual([call.args[1] for call in spawn.call_args_list],
+                         ["server", "client", "client-2"])
+
+    def test_extra_client_exit_gates_and_retains_unreaped_handle(self) -> None:
+        for rc in (0, 1, None):
+            with self.subTest(rc=rc):
+                pair = _REAL_DAEMONS(
+                    self.log_dir, self.log_dir, server_cfg={}, client_cfg={},
+                    server_api=1, client_api=2, tag="multi")
+                extra = mock.Mock()
+                pair._extra_procs = [(extra, 3, "client-2")]
+                with mock.patch.object(smoke_test, "terminate_process", return_value=rc):
+                    suite = smoke_test.Suite()
+                    suite.teardown(pair)
+                self.assertEqual(bool(suite.results), rc != 0)
+                self.assertEqual(bool(pair._extra_procs), rc is None)
+
+
+class PluginPayloadTests(unittest.TestCase):
+    def test_tcp_routes_reject_the_wrong_backend_or_corrupt_payload(self) -> None:
+        for greeting, echoed, error in ((b"wrong---", b"", "reached"),
+                                        (b"right---", b"bad", "corrupt")):
+            with self.subTest(greeting=greeting):
+                sock = mock.MagicMock()
+                with mock.patch.object(smoke_test, "connect", return_value=sock), \
+                        mock.patch.object(smoke_test, "recv_exact",
+                                          side_effect=(greeting, echoed)):
+                    with self.assertRaisesRegex(ValueError, error):
+                        smoke_test.scen_identity_routes([(1, b"right---")],
+                                                       smoke_test.random.Random(1), 16)
+                if greeting != b"right---":
+                    sock.__enter__.return_value.sendall.assert_not_called()
+
+    def test_udp_multiflow_rejects_cross_socket_replies(self) -> None:
+        sockets = [mock.MagicMock(), mock.MagicMock()]
+        sockets[0].recv.side_effect = lambda _size: sockets[1].send.call_args.args[0]
+        with mock.patch.object(smoke_test.socket, "socket", side_effect=sockets), \
+                mock.patch.object(smoke_test.select, "select",
+                                  return_value=([sockets[0]], [], [])):
+            ok, detail = smoke_test.scen_udp_multiflow(
+                [(1, b"")], smoke_test.random.Random(1), 2)
+        self.assertFalse(ok)
+        self.assertIn("wrong flow", detail)
+        for sock in sockets:
+            sock.close.assert_called_once()
+
+    def test_udp_multiflow_rejects_wrong_backend_and_missing_replies(self) -> None:
+        for wrong_backend in (True, False):
+            with self.subTest(wrong_backend=wrong_backend):
+                sock = mock.Mock()
+                sock.recv.return_value = b"wrong---payload"
+                readable = [sock] if wrong_backend else []
+                with mock.patch.object(smoke_test.socket, "socket", return_value=sock), \
+                        mock.patch.object(smoke_test.select, "select",
+                                          return_value=(readable, [], [])), \
+                        mock.patch.object(smoke_test.time, "monotonic",
+                                          side_effect=range(100)):
+                    ok, _detail = smoke_test.scen_udp_multiflow(
+                        [(1, b"right---")], smoke_test.random.Random(1), 1)
+                self.assertFalse(ok)
+                sock.close.assert_called_once()
+
+    def test_udp_multiflow_accepts_only_own_replies_across_all_rounds(self) -> None:
+        sockets = [mock.Mock(), mock.Mock()]
+        for sock in sockets:
+            sock.recv.side_effect = lambda _size, s=sock: b"backend-" + s.send.call_args.args[0]
+        rounds = []
+        with mock.patch.object(smoke_test.socket, "socket", side_effect=sockets), \
+                mock.patch.object(smoke_test.select, "select",
+                                  return_value=(sockets, [], [])):
+            ok, _detail = smoke_test.scen_udp_multiflow(
+                [(1, b"backend-")], smoke_test.random.Random(1), 2,
+                after_round=rounds.append)
+        self.assertTrue(ok)
+        self.assertEqual(rounds, [0, 1, 2])
+        self.assertTrue(all(sock.send.call_count == 3 for sock in sockets))
+
+    def test_udp_multiflow_retries_missing_and_ignores_own_duplicates(self) -> None:
+        sock = mock.Mock()
+        replies = []
+        sent = []
+
+        def send(data: bytes) -> None:
+            sent.append(data)
+            if len(sent) > 1:
+                if len(sent) > 2:
+                    replies.append(sent[-2])
+                replies.append(data)
+
+        sock.send.side_effect = send
+        sock.recv.side_effect = lambda _size: replies.pop(0)
+        with mock.patch.object(smoke_test.socket, "socket", return_value=sock), \
+                mock.patch.object(smoke_test.select, "select",
+                                  side_effect=lambda *_args: ([sock] if replies else [], [], [])):
+            ok, _detail = smoke_test.scen_udp_multiflow(
+                [(1, b"")], smoke_test.random.Random(1), 1)
+        self.assertTrue(ok)
+        self.assertEqual(len(sent), 4)
+        self.assertEqual(sent[0], sent[1])
+        self.assertNotEqual(sent[1], sent[2])
+        sock.close.assert_called_once()
+
+    def test_unnegotiated_udp_refuses_unavailable_or_malformed_stats(self) -> None:
+        for status, text in ((503, "unavailable"), (200, "Datagrams: missing")):
+            with self.subTest(status=status), \
+                    mock.patch.object(smoke_test, "api_request", return_value=(status, text)):
+                with self.assertRaises(ValueError):
+                    smoke_test.scen_udp_unnegotiated(1, 2)
+
+    def test_unnegotiated_udp_requires_new_drops_and_no_reply(self) -> None:
+        for counters, reply, expected in (((3, 4), False, True),
+                                          ((3, 3), False, False),
+                                          ((3, 4), True, False)):
+            with self.subTest(counters=counters, reply=reply):
+                sock = mock.MagicMock()
+                sock.__enter__.return_value = sock
+                if not reply:
+                    sock.recv.side_effect = socket.timeout
+                stats = [(200, "Datagrams: Rx 0, Tx 0, Dropped %d, Flows 0" % n)
+                         for n in counters]
+                with mock.patch.object(smoke_test.socket, "socket", return_value=sock), \
+                        mock.patch.object(smoke_test, "api_request", side_effect=stats), \
+                        mock.patch.object(smoke_test.time, "monotonic",
+                                          side_effect=(0, 0, 2)):
+                    ok, _detail = smoke_test.scen_udp_unnegotiated(1, 2)
+                self.assertEqual(ok, expected)
+                sock.send.assert_called_once()
+
+    def test_coexistence_requires_tcp_progress_between_udp_rounds(self) -> None:
+        class EchoSocket:
+            def __init__(self) -> None:
+                self.pending = b""
+                self.sent = []
+
+            def sendall(self, data: bytes) -> None:
+                self.pending += data
+                self.sent.append(data)
+
+            def recv(self, n: int) -> bytes:
+                data, self.pending = self.pending[:n], self.pending[n:]
+                return data
+
+            def gettimeout(self) -> float:
+                return 5.0
+
+            def settimeout(self, _timeout: Optional[float]) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        for progress in (True, False):
+            with self.subTest(progress=progress):
+                sock = EchoSocket()
+
+                def udp(*_args: object, **kwargs: object) -> Tuple[bool, str]:
+                    self.assertEqual(sock.sent, [b"tcp-warmup"])
+                    if progress:
+                        for round_no in range(3):
+                            kwargs["after_round"](round_no)
+                        self.assertEqual(len(sock.sent), 2)
+                    return True, "UDP ok"
+
+                with mock.patch.object(smoke_test, "connect", return_value=sock), \
+                        mock.patch.object(smoke_test, "scen_udp_multiflow", udp):
+                    ok, _detail = smoke_test.scen_udp_tcp_coexistence(
+                        [1], smoke_test.random.Random(1), 16)
+                self.assertEqual(ok, progress)
+                self.assertEqual(sock.sent[-1], b"tcp-final")
+
+
 class TeardownTests(_Base):
     def test_traffic_only_scenarios_gate_on_abnormal_exit(self) -> None:
         for name, tag in (("psk_match", "psk-ok"),
@@ -357,6 +638,10 @@ class TeardownTests(_Base):
                             smoke_test, scenario, return_value=(True, "traffic ok")))
                     stack.enter_context(mock.patch.object(
                         smoke_test, "wait_sessions", return_value=(True, "2")))
+                    stack.enter_context(mock.patch.object(
+                        smoke_test, "stream_open_counts", side_effect=[
+                            {"1": 0, "2": 0}, {"1": 1, "2": 1},
+                            {"1": 0, "2": 0}, {"1": 1, "2": 1}]))
                     stack.enter_context(mock.patch.object(
                         smoke_test, "udp_echo", return_value=True))
                     stack.enter_context(mock.patch.object(
@@ -376,17 +661,55 @@ class TeardownTests(_Base):
                     self.log_dir / "multiplexd", self.log_dir, server_cfg={},
                     client_cfg={}, server_api=1, client_api=2, tag="probe")
                 pair.client = mock.Mock(pid=123, returncode=client_rc)
-                pair.client.poll.return_value = client_rc
+                pair.client.poll.side_effect = [None, client_rc]
                 if client_rc is None:
+                    pair.client.poll.side_effect = None
+                    pair.client.poll.return_value = None
                     pair.client.wait.side_effect = subprocess.TimeoutExpired("probe", 1)
                 pair.server = mock.Mock(pid=456, returncode=server_rc)
-                pair.server.poll.return_value = server_rc
+                pair.server.poll.side_effect = [None, server_rc]
                 suite = smoke_test.Suite(only={"psk_match"})
                 suite.teardown(pair)
                 self.assertEqual(any(r.gating_failure for r in suite.results),
                                  client_rc != 0 or server_rc != 0)
                 self.assertEqual(pair.client is not None, client_rc is None)
                 self.assertIsNone(pair.server)
+
+    def test_zero_exit_before_shutdown_fails_for_every_owned_role(self) -> None:
+        for role in ("client", "server", "extra"):
+            with self.subTest(role=role):
+                pair = _REAL_DAEMONS(
+                    self.log_dir, self.log_dir, server_cfg={}, client_cfg={},
+                    server_api=1, client_api=2, tag="probe")
+                proc = mock.Mock(pid=123)
+                proc.poll.return_value = 0
+                if role == "extra":
+                    pair._extra_procs = [(proc, 3, "client-2")]
+                else:
+                    setattr(pair, role, proc)
+                suite = smoke_test.Suite(only={"forward_integrity"})
+                suite.teardown(pair)
+                self.assertEqual(len(suite.results), 1)
+                self.assertTrue(suite.results[0].gating_failure)
+                self.assertIn("exited before shutdown", suite.results[0].detail)
+                self.assertIn("code 0", suite.results[0].detail)
+                proc.send_signal.assert_not_called()
+                self.assertIsNone(pair.client)
+                self.assertIsNone(pair.server)
+                self.assertEqual(pair._extra_procs, [])
+
+    def test_intentionally_stopped_process_is_not_checked_again(self) -> None:
+        pair = _REAL_DAEMONS(
+            self.log_dir, self.log_dir, server_cfg={}, client_cfg={},
+            server_api=1, client_api=2, tag="probe")
+        proc = mock.Mock(pid=123)
+        proc.poll.side_effect = [None, 0]
+        pair.client = proc
+        self.assertEqual(pair.shutdown(), (0, 0))
+        suite = smoke_test.Suite()
+        suite.teardown(pair)
+        self.assertEqual(suite.results, [])
+        self.assertEqual(proc.poll.call_count, 2)
 
     def test_teardown_exception_gates_the_suite(self) -> None:
         pair = _FakeDaemons(self.log_dir, self.log_dir, tag="probe")
@@ -412,6 +735,215 @@ class TeardownTests(_Base):
         self.assertEqual([(r.name, r.status) for r in suite.results],
                          [("identity_verify_mismatch", "PASS"),
                           ("psk_mismatch", "PASS")])
+
+
+class SocketBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = 10.0
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(
+            smoke_test.time, "monotonic", side_effect=lambda: self.now))
+        self.sleep = self.stack.enter_context(mock.patch.object(
+            smoke_test.time, "sleep", side_effect=self.advance))
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def test_recv_caps_each_read_and_restores_timeout(self) -> None:
+        for original in (None, 30.0, 0.25):
+            with self.subTest(original=original):
+                self.now = 10.0
+                sock = mock.Mock()
+                sock.gettimeout.return_value = original
+
+                def recv(_size: int) -> bytes:
+                    self.advance(0.5)
+                    return b"x"
+
+                sock.recv.side_effect = recv
+                self.assertEqual(smoke_test.recv_exact(sock, 2, deadline=12.0), b"xx")
+                cap = 2.0 if original is None else min(2.0, original)
+                next_cap = 1.5 if original is None else min(1.5, original)
+                self.assertEqual(sock.settimeout.call_args_list,
+                                 [mock.call(cap), mock.call(next_cap), mock.call(original)])
+
+    def test_recv_rejects_late_complete_payload_and_closes_budget_on_timeout(self) -> None:
+        for timed_out in (False, True):
+            with self.subTest(timed_out=timed_out):
+                self.now = 10.0
+                sock = mock.Mock()
+                sock.gettimeout.return_value = 30.0
+
+                def recv(_size: int) -> bytes:
+                    self.advance(2.0)
+                    if timed_out:
+                        raise socket.timeout()
+                    return b"complete"
+
+                sock.recv.side_effect = recv
+                with self.assertRaises(TimeoutError):
+                    smoke_test.recv_exact(sock, 8, deadline=11.0)
+                sock.recv.assert_called_once()
+                self.assertEqual(sock.settimeout.call_args_list,
+                                 [mock.call(1.0), mock.call(30.0)])
+
+    def test_recv_does_not_start_after_deadline_and_restores_after_eof(self) -> None:
+        sock = mock.Mock()
+        sock.gettimeout.return_value = None
+        with self.assertRaises(TimeoutError):
+            smoke_test.recv_exact(sock, 1, deadline=10.0)
+        sock.recv.assert_not_called()
+        sock.recv.return_value = b""
+        with self.assertRaises(ConnectionError):
+            smoke_test.recv_exact(sock, 1, deadline=11.0)
+        sock.settimeout.assert_called_with(None)
+
+    def test_connect_caps_operation_and_retry_delay(self) -> None:
+        sock = mock.Mock()
+
+        def refuse(_address: object) -> None:
+            self.advance(0.95)
+            raise ConnectionRefusedError()
+
+        sock.connect.side_effect = refuse
+        with mock.patch.object(smoke_test.socket, "socket", return_value=sock) as factory:
+            with self.assertRaises(TimeoutError):
+                smoke_test.connect(1, deadline=11.0)
+        sock.settimeout.assert_called_once_with(1.0)
+        sock.close.assert_called_once()
+        self.assertEqual(factory.call_count, 1)
+        self.assertAlmostEqual(self.sleep.call_args.args[0], 0.05)
+        self.assertEqual(self.now, 11.0)
+
+    def test_connect_rejects_a_late_success(self) -> None:
+        sock = mock.Mock()
+        sock.connect.side_effect = lambda _address: self.advance(2.0)
+        with mock.patch.object(smoke_test.socket, "socket", return_value=sock):
+            with self.assertRaises(TimeoutError):
+                smoke_test.connect(1, deadline=11.0)
+        sock.close.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_recovery_passes_budget_through_send_and_receive(self) -> None:
+        sock = mock.Mock()
+        sock.gettimeout.return_value = 4.0
+        payload = b"p" * 64
+
+        def connected(_port: int, *, timeout: float, deadline: float) -> object:
+            self.assertEqual(deadline, 15.0)
+            self.advance(1.0)
+            return sock
+
+        sock.sendall.side_effect = lambda _data: self.advance(1.0)
+        sock.recv.side_effect = lambda _size: payload
+        with mock.patch.object(smoke_test, "connect", side_effect=connected), \
+                mock.patch.object(smoke_test, "make_payload", return_value=payload):
+            self.assertTrue(smoke_test.wait_forward_ready(1, mock.Mock(), timeout=5.0))
+        self.assertEqual(sock.settimeout.call_args_list,
+                         [mock.call(4.0), mock.call(3.0), mock.call(4.0)])
+        sock.close.assert_called_once()
+
+    def test_recovery_closes_failed_probe_and_caps_retry_sleep(self) -> None:
+        sock = mock.Mock()
+
+        def send(_data: bytes) -> None:
+            self.advance(0.9)
+            raise socket.timeout()
+
+        sock.sendall.side_effect = send
+        with mock.patch.object(smoke_test, "connect", return_value=sock):
+            self.assertFalse(smoke_test.wait_forward_ready(1, mock.Mock(), timeout=1.0))
+        sock.close.assert_called_once()
+        self.assertAlmostEqual(self.sleep.call_args.args[0], 0.1)
+        self.assertEqual(self.now, 11.0)
+
+
+class BulkExchangeTests(unittest.TestCase):
+    def test_verifies_echo_and_preserves_send_pacing(self) -> None:
+        for payload, received, expected in (
+            (b"", b"", (True, "0 bytes verified")),
+            (b"echo", b"echo", (True, "4 bytes verified")),
+            (b"echo", b"ech", (False, "length mismatch: got 3 want 4")),
+            (b"echo", b"xxxx", (False, "payload mismatch (4 bytes)")),
+        ):
+            with self.subTest(payload=payload, received=received):
+                sock = mock.Mock()
+                with mock.patch.object(smoke_test, "connect", return_value=sock), \
+                        mock.patch.object(smoke_test, "recv_exact", return_value=received) as recv, \
+                        mock.patch.object(smoke_test.time, "monotonic", return_value=10.0), \
+                        mock.patch.object(smoke_test.time, "sleep") as pace, \
+                        mock.patch.object(smoke_test, "_CHUNK", 2):
+                    self.assertEqual(smoke_test.bulk_exchange(
+                        1234, payload, timeout=3.0, pace_seconds=0.1), expected)
+                recv.assert_called_once_with(sock, len(payload), deadline=13.0)
+                self.assertEqual(sock.sendall.call_args_list,
+                                 [mock.call(payload[i:i + 2])
+                                  for i in range(0, len(payload), 2)])
+                self.assertEqual(pace.call_count, (len(payload) + 1) // 2)
+                sock.settimeout.assert_called_once_with(3.0)
+                sock.close.assert_called_once()
+
+    def test_collects_sender_and_receiver_errors_before_comparing(self) -> None:
+        sock = mock.Mock()
+        sock.sendall.side_effect = OSError("send failed")
+        with mock.patch.object(smoke_test, "connect", return_value=sock), \
+                mock.patch.object(smoke_test, "recv_exact", side_effect=TimeoutError("late")):
+            ok, detail = smoke_test.bulk_exchange(1234, b"echo", timeout=3.0)
+        self.assertFalse(ok)
+        self.assertIn("receiver: TimeoutError('late')", detail)
+        self.assertIn("sender: OSError('send failed')", detail)
+        sock.close.assert_called_once()
+
+    def test_unfinished_receiver_reports_timeout_after_closing_socket(self) -> None:
+        sock = mock.Mock()
+        rx = mock.Mock()
+        rx.is_alive.return_value = True
+        with mock.patch.object(smoke_test, "connect", return_value=sock), \
+                mock.patch.object(smoke_test.threading, "Thread", return_value=rx):
+            self.assertEqual(smoke_test.bulk_exchange(1234, b"echo", timeout=3.0),
+                             (False, "transfer did not complete within 3.0 s"))
+        rx.start.assert_called_once()
+        rx.join.assert_called_once_with(timeout=3.0)
+        sock.close.assert_called_once()
+
+
+class PortReservationTests(unittest.TestCase):
+    def test_udp_only_occupation_rejects_a_tcp_candidate(self) -> None:
+        real_socket = socket.socket
+        with real_socket(socket.AF_INET, socket.SOCK_DGRAM) as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            port = occupied.getsockname()[1]
+            candidates = []
+
+            class CandidateSocket(real_socket):
+                def bind(self, address: Tuple[str, int]) -> None:
+                    if self.type == socket.SOCK_STREAM:
+                        candidates.append(self)
+                        if len(candidates) == 1:
+                            address = (address[0], port)
+                    super().bind(address)
+
+            with mock.patch.object(smoke_test.socket, "socket", CandidateSocket):
+                ports = smoke_test.free_ports(2, udp=(0, 1))
+            self.assertNotIn(port, ports)
+            self.assertEqual(len(set(ports)), 2)
+            self.assertEqual(len(candidates), 3)
+            self.assertTrue(all(sock.fileno() == -1 for sock in candidates))
+            for selected in ports:
+                with real_socket() as tcp, real_socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                    tcp.bind(("127.0.0.1", selected))
+                    udp.bind(("127.0.0.1", selected))
+
+    def test_reservations_are_closed_when_a_later_bind_fails(self) -> None:
+        sockets = [mock.Mock(), mock.Mock(), mock.Mock()]
+        sockets[0].getsockname.return_value = ("127.0.0.1", 1234)
+        sockets[2].bind.side_effect = PermissionError(13, "denied")
+        with mock.patch.object(smoke_test.socket, "socket", side_effect=sockets):
+            with self.assertRaises(PermissionError):
+                smoke_test.free_ports(2, udp=(0,))
+        for sock in sockets:
+            sock.close.assert_called_once()
 
 
 class CoexistenceTests(unittest.TestCase):
@@ -604,7 +1136,10 @@ class _EchoSocket:
         self.corrupt = False
         self.read_error: Optional[OSError] = None
 
-    def settimeout(self, _timeout: float) -> None:
+    def gettimeout(self) -> float:
+        return 30.0
+
+    def settimeout(self, _timeout: Optional[float]) -> None:
         pass
 
     def sendall(self, data: bytes) -> None:
@@ -749,14 +1284,204 @@ class ActiveFaultTests(unittest.TestCase):
                 self.assertFalse(ok)
 
 
+class ReadinessBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = 10.0
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(
+            smoke_test.time, "monotonic", side_effect=lambda: self.now))
+        self.sleep = self.stack.enter_context(mock.patch.object(
+            smoke_test.time, "sleep", side_effect=self.advance))
+        self.stack.enter_context(mock.patch.object(smoke_test, "log"))
+        self.stats = (200, "Sessions: 2 / 2\n")
+        self.api = self.stack.enter_context(mock.patch.object(
+            smoke_test, "api_request", return_value=self.stats))
+        self.response = mock.MagicMock()
+        self.response.__enter__.return_value.status = 200
+        self.opener = self.stack.enter_context(mock.patch.object(
+            smoke_test._OPENER, "open", return_value=self.response))
+        self.proc = mock.Mock()
+        self.proc.poll.return_value = None
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def wait(self, kind: str, timeout: float) -> bool:
+        if kind == "sessions":
+            return smoke_test.wait_sessions(1, 2, timeout=timeout)[0]
+        return smoke_test.wait_healthy(1, "test", proc=self.proc, timeout=timeout)
+
+    def probe(self, kind: str) -> mock.Mock:
+        return self.api if kind == "sessions" else self.opener
+
+    def result(self, kind: str) -> object:
+        return self.stats if kind == "sessions" else self.response
+
+    def test_no_probe_after_expired_budget(self) -> None:
+        for kind in ("sessions", "healthy"):
+            for timeout in (0.0, -1.0):
+                with self.subTest(kind=kind, timeout=timeout):
+                    self.assertFalse(self.wait(kind, timeout))
+                    self.probe(kind).assert_not_called()
+                    self.sleep.assert_not_called()
+
+    def test_success_at_or_after_deadline_is_rejected(self) -> None:
+        for kind in ("sessions", "healthy"):
+            for elapsed in (1.0, 1.5):
+                with self.subTest(kind=kind, elapsed=elapsed):
+                    self.now = 10.0
+                    probe = self.probe(kind)
+                    probe.reset_mock()
+
+                    def late(*_args: object, **_kwargs: object) -> object:
+                        self.advance(elapsed)
+                        return self.result(kind)
+
+                    probe.side_effect = late
+                    self.assertFalse(self.wait(kind, 1.0))
+                    self.assertEqual(probe.call_count, 1)
+                    self.assertEqual(probe.call_args.kwargs["timeout"], 1.0)
+                    self.sleep.assert_not_called()
+
+    def test_probe_and_retry_sleep_fit_remaining_budget(self) -> None:
+        for kind in ("sessions", "healthy"):
+            with self.subTest(kind=kind):
+                self.now = 10.0
+                self.sleep.reset_mock()
+                probe = self.probe(kind)
+                probe.reset_mock()
+
+                def unavailable(*_args: object, **_kwargs: object) -> object:
+                    self.advance(0.03)
+                    raise OSError("not ready")
+
+                probe.side_effect = unavailable
+                self.assertFalse(self.wait(kind, 0.05))
+                self.assertEqual(probe.call_count, 1)
+                self.assertAlmostEqual(probe.call_args.kwargs["timeout"], 0.05)
+                self.sleep.assert_called_once()
+                self.assertAlmostEqual(self.sleep.call_args.args[0], 0.02)
+                self.assertAlmostEqual(self.now, 10.05)
+
+    def test_retry_can_succeed_before_deadline(self) -> None:
+        for kind, pause in (("sessions", 0.1), ("healthy", 0.2)):
+            with self.subTest(kind=kind):
+                self.now = 10.0
+                self.sleep.reset_mock()
+                probe = self.probe(kind)
+                probe.reset_mock()
+
+                def retry(*_args: object, **_kwargs: object) -> object:
+                    self.advance(0.05)
+                    if probe.call_count == 1:
+                        raise OSError("not ready")
+                    return self.result(kind)
+
+                probe.side_effect = retry
+                self.assertTrue(self.wait(kind, 0.5))
+                self.assertEqual(probe.call_count, 2)
+                self.assertAlmostEqual(probe.call_args_list[0].kwargs["timeout"], 0.5)
+                self.assertAlmostEqual(probe.call_args_list[1].kwargs["timeout"],
+                                       0.45 - pause)
+                self.sleep.assert_called_once_with(pause)
+                self.assertLess(self.now, 10.5)
+
+    def test_probe_timeout_retains_normal_cap(self) -> None:
+        for kind, cap in (("sessions", 5.0), ("healthy", 1.0)):
+            with self.subTest(kind=kind):
+                self.assertTrue(self.wait(kind, 10.0))
+                self.assertEqual(self.probe(kind).call_args.kwargs["timeout"], cap)
+
+    def test_process_exit_prevents_health_probe(self) -> None:
+        self.proc.poll.return_value = 7
+        self.proc.returncode = 7
+        self.assertFalse(self.wait("healthy", 1.0))
+        self.opener.assert_not_called()
+        self.sleep.assert_not_called()
+
+
 class ParallelSessionsTests(_Base):
+    @staticmethod
+    def metrics(identity: str, counts: dict) -> str:
+        return "".join(
+            'multiplexd_session_stream_open_total{identity="%s",tunnel="%s"} %d\n'
+            % (identity, tunnel, count) for tunnel, count in counts.items())
+
+    def run_parallel(self, snapshots: list) -> smoke_test.ScenarioResult:
+        def api_request(_port: int, path: str,
+                        **_kwargs: object) -> Tuple[int, str]:
+            self.assertEqual(path, "/metrics")
+            return 200, snapshots.pop(0)
+
+        self.stack.enter_context(mock.patch.object(
+            smoke_test, "wait_sessions", return_value=(True, "2 / 2")))
+        self.stack.enter_context(mock.patch.object(
+            smoke_test, "api_request", side_effect=api_request))
+        self.traffic = self.stack.enter_context(mock.patch.object(
+            smoke_test, "scen_concurrent_streams", return_value=(True, "traffic ok")))
+        self.integrity = self.stack.enter_context(mock.patch.object(
+            smoke_test, "scen_integrity", return_value=(True, "reverse ok")))
+        suite = smoke_test.Suite(only={"parallel_tunnels"})
+        smoke_test.run_parallel_topology(
+            self.log_dir / "multiplexd", self.log_dir, suite,
+            smoke_test.random.Random(1), self.sizes, window=None, loglevel=0)
+        return suite.results[0]
+
+    def test_requires_each_tunnel_to_carry_new_streams_in_both_directions(self) -> None:
+        for forward, reverse, expected in (
+                ({"1": 4, "2": 3}, {"7": 5, "8": 6}, "PASS"),
+                ({"1": 8, "2": 2}, {"7": 5, "8": 6}, "FAIL"),
+                ({"1": 4, "2": 3}, {"7": 9, "8": 4}, "FAIL")):
+            with self.subTest(forward=forward, reverse=reverse):
+                result = self.run_parallel([
+                    self.metrics("server", {"1": 2, "2": 2}),
+                    self.metrics("server", forward),
+                    self.metrics("client", {"7": 4, "8": 4}),
+                    self.metrics("client", reverse)])
+                self.assertEqual(result.status, expected, result.detail)
+                if expected == "FAIL":
+                    self.assertIn("did not use every tunnel", result.detail)
+                else:
+                    self.assertEqual(self.traffic.call_count, 2)
+                    self.integrity.assert_called_once()
+
+    def test_rejects_missing_replaced_and_reset_tunnel_counters(self) -> None:
+        for before, after, message in (
+                ({"1": 0}, {"1": 2}, "expected 2 tunnel counters"),
+                ({"1": 0, "2": 0}, {"1": 2, "3": 2}, "tunnel set changed"),
+                ({"1": 5, "2": 5}, {"1": 1, "2": 6}, "did not use every tunnel")):
+            with self.subTest(before=before, after=after):
+                result = self.run_parallel([
+                    self.metrics("server", before), self.metrics("server", after)])
+                self.assertEqual(result.status, "FAIL")
+                self.assertIn(message, result.detail)
+
+    def test_stream_counter_parser_filters_peer_and_rejects_bad_responses(self) -> None:
+        valid = self.metrics("server", {"1": 23, "2": 29})
+        other = self.metrics("client", {"1": 99})
+        with mock.patch.object(smoke_test, "api_request", return_value=(200, valid + other)):
+            self.assertEqual(smoke_test.stream_open_counts(1, "server"),
+                             {"1": 23, "2": 29})
+        for response in ((503, valid), (200, valid + valid)):
+            with self.subTest(response=response), mock.patch.object(
+                    smoke_test, "api_request", return_value=response):
+                with self.assertRaises(ValueError):
+                    smoke_test.stream_open_counts(1, "server")
+
     def test_waits_for_trailing_tunnels(self) -> None:
         # /healthy is 200 with one tunnel up; the others arrive on a later
         # backoff step, after the first /stats read.
         stats_reads = []
+        metric_reads = []
 
         def api_request(_port: int, path: str,
                         **_kwargs: object) -> Tuple[int, str]:
+            if path == "/metrics":
+                metric_reads.append(path)
+                identity = "server" if len(metric_reads) <= 2 else "client"
+                count = len(metric_reads) % 2 == 0
+                return 200, self.metrics(identity, {"1": int(count), "2": int(count)})
             self.assertEqual(path, "/stats")
             stats_reads.append(path)
             up = 1 if len(stats_reads) < 3 else self.sizes.tunnels
@@ -780,6 +1505,16 @@ class ParallelSessionsTests(_Base):
                          statuses["parallel_tunnels"][1])
 
     def test_gives_up_at_the_deadline(self) -> None:
+        now = 10.0
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        self.stack.enter_context(mock.patch.object(
+            smoke_test.time, "monotonic", side_effect=lambda: now))
+        self.stack.enter_context(mock.patch.object(
+            smoke_test.time, "sleep", side_effect=advance))
         self.stack.enter_context(mock.patch.object(
             smoke_test, "api_request",
             return_value=(200, "Sessions            : 1 / 1 (+0)\n")))
@@ -846,6 +1581,8 @@ class GeneratorTests(_Base):
 
 
 class RelayTests(unittest.TestCase):
+    recv_limit: Optional[int] = None
+
     def setUp(self) -> None:
         self.waiting = {}
         self.condition = threading.Condition()
@@ -855,12 +1592,15 @@ class RelayTests(unittest.TestCase):
         test = self
 
         class ObservedSocket(original_socket):
-            def recv(self, *args: object, **kwargs: object) -> bytes:
+            def recv(self, size: int, flags: int = 0) -> bytes:
+                if (threading.current_thread().name != "relay-pump"
+                        and test.recv_limit is not None):
+                    size = min(size, test.recv_limit)
                 if threading.current_thread().name == "relay-pump":
                     ready, _, _ = original_select([self], [], [], 0)
                     if not ready:
                         test.mark_wait(self, True)
-                data = super().recv(*args, **kwargs)
+                data = super().recv(size, flags)
                 if threading.current_thread().name == "relay-pump" and data:
                     test.mark_wait(self, False)
                 return data
@@ -905,9 +1645,11 @@ class RelayTests(unittest.TestCase):
         self.stack.callback(back.close)
         back.settimeout(2.0)
         front.sendall(b"forward")
-        self.assertEqual(back.recv(7), b"forward")
+        self.assertEqual(smoke_test.recv_exact(
+            back, 7, deadline=smoke_test.time.monotonic() + 2.0), b"forward")
         back.sendall(b"reverse")
-        self.assertEqual(front.recv(7), b"reverse")
+        self.assertEqual(smoke_test.recv_exact(
+            front, 7, deadline=smoke_test.time.monotonic() + 2.0), b"reverse")
         # Every successful recv clears the observation. Both pumps must have
         # returned to an empty read before the control thread injects a fault.
         with self.condition:
@@ -1013,9 +1755,18 @@ class RelayTests(unittest.TestCase):
         front.shutdown(socket.SHUT_WR)
         self.assertEqual(back.recv(1), b"")
         back.sendall(b"after EOF")
-        self.assertEqual(front.recv(9), b"after EOF")
+        self.assertEqual(
+            smoke_test.recv_exact(
+                front, 9, deadline=smoke_test.time.monotonic() + 2.0),
+            b"after EOF")
         back.shutdown(socket.SHUT_WR)
         self.assertEqual(front.recv(1), b"")
+
+
+class FragmentedRelayTests(RelayTests):
+    """Run the relay regressions with legal one-byte application reads."""
+
+    recv_limit = 1
 
 
 if __name__ == "__main__":

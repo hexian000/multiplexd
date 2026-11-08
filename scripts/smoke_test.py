@@ -3,7 +3,7 @@
 """End-to-end smoke test for multiplexd.
 
 This is a multi-scenario suite that exercises the daemon the way real
-deployments do, rather than a single happy-path run.  It builds three live
+deployments do, rather than a single happy-path run.  It builds live
 server/client topologies and runs a battery of scenarios against each:
 
 Load topology (plain bidirectional, single tunnel, API enabled)
@@ -28,6 +28,15 @@ UDP topology (lossymux enabled on both ends, plain and identity-routed pairs)
                           effort, so some may be dropped)
   * udp_stats           - /stats "Datagrams" counts the relayed traffic
   * udp_identity        - datagram echo over identity.listen routing
+  * udp_multiflow       - distinct source sockets receive only their own replies
+  * udp_tcp_coexistence - TCP and UDP exchange data on the same listener ports
+
+Multi-peer topology (one hub, two spokes, distinct backend markers)
+  * identity_multi_peer - concurrent TCP routes select the correct named peer
+  * udp_multi_peer      - UDP routes select the correct peer and source socket
+
+Unilateral lossymux topologies (server-only and client-only offers)
+  * udp_negotiation     - UDP is dropped while TCP continues in both directions
 
 Resumption topology (single tunnel through a kill-able TCP relay)
   * session_resumption  - transport is RST mid-transfer; the client reconnects
@@ -53,8 +62,10 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import random
+import re
 import select
 import shlex
 import signal
@@ -66,6 +77,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -250,71 +262,98 @@ def write_config(path: Path, payload: Dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=4) + "\n", encoding="utf-8")
 
 
-def free_ports(count: int) -> List[int]:
-    """Return *count* distinct available localhost TCP port numbers.
+def free_ports(count: int, *, udp: Sequence[int] = ()) -> List[int]:
+    """Return distinct localhost TCP ports, checking UDP for the given indices.
 
-    All sockets are held open simultaneously so the OS cannot reassign a port
-    before we have collected the full set.
+    Hold all reservations together until the full set has been collected.
     """
     socks: List[socket.socket] = []
     ports: List[int] = []
     try:
-        for _ in range(count):
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 0))
-            socks.append(s)
-            ports.append(s.getsockname()[1])
+        for index in range(count):
+            for _ in range(100):
+                candidate = [socket.socket(socket.AF_INET, socket.SOCK_STREAM)]
+                try:
+                    s = candidate[0]
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(("127.0.0.1", 0))
+                    port = s.getsockname()[1]
+                    if index in udp:
+                        d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        candidate.append(d)
+                        d.bind(("127.0.0.1", port))
+                except OSError as exc:
+                    for s in candidate:
+                        s.close()
+                    if exc.errno != errno.EADDRINUSE:
+                        raise
+                else:
+                    socks.extend(candidate)
+                    ports.append(port)
+                    break
+            else:
+                raise OSError(errno.EADDRINUSE, "could not reserve a free port")
     finally:
         for s in socks:
-            try:
-                s.close()
-            except OSError:
-                pass
+            s.close()
     return ports
 
 
-def connect(port: int, *, timeout: float = 5.0,
-            attempts: int = 20) -> socket.socket:
-    """Open a blocking TCP connection to a localhost *port*, with retries.
+def remaining_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("socket operation deadline expired")
+    return remaining
 
-    The local listener is up by the time the daemon reports healthy, but a
-    freshly reloaded listener may briefly refuse; a short retry loop absorbs
-    that without flaking.
-    """
+
+def connect(port: int, *, timeout: float = 5.0,
+            attempts: int = 20, deadline: Optional[float] = None) -> socket.socket:
+    """Open a blocking localhost TCP connection, retrying within *deadline*."""
     last: Optional[OSError] = None
-    for _ in range(attempts):
+    for attempt in range(attempts):
+        operation_timeout = timeout
+        if deadline is not None:
+            operation_timeout = min(timeout, remaining_time(deadline))
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
+        s.settimeout(operation_timeout)
         try:
             s.connect(("127.0.0.1", port))
+            if deadline is not None:
+                remaining_time(deadline)
             return s
         except OSError as exc:
             last = exc
-            try:
-                s.close()
-            except OSError:
-                pass
-            time.sleep(0.1)
+            s.close()
+            if attempt + 1 < attempts:
+                delay = 0.1
+                if deadline is not None:
+                    delay = min(delay, remaining_time(deadline))
+                time.sleep(delay)
     raise ConnectionError(
         "could not connect to 127.0.0.1:%d: %s" % (port, last))
 
 
 def recv_exact(sock: socket.socket, n: int, *, deadline: float) -> bytes:
-    """Read exactly *n* bytes from *sock* or raise before *deadline*."""
+    """Read exactly *n* bytes before *deadline*, preserving the socket timeout."""
     buf = bytearray()
-    while len(buf) < n:
-        if time.monotonic() > deadline:
-            raise TimeoutError(
-                "timed out after %d/%d bytes" % (len(buf), n))
-        try:
-            chunk = sock.recv(min(_CHUNK, n - len(buf)))
-        except socket.timeout:
-            continue
-        if not chunk:
-            raise ConnectionError("EOF after %d/%d bytes" % (len(buf), n))
-        buf += chunk
-    return bytes(buf)
+    original_timeout = sock.gettimeout()
+    try:
+        while len(buf) < n:
+            timeout = remaining_time(deadline)
+            if original_timeout is not None:
+                timeout = min(timeout, original_timeout)
+            sock.settimeout(timeout)
+            try:
+                chunk = sock.recv(min(_CHUNK, n - len(buf)))
+            except socket.timeout:
+                continue
+            remaining_time(deadline)
+            if not chunk:
+                raise ConnectionError("EOF after %d/%d bytes" % (len(buf), n))
+            buf += chunk
+        return bytes(buf)
+    finally:
+        sock.settimeout(original_timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +369,11 @@ class EchoServer:
     on EOF or peer close.
     """
 
-    def __init__(self, port: int, name: str = "echo") -> None:
+    def __init__(self, port: int, name: str = "echo", *,
+                 prefix: bytes = b"") -> None:
         self._port = port
         self._name = name
+        self._prefix = prefix
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -372,13 +413,15 @@ class EchoServer:
             except OSError:
                 break  # listener closed by stop()
             threading.Thread(
-                target=EchoServer._handle, args=(conn,), daemon=True
+                target=EchoServer._handle, args=(conn, self._prefix), daemon=True
             ).start()
 
     @staticmethod
-    def _handle(conn: socket.socket) -> None:
+    def _handle(conn: socket.socket, prefix: bytes = b"") -> None:
         conn.settimeout(None)
         try:
+            if prefix:
+                conn.sendall(prefix)
             while True:
                 chunk = conn.recv(_CHUNK)
                 if not chunk:
@@ -400,9 +443,11 @@ class UdpEchoServer:
     lossymux peer relays each flow to its ``connect`` address over UDP.
     """
 
-    def __init__(self, port: int, name: str = "udp-echo") -> None:
+    def __init__(self, port: int, name: str = "udp-echo", *,
+                 prefix: bytes = b"") -> None:
         self._port = port
         self._name = name
+        self._prefix = prefix
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -431,7 +476,7 @@ class UdpEchoServer:
         while not self._stop.is_set():
             try:
                 data, addr = self._sock.recvfrom(65536)
-                self._sock.sendto(data, addr)
+                self._sock.sendto(self._prefix + data, addr)
             except socket.timeout:
                 continue
             except OSError:
@@ -658,6 +703,25 @@ def stat_reconnects(api_port: int) -> int:
     return int(parse_stats(text).get("Reconnects", "0"))
 
 
+def stream_open_counts(api_port: int, identity: str) -> Dict[str, int]:
+    """Read active-open counters keyed by tunnel for the named peer."""
+    status, text = api_request(api_port, "/metrics")
+    if status != 200:
+        raise ValueError("/metrics status %d" % status)
+    pattern = re.compile(
+        r'multiplexd_session_stream_open_total\{identity="%s",'
+        r'tunnel="([0-9]+)"\} ([0-9]+)' % re.escape(identity))
+    counts: Dict[str, int] = {}
+    for line in text.splitlines():
+        match = pattern.fullmatch(line)
+        if match is not None:
+            tunnel, count = match.groups()
+            if tunnel in counts:
+                raise ValueError("duplicate stream-open counter for tunnel %s" % tunnel)
+            counts[tunnel] = int(count)
+    return counts
+
+
 def wait_sessions(api_port: int, want: int, *,
                   timeout: float = 20.0) -> Tuple[bool, str]:
     """Poll /stats until at least *want* mux sessions are up, or time out.
@@ -670,16 +734,22 @@ def wait_sessions(api_port: int, want: int, *,
     deadline = time.monotonic() + timeout
     sessions_field = ""
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, sessions_field
         try:
-            _status, text = api_request(api_port, "/stats")
+            _status, text = api_request(
+                api_port, "/stats", timeout=min(5.0, remaining))
             sessions_field = parse_stats(text).get("Sessions", "")
-            if int(sessions_field.split("/")[0]) >= want:
+            if (int(sessions_field.split("/")[0]) >= want
+                    and time.monotonic() < deadline):
                 return True, sessions_field
         except (OSError, ValueError):
             pass
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return False, sessions_field
-        time.sleep(0.1)
+        time.sleep(min(0.1, remaining))
 
 
 def wait_forward_ready(port: int, rng: random.Random,
@@ -694,16 +764,20 @@ def wait_forward_ready(port: int, rng: random.Random,
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            s = connect(port, timeout=5.0)
-            s.settimeout(5.0)
-            s.sendall(probe)
-            got = recv_exact(s, 64, deadline=time.monotonic() + 5.0)
-            s.close()
-            if got == probe:
-                return True
-        except Exception:  # noqa: BLE001
+            s = connect(port, timeout=5.0, deadline=deadline)
+            try:
+                s.settimeout(min(5.0, remaining_time(deadline)))
+                s.sendall(probe)
+                got = recv_exact(s, 64, deadline=deadline)
+                if got == probe:
+                    return True
+            finally:
+                s.close()
+        except OSError:
             pass
-        time.sleep(0.3)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.3, remaining))
     return False
 
 
@@ -717,6 +791,7 @@ def terminate_process(
     *,
     sigterm_timeout: float = 10.0,
     sigkill_timeout: float = 3.0,
+    premature_exits: Optional[List[str]] = None,
 ) -> Optional[int]:
     """Send SIGTERM and wait.  Escalate to SIGKILL on timeout.
 
@@ -724,11 +799,14 @@ def terminate_process(
     when even SIGKILL did not reap the process -- e.g. it is wedged in an
     uninterruptible kernel wait.  A ``None`` return means the process is still
     alive: the caller must keep its handle so the live PID is not forgotten,
-    not treat it as successfully stopped.
+    not treat it as successfully stopped. If supplied, *premature_exits* records
+    processes that exited before this helper requested their shutdown.
     """
     rc = proc.poll()
     if rc is not None:
         log("  %s already exited (code %d)" % (name, rc))
+        if premature_exits is not None:
+            premature_exits.append("%s (code %d)" % (name, rc))
         return rc
     log("stopping %s [pid:%d]" % (name, proc.pid))
     proc.send_signal(signal.SIGTERM)
@@ -784,14 +862,19 @@ def wait_healthy(
             log("[FAIL] %s exited prematurely (code %s)" %
                 (label, proc.returncode))
             return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            with _OPENER.open(url, timeout=1.0) as resp:
-                if resp.status == 200:
+            with _OPENER.open(url, timeout=min(1.0, remaining)) as resp:
+                if resp.status == 200 and time.monotonic() < deadline:
                     log("  %s healthy (api_port=%d)" % (label, api_port))
                     return True
         except Exception:
             pass
-        time.sleep(0.2)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.2, remaining))
     log("[FAIL] %s did not become healthy within %.1f s" % (label, timeout))
     return False
 
@@ -937,12 +1020,13 @@ def build_identity_client(
 # ---------------------------------------------------------------------------
 
 class Daemons:
-    """A running server+client pair with their log handles and API ports."""
+    """A server and its clients, with their log handles and API ports."""
 
     def __init__(
         self, binary: Path, log_dir: Path, *,
         server_cfg: Dict[str, object], client_cfg: Dict[str, object],
         server_api: int, client_api: int, tag: str,
+        extra_clients: Sequence[Tuple[Dict[str, object], int]] = (),
     ) -> None:
         self.binary = binary
         self.log_dir = log_dir
@@ -951,9 +1035,12 @@ class Daemons:
         self.tag = tag
         self._server_cfg = server_cfg
         self._client_cfg = client_cfg
+        self._extra_clients = extra_clients
+        self._extra_procs: List[Tuple["subprocess.Popen[bytes]", int, str]] = []
         self.server: Optional["subprocess.Popen[bytes]"] = None
         self.client: Optional["subprocess.Popen[bytes]"] = None
         self._fhs: List[object] = []
+        self.premature_exits: List[str] = []
 
     def _spawn(self, cfg: Dict[str, object], role: str) -> "subprocess.Popen[bytes]":
         cfg_path = self.log_dir / ("%s-%s.json" % (self.tag, role))
@@ -966,30 +1053,38 @@ class Daemons:
             cmd, cwd=str(self.log_dir), stdout=fh, stderr=subprocess.STDOUT)
 
     def spawn(self) -> None:
-        """Start both processes without waiting for either to become healthy.
+        """Start all processes without waiting for any to become healthy.
 
         For scenarios where one peer is expected to stay offline, so start()'s
         health gate would report the intended outcome as a failure.
         """
         self.server = self._spawn(self._server_cfg, "server")
         self.client = self._spawn(self._client_cfg, "client")
+        for i, (cfg, api_port) in enumerate(self._extra_clients):
+            role = "client-%d" % (i + 2)
+            self._extra_procs.append((self._spawn(cfg, role), api_port, role))
 
     def start(self) -> bool:
-        """Start both processes and wait until each reports healthy.
+        """Start all processes and wait until each reports healthy.
 
         Healthy means every forwarding listener has one tunnel; a scenario
         that needs more sessions than that waits for them itself.
         """
-        self.server = self._spawn(self._server_cfg, "server")
-        self.client = self._spawn(self._client_cfg, "client")
+        self.spawn()
         if not wait_healthy(self.server_api, "%s server" % self.tag,
                             proc=self.server):
             return False
-        return wait_healthy(self.client_api, "%s client" % self.tag,
-                            proc=self.client)
+        if not wait_healthy(self.client_api, "%s client" % self.tag,
+                            proc=self.client):
+            return False
+        return all(wait_healthy(api, "%s %s" % (self.tag, role), proc=proc)
+                   for proc, api, role in self._extra_procs)
 
     def shutdown(self) -> Tuple[Optional[int], Optional[int]]:
-        """Stop client then server; return (client_rc, server_rc).
+        """Stop clients then server; return (client_rc, server_rc).
+
+        client_rc includes failures from any additional clients. Processes that
+        exited before shutdown are recorded in premature_exits, even at code 0.
 
         A daemon that could not be reaped keeps its handle -- so the live PID
         is not forgotten -- and yields a ``None`` rc, which the caller's
@@ -998,11 +1093,25 @@ class Daemons:
         client_rc: Optional[int] = 0
         server_rc: Optional[int] = 0
         if self.client is not None:
-            client_rc = terminate_process(self.client, "%s client" % self.tag)
+            client_rc = terminate_process(
+                self.client, "%s client" % self.tag,
+                premature_exits=self.premature_exits)
             if client_rc is not None:
                 self.client = None
+        remaining = []
+        for proc, api, role in self._extra_procs:
+            rc = terminate_process(
+                proc, "%s %s" % (self.tag, role),
+                premature_exits=self.premature_exits)
+            if rc != 0:
+                client_rc = rc if client_rc == 0 else client_rc
+            if rc is None:
+                remaining.append((proc, api, role))
+        self._extra_procs = remaining
         if self.server is not None:
-            server_rc = terminate_process(self.server, "%s server" % self.tag)
+            server_rc = terminate_process(
+                self.server, "%s server" % self.tag,
+                premature_exits=self.premature_exits)
             if server_rc is not None:
                 self.server = None
         for fh in self._fhs:
@@ -1040,15 +1149,18 @@ PSK_MATCH_SCENARIOS = ("psk_match",)
 PSK_MISMATCH_SCENARIOS = ("psk_mismatch",)
 IDENTITY_VERIFY_MATCH_SCENARIOS = ("identity_verify_match",)
 IDENTITY_VERIFY_MISMATCH_SCENARIOS = ("identity_verify_mismatch",)
+MULTI_PEER_SCENARIOS = ("identity_multi_peer", "udp_multi_peer")
+UDP_NEGOTIATION_SCENARIOS = ("udp_negotiation",)
 UDP_SCENARIOS = (
     "udp_forward", "udp_reverse", "udp_burst", "udp_stats", "udp_identity",
-    "udp_shutdown",
+    "udp_shutdown", "udp_multiflow", "udp_tcp_coexistence",
 )
 RESUMPTION_SCENARIOS = ("session_resumption", "resumption_shutdown")
 ALL_SCENARIOS = (
     STANDALONE_SCENARIOS + LOAD_SCENARIOS + PARALLEL_SCENARIOS
     + PSK_MATCH_SCENARIOS + PSK_MISMATCH_SCENARIOS
     + IDENTITY_VERIFY_MATCH_SCENARIOS + IDENTITY_VERIFY_MISMATCH_SCENARIOS
+    + MULTI_PEER_SCENARIOS + UDP_NEGOTIATION_SCENARIOS
     + UDP_SCENARIOS + RESUMPTION_SCENARIOS
 )
 
@@ -1097,10 +1209,12 @@ class Suite:
         """Always gate the run on daemon exits, including with --only."""
         try:
             client_rc, server_rc = daemons.shutdown()
-            if client_rc == 0 and server_rc == 0:
+            if client_rc == 0 and server_rc == 0 and not daemons.premature_exits:
                 return
             detail = "client rc=%s server rc=%s (expected 0)" % (
                 client_rc, server_rc)
+            if daemons.premature_exits:
+                detail += "; exited before shutdown: " + ", ".join(daemons.premature_exits)
         except Exception as exc:  # noqa: BLE001
             detail = "exception during teardown: %r" % exc
         name = "%s_teardown" % daemons.tag
@@ -1155,13 +1269,14 @@ def bulk_exchange(
     """
     sock = connect(port, timeout=timeout)
     sock.settimeout(timeout)
-    received = bytearray()
+    received = b""
     errors: List[str] = []
     deadline = time.monotonic() + timeout
 
     def receiver() -> None:
+        nonlocal received
         try:
-            received.extend(recv_exact(sock, len(payload), deadline=deadline))
+            received = recv_exact(sock, len(payload), deadline=deadline)
         except Exception as exc:  # noqa: BLE001
             errors.append("receiver: %r" % exc)
 
@@ -1188,7 +1303,7 @@ def bulk_exchange(
     if len(received) != len(payload):
         return False, "length mismatch: got %d want %d" % (
             len(received), len(payload))
-    if bytes(received) != payload:
+    if received != payload:
         return False, "payload mismatch (%d bytes)" % len(payload)
     return True, "%d bytes verified" % len(payload)
 
@@ -1999,22 +2114,43 @@ def run_parallel_topology(binary: Path, log_dir: Path, suite: Suite,
                                "daemons not healthy")
             return
 
+        def distributed(port: int, api: int, identity: str) -> Tuple[bool, str]:
+            before = stream_open_counts(api, identity)
+            if len(before) != sizes.tunnels:
+                return False, "expected %d tunnel counters, got %r" % (
+                    sizes.tunnels, before)
+            ok, detail = scen_concurrent_streams(
+                port, rng, max(sizes.streams, sizes.tunnels), sizes.stream_msg)
+            if not ok:
+                return False, detail
+            after = stream_open_counts(api, identity)
+            if before.keys() != after.keys():
+                return False, "tunnel set changed: %r -> %r" % (before, after)
+            deltas = {tunnel: after[tunnel] - count
+                      for tunnel, count in before.items()}
+            if any(count <= 0 for count in deltas.values()):
+                return False, "streams did not use every tunnel: %r" % deltas
+            return True, "%s, stream opens per tunnel %r" % (detail, deltas)
+
         def parallel() -> Tuple[bool, str]:
             # The client should hold one session per configured tunnel.
             ok, sessions_field = wait_sessions(cli_api, sizes.tunnels)
             if not ok:
                 return False, "expected %d sessions, /stats shows %r" % (
                     sizes.tunnels, sessions_field)
-            ok, detail = scen_concurrent_streams(
-                fwd_listen, rng, sizes.streams, sizes.stream_msg)
+            ok, detail = distributed(fwd_listen, cli_api, "server")
             if not ok:
                 return False, "forward: %s" % detail
             # Reverse direction over identity routing too.
+            ok, reverse_detail = distributed(rev_listen, srv_api, "client")
+            if not ok:
+                return False, "reverse: %s" % reverse_detail
             ok, rdetail = scen_integrity(rev_listen, rng, sizes.stream_msg,
                                          "reverse")
             if not ok:
                 return False, rdetail
-            return True, "%d tunnels, %s, reverse ok" % (sizes.tunnels, detail)
+            return True, "%d tunnels, forward %s, reverse %s" % (
+                sizes.tunnels, detail, reverse_detail)
 
         suite.run("parallel_tunnels", parallel)
 
@@ -2037,6 +2173,289 @@ def _enable_lossymux(cfg: Dict[str, object]) -> Dict[str, object]:
     assert isinstance(mux, dict)
     mux["lossymux"] = {"enabled": True, "idle_timeout": 30, "queue": 256}
     return cfg
+
+
+def scen_identity_routes(routes: Sequence[Tuple[int, bytes]],
+                         rng: random.Random, size: int) -> Tuple[bool, str]:
+    """Verify concurrent TCP routes against distinct backend greetings."""
+    payloads = [make_payload(rng, size) for _ in routes]
+
+    def exchange(route: Tuple[int, bytes], payload: bytes) -> None:
+        port, prefix = route
+        with connect(port) as sock:
+            sock.settimeout(0.2)
+            deadline = time.monotonic() + 10.0
+            greeting = recv_exact(sock, len(prefix), deadline=deadline)
+            if greeting != prefix:
+                raise ValueError("port %d reached %r, expected %r" % (
+                    port, greeting, prefix))
+            sock.settimeout(5.0)
+            sock.sendall(payload)
+            sock.settimeout(0.2)
+            echoed = recv_exact(sock, len(payload), deadline=deadline)
+            if echoed != payload:
+                raise ValueError("port %d returned corrupt TCP data" % port)
+
+    with ThreadPoolExecutor(max_workers=len(routes)) as pool:
+        futures = [pool.submit(exchange, route, payload)
+                   for route, payload in zip(routes, payloads)]
+        for future in futures:
+            future.result()
+    return True, "%d TCP routes reached the correct backend" % len(routes)
+
+
+def scen_udp_multiflow(routes: Sequence[Tuple[int, bytes]],
+                       rng: random.Random, count: int, *,
+                       after_round: Optional[Callable[[int], None]] = None
+                       ) -> Tuple[bool, str]:
+    """Keep distinct source sockets alive and verify every flow in each round.
+
+    Retry only missing replies; duplicates from this socket's earlier sends
+    are harmless, but any foreign payload or backend prefix is a failure.
+    """
+    sockets = []
+    sent: Dict[socket.socket, set] = {}
+    try:
+        for port, prefix in routes:
+            for _ in range(count):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sockets.append((sock, prefix))
+                sock.settimeout(0.2)
+                sock.connect(("127.0.0.1", port))
+                sent[sock] = set()
+        prefixes = dict(sockets)
+        for round_no in range(3):
+            pending = {}
+            for flow, (sock, prefix) in enumerate(sockets):
+                payload = struct.pack("!II", flow, round_no) + make_payload(rng, 128)
+                pending[sock] = payload
+                sent[sock].add(prefix + payload)
+            deadline = time.monotonic() + 5.0
+            while pending:
+                for sock, payload in pending.items():
+                    sock.send(payload)
+                retry = min(deadline, time.monotonic() + 0.2)
+                while pending:
+                    remaining = retry - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    readable, _, _ = select.select(list(sent), [], [], remaining)
+                    if not readable:
+                        break
+                    for sock in readable:
+                        data = sock.recv(65536)
+                        if data not in sent[sock]:
+                            return False, "UDP reply has wrong flow, data or backend"
+                        payload = pending.get(sock)
+                        if payload is not None:
+                            if data == prefixes[sock] + payload:
+                                del pending[sock]
+                if pending and time.monotonic() >= deadline:
+                    return False, "%d UDP flows missing in round %d" % (
+                        len(pending), round_no)
+            if after_round is not None:
+                after_round(round_no)
+        return True, "%d UDP flows verified across 3 rounds" % len(sockets)
+    finally:
+        for sock, _prefix in sockets:
+            sock.close()
+
+
+def scen_udp_tcp_coexistence(ports: Sequence[int], rng: random.Random,
+                             size: int) -> Tuple[bool, str]:
+    """Exchange UDP while verified TCP streams remain active on the same ports."""
+    ready = threading.Event()
+    udp_active = threading.Event()
+    tcp_progress = threading.Event()
+    finish = threading.Event()
+    payload = make_payload(rng, size)
+
+    def tcp() -> None:
+        sockets = []
+        try:
+            for port in ports:
+                sock = connect(port)
+                sockets.append(sock)
+                sock.sendall(b"tcp-warmup")
+                sock.settimeout(0.2)
+                if recv_exact(sock, 10, deadline=time.monotonic() + 5.0) != b"tcp-warmup":
+                    raise ValueError("TCP warmup mismatch")
+            ready.set()
+            if not udp_active.wait(5.0):
+                raise TimeoutError("UDP phase never started")
+            # The caller does not finish its UDP phase until it observes TCP
+            # progress; these exact same sockets stay open for the final chunk.
+            for sock in sockets:
+                sock.settimeout(5.0)
+                sock.sendall(payload)
+                sock.settimeout(0.2)
+                if recv_exact(sock, size, deadline=time.monotonic() + 5.0) != payload:
+                    raise ValueError("TCP data mismatch during UDP")
+            tcp_progress.set()
+            if not finish.wait(10.0):
+                raise TimeoutError("UDP phase never finished")
+            for sock in sockets:
+                sock.sendall(b"tcp-final")
+                if recv_exact(sock, 9, deadline=time.monotonic() + 5.0) != b"tcp-final":
+                    raise ValueError("TCP final data mismatch")
+        finally:
+            for sock in sockets:
+                sock.close()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(tcp)
+        try:
+            if not ready.wait(5.0):
+                return False, "TCP did not verify its warmup"
+
+            def after_round(round_no: int) -> None:
+                if round_no == 0:
+                    udp_active.set()
+                elif round_no == 1 and not tcp_progress.wait(5.0):
+                    raise TimeoutError("TCP made no verified progress during UDP")
+
+            ok, detail = scen_udp_multiflow(
+                [(port, b"") for port in ports], rng, 1, after_round=after_round)
+            if not ok:
+                return False, detail
+            if not tcp_progress.is_set():
+                return False, "TCP made no verified progress during UDP"
+        finally:
+            udp_active.set()
+            finish.set()
+            future.result()
+    return True, "TCP and UDP verified on %d shared ports" % len(ports)
+
+
+def run_multi_peer_topology(binary: Path, log_dir: Path, suite: Suite,
+                            rng: random.Random, sizes: Sizes, *,
+                            window: Optional[int], loglevel: int) -> None:
+    if not suite.selected(MULTI_PEER_SCENARIOS):
+        return
+    (mux, hub_api, a_api, b_api, hub_echo, a_echo, b_echo,
+     to_a, to_b, from_a, from_b) = free_ports(
+         11, udp=range(4, 11) if suite.selected(("udp_multi_peer",)) else ())
+    hub = build_identity_server(
+        mux_port=mux, echo_port=hub_echo, reverse_listen=to_a,
+        api_port=hub_api, window=window, loglevel=loglevel)
+    hub["identity"] = {"claim": "hub", "listen": {
+        "spoke-a": "127.0.0.1:%d" % to_a,
+        "spoke-b": "127.0.0.1:%d" % to_b}}
+    clients = []
+    for claim, echo, listen, api in (("spoke-a", a_echo, from_a, a_api),
+                                     ("spoke-b", b_echo, from_b, b_api)):
+        cfg = build_identity_client(
+            mux_port=mux, echo_port=echo, forward_listen=listen,
+            api_port=api, tunnels=1, window=window, loglevel=loglevel,
+            claim=claim)
+        identity = cfg["identity"]
+        assert isinstance(identity, dict)
+        identity["listen"] = {"hub": "127.0.0.1:%d" % listen}
+        clients.append(cfg)
+    need_udp = bool(suite.selected(("udp_multi_peer",)))
+    if need_udp:
+        for cfg in [hub] + clients:
+            _enable_lossymux(cfg)
+    echoes = []
+    for port, prefix in ((hub_echo, b"hub-----"), (a_echo, b"spoke-a-"),
+                         (b_echo, b"spoke-b-")):
+        echoes.append(EchoServer(port, "multi-tcp", prefix=prefix))
+        if need_udp:
+            echoes.append(UdpEchoServer(port, "multi-udp", prefix=prefix))
+    daemons = Daemons(
+        binary, log_dir, server_cfg=hub, client_cfg=clients[0],
+        server_api=hub_api, client_api=a_api, tag="multi-peer",
+        extra_clients=[(clients[1], b_api)])
+    routes = [(to_a, b"spoke-a-"), (to_b, b"spoke-b-"),
+              (from_a, b"hub-----"), (from_b, b"hub-----")]
+    try:
+        for echo in echoes:
+            echo.start()
+        if not daemons.start():
+            suite.start_failed("multi_peer_topology_start", MULTI_PEER_SCENARIOS,
+                               "daemons not healthy")
+            return
+        suite.run("identity_multi_peer", lambda: scen_identity_routes(
+            routes, rng, sizes.stream_msg))
+        suite.run("udp_multi_peer", lambda: scen_udp_multiflow(routes, rng, 1))
+    finally:
+        suite.teardown(daemons)
+        for echo in echoes:
+            echo.stop()
+
+
+def scen_udp_unnegotiated(port: int, api: int) -> Tuple[bool, str]:
+    def dropped() -> int:
+        status, text = api_request(api, "/stats")
+        if status != 200:
+            raise ValueError("/stats returned HTTP %d" % status)
+        fields = parse_stats(text).get("Datagrams", "").replace(",", "").split()
+        return int(fields[fields.index("Dropped") + 1])
+
+    before = dropped()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(0.2)
+        sock.connect(("127.0.0.1", port))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            sock.send(b"must-not-forward")
+            try:
+                sock.recv(65536)
+                return False, "unnegotiated lossymux forwarded UDP"
+            except socket.timeout:
+                pass
+    if dropped() <= before:
+        return False, "UDP did not increase drops"
+    return True, "UDP dropped without an echo"
+
+
+def run_udp_negotiation_topology(binary: Path, log_dir: Path, suite: Suite,
+                                 rng: random.Random, sizes: Sizes, *,
+                                 window: Optional[int], loglevel: int) -> None:
+    if not suite.selected(UDP_NEGOTIATION_SCENARIOS):
+        return
+
+    def negotiation() -> Tuple[bool, str]:
+        for enabled in ("server", "client"):
+            (echo_f, echo_r, mux, srv_api, cli_api, fwd, rev) = free_ports(
+                7, udp=(0, 1, 5, 6))
+            server = build_plain_server(
+                mux_port=mux, echo_port=echo_f, reverse_listen=rev,
+                api_port=srv_api, window=window, loglevel=loglevel)
+            client = build_plain_client(
+                mux_port=mux, echo_port=echo_r, forward_listen=fwd,
+                api_port=cli_api, window=window, loglevel=loglevel)
+            _enable_lossymux(server if enabled == "server" else client)
+            port, api = (rev, srv_api) if enabled == "server" else (fwd, cli_api)
+            daemons = Daemons(
+                binary, log_dir, server_cfg=server, client_cfg=client,
+                server_api=srv_api, client_api=cli_api, tag="udp-only-" + enabled)
+            echoes = [EchoServer(echo_f), EchoServer(echo_r),
+                      UdpEchoServer(echo_f), UdpEchoServer(echo_r)]
+            try:
+                for echo in echoes:
+                    echo.start()
+                if not daemons.start():
+                    return False, "%s-only daemons not healthy" % enabled
+                for listen in (fwd, rev):
+                    ok, detail = scen_integrity(listen, rng, sizes.stream_msg, enabled)
+                    if not ok:
+                        return False, detail
+
+                ok, detail = scen_udp_unnegotiated(port, api)
+                if not ok:
+                    return False, "%s-only: %s" % (enabled, detail)
+                for listen in (fwd, rev):
+                    ok, detail = scen_integrity(listen, rng, sizes.stream_msg, enabled)
+                    if not ok:
+                        return False, detail
+            finally:
+                suite.teardown(daemons)
+                for echo in echoes:
+                    echo.stop()
+        return True, "both unilateral offers drop UDP and preserve TCP"
+
+    suite.run("udp_negotiation", negotiation)
 
 
 def scen_udp_burst(port: int, rng: random.Random, count: int,
@@ -2108,7 +2527,7 @@ def run_udp_topology(binary: Path, log_dir: Path, suite: Suite,
                      rng: random.Random, sizes: Sizes, *,
                      window: Optional[int], loglevel: int) -> None:
     plain_scenarios = ("udp_forward", "udp_reverse", "udp_burst", "udp_stats",
-                       "udp_shutdown")
+                       "udp_shutdown", "udp_multiflow", "udp_tcp_coexistence")
     identity_scenarios = ("udp_identity", "udp_shutdown")
     need_plain = bool(suite.selected(plain_scenarios))
     need_identity = bool(suite.selected(identity_scenarios))
@@ -2116,7 +2535,7 @@ def run_udp_topology(binary: Path, log_dir: Path, suite: Suite,
         return
     (echo_f, echo_r, mux, srv_api, cli_api, fwd_listen, rev_listen,
      id_mux, id_srv_api, id_cli_api, id_fwd_listen,
-     id_rev_listen) = free_ports(12)
+     id_rev_listen) = free_ports(12, udp=(0, 1, 5, 6, 10, 11))
     log("udp topology ports: echoF=%d echoR=%d mux=%d idmux=%d" % (
         echo_f, echo_r, mux, id_mux))
     echoes = [EchoServer(echo_f, "u-echo-fwd"),
@@ -2180,6 +2599,10 @@ def run_udp_topology(binary: Path, log_dir: Path, suite: Suite,
             suite.run("udp_burst", lambda: scen_udp_burst(
                 fwd_listen, rng, sizes.pings * 10, 1200))
             suite.run("udp_stats", lambda: scen_udp_stats(cli_api, fwd_listen))
+            suite.run("udp_multiflow", lambda: scen_udp_multiflow(
+                [(fwd_listen, b""), (rev_listen, b"")], rng, sizes.streams // 4))
+            suite.run("udp_tcp_coexistence", lambda: scen_udp_tcp_coexistence(
+                [fwd_listen, rev_listen], rng, sizes.stream_msg))
         if ident in ready:
             suite.run("udp_identity", identity)
 
@@ -2499,6 +2922,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         suite.skip(IDENTITY_VERIFY_MATCH_SCENARIOS
                    + IDENTITY_VERIFY_MISMATCH_SCENARIOS,
                    "builtin certificate carries no identity")
+    run_multi_peer_topology(binary, log_dir, suite, rng, sizes,
+                            window=args.window, loglevel=args.loglevel)
+    run_udp_negotiation_topology(binary, log_dir, suite, rng, sizes,
+                                 window=args.window, loglevel=args.loglevel)
     run_udp_topology(binary, log_dir, suite, rng, sizes,
                      window=args.window, loglevel=args.loglevel)
     run_resumption_topology(binary, log_dir, suite, rng, sizes,
