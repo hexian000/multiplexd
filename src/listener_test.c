@@ -1,8 +1,9 @@
 /* multiplexd (c) 2022-2026 He Xian <hexian000@outlook.com>
  * This code is licensed under MIT license (see LICENSE for details) */
 
-/* listener_test.c - black-box tests for the socket listener in listener.c via
- * its public API. Dependencies: links the real util.c and listener.c. */
+/* listener_test.c - real-socket tests for the listener public API. Compiles
+ * listener.c locally to inject nonblocking-setup failures; other dependencies
+ * are linked real. */
 
 #include "listener.h"
 
@@ -13,6 +14,7 @@
 
 #include <ev.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -22,6 +24,24 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+static bool g_fail_nonblock;
+static int g_failed_nonblock_fd = -1;
+
+static int test_socket_set_nonblock(const int fd)
+{
+	if (g_fail_nonblock) {
+		g_fail_nonblock = false;
+		g_failed_nonblock_fd = fd;
+		errno = EIO;
+		return -1;
+	}
+	return socket_set_nonblock(fd);
+}
+
+#define socket_set_nonblock test_socket_set_nonblock
+#include "listener.c"
+#undef socket_set_nonblock
 
 static const struct conf_socket_opts g_socket_opts = {
 	.backlog = 4,
@@ -282,6 +302,120 @@ T_DECLARE_CASE(test_listener_start_occupied_addr_fails)
 	T_EXPECT(!started);
 	T_EXPECT_EQ(accept_fd, -1);
 	T_EXPECT(!accept_active);
+}
+
+T_DECLARE_CASE(test_listener_nonblock_failure_leaves_unarmed)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+
+	reset_serve_spy();
+	struct listener l;
+	uint_least64_t accepted = 0;
+	listener_init(&l, &g_socket_opts, test_serve, NULL, &accepted);
+	const union sockaddr_max sa = make_loopback_any(AF_INET);
+
+	g_failed_nonblock_fd = -1;
+	g_fail_nonblock = true;
+	const bool started = listener_start(&l, loop, &sa.sa);
+	const bool injected = !g_fail_nonblock;
+	g_fail_nonblock = false;
+	const int failed_fd = g_failed_nonblock_fd;
+	errno = 0;
+	const bool failed_fd_closed = failed_fd >= 0 &&
+				      fcntl(failed_fd, F_GETFD) == -1 &&
+				      errno == EBADF;
+	const int accept_fd = l.w_accept.fd;
+	const bool accept_active = ev_is_active(&l.w_accept);
+	const bool timer_active = ev_is_active(&l.w_timer);
+	const bool ownership_unchanged = l.socket_opts == &g_socket_opts &&
+					 l.serve == test_serve &&
+					 l.num_accepted == &accepted;
+
+	/* Also release a leaked descriptor when a broken error branch is tested. */
+	if (failed_fd >= 0 && !failed_fd_closed && failed_fd != accept_fd) {
+		(void)close(failed_fd);
+	}
+	listener_stop(&l, loop);
+	ev_loop_destroy(loop);
+
+	T_EXPECT(injected);
+	T_EXPECT(!started);
+	T_EXPECT(failed_fd_closed);
+	T_EXPECT_EQ(accept_fd, -1);
+	T_EXPECT(!accept_active);
+	T_EXPECT(!timer_active);
+	T_EXPECT(ownership_unchanged);
+	T_EXPECT_EQ(g_serve_calls, 0);
+	T_EXPECT_EQ(accepted, 0u);
+}
+
+T_DECLARE_CASE(test_listener_accept_nonblock_failure_closes_and_recovers)
+{
+	struct ev_loop *const loop = ev_loop_new(EVFLAG_AUTO);
+	T_CHECK(loop != NULL);
+
+	reset_serve_spy();
+	struct listener l;
+	uint_least64_t accepted = 0;
+	listener_init(&l, &g_accept_opts, test_serve, NULL, &accepted);
+	const union sockaddr_max sa = make_loopback_any(AF_INET);
+	const int lfd = listener_open(&g_socket_opts, &sa.sa);
+	T_CHECK(lfd >= 0);
+	listener_start_fd(&l, loop, lfd);
+	union sockaddr_max peer;
+	T_CHECK(listener_get_addr(&l, &peer));
+
+	const int first = socket(AF_INET, SOCK_STREAM, 0);
+	T_CHECK(first >= 0);
+	T_CHECK(connect(first, &peer.sa, sa_len(&peer.sa)) == 0);
+
+	g_failed_nonblock_fd = -1;
+	g_fail_nonblock = true;
+	ev_feed_event(loop, &l.w_accept, EV_READ);
+	ev_invoke_pending(loop);
+	const bool injected = !g_fail_nonblock;
+	g_fail_nonblock = false;
+	const int failed_fd = g_failed_nonblock_fd;
+	errno = 0;
+	/* Inspect before opening another socket can reuse the rejected fd. */
+	const bool failed_fd_closed = failed_fd >= 0 &&
+				      fcntl(failed_fd, F_GETFD) == -1 &&
+				      errno == EBADF;
+	const int failed_serve_calls = g_serve_calls;
+	const uint_least64_t accepted_after_failure = accepted;
+	const bool accept_active = ev_is_active(&l.w_accept);
+	const bool timer_active = ev_is_active(&l.w_timer);
+	const bool listener_retained =
+		l.w_accept.fd == lfd && fcntl(lfd, F_GETFD) != -1;
+	if (failed_fd >= 0 && !failed_fd_closed) {
+		(void)close(failed_fd);
+	}
+
+	const int second = socket(AF_INET, SOCK_STREAM, 0);
+	T_CHECK(second >= 0);
+	T_CHECK(connect(second, &peer.sa, sa_len(&peer.sa)) == 0);
+	ev_feed_event(loop, &l.w_accept, EV_READ);
+	ev_invoke_pending(loop);
+
+	(void)close(first);
+	(void)close(second);
+	listener_stop(&l, loop);
+	ev_loop_destroy(loop);
+
+	T_EXPECT(injected);
+	T_EXPECT(failed_fd_closed);
+	T_EXPECT_EQ(failed_serve_calls, 0);
+	T_EXPECT_EQ(accepted_after_failure, 1u);
+	T_EXPECT(accept_active);
+	T_EXPECT(!timer_active);
+	T_EXPECT(listener_retained);
+	T_EXPECT_EQ(g_serve_calls, 1);
+	T_EXPECT_EQ(accepted, 2u);
+	T_EXPECT(g_serve_getpeer_ok);
+	T_EXPECT(g_serve_nonblock);
+	T_EXPECT(g_serve_cloexec);
+	T_EXPECT(g_serve_nodelay);
 }
 
 /* Everything serve_one_connection observes about one accepted connection,
@@ -638,6 +772,8 @@ static const struct testing_suite suite[] = {
 	T_CASE(test_listener_stop_after_start),
 	T_CASE(test_listener_get_addr_tracks_socket),
 	T_CASE(test_listener_start_occupied_addr_fails),
+	T_CASE(test_listener_nonblock_failure_leaves_unarmed),
+	T_CASE(test_listener_accept_nonblock_failure_closes_and_recovers),
 	T_CASE(test_listener_serve_fn_called),
 	T_CASE(test_listener_serve_fn_called_ipv6),
 	T_CASE(test_listener_accept_drains_multiple_in_one_wakeup),

@@ -281,8 +281,9 @@ set_tests_properties(conf_test_run_filter_ere PROPERTIES
     PASS_REGULAR_EXPRESSION "=== DONE  2 passed, 0 failed, 0 skipped"
 )
 
+# Include listener.c locally for deterministic socket-setup failure injection.
 add_src_test(listener_test
-    listener.c listener.h
+    listener.h
     listener_test.c
 )
 
